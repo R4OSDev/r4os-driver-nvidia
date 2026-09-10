@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-Passive NVIDIA display driver for R4OS. Module 0.1.9; original R4OS code is
+Passive NVIDIA display driver for R4OS. Module 0.1.10; original R4OS code is
 Apache-2.0, with selected original MIT headers and separately licensed firmware.
 hardware acceptance for roadmap 0.79.9 is open and offline preparation for
 0.79.10 has started. This owner inventories NVIDIA display functions once through
@@ -117,7 +117,7 @@ packaged GSP containers in CPU memory before continuing the passive probe.
 `mode=runtime-check` explicitly exercises CPU heap calls from init and a real
 worker, validates close admission, and stops init before PCI. Its two leftover
 CPU allocations must be reclaimed by the actual failed-load cleanup. This mode
-requires kernel 0.1.144 / DriverApi33. Other modes are rejected. `DISPLAYD /NVIDIA`
+requires kernel 0.1.145 / DriverApi33 with the optional 80-byte thread table. Other modes are rejected. `DISPLAYD /NVIDIA`
 replays complete NVIDIA boot records, with no additional hardware access.
 Distribution's `graphics-test Test nvidia-passive` runs an explicit short SMP4
 absence/fallback check with the existing graphics harness. It requires the
@@ -296,9 +296,9 @@ and a single release support resident IRQ context. This is a counting
 semaphore, not an IRQ spinlock or a recursive/task-owned mutex.
 
 The void-returning free/up/down paths require `r4nv_native_fault` on failure.
-It is explicitly noreturn and deliberately has no target implementation yet:
-the future native dispatcher must provide a real failure boundary before the
-combined RM/NVKMS link can run. No failed down returns a fabricated permit.
+It is explicitly noreturn. The dedicated-Task boundary described below now
+supplies it in the ordinary R4D; the separate full RM/NVKMS partial objects
+still leave private providers unresolved. No failed down fabricates a permit.
 The 180-check hosted acceptance executes the exact freestanding C objects on
 Linux, including 25 failure transfers into its host-only setjmp/longjmp fixture.
 That fixture never enters a R4D. Windows sources are cross-built, not executed.
@@ -309,8 +309,8 @@ scheduler waits, bounded timeout, busy destruction and actual close/stop
 handoff. All its CPU boxes and task records are freed before the preceding
 diagnostics' accounting. The previous FIFO, 256-update, heap and clock probes
 remain required. Normal passive startup allocates no semaphore. C semaphore
-execution in a guest, the native fault boundary, combined RM link and actual
-GPU/IRQ hardware acceptance remain open.
+execution and its native fault boundary are covered below. The combined RM
+link and actual GPU/IRQ hardware acceptance remain open.
 
 Actual C memory/clock integration (0.79.10)
 -----------------------------------------
@@ -321,7 +321,7 @@ and clock providers. No hosted allocator, timer, Linux implementation, full
 RM/NVKMS object or synchronization-fault stub enters that target link.
 
 `ThirdParty/Nvidia570.144` contains the 19 byte-identical original MIT headers
-needed by these adapters and the separately built semaphore subset. Its
+needed by all linked memory, clock and semaphore adapters. Its
 `ORIGIN.json` records every file hash and the shared firmware/source pin.
 Git preserves this package byte-for-byte on Windows and Linux; automatic
 text and line-ending conversion is disabled for the complete vendor tree.
@@ -342,7 +342,49 @@ unaligned copies with canaries, overlapping moves, strings and the ns-to-us
 clock bridge, then requires zero live allocations and successful close.
 The success record says `native-c=OK adapters=21 ... link=actual` only after
 both real contexts complete. Normal passive startup does not run this probe.
-The C semaphore sources remain outside the ordinary module until their
-required nonreturning native-fault provider and dispatcher are implemented.
+The C semaphore sources also enter the ordinary module in 0.1.10 through
+the native invocation and failure boundary described next.
 The separate full RM/NVKMS partial-object evidence remains unchanged; GSP,
 GPU authentication, native scanout and HDMI acceptance remain open.
+
+Native semaphore callbacks and synchronous abort (0.79.10)
+---------------------------------------------------------
+All sixteen original-header semaphore adapters now join the same R4D link.
+`rm_native.zig` starts caller-owned invocations as explicitly abortable
+dedicated Tasks. No fixed invocation pool or global serialized native lane
+is introduced. A first private fault latches its operation/result, refuses
+new ordinary invocations and aborts only the executing callback with -76001.
+Queued invocations check admission again on entry; already admitted peers
+must finish cooperatively. Cleanup invocations require an explicit flag and
+do not clear the fault. Rebind resets it only after the previous owner closes.
+
+The optional DriverThreadApi tail at offset 72 (table size 80, still version
+1) is required for this path. Passive startup remains available with older
+tables. Kernel 0.1.145 restores an ordinary SysV caller frame, then completes
+and retires the Task through its existing lifetime machinery. No C/Zig defers
+run across an accepted abort. The native owner retains memory, semaphore,
+lock and DMA obligations until it has quiesced every peer. Timeout retains
+the callback and module; it does not revoke execution or GPU access.
+
+Only negative synchronous self-aborts on opted-in Tasks are accepted with
+interrupts enabled, no kernel lock/critical section/wait and exactly the
+initial Task unwind guard. Rejected platform calls return a status. A void
+native failure outside that admitted boundary is a programming/ABI violation
+and traps. This is no CPU-exception, hung-loop or arbitrary GPU recovery path.
+
+The existing runtime-check calls all sixteen real C adapters. A C waiter
+blocks on a zero-count semaphore, then a second C callback attempts Busy
+free: its following instruction must remain unexecuted, while two CPU
+allocations (145 bytes including private prefixes) and the waiter stay live.
+New ordinary dispatch is rejected. Explicit cleanup supplies one real C
+permit, joins and retires the waiter, frees its semaphore through C and
+releases memory through the status-bearing private heap owner. All counts
+return to the preceding probes' baseline; the native failure stays latched.
+Partial diagnostic shutdown also retains resources until every peer retires.
+
+Thin Zig Task entries call the actual C functions directly. This avoids
+external function-address GOT relaxation while retaining the packager's
+strict ABS64/REL32 contract. No relocation check is weakened. The original
+headers, firmware, notices and five nonallocated resources are unchanged.
+The separate full RM/NVKMS link, GSP/RPC, GPU initialization, native display
+and HDMI require further implementation and eventual hardware acceptance.

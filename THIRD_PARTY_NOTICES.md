@@ -24,8 +24,8 @@ license is replaced by the R4OS license.
 selected header plus the complete original COPYING. NVIDIA.R4D carries this
 file byte-for-byte as `NVIDIA-570.144-HEADERS-LICENSE.txt`; Distribution carries
 the identical file in `/R4OS/LICENSES` and its adjacent `Legal` directory.
-The headers compile the R4OS memory/clock C adapters in the actual module and
-provide declarations for separately built semaphore adapters. They are not
+The headers compile the R4OS memory/clock/semaphore C adapters in the actual
+module and in the separate source-build subset. They are not
 a redistribution of the complete RM/NVKMS implementation.
 
 Any future import of RM/NVKMS code or additional firmware must preserve its exact

@@ -1,7 +1,8 @@
-/* Mandatory, still unresolved boundary for native operations without a status
- * return. A failed down must never return as though it had acquired a permit.
- * The future native dispatcher must supply this before RM/NVKMS can be linked
- * into a running R4D. There is deliberately no target stub or global panic. */
+/* Private native callback abort. R4D callers run these void APIs through
+ * rm_native's abortable dedicated Tasks, with explicit owner cleanup after
+ * all peers quiesce. A failed down never returns a fake permit. IRQ, kernel
+ * critical sections and calls outside that boundary are ABI violations.
+ * The separate full-RM partial link still leaves this provider unresolved. */
 #ifndef R4NV_NATIVE_FAULT_H
 #define R4NV_NATIVE_FAULT_H
 #include "nvtypes.h"

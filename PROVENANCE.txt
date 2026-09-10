@@ -167,3 +167,14 @@ Driver Work. It is an original CPU integration diagnostic. Semaphore C files,
 their missing nonreturning target fault boundary, full RM/NVKMS objects and
 GPU execution remain separate, incomplete work. Host setjmp/longjmp stays
 exclusive to the separately compiled semaphore fixture.
+
+NVIDIA 0.1.10 also links the two original R4OS semaphore C adapters and the
+new original semaphore_probe.c. All 37 memory/clock/semaphore adapters use
+the unchanged 19-header package. rm_native.zig implements the private fault
+provider using the optional R4OS abortable dedicated-Task service. Neither
+Linux synchronization code nor host setjmp/longjmp enters the module.
+The kernel's original assembly follows the pinned AMD64 psABI reference
+ab2062ad5653913c39124548943b1177330e34c8, archived with its original notices
+under ExFiles/Reference/GFX/SysV-AMD64-ab2062ad. It copies no implementation.
+The independent full RM/NVKMS partial objects retain unresolved providers;
+their historical evidence is not relabeled as a combined native target.

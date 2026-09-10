@@ -15,7 +15,7 @@ var close_prepared = false;
 var baseline_acquires: u32 = 0;
 
 // Explicit diagnostic only. Executes the actual private Zig C-ABI provider
-// against R4D services; original C adapters are a separate hosted acceptance.
+// against R4D services; native_probe covers the linked original-header C path.
 pub fn start(ctx: *const r4os.r4dev.DriverContext) bool {
     if (api != null or !provider.available()) return false;
     semaphores = ctx.semaphores() orelse return false;
@@ -48,7 +48,7 @@ pub fn start(ctx: *const r4os.r4dev.DriverContext) bool {
     if (cpu.stats(&after) != 0 or after.allocations != 0 or after.bytes != 0 or heap.releaseFailures() != 0 or
         semaphores.?.stats(&sem) != 0 or sem.records != 0 or sem.active_acquires != 0 or
         threads.?.stats(&task) != 0 or task.records != 0 or !provider.available()) return failed(ctx, "cleanup");
-    ctx.logInfo("NVIDIA runtime-check: private-semaphores=OK callbacks=4 contention=128 timeout=bounded cpu-boxes=freed semaphore-c=not-linked");
+    ctx.logInfo("NVIDIA runtime-check: private-semaphores=OK callbacks=4 contention=128 timeout=bounded cpu-boxes=freed provider=zig");
     return true;
 }
 pub fn prepareClose(ctx: *const r4os.r4dev.DriverContext) bool {

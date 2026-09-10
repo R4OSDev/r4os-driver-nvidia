@@ -513,3 +513,43 @@ RM-/NVKMS-Link und GPU-Boot bleiben offen. Kernel 0.1.144 / DriverApi33 und
 RELEASE 0.79.8 bleiben unveraendert. Der lokale SDK-Neubau aktualisiert auch
 ModuleCatalog; ein altes installiertes Werkzeug kennt die neuen C-Begleiter
 noch nicht und muss vor dem Imageplan erneuert werden.
+
+Native C-Semaphoren und kontrollierter Task-Abbruch (0.79.10, 10.09.2026)
+---------------------------------------------------------------------
+NVIDIA 0.1.10 bindet jetzt auch alle sechzehn original-headerbasierten
+C-Semaphoreadapter ins normale R4D ein. rm_native besitzt den Aufrufvertrag:
+caller-eigene Invocation bis zur Task-Freigabe, explizit abortierbarer
+dedizierter Task, zweite Zulassungspruefung vor Eintritt, persistenter erster
+Fehler und ausschliesslich explizite Cleanup-Aufrufe nach dem Fehler.
+Es gibt keine globale native Serialisierung und keinen festen Aufrufpool.
+
+Kernel 0.1.145 erweitert nur die optionale DriverThreadApi: Version 1,
+72-Byte-Praefix bleibt gueltig, abort_current bei Offset 72, insgesamt 80
+Bytes. DriverApi33/632 und Importnamen bleiben unveraendert. Flag 2 aktiviert
+Selbstabbruch; Statusflag 4 wird als Startflag abgelehnt. Ein angenommener
+negativer Selbstabbruch stellt den SysV-Aufrufrahmen wieder her und benutzt
+danach den bestehenden Taskabschluss. Er fuehrt keine Modul-Defers aus.
+Kernelbesitzer, IRQ, aktive Wait-Leases und zusaetzliche Unwind-Guards duerfen
+nicht uebersprungen werden. Ungueltige Plattformaufrufe geben Fehler zurueck;
+eine void-C-Fehlerfunktion ausserhalb der vereinbarten Grenze ist eine ABI-
+Verletzung und trappt. Haengende CPU-Schleifen, Exceptions und unbekannte
+GPU-/DMA-Aktivitaet werden damit nicht aufgefangen.
+
+Die bestehende SMP4-Runtimeprobe benutzt alle sechzehn echten C-Adapter.
+Ein wirklich eingeschriebener NVKMS-Waiter verhindert das Freigeben seiner
+Semaphore. Der C-Free-Aufruf des zweiten Tasks endet mit -76001; sein
+Nachfolgebefehl bleibt unerreicht. 145 CPU-Bytes in zwei Allokationen und
+der Waiter bleiben erhalten. Erst ein expliziter Cleanup-Aufruf gibt einen
+realen Permit frei. Nach Join/Taskfreigabe werden Semaphore und Speicher
+freigegeben; alle Zahlen kehren zur vorherigen Diagnosebasis zurueck. Der
+Fehler bleibt gespeichert. Teilweise fehlgeschlagene Proben werden auch
+nach Owner-Close ohne neue Tasks durch dieselben gecachten Anbieter beendet.
+
+Die kleinen Zig-Taskeinstiege rufen die C-Funktionen direkt auf. Direkt
+adressierte C-Funktionen hatten REX_GOTPCRELX erzeugt und wurden vom Packager
+korrekt abgewiesen; dessen ABS64/REL32-Grenze bleibt streng erhalten.
+Originalheader, Firmware und fuenf Paketressourcen bleiben bytegleich.
+Die frueheren Abschnitte beschreiben historische Zwischenstaende. Aktuelle
+Nachweise stehen in Docs/Drivers/GrafikFirmware07910 und im Referenzordner
+ExFiles/Reference/GFX/Nvidia/0.79.10/native-abort. RELEASE bleibt 0.79.8;
+voller RM-/NVKMS-Link, GSP/RPC, GPU-Bringup, Scanout und HDMI bleiben offen.
