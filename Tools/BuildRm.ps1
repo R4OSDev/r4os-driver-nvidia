@@ -4,6 +4,7 @@ param(
     [Parameter(Mandatory)][string]$Compiler,
     [Parameter(Mandatory)][string]$SourceDirectory,
     [Parameter(Mandatory)][string]$ScratchDirectory,
+    [string]$XzPath,
     [ValidateRange(1,8)][int]$Jobs=4
 )
 $ErrorActionPreference='Stop'
@@ -18,6 +19,12 @@ foreach($path in @($Compiler,$SourceDirectory,$ScratchDirectory)){
 $zig=[IO.Path]::GetFullPath($Compiler)
 $sourceRoot=[IO.Path]::GetFullPath($SourceDirectory)
 $scratchRoot=[IO.Path]::GetFullPath($ScratchDirectory)
+if([string]::IsNullOrWhiteSpace($XzPath)){
+    $available=@(Get-Command xz -CommandType Application -ErrorAction SilentlyContinue)
+    if(!$available.Count){throw 'XZ Utils is required for original NVKMS shaders; supply -XzPath with an absolute xz executable path'}
+    $XzPath=$available[0].Source
+}
+if(![IO.Path]::IsPathFullyQualified($XzPath) -or !(Test-Path -LiteralPath $XzPath -PathType Leaf)){throw 'XZ compressor path must name an existing absolute executable'}
 if(!(Test-Path -LiteralPath $zig -PathType Leaf) -or !(Test-Path -LiteralPath $sourceRoot -PathType Container)){throw 'Compiler or original source directory is missing'}
 foreach($root in @($sourceRoot,$moduleRoot)){
     $relative=[IO.Path]::GetRelativePath($root,$scratchRoot).Replace('\','/')
@@ -77,9 +84,13 @@ try {
     & $pwsh -NoProfile -File (Join-Path $PSScriptRoot 'Rm/Compile.ps1') -Compiler $zig -SourceDirectory $snapshot -OutputDirectory $runRoot -Jobs $Jobs
     if($LASTEXITCODE -ne 0){throw 'Original RM/NVKMS compilation failed; see compile-results.json and compile-logs'}
     $report.compile_complete=$true
+    & $pwsh -NoProfile -File (Join-Path $PSScriptRoot 'Rm/Shaders.ps1') -Compiler $zig -SourceDirectory $snapshot -OutputDirectory $runRoot -XzPath $XzPath
+    if($LASTEXITCODE -ne 0){throw 'Original NVKMS shader preparation failed; see shaders/ logs'}
     & $pwsh -NoProfile -File (Join-Path $PSScriptRoot 'Rm/Link.ps1') -Compiler $zig -SourceDirectory $snapshot -OutputDirectory $runRoot
     if($LASTEXITCODE -ne 0){throw 'RM/NVKMS partial link failed; see link-results.json and component link logs'}
     $report.partial_links_complete=$true
+    $report.shader_payloads_added=$true
+    $report.shaders=Get-Content -Raw -LiteralPath (Join-Path $runRoot 'shader-results.json')|ConvertFrom-Json
     $components=@();$symbolTables=@{}
     foreach($unit in @('nvidia','nvidia-modeset')){
         & $pwsh -NoProfile -File (Join-Path $PSScriptRoot 'Rm/InspectElf.ps1') -InputFile (Join-Path $runRoot ($unit+'-partial.o')) -OutputFile (Join-Path $runRoot ($unit+'-elf.json'))
@@ -114,7 +125,7 @@ try {
     $report.duplicate_global_definition_candidates=@($symbolTables['nvidia-modeset'].defined|Where-Object {$rmNames.Contains($_.name)}|ForEach-Object {$_.name})
     $report.upstream_memcpy_memset_localization_applied=$false
     $report.components=$components;$report.audit_complete=$true
-    Write-Host 'Original RM/NVKMS source build and dependency inspection completed. OS callbacks, shader payloads and a final R4D link are still required.'
+    Write-Host 'Original RM/NVKMS source build, shaders and dependency inspection completed. OS callbacks and a final R4D link are still required.'
 } catch {
     $report.error=$_.Exception.Message
     throw

@@ -236,8 +236,8 @@ R4OS-Zielmakros ersetzen die Linux-Kernel-Zieloptionen. -g0 unterbindet Zigs
 implizite Debugdaten; Prefix-Mapping entfernt Versuchspfade aus Nutzdaten.
 
 Der partielle RM-Link behaelt die originalen Exportwurzeln und nv-kernel.ld.
-NVKMS bindet zunaechst seine C-/C++-Objekte; komprimierte Shader und ihre
-Start-/Endsymbole sind noch nicht enthalten. Pro Komponente entsteht ein
+NVKMS bindet seine C-/C++-Objekte und jetzt auch acht komprimierte Shader mit
+ihren originalen Start-/Endsymbolen. Pro Komponente entsteht ein
 deterministischer Identifikationstext. Die originale nachtraegliche
 memcpy-/memset-Lokalisierung des RM ist ebenfalls noch nicht angewendet.
 Der finale gemeinsame Link muss auch nvstatusToString eindeutig aufloesen.
@@ -251,8 +251,8 @@ Fehlversuche bleiben mit ihren Logs erhalten und ueberschreiben nie einen
 vorherigen Erfolg. Neue permanente Gatefamilien werden nicht angelegt.
 
 Alle 1196 Dateien und beide partiellen Links laufen auf dem Debian-Host.
-RM besitzt 340 offene Symbole, NVKMS 70. Davon sind 60 SPDM-Kryptofunktionen
-und 16 Start-/Endsymbole fuer acht Shaderdateien. Die Crypto-Grenze wird in
+RM besitzt 340 offene Symbole, NVKMS nach Einbettung der Shader noch 54.
+Davon sind 60 SPDM-Kryptofunktionen im RM. Die Crypto-Grenze wird in
 Linux durch kernel-open/nvidia/libspdm_*.c an die Linux Crypto API gebunden;
 diese Betriebssystemimplementierungen sind nicht Teil des gewaehlten src-
 Baums und muessen durch echte R4OS-Funktionen beziehungsweise ausdruecklich
@@ -260,3 +260,38 @@ nicht unterstuetzte Eigenschaften ersetzt werden. Kein Erfolg ohne Backend.
 TLS und automatische Initialisierer sind in beiden Objekten nicht vorhanden.
 Das ist ein Quellbau und Abhaengigkeitsnachweis, kein ladbarer Grafiktreiber.
 R4D-/Kernel-/Releaseversionen aendern sich durch diesen Hostschritt nicht.
+
+NVKMS-Shaderpakete
+-----------------
+Der bestehende build-rm-Step benoetigt XZ Utils. Unter Debian gehoert xz
+bereits zu den DevKit-Hostvoraussetzungen. Alternativ wird auf beiden Hosts
+ein absoluter -XzPath angegeben; unter Windows zeigt er auf ein xz.exe.
+Der Besitzer laedt kein Hostwerkzeug herunter. Das Quellpaket bleibt durch
+den bisherigen Katalog gebunden; es gibt keine neue Shader- oder RM-Version.
+
+Die Liste der acht Pakete kommt aus der originalen COMPRESS_SHADERS-Liste.
+XZ --extreme --check=none entspricht dem Original-Makefile; --threads=1
+vermeidet vom Host abhaengige Mehrblock-Ausgabe. XZ_OPT/XZ_DEFAULTS werden
+fuer diese Unterprozesse entfernt. Datei- und Pipe-I/O bleibt binaer. Ein
+blockierter Schreibkanal kann das absolute Prozessbudget nicht umgehen;
+frueher Prozessabbruch erhaelt Exitcode und stderr. Alle Dateien bleiben
+im jeweiligen privaten Temp-Versuch.
+
+VerifyShader.c wird hostseitig mit den drei originalen XZ-Decoderquellen,
+NV_XZ_CUSTOM_MEM_HOOKS, NV_XZ_USE_NVTYPES und XZ_DEC_SINGLE gebaut. Die sechs
+nv3dImport*-Hooks verwenden echte Hostallokation und Speicheroperationen.
+Einmaliges xz_dec_run muss den ganzen Stream und die exakte Zielgroesse
+liefern; anschliessend wird jedes Byte mit dem Original verglichen. Auch
+die generierte ProgramHeapSize des jeweiligen Shaderheaders muss passen.
+Die Hostdateien sind auf je 1 MB begrenzt. Das sind Pruefungen der Verpackung,
+keine Shaderausfuehrung und kein GPU- oder R4OS-Laufzeit-Allocator.
+
+Die acht Originaldateien haben zusammen 1835264 Bytes; XZ Utils 5.8.1 erzeugt
+153676 Bytes. Die ELF-Einbettung ist allokierbare, nicht schreibbare und nicht
+ausfuehrbare .rodata mit 16-Byte-Ausrichtung. Die sechzehn Originalsymbole
+werden im partiellen NVKMS-Link aufgeloest. Die uebrigen 52 nvkms_-Funktionen
+sowie memcpy und memset bleiben offen. shader-results.json dokumentiert
+Quell-/Metadaten-/Kompressor-/Objekthashes und den erfolgreichen Decoderlauf.
+CRC-fehlerhafter Header, Trunkierung, Anhang und abweichende Nutzdaten werden
+im vorhandenen Hostpfad abgewiesen. Neue permanente Gatefamilien entstehen
+nicht; RM-/NVKMS-Objekte werden weiterhin nicht in NVIDIA.R4D installiert.

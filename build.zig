@@ -64,5 +64,5 @@ pub fn build(b: *std.Build) void {
     rm_build.addFileArg(b.path("Tools/BuildRm.ps1"));
     rm_build.addArgs(&.{ "-Compiler", b.graph.zig_exe });
     if (b.args) |args| rm_build.addArgs(args);
-    b.step("build-rm", "Build original RM/NVKMS sources: -- -SourceDirectory PATH -ScratchDirectory Temp/PATH [-Jobs 4]").dependOn(&rm_build.step);
+    b.step("build-rm", "Build original RM/NVKMS sources and shaders: -- -SourceDirectory PATH -ScratchDirectory Temp/PATH [-Jobs 4] [-XzPath PATH]").dependOn(&rm_build.step);
 }

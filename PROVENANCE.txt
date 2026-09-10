@@ -70,3 +70,21 @@ libspdm_*.c; those files are references, not linked OS implementations.
 This source-only build does not establish a full link, functioning OS adapter,
 GSP authentication or hardware admission. Its outputs list unresolved symbols
 and preserve the distinction between partial-object and loaded relocations.
+
+The source-only build now also embeds the eight original NVKMS shader files
+from src/nvidia-modeset/src/shaders/g_*_shaders. Their source revision and
+input hashes remain covered by Tools/Rm/Sources.json. The source Makefile's
+COMPRESS_SHADERS list selects the families. Its XZ -ce -C none flags determine
+the format; an explicit single thread and removed XZ option environment avoid
+host-dependent defaults. Generated g_*_shader_info.h ProgramHeapSize fields
+must match the original file extents. No shader opcode or metadata is edited.
+
+Verification compiles the original src/common/unix/xzminidec/src/
+xz_crc32.c, xz_dec_lzma2.c and xz_dec_stream.c with NVKMS's decoder defines
+and src/common/unix/nvidia-3d/include/nv_xz_mem_hooks.h. The original
+nvidia-3d/interface/nvidia-3d-imports.h declares the host memory hooks;
+the R4OS verifier implements them with actual host malloc/free/memory calls.
+The comparison to nvidia-3d/src/nvidia-3d-fermi.c preserves XZ_SINGLE and
+checks full input/output consumption and exact decoded bytes additionally.
+The same release's nvidia-3d-init.c defines the sixteen expected boundary
+symbols. The resulting readonly objects are partial-link inputs only.

@@ -36,3 +36,13 @@ in NVIDIA.R4D by this step, and none is vendored into this repository.
 The scripts and digest metadata are original R4OS work. A future redistribution
 of the compiled objects must carry the corresponding original notices and
 third-party terms; a successful source-only build grants no new license.
+
+That private build now also contains the original eight shader payloads,
+their XZ containers and readonly object wrappers. The shader files remain
+covered by the source package's original `COPYING` and matching metadata.
+No shader payload is vendored here or installed in NVIDIA.R4D by this step.
+The host verifier links the source package's XZ Embedded decoder, whose files
+state public-domain terms and credit Lasse Collin and Igor Pavlov, with the
+original MIT-noticed NVIDIA memory-hook headers. Its full original sources
+and notices remain in the verified scratch snapshot. XZ Utils is an external
+host prerequisite and is not redistributed by this driver repository.

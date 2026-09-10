@@ -9,27 +9,11 @@ Set-StrictMode -Version Latest
 $sourceRoot=[IO.Path]::GetFullPath($SourceDirectory)
 $outputRoot=[IO.Path]::GetFullPath($OutputDirectory)
 $zig=[IO.Path]::GetFullPath($Compiler)
-function Invoke-Compiler([string[]]$Arguments,[string]$LogPath){
-    $start=[Diagnostics.ProcessStartInfo]::new($zig)
-    $start.UseShellExecute=$false;$start.RedirectStandardOutput=$true;$start.RedirectStandardError=$true
-    $start.WorkingDirectory=$outputRoot
-    foreach($name in @('CPATH','C_INCLUDE_PATH','CPLUS_INCLUDE_PATH','OBJC_INCLUDE_PATH','LIBRARY_PATH')){$null=$start.Environment.Remove($name)}
-    foreach($argument in $Arguments){$start.ArgumentList.Add($argument)}
-    $process=[Diagnostics.Process]::Start($start)
-    $stdout=$process.StandardOutput.ReadToEndAsync();$stderr=$process.StandardError.ReadToEndAsync()
-    try {
-        $timedOut=!$process.WaitForExit(600000)
-        if($timedOut){$process.Kill($true);$process.WaitForExit()}
-        [IO.File]::WriteAllText($LogPath,$stdout.GetAwaiter().GetResult()+$stderr.GetAwaiter().GetResult(),[Text.UTF8Encoding]::new($false))
-        if($timedOut){throw 'RM link compiler exceeded ten minutes'}
-        return $process.ExitCode
-    } finally {
-        if(!$process.HasExited){$process.Kill($true);$process.WaitForExit()}
-        $process.Dispose()
-    }
-}
+. (Join-Path $PSScriptRoot 'Native.ps1')
 $plan=Get-Content -Raw -LiteralPath (Join-Path $outputRoot 'compile-plan.json')|ConvertFrom-Json
 $results=Get-Content -Raw -LiteralPath (Join-Path $outputRoot 'compile-results.json')|ConvertFrom-Json
+$shaders=Get-Content -Raw -LiteralPath (Join-Path $outputRoot 'shader-results.json')|ConvertFrom-Json
+if($shaders.schema -ne 1 -or $shaders.families -ne 8 -or $shaders.payloads.Count -ne 8 -or $shaders.gpu_executed){throw 'Complete verified shader payloads are required'}
 if($results.completed -ne $plan.translation_units.Count -or $results.failed -ne 0 -or $results.not_executed -ne 0){throw 'Compilation must complete before link audit'}
 $byId=[Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
 foreach($result in $results.results){$byId.Add($result.id,$result)}
@@ -48,9 +32,15 @@ foreach($component in $plan.components) {
     [IO.File]::WriteAllText($generated,$text,[Text.UTF8Encoding]::new($false))
     $idObject=Join-Path $outputRoot ($unit+'-id.o')
     $flags=@($component.flags)+@('-std=gnu11')
-    $idCode=Invoke-Compiler (@('cc')+$flags+@('-c',$generated,'-o',$idObject)) (Join-Path $outputRoot ($unit+'-id.log'))
+    $idCode=Invoke-RmNative -Executable $zig -Arguments (@('cc')+$flags+@('-c',$generated,'-o',$idObject)) -WorkingDirectory $outputRoot -LogPath (Join-Path $outputRoot ($unit+'-id.log'))
     if($idCode -ne 0){throw "ID compilation failed $unit"}
     $objects+=$idObject
+    if($unit -eq 'nvidia-modeset'){
+        foreach($payload in $shaders.payloads){
+            if(!$payload.upstream_decoder_verified -or !$payload.exact_metadata_extent_verified -or !$payload.readonly_data -or $payload.symbols.Count -ne 2 -or (Get-FileHash -LiteralPath $payload.object).Hash.ToLowerInvariant() -cne $payload.object_sha256){throw 'Shader object changed after verification'}
+            $objects+=$payload.object
+        }
+    }
     $response=Join-Path $outputRoot ($unit+'-objects.rsp')
     $quoted=@($objects|ForEach-Object {'"'+$_.Replace('\','/').Replace('"','\"')+'"'})
     [IO.File]::WriteAllLines($response,$quoted,[Text.UTF8Encoding]::new($false))
@@ -65,8 +55,8 @@ foreach($component in $plan.components) {
         }
     }
     $arguments+=@(('@'+$response),'-o',$output)
-    $code=Invoke-Compiler $arguments (Join-Path $outputRoot ($unit+'-link.log'))
-    $record=[ordered]@{component=$unit;exit_code=$code;input_objects=$objects.Count;generated_id=$idSymbol;partial_link=$true;runtime_complete=$false;shader_payloads_added=$false;os_adapter_added=$false}
+    $code=Invoke-RmNative -Executable $zig -Arguments $arguments -WorkingDirectory $outputRoot -LogPath (Join-Path $outputRoot ($unit+'-link.log'))
+    $record=[ordered]@{component=$unit;exit_code=$code;input_objects=$objects.Count;generated_id=$idSymbol;partial_link=$true;runtime_complete=$false;shader_payloads_added=($unit -eq 'nvidia-modeset');os_adapter_added=$false}
     if($code -eq 0){$record.bytes=(Get-Item -LiteralPath $output).Length;$record.sha256=(Get-FileHash -LiteralPath $output).Hash.ToLowerInvariant()}
     $proof+=$record
     Write-Host "$unit partial link: exit=$code"

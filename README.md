@@ -40,7 +40,7 @@ lists into two **incomplete relocatable objects** and reports their unresolved
 symbols, TLS, initializers and allocated relocations. It does not install a
 driver or execute GPU code:
 
-    ./Build.sh build-rm -- -SourceDirectory ORIGINAL_SOURCE_TREE -ScratchDirectory WORKSPACE/Temp/nvidia-rm [-Jobs 4]
+    ./Build.sh build-rm -- -SourceDirectory ORIGINAL_SOURCE_TREE -ScratchDirectory WORKSPACE/Temp/nvidia-rm [-Jobs 4] [-XzPath XZ_EXECUTABLE]
 
 Use absolute paths. Supply the extracted 570.144 source revision named by
 `src/firmware-lock.json`. `Tools/Rm/Sources.json` pins all 3,156 source, header,
@@ -51,6 +51,10 @@ gets a fresh directory below scratch, retaining its source notices and logs.
 The compiler comes from the normal SDK build graph. PowerShell 7 provides the
 same orchestration on both hosts; no vendor build scripts or Linux OS emulation
 are involved. Execution on a Windows host still requires verification.
+The shader step requires XZ Utils, already included in the Debian DevKit host
+prerequisites. It resolves `xz` from PATH, or accepts an explicit absolute
+`-XzPath` on either host, including a Windows `xz.exe`. It never downloads a
+compressor or executes a GPU program.
 
 The only temporary source adaptation adds `NV_R4OS` to the version-string
 header's OS guard, preserving its original notice. Component include order,
@@ -59,9 +63,21 @@ freestanding target flags replace the Linux kernel code model. Explicit `-g0`
 avoids implicit compiler debug metadata; source path remapping removes scratch
 paths from code and data. The RM partial link uses the original export roots
 and linker script. This is not the final loader-compatible link: OS callbacks,
-SPDM crypto, compressed shader payloads, duplicate/global symbol handling and
+SPDM crypto, duplicate/global symbol handling and
 the R4OS runtime integration remain open. Details and evidence are recorded in
 the workspace's `Docs/Drivers/GrafikFirmware07910.txt/.json`.
+
+The eight original NVKMS shader payloads are now compressed with the upstream
+XZ settings (`--extreme --check=none`, one thread), decoded with the original
+NVIDIA XZ Embedded code, and compared byte-for-byte with the pinned originals.
+The generated `ProgramHeapSize` metadata must match exactly. Binary streams
+preserve every byte on both hosts; subprocess deadlines cover a blocked input
+pipe as well as normal execution. Readonly ELF objects provide the original
+sixteen start/end symbols and are linked into the NVKMS partial object.
+`shader-results.json` records input, metadata, compressor and object hashes.
+The verifier uses real host memory functions for the original allocation/copy
+hooks; it is not an R4OS driver runtime or a GPU execution test. Shader bytes
+and compiled objects stay in the private source-build tree.
 
 The optional last inspector argument is the expected hexadecimal PCI device
 ID. The inspector reads at most 1 MB (1024 KB), writes JSON only on success,
