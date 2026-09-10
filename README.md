@@ -1,9 +1,10 @@
 ﻿# NVIDIA.R4D
 
-Passive NVIDIA display driver for R4OS. Module 0.1.11; original R4OS code is
+Passive NVIDIA display driver for R4OS. Module 0.1.14; original R4OS code is
 Apache-2.0, with selected original MIT headers and separately licensed firmware.
-hardware acceptance for roadmap 0.79.9 is open and offline preparation for
-0.79.10 has started. This owner inventories NVIDIA display functions once through
+Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
+subsystem 1458:4074, VBIOS 94.06.2f.00.d6. Preparation for 0.79.10 continues.
+This owner inventories NVIDIA display functions once through
 the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
@@ -16,18 +17,32 @@ The sole bootstrap PCI entry, 10de:2504, permits three reads from two PMC boot
 identity words under the real DriverApi owner when memory decode and power
 state permit it. The 4 KB mapping is a minimum published identity-register
 aperture, never a claimed measurement of the whole BAR. Only an actual GA106
-identity selects `ga106-identity-only`; that profile admits no native writes.
+identity selects `ga106-passive`; that profile admits no native writes.
 Unknown PCI IDs are inventoried without MMIO. Failed or inconsistent identity
 reads cannot authorize engine initialization.
 
-VBIOS transport on real hardware remains unimplemented. PROM shadow selection
-and PRAMIN remapping involve writes and are not advertised as passive reads.
-The independent bounded ROM/BIT/DCB parser handles supplied immutable images,
+When the actual GA106 and current ReBAR extent cover the published PROM
+aperture, the owner reads the one-MB range twice into resident CPU memory.
+Both copies must match within a bounded deadline. It never changes PCI ROM
+shadowing or a PRAMIN window. Unknown identities and unmeasured bounds cannot
+reach this path. IFR 1/2/3 envelopes and bounded NVIDIA private subimages are
+interpreted before the immutable ROM/BIT/DCB parser. The parser
 checks lengths, supported versions and initialization/BIT checksums, and
 resolves DCB 4.0/4.1 routes through CCB 4.1 and connector 3.0/4.0 tables.
+Transport/parse failures preserve the boot framebuffer; failed cleanup retains
+the exact mapping/allocation until shutdown can release it. Display generation
+is explicitly mapped from measured GA106 to the pinned GA102 display reference;
+this is not a query of running display-engine classes or a modeset capability.
 Unsupported forms fail explicitly; parsing does not establish authenticity,
 board compatibility, connected receivers, native display capabilities or
 hardware acceptance. No BIOS code is executed.
+
+Executable x86/EFI images must match the expected PCI device. Private e0
+images with NV/NPDS or NV/RGIS envelopes retain their NVIDIA vendor check;
+their container device field is not used as the board's PCI identity.
+Rejected ROMs produce bounded, explicitly unvalidated header records from
+the CPU copy (at most 4 KB per adapter), without additional MMIO or partial
+topology publication.
 
 Use `Build.bat` (Windows) or `./Build.sh` (Linux), with the same arguments:
 

@@ -20,10 +20,13 @@ pub const Port = struct {
 };
 pub const Result = struct {
     image_count: u8 = 0,
+    rom_bytes: u32 = 0,
     image_offset: u32 = 0,
     image_bytes: u32 = 0,
     // This is only the x86 initialization checksum range, not authentication.
     checksum_bytes: u32 = 0,
+    pci_extension_offset: u32 = 0,
+    pci_extension_bytes: u16 = 0,
     pci_device: u16 = 0,
     bit_offset: u16 = 0,
     bit_entries: u8 = 0,
@@ -36,6 +39,32 @@ pub const Result = struct {
     ports: [max_ports]Port = .{Port{}} ** max_ports,
 };
 
+pub const PromStart = struct { offset: u32, ifr_version: u8 };
+/// Pure interpretation of the pinned NVIDIA IFR envelope. Inputs are already
+/// CPU copies; offsets never authorize reads outside the one-MB PROM aperture.
+pub fn promStart(bytes: []const u8) Error!PromStart {
+    if (bytes.len == 0 or bytes.len > max_rom_bytes) return error.Limit;
+    const header = try span(bytes, 0, 12);
+    if (u16le(header, 0) == 0xaa55) return .{ .offset = 0, .ifr_version = 0 };
+    if (u32le(header, 0) != 0x4947564e) return error.Signature;
+    const fixed1 = u32le(header, 4);
+    const version: u8 = @truncate(fixed1 >> 8);
+    const offset = switch (version) {
+        1, 2 => u32le(try span(bytes, ((fixed1 >> 16) & 0x7fff) + 4, 4), 0),
+        3 => blk: {
+            const size = u32le(header, 8) & 0xfffff;
+            const status = u32le(try span(bytes, size, 4), 0);
+            const directory = try span(bytes, @as(u64, status) + 4096, 12);
+            if (u32le(directory, 0) != 0x44524652) return error.Signature;
+            break :blk u32le(directory, 8);
+        },
+        else => return error.Version,
+    };
+    if (offset < 12 or offset & 3 != 0) return error.Bounds;
+    if (u16le(try span(bytes, offset, 0x1a), 0) != 0xaa55) return error.Signature;
+    return .{ .offset = offset, .ifr_version = version };
+}
+
 /// No allocation, I/O, firmware execution or global publication. On failure the
 /// caller receives an error, never a partially valid topology. All pointers
 /// are relative to the selected x86 image, not arbitrary physical addresses.
@@ -47,24 +76,55 @@ pub fn parse(rom: []const u8, expected_device: ?u16) Error!Result {
     while (true) {
         if (result.image_count == 16) return error.Limit;
         const head = try span(rom, cursor, 0x1a);
-        if (u16le(head, 0) != 0xaa55) return error.Signature;
+        const signature = u16le(head, 0);
+        if (signature != 0xaa55 and signature != 0x4e56 and signature != 0xbb77) return error.Signature;
         const pcir: usize = u16le(head, 0x18);
         if (pcir < 0x1c or pcir & 3 != 0) return error.Bounds;
         const pci = try span(rom, cursor + pcir, 0x18);
-        if (!std.mem.eql(u8, pci[0..4], "PCIR")) return error.Signature;
+        if (!std.mem.eql(u8, pci[0..4], "PCIR") and !std.mem.eql(u8, pci[0..4], "NPDS") and !std.mem.eql(u8, pci[0..4], "RGIS")) return error.Signature;
         const revision = pci[0x0c];
         if (revision != 0 and revision != 3) return error.Version;
         const pci_bytes: usize = u16le(pci, 0x0a);
         if (pci_bytes < (if (revision == 3) @as(usize, 0x1c) else 0x18)) return error.Bounds;
-        const image_bytes = @as(usize, u16le(pci, 0x10)) * 512;
+        var image_bytes = @as(usize, u16le(pci, 0x10)) * 512;
         if (image_bytes == 0) return error.Bounds;
+        var last = pci[0x15] & 0x80 != 0;
+        var extension_bytes: u16 = 0;
+        // NVIDIA's extension describes private subimages inside the standard
+        // PCI image length. The pinned RM parser walks this same envelope.
+        // Only documented revisions are accepted; it never skips a checksum.
+        const extension_offset = (pcir + pci_bytes + 15) & ~@as(usize, 15);
+        if (extension_offset + 4 <= image_bytes) {
+            const extension_sig = u32le(try span(rom, cursor + extension_offset, 4), 0);
+            if (extension_sig == 0x4544504e) {
+                const extension = try span(rom, cursor + extension_offset, 10);
+                const version = u16le(extension, 4);
+                if (version != 0x100 and version != 0x101) return error.Version;
+                const length = u16le(extension, 6);
+                if (length < 10 or extension_offset + length > image_bytes) return error.Bounds;
+                const whole_extension = try span(rom, cursor + extension_offset, length);
+                extension_bytes = length;
+                const subimage_bytes = @as(usize, u16le(extension, 8)) * 512;
+                if (subimage_bytes == 0 or subimage_bytes > image_bytes or extension_offset + length > subimage_bytes) return error.Bounds;
+                if (length > 10) last = whole_extension[10] & 0x80 != 0 else if (subimage_bytes < image_bytes) last = false;
+                image_bytes = subimage_bytes;
+            }
+        }
         const image = try span(rom, cursor, image_bytes);
         _ = try span(image, pcir, pci_bytes);
         if (u16le(pci, 4) != 0x10de) return error.Identity;
-        if (expected_device) |device| {
-            if (u16le(pci, 6) != device and !try deviceListContains(image, pcir, revision, device)) return error.Identity;
+        // RM's VBIOS_EXT (e0) images have private NV/NPDS or NV/RGIS
+        // envelopes, not executable PCI option ROMs. Their device field is
+        // container metadata (2200 on the measured GA106), not the board's
+        // PCI device. Never use it to admit an x86/EFI image or execute code.
+        const private_data = pci[0x14] == 0xe0 and signature != 0xaa55 and !std.mem.eql(u8, pci[0..4], "PCIR");
+        if (!private_data) {
+            if (expected_device) |device| {
+                if (u16le(pci, 6) != device and !try deviceListContains(image, pcir, revision, device)) return error.Identity;
+            }
         }
         if (pci[0x14] == 0) {
+            if (signature != 0xaa55) return error.Signature;
             if (selected != null) return error.Duplicate;
             const initialization = @as(usize, head[2]) * 512;
             if (initialization == 0) return error.Bounds;
@@ -73,17 +133,21 @@ pub fn parse(rom: []const u8, expected_device: ?u16) Error!Result {
             result.image_offset = @intCast(cursor);
             result.image_bytes = @intCast(image.len);
             result.checksum_bytes = @intCast(initialization);
+            result.pci_extension_offset = if (extension_bytes != 0) @intCast(extension_offset) else 0;
+            result.pci_extension_bytes = extension_bytes;
             result.pci_device = u16le(pci, 6);
         } else if (pci[0x14] == 3) {
+            if (signature != 0xaa55) return error.Signature;
             if (u32le(image, 4) != 0x00000ef1) return error.Signature;
             const initialization = @as(usize, u16le(image, 2)) * 512;
             if (initialization == 0) return error.Bounds;
             _ = try span(image, 0, initialization);
-        } else return error.Unsupported;
+        } else if (pci[0x14] != 0xe0) return error.Unsupported;
         result.image_count += 1;
         cursor += image.len;
-        if (pci[0x15] & 0x80 != 0) break;
+        if (last) break;
     }
+    result.rom_bytes = @intCast(cursor);
     const image = selected orelse return error.Missing;
     var ranges: Ranges = .{};
     const header = try span(image, 0, 0x38);
@@ -91,6 +155,7 @@ pub fn parse(rom: []const u8, expected_device: ?u16) Error!Result {
     try ranges.add(0x36, 2);
     const pcir = u16le(header, 0x18);
     try ranges.add(pcir, u16le(image, pcir + 0x0a));
+    if (result.pci_extension_bytes != 0) try ranges.add(result.pci_extension_offset, result.pci_extension_bytes);
     try parseBit(image, &ranges, &result);
     try parseDcb(image, &ranges, &result);
     return result;
@@ -178,7 +243,7 @@ fn parseDcb(image: []const u8, ranges: *Ranges, result: *Result) Error!void {
     result.dcb_version = header[0];
     const ccb_offset = u16le(header, 4);
     const connector_offset = u16le(header, 0x14);
-    const ccb: ?SmallTable = if (ccb_offset == 0) null else try smallTable(image, ccb_offset, 5, 4, ranges);
+    const ccb: ?SmallTable = if (ccb_offset == 0) null else try smallTable(image, ccb_offset, 6, 4, ranges);
     const connectors: ?SmallTable = if (connector_offset == 0) null else try smallTable(image, connector_offset, 4, 2, ranges);
     if (ccb) |value| {
         if (value.version != 0x41) return error.Version;
@@ -228,7 +293,8 @@ fn parseDcb(image: []const u8, ranges: *Ranges, result: *Result) Error!void {
 
 const Ranges = struct {
     const Range = struct { start: usize = 0, end: usize = 0 };
-    values: [8]Range = .{Range{}} ** 8,
+    // Header, DCB pointer, PCI, optional NPDE, BIT header/data and DCB/CCB/connector.
+    values: [9]Range = .{Range{}} ** 9,
     count: usize = 0,
     fn add(self: *Ranges, start: usize, length: usize) Error!void {
         if (self.count == self.values.len) return error.Limit;

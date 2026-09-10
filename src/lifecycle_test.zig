@@ -8,6 +8,10 @@ const firmware = @import("firmware.zig");
 const cpu_provider = @import("rm_heap.zig");
 const clock_provider = @import("rm_clock.zig");
 const sem_provider = @import("rm_semaphore.zig");
+const vbios = @import("vbios.zig");
+const vbios_probe = @import("vbios_probe.zig");
+const fixtures = @import("tests.zig");
+var prom_bytes: [vbios.max_rom_bytes]u8 align(16) = .{0} ** vbios.max_rom_bytes;
 
 const SemFixture = struct {
     live: bool = false,
@@ -230,7 +234,7 @@ fn cpuAllocate(bytes: u64, alignment: u32, output: *a.DriverHeapAllocation) call
     cpu_requested = bytes;
     output.* = .{};
     if (cpu_closed) return a.driver_heap_error_closed;
-    if (bytes > 8192) return a.driver_heap_error_memory;
+    if (bytes > (if (state.rom_fixture) @as(u64, vbios.max_rom_bytes) else 8192)) return a.driver_heap_error_memory;
     std.debug.assert(cpu_backing == null);
     const backing = t.allocator.alignedAlloc(u8, .@"16", @intCast(bytes)) catch return a.driver_heap_error_memory;
     cpu_backing = backing;
@@ -294,6 +298,15 @@ test "NVIDIA actual driver lifecycle bridges resident CPU memory and retains fai
 const State = struct {
     present: bool = true,
     clock_fixture: bool = false,
+    rom_fixture: bool = false,
+    rom_reported: bool = false,
+    full_rom_record: bool = false,
+    prom_mapping: bool = false,
+    prom_seen: bool = false,
+    fail_prom_map: bool = false,
+    fail_prom_unmap: bool = false,
+    fail_prom_collect: bool = false,
+    deadline_prom: bool = false,
     device_id: u16 = 0x2504,
     enumerate_count: usize = 0,
     detail_count: usize = 0,
@@ -343,12 +356,20 @@ fn apiTable() a.DriverApi {
 fn log(text: [*:0]const u8) callconv(.c) void {
     if (std.mem.indexOf(u8, std.mem.span(text), "chip=GA106") != null) state.chip_reported = true;
     if (std.mem.indexOf(u8, std.mem.span(text), "lock=verified") != null) state.lock_verified = true;
+    if (std.mem.indexOf(u8, std.mem.span(text), "vbios: verified source=PROM") != null) state.rom_reported = true;
+    const value = std.mem.span(text);
+    const marker = "bytes=64 hex=";
+    if (std.mem.indexOf(u8, value, marker)) |index| {
+        std.debug.assert(value[index + marker.len ..].len == 128);
+        state.full_rom_record = true;
+    }
 }
 fn resources(output: *a.DriverResourceApi) callconv(.c) i32 {
     output.* = .{ .stat = @intFromPtr(&resourceStat), .read_at = @intFromPtr(&resourceRead), .now_ns = @intFromPtr(&resourceNow) };
     return 0;
 }
 fn resourceNow() callconv(.c) u64 {
+    if (state.prom_mapping and state.deadline_prom) return 11 * std.time.ns_per_s;
     if (state.clock_fixture) return clock_value.instant_ns;
     return 100;
 }
@@ -421,10 +442,15 @@ fn config(kind: u8, bus: u8, device: u8, function: u8, offset: u16) callconv(.c)
     std.debug.assert(kind == 2 and bus == 9 and device == 0 and function == 0);
     return switch (offset) {
         0 => @as(u32, state.device_id) << 16 | 0x10de,
-        4 => 2,
+        4 => if (state.rom_fixture) 0x100002 else 2,
         8 => 0x030000a1,
         0x10 => 0xe0000000,
         0x2c => 0x12341458,
+        0x34 => if (state.rom_fixture) 0x40 else 0,
+        0x40 => if (state.rom_fixture) 0x10 else 0,
+        0x100 => if (state.rom_fixture) 0x10015 else 0,
+        0x104 => if (state.rom_fixture) 1 << 8 else 0,
+        0x108 => if (state.rom_fixture) (4 << 8) | (1 << 5) else 0,
         else => 0,
     };
 }
@@ -434,6 +460,21 @@ fn memory(output: *a.GfxDriverMemoryApi) callconv(.c) i32 {
     return a.gfx_buffer_result_ok;
 }
 fn map(request: *const a.GfxMmioRequest, output: *a.GfxMmioWindow) callconv(.c) i32 {
+    if (request.byte_offset == vbios_probe.prom_offset) {
+        std.debug.assert(state.rom_fixture and !state.mapping and !state.prom_mapping and
+            request.resource_base == 0xe0000000 and request.resource_bytes == 16 * 1024 * 1024 and
+            request.byte_length == vbios.max_rom_bytes and request.cache_policy == a.gfx_buffer_cache_uncached);
+        state.maps += 1;
+        state.prom_seen = true;
+        output.* = .{};
+        if (state.fail_prom_map) {
+            state.private_mapping = true;
+            return -1;
+        }
+        state.prom_mapping = true;
+        output.* = .{ .handle = .{ .id = 2, .generation = 11 }, .cpu_address = @intFromPtr(&prom_bytes), .physical_address = request.resource_base + request.byte_offset, .byte_length = request.byte_length, .cache_policy = request.cache_policy };
+        return a.gfx_buffer_result_ok;
+    }
     std.debug.assert(request.resource_base == 0xe0000000 and request.resource_bytes == 4096 and request.byte_length == 4096 and request.cache_policy == a.gfx_buffer_cache_uncached);
     state.maps += 1;
     output.* = .{};
@@ -447,6 +488,13 @@ fn map(request: *const a.GfxMmioRequest, output: *a.GfxMmioWindow) callconv(.c) 
     return a.gfx_buffer_result_ok;
 }
 fn unmap(handle: *const a.GfxBufferHandle, quiesced: u32) callconv(.c) i32 {
+    if (handle.id == 2) {
+        std.debug.assert(handle.generation == 11 and quiesced == 1 and state.prom_mapping);
+        state.unmaps += 1;
+        if (state.fail_prom_unmap) return -1;
+        state.prom_mapping = false;
+        return a.gfx_buffer_result_ok;
+    }
     std.debug.assert(handle.id == 1 and handle.generation == 11 and quiesced == 1 and state.mapping);
     state.unmaps += 1;
     if (state.fail_unmap) return -1;
@@ -455,9 +503,71 @@ fn unmap(handle: *const a.GfxBufferHandle, quiesced: u32) callconv(.c) i32 {
 }
 fn collect() callconv(.c) i32 {
     state.collects += 1;
-    if (state.fail_collect) return -1;
+    if (state.fail_collect or (state.prom_seen and state.fail_prom_collect)) return -1;
     state.private_mapping = false;
     return a.gfx_buffer_result_ok;
+}
+
+test "NVIDIA actual driver lifecycle reads bounded PROM and retains each failed cleanup owner" {
+    var api = apiTable();
+    api.version = 31;
+    api.heap_query = cpuQuery;
+    const rom = fixtures.fixture();
+    for (0..8) |fault| {
+        state = .{ .rom_fixture = true };
+        defer {
+            state.fail_prom_unmap = false;
+            state.fail_prom_collect = false;
+            cpu_fail_release = false;
+            cpu_closed = false;
+            _ = driver.nvidia_shutdown();
+        }
+        cpu_closed = false;
+        cpu_fail_release = false;
+        @memset(&prom_bytes, 0);
+        @memcpy(prom_bytes[0..rom.len], &rom);
+        switch (fault) {
+            0 => {},
+            1 => {
+                prom_bytes[0x200] ^= 1;
+                prom_bytes[0x102] = 8; // Exercise a full 64-byte diagnostic record.
+            },
+            2 => cpu_closed = true,
+            3 => state.fail_prom_map = true,
+            4 => state.fail_prom_unmap = true,
+            5 => state.fail_prom_collect = true,
+            6 => cpu_fail_release = true,
+            7 => state.deadline_prom = true,
+            else => unreachable,
+        }
+        const result = driver.nvidia_init(&api);
+        try t.expectEqual(@as(i32, if (fault == 0) 0 else -10), result);
+        try t.expectEqual(fault == 0 or (fault >= 4 and fault <= 6), state.rom_reported);
+        if (fault == 1) try t.expect(state.full_rom_record);
+        try t.expect(!state.mapping);
+        if (fault >= 4 and fault <= 6) {
+            try t.expect(cpu_backing != null);
+            try t.expectEqual(@as(i32, -1), driver.nvidia_shutdown());
+            try t.expectEqual(@as(i32, -1), driver.nvidia_init(&api));
+        }
+        state.fail_prom_unmap = false;
+        state.fail_prom_collect = false;
+        cpu_fail_release = false;
+        try t.expectEqual(@as(i32, 0), driver.nvidia_shutdown());
+        try t.expectEqual(@as(i32, 0), driver.nvidia_shutdown());
+        try t.expect(!state.mapping and !state.prom_mapping and !state.private_mapping and cpu_backing == null);
+        try t.expectEqual(@as(usize, if (fault == 2) 1 else 2), state.maps);
+    }
+    cpu_closed = false;
+    // Actual non-GA106 words must never reach the PROM map or allocation,
+    // even when a device advertises adequate ReBAR extents.
+    state = .{ .rom_fixture = true };
+    state.words[0] = 0x172000a1;
+    const before = cpu_calls;
+    try t.expectEqual(@as(i32, 0), driver.nvidia_init(&api));
+    try t.expectEqual(@as(usize, 1), state.maps);
+    try t.expect(!state.rom_reported and cpu_calls == before);
+    try t.expectEqual(@as(i32, 0), driver.nvidia_shutdown());
 }
 
 test "NVIDIA actual driver lifecycle rejects writes and retains failed mappings through shutdown" {

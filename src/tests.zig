@@ -6,6 +6,91 @@ comptime {
     _ = @import("wait_policy.zig");
 }
 
+test "PROM IFR versions and private ROM subimages stay within the supplied aperture" {
+    const rom = fixture();
+    var bytes: [8192]u8 = .{0} ** 8192;
+    @memcpy(bytes[512..][0..rom.len], &rom);
+    put32(&bytes, 0, 0x4947564e);
+    for ([_]u8{ 1, 2 }) |version| {
+        put32(&bytes, 4, (@as(u32, 16) << 16) | (@as(u32, version) << 8));
+        put32(&bytes, 20, 512);
+        const start = try vbios.promStart(&bytes);
+        try t.expectEqual(@as(u32, 512), start.offset);
+        try t.expectEqual(version, start.ifr_version);
+        try t.expectEqual(@as(u8, 2), (try vbios.parse(bytes[start.offset..], 0x2504)).port_count);
+    }
+    put32(&bytes, 4, 3 << 8);
+    put32(&bytes, 8, 32);
+    put32(&bytes, 32, 0);
+    put32(&bytes, 4096, 0x44524652);
+    put32(&bytes, 4104, 512);
+    try t.expectEqual(@as(u32, 512), (try vbios.promStart(&bytes)).offset);
+    put32(&bytes, 32, 0xffffffff);
+    try t.expectError(error.Bounds, vbios.promStart(&bytes));
+    put32(&bytes, 4, 4 << 8);
+    try t.expectError(error.Version, vbios.promStart(&bytes));
+    put32(&bytes, 4, (16 << 16) | (1 << 8));
+    for ([_]u32{ 0, 511, 0xfffffffc, bytes.len }) |offset| {
+        put32(&bytes, 20, offset);
+        try t.expectError(error.Bounds, vbios.promStart(&bytes));
+    }
+    try t.expectEqual(@as(u32, 0), (try vbios.promStart(&rom)).offset);
+    // A standard aggregate length encloses one x86 and one opaque vendor
+    // extension. The latter is bounded but never treated as executable code.
+    var chain: [2048]u8 = .{0} ** 2048;
+    @memcpy(chain[0..rom.len], &rom);
+    put16(&chain, 0x50, 4);
+    @memcpy(chain[0x60..0x64], "NPDE");
+    put16(&chain, 0x64, 0x100);
+    put16(&chain, 0x66, 12);
+    put16(&chain, 0x68, 2);
+    chain[0x6a] = 0;
+    checksum(chain[0..1024], 1023);
+    const second = chain[1024..];
+    put16(second, 0, 0x4e56);
+    put16(second, 0x18, 0x40);
+    @memcpy(second[0x40..0x44], "NPDS");
+    put16(second, 0x44, 0x10de);
+    put16(second, 0x46, 0x2200); // Private container ID observed on GA106.
+    put16(second, 0x4a, 0x18);
+    put16(second, 0x50, 2);
+    second[0x54] = 0xe0;
+    second[0x55] = 0x80;
+    const result = try vbios.parse(&chain, 0x2504);
+    try t.expectEqual(@as(u8, 2), result.image_count);
+    try t.expectEqual(@as(u32, 2048), result.rom_bytes);
+    try t.expectEqual(@as(u32, 1024), result.image_bytes);
+    try t.expectEqual(@as(u8, 2), result.port_count);
+    try t.expectEqual(@as(u16, 0x2504), result.pci_device);
+    // Private container metadata is not permission for another executable
+    // board identity, another vendor, or a disguised standard PCI ROM.
+    for ([_]u8{ 0, 3 }) |code| {
+        second[0x54] = code;
+        try t.expectError(error.Identity, vbios.parse(&chain, 0x2504));
+    }
+    second[0x54] = 0xe0;
+    put16(second, 0x44, 0x1002);
+    try t.expectError(error.Identity, vbios.parse(&chain, 0x2504));
+    put16(second, 0x44, 0x10de);
+    put16(second, 0, 0xaa55);
+    try t.expectError(error.Identity, vbios.parse(&chain, 0x2504));
+    put16(second, 0, 0x4e56);
+    @memcpy(second[0x40..0x44], "PCIR");
+    try t.expectError(error.Identity, vbios.parse(&chain, 0x2504));
+    @memcpy(second[0x40..0x44], "NPDS");
+    try t.expectError(error.Identity, vbios.parse(&chain, 0x2200));
+    chain[1023] ^= 1;
+    try t.expectError(error.Checksum, vbios.parse(&chain, 0x2504));
+    chain[1023] ^= 1;
+    put16(&chain, 0x68, 0);
+    try t.expectError(error.Bounds, vbios.parse(&chain, 0x2504));
+    put16(&chain, 0x68, 5);
+    try t.expectError(error.Bounds, vbios.parse(&chain, 0x2504));
+    put16(&chain, 0x68, 2);
+    put16(&chain, 0x64, 0x102);
+    try t.expectError(error.Version, vbios.parse(&chain, 0x2504));
+}
+
 const device = pci.Pci{ .bus_kind = 2, .bus = 9, .vendor_id = 0x10de, .device_id = 0x2504, .class_code = 3 };
 const Config = struct {
     words: [1024]u32 = .{0} ** 1024,
@@ -155,12 +240,13 @@ pub fn fixture() [1024]u8 {
     put32(&rom, 0x11f, 0x02001216); // DP, CCB1, connector1, head1, OR1.
     put32(&rom, 0x127, 0x0000000e);
     rom[0x180] = 0x41;
-    rom[0x181] = 5;
+    rom[0x181] = 6;
     rom[0x182] = 2;
     rom[0x183] = 4;
     rom[0x184] = 0xff;
-    put32(&rom, 0x185, 3 | (31 << 5));
-    put32(&rom, 0x189, 31 | (2 << 5));
+    rom[0x185] = 0xff;
+    put32(&rom, 0x186, 3 | (31 << 5));
+    put32(&rom, 0x18a, 31 | (2 << 5));
     rom[0x1c0] = 0x40;
     rom[0x1c1] = 4;
     rom[0x1c2] = 2;
@@ -187,8 +273,25 @@ test "modern BIT DCB CCB and connector extraction keeps raw facts and null ports
     try t.expectEqualSlices(u8, &before, &rom);
     try t.expectError(error.Identity, vbios.parse(&rom, 0xbeef));
     try t.expectError(error.Limit, vbios.parse(rom[0..0], null));
-    for (1..rom.len) |length| try t.expectError(error.Bounds, vbios.parse(rom[0..length], null));
+    for (1..rom.len) |length| {
+        try t.expectError(error.Bounds, vbios.parse(rom[0..length], null));
+        var sink: DiagnosticSink = .{ .rom = rom[0..length] };
+        @import("vbios_diagnostic.zig").inspect(sink.rom, &sink);
+    }
+    var sink: DiagnosticSink = .{ .rom = &rom };
+    @import("vbios_diagnostic.zig").inspect(&rom, &sink);
+    try t.expect(sink.records >= 7);
 }
+
+const DiagnosticSink = struct {
+    rom: []const u8,
+    records: usize = 0,
+    pub fn record(self: *DiagnosticSink, _: []const u8, offset: usize, bytes: []const u8) void {
+        std.debug.assert(offset <= self.rom.len and bytes.len <= self.rom.len - offset);
+        std.debug.assert(std.mem.eql(u8, self.rom[offset..][0..bytes.len], bytes));
+        self.records += 1;
+    }
+};
 
 test "corrupt firmware lengths versions checksums and routing references are rejected" {
     const Case = struct { offset: usize, value: u8, failure: anyerror };
@@ -206,6 +309,7 @@ test "corrupt firmware lengths versions checksums and routing references are rej
         .{ .offset = 0x117, .value = 0x22, .failure = error.Reference },
         .{ .offset = 0x118, .value = 0x21, .failure = error.Reference },
         .{ .offset = 0x180, .value = 0x40, .failure = error.Version },
+        .{ .offset = 0x181, .value = 5, .failure = error.Limit },
         .{ .offset = 0x1c0, .value = 0x41, .failure = error.Version },
         .{ .offset = 0x114, .value = 0x80, .failure = error.Overlap },
     }) |case| {
@@ -214,6 +318,8 @@ test "corrupt firmware lengths versions checksums and routing references are rej
         checksum(rom[0x80..0x8c], 11);
         checksum(&rom, rom.len - 1);
         try t.expectError(case.failure, vbios.parse(&rom, null));
+        var sink: DiagnosticSink = .{ .rom = &rom };
+        @import("vbios_diagnostic.zig").inspect(&rom, &sink);
     }
     var rom = fixture();
     rom[0x8b] +%= 1;

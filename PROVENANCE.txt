@@ -178,3 +178,41 @@ ab2062ad5653913c39124548943b1177330e34c8, archived with its original notices
 under ExFiles/Reference/GFX/SysV-AMD64-ab2062ad. It copies no implementation.
 The independent full RM/NVKMS partial objects retain unresolved providers;
 their historical evidence is not relabeled as a combined native target.
+
+NVIDIA 0.1.12 physical PROM transport, 10.09.2026:
+vbios_probe.zig and the IFR/NPDE extensions in vbios.zig are original R4OS
+implementations. The pinned NVIDIA 570.144 source's
+src/nvidia/src/kernel/gpu/gsp/arch/turing/kernel_gsp_vbios_tu102.c defines
+the read-only PROM aperture, IFR versions and private image envelope.
+src/nvidia/generated/g_kernel_gsp_nvoc.c explicitly selects that extraction
+function for GA106; this is not inferred from the TU102 filename. The same
+pin's g_kernel_bif_nvoc.c selects the no-op ERoT grant path for GA106.
+Register/format facts also come from published/turing/tu102/dev_bus.h,
+dev_ext_devices.h and src/nvidia/inc/kernel/platform/pci_exp_table.h.
+No original implementation, additional header or firmware is imported.
+
+The existing Linux 7.2.4 reference, archived under Nvidia/Nouveau, maps
+nv176_chipset (GA106) to ga102_disp_new in nvkm/engine/device/base.c.
+nvkm/engine/disp/ga102.c and include/nvif/class.h describe GA102_DISP c670
+and its distinct c67d core channel. The diagnostic explicitly labels this
+as a source mapping of the measured chip, not a hardware class query.
+Only PMC identification and measured-range PROM reads are enabled. PBUS
+shadow writes, PRAMIN remapping, display/SOR/HDA registers, GSP, FIFO/MMU,
+interrupts and engine initialization remain outside this passive profile.
+The archived upstream files retain their original notices and source pin.
+
+NVIDIA 0.1.14 private image correction, 10.09.2026:
+Physical PROM reads on GA106/10de:2504 are byte-identical across two driver
+versions (full one-MB SHA256 7d6b868cf97d65bcedeeb2fd4e32b4fa2cb79a7d010504b5e353dc21362efb28).
+The x86 and EFI PCIR images both contain 10de:2504. Two following NV/NPDS
+e0 images contain 10de:2200. The pinned RM extraction source above defines
+NV_BCRT_HASH_INFO_BASE_CODE_TYPE_VBIOS_EXT=e0 and walks these private images
+without equating their metadata to the board's PCI device. R4OS keeps all
+envelope/length/vendor checks, interprets their bytes as opaque data and
+continues to require an exact device (or bounded standard device list) for
+executable PCI images. It neither executes nor authenticates private images.
+The bounded diagnostic and regression fixtures are original R4OS code.
+CCB 4.1's six-byte header follows the existing NVIDIA DCB-4.x specification;
+the prior five-byte synthetic fixture was corrected, not treated as hardware.
+The documented PGSP group 110000..113fff comes from the same RM pin's
+src/common/inc/swref/published/ampere/ga102/dev_gsp.h, without enabling access.

@@ -1,6 +1,8 @@
 const std = @import("std");
 const r4os = @import("r4os");
 const identity = @import("identity.zig");
+const vbios = @import("vbios.zig");
+const vbios_probe = @import("vbios_probe.zig");
 const firmware_resources = @import("firmware_resources.zig");
 const firmware = @import("firmware.zig");
 const firmware_storage = @import("firmware_storage.zig");
@@ -21,6 +23,7 @@ var window: a.GfxMmioWindow = .{};
 var mapping_cleanup_needed = false;
 var firmware_cpu: firmware_storage.Storage = .{};
 var checking_runtime = false;
+var board_rom: vbios_probe.Capture = .{};
 
 comptime {
     asm (r4os.r4dev.driverEntriesAsm("nvidia_init", "nvidia_shutdown"));
@@ -111,8 +114,11 @@ pub export fn nvidia_init(api: *const a.DriverApi) callconv(.c) i32 {
         log("NVIDIA irq line={d} pin={d} pm={x} msi={x} msix={x} pcie={x} rebar={x} power={d}", .{ snapshot.interrupt_line, snapshot.interrupt_pin, snapshot.caps.pm, snapshot.caps.msi, snapshot.caps.msix, snapshot.caps.pcie, snapshot.caps.rebar, if (snapshot.caps.power_state) |value| @as(u8, value) else @as(u8, 255) });
         const admission = identity.decision(&snapshot);
         log("NVIDIA admission={s} native-writes=disabled", .{@tagName(admission)});
-        if (admission == .identity_words_only and !readIdentity(&ctx, &snapshot)) return -5;
-        log("NVIDIA vbios=unavailable rom-base={x} rom-enabled={} reason=passive-transport-unproven board-name=unmeasured display-generation=unmeasured", .{ snapshot.rom_base, snapshot.rom_enabled });
+        var chip: ?identity.Chip = null;
+        if (admission == .identity_words_only and !readIdentity(&ctx, &snapshot, &chip)) return -5;
+        if (chip != null and vbios_probe.admitted(&snapshot, chip.?)) {
+            if (!readVbios(&ctx, &snapshot, chip.?)) return -10;
+        } else log("NVIDIA vbios=unavailable rom-base={x} rom-enabled={} reason=identity-or-range-unmeasured board-name=unmeasured display-generation=unmeasured", .{ snapshot.rom_base, snapshot.rom_enabled });
     }
     log("NVIDIA bind: passive devices={d} resources=0 native-writes=disabled fallback=preserved", .{count});
     return 0;
@@ -128,6 +134,7 @@ pub export fn nvidia_shutdown() callconv(.c) i32 {
     if (!thread_probe.shutdown(&ctx)) return -1;
     if (!runtime_probe.shutdown(&ctx)) return -1;
     if (!firmware_cpu.close()) return -1;
+    if (!board_rom.close()) return -1;
     if (!releaseWindow(&ctx)) return -1;
     if (checking_runtime) {
         ctx.logInfo("NVIDIA unbind: driver-state=closed cpu-owner-cleanup=pending native-writes=disabled fallback=preserved");
@@ -167,7 +174,7 @@ fn checkFirmware(ctx: *const r4os.r4dev.DriverContext) bool {
     return true;
 }
 
-fn readIdentity(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot) bool {
+fn readIdentity(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, measured: *?identity.Chip) bool {
     const memory = ctx.memory() orelse {
         ctx.logInfo("NVIDIA chip=unmeasured reason=MMIO-contract-unavailable");
         return true;
@@ -190,11 +197,76 @@ fn readIdentity(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.
     const confirm = words[0];
     if (confirm == boot0) {
         if (identity.chip(boot0, boot1)) |chip| {
+            measured.* = chip;
             log("NVIDIA chip={s} id={x} revision={x} boot0={x:0>8} boot1={x:0>8} profile={s} native-writes=disabled", .{ chip.name, chip.id, chip.revision, boot0, boot1, chip.profile });
+            ctx.logInfo("NVIDIA display-generation=GA102-NVDisplay root-class=c670 core-class=c67d source=measured-chip-and-pinned-reference class-query=unperformed native-writes=disabled");
         } else log("NVIDIA chip=unrecognized boot0={x:0>8} boot1={x:0>8} native-writes=disabled", .{ boot0, boot1 });
     } else ctx.logInfo("NVIDIA chip=unmeasured reason=unstable-identity native-writes=disabled");
     return releaseWindow(ctx);
 }
+
+fn readVbios(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, chip: identity.Chip) bool {
+    const bytes = board_rom.read(ctx, snapshot, chip) catch |err| {
+        log("NVIDIA vbios: rejected phase=read reason={s} source=PROM native-writes=disabled fallback=preserved", .{@errorName(err)});
+        _ = board_rom.close();
+        return false;
+    };
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    log("NVIDIA vbios: snapshot=PROM bytes={d} sha256={s} reads=two-identical aperture=300000..3fffff native-writes=disabled", .{ bytes.len, hex });
+    const start = vbios.promStart(bytes) catch |err| {
+        log("NVIDIA vbios: rejected phase=IFR reason={s} first={x:0>2}{x:0>2}{x:0>2}{x:0>2} fallback=preserved", .{ @errorName(err), bytes[0], bytes[1], bytes[2], bytes[3] });
+        _ = board_rom.close();
+        return false;
+    };
+    const result = vbios.parse(bytes[start.offset..], snapshot.pci.device_id) catch |err| {
+        log("NVIDIA vbios: rejected phase=tables reason={s} offset={x} ifr={d} fallback=preserved", .{ @errorName(err), start.offset, start.ifr_version });
+        var diagnostic: VbiosDiagnostic = .{};
+        @import("vbios_diagnostic.zig").inspect(bytes[start.offset..], &diagnostic);
+        _ = board_rom.close();
+        return false;
+    };
+    std.crypto.hash.sha2.Sha256.hash(bytes[start.offset..][0..result.rom_bytes], &digest, .{});
+    const rom_hex = std.fmt.bytesToHex(digest, .lower);
+    log("NVIDIA vbios: verified source=PROM offset={x} ifr={d} bytes={d} images={d} sha256={s} hardware-bound=yes gpu-authentication=unverified", .{ start.offset, start.ifr_version, result.rom_bytes, result.image_count, rom_hex });
+    log("NVIDIA vbios: version={x:0>2}.{x:0>2}.{x:0>2}.{x:0>2}.{x:0>2} version-present={} BIT={x} DCB={x} dcb-version={x} ccb-version={x} ports={d} checksum-bytes={d}", .{
+        result.vbios_version[0], result.vbios_version[1], result.vbios_version[2], result.vbios_version[3], result.vbios_version[4], result.version_present,
+        result.bit_offset, result.dcb_offset, result.dcb_version, result.ccb_version, result.port_count, result.checksum_bytes,
+    });
+    for (result.ports[0..result.port_count]) |port| {
+        log("NVIDIA vbios port={d} type={x} heads={x} or={x} location={d} bus={d} ccb={d} connector={d} connector-type={d} i2c={d} aux={d} raw={x:0>8}/{x:0>8}", .{
+            port.index, port.kind, port.heads, port.or_mask, port.location, port.bus, port.ccb, port.connector,
+            if (port.connector_type) |value| @as(u16, value) else @as(u16, 256),
+            if (port.i2c) |value| @as(u16, value) else @as(u16, 256),
+            if (port.aux) |value| @as(u16, value) else @as(u16, 256), port.raw_path, port.raw_config,
+        });
+    }
+    if (!board_rom.close()) return false;
+    ctx.logInfo("NVIDIA vbios: cleanup=OK resources=0 native-writes=disabled fallback=preserved");
+    return true;
+}
+
+const VbiosDiagnostic = struct {
+    remaining: usize = 4096,
+    pub fn record(self: *VbiosDiagnostic, label: []const u8, offset: usize, bytes: []const u8) void {
+        var at: usize = 0;
+        while (at < bytes.len and self.remaining != 0) {
+            // @min narrows this to u7. Widen before doubling the hex length:
+            // 64 input bytes need 128 characters, which do not fit in u7.
+            const count: usize = @min(64, bytes.len - at, self.remaining);
+            var hex: [128]u8 = undefined;
+            const alphabet = "0123456789abcdef";
+            for (bytes[at..][0..count], 0..) |byte, index| {
+                hex[index * 2] = alphabet[byte >> 4];
+                hex[index * 2 + 1] = alphabet[byte & 15];
+            }
+            log("NVIDIA vbios raw: unvalidated kind={s} offset={x} bytes={d} hex={s}", .{ label, offset + at, count, hex[0 .. count * 2] });
+            at += count;
+            self.remaining -= count;
+        }
+    }
+};
 
 fn releaseWindow(ctx: *const r4os.r4dev.DriverContext) bool {
     if (window.handle.id == 0 and !mapping_cleanup_needed) return true;

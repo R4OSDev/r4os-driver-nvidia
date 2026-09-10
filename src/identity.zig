@@ -212,5 +212,5 @@ pub fn chip(boot0: u32, boot1: u32) ?Chip {
     // Only the measured GA106 identity matches the sole bootstrap PCI entry.
     // This profile admits identification reads; it grants no engine writes.
     if (id != 0x176) return null;
-    return .{ .id = id, .revision = @truncate(boot0), .name = "GA106", .profile = "ga106-identity-only" };
+    return .{ .id = id, .revision = @truncate(boot0), .name = "GA106", .profile = "ga106-passive" };
 }

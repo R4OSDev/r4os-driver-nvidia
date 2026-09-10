@@ -1,8 +1,13 @@
 ﻿NVIDIA: passiver Besitzer fuer 0.79.9
 ===================================
 
-Stand: 10.09.2026; Unterversion noch offen. OssiPC ist offline. Kein nativer
-NVIDIA-/HDMI-/Audiopfad wird durch diesen Stand als unterstuetzt ausgegeben.
+Stand: 10.09.2026; passive Hardwareaufnahme 0.79.9 abgeschlossen.
+GA106/A1, Subsystem 1458:4074 und aktuelle ReBAR-Bereiche wurden mit
+NVIDIA 0.1.11 / Kernel 0.1.147 gemessen; der User bestaetigt normales Bild.
+NVIDIA 0.1.14 liest VBIOS 94.06.2f.00.d6 und sechs DCB-Routen fuer vier
+Boardanschluesse. Die spaeteren PROM-Boots bestaetigen softwareseitig den
+unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
+diesen Stand als unterstuetzt ausgegeben.
 
 Der R4D-Loader bindet den echten DriverApi-Owner waehrend Init und Shutdown.
 Der Treiber liest den kanonischen PCI-Bestand genau einmal, maximal 4096
@@ -22,7 +27,7 @@ oberhalb 0xFC. Unterversion 0.79.9 schreibt keinerlei PCI-Konfiguration.
 Zulassung und Registergrenzen
 ----------------------------
 PCI 10de:2504 ist nur ein Bootstrap-Kandidat, kein Beweis fuer GA106/Board.
-Die ersten zwei PMC-Dwords NV_PMC_BOOT_0/1 auf BAR0+0/+4 sind die einzigen
+Die ersten zwei PMC-Dwords NV_PMC_BOOT_0/1 auf BAR0+0/+4 sind die ersten
 MMIO-Lesestellen. Der primaere NVIDIA-Registerverweis beschreibt den PMC-
 Bereich 0..0xFFF. Der Owner mappt eine UC-Seite, liest BOOT0/BOOT1/BOOT0,
 vergleicht die Identitaet und gibt den eigenen Mappinghandle sofort frei.
@@ -30,13 +35,57 @@ Ein unklarer Unmap behaelt Handle und Modul fuer denselben Shutdownpfad.
 Es werden keine asynchronen Arbeiten oder DMA-Nutzungen angelegt.
 
 Erst gemessenes Chip-ID 0x176 ohne Architektur-Erweiterungs-/vGPU-Abweichung
-waehlt ga106-identity-only. Andere Chips bleiben unzugeordnet; der gemessene
+waehlt ga106-passive. Andere Chips bleiben unzugeordnet; der gemessene
 Rohwert bleibt sichtbar. BAR-Gesamtgroesse, Displayinstanz, Straps, Boardname
 und Firmwarepaarung werden daraus nicht erfunden. Insbesondere sind NV_PMC_
 ENABLE (0x200), Device-Enable, BAR-/PRAMIN-Fenster, PBUS/PFB/MMU, PFIFO/PBDMA,
 GSP/Falcon, PDISP/SOR/PIOR, I2C/DPAUX und ROM-Shadow-Schalter nicht freigegeben.
 Gemeinsame Klassen- oder Headernamen begruenden keine Registerkompatibilitaet.
 Ein Registerprofil mit Schreibfaehigkeit existiert in diesem Stand nicht.
+Die Displaygeneration GA102-NVDisplay mit Rootklasse c670 und separatem
+Core-Channel c67d folgt aus der gemessenen Chip-ID und der gepinnten
+GA106-Zuordnung, nicht aus einem Hardware-Class-Query. Damit werden keine
+Displayregister oder Ausfuehrungsrechte freigegeben.
+
+Die folgende Zuordnung gilt fuer den tatsaechlich gemessenen Chip 0x176/A1.
+Die Funktionsnamen stammen aus nv176_chipset im archivierten Nouveau-
+Quellstand 7.2.4; sie dokumentieren getrennte Implementierungsfamilien,
+keine Erlaubnis, beliebige Register einer aelteren GPU zu benutzen:
+
+Gruppe                 GA106-Zuordnung / konkrete Grenze
+PMC                    BOOT0/1 auf BAR0+0/+4; weitere PMC-Register gesperrt.
+PROM                   RM kgspExtractVbiosFromRom_TU102 fuer GA106;
+                       BAR0+300000..3fffff, zweimalige DWORD-Lesung.
+BAR / MMU / Fault      tu102_bar_new / tu102_mmu_new / tu102_fault_new.
+                       Gemessene BAR0/1/3-Groessen 16/256/32 MB; kein
+                       Resize, PRAMIN-Remap oder geaenderter Cachealias.
+FB / LTC               ga102_fb_new / ga102_ltc_new; Speichercontroller,
+                       Flush, Tiling und VRAM-Aufteilung noch uninitialisiert.
+FIFO / CE / GR         ga102_fifo_new / ga102_ce_new / ga102_gr_new;
+                       PBDMA/Runlists, Queue-DMA und Engines gesperrt.
+GSP / ACR / SEC2       ga102_gsp_new / ga102_acr_new / ga102_sec2_new;
+                       ga102/dev_gsp.h nennt PGSP 110000..113fff.
+                       Kein Mailboxzugriff, Reset oder Firmwarestart.
+MC / TOP / VFN         ga100_mc_new / ga100_top_new / ga100_vfn_new;
+                       IRQ-Routing und Device-Discovery noch nicht genutzt.
+PCI / Privring         gp100_pci_new / gm200_privring_new; ausser dem
+                       begrenzten Konfigurationssnapshot keine Zugriffe.
+Timer                  gk20a_timer_new; GPU-Zeit noch ungemessen.
+I2C / GPIO             gm200_i2c_new / ga102_gpio_new; DCB/CCB liefern
+                       nur Boardverweise, keine DDC-/AUX-Transaktion.
+NVDisplay / SOR / HDA  ga102_disp_new; Root c670, Core c67d. Die Quelle
+                       kombiniert TU102-Init mit GV100-Head/Window/HDA
+                       und GA102-SOR-Takt/DP. Keine pauschale GV100-
+                       oder Turing-Kompatibilitaet, keine Linkfreigabe.
+
+Bis zum jeweiligen Bringup sind alle Gruppen ausser PMC/PROM ungemessen
+und nicht gemappt. BAR1 enthaelt derzeit die Firmware-Bildflaeche, die
+ausschliesslich beim vorhandenen Display-Fallback bleibt. BAR5 hat keinen
+gemessenen Umfang. Weder diese PCI-Bereiche noch die angefuehrten logischen
+Gruppen werden als lueckenlose Registerkarte oder VRAM-Kapazitaet ausgegeben.
+GSP-/Displayklassen muessen spaeter an Original-RM, echte Instanzen und
+Owner-Lebensdauer gebunden werden. Insbesondere werden keine kompletten
+Gruppen zum Lesen freigegeben: Statusregister koennen Seiteneffekte haben.
 
 VBIOS und Grenzen
 -----------------
@@ -56,11 +105,35 @@ und ueberlappende ausgewertete Tabellen verwerfen den Befund vollstaendig.
 CCB 4.0/Legacy-DCB, BIT-b-Sondersemantik und unbekannte Versionen werden noch
 abgelehnt; es gibt keine stillen Ersatzwerte oder erratenen TV-Anschluesse.
 
-inspect-vbios liest nur eine explizit uebergebene Hostdatei. Der reale
-VBIOS-Transport ist offen: Nouveau shadowrom.c veraendert ROM-Shadowing,
-shadowramin.c veraendert den Fensterauswahlwert. Diese Schritte benoetigen
-einen gemessenen, besitzergebundenen und wiederherstellbaren Hardwarepfad.
-Ein eingelesener ROM-Befund ist nicht automatisch das VBIOS der laufenden GPU.
+NVIDIA 0.1.12 implementiert den PROM-Leseweg aus dem gepinnten RM 570.144,
+dessen HAL ihn ausdruecklich fuer GA106 auswaehlt (PROVENANCE.txt). Erst eine
+gemessene GA106-ID und ein aktueller ReBAR-Bereich, der BAR0+300000..3fffff
+vollstaendig enthaelt, erlauben diese UC-Abbildung. 1 MB wird zweimal durch
+volatile 32-Bit-Lesezugriffe verglichen. Dazwischen wird alle 256 DWORDs
+die monotone Uhr geprueft; Gesamtfrist zehn Sekunden, endliche Wortzahl.
+Es gibt keinen Schreibzugriff fuer PCI-ROM-Shadowing, PRAMIN oder ERoT.
+
+Die CPU-Kopie wird ueber den residenten DriverApi-Heap gehalten. Unmap,
+Collect und Heap-Free muessen ihre jeweilige Freigabe bestaetigen; Fehler
+behalten Handle und Modul fuer denselben Shutdown. Es gibt keinen grossen
+Kernelstack-Puffer. Uhrfehler, Fristablauf, abweichende Zweitlesung, Fehler
+im IFR-Umschlag oder ungueltige Tabellen beenden Init mit Diagnose und bootfb.
+IFR 1/2/3, NPDE 1.0/1.1 und endliche private e0-Subimages sind begrenzt
+interpretierbar. Ausgewertete NPDE-Tabellen werden auf Ueberlappung geprueft.
+Die x86-Pruefsumme bleibt verpflichtend; private Nutzdaten werden nicht
+als authentifiziert oder ausfuehrbar freigegeben. Kein ROM wird ausgefuehrt.
+Der Bootbefund enthaelt Hashes der ganzen PROM-Kopie und der PCI-ROM-Kette,
+Offset, IFR-/VBIOS-Version sowie die validierten Anschlussrohdaten. Der
+unabhaengige inspect-vbios nimmt weiterhin nur eine explizite Hostdatei;
+deren Zuordnung zur echten GPU wird nicht behauptet.
+
+Seit 0.1.13 enthalten Parserfehler zusaetzlich begrenzte Rohdatensaetze aus
+der bereits kopierten PROM-Sicht: Image-/PCI-/NPDE-Header, BIT und kleine
+DCB/CCB/Connector-Tabellen. Jeder Datensatz heisst ausdruecklich unvalidated;
+maximal 4096 Rohbytes je Adapter, in 64-Byte-Stuecken. Dies publiziert weder
+eine Teil-Topologie noch eine Freigabe und fuehrt kein weiteres MMIO aus.
+Die bisherigen Tests pruefen diesen Diagnoseweg auch bei Trunkierungen und
+beschaedigten Tabellen. Ein kompletter Firmwaredump gehoert nicht ins Bootlog.
 
 Pruefung
 --------
@@ -70,7 +143,15 @@ Tabellenueberlappungen, Skip/EOL und alle Einzelbitmutationen einer kleinen
 synthetischen Datei. Diese Datei stammt von keiner echten Grafikkarte.
 Der bestehende Distribution-Grafiklauf bietet nvidia-passive fuer Laden,
 Fehllade-Cleanup, Diagnoseexport und bootfb ohne NVIDIA. Echte Bind-/Unbind-
-und Board-/VBIOS-/IRQ-Abnahmen bleiben offen, bis passende Hardware da ist.
+und Board-/VBIOS-Abnahmen werden getrennt auf echter Hardware nachgeholt.
+
+0.1.12: Im vorhandenen Besitzerstep bestehen 23 Faelle. Hinzu kamen IFR- und
+NPDE-Grenzen sowie echte Init-/Shutdown-Aufrufe mit synthetischem PROM:
+zwei identische Kopien, manipulierte Pruefsumme, Allokations-/Mappingfehler,
+unklarer Unmap/Collect/Free, Fristablauf, exakte Wiederaufnahme des Cleanup
+und eine fremde Chip-ID trotz ausreichendem ReBAR-Bereich. Nicht freigegebene
+DriverApi-Aufrufe scheitern weiterhin im Test. Der bestehende nvidia-passive
+SMP4/KVM-Lauf bestand mit dem neuen Modul in 20.32 s.
 
 Neun gezielte Besitzerfaelle: acht Parser-/PCI-Faelle plus ein ausgewaehlter
 Test der echten R4D-Ein-/Ausstiegsfunktionen mit echter SDK-Fassade und
