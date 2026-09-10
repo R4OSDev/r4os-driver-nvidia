@@ -9,6 +9,46 @@ Boardanschluesse. Die spaeteren PROM-Boots bestaetigen softwareseitig den
 unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
+GSP-Speicherplanung und Radix3-Vorbereitung (0.79.10, Host)
+-------------------------------------------------------
+gsp_boot.zig prueft das Produktions-Bootabbild (24576 Bytes) und seinen
+84-Byte-Deskriptor gegen dieselbe Firmware-/Quellversion 570.144. Geaenderte
+Pins erzwingen eine erneute ABI-Pruefung. Nur der V5-Monitorpfad mit
+vollstaendig begrenzten und nicht ueberlappenden Bereichen wird verarbeitet.
+Dateihashes sind keine GPU-Signaturpruefung.
+
+gsp_layout.zig berechnet den normalen ersten Start auf GA106 ohne Registry-,
+vGPU- oder Recovery-Varianten. Geschuetzte/unvollstaendige Register, aktive
+WPR2-Regionen, laufende Engines, andere Chips, zu grosse Abbilder und
+unzureichender vorgesaeuberter VRAM werden verworfen. RESET_READY bleibt
+ein unverbindlicher Hinweis. Die Rechnung verwendet die .fwimage-Sektion,
+nicht die Groesse ihres ELF-Containers. Der VGA-Bereich wird nur geplant.
+
+OssiPCs vorhandene Aufnahme ergibt 12288 MB VRAM, 192 MB Gesamtreservierung
+am oberen Ende und 128 MB GSP-Heap. FRTS, Metadatenreservierung und Non-WPR-
+Heap erhalten je 1 MB. Der Metadatensatz selbst hat nur 256 Bytes. Alles
+liegt in den oberen 256 MB, die GA106 fuer diesen Startpfad voraussetzt.
+VGA muesste von 0x10e0000 nach 0x2fffe0000 verlagert werden. Der vorhandene
+Bereich bleibt unangetastet; die Rechnung erteilt keinen VRAM-Besitz.
+
+gsp_radix.zig berechnet und schreibt die drei 4-KB-Seitentabellenebenen in
+caller-eigene CPU-Speicherbereiche. Bis zu 256 echte DMA-Segmente duerfen
+physisch verteilt und ungeordnet sein, stehen aber in logischer Reihenfolge.
+Alle Groessen, Adressen, Segmentueberlappungen und CPU-Pufferaliase werden
+vor dem ersten Schreibzugriff geprueft. Das Abbild wird einmal kopiert;
+ungenutzte Tabelleneintraege und die letzte Teilseite werden genullt.
+Fuer die echte Firmware: 15513 Datenseiten plus 33 Tabellenseiten/132 KB,
+insgesamt 63676416 Bytes. Mapping, Synchronisierung, Start und eine bei
+unbekanntem GPU-Zustand sichere Freigabe bleiben beim kuenftigen Runtime-Owner.
+
+Aufruf ueber Build.bat/Build.sh inspect-gsp-layout -- mit absoluten Pfaden
+fuer PREFLIGHT.json, GSP.bin, BOOT.bin, DESC.bin und ein neues OUTPUT.json.
+Schema und Begrenzungen stehen im englischen README. Der Bericht bezeichnet
+die Eingaben als gespeicherte Beobachtung und setzt keine DMA-Adressen ein.
+Neue Software-Zwischenstaende in diesem Abschnitt aendern NVIDIA.R4D nicht;
+Modulversion 0.1.21 und der zuletzt installierte Stand bleiben bytegleich.
+Kein erneutes Hardwareupdate ist fuer diese CPU-Vorbereitung erforderlich.
+
 GSP-/VRAM-Vorpruefung (NVIDIA 0.1.21, 0.79.10)
 ----------------------------------------------
 fwsec_state_probe.zig liest auf gemessenem GA106 hoechstens sechs BAR0-Seiten

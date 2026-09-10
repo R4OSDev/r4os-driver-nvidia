@@ -86,6 +86,14 @@ pub fn build(b: *std.Build) void {
     const inspect_firmware = b.addRunArtifact(firmware_inspector);
     if (b.args) |args| inspect_firmware.addArgs(args);
     b.step("inspect-firmware", "Verify the pinned GSP container: -- INPUT FAMILY OUTPUT.json").dependOn(&inspect_firmware.step);
+    const layout_inspector = b.addExecutable(.{ .name = "nvgsp-layout", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/gsp_layout_inspect.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    }) });
+    const inspect_layout = b.addRunArtifact(layout_inspector);
+    if (b.args) |args| inspect_layout.addArgs(args);
+    b.step("inspect-gsp-layout", "Plan GA106 first boot: -- PREFLIGHT.json GSP.bin BOOT.bin DESC.bin OUTPUT.json").dependOn(&inspect_layout.step);
     const prepare = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-File" });
     prepare.addFileArg(b.path("Tools/PrepareFirmware.ps1"));
     prepare.addArg("-Inspector");

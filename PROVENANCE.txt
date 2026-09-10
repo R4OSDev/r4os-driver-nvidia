@@ -3,6 +3,28 @@ Host/module scaffolding follows R4OS SDK and existing R4D owners.
 Firmware fixture bodies and signatures are synthetic. Selected measured
 table fields are explicit regression data, as described below.
 
+0.79.10 GSP memory preparation (host only), 11.09.2026:
+gsp_boot.zig admits the production GA102 GSP boot image/descriptor already
+exported by prepare-bootstrap from g_bindata_kgspGetBinArchiveGspRmBoot_GA102.c.
+Their lengths and hashes are compile-time bound to the central RM source pin;
+rmRiscvUcode.h defines the V5 descriptor. No executable fixture bytes are added.
+gsp_layout.zig adapts kgspCalculateFbLayout_TU102 and the default bare-metal
+heap calculation in kernel_gsp.c, using gsp_fw_heap.h and the GA106 dispatch
+from g_kernel_gsp_nvoc.c/.h. The original NVIDIA copyright and full MIT terms
+are retained in that source file; original R4OS admission checks are Apache-2.0.
+gsp_fw_wpr_meta.h defines the metadata size and pre-scrubbed-region constraint;
+g_mem_mgr_nvoc.c/.h confirms the absent GA100 MMU-lock path on GA106.
+gsp_radix.zig is an original bounded encoder of the three-level page-table
+format in libos_init_args.h and kgspCreateRadix3_IMPL. It contains no original
+allocator, mapping or memory-copy implementation. gsp_layout_inspect.zig is
+an original host tool; gsp_test.zig uses descriptor fields and measured register
+values with synthetic image bytes and explicitly synthetic DMA segments.
+Thirteen full original source files/notices, the two unmodified boot artifacts,
+their original export metadata and source catalog are preserved separately in
+ExFiles/Reference/GFX/Nvidia/0.79.10/gsp-memory-layout-20260911.
+NVIDIA.R4D, its firmware resources, header package and distributed notices
+remain byte-identical. None of these host preparations grants GPU ownership.
+
 0.79.10 GSP/VRAM preflight (NVIDIA 0.1.21), 11.09.2026:
 fwsec_state.zig and fwsec_state_probe.zig are original R4OS implementations.
 NVIDIA 570.144, commit 8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f, supplies:

@@ -75,6 +75,45 @@ because NVIDIA documents a hardware erratum. MMIO cleanup precedes DMA and
 CPU release; failed cleanup retains the owner for shutdown retry. The result
 is an observation, never an engine-reset, VRAM-allocation or recovery grant.
 
+The optional `inspect-gsp-layout` host step validates the production GA102
+GSP boot image and its 84-byte RISC-V descriptor against the same central
+570.144 pin, then calculates the GA106 bare-metal first-boot layout from a
+recorded preflight and the admitted GSP `.fwimage` section. Descriptor ranges,
+overlap, first-boot state, WPR reuse, 40-bit VRAM bounds, heap limits and all
+alignments are checked before publishing a new report. It does not install
+another module or modify the GPU. The existing NVIDIA.R4D remains 0.1.21.
+
+    ./Build.sh inspect-gsp-layout -- PREFLIGHT.json GSP.bin BOOT.bin DESC.bin OUTPUT.json
+
+Supply absolute paths. The snapshot schema is 1, with `recorded_utc`, unsigned
+`pci_vendor`, `pci_device`, `pmc_boot0`, `pmc_boot1` and `raw`. The latter has
+thirteen unsigned `values` in `fwsec_state.Register` order and a `present` bit
+mask. It is an archived observation, not a current ownership proof. JSON inputs
+are limited to 16 KB; firmware sizes and hashes must match the pin. Existing
+outputs and path aliases are refused. An actual OssiPC input/report, original
+boot files and complete references are preserved under the workspace's
+`ExFiles/Reference/GFX/Nvidia/0.79.10/gsp-memory-layout-20260911`.
+
+For the recorded 12 GB board, the proposed top reservation is 192 MB, with a
+128 MB GSP heap, 1 MB non-WPR heap, 1 MB metadata reservation, 1 MB FRTS and
+the admitted image/boot bytes and alignment padding. The 256-byte WPR metadata
+size is distinct from its 1 MB reservation. The current VGA base `0x10e0000`
+requires relocation to `0x2fffe0000` before this proposed layout can be used.
+Only the top 256 MB may be assumed pre-scrubbed by this GA106 firmware path.
+An active WPR, busy engine, another chip or an unsupported boot profile is
+rejected; recovery/retry margins, vGPU and registry overrides are not modeled.
+
+`gsp_radix.zig` prepares the original three-level, 4 KB Libos page-table format
+using the caller's actual, retained DMA segments. It supports up to 256
+discontiguous spans in logical order, validates their address limits and
+overlap before any output write, copies the admitted image once and clears
+only tables and final-page padding. CPU pointers never become page entries.
+The actual `.fwimage` needs 15,513 data pages and 33 table pages (132 KB), a
+combined allocation of 63,676,416 bytes. This is a requirement, not an allocated
+GPU resource. A future runtime owner must supply and retain mappings, perform
+device synchronization and prove quiescence before release. The host report
+assigns no DMA addresses. Native boot, metadata handoff and recovery remain open.
+
 The explicit `prepare-bootstrap` step exports 26 original GA102 GSP/Booter and
 TU102 SEC2 reference artifacts from the same 570.144 source pin. It verifies a
 private source snapshot before compiling the original data initializers and

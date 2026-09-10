@@ -13,6 +13,23 @@ their original licenses in the separate workspace reference archive.
 Fixture firmware bodies and signatures are synthetic; selected measured table
 metadata is regression data documented in PROVENANCE.txt.
 
+The host-only GSP layout calculation in `src/gsp_layout.zig` adapts the
+MIT-licensed NVIDIA 570.144 layout and heap algorithms from
+`kernel_gsp_tu102.c` (copyright 2017-2024), `kernel_gsp.c` (2019-2024) and
+`gsp_fw_heap.h` (2022-2024), NVIDIA CORPORATION & AFFILIATES. That file retains
+the original copyright lines and full MIT permission/disclaimer. Original
+R4OS admission checks and interfaces remain Apache-2.0. This preparation is
+not linked into the current NVIDIA.R4D.
+
+The boot descriptor validator and scatter/gather Radix3 encoder are original
+R4OS code based on the format facts in `rmRiscvUcode.h`,
+`gsp_fw_wpr_meta.h`, `libos_init_args.h` and the same pinned RM implementation.
+The production boot image and descriptor remain external reference inputs,
+with their full original generated source and MIT notice. All complete
+sources, notices, hashes and original bootstrap metadata accompany
+`ExFiles/Reference/GFX/Nvidia/0.79.10/gsp-memory-layout-20260911`.
+No additional firmware or original header is packaged into NVIDIA.R4D.
+
 The 0.1.21 GSP/VRAM preflight is original R4OS code. Register facts come
 from the same pinned NVIDIA sources and Nouveau's MIT-noticed
 nvkm/falcon/base.c (NVIDIA copyright 2016) in the Linux 7.2.4 reference.
