@@ -85,12 +85,13 @@ Shutdown bleibt harmlos.
 
 0.79.10: Firmwarevorbereitung ohne Realhardware
 ---------------------------------------------
-NVIDIA 0.1.1 enthaelt die einzige firmware-lock.json als NVFW-LOCK.json in
+NVIDIA 0.1.2 enthaelt die einzige firmware-lock.json als NVFW-LOCK.json in
 seiner nicht allokierten R4M0-Ressource. Kernel 0.1.138 behandelt .rsrc auch
 fuer R4D/R4P dateigebunden; ihre Nutzdaten werden weder in das Codeimage
 kopiert noch als Entry-, Export- oder Relocationziel zugelassen. Fuer R4L
-bleiben Ressourcen unzulaessig. Noch kein R4D-Ressourcenlesevertrag und kein
-Firmwareabruf aus dem aktiven passiven NVIDIA-Treiber.
+bleiben Ressourcen unzulaessig. Kernel 0.1.139 stellt zusaetzlich den
+besitzergebundenen DriverApi29-Ressourcenlesevertrag bereit. NVIDIA prueft
+damit die geladene Lockdatei vor PCI; die GSP-Blobs sind noch nicht eingebettet.
 
 firmware.zig besitzt einen festen JSON-Vertrag fuer RM/GSP 570.144 mit zwei
 Originalcontainern, ihrem SHA-256, exakter Laenge, vollstaendiger Lizenz und
@@ -126,7 +127,36 @@ Ausfuehrungen. Fehler hinterlassen keinen neuen Erfolgspfad.
 
 Zwei zusaetzliche Faelle im bestehenden unit-test-Step: 4672 Trunkierungen
 und 3072 Metadatenbitmutationen eines synthetischen ELF sowie inkrementelles
-Laden mit IO-/Kurzlese-/Hash-/Deadline-/Clock-/Close-Fehlern. Elf Besitzerfaelle
+Laden mit IO-/Kurzlese-/Hash-/Deadline-/Clock-/Close-Fehlern. Zwoelf Besitzerfaelle
 insgesamt. Beide Originalcontainer werden getrennt mit ihren echten Hashes
 und allen erwarteten Familiensignaturen geprueft. Weitere Evidenz und die
 offenen Hardwaregrenzen: Docs/Drivers/GrafikFirmware07910.txt/.json.
+
+Aktueller R4D-Ressourcenweg
+--------------------------
+DriverApi29 erweitert den unveraenderten 592-Byte-Praefix auf 600 Bytes.
+Die optionale SDK-Fassade liefert stat, readAt und die monotone Nanosekunde.
+Keine Dateipfade oder erfundenen Owner: Bindung an den echten Treiberstart,
+das geladene Modul und dessen Generation. Referenzen sind nicht besitzend;
+Shutdown und Neustart machen alte Handles ungueltig. Ein einzelner Read
+haelt den Owner sowie den echten Dateisystem-Request bis zum sicheren Ende.
+IRQ- und Storagecallbacks sind unzulaessig, belegte Worker-Einstiege melden
+BUSY. Byte-Preloads ohne gespeicherte Dateiquelle sind ausdruecklich nicht
+unterstuetzt. Die bisherige reine passive Probe bleibt auf DriverApi28
+moeglich; Firmware-Laden ist dort deaktiviert.
+
+firmware_resources.Reader bindet firmware.Load an genau diesen SDK-Pfad.
+Er verlangt bytegleiche Lockdaten, exakten Ressourcenname/Umfang und dieselbe
+Modulgeneration. Caller-Endspeicher, kompletter SHA-256 und ELF/ABI-Befund
+bleiben erforderlich. Weder ein Mount-/Dateiknoten-Snapshot noch das Handle
+garantiert unveraenderliche Dateiinhalte. Kein GSP-Download, keine GPU-DMA.
+Vollstaendige GSP-Paketintegration und runtime CPU-Speicherbesitz folgen noch.
+
+Der echte passive Treiber prueft NVFW-LOCK.json mit zwei Sekunden Deadline
+vor der PCI-Aufnahme. Ein weiterer Fall im bestehenden Lifecycle-Test deckt
+fehlende/falsche/kurze/abgelaufene Lockreads, null PCI-Zugriffe bei Ablehnung,
+idempotentes Shutdown, Paketgenerationswechsel, falsche Ressourcennamen und
+den unveraenderten DriverApi28-Fallback ab. Der kurze SMP4-Lauf verlangt den
+realen Lockread aus dem geladenen Modul und weiterhin nutzbaren bootfb.
+Deadlinepruefungen geschehen vor/nach I/O; Hardware-Cleanup kann laenger
+dauern und gibt den Puffer erst nach Ende seiner realen Nutzung frei.

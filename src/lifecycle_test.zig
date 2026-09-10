@@ -3,6 +3,8 @@ const r4os = @import("r4os");
 const a = r4os.abi;
 const driver = @import("main.zig");
 const t = std.testing;
+const resource_loader = @import("firmware_resources.zig");
+const firmware = @import("firmware.zig");
 
 const State = struct {
     present: bool = true,
@@ -19,6 +21,8 @@ const State = struct {
     mapping: bool = false,
     private_mapping: bool = false,
     chip_reported: bool = false,
+    lock_verified: bool = false,
+    resource_fault: enum { none, missing, wrong, short, deadline, generation } = .none,
     words: [1024]u32 = .{ 0x176000a1, 0 } ++ .{0} ** 1022,
 };
 var state: State = .{};
@@ -37,7 +41,7 @@ fn apiTable() a.DriverApi {
         }
     }
     api.magic = a.driver_magic;
-    api.version = 28;
+    api.version = 29;
     api.size = @sizeOf(a.DriverApi);
     api.log_info = log;
     api.log_warn = log;
@@ -47,10 +51,71 @@ fn apiTable() a.DriverApi {
     api.pci_device_at = at;
     api.pci_read_config32 = config;
     api.gfx_memory_query = memory;
+    api.resource_query = resources;
     return api;
 }
 fn log(text: [*:0]const u8) callconv(.c) void {
     if (std.mem.indexOf(u8, std.mem.span(text), "chip=GA106") != null) state.chip_reported = true;
+    if (std.mem.indexOf(u8, std.mem.span(text), "lock=verified") != null) state.lock_verified = true;
+}
+fn resources(output: *a.DriverResourceApi) callconv(.c) i32 {
+    output.* = .{ .stat = @intFromPtr(&resourceStat), .read_at = @intFromPtr(&resourceRead), .now_ns = @intFromPtr(&resourceNow) };
+    return 0;
+}
+fn resourceNow() callconv(.c) u64 {
+    return 100;
+}
+fn resourceStat(name: [*]const u8, length: u32, output: *a.DriverResourceInfo) callconv(.c) i32 {
+    if (state.resource_fault == .missing) return a.driver_resource_error_not_found;
+    if (std.mem.eql(u8, name[0..length], "NVFW-LOCK.json")) {
+        output.* = .{ .handle = 0x100000001, .byte_length = resource_loader.lock_bytes.len, .module_generation = 13 };
+    } else {
+        std.debug.assert(std.mem.eql(u8, name[0..length], firmware.specification(.ga10x).resource));
+        output.* = .{ .handle = 0x100000002, .byte_length = firmware.specification(.ga10x).bytes, .module_generation = if (state.resource_fault == .generation) 14 else 13 };
+    }
+    return 0;
+}
+fn resourceRead(handle: u64, offset: u64, out: [*]u8, length: u32, deadline: u64) callconv(.c) i32 {
+    std.debug.assert(handle == 0x100000001 or handle == 0x100000002);
+    std.debug.assert(deadline > resourceNow() and offset == 0);
+    if (state.resource_fault == .deadline) return a.driver_resource_error_deadline;
+    if (handle == 0x100000001) {
+        std.debug.assert(length == resource_loader.lock_bytes.len);
+        @memcpy(out[0..length], resource_loader.lock_bytes);
+        if (state.resource_fault == .wrong) out[0] ^= 1;
+    } else {
+        @memset(out[0..length], 0);
+    }
+    return @as(i32, @intCast(length)) - @as(i32, if (state.resource_fault == .short) 1 else 0);
+}
+
+test "NVIDIA actual driver lifecycle verifies loaded lock before PCI and binds firmware generation" {
+    var api = apiTable();
+    for ([_]@TypeOf(state.resource_fault){ .missing, .wrong, .short, .deadline }) |fault| {
+        state = .{ .resource_fault = fault };
+        try t.expectEqual(@as(i32, -6), driver.nvidia_init(&api));
+        try t.expectEqual(@as(usize, 0), state.enumerate_count);
+        try t.expectEqual(@as(i32, 0), driver.nvidia_shutdown());
+        try t.expectEqual(@as(i32, 0), driver.nvidia_shutdown());
+    }
+    state = .{ .present = false };
+    try t.expectEqual(@as(i32, -4), driver.nvidia_init(&api));
+    try t.expect(state.lock_verified);
+    try t.expectEqual(@as(i32, 0), driver.nvidia_shutdown());
+    const ctx = r4os.r4dev.DriverContext.init(&api).resources().?;
+    var reader = try resource_loader.Reader.init(ctx, .ga10x, 1000);
+    var chunk: [65536]u8 = undefined;
+    try t.expectEqual(chunk.len, try reader.readAt(firmware.specification(.ga10x).resource, 0, &chunk, 1000));
+    try t.expectError(error.Name, reader.readAt("other-version.bin", 0, &chunk, 1000));
+    state.resource_fault = .generation;
+    try t.expectError(error.Size, resource_loader.Reader.init(ctx, .ga10x, 1000));
+    // The exact old prefix remains valid for the original passive probe.
+    state = .{ .present = false };
+    api.version = 28;
+    api.size = @offsetOf(a.DriverApi, "resource_query");
+    try t.expectEqual(@as(i32, -4), driver.nvidia_init(&api));
+    try t.expect(!state.lock_verified);
+    try t.expectEqual(@as(i32, 0), driver.nvidia_shutdown());
 }
 fn option(_: [*:0]const u8, _: [*:0]const u8) callconv(.c) [*:0]const u8 {
     return "passive";

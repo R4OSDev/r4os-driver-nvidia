@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-Original Apache-2.0 passive NVIDIA display driver for R4OS. Module 0.1.1;
+Original Apache-2.0 passive NVIDIA display driver for R4OS. Module 0.1.2;
 hardware acceptance for roadmap 0.79.9 is open and offline preparation for
 0.79.10 has started. This owner inventories NVIDIA display functions once through
 the kernel PCI inventory. It does not initialize engines or take over scanout.
@@ -61,7 +61,7 @@ lifetime decisions without claiming physical MMIO or board acceptance.
 Firmware preparation uses the single `src/firmware-lock.json` for RM version,
 upstream commit, exact artifact lengths/hashes, license and container-family
 mapping. The module carries that lock as `NVFW-LOCK.json` in its nonallocated
-R4M0 resource section; it does not yet request firmware at runtime. Embedded
+R4M0 resource section. With DriverApi29 it verifies this exact loaded lock before PCI inventory; rejection leaves the display fallback usable. Embedded
 R4D resources require kernel 0.1.138 or newer to remain outside image memory.
 
     ./Build.sh inspect-firmware -- INPUT.bin ga10x REPORT.json
@@ -81,8 +81,26 @@ signature sections for the selected release's families. Reports are created
 exclusively after success. Opaque signature bytes are preserved; GPU signature
 verification and hardware compatibility are not established by this check.
 Host-file deadlines are checked before and after I/O, not by forcibly cancelling
-a blocked host filesystem operation. The `unit-test` step now has eleven cases.
+a blocked host filesystem operation. The `unit-test` step now has twelve cases.
 
-Owner-bound resource reads in R4D, RM/NVKMS integration, board-specific FWSEC,
+Packaging the original GSP blobs into the runtime resource path, RM/NVKMS integration, board-specific FWSEC,
 GSP bootstrap/RPC and hardware fallback acceptance remain open. Prepared files
 are an explicit host artifact, not an installed or operational GPU driver.
+
+Kernel 0.1.139 adds the optional DriverApi29 resource table. The real passive
+driver now reads and compares NVFW-LOCK.json through that table, with a
+two-second deadline, before enumerating PCI. The old DriverApi28 prefix
+still supports the passive probe, with firmware loading explicitly disabled.
+Missing, mismatched, short or timed-out lock reads on the new path reject init.
+The same SMP4 absence/fallback profile requires the loaded-lock proof.
+
+`firmware_resources.Reader` is the SDK adapter for `firmware.Load`: it checks
+the loaded lock, exact resource name/size and common module generation, then
+passes only that opaque resource handle to bounded reads. Caller-owned final
+CPU storage and full SHA/ELF checks remain required. The current normal module
+contains only the lock, so a GSP Reader reports a missing resource. No GPU
+firmware is booted or DMA submitted by this checkpoint. Driver resources use
+the captured disk module source; preload bytes have no retained source and
+are rejected explicitly. Resource references do not guarantee immutable disk
+contents. Final pinned hashes remain mandatory. Storage cleanup can outlive
+the absolute read deadline while the caller buffer remains retained.

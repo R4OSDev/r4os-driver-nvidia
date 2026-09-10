@@ -1,6 +1,7 @@
 const std = @import("std");
 const r4os = @import("r4os");
 const identity = @import("identity.zig");
+const firmware_resources = @import("firmware_resources.zig");
 const a = r4os.abi;
 var driver_api: ?*const a.DriverApi = null;
 var window: a.GfxMmioWindow = .{};
@@ -19,6 +20,15 @@ pub export fn nvidia_init(api: *const a.DriverApi) callconv(.c) i32 {
         ctx.logError("NVIDIA bind: rejected reason=unsupported-mode native-writes=disabled");
         return -2;
     }
+    if (ctx.resources()) |resources| {
+        const now = resources.nowNs();
+        const deadline = std.math.add(u64, now, 2 * std.time.ns_per_s) catch return -6;
+        const generation = firmware_resources.validateLock(resources, deadline) catch |err| {
+            log("NVIDIA resource: lock=rejected reason={s} native-writes=disabled fallback=preserved", .{@errorName(err)});
+            return -6;
+        };
+        log("NVIDIA resource: lock=verified bytes={d} module-generation={d} source=loaded-r4d native-writes=disabled", .{ firmware_resources.lock_bytes.len, generation });
+    } else ctx.logInfo("NVIDIA resource: unavailable firmware-loading=disabled passive-probe=available");
     var devices: [8]a.PciDeviceInfo = undefined;
     var audio: [32]identity.Pci = undefined;
     var count: usize = 0;
