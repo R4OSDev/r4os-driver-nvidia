@@ -270,7 +270,7 @@ test "NVIDIA actual driver lifecycle bridges monotonic clock units and latches c
 }
 
 var cpu_backing: ?[]align(16) u8 = null;
-var stage_backing: ?[]align(16) u8 = null;
+var stage_backing: ?[]align(256) u8 = null;
 const stage_handle: u64 = 0x700000001;
 var cpu_handle: u64 = 0x100000001;
 var cpu_requested: u64 = 0;
@@ -282,22 +282,22 @@ fn cpuQuery(output: *a.DriverHeapApi) callconv(.c) i32 {
     return 0;
 }
 fn cpuAllocate(bytes: u64, alignment: u32, output: *a.DriverHeapAllocation) callconv(.c) i32 {
-    std.debug.assert(alignment == 16 and output.version == 1 and output.size == @sizeOf(a.DriverHeapAllocation));
+    std.debug.assert((alignment == 16 or alignment == 256) and output.version == 1 and output.size == @sizeOf(a.DriverHeapAllocation));
     cpu_calls += 1;
     cpu_requested = bytes;
     output.* = .{};
     if (cpu_closed) return a.driver_heap_error_closed;
     if (bytes > (if (state.rom_fixture) @as(u64, vbios.max_rom_bytes) else 8192)) return a.driver_heap_error_memory;
     if (cpu_backing != null) {
-        std.debug.assert(state.fuse_fixture and stage_backing == null and bytes == 1280);
+        std.debug.assert(state.fuse_fixture and stage_backing == null and bytes == 1280 and alignment == 256);
         state.stage_allocations += 1;
         if (state.fuse_fault == .allocation) return a.driver_heap_error_memory;
-        const backing = t.allocator.alignedAlloc(u8, .@"16", @intCast(bytes)) catch return a.driver_heap_error_memory;
+        const backing = t.allocator.alignedAlloc(u8, comptime std.mem.Alignment.fromByteUnits(256), @intCast(bytes)) catch return a.driver_heap_error_memory;
         stage_backing = backing;
-        output.* = .{ .handle = stage_handle, .cpu_address = @intFromPtr(backing.ptr), .byte_length = bytes, .alignment = 16 };
+        output.* = .{ .handle = stage_handle, .cpu_address = @intFromPtr(backing.ptr), .byte_length = bytes, .alignment = 256 };
         return 0;
     }
-    std.debug.assert(cpu_backing == null);
+    std.debug.assert(cpu_backing == null and alignment == 16);
     const backing = t.allocator.alignedAlloc(u8, .@"16", @intCast(bytes)) catch return a.driver_heap_error_memory;
     cpu_backing = backing;
     cpu_handle += 1;
@@ -306,7 +306,7 @@ fn cpuAllocate(bytes: u64, alignment: u32, output: *a.DriverHeapAllocation) call
 }
 fn cpuRelease(handle: u64) callconv(.c) i32 {
     if (handle == stage_handle) {
-        std.debug.assert(stage_backing != null);
+        std.debug.assert(stage_backing != null and !state.dma_pinned and !state.dma_mapped);
         if (state.fuse_fault == .release) return a.driver_heap_error_release;
         t.allocator.free(stage_backing.?);
         stage_backing = null;
@@ -381,7 +381,10 @@ const State = struct {
     fuse_fixture: bool = false,
     fuse_seen: bool = false,
     fuse_mapping: [2]bool = .{ false, false },
-    fuse_fault: enum { none, map_debug, map_version, window, unmap_debug, unmap_version, collect, clock, deadline, unstable, allocation, release, signature, debug_missing, sentinel_debug, sentinel_version, short_input } = .none,
+    fuse_fault: enum { none, map_debug, map_version, window, unmap_debug, unmap_version, collect, clock, deadline, unstable, allocation, release, signature, debug_missing, sentinel_debug, sentinel_version, short_input, dma_pin, dma_map, dma_pin_header, dma_count, dma_length, dma_owner, dma_alignment, dma_mask, dma_unmap, dma_unpin, dma_bounce } = .none,
+    dma_pinned: bool = false,
+    dma_mapped: bool = false,
+    dma_reported: bool = false,
     stage_allocations: u32 = 0,
     stage_prepared: bool = false,
     device_id: u16 = 0x2504,
@@ -437,6 +440,7 @@ fn log(text: [*:0]const u8) callconv(.c) void {
     if (std.mem.indexOf(u8, std.mem.span(text), "fwsec: catalog=parsed") != null) state.fwsec_reported = true;
     if (std.mem.indexOf(u8, std.mem.span(text), "fwsec: unavailable") != null) state.fwsec_rejected = true;
     if (std.mem.indexOf(u8, std.mem.span(text), "fwsec: cpu-image=prepared") != null) state.stage_prepared = true;
+    if (std.mem.indexOf(u8, std.mem.span(text), "fwsec: dma-image=staged") != null) state.dma_reported = true;
     const value = std.mem.span(text);
     const marker = "bytes=64 hex=";
     if (std.mem.indexOf(u8, value, marker)) |index| {
@@ -619,10 +623,59 @@ fn collect() callconv(.c) i32 {
 }
 
 var fuse_words: [2][1024]u32 = .{.{0} ** 1024} ** 2;
-test "NVIDIA actual driver lifecycle measures GA106 fuses and owns a CPU-only FWSEC image through failures" {
+fn fwsecPin(address: u64, bytes: u32, flags: u32, out: *a.DmaPinnedBuffer) callconv(.c) i32 {
+    std.debug.assert(state.stage_prepared and stage_backing != null and !state.dma_pinned and !state.dma_mapped);
+    std.debug.assert(address == @intFromPtr(stage_backing.?.ptr) and bytes == 1280 and flags == 0);
+    if (state.fuse_fault == .dma_pin) return -1;
+    state.dma_pinned = true;
+    out.* = .{ .handle = 0x900000001, .virt_addr = address, .bytes = bytes, .page_count = @intCast(((address & 4095) + bytes + 4095) / 4096) };
+    if (state.fuse_fault == .dma_pin_header) out.flags = 1;
+    return 0;
+}
+fn fwsecMap(pin: *const a.DmaPinnedBuffer, constraints: *const a.DmaConstraints, direction: u32, out: *a.DmaMapping) callconv(.c) i32 {
+    std.debug.assert(state.dma_pinned and !state.dma_mapped and pin.handle == 0x900000001);
+    std.debug.assert(constraints.dma_mask == 0x1ffffffffffff and constraints.max_segments == 1 and constraints.alignment == 256 and
+        constraints.max_segment_bytes == 1280 and constraints.boundary == 0 and constraints.flags == 5 and direction == 1);
+    if (state.fuse_fault == .dma_map) return -1;
+    state.dma_mapped = true;
+    out.* = .{ .handle = 0xa00000001, .pin_handle = pin.handle, .requested_bytes = pin.bytes, .mapped_bytes = pin.bytes, .direction = direction, .flags = constraints.flags, .segment_count = 1 };
+    out.segments[0] = .{ .phys_addr = 0x1234567800, .bytes = pin.bytes };
+    switch (state.fuse_fault) {
+        .dma_count => out.segment_count = 2,
+        .dma_length => out.segments[0].bytes -= 1,
+        .dma_owner => out.pin_handle += 1,
+        .dma_alignment => out.segments[0].phys_addr += 1,
+        .dma_mask => out.segments[0].phys_addr = 0x2000000000000,
+        .dma_bounce => {
+            out.segments[0].phys_addr = 0x4567800;
+            out.flags |= a.dma_mapping_flag_bounced;
+        },
+        else => {},
+    }
+    return 0;
+}
+fn fwsecUnmap(mapping: *a.DmaMapping) callconv(.c) i32 {
+    std.debug.assert(state.dma_pinned and state.dma_mapped and stage_backing != null and mapping.handle == 0xa00000001);
+    mapping.* = .{}; // A failure must not destroy the owner's retry descriptor.
+    if (state.fuse_fault == .dma_unmap) return -1;
+    state.dma_mapped = false;
+    return 0;
+}
+fn fwsecUnpin(pin: *a.DmaPinnedBuffer) callconv(.c) i32 {
+    std.debug.assert(state.dma_pinned and !state.dma_mapped and stage_backing != null and pin.handle == 0x900000001);
+    pin.* = .{};
+    if (state.fuse_fault == .dma_unpin) return -1;
+    state.dma_pinned = false;
+    return 0;
+}
+test "NVIDIA actual driver lifecycle measures GA106 fuses and retains FWSEC DMA mappings before CPU backing" {
     var api = apiTable();
     api.version = 31;
     api.heap_query = cpuQuery;
+    api.dma_pin_buffer = fwsecPin;
+    api.dma_map_pinned = fwsecMap;
+    api.dma_unmap = fwsecUnmap;
+    api.dma_unpin_buffer = fwsecUnpin;
     inline for (std.meta.tags(@TypeOf(state.fuse_fault))) |fault| {
         state = .{ .rom_fixture = true, .fuse_fixture = true, .fuse_fault = fault };
         cpu_closed = false;
@@ -641,23 +694,25 @@ test "NVIDIA actual driver lifecycle measures GA106 fuses and owns a CPU-only FW
         fuse_words[0][0x74c / 4] = if (fault == .debug_missing) 0 else if (fault == .sentinel_debug) 0xffffffff else 1;
         fuse_words[1][0x1e0 / 4] = if (fault == .signature) 5 else if (fault == .sentinel_version) 0xffffffff else 8;
         const initial_fuses = fuse_words;
-        const failed_cleanup = fault == .unmap_debug or fault == .unmap_version or fault == .collect or fault == .release;
+        const dma_case = @intFromEnum(fault) >= @intFromEnum(@TypeOf(fault).dma_pin);
+        const failed_cleanup = fault == .unmap_debug or fault == .unmap_version or fault == .collect or fault == .release or fault == .dma_unmap or fault == .dma_unpin;
         try t.expectEqual(@as(i32, if (failed_cleanup) -10 else 0), driver.nvidia_init(&api));
         try t.expect(state.rom_reported and state.fwsec_reported and state.fuse_seen);
-        try t.expectEqual(fault == .none or fault == .release, state.stage_prepared);
-        try t.expectEqual(@as(u32, if (fault == .none or fault == .release or fault == .allocation) 1 else 0), state.stage_allocations);
+        try t.expectEqual(fault == .none or fault == .release or dma_case, state.stage_prepared);
+        try t.expectEqual(fault == .none or fault == .release or fault == .dma_unmap or fault == .dma_unpin or fault == .dma_bounce, state.dma_reported);
+        try t.expectEqual(@as(u32, if (fault == .none or fault == .release or fault == .allocation or dma_case) 1 else 0), state.stage_allocations);
         try t.expectEqualSlices(u8, &rom, prom_bytes[0..rom.len]);
         if (fault != .unstable) try t.expectEqualDeep(initial_fuses, fuse_words);
         if (failed_cleanup) {
             try t.expect(cpu_backing != null);
             try t.expectEqual(@as(i32, -1), driver.nvidia_shutdown());
-            if (fault == .release) try t.expect(stage_backing != null);
+            if (fault == .release or fault == .dma_unmap or fault == .dma_unpin) try t.expect(stage_backing != null);
             state.fuse_fault = .none;
         }
         try t.expectEqual(@as(i32, 0), driver.nvidia_shutdown());
         try t.expectEqual(@as(i32, 0), driver.nvidia_shutdown());
         try t.expect(cpu_backing == null and stage_backing == null and !state.prom_mapping and !state.private_mapping and
-            !state.fuse_mapping[0] and !state.fuse_mapping[1]);
+            !state.fuse_mapping[0] and !state.fuse_mapping[1] and !state.dma_pinned and !state.dma_mapped);
     }
 }
 

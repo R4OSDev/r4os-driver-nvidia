@@ -13,6 +13,12 @@ their original licenses in the separate workspace reference archive.
 Fixture firmware bodies and signatures are synthetic; selected measured table
 metadata is regression data documented in PROVENANCE.txt.
 
+The 0.1.20 FWSEC DMA mapper and load-parameter validator are original R4OS
+code. The pinned NVIDIA GA102 loader, GA106 HAL dispatch and register headers
+are reference material, retained unchanged with their complete notices in
+`ExFiles/Reference/GFX/Nvidia/0.79.10/fwsec-dma-20260910`. No additional NVIDIA
+implementation, header or firmware is linked or vendored by this checkpoint.
+
 Since module 0.1.9, `ThirdParty/Nvidia570.144` vendors 19 unchanged original
 MIT header files (236,096 bytes) from NVIDIA Open GPU Kernel Modules 570.144,
 commit 8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f. `ORIGIN.json` lists each

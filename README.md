@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-Passive NVIDIA display driver for R4OS. Module 0.1.19; original R4OS code is
+Passive NVIDIA display driver for R4OS. Module 0.1.20; original R4OS code is
 Apache-2.0, with selected original MIT headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
 subsystem 1458:4074, VBIOS 94.06.2f.00.d6. Preparation for 0.79.10 continues.
@@ -37,15 +37,30 @@ After closing those mappings, a separate resident CPU allocation receives a
 copy of the selected image, its 24-byte SB input, initial command `19` and
 384-byte signature. Every bound and overlap is checked before writing. The
 ROM and firmware output/workspace declarations remain untouched. The image
-is hashed and freed during init; no GPU address, DMA upload or authentication
-is established. FRTS command encoding is covered separately, including its
+is hashed before DMA staging and freed during init. FRTS encoding is covered
+separately, including its
 48-byte ABI and zero padding; actual FRTS allocation and execution remain open.
 Failed unmap/collect/free retains its exact owner for shutdown retry.
-OssiPC now confirms debug-disable `00000001`, ucode 9 version raw `00000003`
+The 0.1.19 OssiPC check confirmed debug-disable `00000001`, ucode 9 version raw `00000003`
 (version 2), production entry 9 and the 384-byte signature at ROM `4153c`.
 Its 59,904-byte SB image is prepared and released successfully. Bootfb stays
 at generation 1/reset 0, buffer/queue resources balance and all 14 automatic
 services run. This is CPU preparation; no GPU firmware has been started.
+
+Module 0.1.20 stages that immutable image through the existing R4D pin/map
+API. A 256-byte-aligned CPU allocation is mapped coherently to the device
+under the Falcon's 49-bit address limit. Exactly one physical segment is
+required; the kernel can provide its bounded bounce fallback for fragmented
+pages. Mapping performs the device synchronization. CPU pointers are never
+substituted for DMA addresses. Both original GA102 transfer ranges (also used
+by GA106), 256-byte blocks, 24-bit TCM offsets, IMEM virtual bias, V3's absent
+DMEM virtual tag and PKC placement are validated before publishing a plan.
+No GPU address is submitted and no firmware is executed. Current TCM capacity,
+Falcon reset, authentication and recovery still need native implementation.
+Cleanup retires the mapping, its pin and then CPU backing; each failed release
+retains the exact descriptor for shutdown retry. SB is the original unload
+command that restores pre-OS applications, not proof of GSP startup. The native
+startup path needs an owned FRTS/WPR region, FWSEC-FRTS and the GSP boot chain.
 
 The explicit `prepare-bootstrap` step exports 26 original GA102 GSP/Booter and
 TU102 SEC2 reference artifacts from the same 570.144 source pin. It verifies a

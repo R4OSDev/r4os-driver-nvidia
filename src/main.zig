@@ -320,6 +320,19 @@ fn inspectFwsec(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.
     log("NVIDIA fwsec: cpu-image=prepared bytes={d} command={x} input-bytes=24 image-sha256={s} gpu-address=none gpu-authentication=unverified submitted=no", .{
         prepared.metadata.bytes, prepared.metadata.command, fwsec.sha256(prepared.image, .{ .bytes = prepared.metadata.bytes }) catch unreachable,
     });
+    const load_plan = fwsec_cpu.device.stage(ctx, prepared.image, &prepared.metadata) catch |err| {
+        log("NVIDIA fwsec: preparation=unavailable phase=dma-image reason={s} firmware-ready=no fallback=preserved", .{@errorName(err)});
+        return fwsec_cpu.close();
+    };
+    log("NVIDIA fwsec: dma-image=staged bytes={d} segments=1 address={x} bounced={} direction=to-device synchronized=yes submitted=no", .{
+        prepared.metadata.bytes, fwsec_cpu.device.mapping.segments[0].phys_addr, (fwsec_cpu.device.mapping.flags & a.dma_mapping_flag_bounced) != 0,
+    });
+    log("NVIDIA fwsec: load-plan=validated imem-base={x} imem-destination={x} imem-offset={x} imem-blocks={d} imem-command={x}", .{
+        load_plan.imem.base, load_plan.imem.destination, load_plan.imem.source_offset, load_plan.imem.bytes / 256, load_plan.imem.command,
+    });
+    log("NVIDIA fwsec: dmem-base={x} dmem-destination={x} dmem-offset={x} dmem-blocks={d} dmem-command={x} pkc-address={x} boot-vector={x} execution=not-started", .{
+        load_plan.dmem.base, load_plan.dmem.destination, load_plan.dmem.source_offset, load_plan.dmem.bytes / 256, load_plan.dmem.command, load_plan.signature_address, load_plan.boot_vector,
+    });
     if (!fwsec_cpu.close()) return false;
     log("NVIDIA fwsec: preparation-cleanup=OK resources=0", .{});
     log("NVIDIA fwsec: firmware-ready=no native-writes=disabled fallback=preserved", .{});

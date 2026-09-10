@@ -9,6 +9,28 @@ Boardanschluesse. Die spaeteren PROM-Boots bestaetigen softwareseitig den
 unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
+FWSEC-DMA-Staging (NVIDIA 0.1.20, 0.79.10)
+-----------------------------------------
+Die vorbereitete CPU-Kopie wird mit 256-Byte-Ausrichtung angelegt und ueber
+die vorhandene R4D-Pin-/Mapping-API fuer einen lesenden GPU-Zugriff abgebildet.
+Die DMA-Grenze umfasst 49 Bits; verlangt wird genau ein physischer Abschnitt.
+Bei fragmentierten CPU-Seiten darf der vorhandene Kernel einen begrenzten
+Bounce-Puffer verwenden. Das Mapping synchronisiert die vollstaendigen
+vorbereiteten Bytes. Eine CPU-Adresse wird niemals als DMA-Adresse verwendet.
+
+Der Ladeplan folgt kgspExecuteHsFalcon_GA102 aus NVIDIA 570.144, laut HAL auch
+fuer GA106. IMEM/DMEM werden in vollstaendigen 256-Byte-Bloecken beschrieben;
+24-Bit-Zielgrenzen, 32-Bit-Quelloffsets und der IMEM-VA-Abzug werden vorab
+geprueft. V3 hat keine DMEM-VA und setzt kein DMTAG. Die PKC-Position stammt
+aus dem validierten Deskriptor. Unmap, Unpin und CPU-Free erfolgen in dieser
+Reihenfolge; bei Fehler bleiben die genauen Ressourcen fuer Shutdown erhalten.
+
+Dieser Stand reicht keine Adresse an die GPU weiter. TCM-Kapazitaet, Reset,
+GPU-Uebertragung, Authentifizierung und Wiederherstellung bleiben offen.
+SB dient im Original dem Wiederherstellen der Pre-OS-Anwendungen beim Unload.
+Der GSP-Start benoetigt stattdessen insbesondere einen tatsaechlich besessenen
+FRTS-/WPR-Bereich, FWSEC-FRTS und die nachfolgende GSP-Bootkette.
+
 FWSEC-Auswahl und CPU-Vorbereitung (NVIDIA 0.1.19, 0.79.10)
 ---------------------------------------------------------
 Die tatsaechliche GA106-Identitaet und ein gemessener BAR0-Bereich bis

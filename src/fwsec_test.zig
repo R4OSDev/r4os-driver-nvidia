@@ -3,6 +3,46 @@ const t = std.testing;
 const fwsec = @import("fwsec.zig");
 const vbios = @import("vbios.zig");
 const preparation = @import("fwsec_prepare.zig");
+const load = @import("fwsec_load.zig");
+
+test "FWSEC DMA plan preserves high address bits and rejects truncated or wrapping transfers" {
+    const rom = ga106Fixture();
+    const board = try vbios.parse(&rom, 0x2504);
+    var image: [1280]u8 = undefined;
+    const prepared = try preparation.prepare(&rom, &board, .{ .debug_disable_raw = 1, .ucode_version_raw = 8, .ucode_id = 9 }, .sb, &image);
+    const address: u64 = 0x1234567800;
+    const result = try load.plan(&prepared, address, image.len);
+    try t.expectEqual(address, result.imem.base);
+    try t.expectEqual(address + 256, result.dmem.base);
+    try t.expectEqual(@as(u32, 0x614), result.imem.command);
+    try t.expectEqual(@as(u32, 0x600), result.dmem.command);
+    try t.expectEqual(@as(u32, 512), result.signature_address);
+    var relocated = prepared;
+    relocated.selection.entry.imem_va = 0x1000;
+    relocated.selection.entry.imem_pa = 0x2000;
+    const remapped = try load.plan(&relocated, address, image.len);
+    try t.expectEqual(address, remapped.imem.base + remapped.imem.source_offset);
+    try t.expectEqual(@as(u32, 0x2000), remapped.imem.destination);
+    try t.expectError(error.Address, load.plan(&relocated, 256, image.len));
+    try t.expectError(error.Bounds, load.plan(&prepared, address, image.len - 1));
+    for ([_]u64{ 0, load.dma_mask - 255, load.dma_mask + 1, std.math.maxInt(u64) }) |invalid|
+        try t.expectError(error.Address, load.plan(&prepared, invalid, image.len));
+    try t.expectError(error.Alignment, load.plan(&prepared, address + 1, image.len));
+    for (0..6) |fault| {
+        var invalid = prepared;
+        const entry = &invalid.selection.entry;
+        switch (fault) {
+            0 => entry.imem_pa = 0x1000000,
+            1 => entry.dmem_pa = 0xffff00,
+            2 => entry.code.bytes -= 1,
+            3 => entry.data.offset += 256,
+            4 => entry.signature_slot.offset = entry.data.offset + entry.data.bytes,
+            5 => entry.ucode_id = 0,
+            else => unreachable,
+        }
+        if (load.plan(&invalid, address, image.len)) |_| return error.UnexpectedLoadPlan else |_| {}
+    }
+}
 
 pub fn ga106Fixture() [8192]u8 {
     var rom = fixture(3);

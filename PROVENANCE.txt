@@ -3,6 +3,19 @@ Host/module scaffolding follows R4OS SDK and existing R4D owners.
 Firmware fixture bodies and signatures are synthetic. Selected measured
 table fields are explicit regression data, as described below.
 
+0.79.10 FWSEC DMA staging (NVIDIA 0.1.20), 10.09.2026:
+fwsec_load.zig and fwsec_dma.zig are original R4OS implementations. The same
+570.144 pin supplies kernel_gsp_falcon_ga102.c (DMA base calculation, block
+size and commands), kernel_gsp_fwsec.c (V3 layout and invalid DMEM VA),
+g_kernel_gsp_nvoc.c (GA106 dispatch) and published/ampere/ga102/dev_falcon_v4.h
+(49-bit DMA base, 24-bit TCM and 32-bit source-offset fields).
+kernel_gsp_tu102.c establishes SB as the unload/pre-OS restoration command
+and FRTS as part of native startup; kernel_gsp_frts_tu102.c defines both.
+Complete unchanged original files, COPYING and hashes accompany the new
+fwsec-dma-20260910 reference checkpoint. No NVIDIA routine or extra header is
+linked into the module. The existing R4D DMA API supplies memory ownership,
+synchronization and optional bounce backing; no Linux DMA code is copied.
+
 0.79.10 FWSEC preparation (NVIDIA 0.1.19), 10.09.2026:
 fwsec_prepare.zig, fwsec_probe.zig and fwsec_storage.zig are original R4OS
 implementations. The same pinned 570.144 sources establish these facts:
