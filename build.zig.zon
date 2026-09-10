@@ -26,6 +26,7 @@
         "build.zig.zon",
         "src",
         "Tools",
+        "Tests",
 
         "module.R4MF",
         "PROVENANCE.txt",

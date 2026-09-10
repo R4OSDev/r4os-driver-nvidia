@@ -86,10 +86,14 @@ try {
     $report.compile_complete=$true
     & $pwsh -NoProfile -File (Join-Path $PSScriptRoot 'Rm/Shaders.ps1') -Compiler $zig -SourceDirectory $snapshot -OutputDirectory $runRoot -XzPath $XzPath
     if($LASTEXITCODE -ne 0){throw 'Original NVKMS shader preparation failed; see shaders/ logs'}
+    & $pwsh -NoProfile -File (Join-Path $PSScriptRoot 'Rm/Adapter.ps1') -Compiler $zig -OutputDirectory $runRoot
+    if($LASTEXITCODE -ne 0){throw 'R4OS CPU memory adapter build or host acceptance failed; see adapter/ logs'}
     & $pwsh -NoProfile -File (Join-Path $PSScriptRoot 'Rm/Link.ps1') -Compiler $zig -SourceDirectory $snapshot -OutputDirectory $runRoot
     if($LASTEXITCODE -ne 0){throw 'RM/NVKMS partial link failed; see link-results.json and component link logs'}
     $report.partial_links_complete=$true
     $report.shader_payloads_added=$true
+    $report.os_adapter_added=$true
+    $report.os_adapter=Get-Content -Raw -LiteralPath (Join-Path $runRoot 'os-adapter-results.json')|ConvertFrom-Json
     $report.shaders=Get-Content -Raw -LiteralPath (Join-Path $runRoot 'shader-results.json')|ConvertFrom-Json
     $components=@();$symbolTables=@{}
     foreach($unit in @('nvidia','nvidia-modeset')){
@@ -107,6 +111,7 @@ try {
                 '^nvswitch_' {'nvswitch_os';break}
                 '^os_' {'rm_os';break}
                 '^nv_' {'rm_platform';break}
+                '^r4nv_' {'r4os_driver_runtime';break}
                 default {'runtime_and_globals'}
             }
             if(!$groups.Contains($group)){$groups[$group]=0};$groups[$group]++
@@ -125,7 +130,7 @@ try {
     $report.duplicate_global_definition_candidates=@($symbolTables['nvidia-modeset'].defined|Where-Object {$rmNames.Contains($_.name)}|ForEach-Object {$_.name})
     $report.upstream_memcpy_memset_localization_applied=$false
     $report.components=$components;$report.audit_complete=$true
-    Write-Host 'Original RM/NVKMS source build, shaders and dependency inspection completed. OS callbacks and a final R4D link are still required.'
+    Write-Host 'Original RM/NVKMS sources, shaders and CPU memory adapters built and inspected. Remaining OS callbacks, the driver heap provider and a final R4D link are still required.'
 } catch {
     $report.error=$_.Exception.Message
     throw

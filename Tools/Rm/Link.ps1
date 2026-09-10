@@ -13,6 +13,8 @@ $zig=[IO.Path]::GetFullPath($Compiler)
 $plan=Get-Content -Raw -LiteralPath (Join-Path $outputRoot 'compile-plan.json')|ConvertFrom-Json
 $results=Get-Content -Raw -LiteralPath (Join-Path $outputRoot 'compile-results.json')|ConvertFrom-Json
 $shaders=Get-Content -Raw -LiteralPath (Join-Path $outputRoot 'shader-results.json')|ConvertFrom-Json
+$adapter=Get-Content -Raw -LiteralPath (Join-Path $outputRoot 'os-adapter-results.json')|ConvertFrom-Json
+if($adapter.schema -ne 1 -or $adapter.subset -cne 'cpu-memory-and-strings' -or $adapter.components.Count -ne 2 -or !$adapter.host_acceptance.passed -or $adapter.runtime_complete -or $adapter.driver_heap_provider_implemented -or $adapter.gpu_executed -or $adapter.module_installed){throw 'Verified CPU memory adapter subset is required'}
 if($shaders.schema -ne 1 -or $shaders.families -ne 8 -or $shaders.payloads.Count -ne 8 -or $shaders.gpu_executed){throw 'Complete verified shader payloads are required'}
 if($results.completed -ne $plan.translation_units.Count -or $results.failed -ne 0 -or $results.not_executed -ne 0){throw 'Compilation must complete before link audit'}
 $byId=[Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
@@ -35,6 +37,9 @@ foreach($component in $plan.components) {
     $idCode=Invoke-RmNative -Executable $zig -Arguments (@('cc')+$flags+@('-c',$generated,'-o',$idObject)) -WorkingDirectory $outputRoot -LogPath (Join-Path $outputRoot ($unit+'-id.log'))
     if($idCode -ne 0){throw "ID compilation failed $unit"}
     $objects+=$idObject
+    $memory=@($adapter.components|Where-Object {$_.component -ceq $unit})
+    if($memory.Count -ne 1 -or (Get-FileHash -LiteralPath $memory[0].object).Hash.ToLowerInvariant() -cne $memory[0].sha256){throw 'Memory adapter object changed after verification'}
+    $objects+=$memory[0].object
     if($unit -eq 'nvidia-modeset'){
         foreach($payload in $shaders.payloads){
             if(!$payload.upstream_decoder_verified -or !$payload.exact_metadata_extent_verified -or !$payload.readonly_data -or $payload.symbols.Count -ne 2 -or (Get-FileHash -LiteralPath $payload.object).Hash.ToLowerInvariant() -cne $payload.object_sha256){throw 'Shader object changed after verification'}
@@ -56,7 +61,7 @@ foreach($component in $plan.components) {
     }
     $arguments+=@(('@'+$response),'-o',$output)
     $code=Invoke-RmNative -Executable $zig -Arguments $arguments -WorkingDirectory $outputRoot -LogPath (Join-Path $outputRoot ($unit+'-link.log'))
-    $record=[ordered]@{component=$unit;exit_code=$code;input_objects=$objects.Count;generated_id=$idSymbol;partial_link=$true;runtime_complete=$false;shader_payloads_added=($unit -eq 'nvidia-modeset');os_adapter_added=$false}
+    $record=[ordered]@{component=$unit;exit_code=$code;input_objects=$objects.Count;generated_id=$idSymbol;partial_link=$true;runtime_complete=$false;shader_payloads_added=($unit -eq 'nvidia-modeset');os_adapter_added=$true;os_adapter_subset=$adapter.subset}
     if($code -eq 0){$record.bytes=(Get-Item -LiteralPath $output).Length;$record.sha256=(Get-FileHash -LiteralPath $output).Hash.ToLowerInvariant()}
     $proof+=$record
     Write-Host "$unit partial link: exit=$code"

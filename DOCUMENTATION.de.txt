@@ -251,7 +251,8 @@ Fehlversuche bleiben mit ihren Logs erhalten und ueberschreiben nie einen
 vorherigen Erfolg. Neue permanente Gatefamilien werden nicht angelegt.
 
 Alle 1196 Dateien und beide partiellen Links laufen auf dem Debian-Host.
-RM besitzt 340 offene Symbole, NVKMS nach Einbettung der Shader noch 54.
+Mit den unten beschriebenen CPU-Speicheradaptern bleiben 334 offene Symbole
+im RM und 47 in NVKMS, einschliesslich zweier privater R4OS-Heapimports.
 Davon sind 60 SPDM-Kryptofunktionen im RM. Die Crypto-Grenze wird in
 Linux durch kernel-open/nvidia/libspdm_*.c an die Linux Crypto API gebunden;
 diese Betriebssystemimplementierungen sind nicht Teil des gewaehlten src-
@@ -289,9 +290,48 @@ keine Shaderausfuehrung und kein GPU- oder R4OS-Laufzeit-Allocator.
 Die acht Originaldateien haben zusammen 1835264 Bytes; XZ Utils 5.8.1 erzeugt
 153676 Bytes. Die ELF-Einbettung ist allokierbare, nicht schreibbare und nicht
 ausfuehrbare .rodata mit 16-Byte-Ausrichtung. Die sechzehn Originalsymbole
-werden im partiellen NVKMS-Link aufgeloest. Die uebrigen 52 nvkms_-Funktionen
-sowie memcpy und memset bleiben offen. shader-results.json dokumentiert
+werden im partiellen NVKMS-Link aufgeloest. Nach diesem Shader-Schritt waren
+52 nvkms_-Funktionen sowie memcpy und memset offen; der nachfolgende
+Speicheradapter verkleinert diese Liste. shader-results.json dokumentiert
 Quell-/Metadaten-/Kompressor-/Objekthashes und den erfolgreichen Decoderlauf.
 CRC-fehlerhafter Header, Trunkierung, Anhang und abweichende Nutzdaten werden
 im vorhandenen Hostpfad abgewiesen. Neue permanente Gatefamilien entstehen
 nicht; RM-/NVKMS-Objekte werden weiterhin nicht in NVIDIA.R4D installiert.
+
+CPU-Speicher- und C-Schnittstellen des OS-Adapters
+------------------------------------------------
+src/rm/os_memory.c und nvkms_memory.c implementieren 17 echte Funktionen
+gegen die unveraenderten Originalprototypen. Kopie/Fuellen verwenden x86_64-
+Integerregister, wortweise REP-Operationen und exakte Bytetails. So entsteht
+keine Rekursion ueber die originalen gcc_helper.c-Funktionen memcpy/memset.
+Ueberlappendes memmove kopiert bei Bedarf rueckwaerts, ohne das Direction
+Flag zu setzen. Vergleiche behandeln Bytes unsigned; strncpy behaelt seine
+Nullauffuellung und darf einen auf n begrenzten Text ohne Abschluss kopieren.
+Diese Funktionen sind fuer CPU-RAM bestimmt; MMIO und DMA bleiben getrennt.
+
+Allokation normalisiert null Bytes auf ein Byte, meldet NULL/NO_MEMORY bei
+Fehler und gibt NvU64-Umfaenge ohne 32-Bit-Kuerzung weiter. NVKMS zero fuellt
+nur die angeforderte Nutzlast. Release verwendet die Autoritaet des
+Speicheranbieters, nicht eine vom Aufrufer rekonstruierte Speicherklasse.
+Die zwei privaten Imports r4nv_heap_allocate/free bleiben im Zielobjekt offen.
+Ihr kuenftiger R4OS-Anbieter muss residenten, 16-Byte-ausgerichteten und an
+den Treiber gebundenen Speicher liefern, Close-Admission beachten und einen
+fehlgeschlagenen Rueckbau behalten. Ein solcher Anbieter ist hier noch
+nicht implementiert; auch Mutex-/IRQ-/Workeranbindung bleiben offen.
+
+Tools/Rm/Adapter.ps1 kopiert die eigenen C-Quellen in den privaten Versuch,
+kompiliert mit den jeweiligen RM-/NVKMS-Flags und prueft die Objektimporte.
+Ausser den beiden privaten Heapimports sind darin keine Laufzeitimporte,
+TLS-Daten oder automatischen Initialisierer erlaubt. Erst der bestandene
+Hosttest erlaubt die Aufnahme der zwei Adapterobjekte in die Teilobjekte.
+
+Tests/RmMemory.c prueft echte Funktionen mit einem Host-Testallocator,
+Fehlinjektion, Ausrichtungs-/Release-Canaries, 64-Bit-Umfaengen, unaligned
+Kopien, Ueberlappung, unsigned Vergleichen und Nullabschluss/-auffuellung.
+Nicht zugaengliche Randseiten erkennen Zugriffe ausserhalb exakter Spannen.
+Unter Linux x86_64 laufen die tatsaechlichen Freestanding-Objekte des
+Quellbaus; Windows baut dieselben C-Quellen fuer seine Host-ABI. Der Test-
+allocator gelangt niemals in die Zielobjekte. Er ersetzt weder R4OS-Heap
+noch Hardwareabnahme. Der Test gehoert nur zum expliziten build-rm-Step;
+der normale unit-test bleibt bei 13 Faellen. Tests.json erfasst diesen
+gezielten Component-Test, ohne einen weiteren Workspace-/Gastlauf anzulegen.

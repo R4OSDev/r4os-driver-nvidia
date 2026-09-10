@@ -79,6 +79,24 @@ The verifier uses real host memory functions for the original allocation/copy
 hooks; it is not an R4OS driver runtime or a GPU execution test. Shader bytes
 and compiled objects stay in the private source-build tree.
 
+The source build also compiles `src/rm/os_memory.c` and `nvkms_memory.c`
+against the original OS interface headers: seventeen actual CPU allocation,
+copy, fill, move, compare and string adapters. Integer-register copies avoid
+recursion through RM's own `gcc_helper.c` memcpy/memset wrappers and preserve
+exact byte spans without SIMD. The private `r4nv_heap_allocate/free` imports
+remain unresolved until a real resident, owner-bound R4OS heap provider exists.
+These adapters do not supply synchronization, DMA, MMIO or GPU initialization.
+
+`Tests/RmMemory.c` runs as part of this explicit source build, with a real host
+test allocator, injected allocation failures and protected boundary pages.
+Linux x86_64 executes the exact freestanding adapter objects used in the
+partial links; Windows compiles the same C sources for its native host ABI.
+The host allocator is never linked into a target object. The resulting RM and
+NVKMS partial objects still have 334 and 47 unresolved imports, including both
+private heap functions. `os-adapter-results.json` records the source/object
+hashes, remaining imports and host-only acceptance. The ordinary thirteen-case
+`unit-test` and installed NVIDIA.R4D remain separate from this source port.
+
 The optional last inspector argument is the expected hexadecimal PCI device
 ID. The inspector reads at most 1 MB (1024 KB), writes JSON only on success,
 and records the source hash, checksum scope, active routes and unverified

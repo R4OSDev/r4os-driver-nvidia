@@ -88,3 +88,17 @@ The comparison to nvidia-3d/src/nvidia-3d-fermi.c preserves XZ_SINGLE and
 checks full input/output consumption and exact decoded bytes additionally.
 The same release's nvidia-3d-init.c defines the sixteen expected boundary
 symbols. The resulting readonly objects are partial-link inputs only.
+
+0.79.10 CPU memory adapter subset, 10.09.2026:
+src/rm/os_memory.c, nvkms_memory.c and memory.h are original R4OS code.
+The pinned os-interface.h and nvidia-modeset-os-interface.h provide the actual
+prototypes; kernel-open/nvidia/os-interface.c and
+kernel-open/nvidia-modeset/nvidia-modeset-linux.c are behavioral references,
+not copied Linux implementation code. The original RM gcc_helper.c wraps
+memcpy/memset through os_mem_copy/os_mem_set, so the R4OS integer-register
+implementations avoid calling those symbols recursively. No register map,
+MMIO, DMA, GPU execution or synchronization backend is implemented here.
+Tests/RmMemory.c uses host allocation and guard pages only in the host checker.
+Two private target heap imports remain deliberately unresolved. The original
+headers and licenses stay in the verified private source snapshot; no third-
+party source is added to this public repository by the adapter implementation.
