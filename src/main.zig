@@ -4,12 +4,13 @@ const identity = @import("identity.zig");
 const a = r4os.abi;
 var driver_api: ?*const a.DriverApi = null;
 var window: a.GfxMmioWindow = .{};
+var mapping_cleanup_needed = false;
 
 comptime {
     asm (r4os.r4dev.driverEntriesAsm("nvidia_init", "nvidia_shutdown"));
 }
 
-export fn nvidia_init(api: *const a.DriverApi) callconv(.c) i32 {
+pub export fn nvidia_init(api: *const a.DriverApi) callconv(.c) i32 {
     const ctx = r4os.r4dev.DriverContext.init(api);
     if (!ctx.apiCompatible() or driver_api != null) return -1;
     driver_api = api;
@@ -73,7 +74,7 @@ export fn nvidia_init(api: *const a.DriverApi) callconv(.c) i32 {
     return 0;
 }
 
-export fn nvidia_shutdown() callconv(.c) i32 {
+pub export fn nvidia_shutdown() callconv(.c) i32 {
     const api = driver_api orelse return 0;
     const ctx = r4os.r4dev.DriverContext.init(api);
     if (!releaseWindow(&ctx)) return -1;
@@ -92,9 +93,11 @@ fn readIdentity(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.
     // Only the two read-only boot dwords are accessed. No assumption about
     // display-engine compatibility follows from this bootstrap mapping.
     const request = a.GfxMmioRequest{ .resource_base = snapshot.bars[0].base, .resource_bytes = 4096, .byte_length = 4096, .cache_policy = a.gfx_buffer_cache_uncached };
+    // Failed maps can retain private partial mappings without a public handle.
+    mapping_cleanup_needed = true;
     if (memory.mmioMap(&request, &window) != a.gfx_buffer_result_ok) {
         ctx.logInfo("NVIDIA chip=unmeasured reason=identity-map-unavailable");
-        return true;
+        return releaseWindow(ctx);
     }
     if (window.cpu_address == 0 or window.byte_length < 8 or window.cpu_address & 3 != 0) return releaseWindow(ctx);
     const words: [*]const volatile u32 = @ptrFromInt(window.cpu_address);
@@ -110,11 +113,15 @@ fn readIdentity(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.
 }
 
 fn releaseWindow(ctx: *const r4os.r4dev.DriverContext) bool {
-    if (window.handle.id == 0) return true;
+    if (window.handle.id == 0 and !mapping_cleanup_needed) return true;
     const memory = ctx.memory() orelse return false;
     // No DMA or callbacks were admitted. All reads from this CPU map ended.
-    if (memory.mmioUnmap(&window.handle, 1) != a.gfx_buffer_result_ok) return false;
-    window = .{};
+    if (window.handle.id != 0) {
+        if (memory.mmioUnmap(&window.handle, 1) != a.gfx_buffer_result_ok) return false;
+        window = .{};
+    }
+    if (memory.collect() != a.gfx_buffer_result_ok) return false;
+    mapping_cleanup_needed = false;
     return true;
 }
 const ConfigReader = struct {

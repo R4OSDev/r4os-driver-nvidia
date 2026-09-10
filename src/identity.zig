@@ -195,7 +195,7 @@ fn extendedCaps(result: *Snapshot, reader: anytype) Error!void {
 
 pub const ProbeDecision = enum { identity_words_only, unknown_pci_id, decode_disabled, power_unavailable, invalid_bar };
 pub fn decision(snapshot: *const Snapshot) ProbeDecision {
-    if (snapshot.pci.device_id != 0x2504) return .unknown_pci_id;
+    if (!isDisplay(snapshot.pci) or snapshot.pci.device_id != 0x2504) return .unknown_pci_id;
     if (snapshot.command & 2 == 0) return .decode_disabled;
     if (snapshot.caps.power_state) |power| {
         if (power != 0) return .power_unavailable;

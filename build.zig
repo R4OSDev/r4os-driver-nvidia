@@ -9,7 +9,12 @@ pub fn build(b: *std.Build) void {
         .target = b.graph.host,
         .optimize = .ReleaseSafe,
     }) });
-    b.step("unit-test", "Passive PCI identity and bounded NVIDIA firmware parsing").dependOn(&b.addRunArtifact(unit).step);
+    const unit_step = b.step("unit-test", "Passive PCI identity and bounded NVIDIA firmware parsing");
+    unit_step.dependOn(&b.addRunArtifact(unit).step);
+    const lifecycle = b.createModule(.{ .root_source_file = b.path("src/lifecycle_test.zig"), .target = b.graph.host, .optimize = .ReleaseSafe });
+    lifecycle.addImport("r4os", sdk.createR4osModule(b.graph.host, .ReleaseSafe));
+    const lifecycle_test = b.addTest(.{ .root_module = lifecycle, .filters = &.{"NVIDIA actual driver lifecycle"} });
+    unit_step.dependOn(&b.addRunArtifact(lifecycle_test).step);
     const inspector = b.addExecutable(.{ .name = "nvbios-inspect", .root_module = b.createModule(.{
         .root_source_file = b.path("src/inspect.zig"),
         .target = b.graph.host,

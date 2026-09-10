@@ -119,7 +119,7 @@ fn checksum(bytes: []u8, index: usize) void {
     }
     bytes[index] = 0 -% sum;
 }
-fn fixture() [1024]u8 {
+pub fn fixture() [1024]u8 {
     var rom: [1024]u8 = .{0} ** 1024;
     put16(&rom, 0, 0xaa55);
     rom[2] = 2;

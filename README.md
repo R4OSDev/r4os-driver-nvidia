@@ -50,3 +50,9 @@ current NVIDIA, DISPLAYD and normal Test artifacts. It is not a hardware test.
 See `DOCUMENTATION.de.txt`, `PROVENANCE.txt`, `LICENSE`, `NOTICE` and
 `THIRD_PARTY_NOTICES.md`. RM/NVKMS/GSP 570.144 is the selected future bringup
 baseline; this passive stage embeds none of those components or binaries.
+
+The same `unit-test` step also runs the actual driver init/shutdown functions
+against the real SDK facade and a simulated DriverApi. Unadmitted callbacks
+trap; unknown-device refusal, repeated init/shutdown, failed public unmap and
+retained private partial mappings are exercised. This verifies software
+lifetime decisions without claiming physical MMIO or board acceptance.

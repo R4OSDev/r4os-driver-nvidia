@@ -71,3 +71,11 @@ synthetischen Datei. Diese Datei stammt von keiner echten Grafikkarte.
 Der bestehende Distribution-Grafiklauf bietet nvidia-passive fuer Laden,
 Fehllade-Cleanup, Diagnoseexport und bootfb ohne NVIDIA. Echte Bind-/Unbind-
 und Board-/VBIOS-/IRQ-Abnahmen bleiben offen, bis passende Hardware da ist.
+
+Neun gezielte Besitzerfaelle: acht Parser-/PCI-Faelle plus ein ausgewaehlter
+Test der echten R4D-Ein-/Ausstiegsfunktionen mit echter SDK-Fassade und
+simulierter DriverApi. Nicht freigegebene API-Aufrufe loesen einen Testfehler
+aus. Fehlgeschlagene Maps koennen ohne oeffentlichen Handle private Teilmaps
+behalten. mapping_cleanup_needed verlangt daher Collect auch ohne Handle;
+fehlerhafter Collect/Unmap verhindert Shutdown und erneutes Init. Derselbe
+Pfad gibt nach aufgehobenem Fehler frei, mehrfacher Shutdown bleibt harmlos.
