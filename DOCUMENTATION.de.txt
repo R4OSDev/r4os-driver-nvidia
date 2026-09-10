@@ -1,0 +1,73 @@
+﻿NVIDIA: passiver Besitzer fuer 0.79.9
+===================================
+
+Stand: 10.09.2026; Unterversion noch offen. OssiPC ist offline. Kein nativer
+NVIDIA-/HDMI-/Audiopfad wird durch diesen Stand als unterstuetzt ausgegeben.
+
+Der R4D-Loader bindet den echten DriverApi-Owner waehrend Init und Shutdown.
+Der Treiber liest den kanonischen PCI-Bestand genau einmal, maximal 4096
+Eintraege, acht Displayfunktionen und 32 NVIDIA-HDA-Funktionen. HDA-Zuordnung
+verlangt denselben Buszugriffsweg, Bus und Slot sowie eine andere Funktion.
+Dies belegt eine Geschwisterfunktion, keinen erkannten TV-Audioempfaenger.
+
+identity.zig besitzt ausschliesslich einen lesenden Konfigurationszugriff.
+Es prueft Identitaet, Type-0-Header, Klasse, Revision, Subsystem, Command,
+sechs BAR-Dwords, ROM-Basis/Enable und endliche Capabilitylisten. 64-Bit-BARs
+behalten ihre oberen Bits und belegen den Folgeslot. Eine Groesse von null
+bedeutet ungemessen; weder Basisadresse noch Maskierung beweisen eine Groesse.
+Nur ECAM (bus_kind=2), PCIe und eine passende ReBAR-v1-Capability erlauben
+die aktuelle Groesse aus dem Auswahlfeld. Legacy (bus_kind=1) liest niemals
+oberhalb 0xFC. Unterversion 0.79.9 schreibt keinerlei PCI-Konfiguration.
+
+Zulassung und Registergrenzen
+----------------------------
+PCI 10de:2504 ist nur ein Bootstrap-Kandidat, kein Beweis fuer GA106/Board.
+Die ersten zwei PMC-Dwords NV_PMC_BOOT_0/1 auf BAR0+0/+4 sind die einzigen
+MMIO-Lesestellen. Der primaere NVIDIA-Registerverweis beschreibt den PMC-
+Bereich 0..0xFFF. Der Owner mappt eine UC-Seite, liest BOOT0/BOOT1/BOOT0,
+vergleicht die Identitaet und gibt den eigenen Mappinghandle sofort frei.
+Ein unklarer Unmap behaelt Handle und Modul fuer denselben Shutdownpfad.
+Es werden keine asynchronen Arbeiten oder DMA-Nutzungen angelegt.
+
+Erst gemessenes Chip-ID 0x176 ohne Architektur-Erweiterungs-/vGPU-Abweichung
+waehlt ga106-identity-only. Andere Chips bleiben unzugeordnet; der gemessene
+Rohwert bleibt sichtbar. BAR-Gesamtgroesse, Displayinstanz, Straps, Boardname
+und Firmwarepaarung werden daraus nicht erfunden. Insbesondere sind NV_PMC_
+ENABLE (0x200), Device-Enable, BAR-/PRAMIN-Fenster, PBUS/PFB/MMU, PFIFO/PBDMA,
+GSP/Falcon, PDISP/SOR/PIOR, I2C/DPAUX und ROM-Shadow-Schalter nicht freigegeben.
+Gemeinsame Klassen- oder Headernamen begruenden keine Registerkompatibilitaet.
+Ein Registerprofil mit Schreibfaehigkeit existiert in diesem Stand nicht.
+
+VBIOS und Grenzen
+-----------------
+vbios.zig arbeitet ohne Allokation, I/O oder globale Teilveroeffentlichung
+auf einem unveraenderlichen Caller-Slice. Maximal 1 MB und 16 verkettete
+Images. PCI-ROM/PCIR 2.2 und 3.0, genau ein x86-Image, getrennte EFI-Images;
+gegebenenfalls begrenzte PCIR-Gerateliste. Das x86-Initialisierungssegment
+und der BIT-Header besitzen ihre jeweiligen Summenpruefungen. Das ist keine
+Signaturpruefung des Gesamt-ROM und keine Freigabe zur BIOS-Ausfuehrung.
+
+BIT 1.00: max. 64 Eintraege, Laengen/Version/Mehrdeutigkeiten; BIOS-Version
+aus fuenf Bytes eines i-v2-Eintrags. DCB 4.0/4.1: max. 32 Eintraege, bekannte
+Signatur und feste acht Byte je Route; Skip/EOL und Rohwerte bleiben korrekt.
+CCB 4.1: I2C-/AUX-Controllerindex 0x1F bedeutet unbenutzt. Anschlussreferenzen
+verwenden Connector-Tabellen 3.0/4.0. Fehlende oder ungueltige Querverweise
+und ueberlappende ausgewertete Tabellen verwerfen den Befund vollstaendig.
+CCB 4.0/Legacy-DCB, BIT-b-Sondersemantik und unbekannte Versionen werden noch
+abgelehnt; es gibt keine stillen Ersatzwerte oder erratenen TV-Anschluesse.
+
+inspect-vbios liest nur eine explizit uebergebene Hostdatei. Der reale
+VBIOS-Transport ist offen: Nouveau shadowrom.c veraendert ROM-Shadowing,
+shadowramin.c veraendert den Fensterauswahlwert. Diese Schritte benoetigen
+einen gemessenen, besitzergebundenen und wiederherstellbaren Hardwarepfad.
+Ein eingelesener ROM-Befund ist nicht automatisch das VBIOS der laufenden GPU.
+
+Pruefung
+--------
+Ein gezielter unit-test-Step prueft PCI-Ablehnungen, 64-Bit-/ReBAR-Adressen,
+Kapazitaeten, ROM-Trunkierungen, Imageketten, Checksummen, Querverweise,
+Tabellenueberlappungen, Skip/EOL und alle Einzelbitmutationen einer kleinen
+synthetischen Datei. Diese Datei stammt von keiner echten Grafikkarte.
+Der bestehende Distribution-Grafiklauf bietet nvidia-passive fuer Laden,
+Fehllade-Cleanup, Diagnoseexport und bootfb ohne NVIDIA. Echte Bind-/Unbind-
+und Board-/VBIOS-/IRQ-Abnahmen bleiben offen, bis passende Hardware da ist.

@@ -1,0 +1,27 @@
+﻿Original R4OS implementation for roadmap 0.79.9, 10.09.2026.
+Host/module scaffolding follows R4OS SDK and existing R4D owners.
+The firmware fixtures are synthetic and contain no third-party ROM bytes.
+
+Register field facts: NVIDIA open-gpu-kernel-modules 570.144,
+commit 8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f,
+src/common/inc/swref/published/nv_ref.h and
+src/common/inc/swref/published/ampere/ga100/dev_boot.h.
+https://github.com/NVIDIA/open-gpu-kernel-modules/tree/570.144
+
+Display table facts: NVIDIA Open GPU Documentation,
+DCB/DCB-4.x-Specification.html, headers/entries and CCB 4.1.
+https://github.com/NVIDIA/open-gpu-doc/blob/master/DCB/DCB-4.x-Specification.html
+
+Comparative BIOS readers: envytools nvbios/{bios,bit,info}.c and
+Nouveau nvkm/subdev/bios/{bit,dcb,i2c,conn,shadowrom,shadowramin}.c.
+These selected files have MIT-style notices; the surrounding Linux tree has
+additional licensing. Their implementations are not copied into this repo.
+https://github.com/envytools/envytools/tree/master/nvbios
+https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/drivers/gpu/drm/nouveau/nvkm/subdev/bios
+
+PCI field comparison: Linux v6.14 include/uapi/linux/pci_regs.h and
+drivers/pci/pci.c, pci_rebar_find_pos and current-size extraction.
+https://github.com/torvalds/linux/blob/v6.14/drivers/pci/pci.c
+No Linux implementation or firmware binary is linked or redistributed here.
+The workspace keeps pinned upstream sources and hashes under
+ExFiles/Reference/GFX/Nvidia and Docs/Drivers/GrafikArchitektur07903.json.
