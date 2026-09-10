@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-Passive NVIDIA display driver for R4OS. Module 0.1.10; original R4OS code is
+Passive NVIDIA display driver for R4OS. Module 0.1.11; original R4OS code is
 Apache-2.0, with selected original MIT headers and separately licensed firmware.
 hardware acceptance for roadmap 0.79.9 is open and offline preparation for
 0.79.10 has started. This owner inventories NVIDIA display functions once through
@@ -117,7 +117,7 @@ packaged GSP containers in CPU memory before continuing the passive probe.
 `mode=runtime-check` explicitly exercises CPU heap calls from init and a real
 worker, validates close admission, and stops init before PCI. Its two leftover
 CPU allocations must be reclaimed by the actual failed-load cleanup. This mode
-requires kernel 0.1.145 / DriverApi33 with the optional 80-byte thread table. Other modes are rejected. `DISPLAYD /NVIDIA`
+requires kernel 0.1.146 / DriverApi33 with the optional 88-byte thread table. Other modes are rejected. `DISPLAYD /NVIDIA`
 replays complete NVIDIA boot records, with no additional hardware access.
 Distribution's `graphics-test Test nvidia-passive` runs an explicit short SMP4
 absence/fallback check with the existing graphics harness. It requires the
