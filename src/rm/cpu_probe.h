@@ -3,4 +3,5 @@
 #define R4NV_CPU_PROBE_H
 #include "nvtypes.h"
 NvS32 r4nv_cpu_probe(NvU32 seed);
+NvS32 r4nv_format_probe(NvU32 seed);
 #endif

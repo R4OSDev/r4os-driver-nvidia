@@ -11,6 +11,51 @@ const sem_provider = @import("rm_semaphore.zig");
 const vbios = @import("vbios.zig");
 const vbios_probe = @import("vbios_probe.zig");
 const fixtures = @import("tests.zig");
+const log_provider = @import("rm_log.zig");
+extern fn r4nv_format_probe(u32) callconv(.c) i32;
+extern fn nv_printf(u32, [*:0]const u8, ...) callconv(.c) c_int;
+var native_log_text: [513]u8 = undefined;
+var native_log_length: usize = 0;
+var native_log_severity: u32 = 0;
+fn nativeLogInfo(text: [*:0]const u8) callconv(.c) void { captureNativeLog(0, text); }
+fn nativeLogWarn(text: [*:0]const u8) callconv(.c) void { captureNativeLog(1, text); }
+fn nativeLogError(text: [*:0]const u8) callconv(.c) void { captureNativeLog(2, text); }
+fn captureNativeLog(level: u32, text: [*:0]const u8) void {
+    const value = std.mem.span(text);
+    std.debug.assert(value.len <= 512);
+    @memcpy(native_log_text[0..value.len], value);
+    native_log_text[value.len] = 0;
+    native_log_length = value.len;
+    native_log_severity = level;
+}
+test "NVIDIA actual driver lifecycle formats original C arguments and binds bounded native logs through shutdown" {
+    var api = apiTable();
+    state = .{ .present = false };
+    try t.expectEqual(@as(i32, -4), driver.nvidia_init(&api));
+    defer _ = driver.nvidia_shutdown();
+    api.log_info = nativeLogInfo;
+    api.log_warn = nativeLogWarn;
+    api.log_error = nativeLogError;
+    try t.expectEqual(@as(i32, 0), r4nv_format_probe(7));
+    try t.expectEqual(@as(u64, 4), log_provider.recordCount());
+    try t.expectEqual(@as(u32, 1), native_log_severity);
+    try t.expectEqualStrings("NVIDIA modeset: GPU-check: native-log-check severity=warning", native_log_text[0..native_log_length]);
+    const before = log_provider.recordCount();
+    try t.expectEqual(@as(i32, -1), log_provider.r4nv_log(3, "invalid"));
+    try t.expectEqual(@as(i32, -1), log_provider.r4nv_log(0, null));
+    try t.expectEqual(before, log_provider.recordCount());
+    var oversized: [600:0]u8 = @splat('x');
+    oversized[600] = 0;
+    try t.expectEqual(@as(i32, 512), log_provider.r4nv_log(2, &oversized));
+    try t.expectEqual(@as(u32, 2), native_log_severity);
+    try t.expectEqual(@as(usize, 512), native_log_length);
+    try t.expect(std.mem.endsWith(u8, native_log_text[0..native_log_length], " [truncated]"));
+    try t.expectEqual(@as(i32, 0), driver.nvidia_shutdown());
+    const closed = log_provider.recordCount();
+    try t.expectEqual(@as(i32, -1), log_provider.r4nv_log(0, "closed"));
+    try t.expectEqual(@as(c_int, -1), nv_printf(4, "closed: %llu", @as(c_ulonglong, 79)));
+    try t.expectEqual(closed, log_provider.recordCount());
+}
 var prom_bytes: [vbios.max_rom_bytes]u8 align(16) = .{0} ** vbios.max_rom_bytes;
 
 const SemFixture = struct {

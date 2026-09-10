@@ -15,7 +15,7 @@ $plan=Get-Content -Raw -LiteralPath (Join-Path $outputRoot 'compile-plan.json')|
 $adapterRoot=Join-Path $outputRoot 'adapter'
 $sourceRoot=Join-Path $adapterRoot 'source'
 $inputs=@()
-foreach($relative in @('src/rm/memory.h','src/rm/os_memory.c','src/rm/nvkms_memory.c','Tests/RmMemory.c','src/rm/clock.h','src/rm/os_clock.c','src/rm/nvkms_clock.c','Tests/RmClock.c','src/rm/semaphore.h','src/rm/native_fault.h','src/rm/os_semaphore.c','src/rm/nvkms_semaphore.c','Tests/RmSemaphore.c','src/rm/wait.h','src/rm/os_wait.c','src/rm/nvkms_wait.c','Tests/RmWait.c')){
+foreach($relative in @('src/rm/memory.h','src/rm/os_memory.c','src/rm/nvkms_memory.c','Tests/RmMemory.c','src/rm/clock.h','src/rm/os_clock.c','src/rm/nvkms_clock.c','Tests/RmClock.c','src/rm/semaphore.h','src/rm/native_fault.h','src/rm/os_semaphore.c','src/rm/nvkms_semaphore.c','Tests/RmSemaphore.c','src/rm/wait.h','src/rm/os_wait.c','src/rm/nvkms_wait.c','Tests/RmWait.c','src/rm/format.h','src/rm/log.h','src/rm/os_format.c','src/rm/nvkms_format.c','src/rm/os_log.c','src/rm/nvkms_log.c','Tests/RmFormat.c')){
     $source=Join-Path $moduleRoot $relative
     $copy=Join-Path $sourceRoot $relative
     [IO.Directory]::CreateDirectory((Split-Path -Parent $copy))|Out-Null
@@ -155,6 +155,10 @@ $code=Invoke-RmNative -Executable $waitCheck -Arguments @('check') -WorkingDirec
 $message=Get-Content -Raw -LiteralPath $waitLog
 if($code -ne 0 -or $message -notmatch '^RM wait adapters: OK checks=(\d+) calls=(\d+) faults=(\d+) width=64 status=preserved gpu=none\r?\n$'){throw 'R4OS wait adapter host acceptance failed'}
 $waitAcceptance=[ordered]@{passed=$true;checks=[int]$Matches[1];calls=[int]$Matches[2];nonreturning_faults=[int]$Matches[3];exact_freestanding_objects_executed=$exactTargetObjects;executable_sha256=(Get-FileHash -LiteralPath $waitCheck).Hash.ToLowerInvariant();native_fault_provider='host-only setjmp/longjmp fixture; target provider excluded from partial links';kernel_waits_executed=$false;gpu_executed=$false}
-$report=[ordered]@{schema=4;subset='cpu-memory-clock-semaphores-and-waits';runtime_complete=$false;driver_heap_provider_linked=$false;driver_clock_provider_linked=$false;driver_semaphore_provider_linked=$false;native_fault_provider_linked=$false;gpu_executed=$false;module_installed=$false;inputs=$inputs;components=$components;host_acceptance=$acceptance;clock_acceptance=$clockAcceptance;semaphore_acceptance=$semaphoreAcceptance;wait_acceptance=$waitAcceptance;driver_wait_provider_linked=$false}
+& $pwsh -NoProfile -File (Join-Path $PSScriptRoot 'Format.ps1') -Compiler $zig -OutputDirectory $outputRoot
+if($LASTEXITCODE -ne 0){throw 'R4OS formatting and logging adapter acceptance failed'}
+$format=Get-Content -Raw -LiteralPath (Join-Path $adapterRoot 'format-results.json')|ConvertFrom-Json
+$components+=@($format.components)
+$report=[ordered]@{schema=5;subset='cpu-memory-clock-semaphores-waits-and-logging';runtime_complete=$false;driver_heap_provider_linked=$false;driver_clock_provider_linked=$false;driver_semaphore_provider_linked=$false;native_fault_provider_linked=$false;gpu_executed=$false;module_installed=$false;inputs=$inputs;components=$components;host_acceptance=$acceptance;clock_acceptance=$clockAcceptance;semaphore_acceptance=$semaphoreAcceptance;wait_acceptance=$waitAcceptance;format_acceptance=$format.acceptance;driver_wait_provider_linked=$false;driver_log_provider_linked=$false}
 [IO.File]::WriteAllText((Join-Path $outputRoot 'os-adapter-results.json'),($report|ConvertTo-Json -Depth 8)+"`n",[Text.UTF8Encoding]::new($false))
 Write-Host $message.Trim()

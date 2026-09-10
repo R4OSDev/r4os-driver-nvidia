@@ -49,6 +49,18 @@ pub fn build(b: *std.Build) void {
     const lifecycle_test = b.addTest(.{ .root_module = lifecycle, .filters = &.{"NVIDIA actual driver lifecycle"} });
     lifecycle_test.step.dependOn(&headers.step);
     unit_step.dependOn(&b.addRunArtifact(lifecycle_test).step);
+    // The existing owner test also exercises the original-header C varargs
+    // boundary against host libc. Its log sink stays in this host executable.
+    const format_module = b.createModule(.{ .target = b.graph.host, .optimize = .ReleaseSafe, .link_libc = true });
+    for (manifest.c_includes) |path| format_module.addIncludePath(b.path(path));
+    format_module.addIncludePath(b.path("src/rm"));
+    for (manifest.c_defines) |value| format_module.addCMacro(value.name, value.value);
+    for ([_][]const u8{ "src/rm/os_format.c", "src/rm/nvkms_format.c", "src/rm/os_log.c", "src/rm/nvkms_log.c" }) |path|
+        format_module.addCSourceFile(.{ .file = b.path(path), .flags = combined_flags });
+    format_module.addCSourceFile(.{ .file = b.path("Tests/RmFormat.c"), .flags = &.{ "-std=gnu11", "-fno-builtin" } });
+    const format_test = b.addExecutable(.{ .name = "rm-format-test", .root_module = format_module });
+    format_test.step.dependOn(&headers.step);
+    unit_step.dependOn(&b.addRunArtifact(format_test).step);
     const storage = b.createModule(.{ .root_source_file = b.path("src/firmware_storage_test.zig"), .target = b.graph.host, .optimize = .ReleaseSafe });
     storage.addImport("r4os", sdk.createR4osModule(b.graph.host, .ReleaseSafe));
     unit_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = storage, .filters = &.{"firmware CPU storage"} })).step);

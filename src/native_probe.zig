@@ -17,6 +17,7 @@ comptime {
     if (@sizeOf(State) != 32 or @offsetOf(State, "permit_sent") != 24) @compileError("native C probe layout drift");
 }
 extern fn r4nv_semaphore_probe_healthy(usize) callconv(.c) i32;
+extern fn r4nv_format_probe(u32) callconv(.c) i32;
 extern fn r4nv_semaphore_probe_setup(usize) callconv(.c) i32;
 extern fn r4nv_semaphore_probe_wait(usize) callconv(.c) i32;
 extern fn r4nv_semaphore_probe_fault(usize) callconv(.c) i32;
@@ -26,6 +27,8 @@ extern fn r4nv_semaphore_probe_cleanup(usize) callconv(.c) i32;
 // C address produces REX_GOTPCRELX hints that the current portable R4M0
 // packager deliberately rejects; these thunks need only PC32/PLT32.
 fn healthy(context: usize) callconv(.c) i32 {
+    const formatted = r4nv_format_probe(3);
+    if (formatted != 0) return formatted;
     return r4nv_semaphore_probe_healthy(context);
 }
 fn setup(context: usize) callconv(.c) i32 {
@@ -82,6 +85,7 @@ pub fn start(ctx: *const r4os.r4dev.DriverContext) bool {
         threads.?.stats(&tasks) != 0 or tasks.records != 0 or native.faultCount() != 0 or native.firstFault() != 0 or
         !semaphore.available() or heap.releaseFailures() != 0 or state.semaphore != null) return failed(ctx, "healthy-cleanup");
     ctx.logInfo("NVIDIA runtime-check: native-semaphores=OK adapters=16 provider=driver-api link=actual resources=0");
+    ctx.logInfo("NVIDIA runtime-check: native-format-task=OK context=dedicated log=driver-owner");
     ctx.logInfo("NVIDIA runtime-check: native-boundary=OK prefix=72,80,88 context=checked result=negative-only status-flag=rejected current-request=verified");
     return true;
 }

@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-Passive NVIDIA display driver for R4OS. Module 0.1.14; original R4OS code is
+Passive NVIDIA display driver for R4OS. Module 0.1.15; original R4OS code is
 Apache-2.0, with selected original MIT headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
 subsystem 1458:4074, VBIOS 94.06.2f.00.d6. Preparation for 0.79.10 continues.
@@ -8,6 +8,14 @@ This owner inventories NVIDIA display functions once through
 the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
+
+The current native CPU port also provides the nine original RM/NVKMS
+formatting and logging declarations. Integer varargs, truncation lengths,
+bounded input scans and driver-owned severity records are checked by the
+existing `unit-test` and explicit SMP4 runtime profile. The complete R4D has
+51 C adapters and 13 actual private providers; the separate full-source partial
+links still have 325 RM and 46 NVKMS undefined symbols. GSP initialization,
+native scanout and HDMI audio remain unimplemented.
 
 Subsystem IDs, PCI revision, HDA siblings, BAR addresses, standard interrupt
 capabilities and readable current Resizable BAR sizes are reported separately

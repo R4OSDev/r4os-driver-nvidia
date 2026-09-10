@@ -216,3 +216,14 @@ CCB 4.1's six-byte header follows the existing NVIDIA DCB-4.x specification;
 the prior five-byte synthetic fixture was corrected, not treated as hardware.
 The documented PGSP group 110000..113fff comes from the same RM pin's
 src/common/inc/swref/published/ampere/ga102/dev_gsp.h, without enabling access.
+
+NVIDIA 0.1.15 native logging, 10.09.2026:
+The integer formatter, four C interface files, private Zig log provider and
+checks are original R4OS Apache-2.0 code. No Linux formatter or NVIDIA host
+implementation is copied. Public declarations come from the same unchanged
+19 MIT headers. Threshold encoding and callback semantics were checked against
+the pinned kernel-open/nvidia/os-interface.c and
+kernel-open/nvidia-modeset/nvidia-modeset-linux.c. The unsupported floating,
+writeback and pointer-extension cases follow an explicit bounded port policy;
+this is not a claim of full Linux printk compatibility. Original primary
+references and their complete notices remain in the reference archive.

@@ -664,3 +664,56 @@ Neuzulassung und vollstaendige Taskfreigabe. Keine IRQ-/GPU-Hardwareabnahme,
 kein erzwungener Abbruch beliebiger CPU-Schleifen. Der gesamte native RM- und
 NVKMS-Link, GSP/RPC, Grafik und HDMI bleiben offen. Nachweise liegen im
 native_waits_checkpoint und ExFiles/Reference/GFX/Nvidia/0.79.10/native-waits.
+
+Native Formatierung und Diagnoseausgabe (NVIDIA 0.1.15, 10.09.2026)
+----------------------------------------------------------------
+Neun weitere unveraenderte Originaldeklarationen sind im R4D angebunden:
+os_snprintf/os_vsnprintf, nvkms_snprintf/nvkms_vsnprintf, nv_printf,
+out_string, os_log_error, os_dbg_set_level und nvkms_log. Zusammen sind es
+51 C-Adapter und 13 private Anbieter; Kernel/API bleiben unveraendert.
+
+Der private ganzzahlige Formatter versteht d/i/u/o/x/X, c/s/p/%, Flags,
+Feldbreite/Praezision einschliesslich Sternargumenten und hh/h/l/ll/j/z/t.
+snprintf liefert die erforderliche Laenge auch bei kleinerem Ziel oder
+Groesse null. Reale Writes und gemeinsame Eingabescans sind auf 64 KB
+begrenzt; riesige wegfallende Auffuellbereiche werden nur gezaehlt. Ueberlauf,
+unbekannte Formate, Gleitkomma, breite Zeichen, Positionsargumente, %n und
+Linux-Pointererweiterungen liefern -1 und eine leere Ausgabe. %p zeigt die
+rohe Adresse mit sechzehn Hexstellen ohne automatisch vorangestelltes 0x;
+vorhandene NVIDIA-Formate wie 0x%p bleiben damit eindeutig.
+
+Jeder Logaufruf benutzt einen eigenen begrenzten Puffer. Die vorhandene
+DriverApi ordnet den einzelnen Datensatz dem realen Treiberbesitzer zu;
+kein globaler Textpuffer, neue Heapallokation oder neuer Kernellogpfad.
+Schweregrad und NVIDIAs Schwellwertkodierung bleiben erhalten. Lange Logs
+tragen einen sichtbaren Abbruchhinweis; nv_printf meldet tatsaechlich
+uebergebene Bytes, snprintf weiterhin die erforderliche Gesamtlange.
+Formatfehler erzeugen eine ausdrueckliche Fehlermeldung. Nach Unbind
+verweigert der private Loganbieter neue Ausgaben.
+
+Der bestehende unit-test enthaelt 24 Zig-Faelle und denselben C-Formattest
+mit 6588 Pruefungen, darunter 5833 Vergleiche gegen die Host-libc.
+Geschuetzte Seitengrenzen pruefen kurze Ziele und praezisionsbegrenzte
+Strings ohne lesbaren Nullterminator. Dieselben vier freestanding Objekte
+laufen nochmals im vorhandenen build-rm; dort bleiben Zielanbieter offen.
+Die Windows-Fassung ist kompiliert, aber nicht auf Windows ausgefuehrt.
+
+SMP4/KVM: Runtime 27.57s und passiver Fallback 20.22s, frische Images ohne
+Gastnetz oder NVIDIA-Geraet. Alle neun C-Pfade laufen in Init, Driver Work
+und einem dedizierten nativen Task. Der Gastnachweis prueft zusammenhaengende
+Logbytes, 64-Bit-Wert, Schweregrad und identische nichtnull Treiber-ID.
+Bisherige Wait-/Semaphore-/Abbruch-/Cleanup-Nachweise bleiben erfolgreich.
+Keine neue Gatefamilie, kein GPU-, Scanout- oder HDMI-Nachweis.
+
+Der volle Quellbau ueber 1196 originale Uebersetzungseinheiten und 3156
+verifizierte Dateien nimmt nun zwoelf Adapterobjekte auf. RM hat 325,
+NVKMS 46 offene Symbole; beide Partiallinks sind weiterhin unvollstaendig.
+Das R4D selbst hat keine offenen Symbole, TLS oder Initialisierer:
+92335248 Dateibytes, 114688 allokierte Bytes (112 KB), 1909 Relocations,
+ein Import und zwei Exports. Alle fuenf bisherigen Ressourcen bleiben
+bytegleich; kein fremder Implementierungscode oder Lizenzwechsel.
+
+Nachweise: native_logging_checkpoint und
+ExFiles/Reference/GFX/Nvidia/0.79.10/native-logging. Release bleibt 0.79.9;
+0.79.10, der volle native RM-/NVKMS-Link, FWSEC/GSP/RPC, Thermik, native
+Anzeige, HDMI und ihre Hardwareabnahmen bleiben offen.

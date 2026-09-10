@@ -42,6 +42,7 @@ pub fn start(ctx: *const r4os.r4dev.DriverContext) bool {
     ctx.logInfo("NVIDIA runtime-check: memory=OK init=64 worker=64 alignment=16 content=verified live=0");
     ctx.logInfo("NVIDIA runtime-check: clock=OK init=64 worker=64 monotonic-ns=verified");
     ctx.logInfo("NVIDIA runtime-check: native-c=OK adapters=21 contexts=init,worker providers=driver-api link=actual");
+    ctx.logInfo("NVIDIA runtime-check: native-format=OK adapters=9 contexts=init,worker integers=64 truncation=reported invalid=rejected log=driver-owner");
 
     var page: a.DriverHeapAllocation = .{};
     if (heap.allocate(4096, 4096, &page) != 0 or page.cpu_address & 4095 != 0) return false;
@@ -95,6 +96,7 @@ pub fn shutdown(ctx: *const r4os.r4dev.DriverContext) bool {
 
 var heap_table: a.DriverHeapApi = .{};
 extern fn r4nv_cpu_probe(seed: u32) callconv(.c) i32;
+extern fn r4nv_format_probe(seed: u32) callconv(.c) i32;
 
 fn runWorker(seed: usize) callconv(.c) i32 {
     return if (exercise(@intCast(seed))) 0 else -1;
@@ -102,6 +104,7 @@ fn runWorker(seed: usize) callconv(.c) i32 {
 
 fn exercise(seed: u8) bool {
     const ctx = r4os.r4dev.DriverContext.init(api orelse return false);
+    if (r4nv_format_probe(seed) != 0) return false;
     const native_result = r4nv_cpu_probe(seed);
     if (native_result != 0) {
         var buffer: [128]u8 = undefined;

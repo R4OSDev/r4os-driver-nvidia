@@ -3,6 +3,42 @@
 #include "os-interface.h"
 #include "nvidia-modeset-os-interface.h"
 #include "cpu_probe.h"
+/* Nine original declarations, real private log provider, caller's CPU context. */
+static int probe_os_v(char *data, NvU32 bytes, const char *format, ...)
+{
+    va_list args; va_start(args, format);
+    int result = os_vsnprintf(data, bytes, format, args);
+    va_end(args); return result;
+}
+static int probe_kms_v(char *data, size_t bytes, const char *format, ...)
+{
+    va_list args; va_start(args, format);
+    int result = nvkms_vsnprintf(data, bytes, format, args);
+    va_end(args); return result;
+}
+static void probe_error(const char *format, ...)
+{
+    va_list args; va_start(args, format);
+    os_log_error(format, args); va_end(args);
+}
+NvS32 r4nv_format_probe(NvU32 seed)
+{
+    char data[96];
+    int preserved = 79;
+    if (os_snprintf(data, sizeof(data), "%lld/%#llx", (-9223372036854775807LL - 1), 0xfedcba9876543210ULL) != 39 ||
+        os_string_compare(data, "-9223372036854775808/0xfedcba9876543210") != 0) return -__LINE__;
+    if (probe_os_v(data, 5, "%08x", 0x79U) != 8 || os_string_compare(data, "0000") != 0) return -__LINE__;
+    if (nvkms_snprintf(data, sizeof(data), "%zu/%hhu/%.*s", (size_t)0x100000001ULL, 255U, 3, "abcde") != 18 ||
+        nvkms_strcmp(data, "4294967297/255/abc") != 0) return -__LINE__;
+    if (probe_kms_v(data, sizeof(data), "%*.*d", -8, 4, -12) != 8 || nvkms_strcmp(data, "-0012   ") != 0) return -__LINE__;
+    if (os_snprintf(data, sizeof(data), "%n", &preserved) != -1 || data[0] != 0 || preserved != 79) return -__LINE__;
+    os_dbg_set_level(0);
+    if (nv_printf(NV_DBG_INFO, "NVIDIA native-log-check: context=%u value=%016llx", seed, 0xfedcba9876543210ULL) <= 0) return -__LINE__;
+    out_string("NVIDIA native-log-check: literal=100% complete");
+    probe_error("NVIDIA native-log-check: severity=error context=%u", seed);
+    nvkms_log(NVKMS_LOG_LEVEL_WARN, "GPU-check: ", "native-log-check severity=warning");
+    return 0;
+}
 
 #define CHECK(condition) do { if (!(condition)) { result = __LINE__; goto done; } } while (0)
 NvS32 r4nv_cpu_probe(NvU32 seed)
