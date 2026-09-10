@@ -35,6 +35,34 @@ Use `Build.bat` (Windows) or `./Build.sh` (Linux), with the same arguments:
     ./Build.sh prepare-firmware -- -SourceDirectory EXTRACTED_FILES -ScratchDirectory WORKSPACE/Temp/nvidia
     ./Build.sh
 
+The separate `build-rm` step compiles the selected original RM/NVKMS source
+lists into two **incomplete relocatable objects** and reports their unresolved
+symbols, TLS, initializers and allocated relocations. It does not install a
+driver or execute GPU code:
+
+    ./Build.sh build-rm -- -SourceDirectory ORIGINAL_SOURCE_TREE -ScratchDirectory WORKSPACE/Temp/nvidia-rm [-Jobs 4]
+
+Use absolute paths. Supply the extracted 570.144 source revision named by
+`src/firmware-lock.json`. `Tools/Rm/Sources.json` pins all 3,156 source, header,
+build and license inputs to that revision. A private snapshot is verified
+before compilation; missing, modified or extra inputs are rejected. The source
+tree, firmware package and installed NVIDIA.R4D remain untouched. Every attempt
+gets a fresh directory below scratch, retaining its source notices and logs.
+The compiler comes from the normal SDK build graph. PowerShell 7 provides the
+same orchestration on both hosts; no vendor build scripts or Linux OS emulation
+are involved. Execution on a Windows host still requires verification.
+
+The only temporary source adaptation adds `NV_R4OS` to the version-string
+header's OS guard, preserving its original notice. Component include order,
+defines, C/C++ source lists and SPDM-specific flags remain separate. PIC and
+freestanding target flags replace the Linux kernel code model. Explicit `-g0`
+avoids implicit compiler debug metadata; source path remapping removes scratch
+paths from code and data. The RM partial link uses the original export roots
+and linker script. This is not the final loader-compatible link: OS callbacks,
+SPDM crypto, compressed shader payloads, duplicate/global symbol handling and
+the R4OS runtime integration remain open. Details and evidence are recorded in
+the workspace's `Docs/Drivers/GrafikFirmware07910.txt/.json`.
+
 The optional last inspector argument is the expected hexadecimal PCI device
 ID. The inspector reads at most 1 MB (1024 KB), writes JSON only on success,
 and records the source hash, checksum scope, active routes and unverified

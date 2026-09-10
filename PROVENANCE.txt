@@ -46,3 +46,27 @@ src/nvidia/arch/nvalloc/common/inc/nv-firmware.h and
 src/nvidia/arch/nvalloc/common/inc/nv-firmware-chip-family-select.h.
 These NVIDIA headers carry their upstream MIT notices; implementations are
 not copied into the R4OS parser. The ELF fixture is original synthetic data.
+
+0.79.10 offline RM/NVKMS source build, 10.09.2026:
+Tools/Rm/Sources.json records the digest of 3156 original source/header/build
+and license files (96017025 bytes), checked against the archived per-file
+catalog and the original 18701915-byte GitHub source archive. Archive SHA-256:
+363b011b1692401529b492f7bdfbf115412820462261dc2b129aa1d5c94b37c9.
+Its source revision must match src/firmware-lock.json; there is no alternative
+RM version selected by a host flag. The explicit build-rm step copies and
+verifies a private snapshot, then builds the original srcs.mk lists with
+component-specific flags and upstream RM export/linker inputs.
+No original sources or compiled RM objects are added to this public repo or
+to NVIDIA.R4D. The private build tree retains COPYING and every file notice.
+
+The version-only guard adaptation in src/common/inc/nvUnixVersion.h adds
+NV_R4OS without modifying original references or defining NV_LINUX/NV_BSD.
+The generated overlay preserves the original notice. Compiler target flags,
+deterministic ID strings, output inspection and orchestration are R4OS work.
+Primary OS boundary references remain the pinned os-interface.h/nv.h and
+nvidia-modeset-os-interface.h. Linux crypto bindings are visible in
+kernel-open/nvidia/libspdm_internal_crypt_lib.c, libspdm_sha.c and related
+libspdm_*.c; those files are references, not linked OS implementations.
+This source-only build does not establish a full link, functioning OS adapter,
+GSP authentication or hardware admission. Its outputs list unresolved symbols
+and preserve the distinction between partial-object and loaded relocations.

@@ -209,3 +209,54 @@ vor PCI erkannt, mit echtem Fehllade-Shutdown und benutzbarem bootfb. Normales
 Treiberartefakt, vorbereitete Originale und Referenzbinaerdateien bleiben
 unveraendert. Signaturannahme durch die GPU, RM/GSP-Start und echte
 Displaywiederherstellung sind damit weiterhin nicht nachgewiesen.
+
+Originaler RM-/NVKMS-Quellbau fuer R4OS
+-------------------------------------
+Der ausdrueckliche Besitzerstep build-rm verwendet den Compiler des normalen
+SDK-Buildgraphen sowie SourceDirectory und ScratchDirectory als absolute
+Pfade. Scratch liegt im Workspace unter Temp, ausserhalb des Treiber- und
+Eingabequellbaums. Windows und Linux benutzen denselben PS7-Ablauf. Der
+Build fuehrt keine Hersteller-Buildscripts oder Binaerinstaller aus.
+
+Tools/Rm/Sources.json bindet 3156 Dateien aus src/, COPYING, utils.mk und
+version.mk an die source_commit der einzigen firmware-lock.json. Dieser
+Quellkatalog wurde gegen den bereits archivierten Originalkatalog und das
+originale GitHub-Archiv verifiziert; er dupliziert keine Firmwarehashes.
+Die Eingaben werden in einen neuen privaten Versuch kopiert und dort vor
+jedem Compilerstart anhand von Pfad, Laenge und SHA-256 vollstaendig geprueft.
+Fehlende, gleich lange veraenderte oder zusaetzliche Header werden abgewiesen.
+Originalquellen, installiertes R4D und vorbereitete Firmware bleiben erhalten.
+
+Die beiden srcs.mk ergeben 971 RM- und 225 NVKMS-Uebersetzungseinheiten.
+Komponenten-Defines, Include-Reihenfolge und dateispezifische libspdm-Flags
+bleiben getrennt. Ein temporaerer Header ergaenzt ausschliesslich NV_R4OS
+an der Versionszeichenketten-Abfrage; seine Copyright-/Lizenzhinweise bleiben
+erhalten. Originalheader werden nicht veraendert. PIC, Freestanding und
+R4OS-Zielmakros ersetzen die Linux-Kernel-Zieloptionen. -g0 unterbindet Zigs
+implizite Debugdaten; Prefix-Mapping entfernt Versuchspfade aus Nutzdaten.
+
+Der partielle RM-Link behaelt die originalen Exportwurzeln und nv-kernel.ld.
+NVKMS bindet zunaechst seine C-/C++-Objekte; komprimierte Shader und ihre
+Start-/Endsymbole sind noch nicht enthalten. Pro Komponente entsteht ein
+deterministischer Identifikationstext. Die originale nachtraegliche
+memcpy-/memset-Lokalisierung des RM ist ebenfalls noch nicht angewendet.
+Der finale gemeinsame Link muss auch nvstatusToString eindeutig aufloesen.
+
+run.json, compile-plan.json, compile-results.json, link-results.json und
+beide *-elf.json halten Grenzen und fehlende Abhaengigkeiten ausdruecklich
+fest. Die ELF-Pruefung trennt Relokationen geladener Sections von sonstigen
+Metadaten. GOTPCREL/GOTPCRELX sind hier Compiler-Zwischenformate; daraus darf
+keine neue R4M0-Relokationsart oder Loaderfreigabe abgeleitet werden.
+Fehlversuche bleiben mit ihren Logs erhalten und ueberschreiben nie einen
+vorherigen Erfolg. Neue permanente Gatefamilien werden nicht angelegt.
+
+Alle 1196 Dateien und beide partiellen Links laufen auf dem Debian-Host.
+RM besitzt 340 offene Symbole, NVKMS 70. Davon sind 60 SPDM-Kryptofunktionen
+und 16 Start-/Endsymbole fuer acht Shaderdateien. Die Crypto-Grenze wird in
+Linux durch kernel-open/nvidia/libspdm_*.c an die Linux Crypto API gebunden;
+diese Betriebssystemimplementierungen sind nicht Teil des gewaehlten src-
+Baums und muessen durch echte R4OS-Funktionen beziehungsweise ausdruecklich
+nicht unterstuetzte Eigenschaften ersetzt werden. Kein Erfolg ohne Backend.
+TLS und automatische Initialisierer sind in beiden Objekten nicht vorhanden.
+Das ist ein Quellbau und Abhaengigkeitsnachweis, kein ladbarer Grafiktreiber.
+R4D-/Kernel-/Releaseversionen aendern sich durch diesen Hostschritt nicht.

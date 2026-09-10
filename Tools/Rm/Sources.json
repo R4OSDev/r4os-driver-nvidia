@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "source_commit": "8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f",
+  "upstream": "https://github.com/NVIDIA/open-gpu-kernel-modules",
+  "archive_url": "https://codeload.github.com/NVIDIA/open-gpu-kernel-modules/tar.gz/8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f",
+  "archive_bytes": 18701915,
+  "archive_sha256": "363b011b1692401529b492f7bdfbf115412820462261dc2b129aa1d5c94b37c9",
+  "scope": [
+    "src/",
+    "COPYING",
+    "utils.mk",
+    "version.mk"
+  ],
+  "catalog_format": "Ordinal relative path order; lowercase SHA256, space, invariant decimal length, space, forward-slash path, LF; UTF-8 without BOM",
+  "files": 3156,
+  "bytes": 96017025,
+  "catalog_sha256": "71ac7d7faee1591e84742b615ac33b5c10cebc01a775362fab3927fe3b1492ee"
+}

@@ -25,3 +25,14 @@ with `NVFW-LOCK.json` in NVIDIA.R4D's nonallocated resource section. The R4OS
 Distribution overlay also carries the byte-identical complete license under
 `/R4OS/LICENSES/NVIDIA-570.144-LICENSE.txt` and beside its images.
 Neither preparation nor CPU-side validation executes firmware or an installer.
+
+The optional `build-rm` host step compiles an explicitly supplied, hash-pinned
+original NVIDIA Open GPU Kernel Modules 570.144 source snapshot under scratch.
+It retains the complete upstream `COPYING`, per-file notices and SoftFloat's
+`COPYING.txt` in that private tree. The temporary `nvUnixVersion.h` overlay
+preserves the original NVIDIA notice and adds only the R4OS version-string
+platform guard. No RM/NVKMS implementation or compiled RM object is installed
+in NVIDIA.R4D by this step, and none is vendored into this repository.
+The scripts and digest metadata are original R4OS work. A future redistribution
+of the compiled objects must carry the corresponding original notices and
+third-party terms; a successful source-only build grants no new license.
