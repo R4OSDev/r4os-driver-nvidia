@@ -3,6 +3,18 @@ Host/module scaffolding follows R4OS SDK and existing R4D owners.
 Firmware fixture bodies and signatures are synthetic. Selected measured
 table fields are explicit regression data, as described below.
 
+0.79.10 combined GSP boot storage (host qualification), 11.09.2026:
+gsp_boot_storage.zig is original Apache-2.0 R4OS orchestration of the existing
+GSP DMA owner and one resident 32-KB boot/signature/WPR pack. It uses only
+existing R4D heap, pin/map/sync/unmap/unpin and clock facades. The format
+encoder and its separately retained MIT attribution remain gsp_wpr.zig.
+gsp_boot_storage_test.zig uses synthetic firmware bodies/device addresses,
+the production descriptor fields and recorded GA106 values; it qualifies
+storage/lifetime flow, not firmware admission or hardware authentication.
+No new original header, firmware/license resource or target code is linked
+into NVIDIA.R4D 0.1.22 by this host checkpoint. Full references and owner
+sources accompany ExFiles/Reference/GFX/Nvidia/0.79.10/boot-storage-20260911.
+
 0.79.10 GSP WPR metadata (host only), 11.09.2026:
 gsp_wpr.zig adapts field assignment from kernel_gsp_tu102.c and the complete
 GspFwWprMeta layout in gsp_fw_wpr_meta.h, pinned to NVIDIA 570.144. That file

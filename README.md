@@ -41,6 +41,16 @@ The existing explicit bootstrap ABI probe compares all 256 encoded bytes
 with the original NVIDIA C structure, including padding and the crash union.
 This host preparation leaves NVIDIA.R4D 0.1.22 and OssiPC unchanged.
 
+`gsp_boot_storage.zig` now composes the image owner with one page-aligned
+32-KB boot pack: 24 KB boot image, 4 KB signature, then a 4-KB page containing
+the 256-byte metadata and zero padding. One contiguous mapping, optionally
+bounced, covers the pack. The full pack, including its metadata page, must
+not overlap any GSP span. A second synchronization publishes the completed
+metadata after actual addresses exist. Pack cleanup precedes image cleanup;
+failed releases retain both owners for retry. The caller admits the complete
+firmware inputs first. This owner is tested through the R4D facade on the
+host; loading boot resources and integrating it into the module remain open.
+
 The CPU-only FWSEC catalog resolves BIT 'p', full 32-bit token pointers and
 the original RM expansion-ROM bias. V2 loader and V3 signed-image descriptors,
 code/data bounds, sparse signature-version masks and DMEM command interfaces

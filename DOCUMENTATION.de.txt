@@ -9,6 +9,39 @@ Boardanschluesse. Die spaeteren PROM-Boots bestaetigen softwareseitig den
 unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
+Gemeinsamer GSP-Bootspeicher (Host, R4D 0.1.22 unveraendert)
+--------------------------------------------------------
+gsp_boot_storage.zig besitzt den grossen GSP-DMA-Speicher und einen eigenen
+32-KB-Puffer: 24 KB Bootabbild ab 0, 4 KB Signatur ab 24576, Metadatenseite
+ab 28672. Der Metadatensatz belegt dort nur 256 Bytes; der Rest bleibt null.
+Ein Pin und ein zusammenhaengendes Mapping mit begrenztem Bounce-Fallback
+decken das Paket ab. Zusammen mit dem GSP sind dies zwei CPU-Allokationen
+und fuenf Mappings; Gesamtspeicher 63709184 Bytes ohne moegliche Bouncekopien.
+
+stageAdmitted verlangt zuvor vollstaendig zugelassene, unveraenderte GSP-,
+Boot- und Signaturquellen. Deskriptor und Erststartprofil werden erneut
+geprueft. Der Owner kopiert Boot und Signatur in getrennten residenten
+Speicher, bindet die wirklichen Adressen in die WPR-Metadaten und prueft
+auch die Metadatenseite auf Ueberlappung mit allen GSP-Segmenten. Die
+abschliessende Synchronisierung aktualisiert auch eine vorherige Bouncekopie.
+Erst danach wird ein vollstaendiger Bericht sichtbar. Die gemeinsame Frist
+begrenzt beide Vorbereitungsphasen; keine GPU erhaelt eine Adresse.
+
+Beim Rueckbau wird zuerst der auf das GSP zeigende Bootpuffer geschlossen,
+dann der GSP-Owner. Pro Allokation gilt Mapping vor Pin vor CPU-Speicher.
+Ein Fehler am Bootpuffer behaelt den GSP unveraendert; auch fehlgeschlagene
+In-/Out-Freigaben verlieren ihre Originaldeskriptoren nicht. Die API-Tabellen
+bleiben fuer Shutdown gecacht. Vor spaeterem GPU-Einsatz ist weiterhin
+echte Quieszenz vor der Freigabe erforderlich.
+
+Der bestehende Besitzerlauf besteht 37/37 Faelle; ein neuer zusammengefasster
+Fall prueft 12 Szenarien am echten Owner mit synthetischen Firmwarebytes und
+R4D-Callbacks. Darunter Teilfehler bei Allokation/Pin/Map, falsche Deskriptoren,
+Frist, Synchronisierung, nur die Metadatenseite betreffende Ueberlappung,
+fehlgeschlagenes Unmap/Unpin/Release und Bounce. Keine neue Gate-/Gastvariante,
+kein RM-/Modulbau oder Hardwareupdate. Die Runtime-Ressourcenbereitstellung
+und Anbindung dieses Owners an NVIDIA.R4D sind noch offen.
+
 GSP-WPR-Metadaten (Host, NVIDIA.R4D 0.1.22 unveraendert)
 ------------------------------------------------------
 gsp_wpr.zig bildet den normalen GA106-Erststart auf die originalen 256 Bytes
