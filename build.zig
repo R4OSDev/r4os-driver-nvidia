@@ -4,6 +4,15 @@ pub fn build(b: *std.Build) void {
     const sdk_build = b.lazyImport(@This(), "r4os_sdk") orelse return;
     const sdk = sdk_build.sdk(b, b.dependencyFromBuildZig(sdk_build, .{}), .{});
     const module = sdk.addR4MF(b.path("module.R4MF"));
+    const headers = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-File" });
+    headers.addFileArg(b.path("Tools/VerifyNativeHeaders.ps1"));
+    headers.addArg("-HeaderRoot");
+    headers.addDirectoryArg(b.path("ThirdParty/Nvidia570.144"));
+    headers.addArg("-LockPath");
+    headers.addFileArg(b.path("src/firmware-lock.json"));
+    headers.addArg("-SourceCatalogPath");
+    headers.addFileArg(b.path("Tools/Rm/Sources.json"));
+    module.code.generated.file.step.dependOn(&headers.step);
     const pin = @import("src/firmware.zig").lock;
     const verify = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-File" });
     verify.addFileArg(b.path("Tools/VerifyFirmwarePackage.ps1"));
@@ -27,7 +36,18 @@ pub fn build(b: *std.Build) void {
     unit_step.dependOn(&b.addRunArtifact(unit).step);
     const lifecycle = b.createModule(.{ .root_source_file = b.path("src/lifecycle_test.zig"), .target = b.graph.host, .optimize = .ReleaseSafe });
     lifecycle.addImport("r4os", sdk.createR4osModule(b.graph.host, .ReleaseSafe));
+    // Host lifecycle tests link the same C companions through the canonical
+    // parser. They do not supply replacements for their private Zig providers.
+    const manifest = sdk_build.build_api.module_manifest.parse(b.allocator, "module.R4MF", @embedFile("module.R4MF")) catch @panic("Invalid NVIDIA manifest");
+    for (manifest.c_includes) |path| lifecycle.addIncludePath(b.path(path));
+    for (manifest.c_defines) |value| lifecycle.addCMacro(value.name, value.value);
+    const host_c_base = [_][]const u8{ "-ffreestanding", "-fno-builtin", "-fno-stack-protector", "-mno-red-zone" };
+    const combined_flags = b.allocator.alloc([]const u8, host_c_base.len + manifest.c_flags.len) catch @panic("OOM");
+    @memcpy(combined_flags[0..host_c_base.len], &host_c_base);
+    @memcpy(combined_flags[host_c_base.len..], manifest.c_flags);
+    for (manifest.sources[1..]) |path| lifecycle.addCSourceFile(.{ .file = b.path(path), .flags = combined_flags });
     const lifecycle_test = b.addTest(.{ .root_module = lifecycle, .filters = &.{"NVIDIA actual driver lifecycle"} });
+    lifecycle_test.step.dependOn(&headers.step);
     unit_step.dependOn(&b.addRunArtifact(lifecycle_test).step);
     const storage = b.createModule(.{ .root_source_file = b.path("src/firmware_storage_test.zig"), .target = b.graph.host, .optimize = .ReleaseSafe });
     storage.addImport("r4os", sdk.createR4osModule(b.graph.host, .ReleaseSafe));

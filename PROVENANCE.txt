@@ -144,3 +144,26 @@ os-interface.c (mutex/semaphore and context rules), common/inc/nv-linux.h
 No Linux implementation is copied or linked. The noreturn failure hook has
 no target provider; hosted setjmp/longjmp exists only in the C checker.
 Original source, shader and firmware bytes and all notices remain unchanged.
+
+0.79.10 actual C memory/clock target integration, 10.09.2026:
+NVIDIA 0.1.9 vendors the 19 original MIT headers in the compiler dependency
+closure of the memory, clock and semaphore adapters. Every byte and original
+path is preserved under ThirdParty/Nvidia570.144. ORIGIN.json records 236096
+header bytes and per-file SHA-256, tied to the existing 570.144 source commit
+and Tools/Rm/Sources.json catalog digest. The source pin remains shared with
+firmware-lock.json. This is the first selected header import into this repo;
+the earlier source-only checkpoint statements above describe their own scope.
+
+The complete original COPYING and all nineteen original copyright/permission
+notices accompany those files. LICENSES.txt collects them verbatim, and the
+manifest embeds it as NVIDIA-570.144-HEADERS-LICENSE.txt. Distribution includes
+the same complete bytes inside its filesystem and adjacent Legal directory.
+No original header, shader or firmware byte has been edited or relicensed.
+
+The four existing original-R4OS memory/clock C adapters and new cpu_probe.c
+now link through the canonical R4MF/SDK mixed R4D build. The probe executes
+those real target C functions through private Zig providers in init and
+Driver Work. It is an original CPU integration diagnostic. Semaphore C files,
+their missing nonreturning target fault boundary, full RM/NVKMS objects and
+GPU execution remain separate, incomplete work. Host setjmp/longjmp stays
+exclusive to the separately compiled semaphore fixture.

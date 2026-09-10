@@ -48,7 +48,7 @@ pub fn start(ctx: *const r4os.r4dev.DriverContext) bool {
     if (cpu.stats(&after) != 0 or after.allocations != 0 or after.bytes != 0 or heap.releaseFailures() != 0 or
         semaphores.?.stats(&sem) != 0 or sem.records != 0 or sem.active_acquires != 0 or
         threads.?.stats(&task) != 0 or task.records != 0 or !provider.available()) return failed(ctx, "cleanup");
-    ctx.logInfo("NVIDIA runtime-check: private-semaphores=OK callbacks=4 contention=128 timeout=bounded cpu-boxes=freed native-c=not-linked");
+    ctx.logInfo("NVIDIA runtime-check: private-semaphores=OK callbacks=4 contention=128 timeout=bounded cpu-boxes=freed semaphore-c=not-linked");
     return true;
 }
 pub fn prepareClose(ctx: *const r4os.r4dev.DriverContext) bool {

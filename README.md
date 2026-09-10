@@ -1,6 +1,7 @@
 ﻿# NVIDIA.R4D
 
-Original Apache-2.0 passive NVIDIA display driver for R4OS. Module 0.1.8;
+Passive NVIDIA display driver for R4OS. Module 0.1.9; original R4OS code is
+Apache-2.0, with selected original MIT headers and separately licensed firmware.
 hardware acceptance for roadmap 0.79.9 is open and offline preparation for
 0.79.10 has started. This owner inventories NVIDIA display functions once through
 the kernel PCI inventory. It does not initialize engines or take over scanout.
@@ -307,6 +308,41 @@ runtime-check: four dedicated callbacks, 128 protected updates across real
 scheduler waits, bounded timeout, busy destruction and actual close/stop
 handoff. All its CPU boxes and task records are freed before the preceding
 diagnostics' accounting. The previous FIFO, 256-update, heap and clock probes
-remain required. Normal passive startup allocates no semaphore. Original C
+remain required. Normal passive startup allocates no semaphore. C semaphore
 execution in a guest, the native fault boundary, combined RM link and actual
 GPU/IRQ hardware acceptance remain open.
+
+Actual C memory/clock integration (0.79.10)
+-----------------------------------------
+The ordinary NVIDIA.R4D now links the four memory/clock C source files and
+`src/rm/cpu_probe.c` through the SDK's canonical mixed Zig/C R4D manifest path.
+All 21 RM/NVKMS memory, string and clock symbols use the real private Zig heap
+and clock providers. No hosted allocator, timer, Linux implementation, full
+RM/NVKMS object or synchronization-fault stub enters that target link.
+
+`ThirdParty/Nvidia570.144` contains the 19 byte-identical original MIT headers
+needed by these adapters and the separately built semaphore subset. Its
+`ORIGIN.json` records every file hash and the shared firmware/source pin.
+Git preserves this package byte-for-byte on Windows and Linux; automatic
+text and line-ending conversion is disabled for the complete vendor tree.
+The normal build verifies that package before C compilation. Missing, changed,
+extra or mismatched inputs fail; prepared proprietary firmware is verified
+separately before packaging. Unit tests do not require the firmware binaries.
+
+`COPYING` is the complete original source-package license file. `LICENSES.txt`
+preserves every selected header's full notice plus COPYING, and is packaged
+as `NVIDIA-570.144-HEADERS-LICENSE.txt` in the nonallocated resource section.
+The same file accompanies distribution images inside and beside the image.
+There are five resources: source/firmware lock, header notices, firmware
+license, GA10x firmware and TU10x firmware. Header files remain unchanged.
+
+The existing explicit SMP4 runtime-check calls the actual C probe from both
+init and Driver Work. It checks allocation limits, zero sizes, alignment,
+unaligned copies with canaries, overlapping moves, strings and the ns-to-us
+clock bridge, then requires zero live allocations and successful close.
+The success record says `native-c=OK adapters=21 ... link=actual` only after
+both real contexts complete. Normal passive startup does not run this probe.
+The C semaphore sources remain outside the ordinary module until their
+required nonreturning native-fault provider and dispatcher are implemented.
+The separate full RM/NVKMS partial-object evidence remains unchanged; GSP,
+GPU authentication, native scanout and HDMI acceptance remain open.

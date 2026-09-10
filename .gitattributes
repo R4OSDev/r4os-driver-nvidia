@@ -3,6 +3,8 @@
 .gitattributes text eol=lf
 .gitignore text eol=lf
 *.zig text eol=lf
+*.c text eol=lf
+*.h text eol=lf
 *.zon text eol=lf
 *.txt text eol=lf
 *.R4S text eol=lf
@@ -14,3 +16,6 @@
 *.ico -text
 *.png -text
 *.md text eol=lf
+
+# The verified upstream package must retain exact bytes on either host.
+ThirdParty/** -text

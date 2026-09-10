@@ -1,0 +1,115 @@
+{
+  "schema": 1,
+  "source_commit": "8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f",
+  "source_catalog_sha256": "71ac7d7faee1591e84742b615ac33b5c10cebc01a775362fab3927fe3b1492ee",
+  "headers": 19,
+  "bytes": 236096,
+  "files": [
+    {
+      "path": "src/common/sdk/nvidia/inc/cpuopsys.h",
+      "bytes": 11619,
+      "sha256": "92114293c250b87a0c78d1bbfe52c3c132eba1c03ceef110a0e8b0ba6a80aca1"
+    },
+    {
+      "path": "src/common/sdk/nvidia/inc/nv-kernel-interface-api.h",
+      "bytes": 1810,
+      "sha256": "1cf34c1dcd1abf535fb27387145374972a43ec9cd6f6c9ef927777431bda3cc4"
+    },
+    {
+      "path": "src/common/sdk/nvidia/inc/nv_stdarg.h",
+      "bytes": 1523,
+      "sha256": "bd61b81589cfff85ac7af809d792af63f1e48f5648038e27576983a7ecf5ce4d"
+    },
+    {
+      "path": "src/common/sdk/nvidia/inc/nvlimits.h",
+      "bytes": 1967,
+      "sha256": "7c7bf27c5360464b459f6069d2e72f6070bb3fdd0862baccf6c7aa71da67c593"
+    },
+    {
+      "path": "src/common/sdk/nvidia/inc/nvmisc.h",
+      "bytes": 42112,
+      "sha256": "707e5a739d9b8781c05003188d6e64888303c84039e4f2ecc0810b8411669248"
+    },
+    {
+      "path": "src/common/sdk/nvidia/inc/nvstatus.h",
+      "bytes": 4565,
+      "sha256": "e8267172a1f7a56420d612c6734b3554b9ff6a3d33fdda21b1371ff4ce4b8675"
+    },
+    {
+      "path": "src/common/sdk/nvidia/inc/nvstatuscodes.h",
+      "bytes": 15580,
+      "sha256": "cad1684cc2fafaeb8def4289ab107d7a21706425781af8e96865b850c15f4205"
+    },
+    {
+      "path": "src/common/sdk/nvidia/inc/nvtypes.h",
+      "bytes": 25775,
+      "sha256": "3fd5e2c20b1432421a214b12e52778f48f7914b87645d4736cf55324d25c9d3c"
+    },
+    {
+      "path": "src/common/sdk/nvidia/inc/rs_access.h",
+      "bytes": 9561,
+      "sha256": "ee3174aa565a08594f66c325b06d24bd8e798d933bf74ff12c803cf3614bb117"
+    },
+    {
+      "path": "src/nvidia/arch/nvalloc/unix/include/nv-caps.h",
+      "bytes": 3183,
+      "sha256": "b36a1d6cb9a66bf2716e15e6f25de87f691cea930c2763ff5effcd3e8a7742c3"
+    },
+    {
+      "path": "src/nvidia/arch/nvalloc/unix/include/nv-gpu-info.h",
+      "bytes": 1604,
+      "sha256": "62a6b51aac087533be30c33576375bb3d08d29193407cb4bfa47ec67332ef416"
+    },
+    {
+      "path": "src/nvidia/arch/nvalloc/unix/include/os-interface.h",
+      "bytes": 14025,
+      "sha256": "f48a59793a5184a6cc917567f79ba16cdb57e2840bc9b34d1aa9571c704f2c2e"
+    },
+    {
+      "path": "src/nvidia/inc/kernel/os/nv_memory_area.h",
+      "bytes": 2454,
+      "sha256": "4fc1fdb861047e6cca8224e22a225c30a57f3d6fcb874a528793a7b85edc9d55"
+    },
+    {
+      "path": "src/nvidia/inc/kernel/os/nv_memory_type.h",
+      "bytes": 1770,
+      "sha256": "c6472e939ac912d5df5e2e17dab35f8444269b964e2b1536f05df874990354cb"
+    },
+    {
+      "path": "src/nvidia-modeset/interface/nvkms-api-types.h",
+      "bytes": 24893,
+      "sha256": "00373f44e8b17b394f700dcf09969b2b90cedc6060655eb2d8b0a54fba2d96bf"
+    },
+    {
+      "path": "src/nvidia-modeset/interface/nvkms-format.h",
+      "bytes": 5244,
+      "sha256": "ab92f64f5801b736b514e8a1a21133b2924bf6c7789366a6d7663f2d69b00a4f"
+    },
+    {
+      "path": "src/nvidia-modeset/kapi/interface/nvkms-kapi.h",
+      "bytes": 51665,
+      "sha256": "7a0089e08c526ebf495809d58c93d92e77f7a32ecb1c49b0fd1435614600ec9a"
+    },
+    {
+      "path": "src/nvidia-modeset/os-interface/include/nvidia-modeset-os-interface.h",
+      "bytes": 12700,
+      "sha256": "8b3f3de809c452a0a33e1ee6d1826cebc249a1bcabd9ce962e6196fc78d2e439"
+    },
+    {
+      "path": "src/nvidia-modeset/os-interface/include/nvkms.h",
+      "bytes": 4046,
+      "sha256": "11cbb6e4f4e430c80b7df81a261c7ecd507a806183ce170c55341beddaac72b2"
+    }
+  ],
+  "copying": {
+    "path": "COPYING",
+    "bytes": 19391,
+    "sha256": "d8e96d29bc323000e7ba56102d77c88226a7a3d0d94e2081cb4b071ae9de4a06"
+  },
+  "license": {
+    "path": "LICENSES.txt",
+    "resource": "NVIDIA-570.144-HEADERS-LICENSE.txt",
+    "bytes": 43561,
+    "sha256": "093605f2e2b133cf52b95e3e2a65ece1db7a013849b951012f511782295b6ef4"
+  }
+}

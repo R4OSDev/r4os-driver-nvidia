@@ -1,15 +1,32 @@
 ﻿# Third-Party Notices
 
-The driver, parser, tests and inspector are original R4OS Apache-2.0 code.
-No NVIDIA RM/NVKMS host implementation, Linux driver, or envytools
-implementation is copied or linked into the R4OS driver code. The packaged
-module contains the two original GSP firmware containers described below.
+The driver, parser, adapters, tests and inspector are original R4OS Apache-2.0
+code. The selected original NVIDIA MIT headers described below retain their
+own terms. No full NVIDIA RM/NVKMS host implementation, Linux driver or
+envytools implementation is linked into the R4OS driver. The packaged module
+also contains the two original GSP firmware containers described below.
 
 Register and binary-format facts were checked against the NVIDIA-published
 register headers and DCB specification and the selected MIT-licensed BIOS
 readers recorded in PROVENANCE.txt. Those upstream materials remain under
 their original licenses in the separate workspace reference archive.
 The synthetic parser fixtures are original test data, not extracted VBIOS.
+
+Since module 0.1.9, `ThirdParty/Nvidia570.144` vendors 19 unchanged original
+MIT header files (236,096 bytes) from NVIDIA Open GPU Kernel Modules 570.144,
+commit 8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f. `ORIGIN.json` lists each
+path, size and SHA-256 and binds them to the single firmware/source pin.
+All per-file notices remain intact; `COPYING` is the complete upstream file,
+including the terms for other parts of the source package. No source package
+license is replaced by the R4OS license.
+
+`LICENSES.txt` collects the full copyright and permission notice of every
+selected header plus the complete original COPYING. NVIDIA.R4D carries this
+file byte-for-byte as `NVIDIA-570.144-HEADERS-LICENSE.txt`; Distribution carries
+the identical file in `/R4OS/LICENSES` and its adjacent `Legal` directory.
+The headers compile the R4OS memory/clock C adapters in the actual module and
+provide declarations for separately built semaphore adapters. They are not
+a redistribution of the complete RM/NVKMS implementation.
 
 Any future import of RM/NVKMS code or additional firmware must preserve its exact
 source/binary license and provenance and update the distribution notices.

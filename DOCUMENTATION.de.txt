@@ -478,3 +478,38 @@ Busy-Free erhaelt beide Ressourcen. Anschliessend bestehen die bisherigen
 Semaphore-/Thread-/Heap-/Uhrproben und das generische Cleanup unveraendert.
 Der kombinierte native Link, seine Fehlergrenze, GSP-/HDMI- und echte IRQ-
 Abnahmen bleiben offen. RELEASE bleibt 0.79.8; OssiPC wurde nicht kontaktiert.
+
+Tatsaechlicher C-Speicher-/Uhrpfad im R4D (0.79.10)
+-------------------------------------------------
+NVIDIA 0.1.9 bindet die vier eigenen Speicher-/Uhr-C-Dateien und cpu_probe.c
+in dasselbe R4D wie die bestehenden Zig-Anbieter ein. Die kanonische R4MF
+besitzt dazu eine Zig-Rootquelle, danach geordnete C-SOURCE-Eintraege und
+C_INCLUDE/C_DEFINE/C_FLAG. Der gemeinsame SDK-Parser erlaubt diese Form nun
+auch fuer R4D, neben R4L; Zig-R4X/R4P bleiben unveraendert. Kein neuer Entry-,
+APP_CLASS-, Import- oder Laufzeitvertrag entsteht dadurch.
+
+Neunzehn unveraenderte originale MIT-Header (236096 Bytes) stehen unter
+ThirdParty/Nvidia570.144. ORIGIN.json haelt Pfade, Laengen und SHA-256 sowie
+denselben Firmware-/Quellpin fest. Git bewahrt auch unter Windows die exakten
+Originalbytes ohne Text-/Zeilenumbruchkonvertierung. Der normale Bau prueft
+vor der C-Uebersetzung den vollstaendigen Bestand. Fehlende, geaenderte,
+zusaetzliche oder zu einem
+anderen Pin gehoerende Dateien brechen ab. Originales COPYING und saemtliche
+vollstaendigen Headerhinweise bleiben erhalten. LICENSES.txt kommt bytegleich
+als fuenfte Ressource sowie in und neben die Distributionsimages.
+
+Der vorhandene SMP4-runtime-check fuehrt jetzt alle 21 echten C-Speicher-,
+String- und Uhradapter sowohl im Init als auch im echten DriverWork aus.
+Er prueft ungueltige/grosse/nullgrosse Allokationen, Alignment, Zero-Fill,
+unausgerichtete Kopien mit Randmarken, ueberlappende Moves, Strings und die
+Nanosekunden-/Mikrosekundenumrechnung. Beide Aufrufwege nutzen den echten
+Kernelservice ueber die privaten Zig-Anbieter. Erst ihr Abschluss und null
+lebende Allokationen erlauben den Marker native-c=OK adapters=21 link=actual.
+Normale passive Starts fuehren diese Diagnose nicht aus.
+
+Die sechzehn Semaphore-C-Adapter sind weiterhin getrennte Sourcebuildobjekte;
+ihre benoetigte native Fehlergrenze hat noch keinen Zielanbieter. Der komplette
+RM-/NVKMS-Link und GPU-Boot bleiben offen. Kernel 0.1.144 / DriverApi33 und
+RELEASE 0.79.8 bleiben unveraendert. Der lokale SDK-Neubau aktualisiert auch
+ModuleCatalog; ein altes installiertes Werkzeug kennt die neuen C-Begleiter
+noch nicht und muss vor dem Imageplan erneuert werden.
