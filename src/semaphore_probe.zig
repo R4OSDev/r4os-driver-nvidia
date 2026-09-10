@@ -72,7 +72,7 @@ pub fn start(ctx: *const r4os.r4dev.DriverContext) bool {
     if (shared_value != 256 or shared_check != (shared_value ^ 0x79007900)) return failed(ctx, "exclusion");
     var after: a.DriverSemaphoreStats = .{};
     if (sem.stats(&after) != 0 or after.records != 2 or after.active_acquires != 0 or after.pending_creates != 0 or
-        after.pending_destroys != 0 or after.destroys != 1) return failed(ctx, "accounting");
+        after.pending_destroys != 0 or after.destroys - before.destroys != 1) return failed(ctx, "accounting");
     prepared = true;
     ctx.logInfo("NVIDIA runtime-check: semaphores=OK fifo=3 contention=256 timeout=bounded overflow=retained stale=verified");
     return true;

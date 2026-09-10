@@ -14,7 +14,7 @@ $plan=Get-Content -Raw -LiteralPath (Join-Path $outputRoot 'compile-plan.json')|
 $results=Get-Content -Raw -LiteralPath (Join-Path $outputRoot 'compile-results.json')|ConvertFrom-Json
 $shaders=Get-Content -Raw -LiteralPath (Join-Path $outputRoot 'shader-results.json')|ConvertFrom-Json
 $adapter=Get-Content -Raw -LiteralPath (Join-Path $outputRoot 'os-adapter-results.json')|ConvertFrom-Json
-if($adapter.schema -ne 2 -or $adapter.subset -cne 'cpu-memory-strings-and-monotonic-clock' -or $adapter.components.Count -ne 4 -or !$adapter.host_acceptance.passed -or !$adapter.clock_acceptance.passed -or $adapter.runtime_complete -or $adapter.driver_heap_provider_linked -or $adapter.driver_clock_provider_linked -or $adapter.gpu_executed -or $adapter.module_installed){throw 'Verified CPU memory and clock adapter subsets are required'}
+if($adapter.schema -ne 3 -or $adapter.subset -cne 'cpu-memory-clock-and-semaphores' -or $adapter.components.Count -ne 6 -or !$adapter.host_acceptance.passed -or !$adapter.clock_acceptance.passed -or !$adapter.semaphore_acceptance.passed -or $adapter.runtime_complete -or $adapter.driver_heap_provider_linked -or $adapter.driver_clock_provider_linked -or $adapter.driver_semaphore_provider_linked -or $adapter.native_fault_provider_linked -or $adapter.gpu_executed -or $adapter.module_installed){throw 'Verified CPU memory, clock and semaphore adapter subsets are required'}
 if($shaders.schema -ne 1 -or $shaders.families -ne 8 -or $shaders.payloads.Count -ne 8 -or $shaders.gpu_executed){throw 'Complete verified shader payloads are required'}
 if($results.completed -ne $plan.translation_units.Count -or $results.failed -ne 0 -or $results.not_executed -ne 0){throw 'Compilation must complete before link audit'}
 $byId=[Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
@@ -38,7 +38,7 @@ foreach($component in $plan.components) {
     if($idCode -ne 0){throw "ID compilation failed $unit"}
     $objects+=$idObject
     $componentAdapters=@($adapter.components|Where-Object {$_.component -ceq $unit})
-    if($componentAdapters.Count -ne 2){throw 'Both memory and clock adapters are required for each component'}
+    if($componentAdapters.Count -ne 3){throw 'Memory, clock and semaphore adapters are required for each component'}
     foreach($item in $componentAdapters){
         if((Get-FileHash -LiteralPath $item.object).Hash.ToLowerInvariant() -cne $item.sha256){throw 'OS adapter object changed after verification'}
         $objects+=$item.object

@@ -87,7 +87,7 @@ try {
     & $pwsh -NoProfile -File (Join-Path $PSScriptRoot 'Rm/Shaders.ps1') -Compiler $zig -SourceDirectory $snapshot -OutputDirectory $runRoot -XzPath $XzPath
     if($LASTEXITCODE -ne 0){throw 'Original NVKMS shader preparation failed; see shaders/ logs'}
     & $pwsh -NoProfile -File (Join-Path $PSScriptRoot 'Rm/Adapter.ps1') -Compiler $zig -OutputDirectory $runRoot
-    if($LASTEXITCODE -ne 0){throw 'R4OS CPU memory adapter build or host acceptance failed; see adapter/ logs'}
+    if($LASTEXITCODE -ne 0){throw 'R4OS CPU adapter build or host acceptance failed; see adapter/ logs'}
     & $pwsh -NoProfile -File (Join-Path $PSScriptRoot 'Rm/Link.ps1') -Compiler $zig -SourceDirectory $snapshot -OutputDirectory $runRoot
     if($LASTEXITCODE -ne 0){throw 'RM/NVKMS partial link failed; see link-results.json and component link logs'}
     $report.partial_links_complete=$true
@@ -130,7 +130,7 @@ try {
     $report.duplicate_global_definition_candidates=@($symbolTables['nvidia-modeset'].defined|Where-Object {$rmNames.Contains($_.name)}|ForEach-Object {$_.name})
     $report.upstream_memcpy_memset_localization_applied=$false
     $report.components=$components;$report.audit_complete=$true
-    Write-Host 'Original RM/NVKMS sources, shaders, memory and clock adapters built and inspected. Remaining OS callbacks and a final R4D link with the private runtime providers are still required.'
+    Write-Host 'Original RM/NVKMS sources, shaders, memory, clock and semaphore adapters built and inspected. Remaining OS callbacks, the native-fault boundary and a final R4D link with private runtime providers are still required.'
 } catch {
     $report.error=$_.Exception.Message
     throw

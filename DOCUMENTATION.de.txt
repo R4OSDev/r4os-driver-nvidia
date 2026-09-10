@@ -251,8 +251,9 @@ Fehlversuche bleiben mit ihren Logs erhalten und ueberschreiben nie einen
 vorherigen Erfolg. Neue permanente Gatefamilien werden nicht angelegt.
 
 Alle 1196 Dateien und beide partiellen Links laufen auf dem Debian-Host.
-Mit CPU-Speicher- und Zeitadaptern bleiben 333 offene Symbole im RM und
-47 in NVKMS, einschliesslich vier beziehungsweise drei privater Heap-/Zeitimporte.
+Mit CPU-Speicher-, Zeit- und Semaphoreadaptern bleiben 329 offene Symbole
+im RM und 48 in NVKMS, einschliesslich zehn beziehungsweise acht privater
+Importe. Dazu gehoert die noch fehlende native Fehlergrenze.
 Davon sind 60 SPDM-Kryptofunktionen im RM. Die Crypto-Grenze wird in
 Linux durch kernel-open/nvidia/libspdm_*.c an die Linux Crypto API gebunden;
 diese Betriebssystemimplementierungen sind nicht Teil des gewaehlten src-
@@ -431,5 +432,49 @@ Endlicher Timeout, Zaehlerueberlauf, alte Handles und Freigabe bei wartenden
 Tasks werden geprueft. Ein gestoppter Task bleibt bis zur echten Freigabe im
 Shutdown wartend; Stop gilt niemals als erfolgreicher Semaphore-Erwerb.
 Zwei Semaphore bleiben fuer das generische Cleanup nach Callback-Quieszenz.
-Die nativen RM-/NVKMS-C-Adapter, ihr privater C-Anbieter und die GPU-Anbindung
-bleiben Folgearbeit. Der normale passive Start legt keine Semaphore an.
+Die folgende Erweiterung verbindet diese Grundlage mit privaten C-Aufrufen.
+Der normale passive Start legt keine Semaphore an.
+
+Privater RM-/NVKMS-Semaphoreanschluss (0.79.10)
+--------------------------------------------
+NVIDIA 0.1.8 nutzt Kernel 0.1.144 / DriverApi33 unveraendert. Fuenf private
+C-Signaturen in rm/semaphore.h erhalten mit rm_semaphore.zig einen echten
+R4D-Anbieter. Opake Zeiger besitzen einen 16-Byte-CPU-Block samt 16-Byte-
+Heap-Praefix und ein echtes u64-Semaphorehandle. Keine als Zeiger getarnten
+Handles, keine Linux-Implementierung und keine GPU-Allokation.
+
+Der volle u32-Zaehler bleibt erhalten. Null prueft sofort; UINT64_MAX wartet
+auf ein echtes Permit. Geschlossene Anlage verhindert neue Objekte, vorhandene
+Aufrufe bleiben fuer Shutdown nutzbar. Der Aufrufer muss alle Benutzer vor Free
+beenden; Cookies pruefen keine beliebigen oder bereits freigegebenen Zeiger.
+Bei fehlgeschlagenem Destroy bleiben Semaphore und CPU-Block erhalten. Nach
+erfolgreichem Destroy setzt der Anbieter das Handle auf null; scheitert erst
+die CPU-Freigabe, wiederholt ein Retry ausschliesslich diese. Der Heap liefert
+dazu intern den exakten Freigabeausgang, ohne seinen bisherigen void-C-Vertrag
+zu aendern. Unerwartete Fehler verriegeln neue Nutzung bis Rebind, verhindern
+aber nicht den notwendigen Rueckbau bestehender Objekte.
+
+Zwoelf RM-Funktionen einschliesslich MaySleep/ISR sowie vier NVKMS-Funktionen
+werden gegen NVIDIAs Originalheader gebaut. Der bedingte RM-Mutex verlangt
+wie die Referenz einen schlafbaren Kontext; der bedingte Semaphore-Erwerb ist
+auch im IRQ-Kontext vorgesehen. Daraus folgt keine Spinlock-Implementierung.
+void-Free/Up/Down benoetigen bei Fehler eine nicht zurueckkehrende native
+Fehlergrenze. r4nv_native_fault bleibt ausdruecklich ein offener Zielimport;
+kein Abbruch-Stub, globaler Panic oder erfundener erfolgreicher Erwerb ersetzt
+die spaetere echte Dispatch- und Quieszenzbehandlung.
+
+Tests/RmSemaphore.c fuehrt die echten Zielobjekte auf Linux aus: 180 Pruefungen,
+25 nicht zurueckkehrende Fehleruebergaenge, volle Integerbreiten, Kontext,
+Fehlerabbildung und keine verbleibenden Testobjekte. setjmp/longjmp gehoert
+nur zu diesem Hostfixture. Der Windows-Checker wird crossgebaut, nicht
+ausgefuehrt. Siebzehn normale NVIDIA-Faelle enthalten zwei neue Faelle fuer
+den echten Zig-Anbieter mit simuliertem DriverApi und realem Hostspeicher.
+
+Der vorhandene SMP4-runtime-check prueft den privaten Anbieter getrennt von
+den C-Objekten: vier echte Tasks, 128 geschuetzte Aenderungen mit Scheduler-
+Wait unter gehaltenem Permit, endlicher Timeout und vollstaendiger Rueckbau.
+Ein gestoppter Waiter bleibt bis zur wirklichen Shutdown-Freigabe blockiert;
+Busy-Free erhaelt beide Ressourcen. Anschliessend bestehen die bisherigen
+Semaphore-/Thread-/Heap-/Uhrproben und das generische Cleanup unveraendert.
+Der kombinierte native Link, seine Fehlergrenze, GSP-/HDMI- und echte IRQ-
+Abnahmen bleiben offen. RELEASE bleibt 0.79.8; OssiPC wurde nicht kontaktiert.

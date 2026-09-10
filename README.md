@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-Original Apache-2.0 passive NVIDIA display driver for R4OS. Module 0.1.7;
+Original Apache-2.0 passive NVIDIA display driver for R4OS. Module 0.1.8;
 hardware acceptance for roadmap 0.79.9 is open and offline preparation for
 0.79.10 has started. This owner inventories NVIDIA display functions once through
 the kernel PCI inventory. It does not initialize engines or take over scanout.
@@ -94,9 +94,10 @@ test allocator, injected allocation failures and protected boundary pages.
 Linux x86_64 executes the exact freestanding adapter objects used in the
 partial links; Windows compiles the same C sources for its native host ABI.
 The host allocator is never linked into a target object. The resulting RM and
-NVKMS partial objects now have 333 and 47 unresolved imports after the clock
-adapters below, including the remaining private heap and clock functions. `os-adapter-results.json` records the source/object
-hashes, remaining imports and host-only acceptance. The ordinary fifteen-case
+NVKMS partial objects now have 329 and 48 unresolved imports after the
+semaphore adapters below, including the remaining private providers and the
+required nonreturning native-fault boundary. `os-adapter-results.json` records the source/object
+hashes, remaining imports and host-only acceptance. The ordinary seventeen-case
 `unit-test` and installed NVIDIA.R4D remain separate from this source port.
 
 The optional last inspector argument is the expected hexadecimal PCI device
@@ -172,7 +173,7 @@ signature sections for the selected release's families. Reports are created
 exclusively after success. Opaque signature bytes are preserved; GPU signature
 verification and hardware compatibility are not established by this check.
 Host-file deadlines are checked before and after I/O, not by forcibly cancelling
-a blocked host filesystem operation. The `unit-test` step now has thirteen cases.
+a blocked host filesystem operation. The `unit-test` step now has seventeen cases.
 
 RM/NVKMS integration, board-specific FWSEC, GSP bootstrap/RPC and hardware
 fallback acceptance remain open. Packaged and CPU-verified firmware does not
@@ -229,7 +230,7 @@ os_get_tick_resolution in nanoseconds. nvkms_clock.c converts valid readings
 to microseconds and preserves the error marker. Both RM tick functions use
 the same high-resolution source; tick resolution describes that actual source.
 The explicit source build tests these exact target objects in Tests/RmClock.c
-and records schema-2 os-adapter-results.json. The private provider is exercised
+and records the clock acceptance in schema-3 os-adapter-results.json. The private provider is exercised
 separately by the actual NVIDIA.R4D runtime-check: 64 sequential clock reads
 from both init and a real worker, followed by a scheduler wait and progress
 check. The combined RM link remains pending. No UTC, CPU-frequency, delay,
@@ -254,8 +255,8 @@ Three returned task records remain for generic driver cleanup. Failed waits
 retain the module; a diagnostic assertion after confirmed callback quiescence
 reports failure without vetoing safe cleanup. Normal passive starts create no
 tasks. No RM/NVKMS thread adapter or combined RM link is claimed by this CPU
-service integration; mutexes, semaphores, precise delays and hardware remain
-separate work.
+service integration; precise delays, the remaining native OS callbacks and
+hardware remain separate work.
 
 Resident semaphores (0.79.10)
 ----------------------------
@@ -270,8 +271,42 @@ The diagnostic retires its own tasks before the preceding thread probe's
 accounting, and leaves two semaphore records for generic kernel cleanup.
 Normal passive startup still creates neither tasks nor semaphores.
 
-This is the actual generic scheduler service needed by the RM port. The
-original RM/NVKMS C synchronization adapters and private C provider are still
-pending; in particular a void-returning NVKMS down must never pretend to have
-acquired a permit after failure. No new original-source build or GPU/IRQ
-hardware acceptance is claimed by this CPU-only integration.
+Private RM/NVKMS semaphore bridge (0.79.10)
+------------------------------------------
+`rm_semaphore.zig` supplies five private C-ABI hooks through DriverApi33 and
+the resident CPU heap. Each opaque pointer owns a real aligned CPU box with
+a kernel semaphore handle. Creation uses the full u32 counter range; zero
+timeout tries once and UINT64_MAX waits for a real permit. Close rejects new
+objects while cached operations can finish existing waits and free backing.
+The caller must quiesce every user before freeing; the cookie is a corruption
+check for live pointers, not arbitrary-address or double-free validation.
+
+Failed kernel destruction retains both objects. If the semaphore is gone but
+its CPU free fails, a retry frees only that box, without destroying a stale
+handle. Unexpected failures latch provider availability until rebind; cleanup
+remains usable. The shared heap adds an internal per-operation result while
+preserving its existing void C ABI. No kernel or public API change is needed.
+
+`os_semaphore.c` implements twelve original RM entrypoints, including the two
+context predicates; `nvkms_semaphore.c` supplies four NVKMS entrypoints. Both
+compile against the pinned original headers. Conditional RM mutex acquisition
+still requires a sleepable context, whereas conditional semaphore acquisition
+and a single release support resident IRQ context. This is a counting
+semaphore, not an IRQ spinlock or a recursive/task-owned mutex.
+
+The void-returning free/up/down paths require `r4nv_native_fault` on failure.
+It is explicitly noreturn and deliberately has no target implementation yet:
+the future native dispatcher must provide a real failure boundary before the
+combined RM/NVKMS link can run. No failed down returns a fabricated permit.
+The 180-check hosted acceptance executes the exact freestanding C objects on
+Linux, including 25 failure transfers into its host-only setjmp/longjmp fixture.
+That fixture never enters a R4D. Windows sources are cross-built, not executed.
+
+The actual private Zig provider is tested separately in the existing SMP4
+runtime-check: four dedicated callbacks, 128 protected updates across real
+scheduler waits, bounded timeout, busy destruction and actual close/stop
+handoff. All its CPU boxes and task records are freed before the preceding
+diagnostics' accounting. The previous FIFO, 256-update, heap and clock probes
+remain required. Normal passive startup allocates no semaphore. Original C
+execution in a guest, the native fault boundary, combined RM link and actual
+GPU/IRQ hardware acceptance remain open.

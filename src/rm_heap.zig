@@ -44,11 +44,18 @@ pub export fn r4nv_heap_allocate(bytes: u64) callconv(.c) ?*anyopaque {
 }
 
 pub export fn r4nv_heap_free(pointer: ?*anyopaque) callconv(.c) void {
-    const address = @intFromPtr(pointer orelse return);
-    const ctx = context orelse return;
+    _ = release(pointer);
+}
+
+// Private Zig users which own more than one resource need the outcome of this
+// exact free, not a snapshot of the shared diagnostic counter. The C ABI stays
+// void; a failed release keeps the same live allocation for retry or cleanup.
+pub fn release(pointer: ?*anyopaque) bool {
+    const address = @intFromPtr(pointer orelse return true);
+    const ctx = context orelse return false;
     if (address < @sizeOf(Header) or address & 15 != 0) {
         _ = @atomicRmw(u64, &failed_releases, .Add, 1, .monotonic);
-        return;
+        return false;
     }
     // Like the upstream free contract, the caller must supply a live pointer
     // from this allocator. The cookie detects damaged prefix metadata, not
@@ -59,5 +66,7 @@ pub export fn r4nv_heap_free(pointer: ?*anyopaque) callconv(.c) void {
         // Failed free retains the exact kernel-owned allocation for retry or
         // quiesced owner cleanup, despite the upstream void return type.
         _ = @atomicRmw(u64, &failed_releases, .Add, 1, .monotonic);
+        return false;
     }
+    return true;
 }

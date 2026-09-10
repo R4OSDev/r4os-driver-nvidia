@@ -1,6 +1,6 @@
-# Build the R4OS memory and monotonic-clock subsets against pinned headers.
-# Private providers remain unresolved in these partial objects. Host fixtures
-# supply an allocator and clock; nothing from this build is installed in R4D.
+# Build the R4OS CPU subsets against pinned headers. Private providers and the
+# mandatory native-fault boundary remain unresolved in these partial objects.
+# Hosted fixtures never become target providers or get installed in R4D.
 param(
     [Parameter(Mandatory)][string]$Compiler,
     [Parameter(Mandatory)][string]$OutputDirectory
@@ -15,7 +15,7 @@ $plan=Get-Content -Raw -LiteralPath (Join-Path $outputRoot 'compile-plan.json')|
 $adapterRoot=Join-Path $outputRoot 'adapter'
 $sourceRoot=Join-Path $adapterRoot 'source'
 $inputs=@()
-foreach($relative in @('src/rm/memory.h','src/rm/os_memory.c','src/rm/nvkms_memory.c','Tests/RmMemory.c','src/rm/clock.h','src/rm/os_clock.c','src/rm/nvkms_clock.c','Tests/RmClock.c')){
+foreach($relative in @('src/rm/memory.h','src/rm/os_memory.c','src/rm/nvkms_memory.c','Tests/RmMemory.c','src/rm/clock.h','src/rm/os_clock.c','src/rm/nvkms_clock.c','Tests/RmClock.c','src/rm/semaphore.h','src/rm/native_fault.h','src/rm/os_semaphore.c','src/rm/nvkms_semaphore.c','Tests/RmSemaphore.c')){
     $source=Join-Path $moduleRoot $relative
     $copy=Join-Path $sourceRoot $relative
     [IO.Directory]::CreateDirectory((Split-Path -Parent $copy))|Out-Null
@@ -93,6 +93,37 @@ $code=Invoke-RmNative -Executable $clockCheck -Arguments @('check') -WorkingDire
 $message=Get-Content -Raw -LiteralPath $clockLog
 if($code -ne 0 -or $message -notmatch '^RM clock adapters: OK checks=(\d+) reads=(\d+) resolution-reads=(\d+) units=ns/us gpu=none\r?\n$'){throw 'R4OS clock adapter host acceptance failed'}
 $clockAcceptance=[ordered]@{passed=$true;checks=[int]$Matches[1];reads=[int]$Matches[2];resolution_reads=[int]$Matches[3];exact_freestanding_objects_executed=$exactTargetObjects;executable_sha256=(Get-FileHash -LiteralPath $clockCheck).Hash.ToLowerInvariant();gpu_executed=$false}
-$report=[ordered]@{schema=2;subset='cpu-memory-strings-and-monotonic-clock';runtime_complete=$false;driver_heap_provider_linked=$false;driver_clock_provider_linked=$false;gpu_executed=$false;module_installed=$false;inputs=$inputs;components=$components;host_acceptance=$acceptance;clock_acceptance=$clockAcceptance}
+Write-Host $message.Trim()
+$semaphoreObjects=@()
+foreach($component in $plan.components){
+    $name=if($component.name -ceq 'nvidia'){'os_semaphore'}else{'nvkms_semaphore'}
+    $source=Join-Path $sourceRoot ('src/rm/'+$name+'.c')
+    $object=Join-Path $adapterRoot ($name+'.o')
+    $flags=@($component.flags)+@('-std=gnu11','-Werror','-Wmissing-prototypes')
+    $code=Invoke-RmNative -Executable $zig -Arguments (@('cc')+$flags+@('-c',$source,'-o',$object)) -WorkingDirectory $adapterRoot -LogPath (Join-Path $adapterRoot ($name+'-compile.log'))
+    if($code -ne 0){throw "R4OS semaphore adapter compilation failed: $name"}
+    $elfFile=Join-Path $adapterRoot ($name+'-elf.json')
+    & $pwsh -NoProfile -File (Join-Path $PSScriptRoot 'InspectElf.ps1') -InputFile $object -OutputFile $elfFile
+    if($LASTEXITCODE -ne 0){throw "R4OS semaphore adapter inspection failed: $name"}
+    $elf=Get-Content -Raw -LiteralPath $elfFile|ConvertFrom-Json
+    [string[]]$undefined=@($elf.undefined|ForEach-Object {$_.name});[Array]::Sort($undefined,[StringComparer]::Ordinal)
+    $expectedImports=if($name -ceq 'os_semaphore'){'r4nv_native_fault,r4nv_semaphore_acquire,r4nv_semaphore_context_flags,r4nv_semaphore_create,r4nv_semaphore_free,r4nv_semaphore_release'}else{'r4nv_native_fault,r4nv_semaphore_acquire,r4nv_semaphore_create,r4nv_semaphore_free,r4nv_semaphore_release'}
+    $expectedExports=if($name -ceq 'os_semaphore'){12}else{4}
+    if(($undefined -join ',') -cne $expectedImports -or $elf.defined_count -ne $expectedExports -or $elf.tls_bytes -ne 0 -or $elf.initializer_sections.Count){throw 'Semaphore adapter gained an unexpected runtime dependency'}
+    $components+=[ordered]@{component=$component.name;object=$object;bytes=$elf.bytes;sha256=$elf.sha256;implemented=@($elf.defined|ForEach-Object {$_.name});undefined=$undefined;tls_bytes=$elf.tls_bytes;initializer_sections=$elf.initializer_sections}
+    $semaphoreObjects+=$object
+}
+$semaphoreCheck=Join-Path $adapterRoot $(if($IsWindows){'check-semaphore.exe'}else{'check-semaphore'})
+$semaphoreInputs=@((Join-Path $sourceRoot 'Tests/RmSemaphore.c'))
+if($exactTargetObjects){$semaphoreInputs+=$semaphoreObjects}
+else{$semaphoreInputs+=@((Join-Path $sourceRoot 'src/rm/os_semaphore.c'),(Join-Path $sourceRoot 'src/rm/nvkms_semaphore.c'))}
+$code=Invoke-RmNative -Executable $zig -Arguments (@('cc')+$hostFlags+$semaphoreInputs+@('-o',$semaphoreCheck)) -WorkingDirectory $adapterRoot -LogPath (Join-Path $adapterRoot 'semaphore-host-build.log')
+if($code -ne 0){throw 'R4OS semaphore adapter host acceptance did not build'}
+$semaphoreLog=Join-Path $adapterRoot 'semaphore-host-check.log'
+$code=Invoke-RmNative -Executable $semaphoreCheck -Arguments @('check') -WorkingDirectory $adapterRoot -LogPath $semaphoreLog -TimeoutSeconds 10
+$message=Get-Content -Raw -LiteralPath $semaphoreLog
+if($code -ne 0 -or $message -notmatch '^RM semaphore adapters: OK checks=(\d+) creates=(\d+) acquires=(\d+) releases=(\d+) frees=(\d+) faults=(\d+) live=0 gpu=none\r?\n$'){throw 'R4OS semaphore adapter host acceptance failed'}
+$semaphoreAcceptance=[ordered]@{passed=$true;checks=[int]$Matches[1];creates=[int]$Matches[2];acquires=[int]$Matches[3];releases=[int]$Matches[4];frees=[int]$Matches[5];nonreturning_faults=[int]$Matches[6];live_allocations=0;exact_freestanding_objects_executed=$exactTargetObjects;executable_sha256=(Get-FileHash -LiteralPath $semaphoreCheck).Hash.ToLowerInvariant();native_fault_provider='host-only setjmp/longjmp fixture; no target implementation';kernel_waits_executed=$false;gpu_executed=$false}
+$report=[ordered]@{schema=3;subset='cpu-memory-clock-and-semaphores';runtime_complete=$false;driver_heap_provider_linked=$false;driver_clock_provider_linked=$false;driver_semaphore_provider_linked=$false;native_fault_provider_linked=$false;gpu_executed=$false;module_installed=$false;inputs=$inputs;components=$components;host_acceptance=$acceptance;clock_acceptance=$clockAcceptance;semaphore_acceptance=$semaphoreAcceptance}
 [IO.File]::WriteAllText((Join-Path $outputRoot 'os-adapter-results.json'),($report|ConvertTo-Json -Depth 8)+"`n",[Text.UTF8Encoding]::new($false))
 Write-Host $message.Trim()

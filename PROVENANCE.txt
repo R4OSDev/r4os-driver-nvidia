@@ -133,3 +133,14 @@ unchanged. This checkpoint adds no third-party source or binary.
 src/semaphore_probe.zig is original R4OS diagnostic code using DriverApi33.
 No NVIDIA/Linux implementation is copied. Pinned upstream sources, shaders,
 firmware and the existing memory/clock C adapters remain unchanged.
+
+0.79.10 private semaphore provider and original-header adapters, 10.09.2026:
+src/rm_semaphore.zig, rm_semaphore_probe.zig, rm/semaphore.h, native_fault.h,
+os_semaphore.c, nvkms_semaphore.c and Tests/RmSemaphore.c are original R4OS
+code. The pinned os-interface.h and nvidia-modeset-os-interface.h provide
+the actual declarations. Behavioral comparison used kernel-open/nvidia/
+os-interface.c (mutex/semaphore and context rules), common/inc/nv-linux.h
+(NV_MAY_SLEEP), and nvidia-modeset/nvidia-modeset-linux.c (sema alloc/down/up).
+No Linux implementation is copied or linked. The noreturn failure hook has
+no target provider; hosted setjmp/longjmp exists only in the C checker.
+Original source, shader and firmware bytes and all notices remain unchanged.

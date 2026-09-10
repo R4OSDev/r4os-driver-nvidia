@@ -7,6 +7,147 @@ const resource_loader = @import("firmware_resources.zig");
 const firmware = @import("firmware.zig");
 const cpu_provider = @import("rm_heap.zig");
 const clock_provider = @import("rm_clock.zig");
+const sem_provider = @import("rm_semaphore.zig");
+
+const SemFixture = struct {
+    live: bool = false,
+    closed: bool = false,
+    flags: u32 = a.driver_semaphore_context_sleepable,
+    count: u32 = 0,
+    deadline: u64 = 0,
+    create_result: i32 = 0,
+    destroy_result: i32 = 0,
+    release_result: i32 = 0,
+    destroys: u32 = 0,
+};
+var sem_fixture: SemFixture = .{};
+const sem_handle: u64 = 0xf000000100000079;
+fn semQuery(output: *a.DriverSemaphoreApi) callconv(.c) i32 {
+    if (sem_fixture.closed) return a.driver_semaphore_error_closed;
+    output.* = .{ .create = @intFromPtr(&semCreate), .acquire = @intFromPtr(&semAcquire), .release = @intFromPtr(&semRelease), .destroy = @intFromPtr(&semDestroy), .context_flags = @intFromPtr(&semFlags) };
+    return 0;
+}
+fn semCreate(initial: u32, maximum: u32, out: *u64) callconv(.c) i32 {
+    std.debug.assert(maximum == std.math.maxInt(u32) and out.* == 0 and !sem_fixture.live);
+    if (sem_fixture.closed) return a.driver_semaphore_error_closed;
+    if (sem_fixture.create_result != 0) return sem_fixture.create_result;
+    sem_fixture.live = true;
+    sem_fixture.count = initial;
+    out.* = sem_handle;
+    return 0;
+}
+fn semAcquire(handle: u64, ticks: u64) callconv(.c) i32 {
+    std.debug.assert(handle == sem_handle and sem_fixture.live);
+    sem_fixture.deadline = ticks;
+    if (ticks != 0 and sem_fixture.flags & a.driver_semaphore_context_sleepable == 0) return a.driver_semaphore_error_context;
+    if (sem_fixture.count == 0) return a.driver_semaphore_error_timeout;
+    sem_fixture.count -= 1;
+    return 0;
+}
+fn semRelease(handle: u64) callconv(.c) i32 {
+    std.debug.assert(handle == sem_handle and sem_fixture.live);
+    if (sem_fixture.release_result != 0) return sem_fixture.release_result;
+    if (sem_fixture.count == std.math.maxInt(u32)) return a.driver_semaphore_error_overflow;
+    sem_fixture.count += 1;
+    return 0;
+}
+fn semDestroy(handle: u64) callconv(.c) i32 {
+    std.debug.assert(handle == sem_handle and sem_fixture.live);
+    sem_fixture.destroys += 1;
+    if (sem_fixture.destroy_result != 0) return sem_fixture.destroy_result;
+    sem_fixture.live = false;
+    return 0;
+}
+fn semFlags() callconv(.c) u32 {
+    return sem_fixture.flags;
+}
+fn semaphoreApi() a.DriverApi {
+    var api = apiTable();
+    api.version = 33;
+    api.heap_query = cpuQuery;
+    api.semaphore_query = semQuery;
+    state = .{ .present = false };
+    cpu_closed = false;
+    cpu_fail_release = false;
+    sem_fixture = .{};
+    return api;
+}
+
+test "NVIDIA actual driver lifecycle bridges opaque semaphores and preserves close context and integer widths" {
+    var api = semaphoreApi();
+    try t.expectEqual(@as(i32, -4), driver.nvidia_init(&api));
+    defer _ = driver.nvidia_shutdown();
+    try t.expect(sem_provider.available());
+    const pointer = sem_provider.r4nv_semaphore_create(std.math.maxInt(u32)) orelse return error.SemaphoreAllocation;
+    try t.expectEqual(@as(u64, 32), cpu_requested);
+    try t.expectEqual(@as(usize, 0), @intFromPtr(pointer) & 15);
+    try t.expectEqual(std.math.maxInt(u32), sem_fixture.count);
+    try t.expectEqual(sem_provider.ok, sem_provider.r4nv_semaphore_acquire(pointer, std.math.maxInt(u64)));
+    try t.expectEqual(std.math.maxInt(u64), sem_fixture.deadline);
+    sem_fixture.count = 0;
+    try t.expectEqual(sem_provider.retry, sem_provider.r4nv_semaphore_acquire(pointer, 0x100000007));
+    try t.expectEqual(@as(u64, 0x100000007), sem_fixture.deadline);
+    sem_fixture.flags = a.driver_semaphore_context_irq;
+    try t.expectEqual(sem_provider.irq, sem_provider.r4nv_semaphore_context_flags());
+    try t.expectEqual(sem_provider.invalid_context, sem_provider.r4nv_semaphore_acquire(pointer, 1));
+    try t.expectEqual(sem_provider.ok, sem_provider.r4nv_semaphore_release(pointer));
+    try t.expectEqual(sem_provider.ok, sem_provider.r4nv_semaphore_acquire(pointer, 0));
+    try t.expectEqual(sem_provider.retry, sem_provider.r4nv_semaphore_acquire(pointer, 0));
+    sem_fixture.flags = a.driver_semaphore_context_sleepable;
+    try t.expectEqual(sem_provider.sleepable, sem_provider.r4nv_semaphore_context_flags());
+    sem_fixture.closed = true;
+    cpu_closed = true;
+    const ctx = r4os.r4dev.DriverContext.init(&api);
+    try t.expect(ctx.semaphores() == null and sem_provider.r4nv_semaphore_create(1) == null);
+    try t.expectEqual(sem_provider.ok, sem_provider.r4nv_semaphore_release(pointer));
+    try t.expectEqual(sem_provider.ok, sem_provider.r4nv_semaphore_acquire(pointer, std.math.maxInt(u64)));
+    try t.expectEqual(sem_provider.ok, sem_provider.r4nv_semaphore_free(pointer));
+    try t.expect(cpu_backing == null and !sem_fixture.live and sem_provider.faultCount() == 0);
+    try t.expectEqual(sem_provider.ok, sem_provider.r4nv_semaphore_free(null));
+    try t.expectEqual(@as(i32, 0), driver.nvidia_shutdown());
+    try t.expect(!sem_provider.available() and sem_provider.r4nv_semaphore_context_flags() == 0);
+    api.version = 32;
+    api.size = @offsetOf(a.DriverApi, "semaphore_query");
+    sem_provider.bind(&ctx);
+    try t.expect(!sem_provider.available());
+    sem_provider.unbind();
+}
+
+test "NVIDIA actual driver lifecycle retains independent semaphore and CPU free failures" {
+    var api = semaphoreApi();
+    try t.expectEqual(@as(i32, -4), driver.nvidia_init(&api));
+    defer _ = driver.nvidia_shutdown();
+    sem_fixture.create_result = a.driver_semaphore_error_memory;
+    try t.expect(sem_provider.r4nv_semaphore_create(1) == null and cpu_backing == null and !sem_fixture.live);
+    sem_fixture.create_result = 0;
+    sem_fixture.flags = 0;
+    const calls = cpu_calls;
+    try t.expect(sem_provider.r4nv_semaphore_create(1) == null and calls == cpu_calls);
+    sem_fixture.flags = a.driver_semaphore_context_sleepable;
+    const pointer = sem_provider.r4nv_semaphore_create(0) orelse return error.SemaphoreAllocation;
+    sem_fixture.destroy_result = a.driver_semaphore_error_busy;
+    try t.expectEqual(sem_provider.retry, sem_provider.r4nv_semaphore_free(pointer));
+    try t.expect(sem_fixture.live and cpu_backing != null and sem_provider.available());
+    sem_fixture.destroy_result = a.driver_semaphore_error_release;
+    try t.expectEqual(sem_provider.invalid, sem_provider.r4nv_semaphore_free(pointer));
+    try t.expect(sem_fixture.live and cpu_backing != null and !sem_provider.available());
+    sem_fixture.destroy_result = 0;
+    cpu_fail_release = true;
+    try t.expectEqual(sem_provider.invalid, sem_provider.r4nv_semaphore_free(pointer));
+    try t.expect(!sem_fixture.live and cpu_backing != null and sem_fixture.destroys == 3);
+    cpu_fail_release = false;
+    try t.expectEqual(sem_provider.ok, sem_provider.r4nv_semaphore_free(pointer));
+    try t.expect(cpu_backing == null and sem_fixture.destroys == 3 and cpu_provider.releaseFailures() == 1 and sem_provider.faultCount() == 2);
+    try t.expect(sem_provider.r4nv_semaphore_create(1) == null);
+    const ctx = r4os.r4dev.DriverContext.init(&api);
+    sem_provider.bind(&ctx);
+    const another = sem_provider.r4nv_semaphore_create(1) orelse return error.SemaphoreAllocation;
+    sem_fixture.release_result = a.driver_semaphore_error_overflow;
+    try t.expectEqual(sem_provider.invalid, sem_provider.r4nv_semaphore_release(another));
+    try t.expect(sem_fixture.count == 1 and sem_fixture.live and !sem_provider.available());
+    try t.expectEqual(sem_provider.ok, sem_provider.r4nv_semaphore_free(another));
+    try t.expect(cpu_backing == null and !sem_fixture.live);
+}
 
 var clock_value: a.MonotonicClockInfo = .{};
 var clock_result: i32 = 1;
