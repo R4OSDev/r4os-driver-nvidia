@@ -6,6 +6,72 @@ const t = std.testing;
 const resource_loader = @import("firmware_resources.zig");
 const firmware = @import("firmware.zig");
 const cpu_provider = @import("rm_heap.zig");
+const clock_provider = @import("rm_clock.zig");
+
+var clock_value: a.MonotonicClockInfo = .{};
+var clock_result: i32 = 1;
+fn clockRead(output: *a.MonotonicClockInfo) callconv(.c) i32 {
+    output.* = clock_value;
+    return clock_result;
+}
+fn goodClock() a.MonotonicClockInfo {
+    return .{ .flags = a.monotonic_clock_flag_valid | a.monotonic_clock_flag_continuous | a.monotonic_clock_flag_high_resolution, .source = a.monotonic_clock_source_tsc, .generation = 3, .instant_ns = 0x10000000001, .resolution_ns = 1 };
+}
+test "NVIDIA actual driver lifecycle bridges monotonic clock units and latches clock failure" {
+    var api = apiTable();
+    api.version = 31;
+    api.monotonic_clock = clockRead;
+    clock_result = 1;
+    clock_value = goodClock();
+    state = .{ .present = false, .clock_fixture = true };
+    try t.expectEqual(@as(i32, -4), driver.nvidia_init(&api));
+    defer _ = driver.nvidia_shutdown();
+    try t.expect(clock_provider.available());
+    try t.expectEqual(clock_value.instant_ns, clock_provider.r4nv_clock_now_ns());
+    try t.expectEqual(@as(u64, 1), clock_provider.r4nv_clock_resolution_ns());
+    // A real source change is allowed; its unit stays ns and its current
+    // degraded resolution is reported, not cached from the original TSC.
+    clock_value.flags = a.monotonic_clock_flag_valid | a.monotonic_clock_flag_continuous | a.monotonic_clock_flag_degraded;
+    clock_value.source = a.monotonic_clock_source_periodic_event;
+    clock_value.generation += 1;
+    clock_value.instant_ns += 10000001;
+    clock_value.resolution_ns = 10000001;
+    try t.expectEqual(clock_value.instant_ns, clock_provider.r4nv_clock_now_ns());
+    try t.expectEqual(@as(u64, 10000001), clock_provider.r4nv_clock_resolution_ns());
+    const ctx = r4os.r4dev.DriverContext.init(&api);
+    for (0..8) |fault| {
+        clock_value = goodClock();
+        clock_provider.bind(&ctx);
+        switch (fault) {
+            0 => clock_result = 0,
+            1 => clock_value.flags = a.monotonic_clock_flag_valid,
+            2 => clock_value.frequency_hz = 100,
+            3 => clock_value.resolution_ns = 0,
+            4 => clock_value.instant_ns = std.math.maxInt(u64),
+            5 => clock_value.source = a.monotonic_clock_source_unavailable,
+            6 => clock_value.version = 2,
+            7 => clock_value.size = 79,
+            else => unreachable,
+        }
+        try t.expectEqual(clock_provider.unavailable, clock_provider.r4nv_clock_resolution_ns());
+        try t.expectEqual(clock_provider.unavailable, clock_provider.r4nv_clock_now_ns());
+        try t.expect(!clock_provider.available());
+        clock_value = goodClock();
+        clock_result = 1;
+        try t.expectEqual(clock_provider.unavailable, clock_provider.r4nv_clock_resolution_ns());
+    }
+    clock_provider.bind(&ctx);
+    clock_value.instant_ns = std.math.maxInt(u64);
+    try t.expectEqual(clock_provider.unavailable, clock_provider.r4nv_clock_now_ns());
+    try t.expect(!clock_provider.available());
+    try t.expectEqual(@as(i32, 0), driver.nvidia_shutdown());
+    try t.expectEqual(clock_provider.unavailable, clock_provider.r4nv_clock_now_ns());
+    api.version = 30;
+    api.size = @offsetOf(a.DriverApi, "monotonic_clock");
+    clock_provider.bind(&ctx);
+    try t.expect(!clock_provider.available());
+    clock_provider.unbind();
+}
 
 var cpu_backing: ?[]align(16) u8 = null;
 var cpu_handle: u64 = 0x100000001;
@@ -86,6 +152,7 @@ test "NVIDIA actual driver lifecycle bridges resident CPU memory and retains fai
 
 const State = struct {
     present: bool = true,
+    clock_fixture: bool = false,
     device_id: u16 = 0x2504,
     enumerate_count: usize = 0,
     detail_count: usize = 0,
@@ -141,6 +208,7 @@ fn resources(output: *a.DriverResourceApi) callconv(.c) i32 {
     return 0;
 }
 fn resourceNow() callconv(.c) u64 {
+    if (state.clock_fixture) return clock_value.instant_ns;
     return 100;
 }
 fn resourceStat(name: [*]const u8, length: u32, output: *a.DriverResourceInfo) callconv(.c) i32 {

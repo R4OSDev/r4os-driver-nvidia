@@ -251,8 +251,8 @@ Fehlversuche bleiben mit ihren Logs erhalten und ueberschreiben nie einen
 vorherigen Erfolg. Neue permanente Gatefamilien werden nicht angelegt.
 
 Alle 1196 Dateien und beide partiellen Links laufen auf dem Debian-Host.
-Mit den unten beschriebenen CPU-Speicheradaptern bleiben 334 offene Symbole
-im RM und 47 in NVKMS, einschliesslich zweier privater R4OS-Heapimports.
+Mit CPU-Speicher- und Zeitadaptern bleiben 333 offene Symbole im RM und
+47 in NVKMS, einschliesslich vier beziehungsweise drei privater Heap-/Zeitimporte.
 Davon sind 60 SPDM-Kryptofunktionen im RM. Die Crypto-Grenze wird in
 Linux durch kernel-open/nvidia/libspdm_*.c an die Linux Crypto API gebunden;
 diese Betriebssystemimplementierungen sind nicht Teil des gewaehlten src-
@@ -320,9 +320,10 @@ und die weiteren RM-/NVKMS-Mutex-, IRQ- und Workeradapter bleiben offen.
 
 Tools/Rm/Adapter.ps1 kopiert die eigenen C-Quellen in den privaten Versuch,
 kompiliert mit den jeweiligen RM-/NVKMS-Flags und prueft die Objektimporte.
-Ausser den beiden privaten Heapimports sind darin keine Laufzeitimporte,
-TLS-Daten oder automatischen Initialisierer erlaubt. Erst der bestandene
-Hosttest erlaubt die Aufnahme der zwei Adapterobjekte in die Teilobjekte.
+Die beiden Speicherobjekte duerfen nur die privaten Heapimporte besitzen.
+Die beiden Zeitobjekte duerfen nur ihre privaten Zeitimporte besitzen; TLS
+und automatische Initialisierer bleiben verboten. Erst beide bestandenen
+Hosttests erlauben die Aufnahme aller vier Adapterobjekte in die Teilobjekte.
 
 Tests/RmMemory.c prueft echte Funktionen mit einem Host-Testallocator,
 Fehlinjektion, Ausrichtungs-/Release-Canaries, 64-Bit-Umfaengen, unaligned
@@ -332,7 +333,7 @@ Unter Linux x86_64 laufen die tatsaechlichen Freestanding-Objekte des
 Quellbaus; Windows baut dieselben C-Quellen fuer seine Host-ABI. Der Test-
 allocator gelangt niemals in die Zielobjekte. Er ersetzt weder R4OS-Heap
 noch Hardwareabnahme. Der Test gehoert nur zum expliziten build-rm-Step;
-der normale unit-test hat jetzt 14 Faelle. Tests.json erfasst diesen
+der normale unit-test hat jetzt 15 Faelle. Tests.json erfasst diesen
 gezielten Component-Test, ohne einen weiteren Workspace-/Gastlauf anzulegen.
 
 Residenter R4D-Heap und CPU-Laufzeitprobe
@@ -366,3 +367,34 @@ Windows-Starter nutzen den vorhandenen SMP4-Grafiklauf mit separatem Image,
 ohne Gastnetz und ohne NVIDIA-Geraet. Normale Profile fuehren diese Diagnose
 nicht aus. Die C-Quellportadapter sind weiterhin getrennte Teilobjekte; dieser
 Nachweis ist kein kombinierter RM-Link und keine GPU- oder Hardwareabnahme.
+
+Monotone Zeit fuer RM/NVKMS
+--------------------------
+Kernel 0.1.142 / DriverApi31 erweitert den 608-Byte-Praefix um genau einen
+optionalen Eintrag monotonic_clock auf 616 Bytes. Der vorhandene feste
+80-Byte-Payload MonotonicClockInfo wird unveraendert wiederverwendet. Die
+gemeinsame Kernelabbildung gehoert kernel/monotonic_api.zig; R4SYS und R4D
+verwenden dieselben Nanosekunden, Quellen, Generationen und Aufloesungen.
+
+NVIDIA 0.1.5 bindet rm_clock.zig vor Work-Publikation und loest die Bindung
+erst nach Quieszenz. Zeitstempel lesen den im Init erfassten now_ns-Eintrag
+der ResourceApi ohne Ressourcen-/Lifecycle-Guard und ohne Metadatenberechnung.
+Die aktuelle Aufloesung stammt dagegen aus monotonic_clock. Eine langsamere
+Fallbackquelle wird mit ihrer echten Aufloesung akzeptiert. Fehlende oder
+ungueltige Zeit verriegelt available bis zur naechsten Bindung; der private
+C-Pfad meldet UINT64_MAX. Spaetere native Dispatches muessen diesen Fehler
+beachten und unabhaengig begrenzt sein; der Wert allein bricht keine RM-Schleife ab.
+
+os_get_current_tick und os_get_current_tick_hr liefern beide die kanonische
+monotone Nanosekundenquelle. os_get_tick_resolution ist deren Quellenquantum
+in Nanosekunden, niemals Hertz. nvkms_get_usec teilt gueltige Werte durch 1000
+und erhaelt UINT64_MAX unveraendert. os_get_current_time verlangt UTC und bleibt
+wie echte Warte-/Synchronisationsfunktionen ausdruecklich unimplementiert.
+
+Tests/RmClock.c prueft die echten Zielobjekte, Null, Einheiten-/Sekundengrenzen,
+Werte ueber 32 Bit, UINT64_MAX-1, Fehler und wechselnde Aufloesung. Die normalen
+Lifecyclefaelle pruefen den echten Zig-Anbieter, alten Tabellenpraefix, langsame
+Quelle, falsche Metadaten und verriegelten Ausfall. runtime-check prueft im
+SMP4-Gast je 64 reale Init-/Workerreads und Zeitfortschritt nach Scheduler-Wait.
+Die getrennten Teilobjekte enthalten weiterhin offene private Providerimporte;
+dieser Nachweis ist kein kombinierter RM-Start und keine Hardwareabnahme.

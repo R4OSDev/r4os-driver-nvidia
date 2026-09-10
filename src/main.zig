@@ -5,6 +5,7 @@ const firmware_resources = @import("firmware_resources.zig");
 const firmware = @import("firmware.zig");
 const firmware_storage = @import("firmware_storage.zig");
 const rm_heap = @import("rm_heap.zig");
+const rm_clock = @import("rm_clock.zig");
 const runtime_probe = @import("runtime_probe.zig");
 const a = r4os.abi;
 var driver_api: ?*const a.DriverApi = null;
@@ -22,6 +23,7 @@ pub export fn nvidia_init(api: *const a.DriverApi) callconv(.c) i32 {
     if (!ctx.apiCompatible() or driver_api != null) return -1;
     driver_api = api;
     rm_heap.bind(&ctx);
+    rm_clock.bind(&ctx);
     const mode = std.mem.span(ctx.getOption("NVIDIA", "mode"));
     const check_firmware = std.ascii.eqlIgnoreCase(mode, "firmware-check");
     checking_runtime = std.ascii.eqlIgnoreCase(mode, "runtime-check");
@@ -115,6 +117,7 @@ pub export fn nvidia_shutdown() callconv(.c) i32 {
         ctx.logInfo("NVIDIA unbind: driver-state=closed cpu-owner-cleanup=pending native-writes=disabled fallback=preserved");
     } else ctx.logInfo("NVIDIA unbind: OK resources=0 native-writes=disabled fallback=preserved");
     rm_heap.unbind();
+    rm_clock.unbind();
     checking_runtime = false;
     driver_api = null;
     return 0;

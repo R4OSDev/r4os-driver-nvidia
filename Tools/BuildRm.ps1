@@ -130,7 +130,7 @@ try {
     $report.duplicate_global_definition_candidates=@($symbolTables['nvidia-modeset'].defined|Where-Object {$rmNames.Contains($_.name)}|ForEach-Object {$_.name})
     $report.upstream_memcpy_memset_localization_applied=$false
     $report.components=$components;$report.audit_complete=$true
-    Write-Host 'Original RM/NVKMS sources, shaders and CPU memory adapters built and inspected. Remaining OS callbacks, the driver heap provider and a final R4D link are still required.'
+    Write-Host 'Original RM/NVKMS sources, shaders, memory and clock adapters built and inspected. Remaining OS callbacks and a final R4D link with the private runtime providers are still required.'
 } catch {
     $report.error=$_.Exception.Message
     throw

@@ -112,3 +112,13 @@ The explicit R4D CPU diagnostic executes real init/work/close calls. The
 separate RM/NVKMS partial objects are not yet linked with this provider and
 continue to list those imports; their earlier source-build evidence remains
 historical and unchanged. No new third-party material is introduced.
+
+0.79.10 monotonic provider and adapters, 10.09.2026:
+src/rm_clock.zig, src/rm/clock.h, os_clock.c, nvkms_clock.c and Tests/RmClock.c
+are original R4OS implementations. Signatures and unit semantics were checked
+against the pinned original os-interface.h and nvidia-modeset-os-interface.h,
+and kernel-open/nvidia/os-interface.c and nvidia-modeset-linux.c. Original
+vendor files remain unchanged. R4OS uses its own common monotonic source;
+no Linux implementation, timer scheduler or semaphore is copied. Source-build
+fixtures and actual R4D runtime evidence remain separate. No new third-party
+source, firmware revision or license is introduced.

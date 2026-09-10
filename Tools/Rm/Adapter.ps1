@@ -1,6 +1,6 @@
-# Build the actual R4OS CPU-memory subset against the pinned NVIDIA headers.
-# The private heap provider remains unresolved in target objects; only the
-# host acceptance supplies a test allocator. Nothing is installed into R4D.
+# Build the R4OS memory and monotonic-clock subsets against pinned headers.
+# Private providers remain unresolved in these partial objects. Host fixtures
+# supply an allocator and clock; nothing from this build is installed in R4D.
 param(
     [Parameter(Mandatory)][string]$Compiler,
     [Parameter(Mandatory)][string]$OutputDirectory
@@ -15,7 +15,7 @@ $plan=Get-Content -Raw -LiteralPath (Join-Path $outputRoot 'compile-plan.json')|
 $adapterRoot=Join-Path $outputRoot 'adapter'
 $sourceRoot=Join-Path $adapterRoot 'source'
 $inputs=@()
-foreach($relative in @('src/rm/memory.h','src/rm/os_memory.c','src/rm/nvkms_memory.c','Tests/RmMemory.c')){
+foreach($relative in @('src/rm/memory.h','src/rm/os_memory.c','src/rm/nvkms_memory.c','Tests/RmMemory.c','src/rm/clock.h','src/rm/os_clock.c','src/rm/nvkms_clock.c','Tests/RmClock.c')){
     $source=Join-Path $moduleRoot $relative
     $copy=Join-Path $sourceRoot $relative
     [IO.Directory]::CreateDirectory((Split-Path -Parent $copy))|Out-Null
@@ -62,6 +62,37 @@ $code=Invoke-RmNative -Executable $check -Arguments @('check') -WorkingDirectory
 $message=Get-Content -Raw -LiteralPath $checkLog
 if($code -ne 0 -or $message -notmatch '^RM memory adapters: OK checks=(\d+) allocations=(\d+) frees=(\d+) live=0 guard-pages=active gpu=none\r?\n$'){throw 'R4OS memory adapter host acceptance failed'}
 $acceptance=[ordered]@{passed=$true;checks=[long]$Matches[1];allocation_calls=[int]$Matches[2];frees=[int]$Matches[3];live_allocations=0;guard_pages=$true;exact_freestanding_objects_executed=$exactTargetObjects;host=[Runtime.InteropServices.RuntimeInformation]::OSDescription;executable_sha256=(Get-FileHash -LiteralPath $check).Hash.ToLowerInvariant();gpu_executed=$false}
-$report=[ordered]@{schema=1;subset='cpu-memory-and-strings';runtime_complete=$false;driver_heap_provider_implemented=$false;gpu_executed=$false;module_installed=$false;inputs=$inputs;components=$components;host_acceptance=$acceptance}
+Write-Host $message.Trim()
+$clockObjects=@()
+foreach($component in $plan.components){
+    $name=if($component.name -ceq 'nvidia'){'os_clock'}else{'nvkms_clock'}
+    $source=Join-Path $sourceRoot ('src/rm/'+$name+'.c')
+    $object=Join-Path $adapterRoot ($name+'.o')
+    $flags=@($component.flags)+@('-std=gnu11','-Werror','-Wmissing-prototypes')
+    $code=Invoke-RmNative -Executable $zig -Arguments (@('cc')+$flags+@('-c',$source,'-o',$object)) -WorkingDirectory $adapterRoot -LogPath (Join-Path $adapterRoot ($name+'-compile.log'))
+    if($code -ne 0){throw "R4OS clock adapter compilation failed: $name"}
+    $elfFile=Join-Path $adapterRoot ($name+'-elf.json')
+    & $pwsh -NoProfile -File (Join-Path $PSScriptRoot 'InspectElf.ps1') -InputFile $object -OutputFile $elfFile
+    if($LASTEXITCODE -ne 0){throw "R4OS clock adapter inspection failed: $name"}
+    $elf=Get-Content -Raw -LiteralPath $elfFile|ConvertFrom-Json
+    [string[]]$undefined=@($elf.undefined|ForEach-Object {$_.name});[Array]::Sort($undefined,[StringComparer]::Ordinal)
+    $expectedImports=if($name -ceq 'os_clock'){'r4nv_clock_now_ns,r4nv_clock_resolution_ns'}else{'r4nv_clock_now_ns'}
+    $expectedExports=if($name -ceq 'os_clock'){3}else{1}
+    if(($undefined -join ',') -cne $expectedImports -or $elf.defined_count -ne $expectedExports -or $elf.tls_bytes -ne 0 -or $elf.initializer_sections.Count){throw 'Clock adapter gained an unexpected runtime dependency'}
+    $components+=[ordered]@{component=$component.name;object=$object;bytes=$elf.bytes;sha256=$elf.sha256;implemented=@($elf.defined|ForEach-Object {$_.name});undefined=$undefined;tls_bytes=$elf.tls_bytes;initializer_sections=$elf.initializer_sections}
+    $clockObjects+=$object
+}
+$clockCheck=Join-Path $adapterRoot $(if($IsWindows){'check-clock.exe'}else{'check-clock'})
+$clockInputs=@((Join-Path $sourceRoot 'Tests/RmClock.c'))
+if($exactTargetObjects){$clockInputs+=$clockObjects}
+else{$clockInputs+=@((Join-Path $sourceRoot 'src/rm/os_clock.c'),(Join-Path $sourceRoot 'src/rm/nvkms_clock.c'))}
+$code=Invoke-RmNative -Executable $zig -Arguments (@('cc')+$hostFlags+$clockInputs+@('-o',$clockCheck)) -WorkingDirectory $adapterRoot -LogPath (Join-Path $adapterRoot 'clock-host-build.log')
+if($code -ne 0){throw 'R4OS clock adapter host acceptance did not build'}
+$clockLog=Join-Path $adapterRoot 'clock-host-check.log'
+$code=Invoke-RmNative -Executable $clockCheck -Arguments @('check') -WorkingDirectory $adapterRoot -LogPath $clockLog -TimeoutSeconds 10
+$message=Get-Content -Raw -LiteralPath $clockLog
+if($code -ne 0 -or $message -notmatch '^RM clock adapters: OK checks=(\d+) reads=(\d+) resolution-reads=(\d+) units=ns/us gpu=none\r?\n$'){throw 'R4OS clock adapter host acceptance failed'}
+$clockAcceptance=[ordered]@{passed=$true;checks=[int]$Matches[1];reads=[int]$Matches[2];resolution_reads=[int]$Matches[3];exact_freestanding_objects_executed=$exactTargetObjects;executable_sha256=(Get-FileHash -LiteralPath $clockCheck).Hash.ToLowerInvariant();gpu_executed=$false}
+$report=[ordered]@{schema=2;subset='cpu-memory-strings-and-monotonic-clock';runtime_complete=$false;driver_heap_provider_linked=$false;driver_clock_provider_linked=$false;gpu_executed=$false;module_installed=$false;inputs=$inputs;components=$components;host_acceptance=$acceptance;clock_acceptance=$clockAcceptance}
 [IO.File]::WriteAllText((Join-Path $outputRoot 'os-adapter-results.json'),($report|ConvertTo-Json -Depth 8)+"`n",[Text.UTF8Encoding]::new($false))
 Write-Host $message.Trim()

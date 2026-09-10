@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-Original Apache-2.0 passive NVIDIA display driver for R4OS. Module 0.1.4;
+Original Apache-2.0 passive NVIDIA display driver for R4OS. Module 0.1.5;
 hardware acceptance for roadmap 0.79.9 is open and offline preparation for
 0.79.10 has started. This owner inventories NVIDIA display functions once through
 the kernel PCI inventory. It does not initialize engines or take over scanout.
@@ -94,9 +94,9 @@ test allocator, injected allocation failures and protected boundary pages.
 Linux x86_64 executes the exact freestanding adapter objects used in the
 partial links; Windows compiles the same C sources for its native host ABI.
 The host allocator is never linked into a target object. The resulting RM and
-NVKMS partial objects still have 334 and 47 unresolved imports, including both
-private heap functions. `os-adapter-results.json` records the source/object
-hashes, remaining imports and host-only acceptance. The ordinary fourteen-case
+NVKMS partial objects now have 333 and 47 unresolved imports after the clock
+adapters below, including the remaining private heap and clock functions. `os-adapter-results.json` records the source/object
+hashes, remaining imports and host-only acceptance. The ordinary fifteen-case
 `unit-test` and installed NVIDIA.R4D remain separate from this source port.
 
 The optional last inspector argument is the expected hexadecimal PCI device
@@ -115,7 +115,7 @@ packaged GSP containers in CPU memory before continuing the passive probe.
 `mode=runtime-check` explicitly exercises CPU heap calls from init and a real
 worker, validates close admission, and stops init before PCI. Its two leftover
 CPU allocations must be reclaimed by the actual failed-load cleanup. This mode
-requires kernel 0.1.141 / DriverApi30. Other modes are rejected. `DISPLAYD /NVIDIA`
+requires kernel 0.1.142 / DriverApi31. Other modes are rejected. `DISPLAYD /NVIDIA`
 replays complete NVIDIA boot records, with no additional hardware access.
 Distribution's `graphics-test Test nvidia-passive` runs an explicit short SMP4
 absence/fallback check with the existing graphics harness. It requires the
@@ -212,3 +212,27 @@ private module copy; the canonical artifact and prepared originals stay intact.
 The successful guest verifies 63571696 and 28542040 bytes through 971 and 436
 resource reads, releases both CPU buffers, and leaves bootfb usable. The R4D
 image is 44 KB; its large resource payload remains outside that allocation.
+
+Monotonic clock integration (0.79.10)
+-----------------------------------
+DriverApi31 appends the existing 80-byte MonotonicClockInfo snapshot without
+changing the old 608-byte prefix. R4SYS and R4D use one kernel mapping of the
+same source, nanosecond origin, resolution and quality flags. The actual
+rm_clock.zig provider caches the existing read-only resource clock for fast
+timestamp reads, avoiding a full metadata snapshot in polling hot paths.
+Resolution queries read current metadata, including degraded source changes.
+Unavailable or malformed readings latch the provider unavailable until rebind;
+UINT64_MAX is an error marker, never an invented timestamp.
+
+os_clock.c implements os_get_current_tick, os_get_current_tick_hr and
+os_get_tick_resolution in nanoseconds. nvkms_clock.c converts valid readings
+to microseconds and preserves the error marker. Both RM tick functions use
+the same high-resolution source; tick resolution describes that actual source.
+The explicit source build tests these exact target objects in Tests/RmClock.c
+and records schema-2 os-adapter-results.json. The private provider is exercised
+separately by the actual NVIDIA.R4D runtime-check: 64 sequential clock reads
+from both init and a real worker, followed by a scheduler wait and progress
+check. The combined RM link remains pending. No UTC, CPU-frequency, delay,
+mutex, semaphore, interrupt or firmware-start callback is faked. Future native
+dispatch must honor the latched clock fault and its own bounded work budget;
+upstream value-only time functions cannot cancel arbitrary RM loops.

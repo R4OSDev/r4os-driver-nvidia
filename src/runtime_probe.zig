@@ -2,6 +2,7 @@ const std = @import("std");
 const r4os = @import("r4os");
 const a = r4os.abi;
 const provider = @import("rm_heap.zig");
+const clock_provider = @import("rm_clock.zig");
 
 // Explicit CPU-only diagnostic. No ordinary driver start allocates these
 // buffers or submits these callbacks. If the same image is reused, retained
@@ -16,7 +17,7 @@ var previous_epoch: u64 = 0;
 var previous_handle: u64 = 0;
 
 pub fn start(ctx: *const r4os.r4dev.DriverContext) bool {
-    if (api != null or !provider.available()) return false;
+    if (api != null or !provider.available() or !clock_provider.available()) return false;
     api = ctx.api;
     prepared = false;
     @atomicStore(u32, &close_ready, 0, .release);
@@ -39,6 +40,7 @@ pub fn start(ctx: *const r4os.r4dev.DriverContext) bool {
     var after: a.DriverHeapStats = .{};
     if (heap.stats(&after) != 0 or after.allocations != 0 or after.bytes != 0 or after.pending_creates != 0 or after.pending_releases != 0 or provider.releaseFailures() != 0) return false;
     ctx.logInfo("NVIDIA runtime-check: memory=OK init=64 worker=64 alignment=16 content=verified live=0");
+    ctx.logInfo("NVIDIA runtime-check: clock=OK init=64 worker=64 monotonic-ns=verified");
 
     var page: a.DriverHeapAllocation = .{};
     if (heap.allocate(4096, 4096, &page) != 0 or page.cpu_address & 4095 != 0) return false;
@@ -97,6 +99,8 @@ fn runWorker(seed: usize) callconv(.c) i32 {
 }
 
 fn exercise(seed: u8) bool {
+    const ctx = r4os.r4dev.DriverContext.init(api orelse return false);
+    if (!exerciseClock(&ctx)) return false;
     var pointers: [64]?*anyopaque = .{null} ** 64;
     defer for (&pointers) |*pointer| {
         provider.r4nv_heap_free(pointer.*);
@@ -118,6 +122,23 @@ fn exercise(seed: u8) bool {
         provider.r4nv_heap_free(pointers[index]);
         pointers[index] = null;
     }
+    return true;
+}
+
+fn exerciseClock(ctx: *const r4os.r4dev.DriverContext) bool {
+    const before = clock_provider.snapshot() orelse return false;
+    var previous = before.instant_ns;
+    for (0..64) |_| {
+        const now = clock_provider.r4nv_clock_now_ns();
+        if (now == clock_provider.unavailable or now < previous) return false;
+        previous = now;
+    }
+    const resolution = clock_provider.r4nv_clock_resolution_ns();
+    if (resolution == 0 or resolution == clock_provider.unavailable) return false;
+    ctx.waitTicks(1);
+    const after = clock_provider.snapshot() orelse return false;
+    if (after.instant_ns <= previous or after.instant_ns <= before.instant_ns) return false;
+    if (before.generation == after.generation and (before.resolution_ns != resolution or after.resolution_ns != resolution)) return false;
     return true;
 }
 
