@@ -22,7 +22,8 @@ https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/drivers/
 PCI field comparison: Linux v6.14 include/uapi/linux/pci_regs.h and
 drivers/pci/pci.c, pci_rebar_find_pos and current-size extraction.
 https://github.com/torvalds/linux/blob/v6.14/drivers/pci/pci.c
-No Linux implementation or firmware binary is linked or redistributed here.
+No Linux implementation is linked into the driver. Original NVIDIA firmware
+is redistributed only in the explicit binary module package described below.
 The workspace keeps pinned upstream sources and hashes under
 ExFiles/Reference/GFX/Nvidia and Docs/Drivers/GrafikArchitektur07903.json.
 
@@ -31,7 +32,11 @@ The single src/firmware-lock.json pins installer origin, RM source revision,
 both original GSP containers, their complete license and family mapping.
 Its artifact digests were verified against the archived NVIDIA 570.144 package.
 No firmware opcode decoding, disassembly, signature bypass or modification.
-The prepared external package copies complete binary containers and LICENSE.
+The ignored Firmware/ directory holds complete byte-identical containers and
+LICENSE. Canonical module.R4MF binds their versioned resource names; the normal
+module build verifies every original before packaging. The complete license
+also resides in Distribution's common image and adjacent Legal payloads.
+The public NVIDIA source repository contains no proprietary firmware bytes.
 
 Primary source for ELF version/section admission:
 src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c, _kgspFwContainerVerifyVersion,

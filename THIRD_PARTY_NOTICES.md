@@ -1,8 +1,9 @@
 ﻿# Third-Party Notices
 
 The driver, parser, tests and inspector are original R4OS Apache-2.0 code.
-No NVIDIA RM/NVKMS/GSP implementation, firmware binary, Linux driver, or
-envytools implementation is copied or linked into this passive module.
+No NVIDIA RM/NVKMS host implementation, Linux driver, or envytools
+implementation is copied or linked into the R4OS driver code. The packaged
+module contains the two original GSP firmware containers described below.
 
 Register and binary-format facts were checked against the NVIDIA-published
 register headers and DCB specification and the selected MIT-licensed BIOS
@@ -10,13 +11,17 @@ readers recorded in PROVENANCE.txt. Those upstream materials remain under
 their original licenses in the separate workspace reference archive.
 The synthetic parser fixtures are original test data, not extracted VBIOS.
 
-Any future import of RM/NVKMS code or firmware must preserve its exact
+Any future import of RM/NVKMS code or additional firmware must preserve its exact
 source/binary license and provenance and update the distribution notices.
 
-The offline firmware preparation tool reads explicitly supplied original
-NVIDIA 570.144 files. Its separately prepared package contains both unchanged
+The firmware preparation tool reads explicitly supplied original NVIDIA
+570.144 files. Its local prepared package contains both unchanged
 GSP binaries and the byte-identical complete NVIDIA `LICENSE`, renamed to the
 version-bound resource name recorded in `src/firmware-lock.json`. Those binary
-files remain under NVIDIA's terms, never Apache-2.0. The driver module and this
-source repository contain the pin metadata, not the proprietary binary files.
-Neither the host preparation nor the parser executes firmware or an installer.
+files remain under NVIDIA's terms, never Apache-2.0. The public source
+repository excludes the prepared `Firmware/` directory. The canonical
+`module.R4MF` packages the verified originals and complete license together
+with `NVFW-LOCK.json` in NVIDIA.R4D's nonallocated resource section. The R4OS
+Distribution overlay also carries the byte-identical complete license under
+`/R4OS/LICENSES/NVIDIA-570.144-LICENSE.txt` and beside its images.
+Neither preparation nor CPU-side validation executes firmware or an installer.

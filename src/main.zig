@@ -2,10 +2,13 @@ const std = @import("std");
 const r4os = @import("r4os");
 const identity = @import("identity.zig");
 const firmware_resources = @import("firmware_resources.zig");
+const firmware = @import("firmware.zig");
+const firmware_storage = @import("firmware_storage.zig");
 const a = r4os.abi;
 var driver_api: ?*const a.DriverApi = null;
 var window: a.GfxMmioWindow = .{};
 var mapping_cleanup_needed = false;
+var firmware_cpu: firmware_storage.Storage = .{};
 
 comptime {
     asm (r4os.r4dev.driverEntriesAsm("nvidia_init", "nvidia_shutdown"));
@@ -16,7 +19,8 @@ pub export fn nvidia_init(api: *const a.DriverApi) callconv(.c) i32 {
     if (!ctx.apiCompatible() or driver_api != null) return -1;
     driver_api = api;
     const mode = std.mem.span(ctx.getOption("NVIDIA", "mode"));
-    if (mode.len != 0 and !std.ascii.eqlIgnoreCase(mode, "passive")) {
+    const check_firmware = std.ascii.eqlIgnoreCase(mode, "firmware-check");
+    if (mode.len != 0 and !std.ascii.eqlIgnoreCase(mode, "passive") and !check_firmware) {
         ctx.logError("NVIDIA bind: rejected reason=unsupported-mode native-writes=disabled");
         return -2;
     }
@@ -28,7 +32,11 @@ pub export fn nvidia_init(api: *const a.DriverApi) callconv(.c) i32 {
             return -6;
         };
         log("NVIDIA resource: lock=verified bytes={d} module-generation={d} source=loaded-r4d native-writes=disabled", .{ firmware_resources.lock_bytes.len, generation });
-    } else ctx.logInfo("NVIDIA resource: unavailable firmware-loading=disabled passive-probe=available");
+    } else {
+        ctx.logInfo("NVIDIA resource: unavailable firmware-loading=disabled passive-probe=available");
+        if (check_firmware) return -6;
+    }
+    if (check_firmware and !checkFirmware(&ctx)) return -7;
     var devices: [8]a.PciDeviceInfo = undefined;
     var audio: [32]identity.Pci = undefined;
     var count: usize = 0;
@@ -87,10 +95,36 @@ pub export fn nvidia_init(api: *const a.DriverApi) callconv(.c) i32 {
 pub export fn nvidia_shutdown() callconv(.c) i32 {
     const api = driver_api orelse return 0;
     const ctx = r4os.r4dev.DriverContext.init(api);
+    if (!firmware_cpu.close()) return -1;
     if (!releaseWindow(&ctx)) return -1;
     ctx.logInfo("NVIDIA unbind: OK resources=0 native-writes=disabled fallback=preserved");
     driver_api = null;
     return 0;
+}
+
+fn checkFirmware(ctx: *const r4os.r4dev.DriverContext) bool {
+    for ([_]firmware.Family{ .ga10x, .tu10x }) |family| {
+        firmware_cpu.begin(ctx, family, 30 * std.time.ns_per_s) catch |err| {
+            log("NVIDIA firmware: rejected family={s} phase=storage reason={s} native-writes=disabled", .{ @tagName(family), @errorName(err) });
+            _ = firmware_cpu.close();
+            return false;
+        };
+        while (firmware_cpu.ready() == null) {
+            _ = firmware_cpu.step() catch |err| {
+                log("NVIDIA firmware: rejected family={s} phase=read-verify reason={s} resource-status={d} native-writes=disabled", .{ @tagName(family), @errorName(err), if (firmware_cpu.reader) |reader| reader.last_status else 0 });
+                _ = firmware_cpu.close();
+                return false;
+            };
+        }
+        const verified = firmware_cpu.ready().?;
+        log("NVIDIA firmware: verified family={s} rm={s} bytes={d} reads={d} sha256=matched elf=valid signature-bytes={d} gpu-authentication=unverified", .{ @tagName(family), firmware.lock.rm_version, verified.container.len, firmware_cpu.reads, verified.layout.signature.bytes });
+        if (!firmware_cpu.close()) {
+            ctx.logError("NVIDIA firmware: cleanup=retained native-writes=disabled");
+            return false;
+        }
+    }
+    ctx.logInfo("NVIDIA firmware-check: OK containers=2 cpu-buffers=closed native-writes=disabled fallback=preserved");
+    return true;
 }
 
 fn readIdentity(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot) bool {

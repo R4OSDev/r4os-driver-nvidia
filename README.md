@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-Original Apache-2.0 passive NVIDIA display driver for R4OS. Module 0.1.2;
+Original Apache-2.0 passive NVIDIA display driver for R4OS. Module 0.1.3;
 hardware acceptance for roadmap 0.79.9 is open and offline preparation for
 0.79.10 has started. This owner inventories NVIDIA display functions once through
 the kernel PCI inventory. It does not initialize engines or take over scanout.
@@ -30,9 +30,10 @@ hardware acceptance. No BIOS code is executed.
 
 Use `Build.bat` (Windows) or `./Build.sh` (Linux), with the same arguments:
 
-    ./Build.sh
     ./Build.sh unit-test
     ./Build.sh inspect-vbios -- INPUT.rom OUTPUT.json 2504
+    ./Build.sh prepare-firmware -- -SourceDirectory EXTRACTED_FILES -ScratchDirectory WORKSPACE/Temp/nvidia
+    ./Build.sh
 
 The optional last inspector argument is the expected hexadecimal PCI device
 ID. The inspector reads at most 1 MB (1024 KB), writes JSON only on success,
@@ -41,8 +42,13 @@ hardware status. It never obtains ROM data from a device itself. Both build
 starters use shared PowerShell 7 orchestration and local `Settings.R4S` SDK,
 Contract, Libraries, DevKit and artifact mappings.
 
+The normal module build requires the explicitly prepared originals described
+below. Inspector and unit-test steps work before firmware is provisioned.
+
 In an explicit R4OS Test image, configure `DRIVER=NVIDIA` and optionally
-`OPTION NVIDIA mode=passive`; any other mode is rejected. `DISPLAYD /NVIDIA`
+`OPTION NVIDIA mode=passive`. `mode=firmware-check` additionally verifies both
+packaged GSP containers in CPU memory before continuing the passive probe.
+Other modes are rejected. `DISPLAYD /NVIDIA`
 replays complete NVIDIA boot records, with no additional hardware access.
 Distribution's `graphics-test Test nvidia-passive` runs an explicit short SMP4
 absence/fallback check with the existing graphics harness. It requires the
@@ -50,7 +56,8 @@ current NVIDIA, DISPLAYD and normal Test artifacts. It is not a hardware test.
 
 See `DOCUMENTATION.de.txt`, `PROVENANCE.txt`, `LICENSE`, `NOTICE` and
 `THIRD_PARTY_NOTICES.md`. RM/NVKMS/GSP 570.144 is the selected future bringup
-baseline; this passive stage embeds none of those components or binaries.
+baseline. The module now carries both original GSP containers and their full
+license as resources; it does not link the RM/NVKMS host implementation.
 
 The same `unit-test` step also runs the actual driver init/shutdown functions
 against the real SDK facade and a simulated DriverApi. Unadmitted callbacks
@@ -63,16 +70,22 @@ upstream commit, exact artifact lengths/hashes, license and container-family
 mapping. The module carries that lock as `NVFW-LOCK.json` in its nonallocated
 R4M0 resource section. With DriverApi29 it verifies this exact loaded lock before PCI inventory; rejection leaves the display fallback usable. Embedded
 R4D resources require kernel 0.1.138 or newer to remain outside image memory.
+Use kernel 0.1.140 or newer for the firmware-check CPU storage/cleanup path.
 
     ./Build.sh inspect-firmware -- INPUT.bin ga10x REPORT.json
-    ./Build.sh prepare-firmware -- -SourceDirectory EXTRACTED_FILES -OutputDirectory PACKAGE -ScratchDirectory WORKSPACE/Temp/nvidia
+    ./Build.sh prepare-firmware -- -SourceDirectory EXTRACTED_FILES -ScratchDirectory WORKSPACE/Temp/nvidia [-OutputDirectory PACKAGE]
 
 Supply the previously extracted original `gsp_ga10x.bin`, `gsp_tu10x.bin` and
 `LICENSE` from the pinned NVIDIA 570.144 installer. Neither command downloads
 files or executes the installer. Use absolute paths for preparation directories;
 scratch and output must share a filesystem for atomic publication. The complete
 NVIDIA license accompanies both byte-identical binaries. An existing package
-must match exactly; a different package is never repaired in place.
+must match exactly; a different package is never repaired in place. The default
+output is this owner's ignored `Firmware/` directory, which the canonical
+`module.R4MF` consumes. An explicit different output prepares a standalone
+package and does not change the manifest or the normal build's source paths.
+Normal builds recheck all three pinned originals before packaging; missing or
+corrupt inputs fail without changing a previously installed NVIDIA.R4D.
 
 The inspector uses the same allocation-free loader component intended for the
 R4D adapter: at most 64 KB per step, caller-owned final storage, exact SHA-256,
@@ -81,11 +94,11 @@ signature sections for the selected release's families. Reports are created
 exclusively after success. Opaque signature bytes are preserved; GPU signature
 verification and hardware compatibility are not established by this check.
 Host-file deadlines are checked before and after I/O, not by forcibly cancelling
-a blocked host filesystem operation. The `unit-test` step now has twelve cases.
+a blocked host filesystem operation. The `unit-test` step now has thirteen cases.
 
-Packaging the original GSP blobs into the runtime resource path, RM/NVKMS integration, board-specific FWSEC,
-GSP bootstrap/RPC and hardware fallback acceptance remain open. Prepared files
-are an explicit host artifact, not an installed or operational GPU driver.
+RM/NVKMS integration, board-specific FWSEC, GSP bootstrap/RPC and hardware
+fallback acceptance remain open. Packaged and CPU-verified firmware does not
+establish an operational GPU driver or GPU-side signature authentication.
 
 Kernel 0.1.139 adds the optional DriverApi29 resource table. The real passive
 driver now reads and compares NVFW-LOCK.json through that table, with a
@@ -98,9 +111,26 @@ The same SMP4 absence/fallback profile requires the loaded-lock proof.
 the loaded lock, exact resource name/size and common module generation, then
 passes only that opaque resource handle to bounded reads. Caller-owned final
 CPU storage and full SHA/ELF checks remain required. The current normal module
-contains only the lock, so a GSP Reader reports a missing resource. No GPU
+contains the lock, complete license and both original GSP containers. No GPU
 firmware is booted or DMA submitted by this checkpoint. Driver resources use
 the captured disk module source; preload bytes have no retained source and
 are rejected explicitly. Resource references do not guarantee immutable disk
 contents. Final pinned hashes remain mandatory. Storage cleanup can outlive
 the absolute read deadline while the caller buffer remains retained.
+
+`firmware_storage.Storage` owns a system-memory buffer and CPU map through the
+existing SDK memory table. It loads at most 64 KB per step directly into one
+final buffer, with a 30-second absolute budget per container. Only full hash,
+ELF and version validation returns a borrowed ready view. Close invalidates
+all views before unmap, release and collection. The table is retained across
+shutdown admission closure; failed VM/TLB cleanup retains ownership even after
+the public reference has been dropped. Repeated close is safe. No DMA mapping,
+GPU boot, native register write or display takeover occurs.
+
+The existing Distribution graphics harness provides `nvidia-firmware`,
+`nvidia-firmware-missing` and `nvidia-firmware-corrupt`. All use four vCPUs and
+fresh private images, never real hardware. The failure variants change only a
+private module copy; the canonical artifact and prepared originals stay intact.
+The successful guest verifies 63571696 and 28542040 bytes through 971 and 436
+resource reads, releases both CPU buffers, and leaves bootfb usable. The R4D
+image is 44 KB; its large resource payload remains outside that allocation.

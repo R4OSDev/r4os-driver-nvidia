@@ -85,13 +85,15 @@ Shutdown bleibt harmlos.
 
 0.79.10: Firmwarevorbereitung ohne Realhardware
 ---------------------------------------------
-NVIDIA 0.1.2 enthaelt die einzige firmware-lock.json als NVFW-LOCK.json in
+NVIDIA 0.1.3 enthaelt die einzige firmware-lock.json als NVFW-LOCK.json in
 seiner nicht allokierten R4M0-Ressource. Kernel 0.1.138 behandelt .rsrc auch
 fuer R4D/R4P dateigebunden; ihre Nutzdaten werden weder in das Codeimage
 kopiert noch als Entry-, Export- oder Relocationziel zugelassen. Fuer R4L
 bleiben Ressourcen unzulaessig. Kernel 0.1.139 stellt zusaetzlich den
 besitzergebundenen DriverApi29-Ressourcenlesevertrag bereit. NVIDIA prueft
-damit die geladene Lockdatei vor PCI; die GSP-Blobs sind noch nicht eingebettet.
+damit die geladene Lockdatei vor PCI. Seit 0.1.3 liegen beide unveraenderten
+GSP-Container und die vollstaendige originale Lizenz ebenfalls in .rsrc.
+Die beiden GSP-Dateien gehoeren nicht zum oeffentlichen Quellrepository.
 
 firmware.zig besitzt einen festen JSON-Vertrag fuer RM/GSP 570.144 mit zwei
 Originalcontainern, ihrem SHA-256, exakter Laenge, vollstaendiger Lizenz und
@@ -121,13 +123,20 @@ prepare-firmware verwendet PS7 auf beiden Hosts. Drei ausdruecklich lokale
 Quelldateien werden vor und nach dem Kopieren geprueft. Beide Container
 gehen durch denselben Inspektor; die vollstaendige Lizenz bleibt bytegleich.
 Ein privates Temp-Verzeichnis wird erst als vollstaendiges Paket publiziert.
+Standardziel ist das ignorierte Firmware/ im NVIDIA-Besitzer; ein optionales
+OutputDirectory kann ein separates Paket erzeugen, veraendert aber nicht die
+kanonischen Quellpfade des Modulmanifests. Normale Builds verlangen die drei
+Originale und pruefen ihre Groesse/Hashes zwingend vor R4M-Paketierung und
+Installation. Fehlende oder beschaedigte Dateien ersetzen kein Altartefakt.
+SDK-Ressourcenpfade werden erst im gewaehlten Paketstep geoeffnet; dadurch
+bleiben Vorbereitung und Hosttests vor der Firmwarebeschaffung erreichbar.
 Vorhandene Pakete muessen einschliesslich ihrer Berichte genau uebereinstimmen.
 Keine stillen Reparaturen, Versionsalternativen, Downloads oder Installer-
 Ausfuehrungen. Fehler hinterlassen keinen neuen Erfolgspfad.
 
 Zwei zusaetzliche Faelle im bestehenden unit-test-Step: 4672 Trunkierungen
 und 3072 Metadatenbitmutationen eines synthetischen ELF sowie inkrementelles
-Laden mit IO-/Kurzlese-/Hash-/Deadline-/Clock-/Close-Fehlern. Zwoelf Besitzerfaelle
+Laden mit IO-/Kurzlese-/Hash-/Deadline-/Clock-/Close-Fehlern. Dreizehn Besitzerfaelle
 insgesamt. Beide Originalcontainer werden getrennt mit ihren echten Hashes
 und allen erwarteten Familiensignaturen geprueft. Weitere Evidenz und die
 offenen Hardwaregrenzen: Docs/Drivers/GrafikFirmware07910.txt/.json.
@@ -150,7 +159,7 @@ Er verlangt bytegleiche Lockdaten, exakten Ressourcenname/Umfang und dieselbe
 Modulgeneration. Caller-Endspeicher, kompletter SHA-256 und ELF/ABI-Befund
 bleiben erforderlich. Weder ein Mount-/Dateiknoten-Snapshot noch das Handle
 garantiert unveraenderliche Dateiinhalte. Kein GSP-Download, keine GPU-DMA.
-Vollstaendige GSP-Paketintegration und runtime CPU-Speicherbesitz folgen noch.
+firmware_storage.Storage besitzt jetzt den CPU-Endpuffer und seinen Rueckbau.
 
 Der echte passive Treiber prueft NVFW-LOCK.json mit zwei Sekunden Deadline
 vor der PCI-Aufnahme. Ein weiterer Fall im bestehenden Lifecycle-Test deckt
@@ -160,3 +169,43 @@ den unveraenderten DriverApi28-Fallback ab. Der kurze SMP4-Lauf verlangt den
 realen Lockread aus dem geladenen Modul und weiterhin nutzbaren bootfb.
 Deadlinepruefungen geschehen vor/nach I/O; Hardware-Cleanup kann laenger
 dauern und gibt den Puffer erst nach Ende seiner realen Nutzung frei.
+
+Echter GSP-Ressourcenlauf und CPU-Besitz
+--------------------------------------
+OPTION NVIDIA mode=firmware-check prueft beide Originalcontainer nacheinander
+vor dem unveraenderten passiven PCI-Pfad. Der Standard bleibt passive und
+liest keine GSP-Nutzdaten. Nicht unterstuetzte Modi werden abgelehnt.
+Das Modul besitzt vier kanonische Ressourcen; sein geladenes Code-/Datenimage
+bleibt mit 44 KB getrennt von den grossen dateigebundenen Nutzdaten.
+
+Storage nutzt ein systemeigenes GfxBuffer-Objekt mit Write-Back-CPU-Mapping.
+Es gibt genau einen Endpuffer je geprueftem Container, maximal 64 KB je Read
+und 30 Sekunden absolutes Budget einschliesslich Lockread und Allokation.
+Eine ready-Sicht entsteht nur nach komplettem SHA-/ELF-/Versionsbefund.
+Close entwertet alle geliehenen Sichten vor Unmap, Release und Collect. Die
+Speichertabelle wird vor Schliessen der Shutdown-Admission festgehalten.
+Fehler lassen Handles oder ausstehendes Collect fuer denselben Besitzer
+erhalten; erfolgreicher wiederholter Abschluss ist harmlos.
+
+Kernel 0.1.140 korrigiert den generischen Collect-Befund fuer CPU-Objekte:
+Fehlgeschlagener VM-/TLB-Rueckbau bleibt auch ohne oeffentlichen Referenzhandle
+am exakten Treiberstart sichtbar. Collect liefert BUSY und die Loaderpruefung
+verhindert Wiederverwendung der Owner-ID. Dies gilt auch fuer private Reste
+einer fehlgeschlagenen Allokation. Dieser Firmwarepfad verlangt diesen oder
+einen neueren Kernel. Es werden keine Seiten vor dem echten TLB-Abschluss
+freigegeben und keine CPU-Container als GPU-DMA angemeldet.
+
+Der zusaetzliche ausgewaehlte Storage-Fall im vorhandenen unit-test prueft
+Create-/Map-/Unmap-/Release-/Collect-Fehler, I/O, kurze Reads und Deadline,
+kein ready nach Teilreads und Abschluss ueber die gecachte Speichertabelle
+nach Shutdown. Die echte Kernel-Besitzerprobe prueft Release-Reste ohne
+Referenz, fremde Startepoche, beibehaltenes Budget und erfolgreichen Retry.
+
+Bestehender SMP4-Grafiklauf: nvidia-firmware liest beide Originalcontainer
+aus dem geladenen NVIDIA.R4D mit 971/436 Reads und schliesst ihre CPU-Puffer.
+nvidia-firmware-missing veraendert nur den Ressourcennamen einer privaten
+Modulkopie; nvidia-firmware-corrupt nur ein Nutzdatenbyte. Beide Fehler werden
+vor PCI erkannt, mit echtem Fehllade-Shutdown und benutzbarem bootfb. Normales
+Treiberartefakt, vorbereitete Originale und Referenzbinaerdateien bleiben
+unveraendert. Signaturannahme durch die GPU, RM/GSP-Start und echte
+Displaywiederherstellung sind damit weiterhin nicht nachgewiesen.

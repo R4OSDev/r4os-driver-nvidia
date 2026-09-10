@@ -3,7 +3,21 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const sdk_build = b.lazyImport(@This(), "r4os_sdk") orelse return;
     const sdk = sdk_build.sdk(b, b.dependencyFromBuildZig(sdk_build, .{}), .{});
-    _ = sdk.addR4MF(b.path("module.R4MF"));
+    const module = sdk.addR4MF(b.path("module.R4MF"));
+    const pin = @import("src/firmware.zig").lock;
+    const verify = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-File" });
+    verify.addFileArg(b.path("Tools/VerifyFirmwarePackage.ps1"));
+    verify.addArg("-LockPath");
+    verify.addFileArg(b.path("src/firmware-lock.json"));
+    const parameters = [_][]const u8{ "-LicensePath", "-Ga10xPath", "-Tu10xPath" };
+    const names = [_][]const u8{ pin.license.resource, pin.firmware[0].resource, pin.firmware[1].resource };
+    for (parameters, names) |parameter, name| {
+        verify.addArg(parameter);
+        verify.addFileArg(b.path(b.pathJoin(&.{ "Firmware", name })));
+    }
+    // Verification precedes packaging and installation, not a parallel
+    // check which could publish an invalid module before reporting failure.
+    module.output.generated.file.step.dependOn(&verify.step);
     const unit = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/tests.zig"),
         .target = b.graph.host,
@@ -15,6 +29,9 @@ pub fn build(b: *std.Build) void {
     lifecycle.addImport("r4os", sdk.createR4osModule(b.graph.host, .ReleaseSafe));
     const lifecycle_test = b.addTest(.{ .root_module = lifecycle, .filters = &.{"NVIDIA actual driver lifecycle"} });
     unit_step.dependOn(&b.addRunArtifact(lifecycle_test).step);
+    const storage = b.createModule(.{ .root_source_file = b.path("src/firmware_storage_test.zig"), .target = b.graph.host, .optimize = .ReleaseSafe });
+    storage.addImport("r4os", sdk.createR4osModule(b.graph.host, .ReleaseSafe));
+    unit_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = storage, .filters = &.{"firmware CPU storage"} })).step);
     const inspector = b.addExecutable(.{ .name = "nvbios-inspect", .root_module = b.createModule(.{
         .root_source_file = b.path("src/inspect.zig"),
         .target = b.graph.host,
@@ -42,5 +59,5 @@ pub fn build(b: *std.Build) void {
     prepare.addArg("-Inspector");
     prepare.addArtifactArg(firmware_inspector);
     if (b.args) |args| prepare.addArgs(args);
-    b.step("prepare-firmware", "Prepare local firmware: -- -SourceDirectory PATH -OutputDirectory PATH -ScratchDirectory Temp/PATH").dependOn(&prepare.step);
+    b.step("prepare-firmware", "Prepare local firmware: -- -SourceDirectory PATH -ScratchDirectory Temp/PATH [-OutputDirectory PATH]").dependOn(&prepare.step);
 }

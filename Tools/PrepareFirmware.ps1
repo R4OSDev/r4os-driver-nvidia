@@ -3,12 +3,14 @@
 param(
     [Parameter(Mandatory)][string]$Inspector,
     [Parameter(Mandatory)][string]$SourceDirectory,
-    [Parameter(Mandatory)][string]$OutputDirectory,
+    [string]$OutputDirectory,
     [Parameter(Mandatory)][string]$ScratchDirectory
 )
 $ErrorActionPreference='Stop'
 Set-StrictMode -Version Latest
 $moduleRoot=Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'FirmwarePackage.ps1')
+if([string]::IsNullOrWhiteSpace($OutputDirectory)){$OutputDirectory=Join-Path $moduleRoot 'Firmware'}
 $lockPath=Join-Path $moduleRoot 'src/firmware-lock.json'
 $pin=Get-Content -Raw -LiteralPath $lockPath | ConvertFrom-Json
 if($pin.schema -ne 1){throw 'Unsupported NVIDIA firmware lock schema.'}
@@ -17,19 +19,8 @@ $output=[IO.Path]::GetFullPath($OutputDirectory)
 $scratch=[IO.Path]::GetFullPath($ScratchDirectory)
 $inspectorPath=[IO.Path]::GetFullPath($Inspector)
 $artifacts=@($pin.license)+@($pin.firmware)
-function Test-Artifact([string]$Path,$Artifact) {
-    $file=Get-Item -LiteralPath $Path
-    if($file.PSIsContainer -or $file.Length -ne $Artifact.bytes -or
-       (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $Artifact.sha256){
-        throw "Firmware package size/hash mismatch: $Path"
-    }
-}
 foreach($artifact in $artifacts){
-    foreach($name in @($artifact.file,$artifact.resource)){
-        if([string]::IsNullOrEmpty($name) -or $name.Length -gt 63 -or
-           $name -match '[^\x21-\x7e]|[\\/:]' -or $name -in @('.','..')){throw 'Invalid artifact name in lock.'}
-    }
-    Test-Artifact (Join-Path $source $artifact.file) $artifact
+    Test-NvidiaFirmwareArtifact (Join-Path $source $artifact.file) $artifact
 }
 if(!(Test-Path -LiteralPath $inspectorPath -PathType Leaf)){throw 'Firmware inspector is missing.'}
 [IO.Directory]::CreateDirectory($scratch)|Out-Null
@@ -39,7 +30,7 @@ try {
     foreach($artifact in $artifacts){
         $target=Join-Path $stage $artifact.resource
         Copy-Item -LiteralPath (Join-Path $source $artifact.file) -Destination $target
-        Test-Artifact $target $artifact
+        Test-NvidiaFirmwareArtifact $target $artifact
     }
     $reports=@()
     for($index=0;$index -lt $pin.firmware.Count;$index++){
@@ -62,7 +53,7 @@ try {
         schema=1; rm_version=$pin.rm_version; source_commit=$pin.source_commit
         resources=@($artifacts|ForEach-Object {$_.resource}); reports=$reports
         binary_modifications=$false; downloads=$false; native_initialization_authorized=$false
-        installation='prepared-only; runtime R4D resource binding is not yet implemented'
+        installation='explicit host package; module.R4MF binds original firmware and license resources; no GPU initialization'
     }
     [IO.File]::WriteAllText((Join-Path $stage 'package.json'),($receipt|ConvertTo-Json -Depth 8)+"`n",[Text.UTF8Encoding]::new($false))
     # Compare a complete prepared tree on rerun. Never repair an existing,
