@@ -4,11 +4,14 @@ const identity = @import("identity.zig");
 const firmware_resources = @import("firmware_resources.zig");
 const firmware = @import("firmware.zig");
 const firmware_storage = @import("firmware_storage.zig");
+const rm_heap = @import("rm_heap.zig");
+const runtime_probe = @import("runtime_probe.zig");
 const a = r4os.abi;
 var driver_api: ?*const a.DriverApi = null;
 var window: a.GfxMmioWindow = .{};
 var mapping_cleanup_needed = false;
 var firmware_cpu: firmware_storage.Storage = .{};
+var checking_runtime = false;
 
 comptime {
     asm (r4os.r4dev.driverEntriesAsm("nvidia_init", "nvidia_shutdown"));
@@ -18,9 +21,11 @@ pub export fn nvidia_init(api: *const a.DriverApi) callconv(.c) i32 {
     const ctx = r4os.r4dev.DriverContext.init(api);
     if (!ctx.apiCompatible() or driver_api != null) return -1;
     driver_api = api;
+    rm_heap.bind(&ctx);
     const mode = std.mem.span(ctx.getOption("NVIDIA", "mode"));
     const check_firmware = std.ascii.eqlIgnoreCase(mode, "firmware-check");
-    if (mode.len != 0 and !std.ascii.eqlIgnoreCase(mode, "passive") and !check_firmware) {
+    checking_runtime = std.ascii.eqlIgnoreCase(mode, "runtime-check");
+    if (mode.len != 0 and !std.ascii.eqlIgnoreCase(mode, "passive") and !check_firmware and !checking_runtime) {
         ctx.logError("NVIDIA bind: rejected reason=unsupported-mode native-writes=disabled");
         return -2;
     }
@@ -35,6 +40,14 @@ pub export fn nvidia_init(api: *const a.DriverApi) callconv(.c) i32 {
     } else {
         ctx.logInfo("NVIDIA resource: unavailable firmware-loading=disabled passive-probe=available");
         if (check_firmware) return -6;
+    }
+    if (checking_runtime) {
+        if (!runtime_probe.start(&ctx)) {
+            ctx.logError("NVIDIA runtime-check: FAILED phase=cpu-memory native-writes=disabled");
+            return -9;
+        }
+        ctx.logInfo("NVIDIA runtime-check: OK result=diagnostic-init-stop native-writes=disabled fallback=preserved");
+        return -8;
     }
     if (check_firmware and !checkFirmware(&ctx)) return -7;
     var devices: [8]a.PciDeviceInfo = undefined;
@@ -95,9 +108,14 @@ pub export fn nvidia_init(api: *const a.DriverApi) callconv(.c) i32 {
 pub export fn nvidia_shutdown() callconv(.c) i32 {
     const api = driver_api orelse return 0;
     const ctx = r4os.r4dev.DriverContext.init(api);
+    if (!runtime_probe.shutdown(&ctx)) return -1;
     if (!firmware_cpu.close()) return -1;
     if (!releaseWindow(&ctx)) return -1;
-    ctx.logInfo("NVIDIA unbind: OK resources=0 native-writes=disabled fallback=preserved");
+    if (checking_runtime) {
+        ctx.logInfo("NVIDIA unbind: driver-state=closed cpu-owner-cleanup=pending native-writes=disabled fallback=preserved");
+    } else ctx.logInfo("NVIDIA unbind: OK resources=0 native-writes=disabled fallback=preserved");
+    rm_heap.unbind();
+    checking_runtime = false;
     driver_api = null;
     return 0;
 }

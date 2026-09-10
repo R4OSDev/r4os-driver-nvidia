@@ -5,6 +5,84 @@ const driver = @import("main.zig");
 const t = std.testing;
 const resource_loader = @import("firmware_resources.zig");
 const firmware = @import("firmware.zig");
+const cpu_provider = @import("rm_heap.zig");
+
+var cpu_backing: ?[]align(16) u8 = null;
+var cpu_handle: u64 = 0x100000001;
+var cpu_requested: u64 = 0;
+var cpu_calls: u32 = 0;
+var cpu_closed = false;
+var cpu_fail_release = false;
+fn cpuQuery(output: *a.DriverHeapApi) callconv(.c) i32 {
+    output.* = .{ .allocate = @intFromPtr(&cpuAllocate), .release = @intFromPtr(&cpuRelease) };
+    return 0;
+}
+fn cpuAllocate(bytes: u64, alignment: u32, output: *a.DriverHeapAllocation) callconv(.c) i32 {
+    std.debug.assert(alignment == 16 and output.version == 1 and output.size == @sizeOf(a.DriverHeapAllocation));
+    cpu_calls += 1;
+    cpu_requested = bytes;
+    output.* = .{};
+    if (cpu_closed) return a.driver_heap_error_closed;
+    if (bytes > 8192) return a.driver_heap_error_memory;
+    std.debug.assert(cpu_backing == null);
+    const backing = t.allocator.alignedAlloc(u8, .@"16", @intCast(bytes)) catch return a.driver_heap_error_memory;
+    cpu_backing = backing;
+    cpu_handle += 1;
+    output.* = .{ .handle = cpu_handle, .cpu_address = @intFromPtr(backing.ptr), .byte_length = bytes, .alignment = 16 };
+    return 0;
+}
+fn cpuRelease(handle: u64) callconv(.c) i32 {
+    std.debug.assert(handle == cpu_handle and cpu_backing != null);
+    if (cpu_fail_release) return a.driver_heap_error_release;
+    t.allocator.free(cpu_backing.?);
+    cpu_backing = null;
+    return 0;
+}
+
+test "NVIDIA actual driver lifecycle bridges resident CPU memory and retains failed C frees" {
+    var api = apiTable();
+    api.version = 30;
+    api.heap_query = cpuQuery;
+    state = .{ .present = false };
+    cpu_closed = false;
+    cpu_fail_release = false;
+    cpu_calls = 0;
+    try t.expectEqual(@as(i32, -4), driver.nvidia_init(&api));
+    defer _ = driver.nvidia_shutdown();
+    try t.expect(cpu_provider.available());
+    const pointer = cpu_provider.r4nv_heap_allocate(137) orelse return error.CpuAllocation;
+    try t.expectEqual(@as(u64, 153), cpu_requested);
+    try t.expectEqual(@as(usize, 0), @intFromPtr(pointer) & 15);
+    const data = @as([*]u8, @ptrCast(pointer))[0..137];
+    @memset(data, 0x7b);
+    cpu_fail_release = true;
+    cpu_provider.r4nv_heap_free(pointer);
+    try t.expect(cpu_backing != null and cpu_provider.releaseFailures() == 1);
+    for (data) |value| try t.expectEqual(@as(u8, 0x7b), value);
+    cpu_fail_release = false;
+    cpu_provider.r4nv_heap_free(pointer);
+    try t.expect(cpu_backing == null);
+    const empty = cpu_provider.r4nv_heap_allocate(0) orelse return error.ZeroAllocation;
+    try t.expectEqual(@as(u64, 17), cpu_requested);
+    cpu_provider.r4nv_heap_free(empty);
+    const calls = cpu_calls;
+    try t.expect(cpu_provider.r4nv_heap_allocate(std.math.maxInt(u64)) == null);
+    try t.expectEqual(calls, cpu_calls);
+    try t.expect(cpu_provider.r4nv_heap_allocate(0x100000001) == null);
+    try t.expectEqual(@as(u64, 0x100000011), cpu_requested);
+    cpu_closed = true;
+    try t.expect(cpu_provider.r4nv_heap_allocate(17) == null);
+    cpu_provider.r4nv_heap_free(null);
+    try t.expectEqual(@as(i32, 0), driver.nvidia_shutdown());
+    try t.expect(!cpu_provider.available() and cpu_backing == null);
+    try t.expect(cpu_provider.r4nv_heap_allocate(1) == null);
+    // The unchanged old table prefix never evaluates the optional query.
+    api.version = 29;
+    api.size = @offsetOf(a.DriverApi, "heap_query");
+    state = .{ .present = false };
+    try t.expectEqual(@as(i32, -4), driver.nvidia_init(&api));
+    try t.expect(!cpu_provider.available());
+}
 
 const State = struct {
     present: bool = true,

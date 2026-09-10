@@ -85,7 +85,7 @@ Shutdown bleibt harmlos.
 
 0.79.10: Firmwarevorbereitung ohne Realhardware
 ---------------------------------------------
-NVIDIA 0.1.3 enthaelt die einzige firmware-lock.json als NVFW-LOCK.json in
+Seit NVIDIA 0.1.3 liegt die einzige firmware-lock.json als NVFW-LOCK.json in
 seiner nicht allokierten R4M0-Ressource. Kernel 0.1.138 behandelt .rsrc auch
 fuer R4D/R4P dateigebunden; ihre Nutzdaten werden weder in das Codeimage
 kopiert noch als Entry-, Export- oder Relocationziel zugelassen. Fuer R4L
@@ -313,11 +313,10 @@ Allokation normalisiert null Bytes auf ein Byte, meldet NULL/NO_MEMORY bei
 Fehler und gibt NvU64-Umfaenge ohne 32-Bit-Kuerzung weiter. NVKMS zero fuellt
 nur die angeforderte Nutzlast. Release verwendet die Autoritaet des
 Speicheranbieters, nicht eine vom Aufrufer rekonstruierte Speicherklasse.
-Die zwei privaten Imports r4nv_heap_allocate/free bleiben im Zielobjekt offen.
-Ihr kuenftiger R4OS-Anbieter muss residenten, 16-Byte-ausgerichteten und an
-den Treiber gebundenen Speicher liefern, Close-Admission beachten und einen
-fehlgeschlagenen Rueckbau behalten. Ein solcher Anbieter ist hier noch
-nicht implementiert; auch Mutex-/IRQ-/Workeranbindung bleiben offen.
+Die zwei privaten Imports r4nv_heap_allocate/free bleiben in den getrennten
+RM-/NVKMS-Teilobjekten offen. Seit NVIDIA 0.1.4 implementiert rm_heap.zig den
+echten R4OS-Anbieter ueber DriverApi30 im R4D. Der kombinierte finale Link
+und die weiteren RM-/NVKMS-Mutex-, IRQ- und Workeradapter bleiben offen.
 
 Tools/Rm/Adapter.ps1 kopiert die eigenen C-Quellen in den privaten Versuch,
 kompiliert mit den jeweiligen RM-/NVKMS-Flags und prueft die Objektimporte.
@@ -333,5 +332,37 @@ Unter Linux x86_64 laufen die tatsaechlichen Freestanding-Objekte des
 Quellbaus; Windows baut dieselben C-Quellen fuer seine Host-ABI. Der Test-
 allocator gelangt niemals in die Zielobjekte. Er ersetzt weder R4OS-Heap
 noch Hardwareabnahme. Der Test gehoert nur zum expliziten build-rm-Step;
-der normale unit-test bleibt bei 13 Faellen. Tests.json erfasst diesen
+der normale unit-test hat jetzt 14 Faelle. Tests.json erfasst diesen
 gezielten Component-Test, ohne einen weiteren Workspace-/Gastlauf anzulegen.
+
+Residenter R4D-Heap und CPU-Laufzeitprobe
+---------------------------------------
+Kernel 0.1.141 stellt DriverApi30 (608 Bytes) mit optionalem heap_query bereit.
+DriverHeapApi v1/32 liefert allocate/release/stats. Der unveraenderte Praefix
+von 600 Bytes bleibt erhalten; alte Kernel erlauben weiterhin die passive
+Basisprobe. R4D-Speicher bindet an den echten Start, nicht an eine R4X-Instanz.
+Worker brauchen fuer diese CPU-Operationen keinen globalen R4D-Ladeguard.
+
+rm_heap.zig stellt die beiden C-Symbole bereit, legt einen 16-Byte-Praefix
+fuer Handle und Integritaetsmarker vor die Nutzdaten und prueft Addition der
+vollen u64-Laenge. Null Bytes werden auf ein Byte normalisiert. Ein void-free
+mit fehlgeschlagenem Backendrelease laesst dieselbe Allokation im Kernelbesitz;
+ein Zaehler macht diesen Befund sichtbar. Der Marker ersetzt keinen Schutz
+gegen beliebige oder bereits freigegebene C-Pointer. Neue Allokation nach
+Close wird abgewiesen, Freigabe ueber die gecachte Tabelle bleibt moeglich.
+
+OPTION NVIDIA mode=runtime-check ist eine ausdrueckliche CPU-Diagnose vor PCI.
+Init und ein echter Driver-Worker allozieren, beschreiben und pruefen je 64
+Puffer und geben sie in veraenderter Reihenfolge frei. Ein weiterer Worker
+wartet begrenzt auf die echte Close-Admission, prueft abgewiesene neue
+Allokation und gibt seinen bestehenden Puffer frei. Zwei weitere Allokationen
+(4096 rohe CPU-Bytes sowie 73 C-Nutzbytes plus 16-Byte-Praefix) bleiben bewusst
+fuer den Kernel. Der Modus beendet Init mit Diagnosecode -8; echter Shutdown
+und generischer Owner-Rueckbau muessen die verbleibenden 4185 Bytes freigeben.
+Ein interner Fehler meldet FAILED und -9; er ist kein erfolgreicher Probelauf.
+
+Distribution/Build.sh graphics-test Test nvidia-runtime beziehungsweise der
+Windows-Starter nutzen den vorhandenen SMP4-Grafiklauf mit separatem Image,
+ohne Gastnetz und ohne NVIDIA-Geraet. Normale Profile fuehren diese Diagnose
+nicht aus. Die C-Quellportadapter sind weiterhin getrennte Teilobjekte; dieser
+Nachweis ist kein kombinierter RM-Link und keine GPU- oder Hardwareabnahme.

@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-Original Apache-2.0 passive NVIDIA display driver for R4OS. Module 0.1.3;
+Original Apache-2.0 passive NVIDIA display driver for R4OS. Module 0.1.4;
 hardware acceptance for roadmap 0.79.9 is open and offline preparation for
 0.79.10 has started. This owner inventories NVIDIA display functions once through
 the kernel PCI inventory. It does not initialize engines or take over scanout.
@@ -84,7 +84,9 @@ against the original OS interface headers: seventeen actual CPU allocation,
 copy, fill, move, compare and string adapters. Integer-register copies avoid
 recursion through RM's own `gcc_helper.c` memcpy/memset wrappers and preserve
 exact byte spans without SIMD. The private `r4nv_heap_allocate/free` imports
-remain unresolved until a real resident, owner-bound R4OS heap provider exists.
+remain unresolved in those separate partial objects. `src/rm_heap.zig` now
+implements the real resident provider in NVIDIA.R4D using DriverApi30; the final
+combined RM/NVKMS/provider link is still pending.
 These adapters do not supply synchronization, DMA, MMIO or GPU initialization.
 
 `Tests/RmMemory.c` runs as part of this explicit source build, with a real host
@@ -94,7 +96,7 @@ partial links; Windows compiles the same C sources for its native host ABI.
 The host allocator is never linked into a target object. The resulting RM and
 NVKMS partial objects still have 334 and 47 unresolved imports, including both
 private heap functions. `os-adapter-results.json` records the source/object
-hashes, remaining imports and host-only acceptance. The ordinary thirteen-case
+hashes, remaining imports and host-only acceptance. The ordinary fourteen-case
 `unit-test` and installed NVIDIA.R4D remain separate from this source port.
 
 The optional last inspector argument is the expected hexadecimal PCI device
@@ -110,11 +112,25 @@ below. Inspector and unit-test steps work before firmware is provisioned.
 In an explicit R4OS Test image, configure `DRIVER=NVIDIA` and optionally
 `OPTION NVIDIA mode=passive`. `mode=firmware-check` additionally verifies both
 packaged GSP containers in CPU memory before continuing the passive probe.
-Other modes are rejected. `DISPLAYD /NVIDIA`
+`mode=runtime-check` explicitly exercises CPU heap calls from init and a real
+worker, validates close admission, and stops init before PCI. Its two leftover
+CPU allocations must be reclaimed by the actual failed-load cleanup. This mode
+requires kernel 0.1.141 / DriverApi30. Other modes are rejected. `DISPLAYD /NVIDIA`
 replays complete NVIDIA boot records, with no additional hardware access.
 Distribution's `graphics-test Test nvidia-passive` runs an explicit short SMP4
 absence/fallback check with the existing graphics harness. It requires the
 current NVIDIA, DISPLAYD and normal Test artifacts. It is not a hardware test.
+`graphics-test Test nvidia-runtime` checks the CPU probe, quiesced kernel frees
+and usable bootfb in that same bounded SMP4 harness.
+
+The C heap bridge preserves 16-byte alignment with a small private handle
+prefix and forwards exact checked u64 lengths. A failed void C free retains
+the actual kernel allocation for retry or owner cleanup. Host lifecycle tests
+exercise the real bridge, an injected free failure, close, unavailable old API
+and lengths above 4 GB without allocating a huge host buffer. The kernel owns
+residency and per-start identity; GPU/DMA mapping and synchronization remain
+separate. No RM mutex, GSP transport or native graphics execution is supplied
+by the CPU heap implementation.
 
 See `DOCUMENTATION.de.txt`, `PROVENANCE.txt`, `LICENSE`, `NOTICE` and
 `THIRD_PARTY_NOTICES.md`. RM/NVKMS/GSP 570.144 is the selected future bringup

@@ -102,3 +102,13 @@ Tests/RmMemory.c uses host allocation and guard pages only in the host checker.
 Two private target heap imports remain deliberately unresolved. The original
 headers and licenses stay in the verified private source snapshot; no third-
 party source is added to this public repository by the adapter implementation.
+
+0.79.10 resident CPU provider, 10.09.2026:
+src/rm_heap.zig and runtime_probe.zig are original R4OS code. The provider
+implements the two private C hook signatures through the real DriverApi30
+resident heap. Its 16-byte prefix stores only the allocation identity and a
+corruption marker; it does not reproduce a Linux allocator or OS interface.
+The explicit R4D CPU diagnostic executes real init/work/close calls. The
+separate RM/NVKMS partial objects are not yet linked with this provider and
+continue to list those imports; their earlier source-build evidence remains
+historical and unchanged. No new third-party material is introduced.
