@@ -122,3 +122,9 @@ vendor files remain unchanged. R4OS uses its own common monotonic source;
 no Linux implementation, timer scheduler or semaphore is copied. Source-build
 fixtures and actual R4D runtime evidence remain separate. No new third-party
 source, firmware revision or license is introduced.
+
+0.79.10 dedicated CPU task diagnostic, 10.09.2026:
+src/thread_probe.zig is original R4OS code using the generic DriverApi32 task
+service. It copies no NVIDIA or Linux thread implementation. The pinned RM,
+GSP, shader, C adapter and existing private heap/clock provider sources remain
+unchanged. This checkpoint adds no third-party source or binary.

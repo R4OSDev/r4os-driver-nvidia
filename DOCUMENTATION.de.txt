@@ -398,3 +398,26 @@ Quelle, falsche Metadaten und verriegelten Ausfall. runtime-check prueft im
 SMP4-Gast je 64 reale Init-/Workerreads und Zeitfortschritt nach Scheduler-Wait.
 Die getrennten Teilobjekte enthalten weiterhin offene private Providerimporte;
 dieser Nachweis ist kein kombinierter RM-Start und keine Hardwareabnahme.
+
+Eigene Treiber-Tasks (0.79.10)
+-----------------------------
+NVIDIA 0.1.6 prueft im expliziten runtime-check den echten DriverApi32-Dienst
+auf Kernel 0.1.143. Vier dedizierte Tasks bearbeiten residente CPU-Puffer und
+die erfasste monotone Uhr, waehrend die alte gemeinsame BSP-Workqueue belegt
+bleibt. Ein Task bleibt auf dem BSP, drei erlauben bewusst SMP. Die Probe
+verlangt Ausfuehrung auf mindestens zwei CPUs, keine feste CPU-Zuordnung.
+
+Join ist endlich, null pollt, UINT64_MAX ist ungueltig. Stop beendet nur
+kooperatives Warten; ein abgebrochener Join beendet seinen Zieltask nicht.
+Selbst-Join/Selbst-Freigabe, Freigabe eines laufenden Tasks und alte Handles
+werden abgelehnt. Beim echten Owner-Close wacht ein eigener Task auf, prueft
+geschlossene Thread-/Heap-Anlage und gibt seinen vorhandenen Puffer frei.
+Erst alle zurueckgekehrten Callbacks erlauben Modulabbau. Drei vollstaendige
+Taskrecords bleiben bewusst fuer generisches Cleanup, einschliesslich Stack-
+und FPU-Retirement. Die bisherigen CPU-Heap-/Uhrproben laufen im selben Gast.
+
+Die dedizierten Tasks besitzen einen neuen authentifizierten Weg zu CPU-Heap,
+Threaddienst und Logging; die Uhr ist separat lesbar. Daraus folgt keine
+SMP-Freigabe alter PCI-/DMA-/Backend-/Dateipfade. Die eigentliche RM-Portierung
+bleibt getrennt: keine neuen Erfolgs-Stubs, keine GSP-Ausfuehrung, kein HDMI-
+Nachweis und keine neue Firmwareversion. Passive Normalstarts bleiben taskfrei.

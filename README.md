@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-Original Apache-2.0 passive NVIDIA display driver for R4OS. Module 0.1.5;
+Original Apache-2.0 passive NVIDIA display driver for R4OS. Module 0.1.6;
 hardware acceptance for roadmap 0.79.9 is open and offline preparation for
 0.79.10 has started. This owner inventories NVIDIA display functions once through
 the kernel PCI inventory. It does not initialize engines or take over scanout.
@@ -115,7 +115,7 @@ packaged GSP containers in CPU memory before continuing the passive probe.
 `mode=runtime-check` explicitly exercises CPU heap calls from init and a real
 worker, validates close admission, and stops init before PCI. Its two leftover
 CPU allocations must be reclaimed by the actual failed-load cleanup. This mode
-requires kernel 0.1.142 / DriverApi31. Other modes are rejected. `DISPLAYD /NVIDIA`
+requires kernel 0.1.143 / DriverApi32. Other modes are rejected. `DISPLAYD /NVIDIA`
 replays complete NVIDIA boot records, with no additional hardware access.
 Distribution's `graphics-test Test nvidia-passive` runs an explicit short SMP4
 absence/fallback check with the existing graphics harness. It requires the
@@ -236,3 +236,23 @@ check. The combined RM link remains pending. No UTC, CPU-frequency, delay,
 mutex, semaphore, interrupt or firmware-start callback is faked. Future native
 dispatch must honor the latched clock fault and its own bounded work budget;
 upstream value-only time functions cannot cancel arbitrary RM loops.
+
+Dedicated driver tasks (0.79.10)
+------------------------------
+The explicit runtime-check also uses DriverApi32's dedicated tasks with full
+module FPU state and guarded kernel stacks. Four CPU callbacks verify real
+task/start identities, heap contents and monotonic time while the original
+shared BSP Driver Work lane is deliberately occupied. One callback stays on
+the BSP; the other three explicitly permit SMP placement. This test requires
+actual progress on at least two CPUs, not a fixed affinity or throughput.
+
+The same short diagnostic checks finite join/poll, self-join rejection,
+cooperative stop, cancellation of one join without stopping its target, stale
+handles and exact task retirement. Parent close wakes a dedicated sleeper,
+rejects new starts/allocations and allows its existing heap buffer to be freed.
+Three returned task records remain for generic driver cleanup. Failed waits
+retain the module; a diagnostic assertion after confirmed callback quiescence
+reports failure without vetoing safe cleanup. Normal passive starts create no
+tasks. No RM/NVKMS thread adapter or combined RM link is claimed by this CPU
+service integration; mutexes, semaphores, precise delays and hardware remain
+separate work.
