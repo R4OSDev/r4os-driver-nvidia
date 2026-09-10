@@ -3,6 +3,23 @@ Host/module scaffolding follows R4OS SDK and existing R4D owners.
 Firmware fixture bodies and signatures are synthetic. Selected measured
 table fields are explicit regression data, as described below.
 
+0.79.10 GSP/VRAM preflight (NVIDIA 0.1.21), 11.09.2026:
+fwsec_state.zig and fwsec_state_probe.zig are original R4OS implementations.
+NVIDIA 570.144, commit 8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f, supplies:
+kernel_gsp_ga102.c and g_kernel_gsp_nvoc.c (GSP 110000, RISC-V 111000),
+kernel_falcon_ga102.c and g_kernel_falcon_nvoc.c (RISC-V status, BADFxxxx
+protection and RESET_READY erratum), kern_mem_sys_ga102.c and its HAL
+(usable FB size), kern_disp_0400.c and its HAL (40-bit VGA workspace),
+kern_gpu_ga100.c and g_gpu_nvoc.c (display fuse, also selected for GA106),
+g_mem_mgr_nvoc.c/.h (GA106 no-op MMU-lock path), kernel_gsp_tu102.c
+(WPR2 status and FB layout) and the corresponding published register headers.
+The separately archived Linux 7.2.4 Nouveau nvkm/falcon/base.c defines
+IMEM/DMEM capacity extraction. That complete file bears NVIDIA's 2016 MIT
+notice; no Linux or NVIDIA implementation is copied into the module.
+Original files, notices and hashes are retained under
+ExFiles/Reference/GFX/Nvidia/0.79.10/gsp-preflight-20260911.
+All linked headers, licenses and firmware resources remain byte-identical.
+
 0.79.10 FWSEC DMA staging (NVIDIA 0.1.20), 10.09.2026:
 fwsec_load.zig and fwsec_dma.zig are original R4OS implementations. The same
 570.144 pin supplies kernel_gsp_falcon_ga102.c (DMA base calculation, block

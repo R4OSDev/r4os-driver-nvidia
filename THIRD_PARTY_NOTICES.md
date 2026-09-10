@@ -13,6 +13,13 @@ their original licenses in the separate workspace reference archive.
 Fixture firmware bodies and signatures are synthetic; selected measured table
 metadata is regression data documented in PROVENANCE.txt.
 
+The 0.1.21 GSP/VRAM preflight is original R4OS code. Register facts come
+from the same pinned NVIDIA sources and Nouveau's MIT-noticed
+nvkm/falcon/base.c (NVIDIA copyright 2016) in the Linux 7.2.4 reference.
+Those complete original files and notices remain in the separate
+`ExFiles/Reference/GFX/Nvidia/0.79.10/gsp-preflight-20260911` archive.
+No additional upstream implementation, header or binary is linked or vendored.
+
 The 0.1.20 FWSEC DMA mapper and load-parameter validator are original R4OS
 code. The pinned NVIDIA GA102 loader, GA106 HAL dispatch and register headers
 are reference material, retained unchanged with their complete notices in

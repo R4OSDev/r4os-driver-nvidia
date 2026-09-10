@@ -12,6 +12,7 @@ const vbios = @import("vbios.zig");
 const vbios_probe = @import("vbios_probe.zig");
 const fixtures = @import("tests.zig");
 const log_provider = @import("rm_log.zig");
+const preflight = @import("fwsec_state.zig");
 extern fn r4nv_format_probe(u32) callconv(.c) i32;
 extern fn nv_printf(u32, [*:0]const u8, ...) callconv(.c) c_int;
 var native_log_text: [513]u8 = undefined;
@@ -306,7 +307,7 @@ fn cpuAllocate(bytes: u64, alignment: u32, output: *a.DriverHeapAllocation) call
 }
 fn cpuRelease(handle: u64) callconv(.c) i32 {
     if (handle == stage_handle) {
-        std.debug.assert(stage_backing != null and !state.dma_pinned and !state.dma_mapped);
+        std.debug.assert(stage_backing != null and !state.dma_pinned and !state.dma_mapped and state.preflight_mapping == 0);
         if (state.fuse_fault == .release) return a.driver_heap_error_release;
         t.allocator.free(stage_backing.?);
         stage_backing = null;
@@ -381,7 +382,10 @@ const State = struct {
     fuse_fixture: bool = false,
     fuse_seen: bool = false,
     fuse_mapping: [2]bool = .{ false, false },
-    fuse_fault: enum { none, map_debug, map_version, window, unmap_debug, unmap_version, collect, clock, deadline, unstable, allocation, release, signature, debug_missing, sentinel_debug, sentinel_version, short_input, dma_pin, dma_map, dma_pin_header, dma_count, dma_length, dma_owner, dma_alignment, dma_mask, dma_unmap, dma_unpin, dma_bounce } = .none,
+    fuse_fault: enum { none, map_debug, map_version, window, unmap_debug, unmap_version, collect, clock, deadline, unstable, allocation, release, signature, debug_missing, sentinel_debug, sentinel_version, short_input, dma_pin, dma_map, dma_pin_header, dma_count, dma_length, dma_owner, dma_alignment, dma_mask, dma_unmap, dma_unpin, dma_bounce, state_map, state_window, state_clock, state_deadline, state_unstable, state_unmap, state_collect, state_protected, state_display_disabled, state_riscv_disabled } = .none,
+    preflight_seen: bool = false,
+    preflight_mapping: u8 = 0,
+    preflight_reported: bool = false,
     dma_pinned: bool = false,
     dma_mapped: bool = false,
     dma_reported: bool = false,
@@ -441,6 +445,7 @@ fn log(text: [*:0]const u8) callconv(.c) void {
     if (std.mem.indexOf(u8, std.mem.span(text), "fwsec: unavailable") != null) state.fwsec_rejected = true;
     if (std.mem.indexOf(u8, std.mem.span(text), "fwsec: cpu-image=prepared") != null) state.stage_prepared = true;
     if (std.mem.indexOf(u8, std.mem.span(text), "fwsec: dma-image=staged") != null) state.dma_reported = true;
+    if (std.mem.indexOf(u8, std.mem.span(text), "fwsec: preflight-tcm=fits") != null) state.preflight_reported = true;
     const value = std.mem.span(text);
     const marker = "bytes=64 hex=";
     if (std.mem.indexOf(u8, value, marker)) |index| {
@@ -453,6 +458,10 @@ fn resources(output: *a.DriverResourceApi) callconv(.c) i32 {
     return 0;
 }
 fn resourceNow() callconv(.c) u64 {
+    if (state.preflight_seen) {
+        if (state.fuse_fault == .state_clock) return 99;
+        if (state.fuse_fault == .state_deadline) return 2 * std.time.ns_per_s;
+    }
     if (state.fuse_seen) {
         if (state.fuse_fault == .clock) return 99;
         if (state.fuse_fault == .deadline) return 2 * std.time.ns_per_s;
@@ -548,6 +557,26 @@ fn memory(output: *a.GfxDriverMemoryApi) callconv(.c) i32 {
     return a.gfx_buffer_result_ok;
 }
 fn map(request: *const a.GfxMmioRequest, output: *a.GfxMmioWindow) callconv(.c) i32 {
+    for (preflight.pages, 0..) |page, index| {
+        if (!state.dma_reported or request.byte_offset != page) continue;
+        std.debug.assert(state.dma_reported and state.dma_mapped and state.fuse_mapping[0] == false and state.fuse_mapping[1] == false and
+            request.resource_base == 0xe0000000 and request.resource_bytes == 16 * 1024 * 1024 and
+            request.byte_length == 4096 and request.cache_policy == a.gfx_buffer_cache_uncached);
+        const bit = @as(u8, 1) << @as(u3, @intCast(index));
+        std.debug.assert(state.preflight_mapping & bit == 0);
+        std.debug.assert(!(state.fuse_fault == .state_display_disabled and page == 0x625000));
+        std.debug.assert(!(state.fuse_fault == .state_riscv_disabled and page == 0x111000));
+        state.maps += 1;
+        state.preflight_seen = true;
+        if (state.fuse_fault == .state_map and index == 2) {
+            state.private_mapping = true;
+            return -1;
+        }
+        state.preflight_mapping |= bit;
+        if (state.fuse_fault == .state_unstable and index == 2) preflight_words[0][0x108 / 4] ^= 1;
+        output.* = .{ .handle = .{ .id = @intCast(5 + index), .generation = 11 }, .cpu_address = @intFromPtr(&preflight_words[index]), .physical_address = request.resource_base + page, .byte_length = if (state.fuse_fault == .state_window) 4095 else 4096, .cache_policy = request.cache_policy };
+        return a.gfx_buffer_result_ok;
+    }
     if (request.byte_offset == 0x820000 or request.byte_offset == 0x824000) {
         const index: usize = if (request.byte_offset == 0x820000) 0 else 1;
         std.debug.assert(state.fuse_fixture and state.prom_mapping and !state.mapping and !state.fuse_mapping[index] and
@@ -593,6 +622,14 @@ fn map(request: *const a.GfxMmioRequest, output: *a.GfxMmioWindow) callconv(.c) 
     return a.gfx_buffer_result_ok;
 }
 fn unmap(handle: *const a.GfxBufferHandle, quiesced: u32) callconv(.c) i32 {
+    if (handle.id >= 5 and handle.id < 5 + preflight.pages.len) {
+        const bit = @as(u8, 1) << @as(u3, @intCast(handle.id - 5));
+        std.debug.assert(handle.generation == 11 and quiesced == 1 and state.preflight_mapping & bit != 0);
+        state.unmaps += 1;
+        if (state.fuse_fault == .state_unmap and handle.id == 7) return -1;
+        state.preflight_mapping &= ~bit;
+        return a.gfx_buffer_result_ok;
+    }
     if (handle.id == 3 or handle.id == 4) {
         const index: usize = handle.id - 3;
         std.debug.assert(handle.generation == 11 and quiesced == 1 and state.fuse_mapping[index]);
@@ -616,6 +653,7 @@ fn unmap(handle: *const a.GfxBufferHandle, quiesced: u32) callconv(.c) i32 {
 }
 fn collect() callconv(.c) i32 {
     state.collects += 1;
+    if (state.preflight_seen and state.fuse_fault == .state_collect) return -1;
     if (state.fuse_seen and state.fuse_fault == .collect) return -1;
     if (state.fail_collect or (state.prom_seen and state.fail_prom_collect)) return -1;
     state.private_mapping = false;
@@ -623,6 +661,7 @@ fn collect() callconv(.c) i32 {
 }
 
 var fuse_words: [2][1024]u32 = .{.{0} ** 1024} ** 2;
+var preflight_words: [preflight.pages.len][1024]u32 = @splat(@splat(0));
 fn fwsecPin(address: u64, bytes: u32, flags: u32, out: *a.DmaPinnedBuffer) callconv(.c) i32 {
     std.debug.assert(state.stage_prepared and stage_backing != null and !state.dma_pinned and !state.dma_mapped);
     std.debug.assert(address == @intFromPtr(stage_backing.?.ptr) and bytes == 1280 and flags == 0);
@@ -694,25 +733,39 @@ test "NVIDIA actual driver lifecycle measures GA106 fuses and retains FWSEC DMA 
         fuse_words[0][0x74c / 4] = if (fault == .debug_missing) 0 else if (fault == .sentinel_debug) 0xffffffff else 1;
         fuse_words[1][0x1e0 / 4] = if (fault == .signature) 5 else if (fault == .sentinel_version) 0xffffffff else 8;
         const initial_fuses = fuse_words;
+        var raw = @import("fwsec_test.zig").preflightFixture();
+        if (fault == .state_protected) raw.put(.bcr, 0xbadf5040);
+        if (fault == .state_display_disabled) raw.put(.display_fuse, 1);
+        if (fault == .state_riscv_disabled) raw.put(.hwcfg2, 0);
+        preflight_words = @splat(@splat(0));
+        for (preflight.pages, 0..) |page, page_index| {
+            for (preflight.addresses, 0..) |address, index| {
+                if (address & ~@as(u32, 0xfff) == page) preflight_words[page_index][(address & 0xfff) / 4] = raw.values[index];
+            }
+        }
+        const initial_preflight = preflight_words;
         const dma_case = @intFromEnum(fault) >= @intFromEnum(@TypeOf(fault).dma_pin);
-        const failed_cleanup = fault == .unmap_debug or fault == .unmap_version or fault == .collect or fault == .release or fault == .dma_unmap or fault == .dma_unpin;
+        const state_case = @intFromEnum(fault) >= @intFromEnum(@TypeOf(fault).state_map);
+        const failed_cleanup = fault == .unmap_debug or fault == .unmap_version or fault == .collect or fault == .release or fault == .dma_unmap or fault == .dma_unpin or fault == .state_unmap or fault == .state_collect;
         try t.expectEqual(@as(i32, if (failed_cleanup) -10 else 0), driver.nvidia_init(&api));
         try t.expect(state.rom_reported and state.fwsec_reported and state.fuse_seen);
         try t.expectEqual(fault == .none or fault == .release or dma_case, state.stage_prepared);
-        try t.expectEqual(fault == .none or fault == .release or fault == .dma_unmap or fault == .dma_unpin or fault == .dma_bounce, state.dma_reported);
+        try t.expectEqual(fault == .none or fault == .release or fault == .dma_unmap or fault == .dma_unpin or fault == .dma_bounce or state_case, state.dma_reported);
+        try t.expectEqual((!state_case and state.dma_reported) or fault == .state_display_disabled or fault == .state_riscv_disabled, state.preflight_reported);
         try t.expectEqual(@as(u32, if (fault == .none or fault == .release or fault == .allocation or dma_case) 1 else 0), state.stage_allocations);
         try t.expectEqualSlices(u8, &rom, prom_bytes[0..rom.len]);
         if (fault != .unstable) try t.expectEqualDeep(initial_fuses, fuse_words);
+        if (fault != .state_unstable) try t.expectEqualDeep(initial_preflight, preflight_words);
         if (failed_cleanup) {
             try t.expect(cpu_backing != null);
             try t.expectEqual(@as(i32, -1), driver.nvidia_shutdown());
-            if (fault == .release or fault == .dma_unmap or fault == .dma_unpin) try t.expect(stage_backing != null);
+            if (fault == .release or fault == .dma_unmap or fault == .dma_unpin or state_case) try t.expect(stage_backing != null);
             state.fuse_fault = .none;
         }
         try t.expectEqual(@as(i32, 0), driver.nvidia_shutdown());
         try t.expectEqual(@as(i32, 0), driver.nvidia_shutdown());
         try t.expect(cpu_backing == null and stage_backing == null and !state.prom_mapping and !state.private_mapping and
-            !state.fuse_mapping[0] and !state.fuse_mapping[1] and !state.dma_pinned and !state.dma_mapped);
+            !state.fuse_mapping[0] and !state.fuse_mapping[1] and !state.dma_pinned and !state.dma_mapped and state.preflight_mapping == 0);
     }
 }
 

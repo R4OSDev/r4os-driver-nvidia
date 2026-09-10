@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-Passive NVIDIA display driver for R4OS. Module 0.1.20; original R4OS code is
+Passive NVIDIA display driver for R4OS. Module 0.1.21; original R4OS code is
 Apache-2.0, with selected original MIT headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
 subsystem 1458:4074, VBIOS 94.06.2f.00.d6. Preparation for 0.79.10 continues.
@@ -55,12 +55,25 @@ pages. Mapping performs the device synchronization. CPU pointers are never
 substituted for DMA addresses. Both original GA102 transfer ranges (also used
 by GA106), 256-byte blocks, 24-bit TCM offsets, IMEM virtual bias, V3's absent
 DMEM virtual tag and PKC placement are validated before publishing a plan.
-No GPU address is submitted and no firmware is executed. Current TCM capacity,
-Falcon reset, authentication and recovery still need native implementation.
+No GPU address is submitted and no firmware is executed. Falcon reset,
+authentication and recovery still need native implementation.
 Cleanup retires the mapping, its pin and then CPU backing; each failed release
 retains the exact descriptor for shutdown retry. SB is the original unload
 command that restores pre-OS applications, not proof of GSP startup. The native
 startup path needs an owned FRTS/WPR region, FWSEC-FRTS and the GSP boot chain.
+
+Module 0.1.21 adds a bounded, read-only GA106 preflight. At most six measured
+BAR0 pages supply thirteen named registers: Falcon capacity/state, RISC-V,
+devinit-published VRAM size, WPR2 bounds, display fuse and VGA workspace.
+Disabled or inaccessible capability bits prevent reads of their dependent
+windows. Two identical passes must finish within one monotonic second;
+protected, missing or changing values never authorize execution.
+The staged IMEM/DMEM ranges are checked against actual TCM capacity. The
+current VGA reservation is retained; a needed relocation is only reported.
+The GA106 HAL does not use GA100's MMU-lock registers. RESET_READY is a hint
+because NVIDIA documents a hardware erratum. MMIO cleanup precedes DMA and
+CPU release; failed cleanup retains the owner for shutdown retry. The result
+is an observation, never an engine-reset, VRAM-allocation or recovery grant.
 
 The explicit `prepare-bootstrap` step exports 26 original GA102 GSP/Booter and
 TU102 SEC2 reference artifacts from the same 570.144 source pin. It verifies a

@@ -4,6 +4,89 @@ const fwsec = @import("fwsec.zig");
 const vbios = @import("vbios.zig");
 const preparation = @import("fwsec_prepare.zig");
 const load = @import("fwsec_load.zig");
+const preflight = @import("fwsec_state.zig");
+
+pub fn preflightFixture() preflight.Raw {
+    var raw: preflight.Raw = .{};
+    for (0..preflight.addresses.len) |index| raw.put(@enumFromInt(index), 0);
+    raw.put(.hwcfg, 256 | (256 << 9)); // 64 KB IMEM and DMEM.
+    raw.put(.hwcfg2, 0x80000400);
+    raw.put(.cpuctl, 0x10);
+    raw.put(.dmacmd, 2);
+    raw.put(.riscv_cpuctl, 0x90);
+    raw.put(.bcr, 0x111);
+    raw.put(.fb_mb, 12 * 1024);
+    raw.put(.vga, 0x2fffe08); // 40-bit address: 12 GB minus 128 KB.
+    return raw;
+}
+
+test "FWSEC preflight rejects inaccessible state and bounds TCM against actual capacity" {
+    const raw = preflightFixture();
+    const decoded = try preflight.decode(&raw);
+    try t.expectEqual(@as(u32, 65536), decoded.imem_bytes);
+    try t.expectEqual(@as(u32, 65536), decoded.dmem_bytes);
+    try t.expectEqual(@as(u64, 0x300000000), decoded.fb_bytes);
+    try t.expectEqual(@as(u64, 0x2fffe0000), decoded.reserved_base);
+    try t.expect(decoded.riscv_active and decoded.riscv_selected and decoded.bcr_valid and !decoded.wpr_up);
+    var changed = raw;
+    changed.put(.hwcfg2, 0x400); // RESET_READY not asserted is not a failure.
+    try t.expect(!(try preflight.decode(&changed)).reset_ready_hint);
+    changed.put(.vga, 0x10008);
+    const old_vga = try preflight.decode(&changed);
+    try t.expect(old_vga.vga_relocation_needed);
+    try t.expectEqual(@as(u64, 0x1000000), old_vga.reserved_base);
+    changed.put(.vga, 0);
+    try t.expectEqual(@as(u64, 0x2fff00000), (try preflight.decode(&changed)).reserved_base);
+    for (0..preflight.addresses.len) |index| {
+        changed = raw;
+        changed.present &= ~(@as(u16, 1) << @as(u4, @intCast(index)));
+        try t.expectError(error.MissingRegister, preflight.decode(&changed));
+        for ([_]u32{ 0xffffffff, 0xbadf0000, 0xbadf5040 }) |blocked| {
+            changed = raw;
+            changed.put(@enumFromInt(index), blocked);
+            try t.expectError(error.ProtectedRegister, preflight.decode(&changed));
+        }
+    }
+    changed = raw;
+    changed.put(.hwcfg2, 0);
+    changed.put(.display_fuse, 1);
+    changed.put(.bcr, 0xbadf0000);
+    changed.put(.riscv_cpuctl, 0xbadf0000);
+    changed.put(.vga, 0xbadf0000);
+    const disabled = try preflight.decode(&changed);
+    try t.expect(!disabled.riscv_enabled and !disabled.display_enabled);
+    for ([_]u32{ 0, 0x100001 }) |fb| {
+        changed = raw;
+        changed.put(.fb_mb, fb);
+        try t.expectError(error.Framebuffer, preflight.decode(&changed));
+    }
+    changed = raw;
+    changed.put(.vga, 0x3000008);
+    try t.expectError(error.Framebuffer, preflight.decode(&changed));
+    changed = raw;
+    changed.put(.wpr_hi, 0x3000000);
+    try t.expectError(error.WprRange, preflight.decode(&changed));
+    changed.put(.wpr_hi, 0x2000000);
+    changed.put(.wpr_lo, 0x2000010);
+    try t.expectError(error.WprRange, preflight.decode(&changed));
+    changed.put(.wpr_lo, 0x1ff0000);
+    try t.expect((try preflight.decode(&changed)).wpr_up);
+    const rom = ga106Fixture();
+    const board = try vbios.parse(&rom, 0x2504);
+    var image: [1280]u8 = undefined;
+    const prepared = try preparation.prepare(&rom, &board, .{ .debug_disable_raw = 1, .ucode_version_raw = 8, .ucode_id = 9 }, .sb, &image);
+    var plan = try load.plan(&prepared, 0x1234567800, image.len);
+    plan.imem.destination = 65536 - plan.imem.bytes;
+    plan.dmem.destination = 65536 - plan.dmem.bytes;
+    try decoded.checkTcm(&plan); // Exact end is valid; the following byte is not.
+    plan.imem.destination += 1;
+    try t.expectError(error.Capacity, decoded.checkTcm(&plan));
+    plan.imem.destination -= 1;
+    plan.dmem.destination += 1;
+    try t.expectError(error.Capacity, decoded.checkTcm(&plan));
+    plan.dmem.destination = 0xffffff00;
+    try t.expectError(error.Capacity, decoded.checkTcm(&plan));
+}
 
 test "FWSEC DMA plan preserves high address bits and rejects truncated or wrapping transfers" {
     const rom = ga106Fixture();

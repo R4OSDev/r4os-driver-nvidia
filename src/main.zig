@@ -6,6 +6,8 @@ const fwsec = @import("fwsec.zig");
 const fwsec_prepare = @import("fwsec_prepare.zig");
 const fwsec_probe = @import("fwsec_probe.zig");
 const fwsec_storage = @import("fwsec_storage.zig");
+const fwsec_state = @import("fwsec_state.zig");
+const fwsec_state_probe = @import("fwsec_state_probe.zig");
 const vbios_probe = @import("vbios_probe.zig");
 const firmware_resources = @import("firmware_resources.zig");
 const firmware = @import("firmware.zig");
@@ -31,6 +33,7 @@ var checking_runtime = false;
 var board_rom: vbios_probe.Capture = .{};
 var security_fuses: fwsec_probe.Capture = .{};
 var fwsec_cpu: fwsec_storage.Storage = .{};
+var fwsec_hardware: fwsec_state_probe.Capture = .{};
 
 comptime {
     asm (r4os.r4dev.driverEntriesAsm("nvidia_init", "nvidia_shutdown"));
@@ -143,6 +146,7 @@ pub export fn nvidia_shutdown() callconv(.c) i32 {
     if (!runtime_probe.shutdown(&ctx)) return -1;
     if (!firmware_cpu.close()) return -1;
     if (!security_fuses.close()) return -1;
+    if (!fwsec_hardware.close()) return -1;
     if (!fwsec_cpu.close()) return -1;
     if (!board_rom.close()) return -1;
     if (!releaseWindow(&ctx)) return -1;
@@ -333,9 +337,42 @@ fn inspectFwsec(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.
     log("NVIDIA fwsec: dmem-base={x} dmem-destination={x} dmem-offset={x} dmem-blocks={d} dmem-command={x} pkc-address={x} boot-vector={x} execution=not-started", .{
         load_plan.dmem.base, load_plan.dmem.destination, load_plan.dmem.source_offset, load_plan.dmem.bytes / 256, load_plan.dmem.command, load_plan.signature_address, load_plan.boot_vector,
     });
+    if (!inspectFwsecState(ctx, snapshot, chip, &load_plan)) return false;
     if (!fwsec_cpu.close()) return false;
     log("NVIDIA fwsec: preparation-cleanup=OK resources=0", .{});
     log("NVIDIA fwsec: firmware-ready=no native-writes=disabled fallback=preserved", .{});
+    return true;
+}
+
+fn inspectFwsecState(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, chip: identity.Chip, plan: *const @import("fwsec_load.zig").Plan) bool {
+    const raw = fwsec_hardware.read(ctx, snapshot, chip) catch |err| {
+        log("NVIDIA fwsec: preflight=unavailable phase=registers reason={s} native-writes=disabled", .{@errorName(err)});
+        return fwsec_hardware.close();
+    };
+    if (!fwsec_hardware.close()) return false;
+    for (fwsec_state.addresses, 0..) |address, index| {
+        const reg: fwsec_state.Register = @enumFromInt(index);
+        if (raw.has(reg)) log("NVIDIA fwsec preflight: register={s} address={x} value={x:0>8} reads=two-identical", .{ @tagName(reg), address, raw.values[index] });
+    }
+    const observed = fwsec_state.decode(&raw) catch |err| {
+        log("NVIDIA fwsec: preflight=unavailable phase=decode reason={s} mmio-cleanup=OK native-writes=disabled", .{@errorName(err)});
+        return true;
+    };
+    log("NVIDIA fwsec: preflight=observed imem-bytes={d} dmem-bytes={d} reset={} reset-ready-hint={} scrubbing={} falcon-halted={} dma-idle={} dma-full={}", .{
+        observed.imem_bytes, observed.dmem_bytes, observed.reset_asserted, observed.reset_ready_hint, observed.scrubbing, observed.falcon_halted, observed.dma_idle, observed.dma_full,
+    });
+    log("NVIDIA fwsec: riscv-enabled={} riscv-selected={} riscv-active={} riscv-halted={} bcr-valid={} ownership=unclaimed", .{
+        observed.riscv_enabled, observed.riscv_selected, observed.riscv_active, observed.riscv_halted, observed.bcr_valid,
+    });
+    log("NVIDIA fwsec: fb-bytes={d} wpr2-up={} wpr2-lo={x} wpr2-hi={x} mmu-lock=not-applicable-ga106", .{ observed.fb_bytes, observed.wpr_up, observed.wpr_lo, observed.wpr_hi });
+    log("NVIDIA fwsec: display-enabled={} vga-valid={} vga-base={x} relocation-needed={} reserved-base={x} frts-allocation=none", .{
+        observed.display_enabled, observed.vga_valid, observed.vga_base, observed.vga_relocation_needed, observed.reserved_base,
+    });
+    observed.checkTcm(plan) catch |err| {
+        log("NVIDIA fwsec: preflight=unavailable phase=tcm reason={s} mmio-cleanup=OK native-writes=disabled", .{@errorName(err)});
+        return true;
+    };
+    ctx.logInfo("NVIDIA fwsec: preflight-tcm=fits snapshot=read-only mmio-cleanup=OK reset=unperformed execution=not-started");
     return true;
 }
 

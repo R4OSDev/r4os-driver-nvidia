@@ -1,7 +1,7 @@
 ﻿NVIDIA: passiver Besitzer fuer 0.79.9
 ===================================
 
-Stand: 10.09.2026; passive Hardwareaufnahme 0.79.9 abgeschlossen.
+Stand: 11.09.2026; passive Hardwareaufnahme 0.79.9 abgeschlossen.
 GA106/A1, Subsystem 1458:4074 und aktuelle ReBAR-Bereiche wurden mit
 NVIDIA 0.1.11 / Kernel 0.1.147 gemessen; der User bestaetigt normales Bild.
 NVIDIA 0.1.14 liest VBIOS 94.06.2f.00.d6 und sechs DCB-Routen fuer vier
@@ -9,7 +9,26 @@ Boardanschluesse. Die spaeteren PROM-Boots bestaetigen softwareseitig den
 unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
-FWSEC-DMA-Staging (NVIDIA 0.1.20, 0.79.10)
+GSP-/VRAM-Vorpruefung (NVIDIA 0.1.21, 0.79.10)
+----------------------------------------------
+fwsec_state_probe.zig liest auf gemessenem GA106 hoechstens sechs BAR0-Seiten
+und 13 genau benannte Register. Zwei identische Durchgaenge muessen innerhalb
+einer monotonen Sekunde abschliessen. RISC-V- und VGA-Fenster werden nur bei
+lesbaren, aktivierten Faehigkeiten abgebildet. Schreibregister-Aliase,
+Speicherports, Reset, DMA-Einreichung und Adressfensterumschaltung bleiben aus.
+Unmap/Collect schliesst die neuen Fenster vor Freigabe der DMA-/CPU-Ressourcen;
+Fehler behalten ihren Besitzer fuer den wiederholten Shutdown.
+
+fwsec_state.zig erkennt fehlende und geschuetzte Werte (FFFFFFFF, BADFxxxx),
+TCM-Ueberlaeufe und unplausible VRAM-/WPR-/VGA-Grenzen. Der vorhandene Ladeplan
+wird gegen die reale IMEM-/DMEM-Kapazitaet geprueft. VRAM stammt aus dem
+Devinit-Register, nicht aus der BAR1-Fenstergroesse. Die aktuelle VGA-Reservierung
+bleibt erhalten; eine erforderliche Verschiebung wird nur gemeldet. GA106
+verwendet laut HAL keine GA100-MMU-Lock-Register. RESET_READY ist wegen eines
+dokumentierten Hardwarefehlers nur ein Hinweis. Die Aufnahme schafft weder
+GSP-Besitz noch einen FRTS-/WPR-Bereich und ersetzt keine Wiederherstellung.
+
+Historisches FWSEC-DMA-Staging (NVIDIA 0.1.20, 0.79.10)
 -----------------------------------------
 Die vorbereitete CPU-Kopie wird mit 256-Byte-Ausrichtung angelegt und ueber
 die vorhandene R4D-Pin-/Mapping-API fuer einen lesenden GPU-Zugriff abgebildet.
