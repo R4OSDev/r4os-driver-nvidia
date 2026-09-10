@@ -5,6 +5,9 @@ const resources = @import("firmware_resources.zig");
 const Storage = @import("firmware_storage.zig").Storage;
 const a = r4os.abi;
 const t = std.testing;
+comptime {
+    _ = @import("gsp_dma_test.zig");
+}
 const Fault = enum { none, create, map, unmap, release, collect, read, short };
 var fault: Fault = .none;
 var backing: ?[]u8 = null;

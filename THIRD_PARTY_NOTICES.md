@@ -13,6 +13,12 @@ their original licenses in the separate workspace reference archive.
 Fixture firmware bodies and signatures are synthetic; selected measured table
 metadata is regression data documented in PROVENANCE.txt.
 
+Module 0.1.22 links the original R4OS Radix3 encoder and a new original
+DMA-ownership controller in its explicit firmware-check mode. Both remain
+Apache-2.0. The MIT-derived host layout calculation described below remains
+outside the module. All five packaged resources, original headers and
+distributed license files remain byte-identical; no boot firmware is added.
+
 The host-only GSP layout calculation in `src/gsp_layout.zig` adapts the
 MIT-licensed NVIDIA 570.144 layout and heap algorithms from
 `kernel_gsp_tu102.c` (copyright 2017-2024), `kernel_gsp.c` (2019-2024) and

@@ -12,6 +12,7 @@ const vbios_probe = @import("vbios_probe.zig");
 const firmware_resources = @import("firmware_resources.zig");
 const firmware = @import("firmware.zig");
 const firmware_storage = @import("firmware_storage.zig");
+const gsp_dma = @import("gsp_dma.zig");
 const rm_heap = @import("rm_heap.zig");
 const rm_clock = @import("rm_clock.zig");
 const rm_semaphore = @import("rm_semaphore.zig");
@@ -29,6 +30,7 @@ var driver_api: ?*const a.DriverApi = null;
 var window: a.GfxMmioWindow = .{};
 var mapping_cleanup_needed = false;
 var firmware_cpu: firmware_storage.Storage = .{};
+var gsp_image: gsp_dma.Storage = .{};
 var checking_runtime = false;
 var board_rom: vbios_probe.Capture = .{};
 var security_fuses: fwsec_probe.Capture = .{};
@@ -144,6 +146,7 @@ pub export fn nvidia_shutdown() callconv(.c) i32 {
     if (!semaphore_probe.shutdown(&ctx)) return -1;
     if (!thread_probe.shutdown(&ctx)) return -1;
     if (!runtime_probe.shutdown(&ctx)) return -1;
+    if (!gsp_image.close()) return -1;
     if (!firmware_cpu.close()) return -1;
     if (!security_fuses.close()) return -1;
     if (!fwsec_hardware.close()) return -1;
@@ -180,6 +183,26 @@ fn checkFirmware(ctx: *const r4os.r4dev.DriverContext) bool {
         }
         const verified = firmware_cpu.ready().?;
         log("NVIDIA firmware: verified family={s} rm={s} bytes={d} reads={d} sha256=matched elf=valid signature-bytes={d} gpu-authentication=unverified", .{ @tagName(family), firmware.lock.rm_version, verified.container.len, firmware_cpu.reads, verified.layout.signature.bytes });
+        if (family == .ga10x) {
+            const report = gsp_image.stage(ctx, verified.layout.image.slice(verified.container), 30 * std.time.ns_per_s) catch |err| {
+                log("NVIDIA gsp: staging=rejected reason={s} submitted=no fallback=preserved", .{@errorName(err)});
+                _ = gsp_image.close();
+                return false;
+            };
+            log("NVIDIA gsp: radix3=staged image-bytes={d} allocation-bytes={d} table-bytes={d} mappings={d} segments={d} bounced={d} root={x} synchronized=yes submitted=no", .{
+                report.image_bytes, report.allocation_bytes, report.table_bytes, report.mappings, report.segments, report.bounced, report.root_address,
+            });
+            for (gsp_image.pieces[0..gsp_image.piece_count], 0..) |*piece, index| {
+                log("NVIDIA gsp: mapping={d} offset={d} bytes={d} segments={d} bounced={}", .{
+                    index, piece.offset, piece.mapping.mapped_bytes, piece.mapping.segment_count, piece.mapping.flags & a.dma_mapping_flag_bounced != 0,
+                });
+            }
+            if (!gsp_image.close()) {
+                ctx.logError("NVIDIA gsp: stage-cleanup=retained submitted=no");
+                return false;
+            }
+            ctx.logInfo("NVIDIA gsp: stage-cleanup=OK mappings=0 pins=0 cpu=0 submitted=no");
+        }
         if (!firmware_cpu.close()) {
             ctx.logError("NVIDIA firmware: cleanup=retained native-writes=disabled");
             return false;

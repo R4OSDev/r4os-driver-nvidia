@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-Passive NVIDIA display driver for R4OS. Module 0.1.21; original R4OS code is
+Passive NVIDIA display driver for R4OS. Module 0.1.22; original R4OS code is
 Apache-2.0, with selected original MIT headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
 subsystem 1458:4074, VBIOS 94.06.2f.00.d6. Preparation for 0.79.10 continues.
@@ -8,6 +8,27 @@ This owner inventories NVIDIA display functions once through
 the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
+
+Module 0.1.22 extends the existing `firmware-check` diagnostic mode with
+actual GSP image DMA staging. The admitted GA10X `.fwimage` is copied into
+separate, page-aligned resident backing with its three-level Radix3 tables.
+The pinned image needs 63,676,416 bytes including 132 KB of tables. Four
+independently owned mappings obey the DriverApi's 16 MB/64-segment limits;
+up to 256 discontiguous segments are supported overall. No GPU receives the
+root address, and normal passive mode does not allocate this large backing.
+
+Each initial map may synchronize to a bounded bounce buffer, so backing is
+zeroed before mapping. After the actual device addresses have been encoded,
+all mappings are explicitly synchronized again before the root is reported.
+The total preparation deadline is checked before and after the task-context
+operations; it does not promise cancellation of a blocked kernel callback.
+Partial maps, pins and failed release descriptors retain their exact owner.
+Cleanup closes every mapping, then every pin, then the resident allocation;
+the admitted source container stays alive through the preparation call.
+The existing mode line is `OPTION NVIDIA mode=firmware-check`; it remains
+an explicit diagnostic and falls through to the same passive board inventory.
+This stages only the GSP image and its page tables. Bootloader, signature and
+WPR-metadata ownership, VGA recovery and firmware execution remain open.
 
 The CPU-only FWSEC catalog resolves BIT 'p', full 32-bit token pointers and
 the original RM expansion-ROM bias. V2 loader and V3 signed-image descriptors,
@@ -81,7 +102,7 @@ GSP boot image and its 84-byte RISC-V descriptor against the same central
 recorded preflight and the admitted GSP `.fwimage` section. Descriptor ranges,
 overlap, first-boot state, WPR reuse, 40-bit VRAM bounds, heap limits and all
 alignments are checked before publishing a new report. It does not install
-another module or modify the GPU. The existing NVIDIA.R4D remains 0.1.21.
+another module or modify the GPU. That host checkpoint kept NVIDIA.R4D 0.1.21 unchanged.
 
     ./Build.sh inspect-gsp-layout -- PREFLIGHT.json GSP.bin BOOT.bin DESC.bin OUTPUT.json
 
@@ -143,7 +164,7 @@ native scanout and HDMI audio remain unimplemented.
 Subsystem IDs, PCI revision, HDA siblings, BAR addresses, standard interrupt
 capabilities and readable current Resizable BAR sizes are reported separately
 from unmeasured data. There are no BAR-sizing writes, bus-master changes, power
-transitions, IRQ registrations, reset, DMA, firmware downloads or polling scans.
+transitions, IRQ registrations, reset, GPU DMA submissions, firmware downloads or polling scans.
 The sole bootstrap PCI entry, 10de:2504, permits three reads from two PMC boot
 identity words under the real DriverApi owner when memory decode and power
 state permit it. The 4 KB mapping is a minimum published identity-register

@@ -9,7 +9,50 @@ Boardanschluesse. Die spaeteren PROM-Boots bestaetigen softwareseitig den
 unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
-GSP-Speicherplanung und Radix3-Vorbereitung (0.79.10, Host)
+GSP-Abbild im echten DMA-Besitz (NVIDIA 0.1.22)
+----------------------------------------------
+Der vorhandene Modus OPTION NVIDIA mode=firmware-check bindet nun das
+hashgepruefte GA10X-.fwimage an getrennten residenten Hauptspeicher. Vier
+einzeln verwaltete Pin-/Mapping-Paare halten die 63676416 Bytes unter dem
+16-MB-Limit je DriverApi-Aufruf. Pro Mapping sind 64 Segmente moeglich;
+der Radix3-Encoder nutzt insgesamt bis zu 256 physisch verteilte Segmente.
+Der normale passive Modus allokiert diesen grossen Puffer nicht.
+
+Eine erste Abbildung kann bereits in Bounce-Speicher kopieren, deshalb wird
+das neue Backing vor dem Mapping genullt. Nach Aufbau der Tabellen mit den
+echten DMA-Adressen und Kopie des Firmwareabbilds werden alle vier Mappings
+erneut fuer das Geraet synchronisiert. Erst danach entsteht ein gueltiger
+Rootbericht. Die GPU erhaelt keine Adresse und fuehrt keine Firmware aus.
+Die 30-Sekunden-Frist wird um die Task-Kontext-Operationen geprueft; sie kann
+einen blockierten Kernelcallback nicht selbst abbrechen.
+
+gsp_dma.zig behaelt auch unvollstaendige Pin-/Mapping-Vorgaenge und die
+unveraenderten Deskriptoren nach fehlgeschlagenem Unmap/Unpin. Rueckbau:
+erst alle Mappings, dann alle Pins, zuletzt die residente Heapallokation.
+Ein fehlgeschlagener Abschluss bleibt fuer Shutdown erhalten. Nach spaeterer
+GPU-Einreichung waere zuvor echte Quieszenz notwendig; ein Timeout genuegt
+dann nicht. Die originale Containerallokation bleibt waehrend der Kopie
+unveraendert und lebt mindestens bis zum Ende der Vorbereitung.
+
+Der bestehende Besitzerlauf deckt einen zusaetzlichen Speicherfall mit 14
+Szenarien ab, darunter zweites Pin/Map, falsche Deskriptoren, Aliase,
+Synchronisierung, Frist/Clock-Ruecklauf und wiederholter Cleanup. Der
+Erfolgsfall verwendet die echte Abbildgroesse, aber synthetische DMA-Adressen.
+Bootloader-/Signaturpuffer, WPR-Metadaten und Hardwarestart bleiben offen.
+
+OssiPC bestaetigt am 11.09.2026 vier reale Mappings mit 10/9/9/7 Segmenten,
+zusammen 35, ohne Bounce; Radixwurzel 0x1118000. Alle Mappings, Pins und der
+CPU-Puffer wurden freigegeben. Bootfb blieb bei 800x600, Generation 1,
+Reset 0; 14 automatische Dienste ohne Fehler. Nach dem Diagnoseboot wurde
+die urspruengliche 350-Byte-Konfiguration per SYSUPD-Batch und zweitem
+Neustart bytegleich wiederhergestellt. Reine Konfigurationspakete nutzen
+trotz Paketmerkmal activation=live den Neustartpfad; nur passende R4X-
+Pakete koennen durch STAGE unmittelbar aktiviert werden. Der Paket-Roundtrip,
+SYSUPD-Nachpruefung, installierter Katalog und neue Laufzeitmarker belegen
+die Installation; kein separater Download des installierten Moduls erfolgte.
+Der ausgeschaltete Hisense ermoeglicht keine neue Bild-/Tonabnahme.
+
+Historische GSP-Speicherplanung und Radix3-Vorbereitung (0.79.10, Host)
 -------------------------------------------------------
 gsp_boot.zig prueft das Produktions-Bootabbild (24576 Bytes) und seinen
 84-Byte-Deskriptor gegen dieselbe Firmware-/Quellversion 570.144. Geaenderte
@@ -45,8 +88,8 @@ Aufruf ueber Build.bat/Build.sh inspect-gsp-layout -- mit absoluten Pfaden
 fuer PREFLIGHT.json, GSP.bin, BOOT.bin, DESC.bin und ein neues OUTPUT.json.
 Schema und Begrenzungen stehen im englischen README. Der Bericht bezeichnet
 die Eingaben als gespeicherte Beobachtung und setzt keine DMA-Adressen ein.
-Neue Software-Zwischenstaende in diesem Abschnitt aendern NVIDIA.R4D nicht;
-Modulversion 0.1.21 und der zuletzt installierte Stand bleiben bytegleich.
+Dieser historische Host-Zwischenstand aenderte NVIDIA.R4D nicht;
+Modulversion 0.1.21 blieb damals bytegleich.
 Kein erneutes Hardwareupdate ist fuer diese CPU-Vorbereitung erforderlich.
 
 GSP-/VRAM-Vorpruefung (NVIDIA 0.1.21, 0.79.10)
