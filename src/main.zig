@@ -2,6 +2,7 @@ const std = @import("std");
 const r4os = @import("r4os");
 const identity = @import("identity.zig");
 const vbios = @import("vbios.zig");
+const fwsec = @import("fwsec.zig");
 const vbios_probe = @import("vbios_probe.zig");
 const firmware_resources = @import("firmware_resources.zig");
 const firmware = @import("firmware.zig");
@@ -235,19 +236,62 @@ fn readVbios(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Sna
     log("NVIDIA vbios: verified source=PROM offset={x} ifr={d} bytes={d} images={d} sha256={s} hardware-bound=yes gpu-authentication=unverified", .{ start.offset, start.ifr_version, result.rom_bytes, result.image_count, rom_hex });
     log("NVIDIA vbios: version={x:0>2}.{x:0>2}.{x:0>2}.{x:0>2}.{x:0>2} version-present={} BIT={x} DCB={x} dcb-version={x} ccb-version={x} ports={d} checksum-bytes={d}", .{
         result.vbios_version[0], result.vbios_version[1], result.vbios_version[2], result.vbios_version[3], result.vbios_version[4], result.version_present,
-        result.bit_offset, result.dcb_offset, result.dcb_version, result.ccb_version, result.port_count, result.checksum_bytes,
+        result.bit_offset,       result.dcb_offset,       result.dcb_version,      result.ccb_version,      result.port_count,       result.checksum_bytes,
     });
     for (result.ports[0..result.port_count]) |port| {
         log("NVIDIA vbios port={d} type={x} heads={x} or={x} location={d} bus={d} ccb={d} connector={d} connector-type={d} i2c={d} aux={d} raw={x:0>8}/{x:0>8}", .{
-            port.index, port.kind, port.heads, port.or_mask, port.location, port.bus, port.ccb, port.connector,
-            if (port.connector_type) |value| @as(u16, value) else @as(u16, 256),
-            if (port.i2c) |value| @as(u16, value) else @as(u16, 256),
-            if (port.aux) |value| @as(u16, value) else @as(u16, 256), port.raw_path, port.raw_config,
+            port.index,                                                          port.kind,                                                port.heads,                                               port.or_mask,  port.location,   port.bus, port.ccb, port.connector,
+            if (port.connector_type) |value| @as(u16, value) else @as(u16, 256), if (port.i2c) |value| @as(u16, value) else @as(u16, 256), if (port.aux) |value| @as(u16, value) else @as(u16, 256), port.raw_path, port.raw_config,
         });
     }
+    inspectFwsec(bytes[start.offset..][0..result.rom_bytes], &result);
     if (!board_rom.close()) return false;
     ctx.logInfo("NVIDIA vbios: cleanup=OK resources=0 native-writes=disabled fallback=preserved");
     return true;
+}
+
+fn inspectFwsec(rom: []const u8, board: *const vbios.Result) void {
+    log("NVIDIA fwsec: source=PROM expansion-bias={x} first-extension={x} bit-p={} native-writes=disabled", .{
+        board.expansion_rom_offset orelse 0xffffffff, board.first_extension_offset orelse 0xffffffff, board.falcon != null,
+    });
+    const catalog = fwsec.parse(rom, board) catch |err| {
+        log("NVIDIA fwsec: unavailable reason={s} firmware-ready=no fallback=preserved", .{@errorName(err)});
+        var diagnostic: VbiosDiagnostic = .{ .remaining = 2048 };
+        fwsec.diagnose(rom, board, &diagnostic);
+        return;
+    };
+    log("NVIDIA fwsec: catalog=parsed table={x} table-bytes={d} table-entries={d} fwsec-entries={d} fuse-version=unmeasured selection=none gpu-authentication=unverified", .{
+        catalog.table.offset, catalog.table.bytes, catalog.table_entries, catalog.count,
+    });
+    for (catalog.entries[0..catalog.count]) |*entry| {
+        log("NVIDIA fwsec: entry={d} app={x} target={x} desc-version={d} flags={x} descriptor={x}/{d} image={x}/{d} stored={d} uncompressed={d}", .{
+            entry.table_index,        entry.application,      entry.target,       entry.descriptor_version, entry.flags,
+            entry.descriptor.offset,  entry.descriptor.bytes, entry.image.offset, entry.image.bytes,        entry.stored_bytes,
+            entry.uncompressed_bytes,
+        });
+        log("NVIDIA fwsec: code={x}/{d} data={x}/{d} imem-pa={x} imem-va={x} secure-pa={x} secure-bytes={d} dmem-pa={x} engine-mask={x} ucode={x}", .{
+            entry.code.offset,    entry.code.bytes,        entry.data.offset, entry.data.bytes,  entry.imem_pa,  entry.imem_va,
+            entry.imem_secure_pa, entry.imem_secure_bytes, entry.dmem_pa,     entry.engine_mask, entry.ucode_id,
+        });
+        log("NVIDIA fwsec: signatures={x}/{d} count={d} versions={x} reserved-raw={x} patch-slot={x}/{d} selected=no", .{
+            entry.signatures.offset, entry.signatures.bytes,      entry.signature_count,      entry.signature_versions,
+            entry.reserved_raw,      entry.signature_slot.offset, entry.signature_slot.bytes,
+        });
+        const interface = &entry.interface;
+        log("NVIDIA fwsec: interface={x}/{d} mapper={x}/{d} mapper-version={d} signature={x} input={x}/{d} output-address={x}/{d} output-space=firmware-unresolved command-mask={x}/{x} submitted=no", .{
+            interface.table.offset,           interface.table.bytes,          interface.mapper.offset,        interface.mapper.bytes,
+            interface.version,                interface.signature,            interface.command_input.offset, interface.command_input.bytes,
+            interface.command_output.address, interface.command_output.bytes, interface.commands[0],          interface.commands[1],
+        });
+        inline for (.{ "descriptor", "image", "signatures" }) |field| {
+            const value: fwsec.Range = @field(entry, field);
+            if (value.bytes != 0) {
+                const digest = fwsec.sha256(rom, value) catch unreachable; // Immutable, fully bounded catalog.
+                log("NVIDIA fwsec: entry={d} {s}-sha256={s}", .{ entry.table_index, field, digest });
+            }
+        }
+    }
+    log("NVIDIA fwsec: firmware-ready=no native-writes=disabled fallback=preserved", .{});
 }
 
 const VbiosDiagnostic = struct {

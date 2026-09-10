@@ -28,8 +28,14 @@ pub const Result = struct {
     pci_extension_offset: u32 = 0,
     pci_extension_bytes: u16 = 0,
     pci_device: u16 = 0,
+    first_extension_offset: ?u32 = null,
+    // RM adds this bias to Falcon table/descriptor pointers. It is NOT the
+    // first extension's address: intervening EFI images shift the pointers.
+    // null records an impossible subtraction without disabling passive DCB.
+    expansion_rom_offset: ?u32 = 0,
     bit_offset: u16 = 0,
     bit_entries: u8 = 0,
+    falcon: ?FalconData = null,
     vbios_version: [5]u8 = .{0} ** 5,
     version_present: bool = false,
     dcb_offset: u16 = 0,
@@ -38,6 +44,7 @@ pub const Result = struct {
     port_count: u8 = 0,
     ports: [max_ports]Port = .{Port{}} ** max_ports,
 };
+pub const FalconData = struct { version: u8, offset: u32, bytes: u16 };
 
 pub const PromStart = struct { offset: u32, ifr_version: u8 };
 /// Pure interpretation of the pinned NVIDIA IFR envelope. Inputs are already
@@ -67,7 +74,8 @@ pub fn promStart(bytes: []const u8) Error!PromStart {
 
 /// No allocation, I/O, firmware execution or global publication. On failure the
 /// caller receives an error, never a partially valid topology. All pointers
-/// are relative to the selected x86 image, not arbitrary physical addresses.
+/// are ROM offsets, never arbitrary physical addresses. Display table pointers
+/// are x86-relative; BIT 'p' uses the whole PCI ROM as in the pinned RM reader.
 pub fn parse(rom: []const u8, expected_device: ?u16) Error!Result {
     if (rom.len == 0 or rom.len > max_rom_bytes) return error.Limit;
     var result: Result = .{};
@@ -142,13 +150,18 @@ pub fn parse(rom: []const u8, expected_device: ?u16) Error!Result {
             const initialization = @as(usize, u16le(image, 2)) * 512;
             if (initialization == 0) return error.Bounds;
             _ = try span(image, 0, initialization);
-        } else if (pci[0x14] != 0xe0) return error.Unsupported;
+        } else if (pci[0x14] == 0xe0) {
+            if (result.first_extension_offset == null) result.first_extension_offset = @intCast(cursor);
+        } else return error.Unsupported;
         result.image_count += 1;
         cursor += image.len;
         if (last) break;
     }
     result.rom_bytes = @intCast(cursor);
     const image = selected orelse return error.Missing;
+    if (result.first_extension_offset) |offset| {
+        if (offset != 0) result.expansion_rom_offset = if (offset >= result.image_bytes) offset - result.image_bytes else null;
+    }
     var ranges: Ranges = .{};
     const header = try span(image, 0, 0x38);
     try ranges.add(0, 0x1a);
@@ -156,7 +169,7 @@ pub fn parse(rom: []const u8, expected_device: ?u16) Error!Result {
     const pcir = u16le(header, 0x18);
     try ranges.add(pcir, u16le(image, pcir + 0x0a));
     if (result.pci_extension_bytes != 0) try ranges.add(result.pci_extension_offset, result.pci_extension_bytes);
-    try parseBit(image, &ranges, &result);
+    try parseBit(rom[0..cursor], image, &ranges, &result);
     try parseDcb(image, &ranges, &result);
     return result;
 }
@@ -174,7 +187,7 @@ fn deviceListContains(image: []const u8, pcir: usize, revision: u8, device: u16)
     return error.Limit;
 }
 
-fn parseBit(image: []const u8, ranges: *Ranges, result: *Result) Error!void {
+fn parseBit(rom: []const u8, image: []const u8, ranges: *Ranges, result: *Result) Error!void {
     const signature = "\xff\xb8BIT\x00";
     const offset = std.mem.indexOf(u8, image, signature) orelse return error.Missing;
     if (offset > 0xffff or std.mem.indexOf(u8, image[offset + signature.len ..], signature) != null) return error.Duplicate;
@@ -196,10 +209,20 @@ fn parseBit(image: []const u8, ranges: *Ranges, result: *Result) Error!void {
         if (ids[id]) return error.Duplicate;
         ids[id] = true;
         const length: usize = u16le(entry, 2);
-        const pointer: usize = u16le(entry, 4);
+        const pointer: usize = if (stride >= 8) u32le(entry, 4) else u16le(entry, 4);
         // BIT 'b' describes a BIOS data range, not a regular table pointer.
         // Unknown pointer semantics are refused instead of reinterpreted.
         if (id == 'b') return error.Unsupported;
+        if (id == 'p') {
+            result.falcon = .{ .version = entry[1], .offset = @intCast(pointer), .bytes = @intCast(length) };
+            if (length != 0) {
+                if (pointer == 0) return error.Bounds;
+                _ = try span(rom, pointer, length);
+                const bit_start = result.image_offset + offset;
+                if (pointer < bit_start + table.len and bit_start < pointer + length) return error.Overlap;
+            }
+            continue;
+        }
         if (length == 0) continue;
         if (pointer == 0) return error.Bounds;
         const data = try span(image, pointer, length);

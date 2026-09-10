@@ -1,5 +1,6 @@
 const std = @import("std");
 const vbios = @import("vbios.zig");
+const fwsec = @import("fwsec.zig");
 
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
@@ -10,19 +11,44 @@ pub fn main(init: std.process.Init) !void {
     const rom = try std.Io.Dir.cwd().readFileAlloc(init.io, args[1], init.gpa, .limited(vbios.max_rom_bytes));
     defer init.gpa.free(rom);
     const expected: ?u16 = if (args.len == 4) try std.fmt.parseInt(u16, args[3], 16) else null;
-    const result = vbios.parse(rom, expected) catch |err| {
+    const start = try vbios.promStart(rom);
+    const result = vbios.parse(rom[start.offset..], expected) catch |err| {
         std.debug.print("NVIDIA VBIOS rejected: {s}; no report published.\n", .{@errorName(err)});
         return err;
     };
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(rom, &digest, .{});
     const digest_hex = std.fmt.bytesToHex(digest, .lower);
+    const chain = rom[start.offset..][0..result.rom_bytes];
+    const chain_hex = try fwsec.sha256(chain, .{ .offset = 0, .bytes = result.rom_bytes });
+    var fwsec_error: ?[]const u8 = null;
+    const catalog: ?fwsec.Catalog = fwsec.parse(chain, &result) catch |err| blk: {
+        fwsec_error = @errorName(err);
+        break :blk null;
+    };
+    const EntryReport = struct { entry: fwsec.Entry, descriptor_sha256: []const u8, image_sha256: []const u8, signatures_sha256: ?[]const u8 };
+    var entries: [fwsec.max_entries]EntryReport = undefined;
+    var hashes: [fwsec.max_entries][3][64]u8 = undefined;
+    if (catalog) |*value| {
+        for (value.entries[0..value.count], 0..) |*entry, index| {
+            hashes[index][0] = try fwsec.sha256(chain, entry.descriptor);
+            hashes[index][1] = try fwsec.sha256(chain, entry.image);
+            if (entry.signatures.bytes != 0) hashes[index][2] = try fwsec.sha256(chain, entry.signatures);
+            entries[index] = .{ .entry = entry.*, .descriptor_sha256 = &hashes[index][0], .image_sha256 = &hashes[index][1], .signatures_sha256 = if (entry.signatures.bytes == 0) null else &hashes[index][2] };
+        }
+    }
     const report = .{
-        .schema = 1,
+        .schema = 2,
         .source = "supplied-file",
         .sha256 = digest_hex[0..],
         .hardware_verified = false,
         .native_initialization_authorized = false,
+        .prom_offset = start.offset,
+        .ifr_version = start.ifr_version,
+        .rom_bytes = result.rom_bytes,
+        .pci_chain_sha256 = chain_hex[0..],
+        .first_extension_offset = result.first_extension_offset,
+        .expansion_rom_offset = result.expansion_rom_offset,
         .image_count = result.image_count,
         .image_offset = result.image_offset,
         .image_bytes = result.image_bytes,
@@ -37,6 +63,15 @@ pub fn main(init: std.process.Init) !void {
         .dcb_version = result.dcb_version,
         .ccb_version = result.ccb_version,
         .ports = result.ports[0..result.port_count],
+        .fwsec = .{
+            .catalog_parsed = catalog != null,
+            .rejection = fwsec_error,
+            .firmware_ready = false,
+            .signature_cryptographically_verified = false,
+            .variant_selected = false,
+            .fuse_version_measured = false,
+            .entries = entries[0..if (catalog) |value| value.count else 0],
+        },
     };
     const json = try std.json.Stringify.valueAlloc(init.gpa, report, .{ .whitespace = .indent_2 });
     defer init.gpa.free(json);

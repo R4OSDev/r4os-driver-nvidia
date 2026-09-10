@@ -92,6 +92,11 @@ pub fn build(b: *std.Build) void {
     prepare.addArtifactArg(firmware_inspector);
     if (b.args) |args| prepare.addArgs(args);
     b.step("prepare-firmware", "Prepare local firmware: -- -SourceDirectory PATH -ScratchDirectory Temp/PATH [-OutputDirectory PATH]").dependOn(&prepare.step);
+    const bootstrap = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-File" });
+    bootstrap.addFileArg(b.path("Tools/PrepareBootstrap.ps1"));
+    bootstrap.addArgs(&.{ "-Compiler", b.graph.zig_exe });
+    if (b.args) |args| bootstrap.addArgs(args);
+    b.step("prepare-bootstrap", "Export pinned CPU reference data: -- -SourceDirectory PATH -ScratchDirectory Temp/PATH -OutputDirectory PATH").dependOn(&bootstrap.step);
     const rm_build = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-File" });
     rm_build.addFileArg(b.path("Tools/BuildRm.ps1"));
     rm_build.addArgs(&.{ "-Compiler", b.graph.zig_exe });

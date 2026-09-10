@@ -10,7 +10,8 @@ Register and binary-format facts were checked against the NVIDIA-published
 register headers and DCB specification and the selected MIT-licensed BIOS
 readers recorded in PROVENANCE.txt. Those upstream materials remain under
 their original licenses in the separate workspace reference archive.
-The synthetic parser fixtures are original test data, not extracted VBIOS.
+Fixture firmware bodies and signatures are synthetic; selected measured table
+metadata is regression data documented in PROVENANCE.txt.
 
 Since module 0.1.9, `ThirdParty/Nvidia570.144` vendors 19 unchanged original
 MIT header files (236,096 bytes) from NVIDIA Open GPU Kernel Modules 570.144,
@@ -42,6 +43,15 @@ with `NVFW-LOCK.json` in NVIDIA.R4D's nonallocated resource section. The R4OS
 Distribution overlay also carries the byte-identical complete license under
 `/R4OS/LICENSES/NVIDIA-570.144-LICENSE.txt` and beside its images.
 Neither preparation nor CPU-side validation executes firmware or an installer.
+
+The optional `prepare-bootstrap` step compiles four original generated bindata
+archives from the same verified source snapshot. Their full original MIT
+notices, source files and complete COPYING accompany the 26 byte-identical
+decoded artifacts. The host executable links NVIDIA's original utilGz decoder
+in `src/nvidia/src/lib/zlib/inflate.c`; its NVIDIA and Jean-loup Gailly/Mark
+Adler zlib notices and accompanying header are retained verbatim. The R4OS
+exporter and scripts are original code. No bootstrap binary or original
+decoder implementation is vendored into this repository or added to the R4D.
 
 The optional `build-rm` host step compiles an explicitly supplied, hash-pinned
 original NVIDIA Open GPU Kernel Modules 570.144 source snapshot under scratch.

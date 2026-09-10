@@ -9,6 +9,74 @@ Boardanschluesse. Die spaeteren PROM-Boots bestaetigen softwareseitig den
 unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
+FWSEC-Metadaten (NVIDIA 0.1.18, 0.79.10)
+--------------------------------------
+fwsec.zig verarbeitet nur die bereits vorhandene unveraenderte CPU-Kopie des
+PROM. BIT-p-Zeiger beziehen sich auf die gesamte validierte PCI-ROM-Kette;
+acht oder mehr Bytes breite BIT-Eintraege behalten alle 32 Zeigerbits. Der
+Falcon-Versatz ist gemaess RM erste Erweiterung minus Basis-ROM-Groesse,
+nicht die Adresse der Erweiterung selbst. Auf OssiPC ergibt das 0x14800.
+
+V2 trennt Loader-Code und DMEM, V3 erfasst das auf 256 Bytes gerundete Image,
+384-Byte-Signaturen, Versionsmaske und den vollstaendig in DMEM liegenden
+Signaturplatz. Alle Additionen, Bereiche, Duplikate und Ueberlappungen werden
+begrenzt; maximal 64 Falcon-Eintraege und acht FWSEC-Varianten. Interface und
+Kommandoeingabe werden vollstaendig innerhalb des geladenen DMEM geprueft.
+Ausgabe- und Arbeitsbereich sind opake Firmwareadressen ohne CPU-Zugriff.
+Der Treiber patcht weder
+Signatur noch Kommandos, waehlt keine Debug-/Produktionsvariante und liest
+noch keine Fuse-Version. signatureForFuse ist nur eine explizite Indexrechnung.
+
+Das im Original als Reserved bezeichnete V3-Wort ist kein Nullkriterium:
+NVIDIA liest es, wertet es aber nicht aus. OssiPC liefert 0x9249. Version
+0.1.16 hatte das zu streng abgelehnt; 0.1.17 bewahrt den Wert unveraendert.
+0.1.17 behandelte dann die Ausgabeadresse 0x01000000 und den Arbeitsbereich
+0x900/0x2600 faelschlich als CPU-Offsets; 0.1.18 trennt deren Adressraum vom
+ROM. Der originale RM-Kommandoaufbau dereferenziert diese Felder nicht.
+Der echte 64-Byte-Eingabepuffer beginnt bei DMEM-Offset 1984 und endet exakt
+am geladenen DMEM-Ende 2048. Ein zusaetzliches Byte bleibt ein Bereichsfehler.
+Der vorhandene Besitzerstep prueft diese gemessenen Tabellenmetadaten mit
+synthetischen Firmwarekoerpern und Signaturen. Die Lebenszyklustests und der
+passive Fallback bleiben erhalten. Ein FWSEC-Fehler publiziert keinen
+Teilkatalog, sperrt aber nicht
+die bereits valide passive DCB-Diagnose. Die bestehende PROM-Freigabe bleibt
+fuer Erfolg und Fehler zustaendig. Begrenzte Rohdiagnose: maximal 2 KB.
+
+inspect-vbios schreibt Schema 2 mit IFR-/PCI-Kettenumfang, Hash und FWSEC-
+Metadaten. Ein Dateibefund, Hash oder vorhandene Signatur beweist keine
+GPU-Authentifizierung und keine lauffaehige native Firmware.
+
+OssiPC nimmt mit 0.1.18 beide realen FWSEC-Varianten an: Falcon-Eintraege
+8/9, App-IDs 0x45/0x85, Target 7, V3-Deskriptoren mit je 1196 Bytes und
+59904-Byte-Images. Jedes Image enthaelt 57856 Bytes Code und 2048 Bytes DMEM;
+die drei 384-Byte-Signaturen besitzen Versionsmaske 7. Der Diagnoseabschluss
+meldet resources=0, bootfb bleibt bei Generation 1 und Reset 0. Die genaue
+Aufnahme samt sechs Hashes liegt in Docs/Drivers/GrafikFirmware07910.json.
+Weder eine Variante noch eine Signatur wurde fuer GPU-Ausfuehrung gewaehlt.
+
+prepare-bootstrap ist ein ausdruecklicher hostseitiger Besitzerstep. Compiler,
+SourceDirectory, ScratchDirectory und OutputDirectory sind absolute Pfade;
+Scratch liegt unter Workspace/Temp, Ausgabe auf demselben Dateisystem und
+ausserhalb von Quell- und Treiberrepository. Ein privater vollstaendiger
+Snapshot muss den vorhandenen RM-Quellkatalog aus 3156 Dateien erfuellen,
+bevor Compiler oder Originaldecoder starten. Die gemeinsame Firmware-
+Sperrdatei bestimmt weiterhin die RM-Revision; es gibt keinen zweiten Pin.
+
+Vier originale generierte C-Archive liefern 26 unveraenderte GA102-GSP-/
+Booter- und TU102-SEC2-Artefakte. Originale Initialisierer werden kompiliert,
+utilGz mit NVGZ_USER dekomprimiert nur diese gesperrten Originale. Ein zweiter
+begrenzt lesender .NET-Deflate-Decoder muss alle Bytes bestaetigen. Namen,
+Groessen, beide Hashes, Originaldateinamen, Funktionszuordnung, vollstaendige
+Quellhinweise und COPYING begleiten die Ausgabe. Die Original-HAL-Tabellen
+belegen die Familienzuordnung fuer GA106. Eine Produktions-/Debug-Auswahl
+oder kryptografische Signaturannahme ist damit noch nicht erfolgt.
+
+Die vollstaendige Ausgabe wird atomar veroeffentlicht; ein abweichendes
+vorhandenes Paket bleibt unveraendert und fuehrt zu einem Fehler. Der Step
+veraendert weder Firmwarekoerper noch Modulressourcen. Der Originaldecoder
+besitzt keine allgemeine Eingabelaengenbegrenzung und wird deshalb niemals
+mit ungeprueften oder frei gelieferten Kompressionsdaten ausgefuehrt.
+
 Der R4D-Loader bindet den echten DriverApi-Owner waehrend Init und Shutdown.
 Der Treiber liest den kanonischen PCI-Bestand genau einmal, maximal 4096
 Eintraege, acht Displayfunktionen und 32 NVIDIA-HDA-Funktionen. HDA-Zuordnung

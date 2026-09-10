@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-Passive NVIDIA display driver for R4OS. Module 0.1.15; original R4OS code is
+Passive NVIDIA display driver for R4OS. Module 0.1.18; original R4OS code is
 Apache-2.0, with selected original MIT headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
 subsystem 1458:4074, VBIOS 94.06.2f.00.d6. Preparation for 0.79.10 continues.
@@ -8,6 +8,37 @@ This owner inventories NVIDIA display functions once through
 the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
+
+The CPU-only FWSEC catalog resolves BIT 'p', full 32-bit token pointers and
+the original RM expansion-ROM bias. V2 loader and V3 signed-image descriptors,
+code/data bounds, sparse signature-version masks and DMEM command interfaces
+are checked within the validated PCI ROM chain. At most eight FWSEC variants
+are reported with image/descriptor/signature hashes. GPU fuse state is not
+guessed, no variant is selected, and signature lookup does not authenticate.
+The opaque V3 reserved word is preserved, including the nonzero value observed
+on GA106. Command input is bounded within loaded DMEM; firmware output and
+workspace addresses are opaque declarations with no CPU slice accessor.
+A rejected FWSEC catalog leaves valid passive board discovery usable
+and emits at most 2 KB of explicitly unvalidated CPU-copy evidence.
+`inspect-vbios` schema 2 also handles IFR envelopes and reports the same catalog
+for a supplied file; file inspection never claims physical GPU acceptance.
+On OssiPC, module 0.1.18 successfully catalogs the two actual V3 entries in
+VBIOS 94.06.2f.00.d6 and releases all probe resources; bootfb remains active.
+
+The explicit `prepare-bootstrap` step exports 26 original GA102 GSP/Booter and
+TU102 SEC2 reference artifacts from the same 570.144 source pin. It verifies a
+private source snapshot before compiling the original data initializers and
+decoder, compares the decoded bytes with bounded .NET Deflate, and preserves
+original names, hashes, family mappings and complete notices. It publishes a
+complete directory atomically; an existing different output is refused.
+Use absolute paths, with scratch under the workspace's `Temp/` and output on
+the same filesystem, outside the source and driver repositories:
+
+    ./Build.sh prepare-bootstrap -- -SourceDirectory ORIGINAL_RM -ScratchDirectory WORKSPACE/Temp/bootstrap -OutputDirectory REFERENCE_PACKAGE
+
+The host step neither adds module resources nor selects a GPU signature.
+Its original decoder runs only on data covered by the complete source pin;
+it is not a decoder for arbitrary supplied compressed input.
 
 The current native CPU port also provides the nine original RM/NVKMS
 formatting and logging declarations. Integer varargs, truncation lengths,

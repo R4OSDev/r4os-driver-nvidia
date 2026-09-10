@@ -1,6 +1,28 @@
 ﻿Original R4OS implementation for roadmap 0.79.9, 10.09.2026.
 Host/module scaffolding follows R4OS SDK and existing R4D owners.
-The firmware fixtures are synthetic and contain no third-party ROM bytes.
+Firmware fixture bodies and signatures are synthetic. Selected measured
+table fields are explicit regression data, as described below.
+
+0.79.10 FWSEC catalog (NVIDIA 0.1.18), 10.09.2026:
+fwsec.zig and fwsec_test.zig are original R4OS implementations of format facts
+from the pinned NVIDIA 570.144 revision below. Primary sources:
+src/nvidia/src/kernel/gpu/gsp/kernel_gsp_fwsec.c (BIT/Falcon/V2/V3),
+src/nvidia/src/kernel/gpu/gsp/arch/turing/kernel_gsp_vbios_tu102.c
+(s_locateExpansionRoms) and kernel_gsp_frts_tu102.c (DMEM interface and fuse
+signature indexing). All three retain their original MIT notices in the
+workspace reference tree. Nouveau nvkm/subdev/gsp/fwsec.c was read as a
+comparison; no implementation from NVIDIA or Nouveau is copied into this
+parser. OssiPC's measured V3 reserved field (0x9249), 20-byte interface and
+64-byte mapper metadata are regression input. Firmware bodies and signatures
+are synthetic. Output/workspace declarations confer no CPU memory access;
+the pinned command preparer dereferences only its command input buffer.
+The driver consumes no host-extracted bootstrap artifact in this checkpoint.
+The 26 separately compiled/decoded original GA102 GSP/Booter and TU102 SEC2
+reference artifacts remain under ExFiles/Reference/GFX/Nvidia/0.79.10/
+fwsec-bootstrap-20260910, with
+their source pin, individual hashes and complete upstream notices. Original
+utilGz was used only in the host evidence exporter, on pinned original data,
+with its zlib/NVIDIA notices preserved; it is not linked into NVIDIA.R4D.
 
 Register field facts: NVIDIA open-gpu-kernel-modules 570.144,
 commit 8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f,

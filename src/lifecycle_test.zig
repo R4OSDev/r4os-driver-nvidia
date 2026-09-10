@@ -17,9 +17,15 @@ extern fn nv_printf(u32, [*:0]const u8, ...) callconv(.c) c_int;
 var native_log_text: [513]u8 = undefined;
 var native_log_length: usize = 0;
 var native_log_severity: u32 = 0;
-fn nativeLogInfo(text: [*:0]const u8) callconv(.c) void { captureNativeLog(0, text); }
-fn nativeLogWarn(text: [*:0]const u8) callconv(.c) void { captureNativeLog(1, text); }
-fn nativeLogError(text: [*:0]const u8) callconv(.c) void { captureNativeLog(2, text); }
+fn nativeLogInfo(text: [*:0]const u8) callconv(.c) void {
+    captureNativeLog(0, text);
+}
+fn nativeLogWarn(text: [*:0]const u8) callconv(.c) void {
+    captureNativeLog(1, text);
+}
+fn nativeLogError(text: [*:0]const u8) callconv(.c) void {
+    captureNativeLog(2, text);
+}
 fn captureNativeLog(level: u32, text: [*:0]const u8) void {
     const value = std.mem.span(text);
     std.debug.assert(value.len <= 512);
@@ -345,6 +351,8 @@ const State = struct {
     clock_fixture: bool = false,
     rom_fixture: bool = false,
     rom_reported: bool = false,
+    fwsec_reported: bool = false,
+    fwsec_rejected: bool = false,
     full_rom_record: bool = false,
     prom_mapping: bool = false,
     prom_seen: bool = false,
@@ -402,6 +410,8 @@ fn log(text: [*:0]const u8) callconv(.c) void {
     if (std.mem.indexOf(u8, std.mem.span(text), "chip=GA106") != null) state.chip_reported = true;
     if (std.mem.indexOf(u8, std.mem.span(text), "lock=verified") != null) state.lock_verified = true;
     if (std.mem.indexOf(u8, std.mem.span(text), "vbios: verified source=PROM") != null) state.rom_reported = true;
+    if (std.mem.indexOf(u8, std.mem.span(text), "fwsec: catalog=parsed") != null) state.fwsec_reported = true;
+    if (std.mem.indexOf(u8, std.mem.span(text), "fwsec: unavailable") != null) state.fwsec_rejected = true;
     const value = std.mem.span(text);
     const marker = "bytes=64 hex=";
     if (std.mem.indexOf(u8, value, marker)) |index| {
@@ -558,7 +568,7 @@ test "NVIDIA actual driver lifecycle reads bounded PROM and retains each failed 
     api.version = 31;
     api.heap_query = cpuQuery;
     const rom = fixtures.fixture();
-    for (0..8) |fault| {
+    for (0..10) |fault| {
         state = .{ .rom_fixture = true };
         defer {
             state.fail_prom_unmap = false;
@@ -583,11 +593,18 @@ test "NVIDIA actual driver lifecycle reads bounded PROM and retains each failed 
             5 => state.fail_prom_collect = true,
             6 => cpu_fail_release = true,
             7 => state.deadline_prom = true,
+            8, 9 => {
+                const firmware_rom = @import("fwsec_test.zig").fixture(3);
+                @memcpy(prom_bytes[0..firmware_rom.len], &firmware_rom);
+                if (fault == 9) @import("fwsec_test.zig").put32(&prom_bytes, 0xc08, 0xfffffff0);
+            },
             else => unreachable,
         }
         const result = driver.nvidia_init(&api);
-        try t.expectEqual(@as(i32, if (fault == 0) 0 else -10), result);
-        try t.expectEqual(fault == 0 or (fault >= 4 and fault <= 6), state.rom_reported);
+        try t.expectEqual(@as(i32, if (fault == 0 or fault >= 8) 0 else -10), result);
+        try t.expectEqual(fault == 0 or (fault >= 4 and fault <= 6) or fault >= 8, state.rom_reported);
+        try t.expectEqual(fault == 8, state.fwsec_reported);
+        if (fault == 0 or fault == 9) try t.expect(state.fwsec_rejected);
         if (fault == 1) try t.expect(state.full_rom_record);
         try t.expect(!state.mapping);
         if (fault >= 4 and fault <= 6) {
