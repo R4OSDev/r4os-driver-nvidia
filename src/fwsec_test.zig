@@ -2,6 +2,111 @@ const std = @import("std");
 const t = std.testing;
 const fwsec = @import("fwsec.zig");
 const vbios = @import("vbios.zig");
+const preparation = @import("fwsec_prepare.zig");
+
+pub fn ga106Fixture() [8192]u8 {
+    var rom = fixture(3);
+    rom[0xc07] = 7;
+    put16(&rom, 0x1024, 0x400);
+    rom[0x1026] = 9;
+    return rom;
+}
+
+test "FWSEC GA106 fuse selection rejects ambiguous variants and preserves full register version" {
+    for ([_]struct { raw: u32, version: u32 }{
+        .{ .raw = 0, .version = 0 },           .{ .raw = 1, .version = 1 }, .{ .raw = 3, .version = 2 },
+        .{ .raw = 5, .version = 3 },           .{ .raw = 8, .version = 4 }, .{ .raw = 0x10000, .version = 17 },
+        .{ .raw = 0x80000000, .version = 32 },
+    }) |case| try t.expectEqual(case.version, try preparation.fuseVersion(case.raw));
+    try t.expectError(error.Fuse, preparation.fuseVersion(0xffffffff));
+    try t.expectError(error.Fuse, preparation.debugEnabled(0xffffffff));
+    try t.expect(try preparation.debugEnabled(2));
+    try t.expect(!try preparation.debugEnabled(3));
+    var rom = ga106Fixture();
+    const board = try vbios.parse(&rom, 0x2504);
+    var fuses: preparation.Fuses = .{ .debug_disable_raw = 1, .ucode_version_raw = 8, .ucode_id = 9 };
+    const selected = try preparation.select(&rom, &board, fuses);
+    try t.expectEqual(@as(u32, 4), selected.fuse_version);
+    try t.expectEqual(@as(u32, 0x11ac), selected.signature.offset);
+    try t.expect(!selected.debug);
+    fuses.ucode_id = 8;
+    try t.expectError(error.Fuse, preparation.select(&rom, &board, fuses));
+    fuses.ucode_id = 9;
+    fuses.ucode_version_raw = 0x10000;
+    try t.expectError(error.SignatureVersion, preparation.select(&rom, &board, fuses));
+    fuses.ucode_version_raw = 1;
+    fuses.debug_disable_raw = 0;
+    try t.expectError(error.Missing, preparation.select(&rom, &board, fuses));
+    rom[0xc06] = 0x45;
+    try t.expect((try preparation.select(&rom, &board, fuses)).debug);
+    var catalog = try fwsec.parse(&rom, &board);
+    catalog.entries[1] = catalog.entries[0];
+    catalog.entries[1].target = 8;
+    catalog.count = 2;
+    try t.expectError(error.Duplicate, preparation.variant(&catalog, true));
+    for (0..5) |field| {
+        catalog.count = 1;
+        catalog.entries[0] = selected.entry;
+        switch (field) {
+            0 => catalog.entries[0].target = 1,
+            1 => catalog.entries[0].flags = 5,
+            2 => catalog.entries[0].engine_mask = 4,
+            3 => catalog.entries[0].ucode_id = 0,
+            4 => catalog.entries[0].ucode_id = 17,
+            else => unreachable,
+        }
+        try t.expectError(error.Unsupported, preparation.variant(&catalog, false));
+    }
+}
+
+test "FWSEC CPU preparation patches only command and selected signature with atomic rejection" {
+    var rom = ga106Fixture();
+    const original = rom;
+    const board = try vbios.parse(&rom, 0x2504);
+    const fuses: preparation.Fuses = .{ .debug_disable_raw = 1, .ucode_version_raw = 8, .ucode_id = 9 };
+    const selected = try preparation.select(&rom, &board, fuses);
+    const entry = &selected.entry;
+    var buffer: [4096]u8 = @splat(0xa7);
+    for ([_]preparation.Command{ .sb, .{ .frts = 0x123456000 } }) |command| {
+        @memset(&buffer, 0xa7);
+        const result = try preparation.prepare(&rom, &board, fuses, command, buffer[16..]);
+        try t.expectEqualDeep(original, rom);
+        const payload = try preparation.commandBytes(command);
+        const slot = entry.signature_slot.offset - entry.image.offset;
+        const init = entry.interface.mapper.offset - entry.image.offset + 44;
+        const input = entry.interface.command_input.offset - entry.image.offset;
+        const output = buffer[16..][0..result.bytes];
+        try t.expectEqualSlices(u8, try selected.signature.slice(&rom), output[slot..][0..384]);
+        try t.expectEqualSlices(u8, payload.data[0..payload.length], output[input..][0..payload.length]);
+        try t.expectEqual(payload.id, std.mem.readInt(u32, output[init..][0..4], .little));
+        for (output, 0..) |byte, index| {
+            if ((index >= slot and index < slot + 384) or (index >= init and index < init + 4) or
+                (index >= input and index < input + payload.length)) continue;
+            try t.expectEqual(rom[entry.image.offset + index], byte);
+        }
+        for (buffer[0..16]) |byte| try t.expectEqual(@as(u8, 0xa7), byte);
+        for (buffer[16 + result.bytes ..]) |byte| try t.expectEqual(@as(u8, 0xa7), byte);
+    }
+    // Values independently compared with the original C ABI exporter.
+    const sb = try preparation.commandBytes(.sb);
+    try t.expectEqualStrings("010000001800000000000000000000000000000002000000", &std.fmt.bytesToHex(sb.data[0..24].*, .lower));
+    const frts = try preparation.commandBytes(.{ .frts = 0x123456000 });
+    try t.expectEqualStrings("010000001800000000000000000000000000000002000000010000001400000056341200000100000200000000000000", &std.fmt.bytesToHex(frts.data, .lower));
+    @memset(&buffer, 0xa7);
+    try t.expectError(error.Capacity, preparation.prepare(&rom, &board, fuses, .sb, buffer[0 .. entry.image.bytes - 1]));
+    for ([_]u64{ 0, 1, 0x12345, 0xffffffff000, std.math.maxInt(u64) }) |offset|
+        try t.expectError(error.Address, preparation.prepare(&rom, &board, fuses, .{ .frts = offset }, &buffer));
+    _ = try preparation.commandBytes(.{ .frts = 0xffffff00000 }); // Last complete 1 MB region.
+    try t.expectError(error.Overlap, preparation.prepare(&rom, &board, fuses, .sb, rom[entry.image.offset..]));
+    try t.expectEqualDeep(original, rom);
+    // Even a previously valid board result cannot authorize stale entry data.
+    put32(&rom, entry.interface.mapper.offset + 12, 23);
+    try t.expectError(error.Capacity, preparation.prepare(&rom, &board, fuses, .sb, &buffer));
+    rom = original;
+    put32(&rom, 0x1008, 256);
+    try t.expectError(error.Overlap, preparation.prepare(&rom, &board, fuses, .sb, &buffer));
+    for (buffer) |byte| try t.expectEqual(@as(u8, 0xa7), byte);
+}
 
 // Synthetic format examples only. Neither a real board ROM nor signed code.
 pub fn fixture(version: u8) [8192]u8 {

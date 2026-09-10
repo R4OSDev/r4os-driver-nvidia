@@ -53,6 +53,14 @@ Adler zlib notices and accompanying header are retained verbatim. The R4OS
 exporter and scripts are original code. No bootstrap binary or original
 decoder implementation is vendored into this repository or added to the R4D.
 
+The same optional step extracts the unchanged FWSEC command typedefs from
+`kernel_gsp_frts_tu102.c` into a private derived header, preserving the complete
+original MIT notice and source path. A host-only C/Zig comparison uses those
+types and the pinned original `nvtypes.h`. The derived header, original source,
+fuse/HAL references and complete COPYING accompany the reference package.
+The comparison code and target CPU preparer are original R4OS implementations;
+no extracted NVIDIA typedef or RM routine is newly linked into NVIDIA.R4D.
+
 The optional `build-rm` host step compiles an explicitly supplied, hash-pinned
 original NVIDIA Open GPU Kernel Modules 570.144 source snapshot under scratch.
 It retains the complete upstream `COPYING`, per-file notices and SoftFloat's

@@ -9,7 +9,58 @@ Boardanschluesse. Die spaeteren PROM-Boots bestaetigen softwareseitig den
 unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
-FWSEC-Metadaten (NVIDIA 0.1.18, 0.79.10)
+FWSEC-Auswahl und CPU-Vorbereitung (NVIDIA 0.1.19, 0.79.10)
+---------------------------------------------------------
+Die tatsaechliche GA106-Identitaet und ein gemessener BAR0-Bereich bis
+einschliesslich 0x824fff erlauben zwei lesende 4-KB-Fuse-Abbildungen.
+NV_FUSE_OPT_SECURE_GSP_DEBUG_DIS liegt bei 0x82074c; Bit 0 gleich null
+bedeutet Debug. NV_FUSE_OPT_FPF_GSP_UCODE1_VERSION liegt bei 0x8241c0,
+fuer Ucode 9 also bei 0x8241e0. Der originale GA100-HAL gilt laut generierter
+Dispatchtabelle auch fuer GA106. Er verwendet hoechstes gesetztes Bit plus
+eins des vollstaendigen Registers, nicht Popcount oder eine 16-Bit-Kuerzung.
+Beide Werte muessen zweimal uebereinstimmen; Clockfehler, Ein-Sekunden-Frist,
+ungueltige Fenster und FFFFFFFF werden abgelehnt. Kein Fuse wird geschrieben.
+
+App 45/85 wird ausschliesslich anhand des gemessenen Debug-Bits ausgewaehlt.
+Zugelassen sind eindeutige V3-Eintraege mit Target 7, Flags 1, Engine-Maske
+400 und Ucode-ID 1..16. Eine andere Variante ersetzt keine fehlende Variante.
+Die Versionsmaske bestimmt den Index der 384-Byte-Signatur; fehlende Versionen
+bleiben Fehler. Nach Schliessen beider MMIO-Fenster entsteht eine eigene
+residente CPU-Kopie des Images. Sie erhaelt init_cmd=19, einen vollstaendigen
+24-Byte-SB-Eingabepuffer und die ausgewaehlte Signatur. Alle Fehlerpruefungen
+erfolgen vor dem ersten Schreibzugriff auf den Zielpuffer. ROM, Code und
+sonstige Imagebereiche bleiben unveraendert; Ausgabe-/Arbeitsadressen werden
+nicht dereferenziert. Ein SHA-256 dokumentiert die vorbereitete Kopie.
+
+Der reine FRTS-Encoder unterstuetzt 48 Bytes mit explizit genulltem Padding,
+einen ausgerichteten, nichtleeren FB-Versatz und einen vollstaendig im
+32-Bit-Seitenbereich liegenden 1-MB-Bereich. Dieser Versatz ist kein Beleg
+einer GPU-Zuordnung. Der reale Treiber bereitet ausschliesslich SB vor und
+gibt die CPU-Kopie im Init wieder frei. GPU-Upload, FWSEC-Ausfuehrung und
+WPR/FRTS-Zuordnung bleiben offen. Fehler beim Unmap/Collect/Free behalten
+ihren genauen Besitzer fuer wiederholbaren Shutdown; formatbedingte
+Ablehnung mit erfolgreichem Cleanup laesst den passiven Start verwendbar.
+
+prepare-bootstrap prueft nun auch die originale C-ABI: vollstaendige
+typedefs werden mechanisch aus dem gehashten kernel_gsp_frts_tu102.c samt
+MIT-Notiz extrahiert. Ein Hostvergleich kompiliert diese Originaltypen und
+vergleicht ihre SB-/FRTS-Bytes mit dem tatsaechlichen Zig-Encoder. Groessen
+4/8/64/24/20/48, init_cmd-Offset 44 und Region-Offset 24 werden geprueft.
+Das Ergebnis steht in fwsec-abi.json; die Ableitung und Originalreferenzen
+begleiten das atomar publizierte Referenzpaket. Ein argumentloses Hosttool
+wird im gemeinsamen Invoke-RmNative nun ausdruecklich unterstuetzt.
+
+OssiPC-Nachweis: Register 0x82074c liefert 00000001, 0x8241e0 liefert
+00000003. Damit werden Produktions-App 85, Eintrag 9 und Fuse-Version 2
+gewaehlt. Die dritte 384-Byte-Signatur liegt bei ROM-Offset 0x4153c;
+SHA-256 9cb8d7107985347bc1eb3acf6eaf161624eb19808628655bba5ef58727e8f6df.
+Das vorbereitete SB-Image besitzt 59904 Bytes und SHA-256
+226935650584f518953f96426860de5743aa2508e30effa57a2d0ff3d185758b.
+MMIO- und CPU-Cleanup sind erfolgreich. Bootfb bleibt Generation 1/Reset 0;
+Puffer-/Queue-Ressourcen sind ausgeglichen und 14 automatische Dienste laufen.
+Dieser Nachweis umfasst keine GPU-Ausfuehrung und keine neue Sichtpruefung.
+
+FWSEC-Metadaten (Checkpoint NVIDIA 0.1.18, 0.79.10)
 --------------------------------------
 fwsec.zig verarbeitet nur die bereits vorhandene unveraenderte CPU-Kopie des
 PROM. BIT-p-Zeiger beziehen sich auf die gesamte validierte PCI-ROM-Kette;
@@ -23,9 +74,9 @@ Signaturplatz. Alle Additionen, Bereiche, Duplikate und Ueberlappungen werden
 begrenzt; maximal 64 Falcon-Eintraege und acht FWSEC-Varianten. Interface und
 Kommandoeingabe werden vollstaendig innerhalb des geladenen DMEM geprueft.
 Ausgabe- und Arbeitsbereich sind opake Firmwareadressen ohne CPU-Zugriff.
-Der Treiber patcht weder
-Signatur noch Kommandos, waehlt keine Debug-/Produktionsvariante und liest
-noch keine Fuse-Version. signatureForFuse ist nur eine explizite Indexrechnung.
+Im damaligen Stand patchte der Treiber weder Signatur noch Kommandos,
+waehlte keine Debug-/Produktionsvariante und las noch keine Fuse-Version.
+signatureForFuse selbst bleibt eine explizite Indexrechnung.
 
 Das im Original als Reserved bezeichnete V3-Wort ist kein Nullkriterium:
 NVIDIA liest es, wertet es aber nicht aus. OssiPC liefert 0x9249. Version

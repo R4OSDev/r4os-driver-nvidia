@@ -106,7 +106,10 @@ try {
     }
     . (Join-Path $PSScriptRoot 'Bootstrap/Origins.ps1')
     $references=Add-BootstrapOrigins -Source $snapshot -Stage $stage -Artifacts $artifacts
+    . (Join-Path $PSScriptRoot 'Bootstrap/FwsecAbi.ps1')
+    $fwsecAbi=Confirm-FwsecAbi -Compiler $Compiler -Source $snapshot -Run $run -Stage $stage
     $report=[ordered]@{schema=1;source_commit=$pin.source_commit;rm_version=$firmware.rm_version;source_catalog_sha256=$digest;source_files=$paths.Count;source_bytes=$total;artifacts=$artifacts;references=$references;decoders=@('unchanged NVIDIA utilGz NVGZ_USER','bounded .NET DeflateStream');source_family_mapping='GA106 uses GA102 GSP-RM boot/load/unload and TU102 generic SEC2 loader';gpu_executed=$false;signature_cryptographically_verified=$false;hardware_variant_selected=$false;module_resources_added=$false}
+    $report.fwsec_abi=$fwsecAbi
     [IO.File]::WriteAllText((Join-Path $stage 'bootstrap.json'),($report|ConvertTo-Json -Depth 8)+[char]10,$utf8)
     $state.export_complete=$true
     # All provenance, notices and artifacts form one deterministic package.

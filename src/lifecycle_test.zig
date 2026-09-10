@@ -270,6 +270,8 @@ test "NVIDIA actual driver lifecycle bridges monotonic clock units and latches c
 }
 
 var cpu_backing: ?[]align(16) u8 = null;
+var stage_backing: ?[]align(16) u8 = null;
+const stage_handle: u64 = 0x700000001;
 var cpu_handle: u64 = 0x100000001;
 var cpu_requested: u64 = 0;
 var cpu_calls: u32 = 0;
@@ -286,6 +288,15 @@ fn cpuAllocate(bytes: u64, alignment: u32, output: *a.DriverHeapAllocation) call
     output.* = .{};
     if (cpu_closed) return a.driver_heap_error_closed;
     if (bytes > (if (state.rom_fixture) @as(u64, vbios.max_rom_bytes) else 8192)) return a.driver_heap_error_memory;
+    if (cpu_backing != null) {
+        std.debug.assert(state.fuse_fixture and stage_backing == null and bytes == 1280);
+        state.stage_allocations += 1;
+        if (state.fuse_fault == .allocation) return a.driver_heap_error_memory;
+        const backing = t.allocator.alignedAlloc(u8, .@"16", @intCast(bytes)) catch return a.driver_heap_error_memory;
+        stage_backing = backing;
+        output.* = .{ .handle = stage_handle, .cpu_address = @intFromPtr(backing.ptr), .byte_length = bytes, .alignment = 16 };
+        return 0;
+    }
     std.debug.assert(cpu_backing == null);
     const backing = t.allocator.alignedAlloc(u8, .@"16", @intCast(bytes)) catch return a.driver_heap_error_memory;
     cpu_backing = backing;
@@ -294,6 +305,13 @@ fn cpuAllocate(bytes: u64, alignment: u32, output: *a.DriverHeapAllocation) call
     return 0;
 }
 fn cpuRelease(handle: u64) callconv(.c) i32 {
+    if (handle == stage_handle) {
+        std.debug.assert(stage_backing != null);
+        if (state.fuse_fault == .release) return a.driver_heap_error_release;
+        t.allocator.free(stage_backing.?);
+        stage_backing = null;
+        return 0;
+    }
     std.debug.assert(handle == cpu_handle and cpu_backing != null);
     if (cpu_fail_release) return a.driver_heap_error_release;
     t.allocator.free(cpu_backing.?);
@@ -360,6 +378,12 @@ const State = struct {
     fail_prom_unmap: bool = false,
     fail_prom_collect: bool = false,
     deadline_prom: bool = false,
+    fuse_fixture: bool = false,
+    fuse_seen: bool = false,
+    fuse_mapping: [2]bool = .{ false, false },
+    fuse_fault: enum { none, map_debug, map_version, window, unmap_debug, unmap_version, collect, clock, deadline, unstable, allocation, release, signature, debug_missing, sentinel_debug, sentinel_version, short_input } = .none,
+    stage_allocations: u32 = 0,
+    stage_prepared: bool = false,
     device_id: u16 = 0x2504,
     enumerate_count: usize = 0,
     detail_count: usize = 0,
@@ -412,6 +436,7 @@ fn log(text: [*:0]const u8) callconv(.c) void {
     if (std.mem.indexOf(u8, std.mem.span(text), "vbios: verified source=PROM") != null) state.rom_reported = true;
     if (std.mem.indexOf(u8, std.mem.span(text), "fwsec: catalog=parsed") != null) state.fwsec_reported = true;
     if (std.mem.indexOf(u8, std.mem.span(text), "fwsec: unavailable") != null) state.fwsec_rejected = true;
+    if (std.mem.indexOf(u8, std.mem.span(text), "fwsec: cpu-image=prepared") != null) state.stage_prepared = true;
     const value = std.mem.span(text);
     const marker = "bytes=64 hex=";
     if (std.mem.indexOf(u8, value, marker)) |index| {
@@ -424,6 +449,10 @@ fn resources(output: *a.DriverResourceApi) callconv(.c) i32 {
     return 0;
 }
 fn resourceNow() callconv(.c) u64 {
+    if (state.fuse_seen) {
+        if (state.fuse_fault == .clock) return 99;
+        if (state.fuse_fault == .deadline) return 2 * std.time.ns_per_s;
+    }
     if (state.prom_mapping and state.deadline_prom) return 11 * std.time.ns_per_s;
     if (state.clock_fixture) return clock_value.instant_ns;
     return 100;
@@ -515,6 +544,23 @@ fn memory(output: *a.GfxDriverMemoryApi) callconv(.c) i32 {
     return a.gfx_buffer_result_ok;
 }
 fn map(request: *const a.GfxMmioRequest, output: *a.GfxMmioWindow) callconv(.c) i32 {
+    if (request.byte_offset == 0x820000 or request.byte_offset == 0x824000) {
+        const index: usize = if (request.byte_offset == 0x820000) 0 else 1;
+        std.debug.assert(state.fuse_fixture and state.prom_mapping and !state.mapping and !state.fuse_mapping[index] and
+            request.resource_base == 0xe0000000 and request.resource_bytes == 16 * 1024 * 1024 and
+            request.byte_length == 4096 and request.cache_policy == a.gfx_buffer_cache_uncached);
+        state.maps += 1;
+        state.fuse_seen = true;
+        output.* = .{};
+        if ((index == 0 and state.fuse_fault == .map_debug) or (index == 1 and state.fuse_fault == .map_version)) {
+            state.private_mapping = true;
+            return -1;
+        }
+        state.fuse_mapping[index] = true;
+        if (index == 1 and state.fuse_fault == .unstable) fuse_words[0][0x74c / 4] ^= 1;
+        output.* = .{ .handle = .{ .id = @intCast(3 + index), .generation = 11 }, .cpu_address = @intFromPtr(&fuse_words[index]), .physical_address = request.resource_base + request.byte_offset, .byte_length = if (state.fuse_fault == .window) 4095 else 4096, .cache_policy = request.cache_policy };
+        return a.gfx_buffer_result_ok;
+    }
     if (request.byte_offset == vbios_probe.prom_offset) {
         std.debug.assert(state.rom_fixture and !state.mapping and !state.prom_mapping and
             request.resource_base == 0xe0000000 and request.resource_bytes == 16 * 1024 * 1024 and
@@ -543,6 +589,14 @@ fn map(request: *const a.GfxMmioRequest, output: *a.GfxMmioWindow) callconv(.c) 
     return a.gfx_buffer_result_ok;
 }
 fn unmap(handle: *const a.GfxBufferHandle, quiesced: u32) callconv(.c) i32 {
+    if (handle.id == 3 or handle.id == 4) {
+        const index: usize = handle.id - 3;
+        std.debug.assert(handle.generation == 11 and quiesced == 1 and state.fuse_mapping[index]);
+        state.unmaps += 1;
+        if ((index == 0 and state.fuse_fault == .unmap_debug) or (index == 1 and state.fuse_fault == .unmap_version)) return -1;
+        state.fuse_mapping[index] = false;
+        return a.gfx_buffer_result_ok;
+    }
     if (handle.id == 2) {
         std.debug.assert(handle.generation == 11 and quiesced == 1 and state.prom_mapping);
         state.unmaps += 1;
@@ -558,9 +612,53 @@ fn unmap(handle: *const a.GfxBufferHandle, quiesced: u32) callconv(.c) i32 {
 }
 fn collect() callconv(.c) i32 {
     state.collects += 1;
+    if (state.fuse_seen and state.fuse_fault == .collect) return -1;
     if (state.fail_collect or (state.prom_seen and state.fail_prom_collect)) return -1;
     state.private_mapping = false;
     return a.gfx_buffer_result_ok;
+}
+
+var fuse_words: [2][1024]u32 = .{.{0} ** 1024} ** 2;
+test "NVIDIA actual driver lifecycle measures GA106 fuses and owns a CPU-only FWSEC image through failures" {
+    var api = apiTable();
+    api.version = 31;
+    api.heap_query = cpuQuery;
+    inline for (std.meta.tags(@TypeOf(state.fuse_fault))) |fault| {
+        state = .{ .rom_fixture = true, .fuse_fixture = true, .fuse_fault = fault };
+        cpu_closed = false;
+        cpu_fail_release = false;
+        defer {
+            state.fuse_fault = .none;
+            _ = driver.nvidia_shutdown();
+        }
+        var rom = @import("fwsec_test.zig").ga106Fixture();
+        const original_board = try vbios.parse(&rom, 0x2504);
+        const entry = (try @import("fwsec.zig").parse(&rom, &original_board)).entries[0];
+        if (fault == .short_input) @import("fwsec_test.zig").put32(&rom, entry.interface.mapper.offset + 12, 23);
+        @memset(&prom_bytes, 0);
+        @memcpy(prom_bytes[0..rom.len], &rom);
+        fuse_words = .{.{0} ** 1024} ** 2;
+        fuse_words[0][0x74c / 4] = if (fault == .debug_missing) 0 else if (fault == .sentinel_debug) 0xffffffff else 1;
+        fuse_words[1][0x1e0 / 4] = if (fault == .signature) 5 else if (fault == .sentinel_version) 0xffffffff else 8;
+        const initial_fuses = fuse_words;
+        const failed_cleanup = fault == .unmap_debug or fault == .unmap_version or fault == .collect or fault == .release;
+        try t.expectEqual(@as(i32, if (failed_cleanup) -10 else 0), driver.nvidia_init(&api));
+        try t.expect(state.rom_reported and state.fwsec_reported and state.fuse_seen);
+        try t.expectEqual(fault == .none or fault == .release, state.stage_prepared);
+        try t.expectEqual(@as(u32, if (fault == .none or fault == .release or fault == .allocation) 1 else 0), state.stage_allocations);
+        try t.expectEqualSlices(u8, &rom, prom_bytes[0..rom.len]);
+        if (fault != .unstable) try t.expectEqualDeep(initial_fuses, fuse_words);
+        if (failed_cleanup) {
+            try t.expect(cpu_backing != null);
+            try t.expectEqual(@as(i32, -1), driver.nvidia_shutdown());
+            if (fault == .release) try t.expect(stage_backing != null);
+            state.fuse_fault = .none;
+        }
+        try t.expectEqual(@as(i32, 0), driver.nvidia_shutdown());
+        try t.expectEqual(@as(i32, 0), driver.nvidia_shutdown());
+        try t.expect(cpu_backing == null and stage_backing == null and !state.prom_mapping and !state.private_mapping and
+            !state.fuse_mapping[0] and !state.fuse_mapping[1]);
+    }
 }
 
 test "NVIDIA actual driver lifecycle reads bounded PROM and retains each failed cleanup owner" {

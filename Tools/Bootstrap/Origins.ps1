@@ -27,7 +27,11 @@ function Add-BootstrapOrigins([string]$Source,[string]$Stage,$Artifacts){
     $sources+=@('COPYING',
         'src/nvidia/src/lib/zlib/inflate.c','src/nvidia/inc/lib/zlib/inflate.h',
         'src/nvidia/arch/nvalloc/common/inc/rmflcnbl.h',
-        'src/nvidia/generated/g_kernel_gsp_nvoc.c','src/nvidia/generated/g_kernel_sec2_nvoc.c')
+        'src/nvidia/generated/g_kernel_gsp_nvoc.c','src/nvidia/generated/g_kernel_sec2_nvoc.c',
+        'src/nvidia/src/kernel/gpu/gsp/arch/turing/kernel_gsp_frts_tu102.c',
+        'src/nvidia/src/kernel/gpu/gsp/arch/ampere/kernel_gsp_ga100.c',
+        'src/nvidia/src/kernel/gpu/gsp/kernel_gsp_fwsec.c',
+        'src/common/inc/swref/published/ampere/ga100/dev_fuse.h')
     $facts=@()
     foreach($relative in $sources){
         $file=Join-Path $Source $relative

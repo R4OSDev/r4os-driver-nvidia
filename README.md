@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-Passive NVIDIA display driver for R4OS. Module 0.1.18; original R4OS code is
+Passive NVIDIA display driver for R4OS. Module 0.1.19; original R4OS code is
 Apache-2.0, with selected original MIT headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
 subsystem 1458:4074, VBIOS 94.06.2f.00.d6. Preparation for 0.79.10 continues.
@@ -13,8 +13,8 @@ The CPU-only FWSEC catalog resolves BIT 'p', full 32-bit token pointers and
 the original RM expansion-ROM bias. V2 loader and V3 signed-image descriptors,
 code/data bounds, sparse signature-version masks and DMEM command interfaces
 are checked within the validated PCI ROM chain. At most eight FWSEC variants
-are reported with image/descriptor/signature hashes. GPU fuse state is not
-guessed, no variant is selected, and signature lookup does not authenticate.
+are reported with image/descriptor/signature hashes. Signature lookup does
+not authenticate firmware.
 The opaque V3 reserved word is preserved, including the nonzero value observed
 on GA106. Command input is bounded within loaded DMEM; firmware output and
 workspace addresses are opaque declarations with no CPU slice accessor.
@@ -22,8 +22,30 @@ A rejected FWSEC catalog leaves valid passive board discovery usable
 and emits at most 2 KB of explicitly unvalidated CPU-copy evidence.
 `inspect-vbios` schema 2 also handles IFR envelopes and reports the same catalog
 for a supplied file; file inspection never claims physical GPU acceptance.
-On OssiPC, module 0.1.18 successfully catalogs the two actual V3 entries in
-VBIOS 94.06.2f.00.d6 and releases all probe resources; bootfb remains active.
+On OssiPC, module 0.1.18 successfully cataloged the two actual V3 entries in
+VBIOS 94.06.2f.00.d6 and released all probe resources; bootfb remained active.
+
+Module 0.1.19 additionally admits two read-only fuse pages on measured GA106
+with sufficient current BAR0 extent. It reads `82074c` and the selected
+ucode's `8241c0 + 4*(id-1)` twice within a one-second deadline. NVIDIA's GA100
+HAL selects debug/production with bit zero and computes the signature version
+as highest set bit plus one on the complete version register. Missing,
+ambiguous or unsupported entries and unavailable signatures preserve passive
+startup. Only V3 target 7, engine mask `400`, flags 1 and ucode IDs 1..16 qualify.
+
+After closing those mappings, a separate resident CPU allocation receives a
+copy of the selected image, its 24-byte SB input, initial command `19` and
+384-byte signature. Every bound and overlap is checked before writing. The
+ROM and firmware output/workspace declarations remain untouched. The image
+is hashed and freed during init; no GPU address, DMA upload or authentication
+is established. FRTS command encoding is covered separately, including its
+48-byte ABI and zero padding; actual FRTS allocation and execution remain open.
+Failed unmap/collect/free retains its exact owner for shutdown retry.
+OssiPC now confirms debug-disable `00000001`, ucode 9 version raw `00000003`
+(version 2), production entry 9 and the 384-byte signature at ROM `4153c`.
+Its 59,904-byte SB image is prepared and released successfully. Bootfb stays
+at generation 1/reset 0, buffer/queue resources balance and all 14 automatic
+services run. This is CPU preparation; no GPU firmware has been started.
 
 The explicit `prepare-bootstrap` step exports 26 original GA102 GSP/Booter and
 TU102 SEC2 reference artifacts from the same 570.144 source pin. It verifies a
@@ -31,12 +53,15 @@ private source snapshot before compiling the original data initializers and
 decoder, compares the decoded bytes with bounded .NET Deflate, and preserves
 original names, hashes, family mappings and complete notices. It publishes a
 complete directory atomically; an existing different output is refused.
+The same step mechanically extracts the pinned FWSEC C typedefs with their
+complete MIT notice, compiles them, and compares both command buffers against
+the real Zig encoder. `fwsec-abi.json` records sizes, offsets and byte equality.
 Use absolute paths, with scratch under the workspace's `Temp/` and output on
 the same filesystem, outside the source and driver repositories:
 
     ./Build.sh prepare-bootstrap -- -SourceDirectory ORIGINAL_RM -ScratchDirectory WORKSPACE/Temp/bootstrap -OutputDirectory REFERENCE_PACKAGE
 
-The host step neither adds module resources nor selects a GPU signature.
+The host step neither adds module resources nor measures GPU fuses.
 Its original decoder runs only on data covered by the complete source pin;
 it is not a decoder for arbitrary supplied compressed input.
 

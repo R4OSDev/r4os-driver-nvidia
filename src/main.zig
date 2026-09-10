@@ -3,6 +3,9 @@ const r4os = @import("r4os");
 const identity = @import("identity.zig");
 const vbios = @import("vbios.zig");
 const fwsec = @import("fwsec.zig");
+const fwsec_prepare = @import("fwsec_prepare.zig");
+const fwsec_probe = @import("fwsec_probe.zig");
+const fwsec_storage = @import("fwsec_storage.zig");
 const vbios_probe = @import("vbios_probe.zig");
 const firmware_resources = @import("firmware_resources.zig");
 const firmware = @import("firmware.zig");
@@ -26,6 +29,8 @@ var mapping_cleanup_needed = false;
 var firmware_cpu: firmware_storage.Storage = .{};
 var checking_runtime = false;
 var board_rom: vbios_probe.Capture = .{};
+var security_fuses: fwsec_probe.Capture = .{};
+var fwsec_cpu: fwsec_storage.Storage = .{};
 
 comptime {
     asm (r4os.r4dev.driverEntriesAsm("nvidia_init", "nvidia_shutdown"));
@@ -137,6 +142,8 @@ pub export fn nvidia_shutdown() callconv(.c) i32 {
     if (!thread_probe.shutdown(&ctx)) return -1;
     if (!runtime_probe.shutdown(&ctx)) return -1;
     if (!firmware_cpu.close()) return -1;
+    if (!security_fuses.close()) return -1;
+    if (!fwsec_cpu.close()) return -1;
     if (!board_rom.close()) return -1;
     if (!releaseWindow(&ctx)) return -1;
     if (checking_runtime) {
@@ -244,13 +251,13 @@ fn readVbios(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Sna
             if (port.connector_type) |value| @as(u16, value) else @as(u16, 256), if (port.i2c) |value| @as(u16, value) else @as(u16, 256), if (port.aux) |value| @as(u16, value) else @as(u16, 256), port.raw_path, port.raw_config,
         });
     }
-    inspectFwsec(bytes[start.offset..][0..result.rom_bytes], &result);
+    if (!inspectFwsec(ctx, snapshot, chip, bytes[start.offset..][0..result.rom_bytes], &result)) return false;
     if (!board_rom.close()) return false;
     ctx.logInfo("NVIDIA vbios: cleanup=OK resources=0 native-writes=disabled fallback=preserved");
     return true;
 }
 
-fn inspectFwsec(rom: []const u8, board: *const vbios.Result) void {
+fn inspectFwsec(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, chip: identity.Chip, rom: []const u8, board: *const vbios.Result) bool {
     log("NVIDIA fwsec: source=PROM expansion-bias={x} first-extension={x} bit-p={} native-writes=disabled", .{
         board.expansion_rom_offset orelse 0xffffffff, board.first_extension_offset orelse 0xffffffff, board.falcon != null,
     });
@@ -258,9 +265,9 @@ fn inspectFwsec(rom: []const u8, board: *const vbios.Result) void {
         log("NVIDIA fwsec: unavailable reason={s} firmware-ready=no fallback=preserved", .{@errorName(err)});
         var diagnostic: VbiosDiagnostic = .{ .remaining = 2048 };
         fwsec.diagnose(rom, board, &diagnostic);
-        return;
+        return true;
     };
-    log("NVIDIA fwsec: catalog=parsed table={x} table-bytes={d} table-entries={d} fwsec-entries={d} fuse-version=unmeasured selection=none gpu-authentication=unverified", .{
+    log("NVIDIA fwsec: catalog=parsed table={x} table-bytes={d} table-entries={d} fwsec-entries={d} gpu-authentication=unverified", .{
         catalog.table.offset, catalog.table.bytes, catalog.table_entries, catalog.count,
     });
     for (catalog.entries[0..catalog.count]) |*entry| {
@@ -291,7 +298,32 @@ fn inspectFwsec(rom: []const u8, board: *const vbios.Result) void {
             }
         }
     }
+    const fuses = security_fuses.read(ctx, snapshot, chip, &catalog) catch |err| {
+        log("NVIDIA fwsec: preparation=unavailable phase=fuses reason={s} firmware-ready=no fallback=preserved", .{@errorName(err)});
+        return security_fuses.close();
+    };
+    // A retained MMIO mapping must be closed before a CPU image is published.
+    if (!security_fuses.close()) return false;
+    log("NVIDIA fwsec: fuses=measured debug-disable={x:0>8} ucode={x} version-raw={x:0>8} version={d} reads=two-identical registers=82074c/{x} mmio-cleanup=OK", .{
+        fuses.debug_disable_raw,                                           fuses.ucode_id, fuses.ucode_version_raw, fwsec_prepare.fuseVersion(fuses.ucode_version_raw) catch unreachable,
+        fwsec_probe.version_register + 4 * (@as(u32, fuses.ucode_id) - 1),
+    });
+    const prepared = fwsec_cpu.prepare(ctx, rom, board, fuses) catch |err| {
+        log("NVIDIA fwsec: preparation=unavailable phase=cpu-image reason={s} firmware-ready=no fallback=preserved", .{@errorName(err)});
+        return fwsec_cpu.close();
+    };
+    const chosen = &prepared.metadata.selection;
+    log("NVIDIA fwsec: selected-entry={d} app={x} variant={s} fuse-version={d} signature={x}/{d} signature-sha256={s}", .{
+        chosen.entry.table_index, chosen.entry.application, if (chosen.debug) @as([]const u8, "debug") else "production", chosen.fuse_version,
+        chosen.signature.offset,  chosen.signature.bytes,   fwsec.sha256(rom, chosen.signature) catch unreachable,
+    });
+    log("NVIDIA fwsec: cpu-image=prepared bytes={d} command={x} input-bytes=24 image-sha256={s} gpu-address=none gpu-authentication=unverified submitted=no", .{
+        prepared.metadata.bytes, prepared.metadata.command, fwsec.sha256(prepared.image, .{ .bytes = prepared.metadata.bytes }) catch unreachable,
+    });
+    if (!fwsec_cpu.close()) return false;
+    log("NVIDIA fwsec: preparation-cleanup=OK resources=0", .{});
     log("NVIDIA fwsec: firmware-ready=no native-writes=disabled fallback=preserved", .{});
+    return true;
 }
 
 const VbiosDiagnostic = struct {

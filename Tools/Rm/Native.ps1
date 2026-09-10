@@ -3,7 +3,7 @@
 function Invoke-RmNative {
     param(
         [Parameter(Mandatory)][string]$Executable,
-        [Parameter(Mandatory)][string[]]$Arguments,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Arguments,
         [Parameter(Mandatory)][string]$WorkingDirectory,
         [Parameter(Mandatory)][string]$LogPath,
         [ValidateRange(1,600)][int]$TimeoutSeconds=600,
