@@ -4,6 +4,7 @@ const boot = @import("gsp_boot.zig");
 const layout = @import("gsp_layout.zig");
 const preflight = @import("fwsec_state.zig");
 const radix = @import("gsp_radix.zig");
+const wpr = @import("gsp_wpr.zig");
 
 fn word(bytes: []const u8, offset: usize) u64 {
     return std.mem.readInt(u64, bytes[offset..][0..8], .little);
@@ -101,6 +102,131 @@ fn observed() preflight.Raw {
         .values = .{ 0x80420100, 0x47f7, 0x10, 0x80, 2, 0, 0x10, 1, 12288, 0x1ffffe00, 0, 0, 0x10e09 },
         .present = 0x1fff,
     };
+}
+
+test "GSP WPR metadata keeps first-boot defaults and rejects incomplete or overlapping DMA bindings" {
+    const descriptor = descriptorFixture();
+    const input = wpr.Input{ .chip_id = 0x176, .raw = observed(), .image_bytes = wpr.image_bytes, .descriptor = &descriptor, .signature_bytes = 4096 };
+    const prepared = try wpr.prepare(&input);
+    const template = &prepared.unbound_template;
+    try t.expectEqual(@as(u64, 0xdc3aae21371a60b3), word(template, 0));
+    try t.expectEqual(@as(u64, 1), word(template, 8));
+    for ([_]usize{ 16, 32, 72 }) |offset| try t.expectEqual(@as(u64, 0), word(template, offset));
+    try t.expectEqual(@as(u64, 63541248), word(template, 24));
+    try t.expectEqual(@as(u64, 24576), word(template, 40));
+    try t.expectEqual(@as(u64, 6144), word(template, 48));
+    try t.expectEqual(@as(u64, 2048), word(template, 56));
+    try t.expectEqual(@as(u64, 0), word(template, 64));
+    try t.expectEqual(@as(u64, 4096), word(template, 80));
+    try t.expect(std.mem.allEqual(u8, template[200..], 0));
+    const need = try radix.requirements(input.image_bytes);
+    // Explicitly synthetic, unordered physical spans, including data beyond
+    // the root page. No released OssiPC address is reused as a live binding.
+    const good = [_]radix.Segment{
+        .{ .address = 0x200000000, .bytes = 4096 },
+        .{ .address = 0x100000000, .bytes = need.allocation_bytes - 4096 },
+    };
+    const binding = wpr.Bindings{
+        .gsp_segments = &good,
+        .boot_image = .{ .address = 0x300000000, .bytes = 24576 },
+        .signature = .{ .address = 0x300006000, .bytes = 4096 },
+    };
+    const encoded = try wpr.encode(&input, &binding);
+    try t.expectEqual(good[0].address, word(&encoded, 16));
+    try t.expectEqual(binding.boot_image.address, word(&encoded, 32));
+    try t.expectEqual(binding.signature.address, word(&encoded, 72));
+    try t.expect(std.mem.allEqual(u8, encoded[200..], 0));
+    var queue = binding;
+    queue.crash_queue = .{ .address = 0x300007000, .bytes = 16384 };
+    const crash = try wpr.encode(&input, &queue);
+    try t.expectEqual(queue.crash_queue.?.address, word(&crash, 224));
+    try t.expectEqual(@as(u32, 16384), std.mem.readInt(u32, crash[232..236], .little));
+    try t.expect(std.mem.allEqual(u8, crash[200..224], 0));
+    try t.expect(std.mem.allEqual(u8, crash[236..], 0));
+    for (0..15) |case| {
+        var spans = good;
+        var bad = queue;
+        bad.gsp_segments = &spans;
+        const failure: anyerror = switch (case) {
+            0 => blk: {
+                bad.gsp_segments = &.{};
+                break :blk error.Segments;
+            },
+            1 => blk: {
+                spans[0].address = 0;
+                break :blk error.Address;
+            },
+            2 => blk: {
+                spans[1].address = radix.dma_mask - 4095;
+                break :blk error.Address;
+            },
+            3 => blk: {
+                spans[0].address += 1;
+                break :blk error.Alignment;
+            },
+            4 => blk: {
+                spans[1].bytes -= 4096;
+                break :blk error.Capacity;
+            },
+            5 => blk: {
+                spans[1].bytes += 4096;
+                break :blk error.Capacity;
+            },
+            6 => blk: {
+                spans[0].address = spans[1].address;
+                break :blk error.Overlap;
+            },
+            7 => blk: {
+                bad.boot_image.bytes = 20480;
+                break :blk error.WrongSize;
+            },
+            8 => blk: {
+                bad.signature.bytes = 8192;
+                break :blk error.SignatureSize;
+            },
+            9 => blk: {
+                bad.signature.address = bad.boot_image.address + 4096;
+                break :blk error.Overlap;
+            },
+            10 => blk: {
+                bad.signature.address = spans[1].address + 8192;
+                break :blk error.Overlap;
+            },
+            11 => blk: {
+                bad.crash_queue.?.address = bad.boot_image.address;
+                break :blk error.Overlap;
+            },
+            12 => blk: {
+                bad.crash_queue.?.bytes = 1 << 32;
+                break :blk error.CrashQueueSize;
+            },
+            13 => blk: {
+                bad.crash_queue.?.address = radix.dma_mask - 4095;
+                break :blk error.Address;
+            },
+            else => blk: {
+                bad.boot_image.address += 1;
+                break :blk error.Alignment;
+            },
+        };
+        try t.expectError(failure, wpr.encode(&input, &bad));
+    }
+    var changed = input;
+    changed.image_bytes += 1;
+    try t.expectError(error.ImageSize, wpr.prepare(&changed));
+    changed = input;
+    changed.signature_bytes = 0;
+    try t.expectError(error.SignatureSize, wpr.prepare(&changed));
+    var broken = descriptor;
+    broken[48] ^= 1;
+    changed = input;
+    changed.descriptor = &broken;
+    try t.expectError(error.WrongHash, wpr.prepare(&changed));
+    changed = input;
+    changed.raw.put(.wpr_lo, 0x1000);
+    changed.raw.put(.wpr_hi, 0x2000);
+    try t.expectError(error.WprActive, wpr.prepare(&changed));
+    try t.expectEqualDeep(prepared, try wpr.prepare(&input));
 }
 
 test "GSP production boot descriptor admission rejects truncation, overlap and wrong artifacts" {

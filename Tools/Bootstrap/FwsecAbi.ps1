@@ -15,6 +15,8 @@ function Confirm-FwsecAbi([string]$Compiler,[string]$Source,[string]$Run,[string
     [IO.Directory]::CreateDirectory($derived)|Out-Null
     $header=Join-Path $derived 'FwsecAbi-original.h'
     [IO.File]::WriteAllText($header,$license+"`n// Mechanically extracted without type changes from $relative`n"+'#include "nvtypes.h"'+"`n"+$types+"`n",[Text.UTF8Encoding]::new($false))
+    # Preserve the complete original WPR type header, including its MIT notice.
+    Copy-Item -LiteralPath (Join-Path $Source 'src/nvidia/arch/nvalloc/common/inc/gsp/gsp_fw_wpr_meta.h') -Destination (Join-Path $derived 'gsp_fw_wpr_meta.h')
     $owner=Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
     $suffix=if($IsWindows){'.exe'}else{''}
     $exe=Join-Path $Run ('fwsec-abi'+$suffix)
@@ -24,8 +26,8 @@ function Confirm-FwsecAbi([string]$Compiler,[string]$Source,[string]$Run,[string
     $result=Invoke-RmNative -Executable $Compiler -Arguments $compilerArguments -WorkingDirectory $Run -LogPath (Join-Path $Run 'fwsec-abi-compile.log') -TimeoutSeconds 90
     if($result -ne 0){throw 'Original FWSEC ABI comparison did not compile'}
     $result=Invoke-RmNative -Executable $exe -Arguments @() -WorkingDirectory $Run -LogPath (Join-Path $Stage 'fwsec-abi.json') -TimeoutSeconds 20
-    if($result -ne 0){throw 'Zig command bytes differ from original NVIDIA C structures'}
+    if($result -ne 0){throw 'Zig firmware command or WPR bytes differ from original NVIDIA C structures'}
     $abi=Get-Content -Raw (Join-Path $Stage 'fwsec-abi.json')|ConvertFrom-Json
-    if(!$abi.zig_c_byte_comparison -or $abi.gpu_executed){throw 'FWSEC ABI result invalid'}
+    if(!$abi.zig_c_byte_comparison -or !$abi.gsp_wpr_byte_comparison -or $abi.gpu_executed){throw 'Firmware ABI result invalid'}
     return $abi
 }

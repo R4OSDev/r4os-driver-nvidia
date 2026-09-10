@@ -9,6 +9,39 @@ Boardanschluesse. Die spaeteren PROM-Boots bestaetigen softwareseitig den
 unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
+GSP-WPR-Metadaten (Host, NVIDIA.R4D 0.1.22 unveraendert)
+------------------------------------------------------
+gsp_wpr.zig bildet den normalen GA106-Erststart auf die originalen 256 Bytes
+von GspFwWprMeta ab. prepare prueft den gepinnten Produktionsdeskriptor
+erneut und berechnet das Layout aus Rohregistern. Der Caller muss zuvor
+GSP-Container, Signatursektion und Bootabbild zugelassen haben. image_bytes
+und signature_bytes sind an das vorhandene GA10X-Profil gebunden.
+
+inspect-gsp-layout liefert jetzt zusaetzlich eine klar ungebundene Vorlage:
+Little-Endian-Hex, alle drei DMA-Adressen null, bootCount/verified/Flags null.
+Der Encoder setzt nach kompletter Bereichspruefung ausschliesslich die
+benoetigten Geraeteadressen. Alle GSP-Segmente einschliesslich Datenseiten
+muessen sich von Bootloader, Signatur und optionaler Crash-Queue unterscheiden.
+4-KB-Ausrichtung, komplette 49-Bit-Adressspannen und Gesamtlaengen werden
+geprueft; die Queuegroesse muss in das originale 32-Bit-Feld passen.
+Die 256-Byte-Rueckgabe entsteht vollstaendig oder gar nicht. Booters verified-
+Feld bleibt stets null. Recovery-/vGPU-Unionen und Clock-Boost bleiben aus.
+Eine optionale Crash-Queue wird nur beschrieben, noch nicht initialisiert.
+
+Der bestehende Besitzerlauf wurde um einen zusammengefassten Fall mit 15
+ungueltigen Bindungen sowie Profil-/Deskriptorfehlern ergaenzt und besteht.
+Die vorhandene Bootstrap-ABI-Pruefung vergleicht nun zusaetzlich alle 256
+Bytes mit dem originalen NVIDIA-C-Typ; statische Offsets pruefen beide
+Unionen und den verified-Marker. Der gezielte Dateilauf mit den echten
+gepinnten Boot-/GSP-Dateien besteht mit 3/3 Schritten. Der gesamte RM- und
+Bootstrap-Decoderbau wurde nicht wiederholt. Kein neues Gate, Modulbuild,
+Gastlauf, Hardwarekontakt oder Update; NVIDIA.R4D bleibt bytegleich 0.1.22.
+
+Die Vorlage erteilt keinen VRAM-/DMA-Besitz. Vor Hardwareuebergabe fehlen
+weiterhin gehaltene Boot-/Signatur-/Metadatenpuffer, Synchronisierung, echte
+VRAM-Reservierung und VGA-Recovery. Adressen aus abgeschlossenen Probes
+duerfen dafuer nicht wiederverwendet werden.
+
 GSP-Abbild im echten DMA-Besitz (NVIDIA 0.1.22)
 ----------------------------------------------
 Der vorhandene Modus OPTION NVIDIA mode=firmware-check bindet nun das

@@ -19,6 +19,16 @@ Apache-2.0. The MIT-derived host layout calculation described below remains
 outside the module. All five packaged resources, original headers and
 distributed license files remain byte-identical; no boot firmware is added.
 
+The subsequent host-only WPR metadata encoder in `src/gsp_wpr.zig` retains
+NVIDIA's complete MIT notice for the field layout/assignment adapted from
+`gsp_fw_wpr_meta.h` (2021-2024) and `kernel_gsp_tu102.c` (2017-2024),
+NVIDIA CORPORATION & AFFILIATES. Original R4OS admission and validation are
+Apache-2.0. The existing optional ABI probe compiles the complete original
+WPR header and compares the C structure with the actual Zig encoding.
+All original references and notices accompany the separate
+`ExFiles/Reference/GFX/Nvidia/0.79.10/wpr-metadata-20260911` checkpoint.
+No part of this metadata preparation is linked into NVIDIA.R4D 0.1.22.
+
 The host-only GSP layout calculation in `src/gsp_layout.zig` adapts the
 MIT-licensed NVIDIA 570.144 layout and heap algorithms from
 `kernel_gsp_tu102.c` (copyright 2017-2024), `kernel_gsp.c` (2019-2024) and

@@ -1,8 +1,27 @@
 // Explicit host preparation step only; never part of NVIDIA.R4D.
 const preparation = @import("fwsec_prepare.zig");
-extern fn r4nv_fwsec_abi_check([*]const u8, usize, c_uint, [*]const u8, usize, c_uint) c_int;
+const std = @import("std");
+const wpr = @import("gsp_wpr.zig");
+extern fn r4nv_fwsec_abi_check([*]const u8, usize, c_uint, [*]const u8, usize, c_uint, [*]const u8, usize) c_int;
 pub fn main() !void {
     const sb = try preparation.commandBytes(.sb);
     const frts = try preparation.commandBytes(.{ .frts = 0x123456000 });
-    if (r4nv_fwsec_abi_check(&sb.data, sb.length, sb.id, &frts.data, frts.length, frts.id) != 0) return error.OriginalAbiMismatch;
+    // Production descriptor values and captured GA106 register values; the
+    // physical addresses are deliberately synthetic host comparison inputs.
+    const fields = [_]u32{ 5, 20480, 2176, 22656, 16, 0, 0, 0, 0, 2048, 2048, 4096, 6144, 10496, 1, 0, 0, 0, 0, 24576, 0 };
+    var descriptor: [84]u8 = undefined;
+    for (fields, 0..) |value, index| std.mem.writeInt(u32, descriptor[index * 4 ..][0..4], value, .little);
+    const metadata = try wpr.encode(&.{
+        .chip_id = 0x176,
+        .raw = .{ .values = .{ 0x80420100, 0x47f7, 0x10, 0x80, 2, 0, 0x10, 1, 12288, 0x1ffffe00, 0, 0, 0x10e09 }, .present = 0x1fff },
+        .image_bytes = wpr.image_bytes,
+        .descriptor = &descriptor,
+        .signature_bytes = 4096,
+    }, &.{
+        .gsp_segments = &.{ .{ .address = 0x200000000, .bytes = 4096 }, .{ .address = 0x100000000, .bytes = 63672320 } },
+        .boot_image = .{ .address = 0x300000000, .bytes = 24576 },
+        .signature = .{ .address = 0x300006000, .bytes = 4096 },
+        .crash_queue = .{ .address = 0x300007000, .bytes = 16384 },
+    });
+    if (r4nv_fwsec_abi_check(&sb.data, sb.length, sb.id, &frts.data, frts.length, frts.id, &metadata, metadata.len) != 0) return error.OriginalAbiMismatch;
 }

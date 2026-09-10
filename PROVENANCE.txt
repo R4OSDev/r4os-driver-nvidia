@@ -3,6 +3,23 @@ Host/module scaffolding follows R4OS SDK and existing R4D owners.
 Firmware fixture bodies and signatures are synthetic. Selected measured
 table fields are explicit regression data, as described below.
 
+0.79.10 GSP WPR metadata (host only), 11.09.2026:
+gsp_wpr.zig adapts field assignment from kernel_gsp_tu102.c and the complete
+GspFwWprMeta layout in gsp_fw_wpr_meta.h, pinned to NVIDIA 570.144. That file
+retains the full original NVIDIA MIT copyright/permission/disclaimer; R4OS
+admission, disjoint-span validation and interfaces are original Apache-2.0.
+The existing FwsecAbi.c/FwsecAbi.ps1 probe now also compiles the complete
+original WPR header and compares all bytes, both unions and padding with
+the actual Zig encoder. It uses synthetic DMA addresses and the already
+recorded GA106 state, without claiming live mappings. The full private
+3156-file source catalog was verified before the targeted ABI compilation;
+the original bootstrap exporter/decoder and full RM were not rebuilt.
+Sixteen complete original files/notices, nvtypes/cpuopsys, the derived FWSEC
+types with their full MIT notice and all proof accompany
+ExFiles/Reference/GFX/Nvidia/0.79.10/wpr-metadata-20260911.
+No firmware, original header or license resource is added to NVIDIA.R4D;
+the installed 0.1.22 module stays unchanged.
+
 0.79.10 GSP DMA staging (NVIDIA 0.1.22), 11.09.2026:
 gsp_dma.zig is original R4OS ownership/synchronization code using the existing
 DriverApi pin/map/sync/unmap/unpin and resident heap contracts. The 16 MB

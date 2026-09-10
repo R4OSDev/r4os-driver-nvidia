@@ -30,6 +30,17 @@ an explicit diagnostic and falls through to the same passive board inventory.
 This stages only the GSP image and its page tables. Bootloader, signature and
 WPR-metadata ownership, VGA recovery and firmware execution remain open.
 
+The next host preparation adds `gsp_wpr.zig`: a pinned 256-byte first-boot
+metadata template and checked DMA address binding. `inspect-gsp-layout`
+now reports the unbound little-endian template with zero device addresses,
+boot count, clock flags and Booter verification marker. Encoding live bindings
+requires the complete disjoint GSP scatter/gather spans plus contiguous boot
+and signature spans; an optional contiguous crash queue uses the original
+union layout. The encoder confers no memory ownership or authentication.
+The existing explicit bootstrap ABI probe compares all 256 encoded bytes
+with the original NVIDIA C structure, including padding and the crash union.
+This host preparation leaves NVIDIA.R4D 0.1.22 and OssiPC unchanged.
+
 The CPU-only FWSEC catalog resolves BIT 'p', full 32-bit token pointers and
 the original RM expansion-ROM bias. V2 loader and V3 signed-image descriptors,
 code/data bounds, sparse signature-version masks and DMEM command interfaces

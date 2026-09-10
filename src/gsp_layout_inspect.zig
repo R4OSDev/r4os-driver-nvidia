@@ -3,6 +3,7 @@ const firmware = @import("firmware.zig");
 const boot = @import("gsp_boot.zig");
 const layout = @import("gsp_layout.zig");
 const radix = @import("gsp_radix.zig");
+const wpr = @import("gsp_wpr.zig");
 const preflight = @import("fwsec_state.zig");
 const identity = @import("identity.zig");
 
@@ -71,6 +72,14 @@ pub fn main(init: std.process.Init) !void {
     defer init.gpa.free(firmware_bytes);
     const verified = try firmware.verify(firmware_bytes, .ga10x);
     const plan = try layout.firstBoot(chip.id, &snapshot.raw, verified.layout.image.bytes, boot_info.image_bytes);
+    const metadata = try wpr.prepare(&.{
+        .chip_id = chip.id,
+        .raw = snapshot.raw,
+        .image_bytes = verified.layout.image.bytes,
+        .descriptor = desc_bytes,
+        .signature_bytes = verified.layout.signature.bytes,
+    });
+    const metadata_hex = std.fmt.bytesToHex(metadata.unbound_template, .lower);
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(snapshot_bytes, &digest, .{});
     const snapshot_hash = std.fmt.bytesToHex(digest, .lower);
@@ -92,6 +101,17 @@ pub fn main(init: std.process.Init) !void {
         .plan = plan,
         .radix3 = try radix.requirements(verified.layout.image.bytes),
         .metadata_bytes = layout.metadata_bytes,
+        .wpr_metadata = .{
+            .profile = "unbound-first-boot-template",
+            .magic = wpr.magic,
+            .revision = wpr.revision,
+            .little_endian_hex = metadata_hex[0..],
+            .dma_bindings_complete = false,
+            .boot_count = 0,
+            .verified = false,
+            .crash_queue_assigned = false,
+            .flags = 0,
+        },
         .wpr_end_margin = 0,
         .boost_clocks = false,
         .live_hardware_read = false,
