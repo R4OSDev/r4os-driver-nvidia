@@ -128,3 +128,8 @@ src/thread_probe.zig is original R4OS code using the generic DriverApi32 task
 service. It copies no NVIDIA or Linux thread implementation. The pinned RM,
 GSP, shader, C adapter and existing private heap/clock provider sources remain
 unchanged. This checkpoint adds no third-party source or binary.
+
+0.79.10 semaphore CPU diagnostic, 10.09.2026:
+src/semaphore_probe.zig is original R4OS diagnostic code using DriverApi33.
+No NVIDIA/Linux implementation is copied. Pinned upstream sources, shaders,
+firmware and the existing memory/clock C adapters remain unchanged.

@@ -8,6 +8,7 @@ const rm_heap = @import("rm_heap.zig");
 const rm_clock = @import("rm_clock.zig");
 const runtime_probe = @import("runtime_probe.zig");
 const thread_probe = @import("thread_probe.zig");
+const semaphore_probe = @import("semaphore_probe.zig");
 const a = r4os.abi;
 var driver_api: ?*const a.DriverApi = null;
 var window: a.GfxMmioWindow = .{};
@@ -45,7 +46,7 @@ pub export fn nvidia_init(api: *const a.DriverApi) callconv(.c) i32 {
         if (check_firmware) return -6;
     }
     if (checking_runtime) {
-        if (!thread_probe.start(&ctx) or !runtime_probe.start(&ctx) or !thread_probe.prepareClose(&ctx)) {
+        if (!semaphore_probe.start(&ctx) or !thread_probe.start(&ctx) or !runtime_probe.start(&ctx) or !thread_probe.prepareClose(&ctx) or !semaphore_probe.prepareClose(&ctx)) {
             ctx.logError("NVIDIA runtime-check: FAILED phase=cpu-memory native-writes=disabled");
             return -9;
         }
@@ -111,6 +112,7 @@ pub export fn nvidia_init(api: *const a.DriverApi) callconv(.c) i32 {
 pub export fn nvidia_shutdown() callconv(.c) i32 {
     const api = driver_api orelse return 0;
     const ctx = r4os.r4dev.DriverContext.init(api);
+    if (!semaphore_probe.shutdown(&ctx)) return -1;
     if (!thread_probe.shutdown(&ctx)) return -1;
     if (!runtime_probe.shutdown(&ctx)) return -1;
     if (!firmware_cpu.close()) return -1;

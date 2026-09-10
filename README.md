@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-Original Apache-2.0 passive NVIDIA display driver for R4OS. Module 0.1.6;
+Original Apache-2.0 passive NVIDIA display driver for R4OS. Module 0.1.7;
 hardware acceptance for roadmap 0.79.9 is open and offline preparation for
 0.79.10 has started. This owner inventories NVIDIA display functions once through
 the kernel PCI inventory. It does not initialize engines or take over scanout.
@@ -115,7 +115,7 @@ packaged GSP containers in CPU memory before continuing the passive probe.
 `mode=runtime-check` explicitly exercises CPU heap calls from init and a real
 worker, validates close admission, and stops init before PCI. Its two leftover
 CPU allocations must be reclaimed by the actual failed-load cleanup. This mode
-requires kernel 0.1.143 / DriverApi32. Other modes are rejected. `DISPLAYD /NVIDIA`
+requires kernel 0.1.144 / DriverApi33. Other modes are rejected. `DISPLAYD /NVIDIA`
 replays complete NVIDIA boot records, with no additional hardware access.
 Distribution's `graphics-test Test nvidia-passive` runs an explicit short SMP4
 absence/fallback check with the existing graphics harness. It requires the
@@ -256,3 +256,22 @@ reports failure without vetoing safe cleanup. Normal passive starts create no
 tasks. No RM/NVKMS thread adapter or combined RM link is claimed by this CPU
 service integration; mutexes, semaphores, precise delays and hardware remain
 separate work.
+
+Resident semaphores (0.79.10)
+----------------------------
+The explicit runtime-check additionally negotiates DriverApi33. Three actual
+waiters verify FIFO single-permit handoff; four dedicated tasks perform 256
+protected read/modify/write operations, deliberately sleeping while holding
+their binary semaphore to force contention. Finite timeout, counter overflow,
+stale handles and destruction with active waits are checked in the same run.
+A stopped task stays blocked on its uninterruptible semaphore until shutdown
+provides a real permit. New creation closes; existing operations remain usable.
+The diagnostic retires its own tasks before the preceding thread probe's
+accounting, and leaves two semaphore records for generic kernel cleanup.
+Normal passive startup still creates neither tasks nor semaphores.
+
+This is the actual generic scheduler service needed by the RM port. The
+original RM/NVKMS C synchronization adapters and private C provider are still
+pending; in particular a void-returning NVKMS down must never pretend to have
+acquired a permit after failure. No new original-source build or GPU/IRQ
+hardware acceptance is claimed by this CPU-only integration.

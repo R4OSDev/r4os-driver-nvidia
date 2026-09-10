@@ -421,3 +421,15 @@ Threaddienst und Logging; die Uhr ist separat lesbar. Daraus folgt keine
 SMP-Freigabe alter PCI-/DMA-/Backend-/Dateipfade. Die eigentliche RM-Portierung
 bleibt getrennt: keine neuen Erfolgs-Stubs, keine GSP-Ausfuehrung, kein HDMI-
 Nachweis und keine neue Firmwareversion. Passive Normalstarts bleiben taskfrei.
+
+Residente Semaphore (0.79.10)
+----------------------------
+NVIDIA 0.1.7 erweitert den expliziten runtime-check um DriverApi33 auf Kernel
+0.1.144. Drei echte Waiter pruefen FIFO-Handoff. Vier dedizierte Tasks fuehren
+256 konkurrierende, durch eine binaere Semaphore geschuetzte Aenderungen aus.
+Endlicher Timeout, Zaehlerueberlauf, alte Handles und Freigabe bei wartenden
+Tasks werden geprueft. Ein gestoppter Task bleibt bis zur echten Freigabe im
+Shutdown wartend; Stop gilt niemals als erfolgreicher Semaphore-Erwerb.
+Zwei Semaphore bleiben fuer das generische Cleanup nach Callback-Quieszenz.
+Die nativen RM-/NVKMS-C-Adapter, ihr privater C-Anbieter und die GPU-Anbindung
+bleiben Folgearbeit. Der normale passive Start legt keine Semaphore an.
