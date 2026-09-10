@@ -2,6 +2,9 @@ const std = @import("std");
 const t = std.testing;
 const pci = @import("identity.zig");
 const vbios = @import("vbios.zig");
+comptime {
+    _ = @import("wait_policy.zig");
+}
 
 const device = pci.Pci{ .bus_kind = 2, .bus = 9, .vendor_id = 0x10de, .device_id = 0x2504, .class_code = 3 };
 const Config = struct {

@@ -553,3 +553,33 @@ Die frueheren Abschnitte beschreiben historische Zwischenstaende. Aktuelle
 Nachweise stehen in Docs/Drivers/GrafikFirmware07910 und im Referenzordner
 ExFiles/Reference/GFX/Nvidia/0.79.10/native-abort. RELEASE bleibt 0.79.8;
 voller RM-/NVKMS-Link, GSP/RPC, GPU-Bringup, Scanout und HDMI bleiben offen.
+
+Native Wartefunktionen und Aufruffristen (NVIDIA 0.1.11, 10.09.2026)
+-----------------------------------------------------------------
+Fuenf neue original-headerbasierte C-Adapter sind im normalen R4D verlinkt:
+os_delay_us, os_delay, os_schedule, nvkms_usleep und nvkms_yield. Sie nutzen
+zwei echte private Anbieter; insgesamt 42 C-Adapter und zwoelf Anbieter.
+Busy-Wartezeiten pruefen die monotone Uhr, schlaffaehige laengere Pausen
+parken fuer ganze Ticks beim Scheduler und pruefen die Uhr nach jedem
+Wakeup erneut. Es wird keine verstrichene Zeit aus einer Schleifenzahl
+behauptet. 64-Bit-Mikrosekunden bleiben erhalten; Ueberlauf wird abgewiesen.
+Die upstream Linux-Maske auf zwoelf Millisekundenbits wird nicht uebernommen.
+
+Normale caller-eigene native Invocations verlangen absolute monotone
+Fristen. Kernel0.1.146 liefert ihre urspruengliche Startanfrage ueber die
+tatsaechlich laufende Taskidentitaet: optionale DriverThreadApi88, weiterhin
+Version1/Minimalpraefix72 und vollstaendige Rueckgaben fuer 72/80/88 Bytes.
+Der Treiber behaelt den Fristenbesitz. Keine TLS-/CPU-lokale Vermutung,
+keine neue Kernel-Aufrufstruktur und kein zusaetzlicher Unwind-Guard.
+Statusflag8 beweist die wirklich blockierte Task im eigenen Sleep-Wait;
+Flag4/8 sind keine Startflags. Stop weckt dedizierte Tick-Waits auf und
+bleibt als NV_ERR_SIGNAL_PENDING sichtbar. Fristablauf ist NV_ERR_TIMEOUT,
+void-NVKMS-Fehler benutzen die bestehende native Abbruchgrenze. Nur explizites
+Cleanup darf eine Nullfrist verwenden, falls die Uhr nicht verfuegbar ist.
+
+SMP4 prueft alle fuenf echten C-Pfade einschliesslich 4100ms-Wartezeit,
+bestaetigten Schlaf vor Stop, zwei unabhaengige parallele Fristen, abgelaufene
+Neuzulassung und vollstaendige Taskfreigabe. Keine IRQ-/GPU-Hardwareabnahme,
+kein erzwungener Abbruch beliebiger CPU-Schleifen. Der gesamte native RM- und
+NVKMS-Link, GSP/RPC, Grafik und HDMI bleiben offen. Nachweise liegen im
+native_waits_checkpoint und ExFiles/Reference/GFX/Nvidia/0.79.10/native-waits.

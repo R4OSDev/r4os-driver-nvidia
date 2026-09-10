@@ -27,6 +27,9 @@ pub fn unbind() void {
 pub fn available() bool {
     return context != null and @atomicLoad(u32, &failed, .acquire) == 0;
 }
+pub fn invalidate() void {
+    @atomicStore(u32, &failed, 1, .release);
+}
 
 pub fn snapshot() ?a.MonotonicClockInfo {
     const ctx = context orelse return null;
@@ -46,8 +49,8 @@ pub fn snapshot() ?a.MonotonicClockInfo {
 
 // Private C imports for the still-separate RM/NVKMS partial links. UINT64_MAX
 // is an invalid reading, never an invented zero or a divided error value.
-// Loss of the clock latches admission closed until a new bind. Future native
-// dispatch must check this fault and terminate its independently bounded work;
+// Loss of the clock latches ordinary admission closed until a new bind. Native
+// dispatch checks this fault before and after its deadline-bound callback;
 // these value-only upstream callbacks cannot unwind arbitrary RM loops.
 pub export fn r4nv_clock_now_ns() callconv(.c) u64 {
     if (!available()) return unavailable;

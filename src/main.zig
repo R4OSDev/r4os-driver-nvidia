@@ -9,6 +9,8 @@ const rm_clock = @import("rm_clock.zig");
 const rm_semaphore = @import("rm_semaphore.zig");
 const rm_native = @import("rm_native.zig");
 const native_probe = @import("native_probe.zig");
+const rm_wait = @import("rm_wait.zig");
+const wait_probe = @import("wait_probe.zig");
 const runtime_probe = @import("runtime_probe.zig");
 const thread_probe = @import("thread_probe.zig");
 const semaphore_probe = @import("semaphore_probe.zig");
@@ -32,6 +34,7 @@ pub export fn nvidia_init(api: *const a.DriverApi) callconv(.c) i32 {
     rm_clock.bind(&ctx);
     rm_semaphore.bind(&ctx);
     rm_native.bind(&ctx);
+    rm_wait.bind(&ctx);
     const mode = std.mem.span(ctx.getOption("NVIDIA", "mode"));
     const check_firmware = std.ascii.eqlIgnoreCase(mode, "firmware-check");
     checking_runtime = std.ascii.eqlIgnoreCase(mode, "runtime-check");
@@ -52,7 +55,7 @@ pub export fn nvidia_init(api: *const a.DriverApi) callconv(.c) i32 {
         if (check_firmware) return -6;
     }
     if (checking_runtime) {
-        if (!native_probe.start(&ctx) or !rm_semaphore_probe.start(&ctx) or !semaphore_probe.start(&ctx) or !thread_probe.start(&ctx) or !runtime_probe.start(&ctx) or !thread_probe.prepareClose(&ctx) or !semaphore_probe.prepareClose(&ctx) or !rm_semaphore_probe.prepareClose(&ctx) or !native_probe.prepareFault(&ctx)) {
+        if (!wait_probe.start(&ctx) or !native_probe.start(&ctx) or !rm_semaphore_probe.start(&ctx) or !semaphore_probe.start(&ctx) or !thread_probe.start(&ctx) or !runtime_probe.start(&ctx) or !thread_probe.prepareClose(&ctx) or !semaphore_probe.prepareClose(&ctx) or !rm_semaphore_probe.prepareClose(&ctx) or !native_probe.prepareFault(&ctx)) {
             ctx.logError("NVIDIA runtime-check: FAILED phase=cpu-memory native-writes=disabled");
             return -9;
         }
@@ -118,6 +121,7 @@ pub export fn nvidia_init(api: *const a.DriverApi) callconv(.c) i32 {
 pub export fn nvidia_shutdown() callconv(.c) i32 {
     const api = driver_api orelse return 0;
     const ctx = r4os.r4dev.DriverContext.init(api);
+    if (!wait_probe.shutdown(&ctx)) return -1;
     if (!native_probe.shutdown(&ctx)) return -1;
     if (!rm_semaphore_probe.shutdown(&ctx)) return -1;
     if (!semaphore_probe.shutdown(&ctx)) return -1;
@@ -128,6 +132,7 @@ pub export fn nvidia_shutdown() callconv(.c) i32 {
     if (checking_runtime) {
         ctx.logInfo("NVIDIA unbind: driver-state=closed cpu-owner-cleanup=pending native-writes=disabled fallback=preserved");
     } else ctx.logInfo("NVIDIA unbind: OK resources=0 native-writes=disabled fallback=preserved");
+    rm_wait.unbind();
     rm_native.unbind();
     rm_semaphore.unbind();
     rm_heap.unbind();

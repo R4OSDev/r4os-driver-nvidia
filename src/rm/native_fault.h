@@ -9,5 +9,7 @@
 #define R4NV_FAULT_SEMAPHORE_FREE 1U
 #define R4NV_FAULT_SEMAPHORE_DOWN 2U
 #define R4NV_FAULT_SEMAPHORE_UP   3U
+#define R4NV_FAULT_WAIT           4U
+#define R4NV_FAULT_YIELD          5U
 void r4nv_native_fault(NvU32 operation, NvS32 result) __attribute__((noreturn));
 #endif

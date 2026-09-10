@@ -3,6 +3,7 @@ const r4os = @import("r4os");
 const a = r4os.abi;
 const native = @import("rm_native.zig");
 const heap = @import("rm_heap.zig");
+const clock = @import("rm_clock.zig");
 const semaphore = @import("rm_semaphore.zig");
 const Handler = *const fn (usize) callconv(.c) i32;
 const State = extern struct {
@@ -54,8 +55,18 @@ pub fn start(ctx: *const r4os.r4dev.DriverContext) bool {
     threads = ctx.threads() orelse return failed(ctx, "query");
     if (!prefixCompatible(ctx) or threads.?.abortCurrent(native.aborted) != a.driver_thread_error_context)
         return failed(ctx, "prefix-context");
+    var request: a.DriverThreadRequest = .{ .handler = 79, .context = 79, .flags = 79 };
+    if (threads.?.currentRequest(&request) != a.driver_thread_error_context or request.handler != 0 or request.context != 0 or request.flags != 0)
+        return failed(ctx, "init-request");
+    for ([_]a.DriverThreadRequest{ .{ .version = 2, .context = 79 }, .{ .size = 31, .context = 79 } }) |invalid| {
+        var output = invalid;
+        if (threads.?.currentRequest(&output) != a.driver_thread_error_invalid or !std.mem.eql(u8, std.mem.asBytes(&output), std.mem.asBytes(&invalid)))
+            return failed(ctx, "invalid-request");
+    }
     if (threads.?.start(refuseAbort, 0, a.driver_thread_flag_aborted, &handles[0]) != a.driver_thread_error_invalid or handles[0] != 0)
         return failed(ctx, "status-flag");
+    if (threads.?.start(refuseAbort, 0, a.driver_thread_flag_sleeping, &handles[0]) != a.driver_thread_error_invalid or handles[0] != 0)
+        return failed(ctx, "sleep-status-flag");
     if (threads.?.start(refuseAbort, 0, 0, &handles[0]) != 0 or !completed(ctx, 0, 0, false))
         return failed(ctx, "ordinary-context");
     if (!launch(0, refuseAbort, false, 1) or !completed(ctx, 0, 0, false)) return failed(ctx, "negative-only");
@@ -71,7 +82,7 @@ pub fn start(ctx: *const r4os.r4dev.DriverContext) bool {
         threads.?.stats(&tasks) != 0 or tasks.records != 0 or native.faultCount() != 0 or native.firstFault() != 0 or
         !semaphore.available() or heap.releaseFailures() != 0 or state.semaphore != null) return failed(ctx, "healthy-cleanup");
     ctx.logInfo("NVIDIA runtime-check: native-semaphores=OK adapters=16 provider=driver-api link=actual resources=0");
-    ctx.logInfo("NVIDIA runtime-check: native-boundary=OK prefix=72,80 context=checked result=negative-only status-flag=rejected");
+    ctx.logInfo("NVIDIA runtime-check: native-boundary=OK prefix=72,80,88 context=checked result=negative-only status-flag=rejected current-request=verified");
     return true;
 }
 
@@ -146,6 +157,13 @@ pub fn shutdown(ctx: *const r4os.r4dev.DriverContext) bool {
 }
 fn refuseAbort(context: usize) callconv(.c) i32 {
     const service = threads orelse return -1;
+    var request: a.DriverThreadRequest = .{};
+    if (service.currentRequest(&request) != 0) return -4;
+    if (context == 0 and (request.handler != @intFromPtr(&refuseAbort) or request.context != 0 or request.flags != 0)) return -5;
+    if (context != 0) {
+        const invocation = native.currentInvocation() orelse return -6;
+        if (invocation.context != context or invocation.handler != &refuseAbort or invocation.deadline_ns == 0) return -7;
+    }
     if (service.abortCurrent(0) != a.driver_thread_error_invalid or service.abortCurrent(79) != a.driver_thread_error_invalid) return -2;
     if (context == 0 and service.abortCurrent(native.aborted) != a.driver_thread_error_context) return -3;
     return 0;
@@ -153,15 +171,16 @@ fn refuseAbort(context: usize) callconv(.c) i32 {
 fn prefixCompatible(ctx: *const r4os.r4dev.DriverContext) bool {
     const query = ctx.api.thread_query orelse return false;
     const Guard = extern struct { table: a.DriverThreadApi, tail: [16]u8 };
-    for ([_]u32{ 72, 73, 79, 80 }) |capacity| {
+    for ([_]u32{ 72, 73, 79, 80, 81, 87, 88, 90 }) |capacity| {
         var guarded: Guard = undefined;
         @memset(std.mem.asBytes(&guarded), 0xa5);
         guarded.table.version = 1;
         guarded.table.size = capacity;
-        const expected: usize = if (capacity >= 80) 80 else 72;
+        const expected: usize = if (capacity >= 88) 88 else if (capacity >= 80) 80 else 72;
         if (query(&guarded.table) != 0 or guarded.table.size != expected or guarded.table.current == 0) return false;
         for (std.mem.asBytes(&guarded)[expected..]) |byte| if (byte != 0xa5) return false;
-        if (expected == 80 and guarded.table.abort_current == 0) return false;
+        if (expected >= 80 and guarded.table.abort_current == 0) return false;
+        if (expected >= 88 and guarded.table.current_request == 0) return false;
     }
     for ([_]a.DriverThreadApi{ .{ .version = 2 }, .{ .size = 71 } }) |invalid| {
         var guarded = invalid;
@@ -171,7 +190,10 @@ fn prefixCompatible(ctx: *const r4os.r4dev.DriverContext) bool {
 }
 fn launch(index: usize, handler: Handler, is_cleanup: bool, context: usize) bool {
     if (handles[index] != 0) return false;
-    calls[index] = .{ .handler = handler, .context = context, .cleanup = is_cleanup };
+    const now = clock.r4nv_clock_now_ns();
+    if (now == clock.unavailable) return false;
+    const deadline = std.math.add(u64, now, 5 * std.time.ns_per_s) catch return false;
+    calls[index] = .{ .handler = handler, .context = context, .cleanup = is_cleanup, .deadline_ns = deadline };
     return native.start(&calls[index], a.driver_thread_flag_parallel, &handles[index]) == 0;
 }
 fn completed(ctx: *const r4os.r4dev.DriverContext, index: usize, expected: i32, aborted: bool) bool {

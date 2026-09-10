@@ -358,8 +358,8 @@ Queued invocations check admission again on entry; already admitted peers
 must finish cooperatively. Cleanup invocations require an explicit flag and
 do not clear the fault. Rebind resets it only after the previous owner closes.
 
-The optional DriverThreadApi tail at offset 72 (table size 80, still version
-1) is required for this path. Passive startup remains available with older
+The optional DriverThreadApi slots at offsets 72 and 80 (table size 88,
+still version 1) are required for this path. Passive startup remains available with older
 tables. Kernel 0.1.145 restores an ordinary SysV caller frame, then completes
 and retires the Task through its existing lifetime machinery. No C/Zig defers
 run across an accepted abort. The native owner retains memory, semaphore,
@@ -388,3 +388,48 @@ strict ABS64/REL32 contract. No relocation check is weakened. The original
 headers, firmware, notices and five nonallocated resources are unchanged.
 The separate full RM/NVKMS link, GSP/RPC, GPU initialization, native display
 and HDMI require further implementation and eventual hardware acceptance.
+
+Native waits and phase deadlines (NVIDIA 0.1.11, 0.79.10)
+------------------------------------------------------
+`os_delay_us`, `os_delay`, `os_schedule`, `nvkms_usleep` and `nvkms_yield`
+use the actual `r4nv_wait_ns` / `r4nv_schedule` providers in the ordinary R4D.
+There are now 42 original-header C adapters and 12 private target providers.
+The five callbacks use the existing 19 byte-identical headers, with no new
+vendor implementation in the module. The pinned Linux timing implementations
+serve as primary behavior references; the R4OS implementation is original.
+
+Microsecond RM waits remain busy; longer sleepable waits give whole ticks to
+the scheduler and check the actual monotonic clock after every return. The
+remaining fraction uses bounded clock polling. NVKMS waits below 1000us are
+busy; larger waits require a sleepable context. Full 64-bit conversion rejects
+overflow before dispatch, without the upstream 12-bit millisecond mask.
+IRQ busy requests above 20ms are refused. A periodic-event-only clock cannot
+support busy waits while interrupts are disabled. Frozen/regressed/invalid
+clock readings close ordinary native admission, never authorize early success.
+The stalled-read budget detects lack of progress, not calibrated elapsed time.
+
+Each ordinary caller-owned Invocation now requires an absolute monotonic
+deadline, checked before start, on entry, inside waits/yields and after normal
+return. `current_request` identifies its context from the actual running Task;
+concurrent calls have independent immutable deadlines, with no TLS/per-CPU
+pointer cache or fixed invocation pool. A cooperative deadline returns -76002;
+clock loss returns -76003. A nonzero callback result remains intact. Explicit
+cleanup may use deadline zero when the clock is unavailable. No mechanism
+forcibly terminates a busy upstream loop or revokes GPU/DMA access.
+
+Dedicated sleeping Tasks observe cooperative stop as NV_ERR_SIGNAL_PENDING;
+phase expiration maps to NV_ERR_TIMEOUT. Void NVKMS errors enter the existing
+noreturn native fault boundary. Init/work can use valid sleepable legacy tick
+waits, whose elapsed time is still checked after wake. Actual yield requires
+a dedicated Task because the legacy waitTicks(0) ABI is explicitly a no-op;
+missing yield context fails instead of claiming scheduling occurred.
+
+The existing SMP4 runtime-check exercises all five C callbacks, including a
+4100ms NVKMS wait, proves actual blocked sleep-queue enrollment before stop,
+runs concurrent 250ms/5s phase deadlines and rejects an already expired call.
+All Task records retire before the older semaphore/abort/close probes. Four
+pure policy cases join the existing owner step (21 cases total); the separate
+original-source build checks 58 C conversions/statuses and 13 noreturn faults
+against the exact freestanding adapter objects on Linux. Partial links now
+include eight adapter objects; their private runtime providers intentionally
+remain unresolved. Full RM/NVKMS/GSP, native display and HDMI remain open.
