@@ -1,6 +1,6 @@
 .{
     .name = .r4os_driver_nvidia,
-    .version = "0.1.0",
+    .version = "0.1.1",
     .fingerprint = 0x8b7814489d5a1ee,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
@@ -25,6 +25,7 @@
         "build.zig",
         "build.zig.zon",
         "src",
+        "Tools",
 
         "module.R4MF",
         "PROVENANCE.txt",

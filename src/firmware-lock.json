@@ -1,0 +1,37 @@
+{
+  "schema": 1,
+  "rm_version": "570.144",
+  "source_commit": "8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f",
+  "package_url": "https://download.nvidia.com/XFree86/Linux-x86_64/570.144/NVIDIA-Linux-x86_64-570.144-no-compat32.run",
+  "package_sha256": "f3532d135c934c1a25480275da3cf8edb32aa6c5fccef64f657463c26e26fb70",
+  "license": {
+    "file": "LICENSE",
+    "resource": "NVIDIA-570.144-LICENSE.txt",
+    "bytes": 17863,
+    "sha256": "5ac626496a6388d37cdd53e0300525267a4b8c89fb5980da060783afd561faf7"
+  },
+  "firmware": [
+    {
+      "file": "gsp_ga10x.bin",
+      "resource": "GSP-570.144-GA10X.bin",
+      "bytes": 63571696,
+      "sha256": "a8c3ebeed280323aedb51c061f321e73379cce7a9ae643a33dd03915df027f7f"
+    },
+    {
+      "file": "gsp_tu10x.bin",
+      "resource": "GSP-570.144-TU10X.bin",
+      "bytes": 28542040,
+      "sha256": "3052aee2872182a14d8d7c069e3a14fe4642405894b24692c4aca4101dfb1809"
+    }
+  ],
+  "families": [
+    {"name": "ga10x", "artifact": 0},
+    {"name": "ad10x", "artifact": 0},
+    {"name": "gh100", "artifact": 0},
+    {"name": "gb10x", "artifact": 0},
+    {"name": "gb20x", "artifact": 0},
+    {"name": "tu10x", "artifact": 1},
+    {"name": "tu11x", "artifact": 1},
+    {"name": "ga100", "artifact": 1}
+  ]
+}

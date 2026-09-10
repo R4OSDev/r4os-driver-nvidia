@@ -25,3 +25,19 @@ https://github.com/torvalds/linux/blob/v6.14/drivers/pci/pci.c
 No Linux implementation or firmware binary is linked or redistributed here.
 The workspace keeps pinned upstream sources and hashes under
 ExFiles/Reference/GFX/Nvidia and Docs/Drivers/GrafikArchitektur07903.json.
+
+0.79.10 offline firmware preparation, 10.09.2026:
+The single src/firmware-lock.json pins installer origin, RM source revision,
+both original GSP containers, their complete license and family mapping.
+Its artifact digests were verified against the archived NVIDIA 570.144 package.
+No firmware opcode decoding, disassembly, signature bypass or modification.
+The prepared external package copies complete binary containers and LICENSE.
+
+Primary source for ELF version/section admission:
+src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c, _kgspFwContainerVerifyVersion,
+_kgspFwContainerGetSection and _kgspGetSectionNameForPrefix, at the pinned
+open-gpu-kernel-modules revision above. Container-family facts:
+src/nvidia/arch/nvalloc/common/inc/nv-firmware.h and
+src/nvidia/arch/nvalloc/common/inc/nv-firmware-chip-family-select.h.
+These NVIDIA headers carry their upstream MIT notices; implementations are
+not copied into the R4OS parser. The ELF fixture is original synthetic data.

@@ -23,4 +23,24 @@ pub fn build(b: *std.Build) void {
     const run = b.addRunArtifact(inspector);
     if (b.args) |args| run.addArgs(args);
     b.step("inspect-vbios", "Inspect a supplied ROM file: -- INPUT OUTPUT.json [PCI-device-hex]").dependOn(&run.step);
+    const firmware_test = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/firmware_test.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    }) });
+    unit_step.dependOn(&b.addRunArtifact(firmware_test).step);
+    const firmware_inspector = b.addExecutable(.{ .name = "nvfirmware-inspect", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/firmware_inspect.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    }) });
+    const inspect_firmware = b.addRunArtifact(firmware_inspector);
+    if (b.args) |args| inspect_firmware.addArgs(args);
+    b.step("inspect-firmware", "Verify the pinned GSP container: -- INPUT FAMILY OUTPUT.json").dependOn(&inspect_firmware.step);
+    const prepare = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-File" });
+    prepare.addFileArg(b.path("Tools/PrepareFirmware.ps1"));
+    prepare.addArg("-Inspector");
+    prepare.addArtifactArg(firmware_inspector);
+    if (b.args) |args| prepare.addArgs(args);
+    b.step("prepare-firmware", "Prepare local firmware: -- -SourceDirectory PATH -OutputDirectory PATH -ScratchDirectory Temp/PATH").dependOn(&prepare.step);
 }

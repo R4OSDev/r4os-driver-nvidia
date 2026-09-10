@@ -77,5 +77,56 @@ Test der echten R4D-Ein-/Ausstiegsfunktionen mit echter SDK-Fassade und
 simulierter DriverApi. Nicht freigegebene API-Aufrufe loesen einen Testfehler
 aus. Fehlgeschlagene Maps koennen ohne oeffentlichen Handle private Teilmaps
 behalten. mapping_cleanup_needed verlangt daher Collect auch ohne Handle;
-fehlerhafter Collect/Unmap verhindert Shutdown und erneutes Init. Derselbe
-Pfad gibt nach aufgehobenem Fehler frei, mehrfacher Shutdown bleibt harmlos.
+fehlerhafter Collect/Unmap verhindert Shutdown und erneutes Init. Im Hosttest
+kann derselbe Pfad nach aufgehobenem Fehler erneut abschliessen. Der produktive
+Kernel quarantiniert ein fehlgeschlagenes DriverShutdown bis zum Neustart;
+das ist keine Zusage eines laufenden Hardware-Retry. Mehrfacher erfolgreicher
+Shutdown bleibt harmlos.
+
+0.79.10: Firmwarevorbereitung ohne Realhardware
+---------------------------------------------
+NVIDIA 0.1.1 enthaelt die einzige firmware-lock.json als NVFW-LOCK.json in
+seiner nicht allokierten R4M0-Ressource. Kernel 0.1.138 behandelt .rsrc auch
+fuer R4D/R4P dateigebunden; ihre Nutzdaten werden weder in das Codeimage
+kopiert noch als Entry-, Export- oder Relocationziel zugelassen. Fuer R4L
+bleiben Ressourcen unzulaessig. Noch kein R4D-Ressourcenlesevertrag und kein
+Firmwareabruf aus dem aktiven passiven NVIDIA-Treiber.
+
+firmware.zig besitzt einen festen JSON-Vertrag fuer RM/GSP 570.144 mit zwei
+Originalcontainern, ihrem SHA-256, exakter Laenge, vollstaendiger Lizenz und
+der NVIDIA-Zuordnung zu acht Containerfamilien. Diese Liste ist ausdruecklich
+keine Liste unterstuetzter R4OS-Grafikkarten. Die JSON wird beim Kompilieren
+eingelesen; kein Laufzeitparser oder Laufzeitdownload wird dafuer eingebaut.
+
+Load schreibt je Schritt hoechstens 64 KB direkt in den caller-eigenen
+Endpuffer. Vorher/nachher prueft es monotone Zeit und absolute Deadline,
+verwirft kurze/fehlgeschlagene Reads und gibt erst nach vollstaendigem Hash
+und ELF-Befund eine nutzbare Sicht frei. Close ist idempotent; Allokation,
+Freigabe und Lebensdauer aller geliehenen Sichten bleiben beim Aufrufer.
+Ein blockierender Reader braucht einen eigenen begrenzten I/O-Besitzer;
+die Grenzpruefungen unterbrechen keine beliebige blockierende Operation.
+Der Hostinspektor dokumentiert diese Deadlinegrenze ausdruecklich.
+
+ELF-Profil: maximal 64 MB, 64 Sections, 4096 Namensbytes, 63 Bytes je Name;
+64-Bit Little Endian ET_REL/EM_RISCV ohne Programheader, Kompression oder
+ausfuehrbare Sections. Alle Offsets, Ueberlaeufe, Ausrichtungen, Namen und
+Bereichsueberlappungen werden geprueft. .fwimage und .fwversion muessen
+passen; nur die passende originale 4096-Byte-Signatursektion wird ausgewaehlt.
+Hashpruefung beweist Bytegleichheit zum Pin, keine kryptografische GPU-
+Signaturpruefung. Booter/FWSEC, GPU-Authentifizierung, WPR, Mailboxes/RPC,
+DMA, Thermik und Displaywiederherstellung werden noch nicht ausgefuehrt.
+
+prepare-firmware verwendet PS7 auf beiden Hosts. Drei ausdruecklich lokale
+Quelldateien werden vor und nach dem Kopieren geprueft. Beide Container
+gehen durch denselben Inspektor; die vollstaendige Lizenz bleibt bytegleich.
+Ein privates Temp-Verzeichnis wird erst als vollstaendiges Paket publiziert.
+Vorhandene Pakete muessen einschliesslich ihrer Berichte genau uebereinstimmen.
+Keine stillen Reparaturen, Versionsalternativen, Downloads oder Installer-
+Ausfuehrungen. Fehler hinterlassen keinen neuen Erfolgspfad.
+
+Zwei zusaetzliche Faelle im bestehenden unit-test-Step: 4672 Trunkierungen
+und 3072 Metadatenbitmutationen eines synthetischen ELF sowie inkrementelles
+Laden mit IO-/Kurzlese-/Hash-/Deadline-/Clock-/Close-Fehlern. Elf Besitzerfaelle
+insgesamt. Beide Originalcontainer werden getrennt mit ihren echten Hashes
+und allen erwarteten Familiensignaturen geprueft. Weitere Evidenz und die
+offenen Hardwaregrenzen: Docs/Drivers/GrafikFirmware07910.txt/.json.

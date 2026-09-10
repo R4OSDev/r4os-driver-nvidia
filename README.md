@@ -1,7 +1,8 @@
 ﻿# NVIDIA.R4D
 
-Original Apache-2.0 passive NVIDIA display driver for R4OS. Roadmap 0.79.9
-is in progress. This owner inventories NVIDIA display functions once through
+Original Apache-2.0 passive NVIDIA display driver for R4OS. Module 0.1.1;
+hardware acceptance for roadmap 0.79.9 is open and offline preparation for
+0.79.10 has started. This owner inventories NVIDIA display functions once through
 the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
@@ -56,3 +57,32 @@ against the real SDK facade and a simulated DriverApi. Unadmitted callbacks
 trap; unknown-device refusal, repeated init/shutdown, failed public unmap and
 retained private partial mappings are exercised. This verifies software
 lifetime decisions without claiming physical MMIO or board acceptance.
+
+Firmware preparation uses the single `src/firmware-lock.json` for RM version,
+upstream commit, exact artifact lengths/hashes, license and container-family
+mapping. The module carries that lock as `NVFW-LOCK.json` in its nonallocated
+R4M0 resource section; it does not yet request firmware at runtime. Embedded
+R4D resources require kernel 0.1.138 or newer to remain outside image memory.
+
+    ./Build.sh inspect-firmware -- INPUT.bin ga10x REPORT.json
+    ./Build.sh prepare-firmware -- -SourceDirectory EXTRACTED_FILES -OutputDirectory PACKAGE -ScratchDirectory WORKSPACE/Temp/nvidia
+
+Supply the previously extracted original `gsp_ga10x.bin`, `gsp_tu10x.bin` and
+`LICENSE` from the pinned NVIDIA 570.144 installer. Neither command downloads
+files or executes the installer. Use absolute paths for preparation directories;
+scratch and output must share a filesystem for atomic publication. The complete
+NVIDIA license accompanies both byte-identical binaries. An existing package
+must match exactly; a different package is never repaired in place.
+
+The inspector uses the same allocation-free loader component intended for the
+R4D adapter: at most 64 KB per step, caller-owned final storage, exact SHA-256,
+bounded ELF64/LE/ET_REL/EM_RISCV section checks, exact `.fwversion`, and 4096-byte
+signature sections for the selected release's families. Reports are created
+exclusively after success. Opaque signature bytes are preserved; GPU signature
+verification and hardware compatibility are not established by this check.
+Host-file deadlines are checked before and after I/O, not by forcibly cancelling
+a blocked host filesystem operation. The `unit-test` step now has eleven cases.
+
+Owner-bound resource reads in R4D, RM/NVKMS integration, board-specific FWSEC,
+GSP bootstrap/RPC and hardware fallback acceptance remain open. Prepared files
+are an explicit host artifact, not an installed or operational GPU driver.
