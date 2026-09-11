@@ -10,7 +10,42 @@ unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
 
-Gemeinsamer Besitzer fuer GSP-Speicher (NVIDIA 0.1.26)
+Produktions-Booter Load/Unload (NVIDIA 0.1.27)
+-------------------------------------------
+Vierzehn unveraenderte GA102-Produktionsdateien aus dem originalen NVIDIA-
+570.144-Decoderexport sind jetzt versionsgebundene R4D-Ressourcen. Dazu
+kommt ein bytegleiches Lizenzbuendel mit 24640 Bytes in Modul/Distribution:
+vollstaendiges COPYING und vier originale MIT-Hinweise. Der bestehende
+Offline-Provisionierer nimmt -Component booter; kein neuer Downloadpfad.
+
+booter prueft Hashes, HS-Header mit neun u32, zwei 384-Byte-Signaturen und
+Patchmetadaten vor jeder Aenderung am privaten Abbild. SEC2-Ucode3 verwendet
+seine eigene gemessene Fuse bei 0x8241c8; FWSEC-Ucode9 bleibt getrennt.
+Teilweise ueberlappende Abbilder sowie Signatur-/Metadatenalias werden
+abgewiesen. IMEM/DMEM-Plaene erhalten wirkliche behaltene DMA-Adressen.
+booter_storage.Pair bindet alle Dateien an dieselbe Modulressourcengeneration
+und eine endliche Frist; Teilfehler behalten Heap/Pin/Mapping bis zum Abbau.
+
+Beide Booter sind Teil der gemeinsamen Laufzeitlease: sechs Allokationen,
+bis zu fuenfzehn Mappings und Sperren in allen verschachtelten Close-Pfaden.
+OssiPC bestaetigt Fuseversion 1/Signaturindex 0, beide Abbilder
+mit 60416/40192 Bytes, fuenfzehn Mappings, beide Queueheader und vollstaendigen
+geordneten Abbau. NVIDIA 0.1.27 installiert; nach zwei Updateboots ist die
+vorherige passive Konfiguration bytegenau wiederhergestellt. Bootfb bleibt
+800x600, Generation 1/Reset 0/Besitzer 0. Kein GPU-Befehl, Firmwarestart oder
+neuer Bild-/Tonnachweis ohne den abwesenden User.
+
+50 Faelle im vorhandenen Besitzerstep und Modulbuild bestanden. Zwei neue
+gruppierte Faelle fuer Signaturzulassung und die echte Produktionsdatei-/SDK-
+Speicherstrecke; die bestehende Laufzeitleasepruefung umfasst beide Booter.
+Kein neues Gate/QEMU. Modul: 356352 residente Bytes, 23 Dateiressourcen.
+Nativer VRAM/VGA-/Display-Recoverybesitzer, FRTS-Erststart, SEC2-TCM-Zulassung,
+Firmwareausfuehrung/IRQ/Logdienst, Health und bewiesene Quieszenz bleiben
+offen. Neun komplette Originalquellen/Lizenzen liegen im Archiv
+ExFiles/Reference/GFX/Nvidia/0.79.10/gsp-booter-20260911.
+JSON: booter_checkpoint; 0.79.10 bleibt offen.
+
+Historisch: Gemeinsamer Besitzer fuer GSP-Speicher (NVIDIA 0.1.26)
 --------------------------------------------------
 gsp_run_memory.Lease haelt vier CPU-Allokationen und bis zu dreizehn
 GSP-/Boot-/Init-/FWSEC-DMA-Mappings unter einem exklusiven stabilen Besitzer.

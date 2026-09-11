@@ -16,13 +16,25 @@ pub const Capture = struct {
     cleanup_needed: bool = false,
 
     pub fn read(self: *Capture, ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, chip: identity.Chip, catalog: *const fwsec.Catalog) Error!preparation.Fuses {
+        return self.readSelected(ctx, snapshot, chip, catalog, 0);
+    }
+
+    /// SEC2 Booter has its own one-indexed fuse ID; the prior FWSEC result
+    /// must not be reused. Reads and retained MMIO cleanup use the same owner.
+    pub fn readBooter(self: *Capture, ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, chip: identity.Chip) Error!preparation.Fuses {
+        return self.readSelected(ctx, snapshot, chip, null, 3);
+    }
+
+    fn readSelected(self: *Capture, ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, chip: identity.Chip, catalog: ?*const fwsec.Catalog, fixed_id: u8) Error!preparation.Fuses {
         const bar = snapshot.bars[0];
         if (identity.decision(snapshot) != .identity_words_only or chip.id != 0x176 or
             bar.bytes < 0x825000 or bar.base > std.math.maxInt(u64) - bar.bytes) return error.UnmeasuredRange;
-        if (catalog.count > catalog.entries.len) return error.Limit;
-        var supported = false;
-        for (catalog.entries[0..catalog.count]) |*entry| supported = supported or preparation.supported(entry);
-        if (!supported) return error.Unsupported;
+        if (catalog) |entries| {
+            if (entries.count > entries.entries.len) return error.Limit;
+            var supported = false;
+            for (entries.entries[0..entries.count]) |*entry| supported = supported or preparation.supported(entry);
+            if (!supported) return error.Unsupported;
+        } else if (fixed_id != 3) return error.Unsupported;
         if (self.memory != null or self.cleanup_needed) return error.Busy;
         const clock = ctx.resources() orelse return error.Api;
         const start = clock.nowNs();
@@ -33,15 +45,16 @@ pub const Capture = struct {
         try self.map(0, bar.base, bar.bytes, debug_register & ~@as(u32, 0xfff));
         try checkClock(clock, &previous, deadline);
         const debug = self.word(0, debug_register);
-        const entry = try preparation.variant(catalog, try preparation.debugEnabled(debug));
-        const address = version_register + 4 * (@as(u32, entry.ucode_id) - 1);
+        const debug_enabled = try preparation.debugEnabled(debug);
+        const ucode_id = if (catalog) |entries| (try preparation.variant(entries, debug_enabled)).ucode_id else fixed_id;
+        const address = version_register + 4 * (@as(u32, ucode_id) - 1);
         try self.map(1, bar.base, bar.bytes, address & ~@as(u32, 0xfff));
         try checkClock(clock, &previous, deadline);
         const version = self.word(1, address);
         if (self.word(0, debug_register) != debug or self.word(1, address) != version) return error.Unstable;
         try checkClock(clock, &previous, deadline);
         _ = try preparation.fuseVersion(version);
-        return .{ .debug_disable_raw = debug, .ucode_version_raw = version, .ucode_id = entry.ucode_id };
+        return .{ .debug_disable_raw = debug, .ucode_version_raw = version, .ucode_id = ucode_id };
     }
 
     fn map(self: *Capture, index: usize, base: u64, bytes: u64, offset: u32) Error!void {

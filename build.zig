@@ -33,6 +33,8 @@ pub fn build(b: *std.Build) void {
         verify.addArg(parameter);
         verify.addFileArg(b.path(b.pathJoin(&.{ "BootFirmware", name })));
     }
+    verify.addArg("-BooterDirectory");
+    verify.addDirectoryArg(b.path("BooterFirmware"));
     const unit = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/tests.zig"),
         .target = b.graph.host,
@@ -69,6 +71,25 @@ pub fn build(b: *std.Build) void {
     unit_step.dependOn(&b.addRunArtifact(format_test).step);
     const storage = b.createModule(.{ .root_source_file = b.path("src/firmware_storage_test.zig"), .target = b.graph.host, .optimize = .ReleaseSafe });
     storage.addImport("r4os", sdk.createR4osModule(b.graph.host, .ReleaseSafe));
+    // Existing owner step exercises the complete Booter resource/heap/DMA
+    // path with the same pinned bytes as the module, never a fake hash bypass.
+    const fixture_files = b.addWriteFiles();
+    var fixture_source: []const u8 = "pub const Entry = struct { name: []const u8, bytes: []const u8 };\npub const files = [_]Entry{\n";
+    for (pin.booters) |booter| {
+        inline for (.{ "image", "header", "signatures", "patch_location", "patch_signature", "patch_metadata", "signature_count" }) |field| {
+            const name = @field(booter, field).resource;
+            _ = fixture_files.addCopyFile(b.path(b.pathJoin(&.{ "BooterFirmware", name })), name);
+            fixture_source = b.fmt("{s}.{{ .name = \"{s}\", .bytes = @embedFile(\"{s}\") }},\n", .{ fixture_source, name, name });
+        }
+    }
+    const notice = pin.booter_license.artifact.resource;
+    _ = fixture_files.addCopyFile(b.path(b.pathJoin(&.{ "BooterFirmware", notice })), notice);
+    fixture_source = b.fmt("{s}.{{ .name = \"{s}\", .bytes = @embedFile(\"{s}\") }},\n}};\n", .{ fixture_source, notice, notice });
+    storage.addImport("booter_fixture", b.createModule(.{
+        .root_source_file = fixture_files.add("booter_fixture.zig", fixture_source),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    }));
     unit_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = storage, .filters = &.{"firmware CPU storage"} })).step);
     const inspector = b.addExecutable(.{ .name = "nvbios-inspect", .root_module = b.createModule(.{
         .root_source_file = b.path("src/inspect.zig"),
@@ -109,7 +130,7 @@ pub fn build(b: *std.Build) void {
     const prepare_boot = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-File" });
     prepare_boot.addFileArg(b.path("Tools/PrepareBootFirmware.ps1"));
     if (b.args) |args| prepare_boot.addArgs(args);
-    b.step("prepare-boot-firmware", "Provision admitted boot files/notices: -- -SourceDirectory PATH -BootstrapDirectory PATH -ScratchDirectory PATH [-OutputDirectory PATH]").dependOn(&prepare_boot.step);
+    b.step("prepare-boot-firmware", "Provision admitted boot files/notices: -- -SourceDirectory PATH -BootstrapDirectory PATH -ScratchDirectory PATH [-Component gsp|booter] [-OutputDirectory PATH]").dependOn(&prepare_boot.step);
     const bootstrap = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-File" });
     bootstrap.addFileArg(b.path("Tools/PrepareBootstrap.ps1"));
     bootstrap.addArgs(&.{ "-Compiler", b.graph.zig_exe });

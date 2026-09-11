@@ -14,9 +14,19 @@ pub const Mapping = struct {
     execution_owner: usize = 0,
 
     pub fn stage(self: *Mapping, ctx: *const r4os.r4dev.DriverContext, image: []const u8, prepared: *const preparation.Prepared) Error!load.Plan {
+        if (image.len != prepared.bytes) return error.Bounds;
+        try self.stageImage(ctx, image);
+        self.prepared_plan = try load.plan(prepared, self.mapping.segments[0].phys_addr, self.mapping.segments[0].bytes);
+        return self.prepared_plan.?;
+    }
+
+    /// Common retained Falcon image mapping for FWSEC and SEC2 Booter. The
+    /// caller validates its own firmware format and assigns prepared_plan;
+    /// an image mapping alone is not an executable firmware plan.
+    pub fn stageImage(self: *Mapping, ctx: *const r4os.r4dev.DriverContext, image: []const u8) Error!void {
         if (self.context != null) return error.Busy;
         if (!ctx.supportsDriverApi(19, @offsetOf(a.DriverApi, "dma_unpin_buffer") + @sizeOf(usize))) return error.Api;
-        if (image.len != prepared.bytes or image.len == 0 or image.len > a.dma_mapping_max_bytes) return error.Bounds;
+        if (image.len == 0 or image.len > a.dma_mapping_max_bytes) return error.Bounds;
         if (@intFromPtr(image.ptr) & 255 != 0) return error.Alignment;
         self.context = ctx.*;
         if (ctx.pinDmaConstBuffer(image, &self.pin) != 0) return error.Pin;
@@ -27,7 +37,7 @@ pub const Mapping = struct {
             .dma_mask = load.dma_mask,
             .alignment = load.block_bytes,
             .max_segments = 1,
-            .max_segment_bytes = prepared.bytes,
+            .max_segment_bytes = @intCast(image.len),
             .flags = a.dma_flag_coherent | a.dma_flag_allow_bounce,
         };
         // The API synchronizes all prepared bytes for the device, including
@@ -39,8 +49,6 @@ pub const Mapping = struct {
             map.segment_count != 1 or map.reserved0 != 0 or map.reserved1 != 0 or
             (map.flags & ~a.dma_mapping_flag_bounced) != constraints.flags or
             map.segments[0].reserved != 0 or map.segments[0].bytes != image.len) return error.Descriptor;
-        self.prepared_plan = try load.plan(prepared, map.segments[0].phys_addr, map.segments[0].bytes);
-        return self.prepared_plan.?;
     }
 
     pub fn close(self: *Mapping) bool {

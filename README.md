@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-Passive NVIDIA display driver for R4OS. Module 0.1.26; original R4OS code is
+Passive NVIDIA display driver for R4OS. Module 0.1.27; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -10,7 +10,40 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
-Complete GSP run-memory lease (NVIDIA 0.1.26):
+Production GA102 Booter Load/Unload preparation (NVIDIA 0.1.27):
+
+The loaded R4D now provides fourteen original production parts for both
+Booters, pinned to NVIDIA 570.144, with a separate 24,640-byte full notice
+bundle. The existing offline provisioner accepts `-Component booter`; it
+reuses the original decoder export. No driver download or version fallback.
+
+`booter` validates each hash, the nine-word HS header, two 384-byte signatures
+and patch metadata before changing a private image. Its SEC2 ucode3 fuse is
+measured independently of FWSEC ucode9. Separate output and exact in-place
+preparation are allowed; partial or signature/metadata aliases are rejected. Actual DMA
+addresses form separate IMEM/DMEM plans. `booter_storage.Pair` admits the same
+loaded-module generation, applies one bounded deadline and retains partial
+heap/pin/map failures through cached teardown callbacks.
+
+Both images join the complete run lease: six CPU allocations and up to
+fifteen DMA mappings. OssiPC confirms fuse version 1, signature index
+0, both prepared images (60,416/40,192 bytes), fifteen mappings,
+both queue headers and complete ordered cleanup. Two update boots install
+NVIDIA 0.1.27 and restore the exact passive configuration. Bootfb remains
+800x600/generation 1/reset 0/owner 0. GPU authentication/execution and a new
+visible-picture or audio acceptance are not claimed.
+
+50 cases in the existing owner step and the module build pass. Two grouped
+cases cover signature admission and the actual production resource/SDK
+storage path, including second-image failures and retained cleanup. The
+existing complete-run case now covers both Booters. No new gate or QEMU run.
+The R4D contains 23 file resources and 356,352 resident bytes. Core/sequencer
+execution is still unlinked. Native VRAM/VGA/display recovery, FRTS startup,
+SEC2 TCM admission, firmware start/IRQ/log service, health and demonstrated
+quiescence after submission remain open. Nine complete original sources and
+notices accompany `gsp-booter-20260911`; 0.79.10 remains open.
+
+Earlier complete GSP run-memory lease (NVIDIA 0.1.26):
 
 `gsp_run_memory.Lease` holds all four CPU allocations and up to thirteen
 GSP/boot/init/FWSEC DMA mappings under one exclusive, stable owner. It checks

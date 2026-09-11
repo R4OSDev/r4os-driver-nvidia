@@ -18,6 +18,7 @@ const gsp_boot_storage = @import("gsp_boot_storage.zig");
 const gsp_init = @import("gsp_init.zig");
 const gsp_init_storage = @import("gsp_init_storage.zig");
 const gsp_run_memory = @import("gsp_run_memory.zig");
+const booter_storage = @import("booter_storage.zig");
 const rm_heap = @import("rm_heap.zig");
 const rm_clock = @import("rm_clock.zig");
 const rm_semaphore = @import("rm_semaphore.zig");
@@ -40,6 +41,7 @@ var boot_inputs: boot_resources.Inputs = .{};
 var boot_storage: gsp_boot_storage.Storage = .{};
 var init_storage: gsp_init_storage.Storage = .{};
 var run_memory: gsp_run_memory.Lease = .{};
+var booters: booter_storage.Pair = .{};
 // Bounded resident scratch: do not copy the maximum boot SG list to the stack.
 var init_excluded: [gsp_init.max_excluded]gsp_init.Span = undefined;
 var checking_boot = false;
@@ -420,11 +422,11 @@ fn inspectFwsecState(ctx: *const r4os.r4dev.DriverContext, snapshot: *const iden
         return true;
     };
     ctx.logInfo("NVIDIA fwsec: preflight-tcm=fits snapshot=read-only mmio-cleanup=OK reset=unperformed execution=not-started");
-    if (checking_boot and !checkBoot(ctx, chip, raw)) return false;
+    if (checking_boot and !checkBoot(ctx, snapshot, chip, raw)) return false;
     return true;
 }
 
-fn checkBoot(ctx: *const r4os.r4dev.DriverContext, chip: identity.Chip, raw: fwsec_state.Raw) bool {
+fn checkBoot(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, chip: identity.Chip, raw: fwsec_state.Raw) bool {
     const inputs = boot_inputs.load(ctx, 30 * std.time.ns_per_s) catch |err| {
         log("NVIDIA boot-check: rejected phase=boot-resources reason={s} fallback=preserved", .{@errorName(err)});
         boot_inputs.close();
@@ -468,6 +470,28 @@ fn checkBoot(ctx: *const r4os.r4dev.DriverContext, chip: identity.Chip, raw: fws
     log("NVIDIA boot-check: boot-address={x} signature-address={x} metadata-address={x} metadata-bytes={d} verified=0 boot-count=0 vram-reserved=no vga-relocated=no", .{
         report.boot_address, report.signature_address, report.metadata_address, report.metadata_bytes,
     });
+    const fuses = security_fuses.readBooter(ctx, snapshot, chip) catch |err| {
+        log("NVIDIA booters: rejected phase=fuses reason={s} submitted=no", .{@errorName(err)});
+        _ = security_fuses.close();
+        return false;
+    };
+    if (!security_fuses.close()) return false;
+    log("NVIDIA booters: fuses=measured debug-disable={x:0>8} ucode={d} version-raw={x:0>8} version={d} registers=82074c/8241c8 reads=two-identical mmio-cleanup=OK", .{
+        fuses.debug_disable_raw, fuses.ucode_id, fuses.ucode_version_raw, fwsec_prepare.fuseVersion(fuses.ucode_version_raw) catch return false,
+    });
+    booters.stage(ctx, chip.id, fuses, boot_inputs.generation, 30 * std.time.ns_per_s) catch |err| {
+        log("NVIDIA booters: rejected phase=resources-and-dma reason={s} submitted=no", .{@errorName(err)});
+        return false;
+    };
+    for (&booters.images) |*image| {
+        const prepared = image.prepared.?;
+        const plan = image.device.prepared_plan.?;
+        log("NVIDIA booters: operation={s} bytes={d} signature-index={d} fuse-version={d} dma-address={x} bounced={} imem-bytes={d} dmem-bytes={d} pkc-address={x} synchronized=yes submitted=no", .{
+            @tagName(prepared.operation),                                   prepared.info.image_bytes, prepared.signature_index, prepared.fuse_version,  image.device.mapping.segments[0].phys_addr,
+            (image.device.mapping.flags & a.dma_mapping_flag_bounced) != 0, plan.imem.bytes,           plan.dmem.bytes,          plan.signature_address,
+        });
+    }
+    log("NVIDIA booters: resources=14 license=matched generation={d} reads={d} source=loaded-r4d gpu-authentication=unverified", .{ booters.generation, booters.reads });
     if (!stageBootInit(ctx, chip.id)) return false;
     // No GPU submission occurred. On failure leave this owner and all borrowed
     // boot allocations for shutdown, which retries this same dependency order.
@@ -494,7 +518,11 @@ fn stageBootInit(ctx: *const r4os.r4dev.DriverContext, chip_id: u16) bool {
     const security = fwsec_cpu.device.mapping.segments[0];
     init_excluded[image_spans.len] = .{ .address = pack.phys_addr, .bytes = pack.bytes };
     init_excluded[image_spans.len + 1] = .{ .address = security.phys_addr, .bytes = security.bytes };
-    const count = image_spans.len + 2;
+    for (&booters.images, 0..) |*image, n| {
+        const segment = image.device.mapping.segments[0];
+        init_excluded[image_spans.len + 2 + n] = .{ .address = segment.phys_addr, .bytes = segment.bytes };
+    }
+    const count = image_spans.len + 4;
     const report = init_storage.stage(ctx, chip_id, init_excluded[0..count], 30 * std.time.ns_per_s) catch |err| {
         log("NVIDIA boot-init: rejected phase=dma-init reason={s} submitted=no fallback=preserved", .{@errorName(err)});
         return false;
@@ -506,7 +534,7 @@ fn stageBootInit(ctx: *const r4os.r4dev.DriverContext, chip_id: u16) bool {
         report.init.libos_address, report.init.rm_address, report.init.queues_address, report.init.queue_page_count, gsp_init.ring_slots, gsp_init.ring_capacity,
     });
     ctx.logInfo("NVIDIA boot-init: arguments=to-device logs=bidirectional queues=bidirectional status-header=zero native-writes=disabled");
-    run_memory.acquire(ctx, &boot_storage, &init_storage, &fwsec_cpu) catch |err| {
+    run_memory.acquire(ctx, &boot_storage, &init_storage, &fwsec_cpu, &booters) catch |err| {
         log("NVIDIA boot-init: rejected phase=run-memory reason={s} status={d} submitted=no", .{ @errorName(err), init_storage.last_queue_status });
         return false;
     };
@@ -531,7 +559,7 @@ fn stageBootInit(ctx: *const r4os.r4dev.DriverContext, chip_id: u16) bool {
         header.layout.entries_offset != gsp_init.page_bytes or header.layout.slots != gsp_init.ring_slots or
         !std.mem.allEqual(u8, &status, 0)) return false;
     log("NVIDIA boot-init: queue-port=OK epoch={d} command-bytes=32 status-bytes=32 status=zero writes=0 lease=held submitted=no", .{run_memory.generation()});
-    log("NVIDIA boot-init: run-memory=held allocations=4 dma-mappings={d} libos-address={x} app-version={x} firmware-command=unsubmitted", .{
+    log("NVIDIA boot-init: run-memory=held allocations=6 dma-mappings={d} libos-address={x} app-version={x} firmware-command=unsubmitted", .{
         run_memory.mapped_count, bindings.resume_args.libos_dma, bindings.resume_args.app_version,
     });
     return true;
@@ -539,7 +567,8 @@ fn stageBootInit(ctx: *const r4os.r4dev.DriverContext, chip_id: u16) bool {
 
 fn closeBootInit() bool {
     if (!run_memory.releaseBeforeSubmission()) return false;
-    return init_storage.close();
+    if (!init_storage.close()) return false;
+    return booters.close();
 }
 
 const VbiosDiagnostic = struct {

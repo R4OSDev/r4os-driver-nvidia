@@ -4,7 +4,8 @@ param(
     [Parameter(Mandatory)][string]$SourceDirectory,
     [Parameter(Mandatory)][string]$BootstrapDirectory,
     [Parameter(Mandatory)][string]$ScratchDirectory,
-    [string]$OutputDirectory
+    [string]$OutputDirectory,
+    [ValidateSet('gsp','booter')][string]$Component='gsp'
 )
 $ErrorActionPreference='Stop'
 Set-StrictMode -Version Latest
@@ -14,7 +15,20 @@ $lockPath=Join-Path $owner 'src/firmware-lock.json'
 $pin=Get-Content -Raw $lockPath|ConvertFrom-Json
 $sourcePin=Get-Content -Raw (Join-Path $PSScriptRoot 'Rm/Sources.json')|ConvertFrom-Json
 if($pin.schema -ne 1 -or $pin.source_commit -cne $sourcePin.source_commit -or $pin.boot.notices.Count -ne 12){throw 'Boot/source pin mismatch'}
-if([string]::IsNullOrWhiteSpace($OutputDirectory)){$OutputDirectory=Join-Path $owner 'BootFirmware'}
+if($Component -eq 'booter' -and ($pin.booters.Count -ne 2 -or $pin.booter_license.notices.Count -ne 5)){throw 'Booter/source pin mismatch'}
+$artifacts=@($pin.boot.image,$pin.boot.descriptor)
+$notices=$pin.boot.notices
+$licenseArtifact=$pin.boot.license
+$licenseHeading="NVIDIA 570.144 GSP boot, WPR metadata, layout and initialization source notices`n`n"
+$folder='BootFirmware'
+if($Component -eq 'booter'){
+    $artifacts=@(foreach($booter in $pin.booters){foreach($field in @('image','header','signatures','patch_location','patch_signature','patch_metadata','signature_count')){$booter.$field}})
+    $notices=$pin.booter_license.notices
+    $licenseArtifact=$pin.booter_license.artifact
+    $licenseHeading="NVIDIA 570.144 GA102 Booter Load/Unload and source notices`n`n"
+    $folder='BooterFirmware'
+}
+if([string]::IsNullOrWhiteSpace($OutputDirectory)){$OutputDirectory=Join-Path $owner $folder}
 foreach($path in @($SourceDirectory,$BootstrapDirectory,$ScratchDirectory,$OutputDirectory)){
     if(![IO.Path]::IsPathFullyQualified($path)){throw 'Provisioning paths must be absolute'}
 }
@@ -36,15 +50,15 @@ $stage=Join-Path $scratch ('nvidia-boot-'+[Guid]::NewGuid().ToString('N'))
 [IO.Directory]::CreateDirectory($stage)|Out-Null
 $utf8=[Text.UTF8Encoding]::new($false)
 try {
-    foreach($artifact in @($pin.boot.image,$pin.boot.descriptor)){
+    foreach($artifact in $artifacts){
         $original=Join-Path $bootstrap ('artifacts/'+$artifact.file)
         Test-NvidiaFirmwareArtifact $original $artifact
         $target=Join-Path $stage $artifact.resource
         Copy-Item -LiteralPath $original -Destination $target
         Test-NvidiaFirmwareArtifact $target $artifact
     }
-    $license="NVIDIA 570.144 GSP boot, WPR metadata, layout and initialization source notices`n`n"
-    foreach($notice in $pin.boot.notices){
+    $license=$licenseHeading
+    foreach($notice in $notices){
         if([IO.Path]::IsPathRooted($notice.path) -or $notice.path.Contains('../') -or $notice.path.Contains('\')){throw 'Invalid notice path'}
         $sourceFile=Get-Item -Force -LiteralPath (Join-Path $source $notice.path)
         if($sourceFile.PSIsContainer -or $sourceFile.Length -ne $notice.bytes -or $notice.bytes -gt 4MB){throw 'Unexpected notice source size'}
@@ -57,10 +71,10 @@ try {
         }
         $license+='Source: '+$notice.path+"`n"+$text+"`n`n"
     }
-    $licensePath=Join-Path $stage $pin.boot.license.resource
+    $licensePath=Join-Path $stage $licenseArtifact.resource
     [IO.File]::WriteAllText($licensePath,$license,$utf8)
-    Test-NvidiaFirmwareArtifact $licensePath $pin.boot.license
-    [ordered]@{schema=1;source_commit=$pin.source_commit;rm_version=$pin.rm_version;source_catalog_sha256=$sourcePin.catalog_sha256;resources=@($pin.boot.image,$pin.boot.descriptor,$pin.boot.license);notices=$pin.boot.notices;binary_modifications=$false;decoder_repeated=$false;gpu_executed=$false}|ConvertTo-Json -Depth 7|Set-Content (Join-Path $stage 'package.json') -Encoding utf8NoBOM
+    Test-NvidiaFirmwareArtifact $licensePath $licenseArtifact
+    [ordered]@{schema=1;source_commit=$pin.source_commit;rm_version=$pin.rm_version;source_catalog_sha256=$sourcePin.catalog_sha256;resources=@($artifacts)+@($licenseArtifact);notices=$notices;binary_modifications=$false;decoder_repeated=$false;gpu_executed=$false}|ConvertTo-Json -Depth 7|Set-Content (Join-Path $stage 'package.json') -Encoding utf8NoBOM
     if(Test-Path -LiteralPath $output){
         $expected=@(Get-ChildItem -LiteralPath $stage -File)
         $actual=@(Get-ChildItem -LiteralPath $output -Force)
@@ -73,7 +87,7 @@ try {
         [IO.Directory]::CreateDirectory((Split-Path -Parent $output))|Out-Null
         [IO.Directory]::Move($stage,$output)
     }
-    Write-Host "NVIDIA boot package: production image/descriptor and all twelve complete notices verified at $output"
+    Write-Host "NVIDIA $Component package: $($artifacts.Count) production artifacts and $($notices.Count) complete notices verified at $output"
 }finally{
     if(Test-Path -LiteralPath $stage){Remove-Item -LiteralPath $stage -Recurse -Force}
 }

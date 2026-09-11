@@ -1,5 +1,22 @@
 ﻿# Third-Party Notices
 
+NVIDIA 0.1.27 packages fourteen unchanged GA102 Booter Load/Unload
+production artifacts from the original 570.144 bindata decoder export.
+Header/signature preparation in booter.zig adapts kernel_gsp_booter.c
+(NVIDIA CORPORATION & AFFILIATES, 2021-2023, MIT); its full original notice
+is retained. SEC2 fuse semantics come from kernel_sec2_ga100.c. Resource,
+deadline, DMA lifetime and admission interfaces are original R4OS Apache-2.0.
+NVIDIA-570.144-BOOTER-LICENSE.txt contains full COPYING and four per-source
+MIT notices; the 24,640 bytes are identical in R4D and Distribution. Sources,
+artifact lengths/hashes and all notices are bound in firmware-lock.json.
+Resource binaries remain original; selected signatures are installed only
+into private runtime CPU/DMA images. No GPU authentication/start is claimed.
+Nine complete originals including dispatch/HS/core context are preserved in
+gsp-booter-20260911. The additional HAL context is reference material; core,
+sequencer and firmware boot operations are not newly linked or executed.
+
+Earlier complete-run notice:
+
 NVIDIA 0.1.26 adds original Apache-2.0 complete-run ownership code and retains
 the admitted descriptor appVersion. Firmware and full packaged notices remain
 byte-identical. The gsp_core.Resume value type introduces no executable core,

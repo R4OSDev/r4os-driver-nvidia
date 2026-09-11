@@ -50,7 +50,7 @@ pub const rm_offset = page_bytes;
 pub const logs_offset = rm_offset + page_bytes;
 pub const queues_offset = logs_offset + log_count * log_bytes;
 pub const output_bytes = queues_offset + queue_allocation_bytes;
-pub const max_excluded = 258; // GSP's 256 spans, boot pack and FWSEC image.
+pub const max_excluded = 260; // GSP's 256 spans, boot pack, FWSEC and two Booters.
 pub const Error = error{ Profile, Size, Address, Alignment, Overlap, Segments };
 
 comptime {
