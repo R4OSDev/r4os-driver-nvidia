@@ -14,7 +14,7 @@ const pramin = @import("pramin.zig");
 const payload = @import("display_memory.zig");
 pub const max_surfaces = scanout.max_windows * 6;
 pub const Surface = struct { window: u8, plane: u2, eye: u1, handle: u32, context: decoder.Resolved, image: decoder.Surface, backup_offset: usize = 0 };
-pub const Report = struct { address: u64, bytes: u64, surfaces: usize, sha256: [32]u8, window_writes: u32,
+pub const Report = struct { instance_active: bool, address: u64, bytes: u64, surfaces: usize, sha256: [32]u8, window_writes: u32,
     assets: usize, asset_bytes: usize, asset_sha256: [32]u8,
     payload_bytes: usize, payload_ranges: usize, payload_sha256: [32]u8 };
 pub const Capture = struct {
@@ -27,6 +27,7 @@ pub const Capture = struct {
     map: a.GfxBufferMap = .{},
     stamp: a.GfxBufferMap = .{},
     span: decoder.Span = .{ .address = 0, .bytes = 0 },
+    instance_active: bool = false,
     framebuffer_bytes: u64 = 0,
     surfaces: [max_surfaces]Surface = undefined,
     surface_count: usize = 0,
@@ -50,40 +51,45 @@ pub const Capture = struct {
         try self.io.open(parent);
         self.framebuffer_bytes = self.io.framebuffer_bytes;
         const raw = &parent.scanout_original.?;
-        self.span = try decoder.instance(raw.instance_control, raw.instance_address, self.framebuffer_bytes);
-        self.last_status = self.memory.?.bufferCreate(&.{ .byte_length = decoder.instance_bytes, .alignment = 4096, .usage = a.gfx_buffer_usage_cpu_read | a.gfx_buffer_usage_cpu_write }, &self.reference);
-        if (self.last_status != a.gfx_buffer_result_ok) return error.Buffer;
-        try self.mapBackup(a.gfx_buffer_map_write);
-        for (0..decoder.instance_bytes / 4096) |page| {
-            const output: [*]u8 = @ptrFromInt(self.map.cpu_address);
-            try self.io.read(self.span.address + page * 4096, output[page * 4096 ..][0..4096]);
-        }
-        try self.comparePages();
-        try self.resolveSurfaces(raw);
-        try self.asset_catalog.resolve(raw, self.data(), self.framebuffer_bytes);
-        // Resolve all targets before any asset payload read. GPU system
-        // addresses are not CPU pointers and this reader only admits VRAM.
-        for (self.asset_catalog.items[0..self.asset_catalog.count]) |*asset|
-            if (asset.memory.target != .vram) return error.AssetSystemMemory;
-        for (self.surfaces[0..self.surface_count]) |*surface|
-            try self.payload_plan.add(surface.image.span, self.framebuffer_bytes);
-        for (self.asset_catalog.items[0..self.asset_catalog.count]) |*asset|
-            try self.payload_plan.add(asset.memory.span, self.framebuffer_bytes);
-        // Distinct image planes/eyes and assets can alias the same physical
-        // storage. Retain each binding but back up the unique byte union once.
-        for (self.surfaces[0..self.surface_count]) |*surface|
-            surface.backup_offset = try self.payload_plan.offset(surface.image.span);
-        for (self.asset_catalog.items[0..self.asset_catalog.count]) |*asset|
-            asset.backup_offset = try self.payload_plan.offset(asset.memory.span);
-        if (self.payload_plan.bytes != 0) {
-            self.last_status = self.memory.?.bufferCreate(&.{ .byte_length = self.payload_plan.bytes, .alignment = 4096,
-                .usage = a.gfx_buffer_usage_cpu_read | a.gfx_buffer_usage_cpu_write }, &self.payload_reference);
+        if (try decoder.instance(raw.instance_control, raw.instance_address, self.framebuffer_bytes)) |span| {
+            self.span = span;
+            self.instance_active = true;
+            self.last_status = self.memory.?.bufferCreate(&.{ .byte_length = decoder.instance_bytes, .alignment = 4096, .usage = a.gfx_buffer_usage_cpu_read | a.gfx_buffer_usage_cpu_write }, &self.reference);
             if (self.last_status != a.gfx_buffer_result_ok) return error.Buffer;
-            try self.mapPayload(a.gfx_buffer_map_write);
-            try self.transferPayload(false);
-            try self.transferPayload(true);
+            try self.mapBackup(a.gfx_buffer_map_write);
+            for (0..decoder.instance_bytes / 4096) |page| {
+                const output: [*]u8 = @ptrFromInt(self.map.cpu_address);
+                try self.io.read(self.span.address + page * 4096, output[page * 4096 ..][0..4096]);
+            }
+            try self.comparePages();
+            try self.resolveSurfaces(raw);
+            try self.asset_catalog.resolve(raw, self.data(), self.framebuffer_bytes);
+            // Resolve all targets before any asset payload read. GPU system
+            // addresses are not CPU pointers and this reader only admits VRAM.
+            for (self.asset_catalog.items[0..self.asset_catalog.count]) |*asset|
+                if (asset.memory.target != .vram) return error.AssetSystemMemory;
+            for (self.surfaces[0..self.surface_count]) |*surface|
+                try self.payload_plan.add(surface.image.span, self.framebuffer_bytes);
+            for (self.asset_catalog.items[0..self.asset_catalog.count]) |*asset|
+                try self.payload_plan.add(asset.memory.span, self.framebuffer_bytes);
+            // Distinct image planes/eyes and assets can alias the same physical
+            // storage. Retain each binding but back up the unique byte union once.
+            for (self.surfaces[0..self.surface_count]) |*surface|
+                surface.backup_offset = try self.payload_plan.offset(surface.image.span);
+            for (self.asset_catalog.items[0..self.asset_catalog.count]) |*asset|
+                asset.backup_offset = try self.payload_plan.offset(asset.memory.span);
+            if (self.payload_plan.bytes != 0) {
+                self.last_status = self.memory.?.bufferCreate(&.{ .byte_length = self.payload_plan.bytes, .alignment = 4096,
+                    .usage = a.gfx_buffer_usage_cpu_read | a.gfx_buffer_usage_cpu_write }, &self.payload_reference);
+                if (self.last_status != a.gfx_buffer_result_ok) return error.Buffer;
+                try self.mapPayload(a.gfx_buffer_map_write);
+                try self.transferPayload(false);
+                try self.transferPayload(true);
+            }
+            try self.comparePages(); // Bindings must remain identical across payload capture too.
+        } else {
+            try acceptInactive(raw);
         }
-        try self.comparePages(); // Bindings must remain identical across payload capture too.
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(self.data(), &digest, .{});
         var payload_digest: [32]u8 = undefined;
@@ -96,20 +102,34 @@ pub const Capture = struct {
         const writes = self.io.window_writes;
         if (!self.io.close()) return error.Cleanup;
         _ = try parent.reobserve();
-        self.last_status = self.memory.?.bufferUnmap(&self.map.lease);
-        if (self.last_status != a.gfx_buffer_result_ok) return error.Buffer;
-        self.map = .{};
-        self.stamp = .{};
-        try self.mapBackup(a.gfx_buffer_map_read);
+        if (self.instance_active) {
+            self.last_status = self.memory.?.bufferUnmap(&self.map.lease);
+            if (self.last_status != a.gfx_buffer_result_ok) return error.Buffer;
+            self.map = .{};
+            self.stamp = .{};
+            try self.mapBackup(a.gfx_buffer_map_read);
+        }
         if (self.payload_plan.bytes != 0) {
             if (!self.unmapPayload()) return error.Buffer;
             try self.mapPayload(a.gfx_buffer_map_read);
         }
         self.ready = true;
-        return .{ .address = self.span.address, .bytes = self.span.bytes, .surfaces = self.surface_count, .sha256 = digest, .window_writes = writes,
+        return .{ .instance_active = self.instance_active, .address = self.span.address, .bytes = self.span.bytes, .surfaces = self.surface_count, .sha256 = digest, .window_writes = writes,
             .assets = self.asset_catalog.count, .asset_bytes = self.asset_catalog.bytes, .asset_sha256 = asset_digest,
             .payload_bytes = self.payload_plan.bytes, .payload_ranges = self.payload_plan.count, .payload_sha256 = payload_digest };
     }
+    fn acceptInactive(raw: *const scanout.Raw) !void {
+        for (0..scanout.max_windows) |index| {
+            if (raw.window_mask & (@as(u32, 1) << @intCast(index)) != 0 and
+                try scanout.windowHead(&raw.windows[index]) != null) return error.InstanceDependency;
+        }
+        for (0..scanout.max_heads) |index| {
+            if (raw.headMask() & (@as(u8, 1) << @intCast(index)) == 0) continue;
+            const color = &raw.heads[index].color;
+            if (color.cursorEnabled() or color.get(.olut_dma) != 0) return error.InstanceDependency;
+        }
+    }
+
     pub fn payloadData(self: *const Capture) []const u8 {
         if (self.payload_plan.bytes == 0) return &.{};
         const bytes: [*]const u8 = @ptrFromInt(self.payload_map.cpu_address);
@@ -155,6 +175,7 @@ pub const Capture = struct {
         }
     }
     fn data(self: *const Capture) []const u8 {
+        if (!self.instance_active) return &.{};
         const bytes: [*]const u8 = @ptrFromInt(self.map.cpu_address);
         return bytes[0..decoder.instance_bytes];
     }
@@ -165,6 +186,7 @@ pub const Capture = struct {
             self.map.byte_length != decoder.instance_bytes or self.map.cpu_address > std.math.maxInt(u64) - decoder.instance_bytes) return error.Buffer;
     }
     fn comparePages(self: *Capture) !void {
+        if (!self.instance_active) return;
         for (0..decoder.instance_bytes / 4096) |page| {
             try self.io.read(self.span.address + page * 4096, &self.scratch);
             if (!std.mem.eql(u8, &self.scratch, self.data()[page * 4096 ..][0..4096])) return error.Unstable;
@@ -202,6 +224,14 @@ pub const Capture = struct {
         }
     }
     pub fn valid(self: *const Capture, parent: *const boot.Capture) bool {
+        const raw = if (parent.scanout_original) |*value| value else return false;
+        const original = decoder.instance(raw.instance_control, raw.instance_address, self.framebuffer_bytes) catch return false;
+        if ((original != null) != self.instance_active) return false;
+        if (!self.instance_active) acceptInactive(raw) catch return false;
+        const instance_valid = if (self.instance_active)
+            self.span.bytes == decoder.instance_bytes and self.reference.reference.id != 0 and self.map.lease.id != 0
+        else self.span.address == 0 and self.span.bytes == 0 and self.reference.reference.id == 0 and
+            self.map.lease.id == 0 and self.surface_count == 0 and self.asset_catalog.count == 0;
         const payload_valid = if (self.payload_plan.bytes == 0)
             self.payload_plan.count == 0 and self.surface_count == 0 and self.asset_catalog.count == 0 and
                 self.payload_reference.reference.id == 0 and self.payload_map.lease.id == 0
@@ -211,11 +241,11 @@ pub const Capture = struct {
         return self.self_address == @intFromPtr(self) and self.ready and self.parent == parent and
             parent.self_address == @intFromPtr(parent) and parent.ready and parent.context_owner == self.self_address and
             parent.boot.held_generation == self.epoch and self.epoch != 0 and self.io.self_address == 0 and
-            self.reference.reference.id != 0 and self.map.lease.id != 0 and std.meta.eql(self.map, self.stamp) and
+            instance_valid and std.meta.eql(self.map, self.stamp) and
             payload_valid and std.meta.eql(self.payload_map, self.payload_stamp);
     }
     fn overlaps(span: decoder.Span, reserved: layout.Range) bool {
-        return span.address < reserved.end() and reserved.offset < span.address + span.bytes;
+        return span.bytes != 0 and span.address < reserved.end() and reserved.offset < span.address + span.bytes;
     }
     fn reobserve(self: *Capture, parent: *boot.Capture) !void {
         try self.io.open(parent);

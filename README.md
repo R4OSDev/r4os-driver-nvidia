@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-Passive NVIDIA display driver for R4OS. Module 0.1.48; original R4OS code is
+Passive NVIDIA display driver for R4OS. Module 0.1.49; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -11,6 +11,24 @@ Starting with R4OS 0.79.9, `IMAGE_SCOPE=slim` includes the current module in
 Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
+
+Inactive display instance (NVIDIA 0.1.49, 2026-09-11):
+
+STATUS_INVALID is an explicit empty snapshot only when no assigned window,
+enabled cursor or memory-LUT handle depends on instance bindings. Preserve
+raw controls, the real display hold/epoch and fresh comparisons. No invented
+64KB backing, address0 read or extra allocation/window write. Active-instance
+capture remains intact. Existing cases cover empty capture/reservation,
+changed state and each contradictory dependency; all51 cases/build pass.
+
+OssiPC now completes boot-check through all unsubmitted GSP/FWSEC/Booter,
+init-memory and queue preparations, then releases every mapping/pin/CPU
+buffer and display hold. Batch10 restores the exact passive configuration:
+bootfb1920x1080, no pending owner,14 services without failure. This proves
+CPU/DMA preparation only. Native firmware execution, complete device/display
+recovery and GPU quiescence remain open, as do visible picture and audio.
+Sources/evidence:0.79.10/inactive-instance-20260911. Older entries below
+record prior states.
 
 Init-abort recovery (NVIDIA 0.1.48, 2026-09-11):
 

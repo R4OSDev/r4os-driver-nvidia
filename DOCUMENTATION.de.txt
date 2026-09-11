@@ -3,6 +3,32 @@
 
 Stand: 11.09.2026; passive Hardwareaufnahme 0.79.9 abgeschlossen.
 
+Inaktive Displayinstanz und vollstaendige Vorbereitung (NVIDIA 0.1.49)
+--------------------------------------------------------------------
+STATUS_INVALID erzeugt einen explizit leeren Instanz-Snapshot. Bekannte
+Steuer-/Zielbits sowie die Abwesenheit zugeordneter Fenster, aktiver Cursor
+und Speicher-LUT-Handles werden geprueft. Rohzustand, Displaybesitz, Epoche
+und erneuter Hardwarevergleich bleiben erhalten. Fuer die fehlende Instanz
+werden weder 64 KB erfunden noch VRAM-Adresse0 oder abhaengige Bytes gelesen.
+Der aktive Sicherungspfad bleibt erhalten; widerspruechliche Zustaende
+brechen vor weiteren Allokationen ab.
+
+OssiPC durchlaeuft nun den kompletten boot-check: leere Instanz ohne weitere
+Fensterwrites, versionsgebundene Firmware, GSP-/FWSEC-/Booter-DMA-Pakete,
+Init-Speicher und Queueheader vorbereitet. Anschliessend cleanup=OK und
+mappings0/pins0/cpu0, Displaybesitz freigegeben. Batch9 prueft, Batch10
+stellt die bytegleiche passive Konfiguration wieder her. Bootfb1920x1080,
+generation1/reset0/owner0, kein pending-owner,14 Dienste ohne Fehler.
+
+51 bestehende Faelle und Modulbuild bestanden. Der vorhandene Besitzerfall
+prueft leere Sicherung/Reservierung, erneute Zustandspruefung und jeden
+abhaengigen Ablehnungsgrund. Eine alte aktive DMA-Testfixture wurde um ihren
+expliziten Instanzzustand ergaenzt. Keine neuen Faelle oder Gates. Dies ist
+nur CPU-/DMA-Vorbereitung: GPU-Firmwarestart, vollstaendige native
+Wiederherstellung/Ruhebeweis sowie Bild/Ton bleiben offen. Quellen/Belege:
+ExFiles/Reference/GFX/Nvidia/0.79.10/inactive-instance-20260911.
+Die folgenden Zwischenstaende beschreiben die Historie.
+
 Init-Abbruch gibt Bootanzeige selbst zurueck (NVIDIA 0.1.48)
 -----------------------------------------------------------
 Der Kernel beginnt keinen Treiberabbau bei gehaltenem Display. Ein

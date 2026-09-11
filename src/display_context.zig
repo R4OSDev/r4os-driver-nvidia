@@ -281,12 +281,16 @@ pub const entries = hash_bytes / 8;
 pub const descriptor_bytes = 20;
 pub const Error = error{ Control, Target, Bounds, Reserved, Missing, Duplicate, Format, Plane, Stereo, Geometry, Pitch, Context, Capacity };
 pub const Span = struct { address: u64, bytes: u64 };
-pub fn instance(control: u32, address: u32, framebuffer_bytes: u64) Error!Span {
-    if (control & ~@as(u32, 11) != 0 or control & 8 == 0 or address & 0x80000000 != 0) return error.Control;
+/// STATUS_INVALID has no live instance address. Callers must independently
+/// reject any active scanout dependency before accepting an empty snapshot.
+pub fn instance(control: u32, address: u32, framebuffer_bytes: u64) Error!?Span {
+    if (control & ~@as(u32, 11) != 0 or address & 0x80000000 != 0) return error.Control;
+    if (control & 3 == 0) return error.Target;
+    if (control & 8 == 0) return null;
     if (control & 3 != 1) return error.Target;
     const base = @as(u64, address) << 16;
     if (base > framebuffer_bytes or instance_bytes > framebuffer_bytes - base) return error.Bounds;
-    return .{ .address = base, .bytes = instance_bytes };
+    return Span{ .address = base, .bytes = instance_bytes };
 }
 pub fn hash(client: u14, handle: u32, channel: u7) u10 {
     const c = @as(u32, client);

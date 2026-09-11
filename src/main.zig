@@ -560,8 +560,8 @@ fn checkBoot(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Sna
         return false;
     };
     const context_hash = std.fmt.bytesToHex(context_copy.sha256, .lower);
-    log("NVIDIA boot-context: address={x} bytes={d} used-planes={d} sha256={s} window-writes={d} restored=yes immutable=yes", .{
-        context_copy.address, context_copy.bytes, context_copy.surfaces, context_hash, context_copy.window_writes,
+    log("NVIDIA boot-context: instance-active={} address={x} bytes={d} used-planes={d} sha256={s} window-writes={d} restored=yes immutable=yes", .{
+        context_copy.instance_active, context_copy.address, context_copy.bytes, context_copy.surfaces, context_hash, context_copy.window_writes,
     });
     for (boot_context.surfaces[0..boot_context.surface_count]) |*surface| {
         log("NVIDIA boot-surface: window={d} plane={d} eye={d} handle={x} instance-offset={x} vram={x} bytes={d} row-bytes={d} rows={d} layout={s} backup-offset={d}", .{

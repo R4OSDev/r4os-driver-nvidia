@@ -1036,6 +1036,17 @@ const BootVramFixture = struct {
             }
         }
     }
+    fn setupInactiveInstance() void {
+        const scanout = @import("boot_scanout.zig");
+        setupScanout();
+        put(0x610010, 1);
+        put(0x610014, 0);
+        for ([_]usize{ 0, 7 }) |window| put(scanout.armed_base + 0x1000 + window * 0x80, 15);
+        put(scanout.armed_base + 0x209c, 0xe9);
+        put(scanout.armed_base + 0x2288, 0);
+        // Stale unassigned window LUT/plane words and disabled cursor DMA
+        // handles remain nonzero; they must not create active dependencies.
+    }
     fn setupInstance() void {
         @memset(&display_instance, 0);
         const d = @import("display_context.zig");
@@ -1590,7 +1601,7 @@ fn checkBootVramOwner() !void {
     try t.expectError(error.Duplicate, display_decoder.lookup(&f.display_instance, 0x2a3, 0x100, 1));
     @memcpy(f.display_instance[duplicate_entry * 8 ..][0..8], &saved_entry);
     try t.expectError(error.Target, display_decoder.instance(10, 0x100, 0x100000000));
-    try t.expectError(error.Control, display_decoder.instance(1, 0x100, 0x100000000));
+    try t.expect((try display_decoder.instance(1, 0x100, 0x100000000)) == null);
     try t.expectError(error.Bounds, display_decoder.instance(9, 0x100, f.display_address + 4096));
     const iso_context = display_context.surfaces[0].context.descriptor;
     try t.expectError(error.Bounds, display_decoder.surface(iso_context, 0x800000, 800, 600, 64, 0, try display_decoder.format(0xcf), 0, 0x100000000));
@@ -1809,7 +1820,7 @@ fn checkBootVramOwner() !void {
     // DriverShutdown. Exercise the same pre-return snapshot cleanup path.
     for ([_]bool{ false, true }) |restore_failure| {
         f.setupScanout();
-        f.put(display_decoder.instance_control_register, 1); // No valid instance.
+        f.put(display_decoder.instance_control_register, 0x11); // Reserved control bit.
         _ = try capture.capture(&ctx, &snapshot, chip);
         _ = try mapped_boot.capture(&capture);
         try t.expectError(error.Control, display_context.capture(&capture));
@@ -1827,4 +1838,50 @@ fn checkBootVramOwner() !void {
             std.mem.allEqual(bool, &f.leases, false));
         for (&f.buffers) |buffer| try t.expect(buffer == null);
     }
+    // OssiPC's STATUS_INVALID instance consumes no fabricated address-zero
+    // backing. The same held snapshot must still reobserve every raw control.
+    f.setupInactiveInstance();
+    _ = try capture.capture(&ctx, &snapshot, chip);
+    _ = try mapped_boot.capture(&capture);
+    const inactive = try display_context.capture(&capture);
+    try t.expect(!inactive.instance_active and inactive.address == 0 and inactive.bytes == 0 and
+        inactive.surfaces == 0 and inactive.assets == 0 and inactive.payload_bytes == 0 and inactive.window_writes == 0);
+    var empty_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&.{}, &empty_digest, .{});
+    try t.expectEqualSlices(u8, &empty_digest, &inactive.sha256);
+    try t.expect(display_context.valid(&capture) and f.buffers[0] != null and f.buffers[1] != null and
+        f.buffers[2] == null and f.buffers[3] == null and f.buffers[4] == null);
+    try display_context.admit(&capture, &prepared.plan);
+    var inactive_copy = display_context;
+    try t.expect(!inactive_copy.valid(&capture) and !inactive_copy.close());
+    display_context.instance_active = true;
+    try t.expect(!display_context.valid(&capture));
+    display_context.instance_active = false;
+    f.put(display_decoder.instance_address_register, 1);
+    try t.expectError(error.ScanoutChanged, display_context.admit(&capture, &prepared.plan));
+    try t.expect(!driver.closeBootSnapshots(&display_context, &mapped_boot, &capture) and f.held);
+    f.put(display_decoder.instance_address_register, 0);
+    try t.expect(driver.closeBootSnapshots(&display_context, &mapped_boot, &capture));
+    // Each active dependency is rejected before any context/payload BO read.
+    for (0..3) |dependency| {
+        f.setupInactiveInstance();
+        switch (dependency) {
+            0 => f.put(scanout.armed_base + 0x1000 + 7 * 0x80, 1),
+            1 => f.put(scanout.armed_base + 0x209c + 0x400, 0x800000e9),
+            2 => f.put(scanout.armed_base + 0x2288 + 0x400, 0x999),
+            else => unreachable,
+        }
+        _ = try capture.capture(&ctx, &snapshot, chip);
+        try t.expectError(error.InstanceDependency, display_context.capture(&capture));
+        try t.expect(!display_context.ready and f.buffers[2] == null and f.buffers[3] == null and f.buffers[4] == null);
+        try t.expect(driver.closeBootSnapshots(&display_context, &mapped_boot, &capture));
+        try t.expect(!f.held and std.mem.allEqual(bool, &f.mapped, false) and std.mem.allEqual(bool, &f.leases, false));
+        for (&f.buffers) |buffer| try t.expect(buffer == null);
+        // Restore the extra head fields before the next fixture.
+        f.put(scanout.armed_base + 0x2288 + 0x400, 0);
+    }
+    try t.expectError(error.Target, display_decoder.instance(0, 0, 0));
+    try t.expectError(error.Control, display_decoder.instance(0x11, 0, 0));
+    try t.expectError(error.Control, display_decoder.instance(1, 0x80000000, 0));
+    try t.expect((try display_decoder.instance(3, 0x7fffffff, 0)) == null);
 }

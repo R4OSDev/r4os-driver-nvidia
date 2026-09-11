@@ -721,13 +721,15 @@ test "firmware CPU storage complete run lease retains all boot DMA owners" {
     var capture: @import("boot_vram.zig").Capture = .{ .context = ctx, .ready = true };
     capture.self_address = @intFromPtr(&capture);
     capture.boot.held_generation = 9;
+    capture.scanout_original = .{ .instance_control = 9, .instance_address = 0x10 };
     // Explicit host-only retained mapping fixture for this DMA lifetime test.
     var boot_mapping: @import("boot_mapping.zig").Capture = .{ .parent = &capture, .epoch = 9, .ready = true };
     boot_mapping.self_address = @intFromPtr(&boot_mapping);
     capture.mapping_owner = boot_mapping.self_address;
     const context_bytes = try std.testing.allocator.alloc(u8, 65536);
     defer std.testing.allocator.free(context_bytes);
-    var boot_context: @import("boot_context.zig").Capture = .{ .parent = &capture, .epoch = 9, .ready = true, .reference = .{ .reference = .{ .id = 71, .generation = 1 } }, .map = .{ .lease = .{ .id = 72, .generation = 1 }, .cpu_address = @intFromPtr(context_bytes.ptr), .byte_length = context_bytes.len } };
+    var boot_context: @import("boot_context.zig").Capture = .{ .parent = &capture, .epoch = 9, .ready = true,
+        .instance_active = true, .framebuffer_bytes = prepared.plan.fb_bytes, .span = .{ .address = 0x100000, .bytes = 65536 }, .reference = .{ .reference = .{ .id = 71, .generation = 1 } }, .map = .{ .lease = .{ .id = 72, .generation = 1 }, .cpu_address = @intFromPtr(context_bytes.ptr), .byte_length = context_bytes.len } };
     boot_context.stamp = boot_context.map;
     boot_context.self_address = @intFromPtr(&boot_context);
     capture.context_owner = boot_context.self_address;
