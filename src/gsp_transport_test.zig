@@ -6,6 +6,7 @@ const display_rpc = @import("gsp_display_rpc.zig");
 const objects = @import("gsp_objects.zig");
 const sequencer = @import("gsp_sequencer.zig");
 const runtime_events = @import("gsp_runtime_events.zig");
+const event_objects = @import("gsp_event_objects.zig");
 const message = transport.message;
 const ring = transport.ring;
 const profile = message.Profile{ .chip_id = 0x176 };
@@ -1315,12 +1316,238 @@ fn checkRuntimeEvents(model: *Model) !void {
     }
 }
 
+fn eventPlan() !event_objects.Plan {
+    return event_objects.Plan.init(try objectPlan(), .{ .hotplug = 0xe001, .dp_irq = 0xe007 });
+}
+fn startEventObjects(model: *Model, base: *objects.Owner) !event_objects.Owner {
+    try createAll(model, base);
+    var loan = try base.loan(deadline);
+    model.count = 0;
+    return event_objects.Owner.init(&loan.runtime, try eventPlan(), deadline);
+}
+fn eventReply(model: *Model, owner: *event_objects.Owner, status: u32) !void {
+    var bytes: [56]u8 = undefined;
+    const operation = owner.outstanding.?;
+    const encoded = try event_objects.encode(&owner.plan, operation, &bytes);
+    put(&bytes, if (operation == .allocate) 16 else 12, status);
+    if (operation == .enable or operation == .disable) {
+        // Failed controls may leave copyout untouched, including invalid bool.
+        bytes[32] = if (status == 0) 1 else 0xff;
+        bytes[33] = 0xa5;
+        put(&bytes, 36, 0x80000005);
+        std.mem.writeInt(u16, bytes[40..42], 0x79ab, .little);
+        bytes[42] = 0xff;
+    }
+    const count = if (operation == .allocate and operation.allocate == .hotplug) 32 else encoded.bytes.len;
+    try model.replyRpc(owner.exchange.session, .{ .function = encoded.function, .result = 0 }, bytes[0..count]);
+}
+fn eventOperation(model: *Model, owner: *event_objects.Owner, expected: event_objects.Operation, status: u32) !void {
+    try t.expect((try owner.poll()) == null);
+    try t.expectEqualDeep(expected, owner.outstanding.?);
+    try eventReply(model, owner, status);
+    try t.expect((try owner.poll()) == null);
+}
+const event_create = [_]event_objects.Operation{ .{ .allocate = .hotplug }, .{ .enable = .hotplug }, .{ .allocate = .dp_irq }, .{ .enable = .dp_irq } };
+const event_destroy = [_]event_objects.Operation{ .{ .disable = .dp_irq }, .{ .free = .dp_irq }, .{ .disable = .hotplug }, .{ .free = .hotplug } };
+fn registeredPost(bytes: *[40]u8, kind: event_objects.Kind, list: bool) []const u8 {
+    _ = postPayload(bytes);
+    put(bytes, 0, 0xc100);
+    put(bytes, 4, if (kind == .hotplug) 0xe001 else 0xe007);
+    put(bytes, 8, event_objects.index(kind));
+    put(bytes, 20, 0);
+    put(bytes, 24, if (kind == .hotplug) 8 else 4);
+    bytes[28] = @intFromBool(list);
+    return bytes[0..if (kind == .hotplug) @as(usize, 40) else 36];
+}
+fn checkEventObjects(model: *Model) !void {
+    const plan = try eventPlan();
+    try t.expectError(error.Handle, event_objects.Plan.init(plan.base, .{ .hotplug = 0, .dp_irq = 0xe007 }));
+    try t.expectError(error.Handle, event_objects.Plan.init(plan.base, .{ .hotplug = 0xe001, .dp_irq = 0xe001 }));
+    try t.expectError(error.Handle, event_objects.Plan.init(plan.base, .{ .hotplug = plan.base.handles.subdevice, .dp_irq = 0xe007 }));
+    var bytes: [56]u8 = undefined;
+    const alloc = try event_objects.encode(&plan, .{ .allocate = .hotplug }, &bytes);
+    try t.expectEqual(@as(u32, 103), alloc.function);
+    for ([_]u32{ 0xc100, 0xd208, 0xe001, 0x7e, 0, 24, 0, 0, 0xc100, 0, 0x7e, 0x04000001, 0, 0 }, 0..) |value, i| try t.expectEqual(value, get(&bytes, i * 4));
+    const enable = try event_objects.encode(&plan, .{ .enable = .dp_irq }, &bytes);
+    try t.expect(enable.function == 76 and enable.bytes.len == 44);
+    for ([_]u32{ 0xc100, 0xd208, 0x20800301, 0, 20, 0, 7, 2, 0, 0, 0 }, 0..) |value, i| try t.expectEqual(value, get(enable.bytes, i * 4));
+    try t.expectError(error.Bounds, event_objects.encode(&plan, .{ .allocate = .hotplug }, bytes[0..55]));
+    // Original output padding is arbitrary; active fields and identities are not.
+    bytes[32] = 1;
+    bytes[33] = 0xff;
+    put(&bytes, 36, 0x80000001);
+    std.mem.writeInt(u16, bytes[40..42], 0x79ab, .little);
+    const shape = try message.encode(profile, 0, .{ .function = 76, .result = 0 }, enable.bytes, &model.frame);
+    var record = try message.decode(profile, model.frame[0..shape.storage_bytes], 0);
+    const valid = try event_objects.decode(&plan, .{ .enable = .dp_irq }, record);
+    try t.expectEqualDeep(event_objects.Initial{ .notify_state = true, .info32 = 0x80000001, .info16 = 0x79ab }, valid.ok.?);
+    const original = record.payload;
+    record.payload = original[0..43];
+    try t.expectError(error.Payload, event_objects.decode(&plan, .{ .enable = .dp_irq }, record));
+    record.payload = bytes[0..44];
+    bytes[32] = 2;
+    try t.expectError(error.Payload, event_objects.decode(&plan, .{ .enable = .dp_irq }, record));
+    put(&bytes, 12, 0x55);
+    try t.expectEqual(@as(u32, 0x55), (try event_objects.decode(&plan, .{ .enable = .dp_irq }, record)).rm_error);
+    put(&bytes, 4, 0xd209);
+    try t.expectError(error.Unexpected, event_objects.decode(&plan, .{ .enable = .dp_irq }, record));
+
+    var session: transport.Session = undefined;
+    var base = try startObjects(model, &session);
+    var owner = try startEventObjects(model, &base);
+    try t.expectError(error.State, owner.loan(deadline));
+    for (event_create) |operation| try eventOperation(model, &owner, operation, 0);
+    try t.expect(owner.state == .ready and base.state == .loaned);
+    try t.expectEqual(@as(u16, 0x79ab), owner.slots[0].initial.?.info16);
+    var loan = try owner.loan(deadline);
+    var channel = try display_rpc.Channel.init(&loan.runtime, loan.object, deadline);
+    try t.expectError(error.State, owner.poll());
+    try t.expectError(error.State, owner.reclaim(&loan.runtime, deadline));
+    try t.expect(session.state == .active);
+    try channel.begin(.supported, deadline);
+    try t.expect((try channel.poll(deadline)) == null);
+    try displayReply(model, &channel, 0, 0x80000001);
+    try channel.complete((try channel.poll(deadline)).?.ticket);
+    try channel.begin(.{ .connected = 0x80000001 }, deadline);
+    try t.expect((try channel.poll(deadline)) == null);
+    var post: [40]u8 = undefined;
+    // Both routing forms reach the sole matching registration, even while
+    // the runtime queue belongs to a display query under the event graph loan.
+    for ([_]event_objects.Kind{ .hotplug, .dp_irq }, 0..) |kind, i| {
+        try model.replyRpc(&session, .{ .function = 0x1003, .result = 0 }, registeredPost(&post, kind, i == 0));
+        const received = (try channel.poll(deadline)).?;
+        try t.expect(received.value == .notification and channel.request != null);
+        var handler = try runtime_events.Dispatch.initDisplay(&channel, owner.sink());
+        try t.expectError(error.Pending, owner.takeChanges(deadline));
+        const kicks = model.notifications;
+        try handler.step();
+        try t.expect(handler.acknowledged and channel.pending == null and channel.exchange.pending == null and session.pending == null);
+        try t.expect(channel.exchange.phase == .waiting and channel.request != null and model.notifications == kicks);
+        const effects = model.count;
+        try handler.step();
+        try t.expectEqual(effects, model.count);
+    }
+    const changes = try owner.takeChanges(deadline);
+    try t.expectEqualDeep(event_objects.Changes{ .serial = 2, .plug = 0x80000001, .unplug = 1, .dp_irq = 0x80000001 }, changes);
+    try t.expectEqualDeep(event_objects.Changes{ .serial = 2 }, try owner.takeChanges(deadline));
+    @memset(&model.rx, 0xcc); // Delivered state holds no borrowed firmware bytes.
+    try displayReply(model, &channel, 0, 0x80000001);
+    const obsolete = (try channel.poll(deadline)).?;
+    try t.expect(obsolete.value.reply == .obsolete and channel.connected == 0);
+    try channel.complete(obsolete.ticket);
+    var returned = try channel.handoff(deadline);
+    try owner.reclaim(&returned, deadline);
+    model.count = 0;
+    try owner.beginDestroy(deadline);
+    for (event_destroy) |operation| try eventOperation(model, &owner, operation, 0);
+    var finished = try owner.finish(deadline);
+    try t.expect(owner.sink().generation(&owner) == 0);
+    try base.reclaim(&finished, deadline);
+    try base.beginDestroy(deadline);
+    for (0..4) |i| {
+        try t.expect((try base.poll()) == null);
+        try t.expectEqual(@as(objects.Kind, @enumFromInt(3 - i)), base.outstanding.?.free);
+        try objectReply(model, &base, 0, false);
+        try t.expect((try base.poll()) == null);
+    }
+    _ = try base.finish(deadline);
+    try t.expect(session.state == .active); // Object cleanup is not GPU quiescence.
+
+    // A confirmed allocation/enable rejection permits bounded cleanup of the
+    // live prefix. A failed enable is disabled before its object can be freed.
+    for (0..event_create.len) |failed| {
+        base = try startObjects(model, &session);
+        owner = try startEventObjects(model, &base);
+        for (event_create[0..failed]) |operation| try eventOperation(model, &owner, operation, 0);
+        try eventOperation(model, &owner, event_create[failed], 0x51);
+        try t.expect(owner.state == .rejected and base.state == .loaned);
+        try owner.beginDestroy(deadline + 100);
+        const first: usize = switch (failed) {
+            0 => 4,
+            1, 2 => 2,
+            3 => 0,
+            else => unreachable,
+        };
+        for (event_destroy[first..]) |operation| try eventOperation(model, &owner, operation, 0);
+        if (failed == 0) try t.expect((try owner.poll()) == null);
+        _ = try owner.finish(deadline + 100);
+    }
+    // Stop on each failed teardown operation and retain the parent graph.
+    for (0..event_destroy.len) |failed| {
+        base = try startObjects(model, &session);
+        owner = try startEventObjects(model, &base);
+        for (event_create) |operation| try eventOperation(model, &owner, operation, 0);
+        try owner.beginDestroy(deadline);
+        for (event_destroy[0..failed]) |operation| try eventOperation(model, &owner, operation, 0);
+        try t.expect((try owner.poll()) == null);
+        try eventReply(model, &owner, 0x55);
+        try t.expectError(error.FirmwareResult, owner.poll());
+        try t.expect(owner.state == .failed and base.state == .loaned and session.state == .failed);
+        try t.expectError(error.State, owner.finish(deadline));
+        const count = model.count;
+        try t.expectError(error.State, owner.poll());
+        try t.expectEqual(count, model.count);
+        for (base.slots) |slot| try t.expectEqual(objects.Slot.live, slot);
+    }
+    // Exact registration matching, late queued events during enable/disable,
+    // and an ACK lost after effects must all use the real retained receipt.
+    const Fault = enum { none, disabling, client, event, index, ack, stale, expired };
+    for (std.enums.values(Fault)) |fault| {
+        base = try startObjects(model, &session);
+        owner = try startEventObjects(model, &base);
+        try eventOperation(model, &owner, event_create[0], 0);
+        if (fault == .disabling) {
+            for (event_create[1..]) |operation| try eventOperation(model, &owner, operation, 0);
+            try owner.beginDestroy(deadline);
+        }
+        try t.expect((try owner.poll()) == null);
+        const payload = registeredPost(&post, if (fault == .disabling) .dp_irq else .hotplug, false);
+        put(&post, 20, 0x51);
+        if (fault == .client) put(&post, 0, 0xc101);
+        if (fault == .event) put(&post, 4, 0xe007);
+        if (fault == .index) put(&post, 8, 7);
+        try model.replyRpc(&session, .{ .function = 0x1003, .result = 0 }, payload);
+        _ = (try owner.poll()).?;
+        if (fault == .client or fault == .event or fault == .index) {
+            try t.expectError(error.Denied, runtime_events.Dispatch.init(&owner.exchange, owner.sink()));
+            try t.expect(owner.changes.serial == 0 and session.pending != null and session.state == .failed);
+            continue;
+        }
+        var handler = try runtime_events.Dispatch.init(&owner.exchange, owner.sink());
+        if (fault == .ack) {
+            model.fault = model.count + 1;
+            model.after = true;
+        }
+        if (fault == .stale) model.epoch += 1;
+        if (fault == .expired) model.now = deadline;
+        if (fault == .none or fault == .disabling) {
+            try handler.step();
+            try t.expect(owner.changes.serial == 1 and owner.changes.event_error and session.pending == null);
+            try eventReply(model, &owner, 0);
+            try t.expect((try owner.poll()) == null);
+        } else {
+            try t.expectError(switch (fault) {
+                .ack => error.Io,
+                .stale => error.Stale,
+                .expired => error.Deadline,
+                else => unreachable,
+            }, handler.step());
+            try t.expect(session.state == .failed and session.pending != null);
+            try t.expectEqual(@as(u64, if (fault == .ack) 1 else 0), owner.changes.serial);
+            const count = model.count;
+            try t.expectError(error.State, handler.step());
+            try t.expectEqual(count, model.count);
+        }
+    }
+}
+
 test "GSP transport orders range publication, explicit acknowledgement and terminal ambiguous failures" {
     const model = try t.allocator.create(Model);
     defer t.allocator.destroy(model);
     try checkDisplayRpc(model);
     try checkObjects(model);
     try checkRuntimeEvents(model);
+    try checkEventObjects(model);
     for (0..4) |flags| {
         var session = try model.start(@intCast(flags));
         // Device-only neighbour changes must survive CPU command publication.

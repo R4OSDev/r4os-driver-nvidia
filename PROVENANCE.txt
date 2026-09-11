@@ -1,5 +1,12 @@
 ﻿Original R4OS implementation for roadmap 0.79.9, 10.09.2026.
 
+RM display event objects (0.79.12, 2026-09-11):
+NVIDIA 570.144 event/RPC wire definitions and Nouveau allocation/routing: MIT.
+Thirteen full pinned originals under event-objects-20260911; eight full
+original notices in gsp_event_objects.zig. Original R4OS bounded lifecycle,
+receipt and owner integration: Apache-2.0. NVIDIA 0.1.44 remains byte-identical.
+
+
 GSP runtime notifications (0.79.10, 2026-09-11):
 Fixed NVIDIA 570.144 wire/notification layouts and Nouveau framing: MIT.
 Eleven full pinned originals under runtime-events-20260911. New source retains

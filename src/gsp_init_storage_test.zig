@@ -548,6 +548,30 @@ fn checkNativeRuntimeSequencer(port: *QueueNative.native.Port, channel: *@import
                 try t.expect(response.response);
                 try channel.complete(response.ticket);
                 try t.expect(channel.phase == .idle and session.state == .active);
+                // Display owns an additional semantic receipt. Native CPU
+                // completion must release it as well as the shared exchange.
+                const display_rpc = @import("gsp_display_rpc.zig");
+                var token = try channel.handoff(limit);
+                var display = try display_rpc.Channel.init(&token, .{ .epoch = session.epoch, .client = 0xc100, .display = 0xd073 }, limit);
+                var display_execution: native.RuntimeSequencer = .{};
+                try t.expectError(error.State, display_execution.beginDisplay(port, &display, limits));
+                @memset(&bytes, 0);
+                std.mem.writeInt(u32, bytes[0..4], 4, .little);
+                std.mem.writeInt(u32, bytes[4..8], 3, .little);
+                std.mem.writeInt(u32, bytes[44..48], 0x1000, .little);
+                std.mem.writeInt(u32, bytes[48..52], 0x79, .little);
+                try nativeEvent(session, 0x1002, bytes[0..52]);
+                const notice = (try display.poll(limit)).?;
+                try t.expect(notice.value == .notification);
+                try display_execution.beginDisplay(port, &display, limits);
+                try t.expect((try display_execution.step()) == .complete);
+                try t.expect(fixture.words[0x1000 / 4] == 0x79 and display.pending == null and display.exchange.pending == null and session.pending == null);
+                try t.expect(display_execution.close());
+                const display_ranges = range_calls;
+                var reclaimed = try display.handoff(limit);
+                channel.* = try @import("gsp_exchange.zig").Exchange.init(&reclaimed, limit);
+                try t.expect(range_calls == display_ranges and channel.phase == .idle and port.runtime_sequence == null);
+                try t.expectEqual(accesses, fixture.queue_accesses);
                 return;
             },
             .runtime_seq_timeout => {

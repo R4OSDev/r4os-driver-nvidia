@@ -29,6 +29,7 @@
 const std = @import("std");
 const events = @import("gsp_boot_events.zig");
 const exchange = @import("gsp_exchange.zig");
+const display_rpc = @import("gsp_display_rpc.zig");
 const message = @import("gsp_message.zig");
 pub const Error = error{ Profile, Options, Payload, Opcode, Register, Slot, Denied, Unsupported, State, Stale, Clock, Deadline, Timeout, Io };
 pub const Opcode = enum(u32) { write = 0, modify, poll, delay_us, store, core_reset, core_start, core_halt, core_resume };
@@ -288,17 +289,20 @@ pub const Limits = struct { default_timeout_ns: u64, poll_interval_ns: u64, regi
 const Source = union(enum) {
     boot: *events.Boot,
     runtime: *exchange.Exchange,
+    display: *display_rpc.Channel,
 
     fn session(self: Source) *@import("gsp_transport.zig").Session {
         return switch (self) {
             .boot => |owner| owner.session,
             .runtime => |owner| owner.session,
+            .display => |owner| owner.exchange.session,
         };
     }
     fn deadline(self: Source) DispatchError!u64 {
         return switch (self) {
             .boot => |owner| owner.deadline,
             .runtime => |owner| owner.deadline orelse error.State,
+            .display => |owner| owner.exchange.deadline orelse error.State,
         };
     }
     fn borrow(self: Source, ticket: @import("gsp_transport.zig").Ticket) DispatchError!events.Sequencer {
@@ -309,6 +313,11 @@ const Source = union(enum) {
                 if (dispatch.response or dispatch.record.rpc.function != @intFromEnum(events.Kind.cpu_sequencer)) return error.State;
                 break :blk try events.decode(dispatch.record);
             },
+            .display => |owner| blk: {
+                if ((try owner.borrow(ticket)).value != .notification) return error.State;
+                const dispatch = try owner.exchange.borrow(ticket);
+                break :blk try events.decode(dispatch.record);
+            },
         };
         if (event != .cpu_sequencer) return error.State;
         return event.cpu_sequencer;
@@ -317,12 +326,14 @@ const Source = union(enum) {
         return switch (self) {
             .boot => |owner| owner.complete(ticket),
             .runtime => |owner| owner.complete(ticket),
+            .display => |owner| owner.complete(ticket),
         };
     }
     fn reject(self: Source, ticket: @import("gsp_transport.zig").Ticket) void {
         switch (self) {
             .boot => |owner| owner.reject(ticket) catch {},
             .runtime => |owner| owner.reject(ticket) catch {},
+            .display => |owner| owner.reject(ticket) catch {},
         }
     }
 };
@@ -348,6 +359,12 @@ pub const DispatchExecution = struct {
         const pending = owner.pending orelse return error.State;
         if (pending.response or pending.record.rpc.function != @intFromEnum(events.Kind.cpu_sequencer)) return error.State;
         return initSource(.{ .runtime = owner }, pending.ticket, port, limits);
+    }
+    pub fn initDisplay(owner: *display_rpc.Channel, port: Port, limits: Limits) DispatchError!DispatchExecution {
+        const pending = owner.pending orelse return error.State;
+        const dispatch = try owner.borrow(pending.ticket);
+        if (dispatch.value != .notification or dispatch.rpc.function != @intFromEnum(events.Kind.cpu_sequencer)) return error.State;
+        return initSource(.{ .display = owner }, pending.ticket, port, limits);
     }
     fn initSource(source: Source, ticket: @import("gsp_transport.zig").Ticket, port: Port, limits: Limits) DispatchError!DispatchExecution {
         errdefer source.reject(ticket);

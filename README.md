@@ -10,6 +10,31 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
+RM display event objects (source preparation for 0.79.12, 2026-09-11):
+
+The driver now owns bounded allocation, enable, disable and free sequences
+for one HPD and one DP-IRQ event on a single RM client/subdevice. The caller
+reserves all names and retains the live parent graph. Confirmed creation
+rejections allow reverse cleanup; a possibly enabled event is disabled first.
+Failed disable/free or ambiguous transport/ACK retains objects and parents.
+
+Exact client/event/index and receipt checks route addressed/list notices to
+the sole registration. Copied change masks preserve all bits and overlap;
+they require later monitor/EDID refresh. Initial notifier data is raw state.
+Display-aware ordinary and CPU-sequencer completion now clears the Channel
+receipt together with its Exchange ACK, preserving an outstanding query and
+allowing handoff. Events cannot leave a stale semantic dispatch behind.
+
+51 existing cases and one module build pass; NVIDIA 0.1.44 is byte-identical.
+The temporary original-C comparison confirms event24, notification20 and
+ALLOC32/CONTROL24/FREE16. Thirteen full pinned references, source notices,
+logs and the two corrected fixture compile failures are archived under
+ExFiles/Reference/GFX/Nvidia/0.79.12/event-objects-20260911.
+See event_objects_checkpoint in Docs/Drivers/GrafikFirmware07910.json.
+No new grouped case/gate or guest run. Productive bootstrap, global RM name
+reservation, native event registration/refresh/recovery and physical display/
+audio acceptance remain open. OssiPC offline and untouched.
+
 GSP runtime notifications (source preparation for 0.79.10, 2026-09-11):
 
 The shared runtime exchange now has typed decoding and bounded owner delivery

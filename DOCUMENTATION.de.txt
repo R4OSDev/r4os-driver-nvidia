@@ -10,6 +10,32 @@ unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
 
+RM-Display-Eventobjekte (Quellvorbereitung fuer 0.79.12, 11.09.2026)
+-----------------------------------------------------------------
+Der Treiber besitzt nun begrenzte Allocate-/Enable-/Disable-/Free-Ablaeufe
+fuer je ein HPD- und DP-IRQ-Event an einem RM-Client/Subdevice. Der Aufrufer
+reserviert alle Namen und haelt den lebenden Elterngraphen. Bestaetigte
+Erzeugungsfehler erlauben rueckwaertigen Abbau; moeglicherweise aktive Events
+werden zuerst deaktiviert. Fehler bei Disable/Free oder mehrdeutiges ACK
+halten Eventobjekte und Eltern fest. Objektabbau beweist keine GPU-Ruhe.
+
+Exakter Client/Event/Index und Meldungsbeleg ordnen Einzel-/Listennachrichten
+der jeweils einzigen Registrierung zu. Kopierte Aenderungsmasken behalten
+alle Bits und Ueberlappungen; danach muss Monitor/EDID neu abgefragt werden.
+Initiale Notifierdaten bleiben Rohinformationen. Gewoehnliche Meldungen und
+CPU-Sequencer schliessen ueber den Display-Channel ab: dessen Meldungszustand
+wird gemeinsam mit dem Exchange-ACK freigegeben, offene Abfragen bleiben
+erhalten und koennen anschliessend veraltet abgeschlossen werden.
+
+51 bestehende Faelle und ein Modulbuild bestanden; NVIDIA 0.1.44 bytegleich.
+Temporaerer Original-C-Abgleich bestaetigt Event24, Notification20 sowie
+ALLOC32/CONTROL24/FREE16. Dreizehn vollstaendige gepinnte Originale, Lizenzen,
+Logs und die zwei korrigierten Compilefehler der Testhilfen: ExFiles/Reference/
+GFX/Nvidia/0.79.12/event-objects-20260911. Siehe event_objects_checkpoint in
+GrafikFirmware07910.json. Keine neuen Faelle/Gates/Gastlaeufe. Produktiver
+Boot, globale RM-Namensvergabe, native Registrierung/Refresh/Recovery und
+physische Grafik-/Audioabnahme bleiben offen. OssiPC offline/unberuehrt.
+
 GSP-Laufzeitmeldungen (Quellvorbereitung, 11.09.2026)
 -------------------------------------------------
 Zwoelf gewoehnliche Runtime-Meldungsarten besitzen jetzt typisierte Decoder

@@ -106,6 +106,7 @@ const transport = @import("gsp_transport.zig");
 const run_memory = @import("gsp_run_memory.zig");
 const events = @import("gsp_boot_events.zig");
 const exchange = @import("gsp_exchange.zig");
+const display_rpc = @import("gsp_display_rpc.zig");
 // Bare-metal RM queue 0, NV_PGSP_QUEUE_HEAD(0). This is not SWGEN0 or a
 // virtual-function doorbell. The memory cursor is published separately.
 pub const command_queue_head: u32 = 0x110c00;
@@ -622,6 +623,14 @@ pub const RuntimeSequencer = struct {
     failure: ?anyerror = null,
 
     pub fn begin(self: *RuntimeSequencer, device: *Port, owner: *exchange.Exchange, limits: seq.Limits) !void {
+        return self.beginSource(device, owner, limits, null);
+    }
+    pub fn beginDisplay(self: *RuntimeSequencer, device: *Port, owner: *display_rpc.Channel, limits: seq.Limits) !void {
+        const pending = owner.pending orelse return error.State;
+        if ((try owner.borrow(pending.ticket)).value != .notification) return error.State;
+        return self.beginSource(device, &owner.exchange, limits, owner);
+    }
+    fn beginSource(self: *RuntimeSequencer, device: *Port, owner: *exchange.Exchange, limits: seq.Limits, display_owner: ?*display_rpc.Channel) !void {
         if (self.self_address != 0 or device.runtime_sequence != null) return error.Busy;
         if (device.phase != .runtime or device.runtime_session != owner.session) return error.State;
         const pending = owner.pending orelse return error.State;
@@ -637,7 +646,7 @@ pub const RuntimeSequencer = struct {
             self.failure = err;
         }
         // Whole-stream admission runs before any register read/write/core step.
-        self.execution = try seq.DispatchExecution.initRuntime(owner, self.io(), limits);
+        self.execution = if (display_owner) |channel| try seq.DispatchExecution.initDisplay(channel, self.io(), limits) else try seq.DispatchExecution.initRuntime(owner, self.io(), limits);
     }
     fn from(p: *anyopaque) *RuntimeSequencer {
         return @ptrCast(@alignCast(p));

@@ -121,6 +121,7 @@
 const std = @import("std");
 const boot = @import("gsp_boot_events.zig");
 const exchange = @import("gsp_exchange.zig");
+const display_rpc = @import("gsp_display_rpc.zig");
 const transport = exchange.transport;
 const message = transport.message;
 pub const Error = exchange.Error || error{ Unsupported, Denied, SequencerRequired };
@@ -299,6 +300,7 @@ pub const Sink = struct {
 /// event and all borrowed backing remain immutable until completion/failure.
 pub const Dispatch = struct {
     owner: *exchange.Exchange,
+    display_owner: ?*display_rpc.Channel = null,
     sink: Sink,
     scope: Scope,
     event: Event,
@@ -322,8 +324,20 @@ pub const Dispatch = struct {
         try self.guard();
         return self;
     }
+    /// Display queries cache their semantic dispatch as well as the shared
+    /// receipt. Complete through that owner so ACK and cache release agree.
+    pub fn initDisplay(owner: *display_rpc.Channel, sink: Sink) Error!Dispatch {
+        const pending = owner.pending orelse return error.State;
+        if ((try owner.borrow(pending.ticket)).value != .notification) return error.State;
+        var result = try init(&owner.exchange, sink);
+        result.display_owner = owner;
+        return result;
+    }
     fn guard(self: *Dispatch) Error!void {
         if (self.failed) return error.State;
+        if (self.display_owner) |owner| {
+            if (&owner.exchange != self.owner or (try owner.borrow(self.scope.ticket)).value != .notification) return error.State;
+        }
         _ = try self.owner.borrow(self.scope.ticket);
         self.scope.deadline = @min(self.scope.deadline, self.owner.deadline.?);
         try self.owner.guard(self.scope.deadline);
@@ -349,7 +363,7 @@ pub const Dispatch = struct {
         };
         self.delivered = true;
         try self.guard();
-        try self.owner.complete(self.scope.ticket);
+        if (self.display_owner) |owner| try owner.complete(self.scope.ticket) else try self.owner.complete(self.scope.ticket);
         self.acknowledged = true;
     }
 };
