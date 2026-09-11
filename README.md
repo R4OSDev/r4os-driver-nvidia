@@ -7,8 +7,10 @@ Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
 subsystem 1458:4074, VBIOS 94.06.2f.00.d6. Preparation for 0.79.10 continues.
 This owner inventories NVIDIA display functions once through
 the kernel PCI inventory. It does not initialize engines or take over scanout.
-`IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
-and any existing display owner remain in control.
+Starting with R4OS 0.79.9, `IMAGE_SCOPE=slim` includes the current module in
+Slim and Full. The standard configuration selects `mode=passive`; no GPU
+firmware is executed. The boot framebuffer and existing display owner remain
+in control. Full includes DISPLAYD for subsequent hardware diagnostics.
 
 RM connector/resource topology (source preparation, 2026-09-11):
 
