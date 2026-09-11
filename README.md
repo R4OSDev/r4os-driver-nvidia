@@ -47,6 +47,23 @@ cleanup succeeded. Bootfb remained 800x600 at generation 1/reset 0; all
 inventory and unique runtime records establish the update; no separate
 installed-module download or fresh visible-image/audio acceptance was made.
 
+`gsp_init_storage.zig` now owns this 844-KB image through the existing R4D
+heap/DMA facade. One contiguous mapping covers both argument pages, five
+contiguous mappings cover the logs, and one mapping supports up to 64 queue
+segments. Arguments are to-device; logs and queues are bidirectional. Backing
+is zeroed before any initial map synchronization and all seven mappings are
+synchronized again after encoding. Only then is a complete report published.
+
+The shared monotonic deadline brackets each operation. Partial pins/maps and
+failed in/out release descriptors remain owned. Cleanup retires all mappings
+in reverse order, then all pins, then the single resident allocation, using
+the cached shutdown API. It does not own the other boot allocations supplied
+as exclusion spans. A future execution owner must prove actual quiescence
+before releasing any memory that has been submitted to the GPU.
+The existing host step passes 40 cases, including one new grouped case with
+17 storage scenarios and exact full-buffer bounce synchronization. This owner
+is not yet connected to module init; NVIDIA.R4D 0.1.23 and OssiPC stay unchanged.
+
 The next host preparation, `gsp_init.zig`, encodes the pinned GA106 first-boot
 Libos and RM arguments, five 64-KB release log areas and two 256-KB message
 queues. The complete caller-owned image needs 844 KB. Its queue table includes

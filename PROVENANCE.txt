@@ -3,6 +3,17 @@ Host/module scaffolding follows R4OS SDK and existing R4D owners.
 Firmware fixture bodies and signatures are synthetic. Selected measured
 table fields are explicit regression data, as described below.
 
+0.79.10 GSP init storage owner (host), 11.09.2026:
+gsp_init_storage.zig is original Apache-2.0 R4OS ownership/orchestration code
+using existing DriverApi heap, pin, map, synchronize, unmap and unpin calls.
+The previously qualified MIT-attributed gsp_init.zig encoding is unchanged.
+The new host case uses synthetic physical spans and R4D callbacks, including
+initial/final bounce copies and retained failed releases. It executes no GPU.
+No new upstream implementation, header or resource is linked into NVIDIA.R4D;
+module 0.1.23 and its complete packaged notices remain unchanged. Prior
+original C/msgq evidence and 25 full source/notice files accompany the new
+ExFiles/Reference/GFX/Nvidia/0.79.10/gsp-init-storage-20260911 checkpoint.
+
 0.79.10 Libos/RM/log/queue initialization (host), 11.09.2026:
 gsp_init.zig adapts format and initial field assignments from the pinned
 libos_init_args.h (2018-2022), gsp_init_args.h (2020-2024), kernel_gsp.c

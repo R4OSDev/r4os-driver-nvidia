@@ -9,6 +9,7 @@ comptime {
     _ = @import("gsp_dma_test.zig");
     _ = @import("gsp_boot_storage_test.zig");
     _ = @import("boot_resources.zig");
+    _ = @import("gsp_init_storage_test.zig");
 }
 const Fault = enum { none, create, map, unmap, release, collect, read, short };
 var fault: Fault = .none;

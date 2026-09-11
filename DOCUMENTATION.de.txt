@@ -9,6 +9,33 @@ Boardanschluesse. Die spaeteren PROM-Boots bestaetigen softwareseitig den
 unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
+Besitzer fuer GSP-Initialisierungsspeicher (Host)
+----------------------------------------------
+gsp_init_storage.zig besitzt den 844-KB-Initialisierungspuffer ueber die
+vorhandene R4D-Fassade: eine Heapallokation, ein zusammenhaengendes Mapping
+fuer beide Argumentseiten, fuenf fuer Logs und eines mit bis zu64 Segmenten
+fuer Queues. Argumente verwenden to-device; Logs/Queues bidirectional.
+Vor der ersten Abbildung wird alles genullt. Nach Kodierung werden alle
+sieben Abbildungen erneut synchronisiert, damit auch Bouncekopien die
+endgueltigen PTEs und Startdaten erhalten. Erst danach erscheint der Report.
+
+Gemeinsame monotone Frist, exakte Deskriptorpruefung und geordneter Rueckbau:
+alle Mappings rueckwaerts, danach Pins rueckwaerts, zuletzt Heap. Fehlerhafte
+In-/Out-Freigaben verlieren keinen Besitzer; auch teilweise erfolgreiche
+Pin-/Map-Aufrufe bleiben fuer den naechsten Abschlussversuch erhalten.
+Die Heap-API bleibt fuer Shutdown gecacht. Fremde Bootbelegungen werden
+nur auf Ueberlappung geprueft, nicht von diesem Owner besessen/freigegeben.
+
+40/40 Besitzerfaelle bestanden; ein neuer zusammengefasster Fall deckt17
+Szenarien ab: Teilallokation/-pin/-map, Deskriptor/Richtung, interne/externe
+Aliase, Adressgrenze, letzte Synchronisierung, Frist/Clock-Ruecklauf und
+Unmap-/Unpin-/Release-Retry. Der Bouncefall vergleicht den gesamten844KB-
+Geraetepuffer nach erneuter Synchronisierung. Originalencoder/C-ABI bleiben
+unveraendert; kein erneuter Dateipruefer/ABI-, Modul-, Gast- oder Hardwarelauf.
+Noch keine Modulanbindung, Empfangssynchronisierung, Queue-Aushandlung,
+RPC/IRQ oder GPU-Nutzung. Nach spaeterer Einreichung ist vor Freigabe echte
+Quieszenz durch den Ausfuehrungsbesitzer erforderlich.
+
 GSP-Initialisierungsdaten (Host; NVIDIA 0.1.23 unveraendert)
 ---------------------------------------------------------
 gsp_init.zig kodiert fuer den gepinnten normalen GA106-Erststart Libos-
