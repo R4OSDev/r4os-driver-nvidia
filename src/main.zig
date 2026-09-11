@@ -42,6 +42,7 @@ var boot_storage: gsp_boot_storage.Storage = .{};
 var init_storage: gsp_init_storage.Storage = .{};
 var run_memory: gsp_run_memory.Lease = .{};
 var booters: booter_storage.Pair = .{};
+var boot_display: @import("boot_display.zig").Snapshot = .{};
 // Bounded resident scratch: do not copy the maximum boot SG list to the stack.
 var init_excluded: [gsp_init.max_excluded]gsp_init.Span = undefined;
 var checking_boot = false;
@@ -159,6 +160,7 @@ pub export fn nvidia_init(api: *const a.DriverApi) callconv(.c) i32 {
 }
 
 pub export fn nvidia_shutdown() callconv(.c) i32 {
+    if (!boot_display.close()) return -1;
     const api = driver_api orelse return 0;
     const ctx = r4os.r4dev.DriverContext.init(api);
     if (!wait_probe.shutdown(&ctx)) return -1;
@@ -427,6 +429,22 @@ fn inspectFwsecState(ctx: *const r4os.r4dev.DriverContext, snapshot: *const iden
 }
 
 fn checkBoot(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, chip: identity.Chip, raw: fwsec_state.Raw) bool {
+    const display_copy = boot_display.capture(ctx, 0x01000000 | (@as(u32, snapshot.pci.bus) << 8) |
+        (@as(u32, snapshot.pci.device) << 3) | snapshot.pci.function) catch |err| {
+        log("NVIDIA boot-display: rejected reason={s} status={d} native-writes=disabled", .{ @errorName(err), boot_display.last_status });
+        _ = boot_display.close();
+        return false;
+    };
+    const snapshot_hash = std.fmt.bytesToHex(display_copy.sha256, .lower);
+    log("NVIDIA boot-display: captured bytes={d} geometry={d}x{d} pitch={d} boot-generation={d} hold-generation={d} sha256={s} writers=revoked snapshot=immutable effects=none", .{
+        display_copy.bytes, display_copy.boot.width, display_copy.boot.height, display_copy.boot.pitch,
+        display_copy.boot.generation, display_copy.hold_generation, snapshot_hash,
+    });
+    if (!boot_display.close()) {
+        ctx.logError("NVIDIA boot-display: cleanup=retained native-writes=disabled");
+        return false;
+    }
+    ctx.logInfo("NVIDIA boot-display: cleanup=OK writers=restored snapshot-references=0 hardware-recovery=unperformed");
     const inputs = boot_inputs.load(ctx, 30 * std.time.ns_per_s) catch |err| {
         log("NVIDIA boot-check: rejected phase=boot-resources reason={s} fallback=preserved", .{@errorName(err)});
         boot_inputs.close();

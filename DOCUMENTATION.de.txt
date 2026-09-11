@@ -10,7 +10,42 @@ unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
 
-Zusammenhaengender Falcon-Reset-/Firmwarelauf (Hostnachweis)
+Fruehe Bootbildsicherung (Kernel 0.1.150 / NVIDIA 0.1.28)
+------------------------------------------------------
+Der gemeinsame Displaybesitzer kann normale Present-Aufrufe und direkte
+Firmware-Console-Schreiber vor Ausgangs-/Queue-Erkennung sperren. Er kopiert
+alle pitch*height Bytes inklusive Zeilenpadding in einen residenten Byte-BO
+und haelt eigene Referenz plus unveraenderliche Leseliehe. Alte Display-API:
+40-Byte-Praefix unveraendert, zwei optionale groessenbepruefte Aufrufe bis 56
+Bytes. Alte Anbieter bleiben nutzbar. Kurze Anfrageheader werden vor dem
+Lesen des kompletten Payloads abgewiesen; DriverApi 34 bleibt unveraendert.
+
+Vor dem ersten moeglichen Geraeteeffekt ist Retention zwingend zu setzen.
+Danach darf nur der reale Treiber DMA-Ruhe und die wiederhergestellte alte
+Scanoutabbildung bestaetigen; erst dann schreibt der Kernel gesicherte Pixel
+zurueck. Fehler halten Besitzer, Snapshot und Schreibersperre. Ein bereits
+bestaetigter Hardware-Restore wird bei spaeterem Freigabefehler nicht nochmals
+ausgefuehrt. Der Zustand bleibt preparing mit echtem pending_owner; kein
+erfundener Ausgang, Queue-Meilenstein oder Resetabschluss wird gemeldet.
+
+Der vorhandene NVIDIA-Bootcheck sichert, hasht und gibt das Bild vor seiner
+nicht eingereichten Firmwarevorbereitung frei. OssiPC: 2457600 Bytes,
+800x600/Pitch 4096, Bootgeneration 1 / Haltegeneration 2; danach Referenzen 0 und
+Schreiber wieder offen. Kernel 150 / NVIDIA 28 ueber SYSUPD installiert und die
+exakte passive Konfiguration wiederhergestellt. Keine GPU-Firmwareausfuehrung,
+Displayregisterwrites, echte GPU-Recovery oder neue Bild-/Tonabnahme.
+
+48 vorhandene Displayfaelle, 11 SDK-Faelle samt C, Contract und bestehender
+SMP4-EXAMPLE-gfx-memory-Test bestanden. Reale BOs pruefen alte Query/Canary,
+kurzen Header, Schreibschutz, alte Generation, fruehen Referenzabwurf und
+gleichen Snapshot nach Freigabe des Kernelbesitzes. Ein zweiter kurzer Gastlauf
+folgte auf die konkrete Headerkorrektur; keine neue Fallanzahl/Gate/Variante.
+Native VRAM/VGA-Zuordnung, Bindung an den Firmwarelauf und physische Recovery
+bleiben offen; der ausfuehrbare Falconpfad bleibt ungelinkt. Archiv:
+ExFiles/Reference/GFX/Nvidia/0.79.10/boot-display-20260911.
+Aktueller JSON-Beleg: boot_display_checkpoint. 0.79.10 bleibt offen.
+
+Historisch: Zusammenhaengender Falcon-Reset-/Firmwarelauf (Hostnachweis)
 ---------------------------------------------------------
 falcon_run besitzt Engine-Reset, anschliessende TCM-Messung und HS-Upload in
 einer begrenzten Operation. Der gemeinsame Corecode verwendet jetzt auch

@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-Passive NVIDIA display driver for R4OS. Module 0.1.27; original R4OS code is
+Passive NVIDIA display driver for R4OS. Module 0.1.28; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -10,7 +10,38 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
-Complete GA106 reset-to-firmware run (host qualified):
+Early boot-display preservation (NVIDIA 0.1.28 / Kernel 0.1.150):
+
+The common display owner can now freeze normal and firmware CPU writers
+before output/queue discovery. It copies every boot framebuffer row, including
+pitch padding, into a real resident byte BO and keeps a separate reference
+and immutable read lease. The old display API's 40-byte prefix is preserved;
+two optional size-gated slots extend it to 56 bytes. Older providers remain
+usable. Short request headers are rejected before reading the full payload.
+
+Before the first possible device effect the owner must latch retention.
+Afterwards only actual driver-confirmed DMA quiescence and restoration of the
+original scanout mapping permit pixel restoration and release. Failed cleanup
+or recovery keeps the driver, snapshot and writer gate. Confirmed hardware
+recovery is not replayed merely because a later resource release failed.
+The hold publishes a real pending owner and no native device capabilities.
+
+The existing NVIDIA boot-check captures/hashes/releases this snapshot before
+its unsubmitted firmware preparation. OssiPC preserved 2,457,600 bytes at
+800x600, pitch 4096, boot generation 1 / hold generation 2, then released all
+snapshot references. Kernel 150 / NVIDIA 28 were installed through SYSUPD and the
+exact passive configuration restored. No GPU firmware or display register
+programming, actual GPU recovery, new visible-image or audio acceptance.
+
+48 existing display cases, 11 SDK cases plus C, Contract checks and the existing
+SMP4 EXAMPLE gfx-memory fixture pass. The guest uses actual BOs, checks the old
+query canary, immutable writes, stale holds and early producer release. No new
+test case count, recurring gate or guest profile. Native VRAM/VGA ownership,
+firmware-run binding and real GPU recovery remain open. The executable Falcon
+paths are still unlinked. Current evidence: `boot_display_checkpoint` in
+`Docs/Drivers/GrafikFirmware07910.json`, archive `boot-display-20260911`.
+
+Earlier complete GA106 reset-to-firmware run (host qualified):
 
 `falcon_run` owns engine reset, fresh TCM observations and the HS upload as
 one bounded operation. The shared core implementation now selects SEC2's
