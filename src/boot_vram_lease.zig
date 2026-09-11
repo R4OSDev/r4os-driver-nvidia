@@ -23,6 +23,7 @@ pub const Lease = struct {
     pin: u64 = 0,
     cpu_address: u64 = 0,
     metadata_address: u64 = 0,
+    frts_consumer: usize = 0,
 
     /// Serialized native init/work owner. Reject every stale input before
     /// publishing either borrow; no fallible operation follows publication.
@@ -93,12 +94,37 @@ pub const Lease = struct {
         return std.meta.eql(current.range, value.range);
     }
 
+    /// Keep the real reservation and snapshots while an unsubmitted FWSEC
+    /// image names FRTS. Only one resident FWSEC consumer may borrow it.
+    pub fn borrowFrts(self: *Lease, consumer: usize) !Binding {
+        if (consumer == 0 or self.frts_consumer != 0) return error.Owner;
+        const value = try self.binding(.frts);
+        if (value.range.bytes != 1024 * 1024 or value.range.offset & 4095 != 0) return error.Target;
+        self.frts_consumer = consumer;
+        return value;
+    }
+
+    pub fn holdsFrts(self: *const Lease, consumer: usize, value: Binding) bool {
+        return consumer != 0 and self.frts_consumer == consumer and value.target == .frts and self.validates(value);
+    }
+
+    pub fn releaseFrtsBeforeSubmission(self: *Lease, consumer: usize, value: Binding) bool {
+        if (!self.owns() or consumer == 0 or self.frts_consumer != consumer or value.target != .frts or
+            value.owner != self.self_address or value.epoch != self.epoch or value.serial != self.serial or
+            self.plan == null or !std.meta.eql(value.range, self.plan.?.frts) or
+            self.backing.?.execution_owner != 0 or self.backing.?.image.execution_owner != 0) return false;
+        // CPU metadata corruption prevents execution admission, but does not
+        // prevent releasing this exact unsubmitted consumer after DMA close.
+        self.frts_consumer = 0;
+        return true;
+    }
+
     /// Only after the unsubmitted DMA execution lease was released. Neither
     /// corrupt CPU metadata nor a clock timeout manufactures GPU quiescence.
     /// The current diagnostic never submits; any retained run blocks this path.
     pub fn releaseBeforeSubmission(self: *Lease) bool {
         if (self.self_address == 0) return true;
-        if (!self.owns() or self.backing.?.execution_owner != 0 or self.backing.?.image.execution_owner != 0) return false;
+        if (!self.owns() or self.frts_consumer != 0 or self.backing.?.execution_owner != 0 or self.backing.?.image.execution_owner != 0) return false;
         self.display.?.borrower = 0;
         self.backing.?.vram_owner = 0;
         self.* = .{ .serial = self.serial };

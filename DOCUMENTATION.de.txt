@@ -10,7 +10,37 @@ unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
 
-Boot-VRAM-Reservierung und Snapshot-Lebensdauer (NVIDIA 0.1.30)
+FWSEC-FRTS an gehaltenen VRAM binden (NVIDIA 0.1.31)
+-------------------------------------------------
+Der optionale Bootcheck schliesst zuerst sein bisheriges SB-Abbild samt DMA
+und bereitet aus dem gehaltenen VBIOS ein neues unveraenderliches FRTS-Abbild
+vor. Befehl 0x15 benennt den exakten reservierten 1-MB-Zielbereich ueber den
+unveraenderten 48-Byte-Encoder. Die echte DMA-API uebernimmt die vorbereiteten
+Bytes einschliesslich moeglicher Bounce-Kopie. Volle Displaygeneration,
+Reservierungsnummer, feste Besitzeradresse, API-Identitaet und lebende
+Ziel-/Metadatenbindung werden vor dem Ausfuehrungsbesitz geprueft.
+
+Das exklusive FRTS-Leihverhaeltnis bleibt auch bei Teilallokation und Fehlern
+beim Freigeben bestehen. Erst DMA aushaengen, Seiten loesen und CPU-Puffer
+freigeben, danach das Ziel und die uebergeordnete VRAM-/Bildsicherung loesen.
+Ein spaeter Fehler beim Zielabbau verursacht keine doppelte CPU-Freigabe.
+Ein gehaltener Ausfuehrungsbesitzer verhindert vorzeitigen Abbau.
+
+51 vorhandene Besitzerfaelle und Modulbuild bestanden. Der bestehende
+Lifecyclefall prueft echte FRTS-CPU-/DMA-Bytes, zehn Vorbereitungs-/Abbauszenarien
+und falsche/verschobene/doppelte Besitzer. Eine beim ersten Testkompilieren
+kollidierende Fixture-Variable wurde umbenannt; Log erhalten. Keine neue
+Fallzahl, kein Gate/Gastlauf. R4D: 380928 residente Bytes, 3589 Relocations,
+24 unveraenderte gepinnte Ressourcen. Neue Bindung ist originaler R4OS-Code;
+Encoder, Fremdcode und Lizenzpakete unveraendert.
+
+OssiPC offline und unveraendert, kein Zugriff/Update/Reboot. NVIDIA31 ist nur
+lokal gebaut/geprueft; letzter physischer Stand Kernel150/NVIDIA28 passiv.
+FRTS wird vorbereitet, noch nicht ausgefuehrt. Vollstaendige GPU-/Scanout-
+Recovery, Firmwarestart und HDMI bleiben offen. Beleg: fwsec_frts_checkpoint.
+Archiv: ExFiles/Reference/GFX/Nvidia/0.79.10/fwsec-frts-20260911.
+
+Historisch: Boot-VRAM-Reservierung und Snapshot-Lebensdauer (NVIDIA 0.1.30)
 -------------------------------------------------------------
 Der vorhandene Bootcheck behaelt Bootbild und VGA-Sicherung nun waehrend
 Firmware-, DMA- und Queuevorbereitung. Ein exklusiver residenter Besitzer

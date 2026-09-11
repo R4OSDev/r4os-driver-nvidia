@@ -18,6 +18,8 @@ pub const Inputs = struct {
     boot: boot.Report,
     init: init.Report,
     fwsec: @import("fwsec_load.zig").Plan,
+    fwsec_command: u32,
+    frts: ?@import("boot_vram_lease.zig").Binding,
     booters: [2]struct { prepared: booter.Prepared, plan: @import("fwsec_load.zig").Plan },
     resume_args: core.Resume,
 };
@@ -60,7 +62,7 @@ pub const Lease = struct {
     }
     fn available(b: *boot.Storage, i: *init.Storage, f: *security.Storage, p: *booters.Pair, api: *const a.DriverApi) bool {
         if (b.execution_owner != 0 or b.image.execution_owner != 0 or i.execution_owner != 0 or f.device.execution_owner != 0) return false;
-        if (b.report == null or b.image.report == null or i.report == null or !f.complete or f.device.prepared_plan == null) return false;
+        if (b.report == null or b.image.report == null or i.report == null or !f.preparationValid() or f.device.prepared_plan == null) return false;
         if (b.context == null or b.image.context == null or i.context == null or f.device.context == null) return false;
         if (b.context.?.api != api or b.image.context.?.api != api or i.context.?.api != api or f.device.context.?.api != api) return false;
         if (!bootersMatch(p, api, 0)) return false;
@@ -135,7 +137,7 @@ pub const Lease = struct {
             i.execution_owner != self.self_address or f.device.execution_owner != self.self_address) return false;
         if (b.context == null or b.image.context == null or i.context == null or f.device.context == null or
             b.context.?.api != self.api or b.image.context.?.api != self.api or i.context.?.api != self.api or f.device.context.?.api != self.api) return false;
-        if (b.report == null or b.image.report == null or i.report == null or !f.complete or f.device.prepared_plan == null or
+        if (b.report == null or b.image.report == null or i.report == null or !f.preparationValid() or f.device.prepared_plan == null or
             b.image.piece_count == 0 or b.image.piece_count > gsp_dma.max_mappings or i.piece_count != init.max_mappings) return false;
         for (allocationsFor(b, i, f, p), self.allocations) |allocation, expected| if (allocation.handle != expected) return false;
         var maps: [map_count]*const a.DmaMapping = undefined;
@@ -155,7 +157,9 @@ pub const Lease = struct {
         if (self.generation() == 0) return error.Stale;
         const b = self.boot_storage.?.report.?;
         const i = self.init_storage.?.report.?;
-        var result: Inputs = .{ .boot = b, .init = i, .fwsec = self.fwsec_storage.?.device.prepared_plan.?, .booters = undefined, .resume_args = .{ .libos_dma = i.init.libos_address, .app_version = b.app_version } };
+        const f = self.fwsec_storage.?;
+        var result: Inputs = .{ .boot = b, .init = i, .fwsec = f.device.prepared_plan.?, .fwsec_command = f.command,
+            .frts = f.frts_binding, .booters = undefined, .resume_args = .{ .libos_dma = i.init.libos_address, .app_version = b.app_version } };
         for (&self.booter_storage.?.images, &result.booters) |*image, *input| input.* = .{ .prepared = image.prepared.?, .plan = image.device.prepared_plan.? };
         return result;
     }

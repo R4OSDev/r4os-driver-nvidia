@@ -172,6 +172,7 @@ pub export fn nvidia_shutdown() callconv(.c) i32 {
     if (!thread_probe.shutdown(&ctx)) return -1;
     if (!runtime_probe.shutdown(&ctx)) return -1;
     if (!closeBootInit()) return -1;
+    if (boot_vram_lease.self_address != 0 and !fwsec_cpu.close()) return -1;
     if (!boot_vram_lease.releaseBeforeSubmission()) return -1;
     if (!boot_storage.close()) return -1;
     if (!boot_vram.close()) return -1;
@@ -394,14 +395,15 @@ fn inspectFwsec(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.
     log("NVIDIA fwsec: dmem-base={x} dmem-destination={x} dmem-offset={x} dmem-blocks={d} dmem-command={x} pkc-address={x} boot-vector={x} execution=not-started", .{
         load_plan.dmem.base, load_plan.dmem.destination, load_plan.dmem.source_offset, load_plan.dmem.bytes / 256, load_plan.dmem.command, load_plan.signature_address, load_plan.boot_vector,
     });
-    if (!inspectFwsecState(ctx, snapshot, chip, &load_plan)) return false;
+    if (!inspectFwsecState(ctx, snapshot, chip, &load_plan, .{ .rom = rom, .board = board, .fuses = fuses })) return false;
     if (!fwsec_cpu.close()) return false;
     log("NVIDIA fwsec: preparation-cleanup=OK resources=0", .{});
     log("NVIDIA fwsec: firmware-ready=no native-writes=disabled fallback=preserved", .{});
     return true;
 }
 
-fn inspectFwsecState(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, chip: identity.Chip, plan: *const @import("fwsec_load.zig").Plan) bool {
+const FwsecSource = struct { rom: []const u8, board: *const vbios.Result, fuses: fwsec_prepare.Fuses };
+fn inspectFwsecState(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, chip: identity.Chip, plan: *const @import("fwsec_load.zig").Plan, source: FwsecSource) bool {
     const raw = fwsec_hardware.read(ctx, snapshot, chip) catch |err| {
         log("NVIDIA fwsec: preflight=unavailable phase=registers reason={s} native-writes=disabled", .{@errorName(err)});
         return fwsec_hardware.close();
@@ -430,11 +432,11 @@ fn inspectFwsecState(ctx: *const r4os.r4dev.DriverContext, snapshot: *const iden
         return true;
     };
     ctx.logInfo("NVIDIA fwsec: preflight-tcm=fits snapshot=read-only mmio-cleanup=OK reset=unperformed execution=not-started");
-    if (checking_boot and !checkBoot(ctx, snapshot, chip, raw)) return false;
+    if (checking_boot and !checkBoot(ctx, snapshot, chip, raw, source)) return false;
     return true;
 }
 
-fn checkBoot(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, chip: identity.Chip, raw: fwsec_state.Raw) bool {
+fn checkBoot(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, chip: identity.Chip, raw: fwsec_state.Raw, source: FwsecSource) bool {
     const vram_copy = boot_vram.capture(ctx, snapshot, chip) catch |err| {
         log("NVIDIA boot-vram: rejected reason={s} status={d} window-writes={d} firmware-execution=disabled", .{
             @errorName(err), boot_vram.last_status, boot_vram.window_writes,
@@ -503,6 +505,23 @@ fn checkBoot(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Sna
     log("NVIDIA boot-check: boot-address={x} signature-address={x} metadata-address={x} metadata-bytes={d} verified=0 boot-count=0 vram-reserved=boot-owner vga-relocated=no", .{
         report.boot_address, report.signature_address, report.metadata_address, report.metadata_bytes,
     });
+    // The earlier passive SB image must be fully unmapped/freed before a new
+    // immutable FRTS image is constructed and synchronized for the device.
+    if (!fwsec_cpu.close()) return false;
+    const security = fwsec_cpu.prepareFrts(ctx, source.rom, source.board, source.fuses, &boot_vram_lease) catch |err| {
+        log("NVIDIA boot-frts: rejected phase=cpu-preparation reason={s} submitted=no", .{@errorName(err)});
+        return false;
+    };
+    const security_plan = fwsec_cpu.device.stage(ctx, security.image, &security.metadata) catch |err| {
+        log("NVIDIA boot-frts: rejected phase=dma-preparation reason={s} submitted=no", .{@errorName(err)});
+        return false;
+    };
+    const current = fwsec_state.decode(&boot_vram.observation.?) catch return false;
+    current.checkTcm(&security_plan) catch return false;
+    if (!fwsec_cpu.preparationValid()) return false;
+    log("NVIDIA boot-frts: staged command={x} input-bytes=48 target-address={x} target-bytes={d} epoch={d} serial={d} dma-address={x} synchronized=yes submitted=no", .{
+        security.metadata.command, frts.range.offset, frts.range.bytes, frts.epoch, frts.serial, fwsec_cpu.device.mapping.segments[0].phys_addr,
+    });
     const fuses = security_fuses.readBooter(ctx, snapshot, chip) catch |err| {
         log("NVIDIA booters: rejected phase=fuses reason={s} submitted=no", .{@errorName(err)});
         _ = security_fuses.close();
@@ -533,6 +552,7 @@ fn checkBoot(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Sna
         return false;
     }
     ctx.logInfo("NVIDIA boot-init: cleanup=OK mappings=0 pins=0 cpu=0 submitted=no");
+    if (!fwsec_cpu.close()) return false;
     if (!boot_vram_lease.releaseBeforeSubmission()) return false;
     if (!boot_storage.close()) {
         ctx.logError("NVIDIA boot-check: cleanup=retained submitted=no");
@@ -578,6 +598,7 @@ fn stageBootInit(ctx: *const r4os.r4dev.DriverContext, chip_id: u16) bool {
         return false;
     };
     const bindings = run_memory.inputs() catch return false;
+    if (bindings.fwsec_command != 0x15 or bindings.frts == null or !boot_vram_lease.validates(bindings.frts.?)) return false;
     const port = run_memory.transportPort() catch return false;
     const before = port.now_ns(port.context);
     if (before == std.math.maxInt(u64) or before >= init_storage.deadline) return false;

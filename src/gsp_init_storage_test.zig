@@ -218,6 +218,9 @@ test "firmware CPU storage complete run lease retains all boot DMA owners" {
         image.device.prepared_plan = try booter.loadPlan(image.prepared.?, image.device.mapping.segments[0].phys_addr, bytes);
     }
     var lease: run.Lease = .{};
+    f.command = 0x15; // A bare FRTS command without a retained VRAM target is invalid.
+    try t.expectError(error.Storage, lease.acquire(&ctx, &b, &storage, &f, &p));
+    f.command = 0x19;
     f.device.context = r4os.r4dev.DriverContext.init(&other_table);
     try t.expectError(error.Storage, lease.acquire(&ctx, &b, &storage, &f, &p));
     f.device.context = ctx;
@@ -250,6 +253,8 @@ test "firmware CPU storage complete run lease retains all boot DMA owners" {
     try t.expect(!b.close() and !b.image.close() and !f.close() and !f.device.close() and !storage.close() and !p.close());
     try t.expect(f.complete and b.report != null and b.image.report != null and storage.report != null and close_calls == 0);
     const inputs = try lease.inputs();
+    try t.expectEqual(@as(u32, 0x19), inputs.fwsec_command);
+    try t.expect(inputs.frts == null);
     try t.expectEqual(@as(usize, 12), lease.mapped_count);
     for (&p.images, inputs.booters) |*image, binding| {
         try t.expectEqual(image.prepared.?.operation, binding.prepared.operation);

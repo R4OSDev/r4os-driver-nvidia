@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-Passive NVIDIA display driver for R4OS. Module 0.1.30; original R4OS code is
+Passive NVIDIA display driver for R4OS. Module 0.1.31; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -10,7 +10,33 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
-Boot VRAM reservation and snapshot lifetime (NVIDIA 0.1.30):
+FWSEC-FRTS preparation bound to retained VRAM (NVIDIA 0.1.31):
+
+The opt-in boot-check now closes its earlier SB CPU/DMA image and prepares
+a fresh immutable FRTS image from the retained VBIOS. Command 0x15 names the
+exact reserved 1-MB FRTS region through the unchanged 48-byte encoder. The
+real DMA API stages all prepared bytes, including supported bounce copies.
+The full display epoch, reservation serial, stable consumer address, API
+identity and live target/metadata are checked before execution-lease admission.
+
+The exclusive target borrow survives partial allocation and cleanup failures.
+DMA unmap, unpin and CPU free precede target release; the parent VRAM lease
+and snapshots stay held until then. A late target-release failure cannot free
+the CPU image twice. Active execution owners prevent premature close.
+
+All 51 existing owner cases and the module build pass. The existing lifecycle
+case now checks actual FRTS CPU/DMA bytes, ten preparation/cleanup scenarios,
+wrong/moved/duplicate owners and retained release. The first test compilation
+needed a fixture variable rename; its log is preserved. No new case count,
+gate or guest run. R4D: 380,928 resident bytes, 3,589 relocations, 24 unchanged
+pinned nonresident resources. No additional external implementation is linked.
+
+OssiPC is offline and untouched; last physical evidence is Kernel150/NVIDIA28
+passive. This prepares FRTS without executing it. Full GPU/scanout recovery,
+firmware startup and HDMI remain open. Evidence: `fwsec_frts_checkpoint` in
+`Docs/Drivers/GrafikFirmware07910.json`; archive `fwsec-frts-20260911`.
+
+Earlier boot VRAM reservation and snapshot lifetime (NVIDIA 0.1.30):
 
 The existing boot-check now keeps its boot/VGA snapshots throughout firmware
 resource, DMA and queue preparation. A resident exclusive reservation binds

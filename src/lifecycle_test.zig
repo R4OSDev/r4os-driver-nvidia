@@ -984,6 +984,147 @@ const BootVramFixture = struct {
     fn put(address: usize, value: u32) void { std.mem.writeInt(u32, registers[address..][0..4], value, .little); }
 };
 
+// The existing lifecycle case uses a real FWSEC CPU allocation and the SDK
+// DMA descriptors. The fake map copies the exact submitted preparation bytes;
+// this is a host model, not GPU firmware execution or authentication.
+const FrtsFixture = struct {
+    const Fault = enum { none, short_input, allocation, pin, map, unmap, unpin, cpu_free, late_borrow_release, bounce };
+    var fault: Fault = .none;
+    var backing: ?[]align(256) u8 = null;
+    var pinned = false;
+    var mapped = false;
+    var allocations: u32 = 0;
+    var frees: u32 = 0;
+    var copied: [1280]u8 = undefined;
+    fn heapQuery(out: *a.DriverHeapApi) callconv(.c) i32 {
+        out.* = .{ .allocate = @intFromPtr(&allocateImage), .release = @intFromPtr(&releaseImage) };
+        return a.driver_heap_ok;
+    }
+    fn allocateImage(bytes: u64, alignment: u32, out: *a.DriverHeapAllocation) callconv(.c) i32 {
+        std.debug.assert(bytes == 1280 and alignment == 256 and backing == null);
+        backing = std.heap.page_allocator.alignedAlloc(u8, comptime std.mem.Alignment.fromByteUnits(256), @intCast(bytes)) catch return -1;
+        @memset(backing.?, 0xa5);
+        allocations += 1;
+        out.* = .{ .handle = 0x310000001, .cpu_address = @intFromPtr(backing.?.ptr), .byte_length = bytes, .alignment = alignment };
+        return if (fault == .allocation) -1 else a.driver_heap_ok;
+    }
+    fn releaseImage(handle: u64) callconv(.c) i32 {
+        std.debug.assert(handle == 0x310000001 and backing != null and !pinned and !mapped);
+        if (fault == .cpu_free) return -1;
+        std.heap.page_allocator.free(backing.?);
+        backing = null;
+        frees += 1;
+        return a.driver_heap_ok;
+    }
+    fn pinImage(address: u64, bytes: u32, flags: u32, out: *a.DmaPinnedBuffer) callconv(.c) i32 {
+        std.debug.assert(backing != null and !pinned and !mapped and address == @intFromPtr(backing.?.ptr) and bytes == 1280 and flags == 0);
+        pinned = true;
+        out.* = .{ .handle = 0x310000002, .virt_addr = address, .bytes = bytes, .page_count = @intCast(((address & 4095) + bytes + 4095) / 4096) };
+        return if (fault == .pin) -1 else 0;
+    }
+    fn mapImage(pin: *const a.DmaPinnedBuffer, constraints: *const a.DmaConstraints, direction: u32, out: *a.DmaMapping) callconv(.c) i32 {
+        std.debug.assert(pinned and !mapped and backing != null and pin.handle == 0x310000002 and direction == a.dma_direction_to_device);
+        std.debug.assert(constraints.alignment == 256 and constraints.max_segments == 1 and constraints.max_segment_bytes == 1280 and constraints.flags == 5);
+        mapped = true;
+        @memcpy(&copied, backing.?);
+        out.* = .{ .handle = 0x310000003, .pin_handle = pin.handle, .requested_bytes = pin.bytes, .mapped_bytes = pin.bytes,
+            .direction = direction, .flags = constraints.flags | (if (fault == .bounce) a.dma_mapping_flag_bounced else @as(u32, 0)), .segment_count = 1 };
+        out.segments[0] = .{ .phys_addr = 0x4123456700, .bytes = pin.bytes };
+        return if (fault == .map) -1 else 0;
+    }
+    fn unmapImage(descriptor: *a.DmaMapping) callconv(.c) i32 {
+        std.debug.assert(mapped and pinned and backing != null and descriptor.handle == 0x310000003);
+        descriptor.* = .{};
+        if (fault == .unmap) return -1;
+        mapped = false;
+        return 0;
+    }
+    fn unpinImage(descriptor: *a.DmaPinnedBuffer) callconv(.c) i32 {
+        std.debug.assert(!mapped and pinned and backing != null and descriptor.handle == 0x310000002);
+        descriptor.* = .{};
+        if (fault == .unpin) return -1;
+        pinned = false;
+        return 0;
+    }
+    fn wordAt(data: []const u8, offset: usize) u32 { return std.mem.readInt(u32, data[offset..][0..4], .little); }
+};
+
+fn checkFrtsStorage(ctx: *const r4os.r4dev.DriverContext, owner: *@import("boot_vram_lease.zig").Lease) !void {
+    const f = FrtsFixture;
+    const cpu = @import("fwsec_storage.zig");
+    const input = @import("fwsec_test.zig");
+    const selection = @import("fwsec_prepare.zig");
+    const target = try owner.binding(.frts);
+    const fuses: selection.Fuses = .{ .debug_disable_raw = 1, .ucode_version_raw = 8, .ucode_id = 9 };
+    for (std.meta.tags(f.Fault)) |fault| {
+        f.fault = fault;
+        var rom = input.ga106Fixture();
+        const board = try vbios.parse(&rom, 0x2504);
+        const entry = (try selection.select(&rom, &board, fuses)).entry;
+        if (fault == .short_input) input.put32(&rom, entry.interface.mapper.offset + 12, 47);
+        const original = rom;
+        const allocation_count = f.allocations;
+        const free_count = f.frees;
+        var image: cpu.Storage = .{};
+        defer { f.fault = .none; _ = image.close(); }
+        var other_api = ctx.api.*;
+        const other = r4os.r4dev.DriverContext.init(&other_api);
+        try t.expectError(error.Vram, image.prepareFrts(&other, &rom, &board, fuses, owner));
+        try t.expect(f.allocations == allocation_count and owner.frts_consumer == 0);
+        const prepared = image.prepareFrts(ctx, &rom, &board, fuses, owner);
+        if (fault == .short_input or fault == .allocation) {
+            try t.expectError(if (fault == .short_input) error.Capacity else error.Memory, prepared);
+            try t.expect(!image.preparationValid());
+        } else {
+            const value = try prepared;
+            try t.expect(image.preparationValid() and value.metadata.command == 0x15);
+            const input_offset = entry.interface.command_input.offset - entry.image.offset;
+            const mapper = entry.interface.mapper.offset - entry.image.offset;
+            try t.expectEqual(@as(u32, 0x15), f.wordAt(value.image, mapper + 44));
+            try t.expectEqual(@as(u32, @intCast(target.range.offset / 4096)), f.wordAt(value.image, input_offset + 32));
+            try t.expectEqual(@as(u32, 0x100), f.wordAt(value.image, input_offset + 36));
+            try t.expectEqual(@as(u32, 2), f.wordAt(value.image, input_offset + 40));
+            try t.expectEqual(@as(u32, 0), f.wordAt(value.image, input_offset + 44));
+            var moved = image;
+            try t.expect(!moved.preparationValid() and !moved.close());
+            var duplicate: cpu.Storage = .{};
+            try t.expectError(error.Vram, duplicate.prepareFrts(ctx, &rom, &board, fuses, owner));
+            try t.expect(duplicate.close());
+            try t.expectError(error.Busy, image.prepare(ctx, &rom, &board, fuses));
+            const staged = image.device.stage(ctx, value.image, &value.metadata);
+            if (fault == .pin or fault == .map) {
+                try t.expectError(if (fault == .pin) error.Pin else error.Map, staged);
+            } else {
+                const plan = try staged;
+                try t.expect(plan.imem.base != target.range.offset and image.device.mapping.segments[0].phys_addr != image.allocation.cpu_address);
+                try t.expectEqualSlices(u8, value.image, &f.copied);
+                try t.expectEqual(fault == .bounce, image.device.mapping.flags & a.dma_mapping_flag_bounced != 0);
+                image.device.execution_owner = 99;
+                try t.expect(!image.close() and image.preparationValid() and f.backing != null);
+                image.device.execution_owner = 0;
+            }
+        }
+        try t.expectEqualSlices(u8, &original, &rom);
+        try t.expect(owner.frts_consumer == @intFromPtr(&image) and !owner.releaseBeforeSubmission());
+        try t.expect(!owner.display.?.close() and !owner.backing.?.close());
+        if (fault == .late_borrow_release) owner.backing.?.execution_owner = 99;
+        if (fault == .unmap or fault == .unpin or fault == .cpu_free or fault == .late_borrow_release) {
+            try t.expect(!image.close());
+            try t.expect(owner.frts_consumer == @intFromPtr(&image) and !owner.releaseBeforeSubmission());
+            if (fault == .late_borrow_release) {
+                try t.expect(f.backing == null and f.frees == free_count + 1);
+                owner.backing.?.execution_owner = 0;
+            } else try t.expect(f.backing != null);
+        }
+        f.fault = .none;
+        try t.expect(image.close() and image.close());
+        try t.expect(owner.frts_consumer == 0 and owner.validates(target));
+        try t.expect(f.backing == null and !f.pinned and !f.mapped);
+        try t.expectEqual(allocation_count + @intFromBool(fault != .short_input), f.allocations);
+        try t.expectEqual(free_count + @intFromBool(fault != .short_input), f.frees);
+    }
+}
+
 fn checkBootVramOwner() !void {
     const f = BootVramFixture;
     f.registers = try std.heap.page_allocator.alloc(u8, 0x900000);
@@ -1002,6 +1143,11 @@ fn checkBootVramOwner() !void {
     api.gfx_memory_query = f.memoryQuery;
     api.gfx_display_query = f.displayQuery;
     api.resource_query = f.resourcesQuery;
+    api.heap_query = FrtsFixture.heapQuery;
+    api.dma_pin_buffer = FrtsFixture.pinImage;
+    api.dma_map_pinned = FrtsFixture.mapImage;
+    api.dma_unmap = FrtsFixture.unmapImage;
+    api.dma_unpin_buffer = FrtsFixture.unpinImage;
     const ctx = r4os.r4dev.DriverContext.init(&api);
     const id = @import("identity.zig");
     var snapshot: id.Snapshot = .{ .pci = .{} };
@@ -1049,6 +1195,7 @@ fn checkBootVramOwner() !void {
     f.put(0x1183a4, try raw.get(.fb_mb));
     try held.acquire(&capture, &backing);
     const frts = try held.binding(.frts);
+    try checkFrtsStorage(&ctx, &held);
     try t.expect(held.validates(frts) and frts.range.bytes == 0x100000 and frts.range.offset > 0x100000000);
     try t.expect(!capture.close() and !backing.close() and capture.ready and backing.report != null);
     try t.expect(f.held and f.buffers[0] != null and f.buffers[1] != null and f.leases[0] and f.leases[1]);
