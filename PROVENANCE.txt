@@ -1,5 +1,13 @@
 ﻿Original R4OS implementation for roadmap 0.79.9, 10.09.2026.
 
+GSP runtime notifications (0.79.10, 2026-09-11):
+Fixed NVIDIA 570.144 wire/notification layouts and Nouveau framing: MIT.
+Eleven full pinned originals under runtime-events-20260911. New source retains
+four full source MIT blocks and the package-default MIT notice (COPYING) for
+rpc_global_enums.h, which has no own header. Original R4OS bounded owner
+delivery/receipt policy: Apache-2.0. NVIDIA 0.1.44 product remains byte-identical.
+
+
 GSP runtime sequencer (0.79.10, 2026-09-11):
 Original R4OS receipt/ownership/deadline integration, Apache-2.0. Existing
 sequencer and GA106 core semantics reused, no new register or wire layout.

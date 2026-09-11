@@ -10,6 +10,34 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
+GSP runtime notifications (source preparation for 0.79.10, 2026-09-11):
+
+The shared runtime exchange now has typed decoding and bounded owner delivery
+for twelve ordinary notification kinds. POST_EVENT preserves client/event/
+index/list identity and raw status. Its C base is 32 bytes but data begins at
+byte 29; RC_TRIGGERED uses the current 48-byte header and journal extent.
+One host comparison against exact pinned C declarations confirms these and
+the fixed line/modeset/extdev/FECS/recovery layouts. Padding is not a field.
+HPD and DP IRQ data preserve all mask bits and simultaneous plug/unplug.
+They represent notifications, not verified connections or current EDID.
+
+A mandatory owner sink admits registrations/capabilities and completes one
+bounded local delivery or copies deferred work before ACK. Exact receipt,
+epoch and finite deadline remain bound. Before/after delivery failures and
+ambiguous ACK never replay the callback. An outstanding RM request survives;
+lockdown clear occurs after ACK. CPU-sequencer receipts stay on the existing
+native RuntimeSequencer path, without ordinary-handler ACK. One serialized
+owner is required; callbacks cannot recurse into RM or retain borrowed bytes.
+
+51 existing cases and one module build pass; no new grouped case/gate/guest.
+NVIDIA 0.1.44 remains byte-identical. Eleven complete pinned originals, full
+notices, ABI comparison and logs: runtime-events-20260911 under
+ExFiles/Reference/GFX/Nvidia/0.79.10. See runtime_events_checkpoint in
+Docs/Drivers/GrafikFirmware07910.json. New code remains host-linked.
+Actual RM event subscriptions/registration routing and native sinks, remaining
+notification kinds, bootstrap/IRQ/health/recovery and physical display/audio
+acceptance remain open. OssiPC is offline and has not been contacted.
+
 GSP runtime CPU sequencer (source preparation for0.79.10, 2026-09-11):
 
 The sequencer now handles notifications owned by the shared runtime exchange,

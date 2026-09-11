@@ -5,6 +5,7 @@ const boot_events = @import("gsp_boot_events.zig");
 const display_rpc = @import("gsp_display_rpc.zig");
 const objects = @import("gsp_objects.zig");
 const sequencer = @import("gsp_sequencer.zig");
+const runtime_events = @import("gsp_runtime_events.zig");
 const message = transport.message;
 const ring = transport.ring;
 const profile = message.Profile{ .chip_id = 0x176 };
@@ -1129,11 +1130,197 @@ fn checkObjects(model: *Model) !void {
     try t.expect(session.pending != null and owner.slots[0] == .uncertain);
 }
 
+fn runtimeEvent(model: *Model, function: u32, bytes: []const u8) !runtime_events.Event {
+    const shape = try message.encode(profile, 0, .{ .function = function, .result = 0 }, bytes, &model.frame);
+    return runtime_events.decode(try message.decode(profile, model.frame[0..shape.storage_bytes], 0));
+}
+fn postPayload(bytes: *[40]u8) []const u8 {
+    @memset(bytes, 0xcc); // Nonzero C padding is valid, including the trailing3 bytes.
+    put(bytes, 0, 0x1234);
+    put(bytes, 4, 0x56);
+    put(bytes, 8, 1);
+    put(bytes, 12, 0x42);
+    std.mem.writeInt(u16, bytes[16..18], 0x789a, .little);
+    put(bytes, 20, 0xaabb);
+    put(bytes, 24, 8);
+    bytes[28] = 1;
+    put(bytes, 29, 0x80000001); // Flexible data starts BEFORE sizeof(header).
+    put(bytes, 33, 1);
+    return bytes;
+}
+const EventSink = struct {
+    const Fault = enum { none, deny, before, after, late, stale, ack, expired, unknown, sequencer, lockdown };
+    model: *Model,
+    owner: *@import("gsp_exchange.zig").Exchange,
+    fault: Fault,
+    admissions: usize = 0,
+    attempts: usize = 0,
+    effects: usize = 0,
+    display: ?runtime_events.Display = null,
+    fn from(p: *anyopaque) *EventSink {
+        return @ptrCast(@alignCast(p));
+    }
+    fn generation(p: *anyopaque) u64 {
+        return from(p).model.epoch;
+    }
+    fn admit(p: *anyopaque, _: runtime_events.Scope, event: runtime_events.Event) error{ Denied, Unsupported }!void {
+        const self = from(p);
+        self.admissions += 1;
+        if (self.fault == .deny) return error.Unsupported;
+        if (event == .post_event) {
+            const v = event.post_event;
+            if (v.client != 0x1234 or v.event != 0x56 or v.index != 1 or !v.notify_list) return error.Denied;
+        } else if (event != .lockdown) return error.Unsupported;
+    }
+    fn deliver(p: *anyopaque, scope: runtime_events.Scope, event: runtime_events.Event) anyerror!void {
+        const self = from(p);
+        try t.expect(scope.epoch == self.model.epoch and scope.deadline == self.owner.deadline.?);
+        try t.expectEqualDeep(scope.ticket, self.owner.pending.?.ticket);
+        try t.expect(self.model.now < scope.deadline);
+        self.attempts += 1;
+        if (self.fault == .before) return error.SinkFailure;
+        if (event == .post_event) self.display = try event.post_event.display() else try t.expect(self.owner.in_lockdown);
+        self.effects += 1;
+        if (self.fault == .after) return error.SinkFailure;
+        if (self.fault == .late) self.model.now = scope.deadline;
+        if (self.fault == .stale) self.model.epoch += 1;
+    }
+    fn sink(self: *EventSink) runtime_events.Sink {
+        return .{ .context = self, .generation = generation, .admit = admit, .deliver = deliver };
+    }
+};
+fn checkRuntimeEvents(model: *Model) !void {
+    var post: [40]u8 = undefined;
+    var event = try runtimeEvent(model, 0x1003, postPayload(&post));
+    const p = event.post_event;
+    try t.expect(p.client == 0x1234 and p.event == 0x56 and p.data == 0x42 and p.info16 == 0x789a and p.status == 0xaabb and p.notify_list);
+    const hpd = (try p.display()).?.hotplug;
+    try t.expect(hpd.plug_mask == 0x80000001 and hpd.unplug_mask == 1); // Keep overlapping/high bits; no guessed state.
+    put(&post, 8, 7);
+    put(&post, 24, 4);
+    event = try runtimeEvent(model, 0x1003, post[0..36]);
+    try t.expectEqual(@as(u32, 0x80000001), (try event.post_event.display()).?.dp_irq);
+    put(&post, 8, 1);
+    event = try runtimeEvent(model, 0x1003, post[0..36]);
+    try t.expectError(error.Payload, event.post_event.display());
+    put(&post, 24, 0xffffffff);
+    try t.expectError(error.Payload, runtimeEvent(model, 0x1003, &post));
+    _ = postPayload(&post);
+    post[28] = 2;
+    try t.expectError(error.Payload, runtimeEvent(model, 0x1003, &post));
+    try t.expectError(error.Payload, runtimeEvent(model, 0x1003, post[0..31]));
+    var rc: [52]u8 = @splat(0xcc);
+    for ([_]u32{ 9, 0x123, 0, 2, 7, 8 }, 0..) |value, index| put(&rc, index * 4, value);
+    std.mem.writeInt(u16, rc[24..26], 0x3210, .little);
+    put(&rc, 28, 0x55667788);
+    put(&rc, 32, 0x11223344);
+    put(&rc, 36, 17);
+    rc[40] = 1;
+    put(&rc, 44, 4);
+    @memcpy(rc[48..52], "jrnl");
+    const fault = (try runtimeEvent(model, 0x1004, &rc)).rc_triggered;
+    try t.expect(fault.channel == 0x123 and fault.partition == 0x3210 and fault.fault_address == 0x1122334455667788 and fault.fault_type == 17 and fault.callback_needed);
+    try t.expectEqualStrings("jrnl", fault.journal);
+    put(&rc, 8, 1);
+    try t.expectError(error.Guest, runtimeEvent(model, 0x1004, &rc));
+    put(&rc, 8, 0);
+    put(&rc, 44, 5);
+    try t.expectError(error.Payload, runtimeEvent(model, 0x1004, &rc));
+    try t.expect((try runtimeEvent(model, 0x1005, &.{})) == .mmu_fault_queued);
+    try t.expectError(error.Payload, runtimeEvent(model, 0x1005, &.{0}));
+    var fixed: [12]u8 = @splat(0xcc);
+    put(&fixed, 0, 3);
+    put(&fixed, 4, 0x55);
+    try t.expect((try runtimeEvent(model, 0x1007, fixed[0..8])).rg_line_intr.interrupts == 0x55);
+    fixed[0] = 1;
+    put(&fixed, 4, 1234);
+    put(&fixed, 8, 5678);
+    const mode = (try runtimeEvent(model, 0x1011, &fixed)).display_modeset;
+    try t.expect(mode.start and mode.iso_bandwidth_kbps == 1234 and mode.floor_bandwidth_kbps == 5678);
+    try t.expect((try runtimeEvent(model, 0x1012, &.{ 2, 3, 4, 1 })).extdev_intr_service.rm_status);
+    try t.expectError(error.Payload, runtimeEvent(model, 0x1012, &.{ 2, 3, 4, 2 }));
+    put(&fixed, 0, 2);
+    fixed[4] = 5;
+    try t.expect((try runtimeEvent(model, 0x1021, fixed[0..8])).fecs_error.error_type == 5);
+    fixed[4] = 1;
+    try t.expect((try runtimeEvent(model, 0x1022, fixed[0..8])).recovery_action.value);
+    fixed[4] = 2;
+    try t.expectError(error.Payload, runtimeEvent(model, 0x1022, fixed[0..8]));
+    try t.expectError(error.UnknownEvent, runtimeEvent(model, 0x100e, &.{}));
+    // Existing boot decoder is reused for log/error/lockdown/NOCAT layouts.
+    for (std.enums.values(EventSink.Fault)) |scenario| {
+        var session: transport.Session = undefined;
+        var boot = try startBoot(model, &session);
+        try model.replyRpc(&session, .{ .function = 0x1001, .result = 0 }, &.{ 0, 0, 0, 0 });
+        try boot.complete((try boot.poll()).?.ticket);
+        var token = try boot.handoff(deadline);
+        var owner = try @import("gsp_exchange.zig").Exchange.init(&token, 3000);
+        model.now = 1200;
+        try owner.begin(79, "runtime request", 3000);
+        try t.expect((try owner.poll(3000)) == null);
+        const function: u32 = switch (scenario) {
+            .unknown => 0x100e,
+            .sequencer => 0x1002,
+            .lockdown => 0x101c,
+            else => 0x1003,
+        };
+        if (scenario == .lockdown) owner.in_lockdown = true; // Model an already engaged runtime lockdown.
+        try model.replyRpc(&session, .{ .function = function, .result = 0 }, if (scenario == .lockdown) &.{0} else postPayload(&post));
+        const receipt = (try owner.poll(3000)).?;
+        const cursor = model.peerWord(session.link.?.status_read);
+        var sink: EventSink = .{ .model = model, .owner = &owner, .fault = scenario };
+        if (scenario == .deny or scenario == .unknown or scenario == .sequencer) {
+            try t.expectError(switch (scenario) {
+                .deny => error.Unsupported,
+                .unknown => error.UnknownEvent,
+                else => error.SequencerRequired,
+            }, runtime_events.Dispatch.init(&owner, sink.sink()));
+            try t.expect(sink.effects == 0 and session.pending != null);
+            try t.expectEqual(cursor, model.peerWord(session.link.?.status_read));
+            try t.expect(if (scenario == .sequencer) owner.phase == .waiting else owner.phase == .failed);
+            continue;
+        }
+        var dispatch = try runtime_events.Dispatch.init(&owner, sink.sink());
+        try t.expect(sink.admissions == 1 and sink.attempts == 0);
+        if (scenario == .ack) {
+            model.fault = model.count + 1;
+            model.after = true;
+        }
+        if (scenario == .expired) model.now = 3000;
+        switch (scenario) {
+            .none, .lockdown => {
+                try dispatch.step();
+                try t.expect(dispatch.delivered and dispatch.acknowledged and owner.pending == null and session.pending == null);
+                try t.expect(owner.phase == .waiting and owner.function == 79 and owner.deadline == 3000 and !owner.in_lockdown);
+            },
+            else => {
+                const expected: runtime_events.Error = switch (scenario) {
+                    .before, .after => error.Handler,
+                    .late, .expired => error.Deadline,
+                    .stale => error.Stale,
+                    .ack => error.Io,
+                    else => unreachable,
+                };
+                try t.expectError(expected, dispatch.step());
+                try t.expect(dispatch.failed and !dispatch.acknowledged and owner.phase == .failed and session.pending != null);
+                if (scenario == .before or scenario == .after) try t.expectEqual(error.SinkFailure, dispatch.failure.?);
+            },
+        }
+        try t.expectEqual(@as(usize, if (scenario == .before or scenario == .expired) 0 else 1), sink.effects);
+        try t.expectEqual(if (dispatch.acknowledged or scenario == .ack) receipt.ticket.next else cursor, model.peerWord(session.link.?.status_read));
+        const calls = model.count;
+        const attempts = sink.attempts;
+        if (dispatch.failed) try t.expectError(error.State, dispatch.step()) else try dispatch.step();
+        try t.expect(model.count == calls and sink.attempts == attempts and model.notifications == 1);
+    }
+}
+
 test "GSP transport orders range publication, explicit acknowledgement and terminal ambiguous failures" {
     const model = try t.allocator.create(Model);
     defer t.allocator.destroy(model);
     try checkDisplayRpc(model);
     try checkObjects(model);
+    try checkRuntimeEvents(model);
     for (0..4) |flags| {
         var session = try model.start(@intCast(flags));
         // Device-only neighbour changes must survive CPU command publication.

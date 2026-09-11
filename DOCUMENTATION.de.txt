@@ -10,6 +10,34 @@ unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
 
+GSP-Laufzeitmeldungen (Quellvorbereitung, 11.09.2026)
+-------------------------------------------------
+Zwoelf gewoehnliche Runtime-Meldungsarten besitzen jetzt typisierte Decoder
+und eine begrenzte Uebergabe an den jeweiligen Besitzer. POST_EVENT behaelt
+Client/Event/Index/Listenziel und Rohstatus. C-Grundgroesse 32 Bytes, Daten
+bereits ab Byte 29; RC_TRIGGERED verwendet den aktuellen 48-Byte-Header mit
+Journal. Ein kurzer Vergleich gegen exakte gepinnte C-Deklarationen bestaetigt
+auch die festen Line-/Modeset-/Extdev-/FECS-/Recovery-Layouts. Padding bleibt
+uninterpretiert. HPD-/DP-Masken behalten alle Bits, auch gleichzeitiges Plug/
+Unplug. Eine Meldung bestaetigt weder Verbindung noch aktuelle EDID-Daten.
+
+Ein verpflichtender Besitzer prueft Faehigkeiten und registrierte RM-Ziele.
+Er uebernimmt die Meldung begrenzt oder kopiert spaetere Arbeit vor dem ACK.
+Exakte Meldung, Epoche und feste Frist bleiben gebunden. Fehler vor/nach der
+Uebergabe und mehrdeutiges ACK wiederholen keinen Callback. Offene RM-Anfragen
+bleiben erhalten; Lockdown wird erst nach ACK geloest. CPU-Sequencer verbleibt
+beim bestehenden nativen RuntimeSequencer. Ein serialisierter Besitzer ist
+verbindlich; Callbacks duerfen weder rekursiv RM aufrufen noch Byteansichten
+ueber die Uebergabe hinaus behalten. Keine automatische Recovery/Ruhe-Annahme.
+
+51 bestehende Faelle und ein Modulbuild bestanden; keine neuen Faelle/Gates/
+Gastlaeufe. NVIDIA 0.1.44 bytegleich. Elf vollstaendige gepinnte Originale,
+Lizenzen und ABI-/Testbelege unter ExFiles/Reference/GFX/Nvidia/0.79.10/
+runtime-events-20260911; runtime_events_checkpoint in GrafikFirmware07910.json.
+Neuer Dispatcher nur hostseitig angebunden. Echte RM-Eventregistrierung und
+Zielzuordnung, native Empfaenger, weitere Meldungsarten, Boot/IRQ/Health/
+Recovery und physische Grafik-/Audioabnahme bleiben offen. OssiPC unberuehrt.
+
 CPU-Sequencer im GSP-Betrieb (Quellvorbereitung, 11.09.2026)
 --------------------------------------------------------
 Der bestehende Sequencer verarbeitet nun auch Meldungen des gemeinsamen
