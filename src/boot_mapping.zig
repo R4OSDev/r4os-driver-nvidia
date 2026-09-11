@@ -136,13 +136,31 @@ pub const Capture = struct {
     }
     /// The old surface and every full dependency page must survive all planned
     /// GSP destinations. General VRAM allocation remains blocked by the lease.
-    pub fn admit(self: *const Capture, parent: *const boot.Capture, plan: *const layout.Plan) !void {
+    pub fn admit(self: *Capture, parent: *boot.Capture, plan: *const layout.Plan) !void {
         if (!self.valid(parent)) return error.MappingOwner;
         if (self.framebuffer_bytes != plan.fb_bytes) return error.PlanChanged;
         for (self.ranges[0..self.range_count]) |range|
             if (overlaps(range.address, range.bytes, plan.reserved)) return error.BootSurfaceCollision;
         for (self.pages[0..self.page_count]) |address|
             if (overlaps(address, 4096, plan.reserved)) return error.BootTableCollision;
+        self.reobserve(parent) catch |err| {
+            if (!self.io.close()) return error.Cleanup;
+            return err;
+        };
+    }
+    fn reobserve(self: *Capture, parent: *boot.Capture) !void {
+        const control = self.control orelse return error.MappingOwner;
+        try self.io.open(parent);
+        if (!std.meta.eql(control, try self.io.controls())) return error.BootMappingChanged;
+        for (self.pages[0..self.page_count], 0..) |address, index| {
+            try self.io.read(address, &self.scratch);
+            // Even bytes outside the previously used PTEs must match. A
+            // stable descriptor alone cannot prove the saved translation.
+            if (!std.mem.eql(u8, &self.scratch, self.data()[index * 4096 ..][0..4096])) return error.BootMappingChanged;
+        }
+        if (!std.meta.eql(control, try self.io.controls())) return error.BootMappingChanged;
+        if (!self.io.close()) return error.Cleanup;
+        _ = try parent.reobserve();
     }
     pub fn close(self: *Capture) bool {
         if (self.self_address == 0) return true;

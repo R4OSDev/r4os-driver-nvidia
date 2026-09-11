@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-Passive NVIDIA display driver for R4OS. Module 0.1.40; original R4OS code is
+Passive NVIDIA display driver for R4OS. Module 0.1.41; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -10,7 +10,33 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
-Complete active VRAM image backing (NVIDIA 0.1.40):
+Fresh BAR1 mapping admission (NVIDIA 0.1.41):
+
+Before the first-boot VRAM lease publishes any borrow, the mapping owner
+now compares the current BAR1 control and every complete saved dependency
+page with its immutable snapshot. It checks control before and after those
+reads, closes the shared PRAMIN reader and freshly observes the parent.
+Previously this admission checked saved ownership and collisions only.
+A later table or block/bind mutation could therefore escape that check.
+
+BootMappingChanged refuses admission and preserves the table BO; failed
+window restoration retains the exact child and parent owners. Direct BAR1
+mode checks control even without table pages. The existing 128-page bound,
+five-second deadline, epoch, shared register mapping and read-only BO remain
+in force. No new registers, table writes, binding/cache changes or native
+execution authority are introduced.
+
+The existing lifecycle case changes an unused final dependency-page byte
+and the block control after capture; both fail without publishing a borrow.
+Restoring originals allows the normal success/cleanup sequence. All 51
+cases and one module build pass first invocation; no new case/gate/guest.
+All 29 resources match NVIDIA40 exactly. Evidence: mapping_refresh_checkpoint
+in Docs/Drivers/GrafikFirmware07910.json and
+ExFiles/Reference/GFX/Nvidia/0.79.10/mapping-refresh-20260911.
+OssiPC remains offline/untouched; native recovery and hardware acceptance
+are still open.
+
+Previous complete active VRAM image backing (NVIDIA 0.1.40):
 
 The existing immutable payload BO now also contains all resolved active
 ISO image planes and eyes, including pitch/block-linear backing rows.

@@ -10,7 +10,32 @@ unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
 
-Aktive VRAM-Bildflaechen vollstaendig sichern (NVIDIA 0.1.40)
+BAR1-Zuordnung vor der VRAM-Leihe erneut pruefen (NVIDIA 0.1.41)
+---------------------------------------------------------------
+Vor dem Veroeffentlichen der ersten VRAM-Leihe vergleicht der Mapping-
+Besitzer nun die aktuelle BAR1-Steuerung und jede ganze gesicherte
+Seitentabellenseite mit dem unveraenderlichen BO. Steuerung vor/nach den
+Reads vergleichen, gemeinsamen PRAMIN-Reader schliessen und Elternanzeige
+frisch pruefen. Bisher pruefte diese Zulassung nur gespeicherten Besitzer
+und Kollisionen; spaetere Tabellen-/Block-/Bind-Aenderungen fehlten dort.
+
+BootMappingChanged verhindert jede Veroeffentlichung der Leihe und erhaelt
+den Tabellen-BO. Misslingt die Fensterwiederherstellung, bleiben die genauen
+Kind-/Elternbesitzer gehalten. Direkter BAR1-Modus prueft auch ohne Seiten
+die Steuerung. Grenzen von128 Seiten/fuenf Sekunden, Epoche, gemeinsames
+Registermapping und BO-Siegel bleiben erhalten. Keine neuen Register,
+Tabellenwrites, Bind-/Cache-Aenderungen oder nativen Ausfuehrungsrechte.
+
+Der vorhandene Lebenszyklusfall aendert das letzte unbenutzte Byte einer
+Abhaengigkeitsseite und die Blocksteuerung nach der Aufnahme. Beides wird
+ohne veroeffentlichte Leihe abgewiesen; Originalzustand erlaubt Erfolg und
+Abbau. Alle51 Faelle und ein Modulbuild beim ersten Aufruf bestanden;
+keine neuen Faelle/Gates/Gastlaeufe. Alle29 Ressourcen bytegleich zu40.
+Beleg: mapping_refresh_checkpoint in Docs/Drivers/GrafikFirmware07910.json;
+Archiv ExFiles/Reference/GFX/Nvidia/0.79.10/mapping-refresh-20260911.
+OssiPC bleibt offline/unberuehrt; native Recovery und Hardwareabnahme offen.
+
+Vorherige Sicherung aktiver VRAM-Bildflaechen (NVIDIA 0.1.40)
 ------------------------------------------------------------
 Der gemeinsame unveraenderliche Nutzdaten-BO enthaelt nun auch alle bereits
 aufgeloesten aktiven ISO-Bildebenen und -Augen, einschliesslich Pitch- und

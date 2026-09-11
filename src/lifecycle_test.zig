@@ -1635,6 +1635,16 @@ fn checkBootVramOwner() !void {
     mapped_boot.pages[0] = prepared.plan.metadata_reservation.offset;
     try t.expectError(error.BootTableCollision, held.acquire(&capture, &backing, &mapped_boot, &display_context));
     mapped_boot.pages[0] = original_page;
+    f.vram_pages[5][4095] ^= 1; // An unused dependency-page byte changed after capture.
+    try t.expectError(error.BootMappingChanged, held.acquire(&capture, &backing, &mapped_boot, &display_context));
+    try t.expect(mapped_boot.valid(&capture) and capture.borrower == 0 and backing.vram_owner == 0 and
+        capture.registers.borrowedCount() == 1 and f.leases[2]);
+    f.vram_pages[5][4095] ^= 1;
+    const original_block = std.mem.readInt(u32, f.registers[reader.block_register..][0..4], .little);
+    f.put(reader.block_register, original_block ^ 1);
+    try t.expectError(error.BootMappingChanged, held.acquire(&capture, &backing, &mapped_boot, &display_context));
+    try t.expect(mapped_boot.valid(&capture) and capture.borrower == 0 and capture.registers.borrowedCount() == 1);
+    f.put(reader.block_register, original_block);
     const original_instance_span = display_context.span;
     display_context.span.address = prepared.plan.frts.offset;
     try t.expectError(error.DisplayContextCollision, held.acquire(&capture, &backing, &mapped_boot, &display_context));
