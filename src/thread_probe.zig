@@ -17,6 +17,8 @@ var work_gate: u32 = 0;
 var work_ready: u32 = 0;
 var work_done: u32 = 0;
 var work_handle: u32 = 0;
+var work_owner: u32 = 0;
+var posted_work: u32 = 0;
 var close_pointer: ?*anyopaque = null;
 var prepared = false;
 var close_prepared = false;
@@ -37,6 +39,8 @@ pub fn start(ctx: *const r4os.r4dev.DriverContext) bool {
     prepared = false;
     close_prepared = false;
     cpu_mask = 0;
+    posted_work = 0;
+    work_owner = 0;
     var before: a.DriverThreadStats = .{};
     if (service.current() != 0 or service.stats(&before) != 0 or before.records != 0 or before.owner_epoch == 0 or before.closing != 0)
         return failed(ctx, "empty-owner");
@@ -47,6 +51,9 @@ pub fn start(ctx: *const r4os.r4dev.DriverContext) bool {
     // Hold the original shared BSP work lane until the dedicated callbacks
     // finish. Their progress must not depend on that worker returning.
     if (ctx.workSubmit(blockWork, 0, 0, &work_handle) != 0 or !awaitReady(ctx, &work_ready)) return failed(ctx, "work-lane");
+    var initial_work: a.DriverCompletionStatus = .{};
+    if (ctx.completionStatus(work_handle, &initial_work) != 0 or initial_work.owner == 0) return failed(ctx, "work-owner");
+    work_owner = initial_work.owner;
     for (0..4) |index| {
         const flags: u32 = if (index == 0) 0 else a.driver_thread_flag_parallel;
         if (service.start(compute, index, flags, &handles[index]) != 0) return failed(ctx, "start");
@@ -75,6 +82,10 @@ pub fn start(ctx: *const r4os.r4dev.DriverContext) bool {
     @atomicStore(u32, &work_gate, 1, .release);
     var work_result: i32 = 0;
     if (!finishWork(ctx, &work_result) or work_result != 0) return failed(ctx, "work-complete");
+    if (posted_work == 0 or ctx.completionWait(posted_work, timeout(ctx), &work_result) != 0 or
+        work_result != 0 or ctx.completionRelease(posted_work) != 0) return failed(ctx, "thread-work-owner");
+    posted_work = 0;
+    ctx.logInfo("NVIDIA runtime-check: thread-work=OK queued-from-task executed=serialized owner-epoch=matched");
 
     if (service.start(stopWait, 4, a.driver_thread_flag_parallel, &handles[4]) != 0 or !awaitReady(ctx, &ready[4])) return failed(ctx, "stop-target");
     var result: i32 = 123;
@@ -132,6 +143,10 @@ pub fn shutdown(ctx: *const r4os.r4dev.DriverContext) bool {
     }
     var work_result: i32 = 0;
     if (!finishWork(ctx, &work_result)) return false;
+    if (posted_work != 0) {
+        if (ctx.completionWait(posted_work, timeout(ctx), &work_result) != 0 or ctx.completionRelease(posted_work) != 0) return false;
+        posted_work = 0;
+    }
     if (work_result != 0) correct = false;
     if (close_pointer) |pointer| {
         heap.r4nv_heap_free(pointer);
@@ -182,6 +197,9 @@ fn compute(index: usize) callconv(.c) i32 {
             if (byte != index * 17 + which) return -9;
         }
     }
+    if (index == 0) {
+        if (ctx.apiVersion() < a.driver_api_thread_work_version or ctx.workSubmit(postedCallback, 0, 0, &posted_work) != 0) return -10;
+    }
     return 79 + @as(i32, @intCast(index));
 }
 
@@ -206,6 +224,9 @@ fn closeWait(_: usize) callconv(.c) i32 {
     if (service.sleepTicks(std.math.maxInt(u64)) != a.driver_thread_error_cancelled) return -1;
     var rejected: u64 = 79;
     if (service.start(compute, 0, 0, &rejected) != a.driver_thread_error_closed or rejected != 0 or heap.r4nv_heap_allocate(1) != null) return -2;
+    const ctx = r4os.r4dev.DriverContext.init(api orelse return -6);
+    var work_rejected: u32 = 79;
+    if (ctx.workSubmit(postedCallback, 0, 0, &work_rejected) != a.driver_thread_error_closed or work_rejected != 0) return -6;
     const pointer = close_pointer orelse return -3;
     for (@as([*]const u8, @ptrCast(pointer))[0..113]) |byte| {
         if (byte != 0x79) return -4;
@@ -227,6 +248,18 @@ fn blockWork(_: usize) callconv(.c) i32 {
         ctx.waitTicks(1);
     }
     @atomicStore(u32, &work_done, 1, .release);
+    return 0;
+}
+
+fn postedCallback(_: usize) callconv(.c) i32 {
+    const ctx = r4os.r4dev.DriverContext.init(api orelse return -1);
+    const service = threads orelse return -1;
+    var status: a.DriverCompletionStatus = .{};
+    var owner: a.DriverHeapStats = .{};
+    const memory = ctx.heap() orelse return -1;
+    if (service.current() != 0 or ctx.completionStatus(posted_work, &status) != 0 or
+        status.owner == 0 or status.owner != work_owner or status.state != a.driver_work_state_running or
+        memory.stats(&owner) != 0 or owner.owner_epoch != samples[0].owner_epoch) return -1;
     return 0;
 }
 

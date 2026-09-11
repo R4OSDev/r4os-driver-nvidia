@@ -1,7 +1,7 @@
 //! Resident GA106 boot/VGA snapshot owner for the existing boot-check.
 //! Actual SDK BO/MMIO leases and the common boot-display hold remain retained
-//! through failure. The only permitted device write is BAR0_WINDOW; this
-//! recovery callback must never be reused after firmware/DMA/scanout effects.
+//! through failure. The capture itself writes only BAR0_WINDOW. A native
+//! firmware owner permanently fences that limited recovery before submission.
 const std = @import("std");
 const r4os = @import("r4os");
 const a = r4os.abi;
@@ -36,6 +36,7 @@ pub const Capture = struct {
     original_boot: ?a.GfxNativeBootInfo = null,
     self_address: usize = 0,
     effects_latched: bool = false,
+    firmware_owner: usize = 0,
     window_writes: u32 = 0,
     last_status: i32 = 0,
     last_error: ?anyerror = null,
@@ -181,7 +182,7 @@ pub const Capture = struct {
 
     fn recoverWindow(raw: u64, generation_value: u64, boot: *const a.GfxNativeBootInfo) callconv(.c) i32 {
         const self: *Capture = @ptrFromInt(raw);
-        if (self.self_address != raw or generation_value != self.boot.held_generation) return 0;
+        if (self.self_address != raw or generation_value != self.boot.held_generation or self.firmware_owner != 0) return 0;
         const original = self.original_boot orelse return 0;
         if (boot.physical_address != original.physical_address or boot.byte_length != original.byte_length or
             boot.width != original.width or boot.height != original.height or boot.pitch != original.pitch) return 0;
@@ -195,9 +196,25 @@ pub const Capture = struct {
         return 1;
     }
 
+    /// Called by the serialized native owner before its first possible effect.
+    /// This is a permanent retention latch, not a replacement recovery proof.
+    /// The existing PRAMIN-only callback can no longer authorize pixel copy,
+    /// MMIO teardown or bootfb access after a firmware/DMA operation.
+    pub fn retainForFirmware(self: *Capture, owner: usize, epoch: u64) !void {
+        if (owner == 0 or self.self_address != @intFromPtr(self) or !self.ready or
+            epoch == 0 or epoch != self.boot.held_generation or self.borrower == 0 or
+            !self.register_access.valid()) return error.State;
+        if (self.firmware_owner != 0) {
+            if (self.firmware_owner != owner) return error.Busy;
+            return;
+        }
+        self.firmware_owner = owner;
+        if (!self.boot.recovery_required) try self.boot.latchEffects();
+    }
+
     pub fn close(self: *Capture) bool {
         if (self.self_address == 0) return true;
-        if (self.self_address != @intFromPtr(self) or self.borrower != 0 or self.mapping_owner != 0 or self.context_owner != 0) return false;
+        if (self.self_address != @intFromPtr(self) or self.firmware_owner != 0 or self.borrower != 0 or self.mapping_owner != 0 or self.context_owner != 0) return false;
         if (!self.preflight.close()) return false;
         if (!self.scanout_probe.close()) return false;
         const own_borrow: usize = if (self.register_access.owner != null) 1 else 0;

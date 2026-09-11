@@ -1083,6 +1083,7 @@ test "firmware CPU storage complete run lease retains all boot DMA owners" {
     try t.expectEqual(init_report.init.libos_address, inputs.resume_args.libos_dma);
     try t.expectEqual(@as(u32, 0x79), inputs.resume_args.app_version);
     try t.expectEqual(f.device.prepared_plan.?.imem.base, inputs.fwsec.imem.base);
+    try checkDeviceStartup(&lease, &ctx, &table, &capture, &held);
     try checkNativeTeardown(&lease, &ctx, &table);
     try checkLogReader(&lease);
     try t.expect(lease.failed and lease.log_owner == 0);
@@ -1318,4 +1319,193 @@ test "firmware CPU storage GSP init owns bidirectional logs and queues with exac
         try t.expectEqual(@as(usize, 1), queries);
         try t.expect(backing == null and !any(&maps) and !any(&pins));
     }
+}
+
+// Drives the actual resident device owner and native MMIO port against host
+// RAM. The model acknowledges firmware-engine writes and emits one GSP record;
+// it does not simulate authentication, real hardware timing or UEFI recovery.
+const DeviceModel = struct {
+    var boot_info: a.GfxNativeBootInfo = .{};
+    fn bootInfo(out: *a.GfxNativeBootInfo) callconv(.c) i32 { out.* = boot_info; return a.gfx_output_ok; }
+    fn log(_: [*:0]const u8) callconv(.c) void {}
+    fn tick(words: []u32, frts: u64, bad_frts: bool) void {
+        const core = @import("gsp_core.zig");
+        const hs = @import("falcon_hs.zig");
+        for ([_]u32{ hs.reg.gsp, hs.reg.sec2 }) |base| {
+            if (words[(base + hs.reg.dma_command) / 4] != hs.bits.idle)
+                words[(base + hs.reg.dma_command) / 4] = hs.bits.idle;
+            if (words[(base + 0x1668) / 4] == 0) words[(base + 0x1668) / 4] = 1;
+            if (words[(base + 0x3c0) / 4] & 1 != 0 and base == hs.reg.gsp)
+                words[core.reg.riscv_cpuctl / 4] = core.bits.halted;
+            if (words[(base + hs.reg.cpu_alias) / 4] == core.bits.start) {
+                words[(base + hs.reg.cpu_alias) / 4] = 0;
+                if (base == hs.reg.gsp and words[core.reg.bcr / 4] & core.bits.bcr_riscv != 0) {
+                    words[core.reg.riscv_cpuctl / 4] = core.bits.active;
+                } else if (base == hs.reg.gsp) {
+                    words[0x1438 / 4] = if (bad_frts) 0x10000 else 0;
+                    words[0x1fa828 / 4] = @intCast(((frts + 0xff000) >> 12) << 4);
+                    words[0x1fa824 / 4] = @intCast((frts >> 12) << 4);
+                } else {
+                    if (words[core.reg.sec_mailbox0 / 4] == 0xff and words[(core.reg.sec_mailbox0 + 4) / 4] == 0xff) {
+                        words[0x1fa828 / 4] = 0;
+                    } else if (words[core.reg.bcr / 4] & core.bits.bcr_riscv != 0) {
+                        // Successful normal Booter Load starts the prepared
+                        // GSP RISC-V core; Cold.finish verifies that result.
+                        words[core.reg.riscv_cpuctl / 4] = core.bits.active;
+                    }
+                    words[core.reg.sec_mailbox0 / 4] = 0;
+                }
+            }
+        }
+    }
+};
+
+fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r4os.r4dev.DriverContext,
+    table: *a.DriverApi, capture: *@import("boot_vram.zig").Capture, held: *@import("boot_vram_lease.zig").Lease) !void
+{
+    const driver = @import("gsp_device.zig");
+    const core = @import("gsp_core.zig");
+    const hs = @import("falcon_hs.zig");
+    const identity = @import("identity.zig");
+    const words = try t.allocator.alignedAlloc(u32, comptime std.mem.Alignment.fromByteUnits(4096), 0x842000 / 4);
+    defer t.allocator.free(words);
+    const target = try t.allocator.create(driver.Device);
+    defer t.allocator.destroy(target);
+    var fixture: QueueNative = .{ .memory = lease, .words = words, .case = .success };
+    queue_native = &fixture;
+    const saved_table = table.*;
+    defer table.* = saved_table;
+    table.version = a.driver_api_thread_work_version;
+    table.gfx_memory_query = QueueNative.query;
+    table.log_info = DeviceModel.log;
+    table.log_warn = DeviceModel.log;
+    table.log_error = DeviceModel.log;
+    var snapshot: identity.Snapshot = .{ .pci = .{ .vendor_id = 0x10de, .device_id = 0x2504, .class_code = 3 }, .command = 7 };
+    snapshot.bars[0] = .{ .kind = .memory32, .base = 0xfb000000, .bytes = words.len * 4 };
+    const chip = identity.chip(0xb76000a1, 0).?;
+    capture.snapshot = snapshot;
+    capture.chip = chip;
+    capture.operation = try @import("pramin.zig").Capture.init(.{ .epoch = capture.boot.held_generation,
+        .deadline = 1000000, .boot0 = 0xb76000a1, .boot1 = 0, .vga = 0x10e08, .range = .{ .address = 0x10e0000, .bytes = 131072 } });
+    capture.boot.recovery_required = true; // The existing captured-PRAMIN fixture's hold.
+    DeviceModel.boot_info = .{ .generation = 1, .physical_address = 0xd0000000, .byte_length = 4096,
+        .width = 32, .height = 32, .pitch = 128, .state = a.display_state_preparing };
+    capture.original_boot = DeviceModel.boot_info;
+    capture.boot.display = .{ .table = .{ .boot_info = @intFromPtr(&DeviceModel.bootInfo) } };
+    try capture.registers.open(ctx, &snapshot, chip);
+    try capture.register_access.acquire(&capture.registers, ctx, &snapshot, chip);
+    defer {
+        std.debug.assert(capture.register_access.release());
+        std.debug.assert(capture.registers.close());
+        capture.snapshot = null;
+        capture.chip = null;
+        capture.operation = null;
+        capture.original_boot = null;
+        capture.boot.display = null;
+        capture.boot.recovery_required = false;
+    }
+    const original_plan = lease.fwsec_storage.?.device.prepared_plan.?;
+    lease.fwsec_storage.?.device.prepared_plan.?.engine_mask = 0x400;
+    lease.fwsec_storage.?.device.prepared_plan.?.ucode_id = 9;
+    defer lease.fwsec_storage.?.device.prepared_plan = original_plan;
+    const command = init.queues_offset + init.command_offset;
+    const status = init.queues_offset + init.status_offset;
+    const header = backing.?[command..][0..32].*;
+    const Case = enum { success, old_api, frts_error, timeout, stolen_display, unknown_event };
+    for (std.enums.values(Case)) |case| {
+        errdefer |err| std.debug.print("native device startup {s}: {s}\n", .{ @tagName(case), @errorName(err) });
+        @memset(words, 0);
+        words[0] = 0xb76000a1;
+        for ([_]u32{ hs.reg.gsp, hs.reg.sec2 }) |base| {
+            words[(base + 0xf4) / 4] = core.bits.reset_ready | core.bits.riscv_enabled;
+            words[(base + 0x108) / 4] = 0x20100;
+            words[(base + hs.reg.cpu_control) / 4] = hs.bits.cpu_alias | hs.bits.cpu_halted;
+        }
+        words[0x118128 / 4] = 1;
+        words[0x118234 / 4] = 0xff;
+        words[core.reg.riscv_cpuctl / 4] = core.bits.halted;
+        clock = 100;
+        @memset(backing.?[command..][0..init.queue_bytes], 0);
+        @memset(backing.?[status..][0..init.queue_bytes], 0);
+        @memcpy(backing.?[command..][0..32], &header);
+        var reader: @import("gsp_logs.zig").Reader = .{};
+        try reader.open(lease);
+        target.* = .{};
+        if (case == .old_api) {
+            table.version = a.driver_api_thread_work_version - 1;
+            try t.expectError(error.Api, target.open(ctx, capture, held, lease, &reader));
+            try t.expect(target.self_address == 0 and !lease.retained and capture.firmware_owner == 0);
+            table.version += 1;
+            try t.expect(reader.close());
+            continue;
+        }
+        if (case == .success) {
+            capture.snapshot.?.command &= ~@as(u16, 4);
+            try t.expectError(error.BusMasterDisabled, target.open(ctx, capture, held, lease, &reader));
+            try t.expect(target.self_address == 0 and !lease.retained and capture.firmware_owner == 0);
+            capture.snapshot.?.command |= 4;
+        }
+        try target.open(ctx, capture, held, lease, &reader);
+        try t.expect(target.phase == .frts and !target.port.effects_possible and capture.firmware_owner == 0);
+        const original_epoch = capture.boot.held_generation;
+        var injected = false;
+        var notified = false;
+        var steps: usize = 0;
+        while (target.phase != .ready and target.phase != .failed and steps < 12000) : (steps += 1) {
+            clock += 1000;
+            DeviceModel.tick(words, held.plan.?.frts.offset, case == .frts_error);
+            if (!injected and target.port.effects_possible) {
+                if (case == .timeout) clock = target.phase_deadline;
+                if (case == .stolen_display) capture.boot.held_generation += 1;
+                injected = true;
+            }
+            if (target.phase == .notifications and !notified) {
+                @memcpy(backing.?[status..][0..32], &header);
+                std.mem.writeInt(u32, backing.?[status + 24 ..][0..4], 64, .little);
+                try nativeEvent(&target.session.?, if (case == .unknown_event) 0xdead else 0x1001, &.{ 0, 0, 0, 0 });
+                notified = true;
+            }
+            _ = target.step();
+        }
+        if (steps == 12000 or (case == .success and target.phase != .ready)) {
+            std.debug.print("device phase={s} error={?} recovery={?} fw={?} core={?}\n", .{ @tagName(target.phase), target.failure,
+                target.recovery_failure, if (target.port.firmware_operation) |op| op.failure else null,
+                if (target.port.operation) |op| op.failure else null });
+        }
+        try t.expect(steps < 12000 and target.port.effects_possible and lease.retained and capture.firmware_owner == @intFromPtr(target));
+        if (case == .success) {
+            try t.expect(target.phase == .ready and target.handoff != null and target.frts_result != null and target.load_result != null);
+            try t.expect(target.boot.?.handled_events == 1 and target.session.?.pending == null and target.port.phase == .runtime);
+        } else {
+            try t.expect(target.phase == .failed and target.failure != null);
+            if (case == .stolen_display) try t.expect(target.recovery_failure != null) else
+                try t.expect(target.recovery.report != null and target.port.phase == .recovery and !reader.enabled);
+        }
+        try t.expect(!target.closeBeforeSubmission() and !capture.close() and !lease.releaseBeforeSubmission());
+        // Dispose host-only fixture effects. Production exposes no equivalent
+        // release or replay operation; neither model success nor halt is proof.
+        capture.boot.held_generation = original_epoch;
+        capture.firmware_owner = 0;
+        lease.retained = false;
+        lease.failed = false;
+        lease.recovery_owner = 0;
+        lease.queue.failed = false;
+        lease.init_storage.?.device_access = false;
+        target.port.effects_possible = false;
+        target.port.recovery_owner = 0;
+        target.port.phase = .boot;
+        target.port.runtime_session = null;
+        try t.expect(target.port.close());
+        try t.expect(reader.close());
+    }
+    @memset(backing.?[command..][0..init.queue_bytes], 0);
+    @memset(backing.?[status..][0..init.queue_bytes], 0);
+    @memcpy(backing.?[command..][0..32], &header);
+    clock = 100;
+    for ([_]u32{ 0, 4 }) |reg| try t.expect(driver.allowed(.read, reg) and !driver.allowed(.write, reg));
+    try t.expect(!driver.allowed(.read, core.reg.cpuctl_alias) and !driver.allowed(.write, 0x610000));
+    try t.expect(!driver.allowed(.write, 0x1700) and !driver.allowed(.read, 0x110101));
+    for ([_]u32{ core.reg.hwcfg2, core.reg.sec_hwcfg2, core.reg.riscv_cpuctl, core.reg.handoff,
+        hs.reg.gsp + 0x108, hs.reg.sec2 + 0x108 }) |reg|
+        try t.expect(driver.allowed(.read, reg) and !driver.allowed(.write, reg));
 }

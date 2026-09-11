@@ -1,16 +1,45 @@
 ﻿# NVIDIA.R4D
 
-Passive NVIDIA display driver for R4OS. Module 0.1.51; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.52; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
 subsystem 1458:4074, VBIOS 94.06.2f.00.d6. Preparation for 0.79.10 continues.
-This owner inventories NVIDIA display functions once through
-the kernel PCI inventory. It does not initialize engines or take over scanout.
+The default path inventories NVIDIA display functions once through
+the kernel PCI inventory. Explicit diagnostic/start modes are described below.
 Starting with R4OS 0.79.9, `IMAGE_SCOPE=slim` includes the current module in
 Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
+
+Native GSP start wiring (NVIDIA 0.1.52 / Kernel 0.1.152, 2026-09-12):
+
+Explicit `mode=gsp-start` binds the prepared original resources to the real
+GA106 port: FWSEC-FRTS, GSP preparation, normal Booter Load, boot notifications
+and INIT_DONE with ACK. A dedicated Task paces one outstanding normal Work
+completion, bounded to 64 steps or 2 ms. DriverApi35 keeps its complete
+648-byte layout and admits that Task's exact owner/epoch into normal Work;
+stopped/closing Tasks and direct dedicated device access remain rejected.
+Start requires a single matching adapter and already enabled bus mastering.
+
+Startup has 30 seconds, with 5-second firmware/core phases. Errors attempt
+FWSEC-SB/Booter-Unload once under a fresh 10-second bound. Before any possible
+firmware effect the PRAMIN-only restore callback is permanently fenced.
+All post-submit outcomes retain display and DMA memory. Full GPU/UEFI restore
+is still open, so reboot after such a run requires poweroff/halt. INIT_DONE
+alone does not provide native video, IRQ/runtime log/health or audio support.
+
+All 51 existing host cases and builds pass. The existing complete-run group
+drives the actual controller/port against host RAM, including bounded errors,
+stale display ownership and retained cleanup; the lifecycle group checks the
+registered restore callback. The existing SMP4 nvidia-runtime probe passes
+in 29.36 seconds with actual Task-to-Work owner binding and close rejection.
+The runner now avoids explicitly including/staging an already selected Slim
+driver. No new test group or physical firmware execution. OssiPC remains on
+Kernel150/NVIDIA50 passive, pending availability to power on after a required
+poweroff. Evidence: ExFiles/Reference/GFX/Nvidia/0.79.10/gsp-start-20260912.
+
+The entries below describe preceding checkpoints.
 
 One-shot firmware teardown (NVIDIA 0.1.51, 2026-09-11):
 

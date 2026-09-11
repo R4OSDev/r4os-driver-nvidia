@@ -41,6 +41,8 @@ var boot_inputs: boot_resources.Inputs = .{};
 var boot_storage: gsp_boot_storage.Storage = .{};
 var init_storage: gsp_init_storage.Storage = .{};
 var run_memory: gsp_run_memory.Lease = .{};
+var native_device: @import("gsp_device.zig").Device = .{};
+var native_work: @import("gsp_start_work.zig").Work = .{};
 var firmware_logs: @import("gsp_logs.zig").Reader = .{};
 var firmware_log_words: [@import("gsp_logs.zig").output_bytes]u8 = undefined;
 var booters: booter_storage.Pair = .{};
@@ -51,6 +53,7 @@ var boot_vram_lease: @import("boot_vram_lease.zig").Lease = .{};
 // Bounded resident scratch: do not copy the maximum boot SG list to the stack.
 var init_excluded: [gsp_init.max_excluded]gsp_init.Span = undefined;
 var checking_boot = false;
+var starting_gsp = false;
 var boot_checked = false;
 var checking_runtime = false;
 var board_rom: vbios_probe.Capture = .{};
@@ -75,9 +78,14 @@ pub export fn nvidia_init(api: *const a.DriverApi) callconv(.c) i32 {
     rm_log.bind(&ctx);
     const mode = std.mem.span(ctx.getOption("NVIDIA", "mode"));
     const check_firmware = std.ascii.eqlIgnoreCase(mode, "firmware-check");
-    checking_boot = std.ascii.eqlIgnoreCase(mode, "boot-check");
+    starting_gsp = std.ascii.eqlIgnoreCase(mode, "gsp-start");
+    checking_boot = starting_gsp or std.ascii.eqlIgnoreCase(mode, "boot-check");
     boot_checked = false;
     checking_runtime = std.ascii.eqlIgnoreCase(mode, "runtime-check");
+    if (starting_gsp and ctx.apiVersion() < a.driver_api_thread_work_version) {
+        ctx.logError("NVIDIA gsp-start: rejected reason=kernel-work-or-shutdown-contract firmware-execution=disabled");
+        return -12;
+    }
     if (mode.len != 0 and !std.ascii.eqlIgnoreCase(mode, "passive") and !check_firmware and !checking_runtime and !checking_boot) {
         ctx.logError("NVIDIA bind: rejected reason=unsupported-mode native-writes=disabled");
         return -2;
@@ -130,6 +138,10 @@ pub export fn nvidia_init(api: *const a.DriverApi) callconv(.c) i32 {
         ctx.logInfo("NVIDIA bind: absent inventory=canonical native-writes=disabled fallback=preserved");
         return -4;
     }
+    if (starting_gsp and count != 1) {
+        ctx.logError("NVIDIA gsp-start: rejected reason=ambiguous-adapter firmware-execution=disabled");
+        return -12;
+    }
     for (devices[0..count]) |info| {
         const pci = pciIdentity(info);
         var reader: ConfigReader = .{ .ctx = ctx, .info = info };
@@ -161,7 +173,9 @@ pub export fn nvidia_init(api: *const a.DriverApi) callconv(.c) i32 {
         ctx.logError("NVIDIA boot-check: unavailable reason=no-admitted-preflight native-writes=disabled fallback=preserved");
         return -11;
     }
-    if (checking_boot) {
+    if (starting_gsp) {
+        ctx.logInfo("NVIDIA bind: gsp-start=scheduled firmware=570.144 display=held native-output=unavailable");
+    } else if (checking_boot) {
         log("NVIDIA bind: passive devices={d} resources=0 boot-snapshots=checked firmware-execution=disabled fallback=preserved", .{count});
     } else log("NVIDIA bind: passive devices={d} resources=0 native-writes=disabled fallback=preserved", .{count});
     return 0;
@@ -199,6 +213,7 @@ pub export fn nvidia_shutdown() callconv(.c) i32 {
     rm_clock.unbind();
     checking_runtime = false;
     checking_boot = false;
+    starting_gsp = false;
     boot_checked = false;
     driver_api = null;
     return 0;
@@ -423,6 +438,7 @@ fn inspectFwsec(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.
         load_plan.dmem.base, load_plan.dmem.destination, load_plan.dmem.source_offset, load_plan.dmem.bytes / 256, load_plan.dmem.command, load_plan.signature_address, load_plan.boot_vector,
     });
     if (!inspectFwsecState(ctx, snapshot, chip, &load_plan, .{ .rom = rom, .board = board, .fuses = fuses })) return false;
+    if (starting_gsp and boot_checked) return true; // Native run retains its SB image.
     if (!fwsec_cpu.close()) return false;
     log("NVIDIA fwsec: preparation-cleanup=OK resources=0", .{});
     log("NVIDIA fwsec: firmware-ready=no native-writes=disabled fallback=preserved", .{});
@@ -681,6 +697,18 @@ fn checkBoot(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Sna
     }
     log("NVIDIA booters: resources=14 license=matched generation={d} reads={d} source=loaded-r4d gpu-authentication=unverified", .{ booters.generation, booters.reads });
     if (!stageBootInit(ctx, chip.id)) return false;
+    if (starting_gsp) {
+        native_device.open(ctx, &boot_vram, &boot_vram_lease, &run_memory, &firmware_logs) catch |err| {
+            log("NVIDIA gsp-start: rejected phase=owner reason={s} firmware-execution=disabled", .{@errorName(err)});
+            return false;
+        };
+        native_work.start(ctx, &native_device) catch |err| {
+            log("NVIDIA gsp-start: rejected phase=worker reason={s} firmware-execution=disabled", .{@errorName(err)});
+            return false;
+        };
+        boot_checked = true;
+        return true;
+    }
     if (closeBootPreparation()) |phase| {
         logBootCleanup(phase);
         return false;
@@ -766,6 +794,8 @@ fn stageBootInit(ctx: *const r4os.r4dev.DriverContext, chip_id: u16) bool {
 }
 
 fn closeBootInit() bool {
+    if (!native_work.stop()) return false;
+    if (!native_device.closeBeforeSubmission()) return false;
     if (!firmware_logs.close()) return false;
     if (!run_memory.releaseBeforeSubmission()) return false;
     if (!init_storage.close()) return false;
@@ -799,9 +829,9 @@ pub fn closeBootSnapshots(context: *@import("boot_context.zig").Capture, mapping
 }
 
 fn logBootCleanup(phase: ?[]const u8) void {
-    log("NVIDIA boot-abort: cleanup={s} phase={s} display-hold={d} restore-error={s} display-status={d} buffer-status={d} firmware-execution=disabled", .{
+    log("NVIDIA boot-abort: cleanup={s} phase={s} display-hold={d} restore-error={s} display-status={d} buffer-status={d} firmware-effects={}", .{
         if (phase == null) @as([]const u8, "OK") else "retained", phase orelse "complete", boot_vram.boot.held_generation,
-        if (boot_vram.last_error) |err| @errorName(err) else "none", boot_vram.boot.last_status, boot_vram.last_status,
+        if (boot_vram.last_error) |err| @errorName(err) else "none", boot_vram.boot.last_status, boot_vram.last_status, native_device.port.effects_possible,
     });
 }
 

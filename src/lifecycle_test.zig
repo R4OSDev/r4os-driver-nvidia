@@ -1688,6 +1688,18 @@ fn checkBootVramOwner() !void {
     try t.expect(!mapped_boot.close());
     const frts = try held.binding(.frts);
     try checkFrtsStorage(&ctx, &held);
+    // The permanent firmware latch must disable the actual registered
+    // PRAMIN-only recovery callback before any possible firmware effect.
+    const firmware_owner = @intFromPtr(&held);
+    try t.expectError(error.State, capture.retainForFirmware(firmware_owner, capture.boot.held_generation + 1));
+    try t.expect(capture.firmware_owner == 0);
+    try capture.retainForFirmware(firmware_owner, capture.boot.held_generation);
+    try capture.retainForFirmware(firmware_owner, capture.boot.held_generation);
+    try t.expectError(error.Busy, capture.retainForFirmware(firmware_owner + 1, capture.boot.held_generation));
+    const restore: *const fn (u64, u64, *const a.GfxNativeBootInfo) callconv(.c) i32 = @ptrFromInt(f.request.restore_callback);
+    try t.expect(restore(f.request.context, capture.boot.held_generation, &f.info()) == 0);
+    try t.expect(!capture.close() and f.held and f.leases[0] and f.leases[1]);
+    capture.firmware_owner = 0; // Dispose this host-only latch; no firmware was submitted.
     try t.expect(held.validates(frts) and frts.range.bytes == 0x100000 and frts.range.offset > 0x100000000);
     try t.expect(!capture.close() and !backing.close() and capture.ready and backing.report != null);
     try t.expect(f.held and f.buffers[0] != null and f.buffers[1] != null and f.leases[0] and f.leases[1]);
