@@ -10,7 +10,35 @@ unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
 
-Beide FWSEC-Abbilder vor dem Start halten (NVIDIA 0.1.32)
+Normalen GSP-Kaltstart vorbereiten und pruefen (Hostnachweis)
+----------------------------------------------------------
+Nach geprueftem FRTS setzt die Prepare-Phase GSP direkt nach RISC-V zurueck,
+programmiert BCR0x111 und uebergibt die gehaltene Libos-DMA-Seite low32/high32.
+Nach getrenntem normalem Booter Load schreibt Finish die Boot-Appversion und
+beobachtet RISC-V ACTIVE. Kein Resume-Opcode, impliziter SEC2-Start oder
+INIT_DONE-Nachweis. Der native Zulassungsbesitzer muss tatsaechliche Ergebnisse
+desselben Laufs, gehaltene Argumente und vollstaendige Recovery binden; ohne
+diese Faehigkeit Ablehnung vor Effekten. Lauf-/Phasenfristen gelten auch nach
+verzoegerter Zulassung. Keine parallelen Firmware-/Sequencerzugriffe; Fehler
+erhalten Rohzustand und DMA/MMIO.
+
+Final 51 bestehende Besitzerfaelle und Modulbuild bestanden. Die vorhandene
+Core-Gruppe prueft genaue Phasen, DMA-Grenzen, Schreibfehler und nativen MMIO-
+Ablauf samt sieben Ablehnungs-/Spaetfehlerszenarien. Anfaengliche Erwartung an
+einen Testzaehler korrigiert; reine Fehlermarker bleiben im Test. Bei der
+Codepruefung ergaenzte Fristkontrolle nach Zulassung im selben Fall bestaetigt.
+Keine neue Fallzahl/Gates/Gastlaeufe. Ausfuehrung bleibt ungelinkt; NVIDIA
+0.1.32 samt 24 Ressourcen bytegleich. Sechs komplette Referenzen/Lizenzen
+archiviert; vor Einbindung volle zusaetzliche Hinweise paketieren.
+
+Naechste Integrationsluecke aus Quellpruefung: Boot-/VGA-Sicherung haelt
+Teilfenster von BAR0, der native Port verlangt bisher den gesamten BAR0.
+Kernel-MMIO-Besitz weist diese Ueberlappungen ab; gemeinsamer Mappingbesitzer
+erforderlich. Vollstaendige GPU-/Scanout-Recovery und physischer Start/INIT_DONE
+offen. OssiPC offline/unveraendert. Beleg: cold_core_checkpoint. Archiv:
+ExFiles/Reference/GFX/Nvidia/0.79.10/cold-core-20260911.
+
+Aktuell eingebunden: Beide FWSEC-Abbilder vor dem Start halten (NVIDIA 0.1.32)
 -------------------------------------------------------
 Der optionale Bootcheck behaelt sein urspruengliches unveraenderliches SB-
 Abbild samt DMA fuer den normalen Abbau. FRTS bekommt einen getrennten

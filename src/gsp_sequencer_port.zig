@@ -31,6 +31,11 @@ pub const Owner = struct {
     // The executor performs reset and measures TCM itself. Pure admission;
     // absent capability refuses the entire operation before device effects.
     admit_firmware: ?*const fn (*anyopaque, *const firmware_run.Options) anyerror!void = null,
+    // Pure normal-cold-boot admission. Bind the exact retained Libos/boot
+    // descriptor and successful FRTS (prepare) or normal Booter Load (finish)
+    // from this same run, plus full device/display recovery. No boolean caller
+    // result or successful command alone grants these dependencies.
+    admit_cold: ?*const fn (*anyopaque, core.Cold) anyerror!void = null,
 };
 pub const Run = struct { epoch: u64, deadline_ns: u64, resume_args: ?core.Resume = null };
 pub const Port = struct {
@@ -50,6 +55,8 @@ pub const Port = struct {
     memory_status: i32 = 0,
     operation: ?core.Operation = null,
     firmware_operation: ?firmware_run.Operation = null,
+    cold_command: ?core.Cold = null,
+    cold_admitted: bool = false,
     core_phase: u32 = 0,
 
     /// Stable address, serialized init/Driver Work owner; not an IRQ callback
@@ -85,7 +92,7 @@ pub const Port = struct {
     pub fn sequencer(self: *Port) !seq.Port {
         try self.guard();
         if (!self.ready) return error.State;
-        if (self.firmware_operation != null) return error.Busy;
+        if (self.firmware_operation != null or self.cold_command != null) return error.Busy;
         return .{ .context = self, .generation = generation, .now_ns = nowNs, .admit = admit, .read32 = sequenceRead, .write32 = sequenceWrite, .core_step = coreStep };
     }
     pub fn beginFirmware(self: *Port, options: firmware_run.Options) !void {
@@ -102,6 +109,50 @@ pub const Port = struct {
         if (self.owner.?.admit_firmware == null) return error.Unsupported;
         if (options.booter != null and self.owner.?.log_polling == null) return error.Unsupported;
         self.firmware_operation = operation;
+    }
+    /// Two explicit stages around normal Booter Load. Arguments come from the
+    /// bound run; the caller cannot substitute a new Libos DMA address here.
+    pub fn beginColdBoot(self: *Port, stage: core.ColdStage, deadline: u64) !void {
+        try self.guard();
+        if (!self.ready) return error.State;
+        if (self.operation != null or self.firmware_operation != null) return error.Busy;
+        if (deadline > self.run.deadline_ns or deadline <= self.last_clock) return error.Deadline;
+        const args = self.run.resume_args orelse return error.BootArguments;
+        const command: core.Cold = .{ .stage = stage, .args = args };
+        const operation = try core.Operation.initCold(command, self.run.epoch, deadline, self.boot0);
+        if (!self.supports(.write, core.reg.bcr) or !self.supports(.read, core.reg.riscv_cpuctl)) return error.Register;
+        if (self.owner.?.admit_cold == null) return error.Unsupported;
+        self.operation = operation;
+        self.cold_command = command;
+        self.cold_admitted = false;
+    }
+    /// One bounded native stage step. Completion retains every DMA/MMIO owner
+    /// and only means prepared or RISC-V ACTIVE; boot notifications must still
+    /// establish RM_INIT_DONE. Failures preserve the operation and raw state.
+    pub fn stepColdBoot(self: *Port) !bool {
+        errdefer |err| self.failure = err;
+        try self.guard();
+        const command = self.cold_command orelse return error.State;
+        const operation = if (self.operation) |*op| op else return error.State;
+        if (operation.deadline <= self.last_clock or operation.deadline > self.run.deadline_ns) return error.Deadline;
+        if (self.firmware_operation != null or operation.cold_stage != command.stage or
+            self.run.resume_args == null or !std.meta.eql(self.run.resume_args.?, command.args) or
+            operation.resume_args == null or !std.meta.eql(operation.resume_args.?, command.args)) return error.State;
+        if (!self.cold_admitted) {
+            const owner = self.owner.?;
+            try (owner.admit_cold orelse return error.Unsupported)(owner.context, command);
+            try self.guard();
+            if (operation.deadline <= self.last_clock) return error.Deadline;
+            self.cold_admitted = true;
+            return false;
+        }
+        const done = try operation.step(.{ .context = self, .generation = generation, .now_ns = nowNs, .read32 = read32, .write32 = write32 });
+        if (done) {
+            self.operation = null;
+            self.cold_command = null;
+            self.cold_admitted = false;
+        }
+        return done;
     }
     /// FWSEC/Booter completion includes the command-specific result checks;
     /// generic runs return raw mailboxes. All DMA and this mapping stay held.
@@ -164,7 +215,7 @@ pub const Port = struct {
     fn admit(p: *anyopaque, command: seq.Command) error{ Denied, Unsupported }!void {
         const self = cast(p);
         self.guard() catch return error.Denied;
-        if (!self.ready or self.firmware_operation != null) return error.Denied;
+        if (!self.ready or self.firmware_operation != null or self.cold_command != null) return error.Denied;
         // Reject known aperture/identity/write-only errors in the pure pass,
         // including errors near the end of a stream after otherwise valid IO.
         const supported = switch (command) {
@@ -228,11 +279,11 @@ pub const Port = struct {
         return cast(p).write(offset, value);
     }
     fn sequenceRead(p: *anyopaque, offset: u32) anyerror!u32 {
-        if (cast(p).firmware_operation != null) return error.Busy;
+        if (cast(p).firmware_operation != null or cast(p).cold_command != null) return error.Busy;
         return read32(p, offset);
     }
     fn sequenceWrite(p: *anyopaque, offset: u32, value: u32) anyerror!void {
-        if (cast(p).firmware_operation != null) return error.Busy;
+        if (cast(p).firmware_operation != null or cast(p).cold_command != null) return error.Busy;
         return write32(p, offset, value);
     }
     fn logs(p: *anyopaque, enable: bool) anyerror!void {
@@ -247,7 +298,7 @@ pub const Port = struct {
         const self = cast(p);
         errdefer |err| self.failure = err;
         try self.guard();
-        if (self.firmware_operation != null) return error.Busy;
+        if (self.firmware_operation != null or self.cold_command != null) return error.Busy;
         if (deadline > self.run.deadline_ns or deadline <= self.last_clock) return error.Deadline;
         if (state.phase == 0) {
             if (self.operation != null) return error.Busy;

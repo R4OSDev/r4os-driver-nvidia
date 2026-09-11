@@ -10,7 +10,34 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
-Retain both FWSEC images before boot (NVIDIA 0.1.32):
+Normal cold GSP core preparation and completion (host qualified):
+
+After checked FRTS, the cold prepare stage resets directly into RISC-V,
+programs BCR0x111 and passes the bound Libos DMA page low32/high32. After
+separate normal Booter Load, cold finish programs the boot appVersion and
+observes RISC-V ACTIVE. It does not run the resume opcode, start SEC2 implicitly
+or establish INIT_DONE. Native admission must bind those actual same-run
+dependencies and full recovery; missing capability refuses before effects.
+Stage/run deadlines include admission, and all callbacks remain exclusive
+with firmware/sequencer execution. Errors retain raw state and DMA/MMIO.
+
+Final 51 existing owner cases and module build pass. The existing core group
+checks exact cold phases, DMA limits, posted failures and native MMIO ordering,
+including seven native refusal/late-failure scenarios. Initial test-counter
+expectation corrected; failure-only stage markers retained. Code review added
+the deadline check after delayed admission and verified it in the same group.
+No new case count/gate/guest. All native execution remains unlinked: NVIDIA
+0.1.32 and its 24 resources are byte-identical. Six complete pinned sources/
+notices are archived; complete additional notices must be packaged before linkage.
+
+Source review found the next integration dependency: boot/VGA capture holds
+partial BAR0 windows while the native port requests the whole BAR0. Kernel
+MMIO ownership rejects those overlaps; both need a shared mapping owner.
+Full GPU/scanout recovery and physical execution/INIT_DONE remain open.
+OssiPC is offline and untouched. Evidence: `cold_core_checkpoint`; archive
+`cold-core-20260911`.
+
+Current linked: retain both FWSEC images before boot (NVIDIA 0.1.32):
 
 The opt-in boot-check keeps its original immutable SB CPU/DMA image for normal
 teardown and prepares FRTS in a separate resident owner. The complete run now

@@ -1,5 +1,15 @@
 ﻿# Third-Party Notices
 
+Normal GA106 cold core stages (host qualified, 2026-09-11):
+gsp_core extends its existing MIT-attributed adaptation using normal bootstrap
+in kernel_gsp_tu102.c (NVIDIA2017-2024) and kflcnResetIntoRiscv_GA102 in
+kernel_falcon_ga102.c (NVIDIA2021-2024). Existing full copyright lines and MIT
+terms remain in the source. Bounded native admission/lifetime interfaces are
+original R4OS Apache-2.0. Six complete pinned originals/notices accompany
+cold-core-20260911. All execution remains unlinked; NVIDIA0.1.32 and its
+24 packaged resource bytes are unchanged. Package complete additional core/
+HS/result notices in module and distribution before executable linkage.
+
 Normal GA106 Booter arguments/results (host qualified, 2026-09-11):
 booter_result.zig adapts normal cold-load/unload argument/result semantics of
 kernel_gsp_booter_tu102.c (NVIDIA2022-2024) and kgspIsWpr2Up_TU102 in

@@ -79,6 +79,14 @@ pub const Resume = struct {
     libos_dma: u64,
     app_version: u32,
 };
+pub const ColdStage = enum { prepare, finish };
+pub const Cold = struct {
+    stage: ColdStage,
+    // The same retained Libos page and admitted boot descriptor must survive
+    // both stages. Prepare follows successful FRTS; finish follows the actual
+    // normal Booter Load result. The native owner admits those dependencies.
+    args: Resume,
+};
 pub const Io = struct {
     context: *anyopaque,
     generation: *const fn (*anyopaque) u64,
@@ -118,6 +126,7 @@ pub const Phase = enum {
 pub const Operation = struct {
     opcode: seq.Opcode,
     reset_engine: Engine = .gsp,
+    cold_stage: ?ColdStage = null,
     epoch: u64,
     deadline: u64,
     boot0: u32,
@@ -155,6 +164,19 @@ pub const Operation = struct {
     pub fn initReset(engine: Engine, epoch: u64, deadline: u64, boot0: u32) !Operation {
         var operation = try init(.core_reset, epoch, deadline, boot0, null);
         operation.reset_engine = engine;
+        return operation;
+    }
+    /// Normal GA106 bootstrap around Booter Load, not the firmware's resume
+    /// opcode. Prepare resets directly into RISC-V and programs Libos args.
+    /// Finish programs FALCON_OS and observes RISC-V ACTIVE after Booter Load.
+    /// It never starts SEC2 implicitly or claims RM_INIT_DONE/quiescence.
+    pub fn initCold(command: Cold, epoch: u64, deadline: u64, boot0: u32) !Operation {
+        const address = command.args.libos_dma;
+        const mask = @import("gsp_radix.zig").dma_mask;
+        if (address == 0 or address & 4095 != 0 or address > mask or 4095 > mask - address) return error.BootArguments;
+        var operation = try init(.core_reset, epoch, deadline, boot0, command.args);
+        operation.cold_stage = command.stage;
+        if (command.stage == .finish) operation.phase = .os;
         return operation;
     }
     fn register(self: *const Operation, address: u32) !u32 {
@@ -230,7 +252,7 @@ pub const Operation = struct {
             .pre_reset => {
                 if (self.hint_deadline == null) self.hint_deadline = now + @min(pre_reset_ns, self.deadline - now);
                 const value = try self.read(io, reg.hwcfg2);
-                if (self.opcode == .core_resume and value & bits.riscv_enabled == 0) return error.Resume;
+                if ((self.opcode == .core_resume or self.cold_stage == .prepare) and value & bits.riscv_enabled == 0) return error.Resume;
                 // RESET_READY is only a hint: bug 3419321 allows proceeding
                 // after 150 us, even when the bit never becomes set.
                 if (value & bits.reset_ready != 0 or self.last_clock >= self.hint_deadline.?) self.phase = .assert_reset;
@@ -257,7 +279,7 @@ pub const Operation = struct {
                 if (value & bits.scrubbing == 0) self.phase = .select_core;
             },
             .select_core => {
-                if (self.opcode == .core_resume) {
+                if (self.opcode == .core_resume or self.cold_stage == .prepare) {
                     try self.write(io, reg.bcr, bits.bcr_boot);
                     self.phase = .boot_low;
                 } else {
@@ -306,7 +328,7 @@ pub const Operation = struct {
             },
             .boot_high => {
                 try self.write(io, reg.mailbox1, @truncate(self.resume_args.?.libos_dma >> 32));
-                self.phase = .sec_start;
+                self.phase = if (self.cold_stage == .prepare) .complete else .sec_start;
             },
             .sec_start => {
                 try self.startCpu(io, reg.sec_cpuctl, reg.sec_cpuctl_alias);

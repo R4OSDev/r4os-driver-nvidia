@@ -16,6 +16,7 @@ const Model = struct {
     clock: u64 = 1000000,
     epoch: u64 = 7,
     ready: bool = false,
+    riscv_enabled: bool = true,
     reset_edges: u32 = 0,
     propagation: u32 = 0,
     scrub_reads: u32 = 0,
@@ -29,6 +30,7 @@ const Model = struct {
     logs_enabled: bool = true,
     logs_calls: u32 = 0,
     posted_failure: bool = false,
+    posted_address: ?u32 = null,
     read_error: ?u32 = null,
     writes: [12]seq.Write = undefined,
     write_count: usize = 0,
@@ -48,7 +50,7 @@ const Model = struct {
         return switch (address) {
             r.hwcfg2 => blk: {
                 if (self.reset_edges == 2) self.scrub_reads += 1;
-                break :blk b.riscv_enabled | (if (self.ready) @as(u32, b.reset_ready) else 0) |
+                break :blk (if (self.riscv_enabled) @as(u32, b.riscv_enabled) else 0) | (if (self.ready) @as(u32, b.reset_ready) else 0) |
                     (if (self.reset_edges == 2 and self.scrub_reads < 3) @as(u32, b.scrubbing) else 0);
             },
             r.engine => blk: {
@@ -85,7 +87,7 @@ const Model = struct {
         }
         self.writes[self.write_count] = .{ .address = address, .value = value };
         self.write_count += 1;
-        if (self.posted_failure) return error.Posted;
+        if (self.posted_failure or self.posted_address == address) return error.Posted;
     }
     fn logs(p: *anyopaque, enable: bool) anyerror!void {
         const self = cast(p);
@@ -128,6 +130,11 @@ const NativeRig = struct {
     booter_mailboxes: u32 = 0,
     logs_enabled: bool = true,
     logs_calls: u32 = 0,
+    frts_completed: bool = false,
+    cold_prepared: bool = false,
+    load_completed: bool = false,
+    cold_admissions: u32 = 0,
+    cold_admission_timeout: bool = false,
     fn cast(p: *anyopaque) *NativeRig {
         return @ptrCast(@alignCast(p));
     }
@@ -148,6 +155,15 @@ const NativeRig = struct {
         } else try t.expect(options.engine == .gsp);
         self.hs_admissions += 1;
     }
+    fn admitCold(p: *anyopaque, command: core.Cold) anyerror!void {
+        const self = cast(p);
+        try t.expect(std.meta.eql(command.args, args));
+        if (command.stage == .prepare) {
+            if (!self.frts_completed or self.cold_prepared) return error.Dependencies;
+        } else if (!self.cold_prepared or !self.load_completed) return error.Dependencies;
+        self.cold_admissions += 1;
+        if (self.cold_admission_timeout) self.clock = 1000000;
+    }
     fn access(p: *anyopaque, kind: native.Access, address: u32) anyerror!void {
         const self = cast(p);
         self.accesses += 1;
@@ -160,6 +176,7 @@ const NativeRig = struct {
             self.booter_mailboxes += 1;
             self.words[address / 4] = 0; // Host model of a successful Booter.
             if (self.booter_unload) self.words[0x1fa828 / 4] = 0;
+            if (!self.booter_unload) self.words[r.riscv_cpuctl / 4] = b.active;
         }
         if (kind == .read and address == 0 and self.retains != 0) {
             self.flushes += 1;
@@ -219,7 +236,73 @@ const NativeRig = struct {
 };
 var rig: *NativeRig = undefined;
 
+fn checkColdCore() !void {
+    var checkpoint: u32 = 0;
+    errdefer |err| std.debug.print("cold core check={d}: {s}\n", .{ checkpoint, @errorName(err) });
+    for ([_]u64{ args.libos_dma, 0x100000000, @import("gsp_radix.zig").dma_mask - 4095 }) |address| {
+        var model: Model = .{}; // RESET_READY remains a timed hint.
+        const cold_args: core.Resume = .{ .libos_dma = address, .app_version = args.app_version };
+        var op = try core.Operation.initCold(.{ .stage = .prepare, .args = cold_args }, model.epoch, model.clock + std.time.ns_per_s, boot0);
+        checkpoint = 1;
+        try model.drive(&op);
+        try t.expectEqual(@as(usize, 5), model.write_count);
+        try t.expectEqual(seq.Write{ .address = r.bcr, .value = 0x111 }, model.writes[2]);
+        try t.expectEqual(seq.Write{ .address = r.mailbox0, .value = @truncate(address) }, model.writes[3]);
+        try t.expectEqual(seq.Write{ .address = r.mailbox1, .value = @truncate(address >> 32) }, model.writes[4]);
+        try t.expect(model.logs_calls == 0 and model.logs_enabled);
+        // The owner must separately observe the actual Booter Load result
+        // before this stage. This host core model supplies only ACTIVE.
+        op = try core.Operation.initCold(.{ .stage = .finish, .args = cold_args }, model.epoch, model.clock + std.time.ns_per_s, boot0);
+        checkpoint = 2;
+        try model.drive(&op);
+        try t.expectEqual(@as(usize, 6), model.write_count);
+        try t.expectEqual(seq.Write{ .address = r.os, .value = args.app_version }, model.writes[5]);
+        try t.expect(model.reset_edges == 2 and model.logs_calls == 0);
+    }
+    for ([_]u64{ 0, 1, 4097, @import("gsp_radix.zig").dma_mask + 1, std.math.maxInt(u64) }) |address| {
+        checkpoint = 3;
+        try t.expectError(error.BootArguments, core.Operation.initCold(.{ .stage = .prepare, .args = .{ .libos_dma = address, .app_version = 0 } }, 1, 1000, boot0));
+    }
+    for ([_]u32{ r.engine, r.bcr, r.mailbox0, r.mailbox1, r.os }) |address| {
+        checkpoint = address;
+        var model: Model = .{ .ready = true, .posted_address = address };
+        var op = try core.Operation.initCold(.{ .stage = if (address == r.os) .finish else .prepare, .args = args }, model.epoch, model.clock + std.time.ns_per_s, boot0);
+        try t.expectError(error.Posted, model.drive(&op));
+        try t.expect(op.write_attempted and op.last_address.? == address and op.failure.? == error.Posted);
+        const writes = model.write_count;
+        try t.expectError(error.State, op.step(model.io()));
+        try t.expectEqual(writes, model.write_count);
+    }
+    var model: Model = .{ .active = false };
+    checkpoint = 4;
+    var op = try core.Operation.initCold(.{ .stage = .finish, .args = args }, model.epoch, model.clock + std.time.ns_per_s, boot0);
+    try t.expectError(error.NotActive, model.drive(&op));
+    try t.expect(op.last_address.? == r.riscv_cpuctl and op.last_value.? == 0 and model.write_count == 1);
+    model = .{ .riscv_enabled = false };
+    checkpoint = 5;
+    op = try core.Operation.initCold(.{ .stage = .prepare, .args = args }, model.epoch, model.clock + std.time.ns_per_s, boot0);
+    try t.expectError(error.Resume, model.drive(&op));
+    try t.expectEqual(@as(usize, 0), model.write_count);
+    model = .{};
+    checkpoint = 6;
+    op = try core.Operation.initCold(.{ .stage = .prepare, .args = args }, model.epoch, model.clock + std.time.ns_per_s, boot0);
+    model.epoch += 1;
+    try t.expectError(error.Stale, op.step(model.io()));
+    try t.expectEqual(@as(usize, 0), model.write_count);
+    model = .{};
+    checkpoint = 7;
+    op = try core.Operation.initCold(.{ .stage = .finish, .args = args }, model.epoch, model.clock + 1000, boot0);
+    try t.expect(!try op.step(model.io())); // OS written, ACTIVE still unobserved.
+    model.clock = op.deadline;
+    try t.expectError(error.Deadline, op.step(model.io()));
+    try t.expect(op.last_address.? == r.os and model.write_count == 1);
+}
+
 test "firmware CPU storage GA106 core sequencing and native MMIO ownership" {
+    var checkpoint: []const u8 = "cold-core";
+    errdefer |err| std.debug.print("native core check={s}: {s}\n", .{ checkpoint, @errorName(err) });
+    try checkColdCore();
+    checkpoint = "existing-core";
     // Full reset: hint timeout is not failure, both edges propagate through
     // ten reads, scrubbing precedes switching, full BOOT0 goes into FALCON_RM.
     var model: Model = .{};
@@ -285,6 +368,7 @@ test "firmware CPU storage GA106 core sequencing and native MMIO ownership" {
     try t.expectEqual(reads, model.reads);
 
     const words = try t.allocator.alignedAlloc(u32, comptime std.mem.Alignment.fromByteUnits(4096), 0x842000 / 4);
+    checkpoint = "native-open";
     defer t.allocator.free(words);
     var fixture: NativeRig = .{ .words = words };
     rig = &fixture;
@@ -296,10 +380,11 @@ test "firmware CPU storage GA106 core sequencing and native MMIO ownership" {
     var snapshot: identity.Snapshot = .{ .pci = .{ .vendor_id = 0x10de, .device_id = 0x2504, .class_code = 3 }, .command = 2 };
     snapshot.bars[0] = .{ .kind = .memory32, .base = 0xfb000000, .bytes = words.len * 4 };
     var port: native.Port = .{};
-    try port.open(&ctx, &snapshot, boot0, 0, .{ .epoch = 9, .deadline_ns = 10000000 }, fixture.owner());
+    try port.open(&ctx, &snapshot, boot0, 0, .{ .epoch = 9, .deadline_ns = 10000000, .resume_args = args }, fixture.owner());
     const io = try port.sequencer();
     const initial_accesses = fixture.accesses;
     try t.expectError(error.Unsupported, io.admit(io.context, .core_resume));
+    try t.expectError(error.Unsupported, port.beginColdBoot(.prepare, 1000000));
     try t.expectError(error.Denied, io.admit(io.context, .{ .write = .{ .address = 0, .value = 0 } }));
     try t.expectError(error.Denied, io.admit(io.context, .{ .store = .{ .address = r.cpuctl_alias, .index = 0 } }));
     try t.expectError(error.Denied, io.admit(io.context, .{ .write = .{ .address = @intCast(words.len * 4), .value = 0 } }));
@@ -375,7 +460,8 @@ test "firmware CPU storage GA106 core sequencing and native MMIO ownership" {
     // Same actual SDK/MMIO port retains the run through post-halt FWSEC
     // reads. Command results never mark the device quiescent or release it.
     const result_check = @import("fwsec_result.zig");
-    for ([_]result_check.Command{ .{ .frts = 0x2ffee0000 }, .sb }) |command| {
+    checkpoint = "native-fwsec";
+    for ([_]result_check.Command{ .sb, .{ .frts = 0x2ffee0000 } }) |command| {
         var fwsec_options = hs_options;
         fwsec_options.mailboxes = .{ null, null };
         fwsec_options.fwsec = command;
@@ -390,9 +476,33 @@ test "firmware CPU storage GA106 core sequencing and native MMIO ownership" {
         }
         try t.expect(hs_result != null and hs_result.?.fwsec != null);
         try t.expectEqualSlices(u32, &expected, &hs_result.?.fwsec.?.raw);
+        if (command == .frts) fixture.frts_completed = true;
         try t.expect(fixture.retains == 1 and !port.close() and fixture.unmaps == 0);
     }
+    // Cold preparation follows this port's checked FRTS result and uses the
+    // run's original Libos address. SEC2 Booter Load remains a separate run.
+    port.owner.?.admit_cold = NativeRig.admitCold;
+    checkpoint = "native-cold-prepare";
+    words[r.hwcfg2 / 4] = b.reset_ready | b.riscv_enabled;
+    try port.beginColdBoot(.prepare, fixture.clock + 2 * std.time.ns_per_ms);
+    try t.expectError(error.Busy, port.beginColdBoot(.prepare, fixture.clock + 2 * std.time.ns_per_ms));
+    try t.expectError(error.Busy, port.beginFirmware(hs_options));
+    try t.expectError(error.Busy, port.sequencer());
+    try t.expectError(error.Busy, io.read32(io.context, r.os));
+    try t.expectError(error.Busy, io.write32(io.context, r.os, 1));
+    try t.expectError(error.Denied, io.admit(io.context, .core_start));
+    for (0..128) |_| {
+        if (try port.stepColdBoot()) break;
+        fixture.clock += 10 * std.time.ns_per_us;
+    }
+    try t.expect(port.operation == null and port.cold_command == null and fixture.cold_admissions == 1);
+    fixture.cold_prepared = true;
+    try t.expectEqual(@as(u32, 0x111), words[r.bcr / 4]);
+    try t.expectEqual(@as(u32, @truncate(args.libos_dma)), words[r.mailbox0 / 4]);
+    try t.expectEqual(@as(u32, @truncate(args.libos_dma >> 32)), words[r.mailbox1 / 4]);
+    try t.expect(fixture.logs_calls == 0 and fixture.retains == 1 and !port.close());
     const boot_check = @import("booter_result.zig");
+    checkpoint = "native-booter";
     words[(hs.reg.sec2 + firmware_run.hwcfg_offset) / 4] = 0x20100;
     words[(hs.reg.sec2 + hs.reg.cpu_control) / 4] = b.alias | b.halted;
     for ([_]boot_check.Command{ .{ .normal_load = 0x123456000 }, .normal_unload }) |command| {
@@ -419,6 +529,21 @@ test "firmware CPU storage GA106 core sequencing and native MMIO ownership" {
         try t.expect(fixture.logs_enabled and fixture.logs_calls == prior_logs + 2);
         try t.expect(hs_result.?.mailboxes[0].? == 0 and hs_result.?.blocks == 4);
         try t.expect(fixture.retains == 1 and !port.close() and fixture.unmaps == 0);
+        if (command == .normal_load) {
+            fixture.load_completed = true; // The preceding actual-port result was checked.
+            checkpoint = "native-cold-finish";
+            const prior_flushes = fixture.flushes;
+            try port.beginColdBoot(.finish, fixture.clock + 2 * std.time.ns_per_ms);
+            try t.expect(!try port.stepColdBoot()); // Pure whole-stage admission.
+            try t.expect(!try port.stepColdBoot()); // FALCON_OS only.
+            try t.expect(try port.stepColdBoot()); // Actual-port ACTIVE observation.
+            try t.expectEqual(args.app_version, words[r.os / 4]);
+            // The fixture counts access-policy calls: one admission before
+            // the OS write and one for its actual posted-write flush.
+            try t.expect(fixture.flushes == prior_flushes + 2 and fixture.cold_admissions == 2);
+            try t.expect(fixture.logs_calls == prior_logs + 2 and !port.close());
+            checkpoint = "native-booter";
+        }
         if (command == .normal_unload) {
             try t.expectEqual(@as(?u32, 0), hs_result.?.booter.?.wpr_hi_after);
             const flushes = fixture.flushes;
@@ -432,6 +557,7 @@ test "firmware CPU storage GA106 core sequencing and native MMIO ownership" {
     // An invalid flush comes AFTER the write: preserve the actual effect and
     // keep the MMIO/DMA owner alive. Subsequent callbacks cannot write again.
     fixture.wrong_flush = true;
+    checkpoint = "native-posted-cleanup";
     try t.expectError(error.IdentityChanged, io.write32(io.context, r.os, 0xaabb));
     try t.expectEqual(@as(u32, 0xaabb), words[r.os / 4]);
     try t.expectError(error.State, io.write32(io.context, r.os, 0xccdd));
@@ -450,4 +576,49 @@ test "firmware CPU storage GA106 core sequencing and native MMIO ownership" {
     try t.expectError(error.Mapping, port.open(&ctx, &snapshot, boot0, 0, .{ .epoch = 9, .deadline_ns = 10000000 }, fixture.owner()));
     try t.expect(fixture.accesses == 0 and fixture.mapped);
     try t.expect(port.close() and fixture.unmaps == 1);
+    // Cold admission/late-failure paths use the same native mapping callbacks.
+    // All quiescence flags below dispose host registers only; no GPU ran.
+    for (0..7) |fault| {
+        checkpoint = "native-cold-rejection";
+        @memset(words, 0);
+        words[0] = boot0;
+        words[r.hwcfg2 / 4] = b.reset_ready | b.riscv_enabled;
+        fixture = .{ .words = words, .frts_completed = fault >= 3, .wrong_flush = fault == 5, .cold_admission_timeout = fault == 6 };
+        port = .{};
+        var owner = fixture.owner();
+        owner.admit_cold = NativeRig.admitCold;
+        try port.open(&ctx, &snapshot, boot0, 0, .{ .epoch = 9, .deadline_ns = 10000000, .resume_args = if (fault == 0) null else args }, owner);
+        if (fault == 0) {
+            try t.expectError(error.BootArguments, port.beginColdBoot(.prepare, 1000000));
+            try t.expect(fixture.cold_admissions == 0 and fixture.retains == 0 and port.operation == null);
+        } else {
+            try port.beginColdBoot(if (fault == 2) .finish else .prepare, 1000000);
+            if (fault <= 2) {
+                try t.expectError(error.Dependencies, port.stepColdBoot());
+            } else if (fault == 3) {
+                port.run.resume_args.?.libos_dma += 4096;
+                try t.expectError(error.State, port.stepColdBoot());
+            } else if (fault == 6) {
+                try t.expectError(error.Deadline, port.stepColdBoot());
+                try t.expect(!port.cold_admitted and fixture.retains == 0);
+            } else {
+                try t.expect(!try port.stepColdBoot()); // Admission is separate from effects.
+                if (fault == 4) {
+                    fixture.clock = 1000000;
+                    try t.expectError(error.Deadline, port.stepColdBoot());
+                } else {
+                    try t.expect(!try port.stepColdBoot()); // Pre-reset observation.
+                    try t.expectError(error.IdentityChanged, port.stepColdBoot()); // Posted reset write.
+                }
+            }
+            try t.expect(port.operation != null and port.failure != null);
+            try t.expectError(error.State, port.stepColdBoot());
+            try t.expectEqual(@as(u32, if (fault == 5) 1 else 0), fixture.retains);
+            if (fault == 5) {
+                try t.expect(!port.close() and fixture.unmaps == 0 and port.operation.?.write_attempted);
+                fixture.quiet = true;
+            }
+        }
+        try t.expect(port.close() and !fixture.mapped and fixture.unmaps == 1);
+    }
 }
