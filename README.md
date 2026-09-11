@@ -10,7 +10,31 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
-Shared BAR0 ownership (NVIDIA 0.1.33):
+Existing BAR1 mapping resolution (host qualified):
+
+bar1_walk translates one contiguous part of a CPU physical BAR1 span to local
+VRAM. It handles physical mode and the pinned GA106 v2 directory format,
+including4KB/64KB/128KB/2MB/512MB leaves and high address bits. It returns the
+instance span and raw dependency path, with exact bounds and leaf clipping.
+Seven8/16-byte records at most are reread before publication; control words,
+epoch and absolute monotonic deadline must remain valid. Sparse/conflicting,
+foreign, protected, compressed and misaligned mappings refuse explicitly.
+
+The generated NVIDIA HAL admits onlyv2 for this GA106 RM path. An initial
+legacy-v1 prototype was removed after that source review; the existing test
+now requires refusal before following its root. Final51 existing cases and
+module build pass. No new case/gate count or guest run. NVIDIA0.1.33 and its
+24resources remain byte-identical: this resolver is not yet linked from main.
+Fourteen complete pinned sources/notices are archived with hashes. Full MMU
+notices must be packaged before executable linkage.
+
+Next: bind the reader to shared BAR0 and held boot display, resolve the whole
+boot surface, preserve its table pages and reserve the actual VRAM ranges.
+The returned path is not a table backup, recovery or quiescence proof. Full
+device/scanout recovery and physical bootstrap/INIT_DONE/HDMI remain open.
+OssiPC offline/unmodified. Evidence: bar1_walk_checkpoint; bar1-walk-20260911.
+
+Current linked checkpoint: shared BAR0 ownership (NVIDIA 0.1.33):
 
 The opt-in boot-check now keeps one full measured GA106 BAR0 UC mapping.
 Boot/VGA capture, repeated preflight and Booter fuse reads borrow this owner;

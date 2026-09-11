@@ -10,7 +10,33 @@ unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
 
-Gemeinsamer BAR0-Besitz (NVIDIA 0.1.33)
+Vorhandene BAR1-Zuordnung aufloesen (Hostnachweis)
+-----------------------------------------------
+bar1_walk uebersetzt einen zusammenhaengenden Teil eines CPU-physischen
+BAR1-Bereichs in lokales VRAM. Direkter Modus und das zugelassene GA106-
+Tabellenformatv2 mit4KB/64KB/128KB/2MB/512MB-Seiten, hohen Adressbits und
+genauen Bereichsgrenzen. Instanzbereich und rohe Tabellenabhaengigkeiten
+werden mitgeliefert. Hoechstens sieben8/16-Byte-Eintraege werden vor Rueckgabe
+erneut gelesen; Steuerregister, Epoche und absolute monotone Frist gelten
+durchgaengig. Luecken, widerspruechliche, fremde, geschuetzte, komprimierte
+oder falsch ausgerichtete Zuordnungen werden abgewiesen.
+
+Die originale HAL-Auswahl laesst fuer diesen GA106-RM-Pfad nurv2 zu. Eine
+erstev1-Auswertung nach dieser Quellpruefung entfernt; vorhandener Test
+verlangt jetzt Ablehnung vor dem Folgen ihres Wurzelzeigers. Final51 bestehende
+Faelle und Modulbuild bestanden. Keine neue Fallzahl/Gates/Gastlaeufe.
+NVIDIA0.1.33 samt24Ressourcen bytegleich: Auswertung noch nicht aus main
+eingebunden.14vollstaendige gepinnte Quellen/Lizenztexte mit Hashes archiviert;
+vor Einbindung die vollstaendigen MMU-Hinweise paketieren.
+
+Naechster Schritt: Leser an gemeinsamen BAR0 und gehaltenes Boot-Display
+binden, die ganze Bootflaeche aufloesen, Tabellenseiten sichern und wirkliche
+VRAM-Bereiche reservieren. Rueckgegebener Pfad ist keine Tabellensicherung,
+Recovery oder Quieszenz. Gesamt-Recovery und physischer Start/INIT_DONE/HDMI
+offen. OssiPC offline/unveraendert. Beleg: bar1_walk_checkpoint; Archiv:
+ExFiles/Reference/GFX/Nvidia/0.79.10/bar1-walk-20260911.
+
+Aktuell eingebundener Stand: Gemeinsamer BAR0-Besitz (NVIDIA 0.1.33)
 -------------------------------------
 Der optionale Boot-Check haelt jetzt ein vollstaendiges gemessenes GA106-
 BAR0-Mapping mit UC-Cachetyp. Boot-/VGA-Sicherung, erneute Zustandspruefung

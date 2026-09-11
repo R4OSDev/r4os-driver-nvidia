@@ -87,6 +87,163 @@ test "FWSEC preflight rejects inaccessible state and bounds TCM against actual c
     plan.dmem.destination = 0xffffff00;
     try t.expectError(error.Capacity, decoded.checkTcm(&plan));
     try checkPraminCapture();
+    try checkBar1Walk();
+}
+
+// Same preflight case: resolve the existing CPU-visible console mapping,
+// following the pinned GA106 format admission. Host memory, not a GPU.
+fn checkBar1Walk() !void {
+    const walk = @import("bar1_walk.zig");
+    const Model = struct {
+        records: [walk.max_entries]walk.Entry = @splat(.{}),
+        count: usize = 0,
+        reads: usize = 0,
+        controls_read: usize = 0,
+        epoch: u64 = 9,
+        clock: u64 = 100,
+        control: walk.Control = .{ .boot0 = 0xb76000a1, .boot1 = 0, .block = 0x80000001, .bind_status = 0 },
+        unstable: bool = false,
+        control_changed: bool = false,
+        late: bool = false,
+        stale: bool = false,
+        fault: bool = false,
+        fn cast(p: *anyopaque) *@This() { return @ptrCast(@alignCast(p)); }
+        fn generation(p: *anyopaque) u64 { return cast(p).epoch; }
+        fn now(p: *anyopaque) u64 { return cast(p).clock; }
+        fn controls(p: *anyopaque) !walk.Control {
+            const self = cast(p);
+            self.controls_read += 1;
+            var result = self.control;
+            if (self.control_changed and self.controls_read == 2) result.block ^= 0x100;
+            return result;
+        }
+        fn read(p: *anyopaque, address: u64, out: []u8) !void {
+            const self = cast(p);
+            self.reads += 1;
+            if (self.fault) return error.DataRead;
+            for (self.records[0..self.count]) |record| if (record.address == address and record.bytes == out.len) {
+                @memcpy(out, record.value[0..out.len]);
+                if (self.unstable and self.reads > self.count) out[0] ^= 0x10;
+                if (self.late) self.clock = 200;
+                if (self.stale) self.epoch += 1;
+                return;
+            };
+            return error.UnexpectedRead;
+        }
+        fn reader(self: *@This()) walk.Reader { return .{ .context = self, .generation = generation, .now_ns = now, .controls = controls, .read_vram = read }; }
+        fn add(self: *@This(), address: u64, low: u64, high: ?u64) void {
+            const record = &self.records[self.count];
+            record.* = .{ .address = address, .bytes = if (high != null) 16 else 8 };
+            std.mem.writeInt(u64, record.value[0..8], low, .little);
+            if (high) |value| std.mem.writeInt(u64, record.value[8..16], value, .little);
+            self.count += 1;
+        }
+        fn change(self: *@This(), index: usize, at: usize, value: u64) void { std.mem.writeInt(u64, self.records[index].value[at..][0..8], value, .little); }
+        fn request() walk.Request {
+            return .{ .epoch = 9, .deadline = 200, .boot0 = 0xb76000a1, .boot1 = 0,
+                .bar = .{ .kind = .memory64, .base = 0x400000000, .bytes = 0x400000000, .prefetchable = true },
+                .framebuffer_bytes = 0x300000000, .cpu_physical = 0x400002345, .bytes = 0x200000 };
+        }
+        fn setup(format: walk.Format, shift: u6) @This() {
+            var self: @This() = .{};
+            if (format == .physical) { self.control.block = 0x79; return self; } // PTR ignored in physical mode.
+            const flags: u64 = 0x400 | (if (shift == 17) @as(u64, 0) else 0x800);
+            self.add(0x1200, 0x2000 | flags, 0x3ffffffff);
+            // All leaf addresses start at6GB, well above32 bits.
+            const pte: u64 = 0x18000001;
+            self.add(0x2000, 0x302, null);
+            self.add(0x3000, 0x402, null);
+            self.add(0x4000, if (shift == 29) pte else 0x502, null);
+            if (shift == 29) return self;
+            self.add(0x5000, if (shift == 21) pte else if (shift != 12) 0x602 else 0, if (shift == 12) 0x602 else 0);
+            if (shift != 21) self.add(if (shift == 12) 0x6010 else 0x6000, pte, null);
+            return self;
+        }
+    };
+    var checkpoint: usize = 0;
+    errdefer std.debug.print("BAR1 mapping checkpoint {d}\n", .{checkpoint});
+    var request = Model.request();
+    var model = Model.setup(.physical, 0);
+    const physical = try walk.resolve(request, model.reader());
+    try t.expect(physical.format == .physical and physical.mapped.address == 0x2345 and physical.mapped.bytes == request.bytes and model.reads == 0 and model.controls_read == 2);
+    for ([_]u6{ 12, 16, 17, 21, 29 }) |shift| {
+            checkpoint += 1;
+            model = Model.setup(.v2, shift);
+            const report = try walk.resolve(request, model.reader());
+            try t.expect(report.format == .v2 and report.leaf_shift == shift and report.instance.?.address == 0x1000);
+            try t.expectEqual(@as(u64, 0x180000000) + (0x2345 & ((@as(u64, 1) << shift) - 1)), report.mapped.address);
+            try t.expectEqual(@min(request.bytes, (@as(u64, 1) << shift) - (0x2345 & ((@as(u64, 1) << shift) - 1))), report.mapped.bytes);
+            try t.expect(model.reads == 2 * model.count and model.controls_read == 2 and report.entry_count == model.count);
+    }
+    checkpoint = 20;
+    // Both tables may exist, but only one may cover this VA. An invalid big
+    // PTE falls through; a sparse or conflicting entry never fabricates RAM.
+    model = Model.setup(.v2, 12);
+    model.change(4, 0, 0x702);
+    model.add(0x7000, 0, null);
+    const mixed = try walk.resolve(request, model.reader());
+    try t.expect(mixed.mapped.address == 0x180000345 and mixed.entry_count == 7 and model.reads == 14);
+    model.reads = 0;
+    model.change(6, 0, 0x18000001);
+    try t.expectError(error.Ambiguous, walk.resolve(request, model.reader()));
+    model.reads = 0;
+    model.change(6, 0, 8);
+    try t.expectError(error.Unmapped, walk.resolve(request, model.reader()));
+    checkpoint = 21;
+    // The pinned GA106 HAL admits v2 only. Recognize v1, but do not follow
+    // its page-directory pointer or claim a supported physical translation.
+    model = Model.setup(.v2, 12);
+    model.change(0, 0, 0x2800);
+    try t.expectError(error.Format, walk.resolve(request, model.reader()));
+    try t.expectEqual(@as(usize, 1), model.reads);
+    checkpoint = 22;
+    // Exercise nonzero indices at every v2 directory level. These fixture
+    // addresses correspond to VA0x1808040a02345, not any allocator's output.
+    model = Model.setup(.v2, 12);
+    request.bar.bytes = 0x2000000000000;
+    request.cpu_physical = request.bar.base + 0x1808040a02345;
+    model.change(0, 8, 0x1ffffffffffff);
+    model.records[1].address = 0x2018; // PD3[3]
+    model.records[2].address = 0x3010; // PD2[2]
+    model.records[3].address = 0x4010; // PD1[2]
+    model.records[4].address = 0x5050; // PD0[5]
+    const high = try walk.resolve(request, model.reader());
+    try t.expectEqual(@as(u64, 0x180000345), high.mapped.address);
+    request = Model.request();
+    for (0..15) |fault| {
+        checkpoint = 30 + fault;
+        model = Model.setup(.v2, 12);
+        const expected: anyerror = switch (fault) {
+            0 => blk: { model.control.bind_status = 1; break :blk error.BindPending; },
+            1 => blk: { model.control.block |= 0x20000000; break :blk error.Aperture; },
+            2 => blk: { model.control.boot0 ^= 1; break :blk error.Identity; },
+            3 => blk: { model.change(0, 0, 0x2c02); break :blk error.Aperture; },
+            4 => blk: { model.change(1, 0, 0x304); break :blk error.Aperture; },
+            5 => blk: { model.change(2, 0, 1); break :blk error.Pde; },
+            6 => blk: { model.change(5, 0, 0); break :blk error.Unmapped; },
+            7 => blk: { model.change(5, 0, 0x18000041); break :blk error.Pte; },
+            8 => blk: { model.change(5, 0, 0x0100000018000001); break :blk error.Pte; },
+            9 => blk: { model.unstable = true; break :blk error.Unstable; },
+            10 => blk: { model.control_changed = true; break :blk error.Unstable; },
+            11 => blk: { model.late = true; break :blk error.Deadline; },
+            12 => blk: { model.stale = true; break :blk error.Stale; },
+            13 => blk: { model.fault = true; break :blk error.DataRead; },
+            else => blk: { model.change(0, 8, 0xfff); break :blk error.Bounds; },
+        };
+        try t.expectError(expected, walk.resolve(request, model.reader()));
+        try t.expect(model.reads <= 14);
+    }
+    checkpoint = 50;
+    model = Model.setup(.v2, 21);
+    model.change(4, 0, 0x18000101);
+    try t.expectError(error.Alignment, walk.resolve(request, model.reader()));
+    model = Model.setup(.physical, 0);
+    request.cpu_physical = request.bar.base + request.framebuffer_bytes - 1;
+    request.bytes = 1;
+    const last = try walk.resolve(request, model.reader());
+    try t.expectEqual(request.framebuffer_bytes - 1, last.mapped.address);
+    request.bytes = 2;
+    try t.expectError(error.Bounds, walk.resolve(request, model.reader()));
 }
 
 // Extend the existing preflight owner case; no separate gate or case count.
