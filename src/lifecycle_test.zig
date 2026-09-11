@@ -884,8 +884,8 @@ test "NVIDIA actual driver lifecycle rejects writes and retains failed mappings 
 // selection and partial device effects independently. This is no GPU proof.
 const BootVramFixture = struct {
     var registers: []u8 = &.{};
-    var buffers: [4]?[]u8 = @splat(null);
-    var leases: [4]bool = @splat(false);
+    var buffers: [5]?[]u8 = @splat(null);
+    var leases: [5]bool = @splat(false);
     var mapped: [0x1000]bool = @splat(false);
     var map_pages: [0x1000]usize = @splat(0);
     var maps: usize = 0;
@@ -895,6 +895,7 @@ const BootVramFixture = struct {
     var request: a.GfxBootHoldRequest = .{};
     var fail_unmap = false;
     var fail_map = false;
+    var fail_asset_unmap = false;
     fn info() a.GfxNativeBootInfo {
         return .{ .generation = 7, .physical_address = 0xd0000000, .byte_length = 16384,
             .width = 64, .height = 64, .pitch = 256, .state = if (held) 2 else 1 };
@@ -921,6 +922,10 @@ const BootVramFixture = struct {
     var delay_selected = false;
     var vram_pages: [6][4096]u8 = undefined;
     var display_instance: [65536]u8 = undefined;
+    var asset_pixels: [4][16384]u8 = undefined;
+    var asset_selections: usize = 0;
+    const asset_addresses = [_]u64{ 0x6002000, 0x6240000, 0x6420000, 0x66fff00 };
+    const asset_sizes = [_]usize{ 16384, 1029 * 8, 261 * 8, 517 * 8 };
     const display_address: u64 = 0x1000000;
     const addresses = [_]u64{ 0x100000, 0x201000, 0x302000, 0x403000, 0x504000, 0x605000 };
     fn now() callconv(.c) u64 {
@@ -948,6 +953,14 @@ const BootVramFixture = struct {
                     }
                     if (display_address >= base and display_address + display_instance.len <= base + 0x100000)
                         @memcpy(registers[0x700000 + display_address - base ..][0..display_instance.len], &display_instance);
+                    for (asset_addresses, asset_sizes, &asset_pixels) |address, bytes, *pixels| {
+                        const begin = @max(base, address);
+                        const end = @min(base + 0x100000, address + bytes);
+                        if (begin < end) {
+                            asset_selections += 1;
+                            @memcpy(registers[0x700000 + begin - base ..][0..end - begin], pixels[begin - address ..][0..end - begin]);
+                        }
+                    }
                     if (delay_selected) { clock += 6 * std.time.ns_per_s; delay_selected = false; }
                 }
             }
@@ -1031,6 +1044,21 @@ const BootVramFixture = struct {
             const values = [_]u32{ if (index == 0) 0x45 else 0x100045, @intCast(address >> 8), 0, @intCast((address + 0x800000 - 1) >> 8), 0 };
             for (values, 0..) |value, word_index| std.mem.writeInt(u32, display_instance[object + word_index * 4 ..][0..4], value, .little);
         }
+        const handles = [_]u32{ 0x701, 0x801, 0x901, 0x902 };
+        const offsets = [_]u64{ 0x2000, 0x40000, 0x20000, 0x50000 };
+        for (handles, offsets, asset_addresses, &asset_pixels, 0..) |handle, offset, address, *pixels, index| {
+            @memset(pixels, @as(u8, @intCast(0xa0 + index)));
+            const client: u14 = if (index < 2) 0x333 else 0x2a3;
+            const channel: u7 = if (index < 2) 0 else 1;
+            var slot: usize = d.hash(client, handle, channel);
+            while (std.mem.readInt(u32, display_instance[slot * 8 + 4 ..][0..4], .little) != 0) slot = (slot + 1) % d.entries;
+            const object: u32 = @intCast(0x2040 + index * 32);
+            std.mem.writeInt(u32, display_instance[slot * 8 ..][0..4], handle, .little);
+            std.mem.writeInt(u32, display_instance[slot * 8 + 4 ..][0..4], @as(u32, channel) << 25 | (object >> 5) << 14 | client, .little);
+            const base = address - offset;
+            const values = [_]u32{ 0x45, @intCast(base >> 8), 0, @intCast((base + 0x100000 - 1) >> 8), 0 };
+            for (values, 0..) |value, word_index| std.mem.writeInt(u32, display_instance[object + word_index * 4 ..][0..4], value, .little);
+        }
     }
     fn setupTables() void {
         setupInstance();
@@ -1092,6 +1120,7 @@ const BootVramFixture = struct {
     fn bufferUnmap(input: *const a.GfxBufferHandle) callconv(.c) i32 {
         const index = input.id - 101;
         std.debug.assert(index < leases.len and leases[index]);
+        if (index == 4 and fail_asset_unmap) return a.gfx_buffer_error_busy;
         leases[index] = false;
         return a.gfx_buffer_result_ok;
     }
@@ -1452,12 +1481,61 @@ fn checkBootVramOwner() !void {
     const display_decoder = @import("display_context.zig");
     var display_context: @import("boot_context.zig").Capture = .{};
     defer _ = display_context.close();
+    // A system-memory OLUT retains its target but cannot enter this VRAM
+    // reader. All targets are resolved before any asset read/allocation.
+    f.display_instance[0x2060] = 0x46;
+    try t.expectError(error.AssetSystemMemory, display_context.capture(&capture));
+    try t.expect(!display_context.ready and display_context.asset_catalog.count == 4 and
+        display_context.asset_catalog.items[1].memory.target == .pci and
+        display_context.asset_reference.reference.id == 0 and f.asset_selections == 0 and !capture.close());
+    try t.expect(display_context.close());
+    f.display_instance[0x2060] = 0x45;
     const context_report = try display_context.capture(&capture);
     try t.expect(context_report.address == f.display_address and context_report.bytes == 65536 and context_report.surfaces == 2);
     try t.expect(display_context.valid(&capture) and f.buffers[3] != null and f.leases[3] and !capture.close());
     var display_digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(&f.display_instance, &display_digest, .{});
     try t.expectEqualSlices(u8, &display_digest, &context_report.sha256);
+    try t.expect(context_report.assets == 4 and context_report.asset_bytes == 30840 and f.buffers[4] != null and f.leases[4]);
+    var asset_hash = std.crypto.hash.sha2.Sha256.init(.{});
+    for (&f.asset_pixels, f.asset_sizes, f.asset_addresses, display_context.asset_catalog.items[0..4]) |*pixels, bytes, address, asset| {
+        try t.expect(asset.memory.target == .vram and asset.memory.span.address == address and asset.memory.span.bytes == bytes);
+        try t.expectEqualSlices(u8, pixels[0..bytes], display_context.assetData()[asset.backup_offset..][0..bytes]);
+        asset_hash.update(pixels[0..bytes]);
+    }
+    var asset_digest: [32]u8 = undefined;
+    asset_hash.final(&asset_digest);
+    try t.expectEqualSlices(u8, &asset_digest, &context_report.asset_sha256);
+    const assets = @import("display_assets.zig");
+    for (0..4) |size_index| {
+        const encoded: u32 = @as(u32, @intCast(size_index)) << 8;
+        const width = @as(u64, 32) << @as(u6, @intCast(size_index));
+        try t.expectEqual(width * width * 4, try assets.cursorBytes(0x800000cf | encoded));
+        try t.expectEqual(width * width * 2, try assets.cursorBytes(0x800000e9 | encoded));
+    }
+    try t.expectEqual(@as(u64, 0), try assets.cursorBytes(0x7fffffff));
+    try t.expectError(error.AssetFormat, assets.cursorBytes(0x800000ff));
+    try t.expectError(error.AssetControl, assets.lutBytes(.olut, (261 << 8) | 12));
+    try t.expectError(error.AssetControl, assets.lutBytes(.tmo, (517 << 8) | 2));
+    try t.expectError(error.AssetSize, assets.lutBytes(.ilut, 1));
+    var sys_descriptor = display_context.asset_catalog.items[0].binding.descriptor;
+    sys_descriptor.target = .pci_coherent;
+    sys_descriptor.address = 0x100000000;
+    sys_descriptor.end = 0x20000010000;
+    const sys_span = try assets.memorySpan(sys_descriptor, 0xffffffff, 8, 1);
+    try t.expect(sys_span.target == .pci_coherent and sys_span.span.address == 0x100ffffff00);
+    sys_descriptor.target = .vram;
+    try t.expectError(error.AssetBounds, assets.memorySpan(sys_descriptor, 0xffffffff, 8, 0x30000000000));
+    const cursor_descriptor = display_context.asset_catalog.items[0].binding.descriptor;
+    try t.expectError(error.AssetBounds, assets.memorySpan(cursor_descriptor, 0x1000, 16384, 0x100000000));
+    var invalid_assets: assets.Catalog = .{};
+    var wrong_asset_raw = observed_scanout;
+    wrong_asset_raw.core_client = 0x334;
+    try t.expectError(error.Missing, invalid_assets.resolve(&wrong_asset_raw, &f.display_instance, 0x100000000));
+    wrong_asset_raw = observed_scanout;
+    wrong_asset_raw.heads[0].color.words[@intFromEnum(@import("color_state.zig").HeadField.cursor_present)] = 1;
+    // Mono deliberately ignored the stale, unmapped right-eye handle0x702.
+    try t.expectError(error.Missing, invalid_assets.resolve(&wrong_asset_raw, &f.display_instance, 0x100000000));
     try t.expect(display_context.surfaces[0].image.span.address == 0x2020000 and display_context.surfaces[0].image.span.bytes == 4096 * 600);
     try t.expect(display_context.surfaces[1].image.span.address == 0x4027000 and display_context.surfaces[1].image.span.bytes == 4096 * 608);
     try t.expect(display_context.surfaces[1].image.layout == .block_linear and display_context.surfaces[1].context.offset == 0x2020);
@@ -1466,9 +1544,10 @@ fn checkBootVramOwner() !void {
     try t.expectError(error.Missing, display_decoder.lookup(&f.display_instance, 0x2a3, 0x100, 8));
     const original_entry: usize = display_context.surfaces[0].context.entry;
     const duplicate_entry = (original_entry + 1) % display_decoder.entries;
+    const saved_entry = f.display_instance[duplicate_entry * 8 ..][0..8].*;
     @memcpy(f.display_instance[duplicate_entry * 8 ..][0..8], f.display_instance[original_entry * 8 ..][0..8]);
     try t.expectError(error.Duplicate, display_decoder.lookup(&f.display_instance, 0x2a3, 0x100, 1));
-    @memset(f.display_instance[duplicate_entry * 8 ..][0..8], 0);
+    @memcpy(f.display_instance[duplicate_entry * 8 ..][0..8], &saved_entry);
     try t.expectError(error.Target, display_decoder.instance(10, 0x100, 0x100000000));
     try t.expectError(error.Control, display_decoder.instance(1, 0x100, 0x100000000));
     try t.expectError(error.Bounds, display_decoder.instance(9, 0x100, f.display_address + 4096));
@@ -1526,6 +1605,14 @@ fn checkBootVramOwner() !void {
     display_context.surfaces[0].image.span.address = prepared.plan.metadata_reservation.offset;
     try t.expectError(error.DisplaySurfaceCollision, held.acquire(&capture, &backing, &mapped_boot, &display_context));
     display_context.surfaces[0].image.span = original_display_span;
+    const original_asset_span = display_context.asset_catalog.items[3].memory.span;
+    display_context.asset_catalog.items[3].memory.span.address = prepared.plan.metadata_reservation.offset;
+    try t.expectError(error.DisplayAssetCollision, held.acquire(&capture, &backing, &mapped_boot, &display_context));
+    display_context.asset_catalog.items[3].memory.span = original_asset_span;
+    f.asset_pixels[3][f.asset_sizes[3] - 1] ^= 1; // Last LUT byte after a 1-MB aperture boundary.
+    try t.expectError(error.AssetChanged, held.acquire(&capture, &backing, &mapped_boot, &display_context));
+    try t.expect(display_context.valid(&capture) and capture.borrower == 0 and f.leases[4] and capture.registers.borrowedCount() == 1);
+    f.asset_pixels[3][f.asset_sizes[3] - 1] ^= 1;
     f.display_instance[65535] ^= 1; // Even an unused instance byte must match before reservation.
     try t.expectError(error.Unstable, held.acquire(&capture, &backing, &mapped_boot, &display_context));
     try t.expect(display_context.valid(&capture) and capture.borrower == 0 and capture.registers.borrowedCount() == 1);
@@ -1563,7 +1650,10 @@ fn checkBootVramOwner() !void {
     held.serial = std.math.maxInt(u64);
     try t.expectError(error.Exhausted, held.acquire(&capture, &backing, &mapped_boot, &display_context));
     try t.expect(capture.borrower == 0 and backing.vram_owner == 0 and f.mapped[0x625]);
-    try t.expect(display_context.close() and display_context.close() and f.buffers[3] == null and !f.leases[3]);
+    f.fail_asset_unmap = true;
+    try t.expect(!display_context.close() and !capture.close() and f.buffers[3] != null and f.leases[3] and f.buffers[4] != null and f.leases[4]);
+    f.fail_asset_unmap = false;
+    try t.expect(display_context.close() and display_context.close() and f.buffers[3] == null and !f.leases[3] and f.buffers[4] == null and !f.leases[4]);
     try t.expect(mapped_boot.close() and f.buffers[2] == null and !f.leases[2]);
     // Direct BAR1 mode needs no table BO and still covers the complete span.
     f.put(reader.block_register, 0x4321);

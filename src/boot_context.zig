@@ -1,4 +1,4 @@
-//! Resident backup of the complete held display instance and used ISO spans.
+//! Resident display instance and VRAM cursor/LUT payload backup; used ISO spans.
 //! No native display programming. Preserve every instance byte, including
 //! opaque unused objects; decoded ranges constrain GSP VRAM reservations.
 const std = @import("std");
@@ -9,9 +9,12 @@ const scanout = @import("boot_scanout.zig");
 const decoder = @import("display_context.zig");
 const reader = @import("bar1_reader.zig");
 const layout = @import("gsp_layout.zig");
+const asset_decoder = @import("display_assets.zig");
+const pramin = @import("pramin.zig");
 pub const max_surfaces = scanout.max_windows * 6;
 pub const Surface = struct { window: u8, plane: u2, eye: u1, handle: u32, context: decoder.Resolved, image: decoder.Surface };
-pub const Report = struct { address: u64, bytes: u64, surfaces: usize, sha256: [32]u8, window_writes: u32 };
+pub const Report = struct { address: u64, bytes: u64, surfaces: usize, sha256: [32]u8, window_writes: u32,
+    assets: usize, asset_bytes: usize, asset_sha256: [32]u8 };
 pub const Capture = struct {
     self_address: usize = 0,
     parent: ?*boot.Capture = null,
@@ -25,6 +28,10 @@ pub const Capture = struct {
     framebuffer_bytes: u64 = 0,
     surfaces: [max_surfaces]Surface = undefined,
     surface_count: usize = 0,
+    asset_catalog: asset_decoder.Catalog = .{},
+    asset_reference: a.GfxBufferReference = .{},
+    asset_map: a.GfxBufferMap = .{},
+    asset_stamp: a.GfxBufferMap = .{},
     scratch: [4096]u8 = undefined,
     ready: bool = false,
     last_status: i32 = 0,
@@ -50,8 +57,24 @@ pub const Capture = struct {
         }
         try self.comparePages();
         try self.resolveSurfaces(raw);
+        try self.asset_catalog.resolve(raw, self.data(), self.framebuffer_bytes);
+        // Resolve all targets before any asset payload read. GPU system
+        // addresses are not CPU pointers and this reader only admits VRAM.
+        for (self.asset_catalog.items[0..self.asset_catalog.count]) |*asset|
+            if (asset.memory.target != .vram) return error.AssetSystemMemory;
+        if (self.asset_catalog.bytes != 0) {
+            self.last_status = self.memory.?.bufferCreate(&.{ .byte_length = self.asset_catalog.bytes, .alignment = 4096,
+                .usage = a.gfx_buffer_usage_cpu_read | a.gfx_buffer_usage_cpu_write }, &self.asset_reference);
+            if (self.last_status != a.gfx_buffer_result_ok) return error.Buffer;
+            try self.mapAssets(a.gfx_buffer_map_write);
+            try self.transferAssets(false);
+            try self.transferAssets(true);
+        }
+        try self.comparePages(); // Bindings must remain identical across payload capture too.
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(self.data(), &digest, .{});
+        var asset_digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(self.assetData(), &asset_digest, .{});
         const writes = self.io.window_writes;
         if (!self.io.close()) return error.Cleanup;
         _ = try parent.reobserve();
@@ -60,8 +83,56 @@ pub const Capture = struct {
         self.map = .{};
         self.stamp = .{};
         try self.mapBackup(a.gfx_buffer_map_read);
+        if (self.asset_catalog.bytes != 0) {
+            if (!self.unmapAssets()) return error.Buffer;
+            try self.mapAssets(a.gfx_buffer_map_read);
+        }
         self.ready = true;
-        return .{ .address = self.span.address, .bytes = self.span.bytes, .surfaces = self.surface_count, .sha256 = digest, .window_writes = writes };
+        return .{ .address = self.span.address, .bytes = self.span.bytes, .surfaces = self.surface_count, .sha256 = digest, .window_writes = writes,
+            .assets = self.asset_catalog.count, .asset_bytes = self.asset_catalog.bytes, .asset_sha256 = asset_digest };
+    }
+    pub fn assetData(self: *const Capture) []const u8 {
+        if (self.asset_catalog.bytes == 0) return &.{};
+        const bytes: [*]const u8 = @ptrFromInt(self.asset_map.cpu_address);
+        return bytes[0..self.asset_catalog.bytes];
+    }
+    fn mapAssets(self: *Capture, access: u32) !void {
+        self.last_status = self.memory.?.bufferMap(&self.asset_reference.reference, access, 0, self.asset_catalog.bytes, &self.asset_map);
+        self.asset_stamp = self.asset_map;
+        if (self.last_status != a.gfx_buffer_result_ok or self.asset_map.lease.id == 0 or self.asset_map.cpu_address == 0 or
+            self.asset_map.byte_length != self.asset_catalog.bytes or self.asset_map.cpu_address > std.math.maxInt(u64) - self.asset_catalog.bytes) return error.Buffer;
+    }
+    fn unmapAssets(self: *Capture) bool {
+        if (!std.meta.eql(self.asset_map, self.asset_stamp)) return false;
+        if (self.asset_map.lease.id != 0) {
+            self.last_status = self.memory.?.bufferUnmap(&self.asset_map.lease);
+            if (self.last_status != a.gfx_buffer_result_ok) return false;
+            self.asset_map = .{};
+            self.asset_stamp = .{};
+        }
+        return true;
+    }
+    fn transferAssets(self: *Capture, compare: bool) !void {
+        for (self.asset_catalog.items[0..self.asset_catalog.count]) |*asset| {
+            if (asset.memory.target != .vram) return error.AssetSystemMemory;
+            var offset: usize = 0;
+            while (offset < asset.memory.span.bytes) {
+                const address = asset.memory.span.address + offset;
+                // LUTs can start only 256-byte aligned, including 256 bytes
+                // before the aperture edge. Never cross that edge in one read.
+                const count: usize = @intCast(@min(self.scratch.len, asset.memory.span.bytes - offset,
+                    pramin.aperture_bytes - (address & (pramin.aperture_bytes - 1))));
+                const start = asset.backup_offset + offset;
+                try self.io.read(address, self.scratch[0..count]);
+                if (compare) {
+                    if (!std.mem.eql(u8, self.scratch[0..count], self.assetData()[start..][0..count])) return error.AssetChanged;
+                } else {
+                    const output: [*]u8 = @ptrFromInt(self.asset_map.cpu_address);
+                    @memcpy(output[start..][0..count], self.scratch[0..count]);
+                }
+                offset += count;
+            }
+        }
     }
     fn data(self: *const Capture) []const u8 {
         const bytes: [*]const u8 = @ptrFromInt(self.map.cpu_address);
@@ -111,16 +182,24 @@ pub const Capture = struct {
         }
     }
     pub fn valid(self: *const Capture, parent: *const boot.Capture) bool {
+        const assets_valid = if (self.asset_catalog.bytes == 0)
+            self.asset_catalog.count == 0 and self.asset_reference.reference.id == 0 and self.asset_map.lease.id == 0
+        else self.asset_catalog.count > 0 and self.asset_catalog.count <= asset_decoder.max_assets and
+            self.asset_catalog.bytes <= asset_decoder.max_payload_bytes and self.asset_reference.reference.id != 0 and
+            self.asset_map.lease.id != 0 and self.asset_map.cpu_address != 0 and self.asset_map.byte_length == self.asset_catalog.bytes;
         return self.self_address == @intFromPtr(self) and self.ready and self.parent == parent and
             parent.self_address == @intFromPtr(parent) and parent.ready and parent.context_owner == self.self_address and
             parent.boot.held_generation == self.epoch and self.epoch != 0 and self.io.self_address == 0 and
-            self.reference.reference.id != 0 and self.map.lease.id != 0 and std.meta.eql(self.map, self.stamp);
+            self.reference.reference.id != 0 and self.map.lease.id != 0 and std.meta.eql(self.map, self.stamp) and
+            assets_valid and std.meta.eql(self.asset_map, self.asset_stamp);
     }
     fn overlaps(span: decoder.Span, reserved: layout.Range) bool {
         return span.address < reserved.end() and reserved.offset < span.address + span.bytes;
     }
     fn reobserve(self: *Capture, parent: *boot.Capture) !void {
         try self.io.open(parent);
+        try self.comparePages();
+        try self.transferAssets(true);
         try self.comparePages();
         if (!self.io.close()) return error.Cleanup;
         _ = try parent.reobserve();
@@ -131,6 +210,10 @@ pub const Capture = struct {
         if (overlaps(self.span, plan.reserved)) return error.DisplayContextCollision;
         for (self.surfaces[0..self.surface_count]) |*surface|
             if (overlaps(surface.image.span, plan.reserved)) return error.DisplaySurfaceCollision;
+        for (self.asset_catalog.items[0..self.asset_catalog.count]) |*asset| {
+            if (asset.memory.target != .vram) return error.AssetSystemMemory;
+            if (overlaps(asset.memory.span, plan.reserved)) return error.DisplayAssetCollision;
+        }
         self.reobserve(parent) catch |err| {
             if (!self.io.close()) return error.Cleanup;
             return err;
@@ -141,7 +224,12 @@ pub const Capture = struct {
         const parent = self.parent orelse return false;
         if (self.self_address != @intFromPtr(self) or parent.self_address != @intFromPtr(parent) or
             parent.context_owner != self.self_address or parent.borrower != 0 or parent.boot.held_generation != self.epoch) return false;
-        if (!self.io.close() or !std.meta.eql(self.map, self.stamp)) return false;
+        if (!self.io.close() or !std.meta.eql(self.map, self.stamp) or !self.unmapAssets()) return false;
+        if (self.asset_reference.reference.id != 0) {
+            self.last_status = self.memory.?.bufferRelease(&self.asset_reference.reference);
+            if (self.last_status != a.gfx_buffer_result_ok) return false;
+            self.asset_reference = .{};
+        }
         if (self.map.lease.id != 0) {
             self.last_status = self.memory.?.bufferUnmap(&self.map.lease);
             if (self.last_status != a.gfx_buffer_result_ok) return false;

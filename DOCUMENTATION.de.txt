@@ -10,7 +10,43 @@ unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
 
-Aktiver Farb- und Cursorzustand (NVIDIA 0.1.38)
+Cursor- und Farbtabelleninhalte im VRAM (NVIDIA 0.1.39)
+-----------------------------------------------------
+Die gehaltene Displayinstanz loest Cursor, Ausgangs-/Eingangs-LUT und
+Tone-Mapping-Tabelle ueber den genauen Client-/Handle-/Channel-Schluessel
+auf. Mono/Stereo waehlt aktive Cursoraugen; LUT-Handle 0 und deaktivierte
+Cursor brauchen ihre alten Bindungen nicht. Cursor haben gepackte Zeilen;
+die LUT-Groesse zaehlt bereits alle acht Byte grossen Eintraege inklusive
+programmierter Header/Endpunkte. Offsets werden vor der Umrechnung verbreitert.
+
+Lokale VRAM-Inhalte werden in einen eigenen BO kopiert, vollstaendig erneut
+verglichen und gehasht, danach unter demselben Anzeigebesitzer nur lesbar
+gemappt. Lesebloecke enden nach maximal 4 KB oder an der 1-MB-PRAMIN-Grenze.
+Die Instanz wird um die Aufnahme herum verglichen. Vor einer VRAM-Leihe
+muessen alle Inhalte noch passen und ausserhalb des gesamten reservierten
+GSP-Bereichs liegen. DMA-/FWSEC-Leihen und fehlgeschlagenes Unmap halten
+Instanz und Nutzdaten. Grenze: 40 Bindungen, 4587328 Byte; Modell: vier
+Bindungen mit zusammen 30840 Byte einschliesslich einer Aperturgrenze.
+
+Alle 51 bestehenden Besitzerfaelle bestanden. Der erste Lauf (50/51)
+deckte eine alte Testannahme auf: Der benachbarte RAMHT-Eintrag war bisher
+leer, wird jetzt aber vom Cursor benutzt. Die Duplikatprobe stellt nun die
+vorherigen acht Byte wieder her. Ein gezielter Wiederholungslauf und ein
+Modulbuild bestanden; keine neuen Faelle/Gates/Gast-/Hardwarelaeufe. Alle
+29 Ressourcen geprueft, vorherige 28 unveraendert; acht volle MIT-Hinweise
+im neuen 10098-Byte-Lizenztext und 38 komplette gepinnte Originaldateien.
+Beleg: display_assets_checkpoint in Docs/Drivers/GrafikFirmware07910.json;
+Archiv: ExFiles/Reference/GFX/Nvidia/0.79.10/display-assets-20260911.
+
+Systemspeicher bleibt ein eigener GPU-Adressraum; NVKMS legt dort ebenfalls
+LUTs ab. Der aktuelle Aufnahmepfad liefert AssetSystemMemory vor jedem
+Nutzdaten-Read/BO statt solche Adressen als CPU-Zeiger zu behandeln oder
+Bus-Master/Cache blind zu aendern. System-Reads, indizierte LUT-/Skaliertabellen,
+weitere ISO-Pixel und native UEFI-/Geraete-Recovery bleiben offen. Gesicherte
+Inhalte sind noch keine native Wiederherstellung. OssiPC offline/unberuehrt;
+keine neue sichtbare oder akustische Abnahme.
+
+Vorheriger aktiver Farb- und Cursorzustand (NVIDIA 0.1.38)
 ---------------------------------------------
 Die gehaltene Aufnahme erhaelt zusaetzlich 53 C67D-Woerter je vorhandenem
 Head und 79 C67E-Farbwoerter je Window: Hintergrund, Clamp, Procamp/Dither/

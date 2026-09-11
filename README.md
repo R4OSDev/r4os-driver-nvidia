@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-Passive NVIDIA display driver for R4OS. Module 0.1.38; original R4OS code is
+Passive NVIDIA display driver for R4OS. Module 0.1.39; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -10,7 +10,39 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
-Armed color and cursor state (NVIDIA 0.1.38):
+VRAM cursor and color-table payloads (NVIDIA 0.1.39):
+
+The held display instance now resolves cursor, output/input LUT and tone-map
+attachments using their exact client, handle and channel. Active mono/stereo
+cursor eyes and nonzero LUT handles select the required data; stale unused
+bindings are ignored. Packed cursor rows and complete eight-byte LUT entry
+counts define bounded extents, with offsets widened before conversion.
+
+Local-VRAM payloads are copied, fully compared and hashed in a private BO,
+then mapped read-only under the existing held display owner. Reads stop at
+both 4-KB chunks and the 1-MB PRAMIN aperture edge. Instance bindings are
+compared around payload capture. Before the VRAM lease, every payload must
+still match and avoid the full GSP reservation. DMA/FWSEC borrowers and
+failed unmaps keep both context and payload BOs alive. Maximum 40 attachments
+and 4587328 payload bytes; the existing model captures four / 30840 bytes.
+
+All 51 existing owner cases pass after correcting the duplicate-RAMHT test
+fixture to restore its original adjacent entry, now used by the cursor.
+The initial 50/51 result is retained. One subsequent owner run and one
+module build pass; no new case/gate/guest/hardware run. All 29 resources
+verified, earlier 28 unchanged. Eight complete MIT source notices in the
+new 10098-byte asset license; 38 complete pinned reference files. Evidence:
+display_assets_checkpoint in Docs/Drivers/GrafikFirmware07910.json and
+ExFiles/Reference/GFX/Nvidia/0.79.10/display-assets-20260911.
+
+System-memory targets remain distinct GPU addresses. NVKMS can place LUTs
+there; capture explicitly rejects AssetSystemMemory before any asset read
+or allocation. No guessed CPU pointer, bus-master or cache change is used.
+System reads, indexed LUT/scaler tables, extra ISO pixels and native UEFI/
+device recovery remain open. Saved payloads do not yet provide native
+restoration. OssiPC is offline and untouched; no new visible/audio evidence.
+
+Previous armed color and cursor state (NVIDIA 0.1.38):
 
 The held snapshot now retains 53 additional C67D words per fused head and
 79 C67E color words per window: background, clamp, procamp/dither/scaling,

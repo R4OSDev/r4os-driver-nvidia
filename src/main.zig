@@ -480,7 +480,7 @@ fn logBootScanout(raw: *const @import("boot_scanout.zig").Raw) void {
             index, fields.cursorEnabled(), fields.get(.cursor_control), fields.get(.cursor_present), left.x, left.y, right.x, right.y,
             fields.get(.cursor_dma_left), fields.get(.cursor_dma_right), fields.get(.cursor_offset_left), fields.get(.cursor_offset_right),
         });
-        log("NVIDIA boot-color-head: id={d} olut-handle={x} olut-control={x} olut-norm={x} csc-control={x},{x} payloads=unresolved", .{
+        log("NVIDIA boot-color-head: id={d} olut-handle={x} olut-control={x} olut-norm={x} csc-control={x},{x} payloads=pending-context-capture", .{
             index, fields.get(.olut_dma), fields.get(.olut_control), fields.get(.olut_norm), fields.get(.csc0_control), fields.get(.csc1_control),
         });
     };
@@ -541,6 +541,16 @@ fn checkBoot(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Sna
         log("NVIDIA boot-surface: window={d} plane={d} eye={d} handle={x} instance-offset={x} vram={x} bytes={d} row-bytes={d} rows={d} layout={s}", .{
             surface.window, surface.plane, surface.eye, surface.handle, surface.context.offset,
             surface.image.span.address, surface.image.span.bytes, surface.image.row_bytes, surface.image.rows, @tagName(surface.image.layout),
+        });
+    }
+    const asset_hash = std.fmt.bytesToHex(context_copy.asset_sha256, .lower);
+    log("NVIDIA boot-assets: count={d} bytes={d} sha256={s} immutable=yes target=vram indexed-tables=unresolved recovery=incomplete", .{
+        context_copy.assets, context_copy.asset_bytes, asset_hash,
+    });
+    for (boot_context.asset_catalog.items[0..boot_context.asset_catalog.count]) |*asset| {
+        log("NVIDIA boot-asset: kind={s} owner={d} eye={d} handle={x} context={x} target={s} address={x} bytes={d} backup-offset={d}", .{
+            @tagName(asset.kind), asset.owner, asset.eye, asset.handle, asset.binding.offset, @tagName(asset.memory.target),
+            asset.memory.span.address, asset.memory.span.bytes, asset.backup_offset,
         });
     }
     const inputs = boot_inputs.load(ctx, 30 * std.time.ns_per_s) catch |err| {

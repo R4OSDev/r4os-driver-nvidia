@@ -1,6 +1,17 @@
 ﻿# Third-Party Notices
 
-GA106 color/cursor state definitions (NVIDIA 0.1.38):
+GA106 cursor and memory-LUT payloads (NVIDIA 0.1.39):
+display_assets uses the original MIT C67D/C67E fields, NVKMS LUT layout
+and pitch semantics, and Nouveau's GA102 cursor dispatch to its shared
+packed-row check. Eight complete original notices remain in code and in
+NVIDIA-DISPLAY-ASSETS-LICENSE.txt (10098 bytes), byte-identical in the
+Distribution overlay. The display-assets-20260911 archive has 38 complete
+hash-verified original files. Original PRAMIN system-target sources are
+reference-only; system-memory reads are not implemented. Previous 28
+resource payloads remain unchanged. Original R4OS ownership, validation
+and backup policy stays Apache-2.0. Native recovery remains incomplete.
+
+Earlier GA106 color/cursor state definitions (NVIDIA 0.1.38):
 color_state follows the original MIT C67D/C67E/C67A method definitions,
 GA102 armed mirror definitions, NVKMS indexed-table semantics and C6 cursor
 HAL. Six complete original notices remain in code and in the new
