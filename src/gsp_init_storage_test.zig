@@ -169,6 +169,103 @@ fn apiTable() a.DriverApi {
     return table;
 }
 
+test "firmware CPU storage complete run lease retains all boot DMA owners" {
+    const run = @import("gsp_run_memory.zig");
+    const boot_storage = @import("gsp_boot_storage.zig");
+    const security = @import("fwsec_storage.zig");
+    var table = apiTable();
+    var other_table = apiTable();
+    const ctx = r4os.r4dev.DriverContext.init(&table);
+    fault = .none;
+    closing = false;
+    clock = 100;
+    pin_calls = 0;
+    sync_calls = 0;
+    close_calls = 0;
+    queries = 0;
+    range_calls = 0;
+    range_failure = 0;
+    var storage: Storage = .{};
+    const init_report = try storage.stage(&ctx, 0x176, &.{}, 1000);
+    // The init queues use the real storage/SDK path above. The three other
+    // already-admitted owners are descriptor fixtures: no fake CPU address is
+    // dereferenced and no real GPU is executing during this ownership test.
+    var b: boot_storage.Storage = .{ .context = ctx };
+    b.image.context = ctx;
+    b.image.piece_count = 1;
+    b.image.allocation = .{ .handle = 101, .cpu_address = 0x100000, .byte_length = 4096 };
+    b.allocation = .{ .handle = 102, .cpu_address = 0x110000, .byte_length = 32768 };
+    b.image.report = .{ .root_address = 0x500000000, .image_bytes = 4096, .allocation_bytes = 4096, .table_bytes = 4096, .mappings = 1, .segments = 1, .bounced = 0 };
+    b.report = .{ .image = b.image.report.?, .boot_address = 0x501000000, .signature_address = 0x501006000, .metadata_address = 0x501007000, .pack_bounced = false, .app_version = 0x79 };
+    var f: security.Storage = .{ .complete = true, .allocation = .{ .handle = 103, .cpu_address = 0x120000, .byte_length = 65536 } };
+    f.device.context = ctx;
+    f.device.prepared_plan = .{ .imem = .{ .base = 0x502000000, .destination = 0, .source_offset = 0, .bytes = 4096, .command = 0x614 }, .dmem = .{ .base = 0x502001000, .destination = 0, .source_offset = 0, .bytes = 4096, .command = 0x600 }, .boot_vector = 0, .signature_address = 0, .engine_mask = 1, .ucode_id = 1 };
+    for ([_]*a.DmaMapping{ &b.image.pieces[0].mapping, &b.mapping, &f.device.mapping }, 0..) |mapping, n| {
+        mapping.* = .{ .handle = 201 + n, .pin_handle = 301 + n, .segment_count = 1 };
+        mapping.segments[0] = .{ .phys_addr = 0x500000000 + n * 0x1000000, .bytes = 65536 };
+    }
+    var lease: run.Lease = .{};
+    f.device.context = r4os.r4dev.DriverContext.init(&other_table);
+    try t.expectError(error.Storage, lease.acquire(&ctx, &b, &storage, &f));
+    f.device.context = ctx;
+    f.device.mapping.segments[0].phys_addr = address(0);
+    try t.expectError(error.Overlap, lease.acquire(&ctx, &b, &storage, &f));
+    f.device.mapping.segments[0].phys_addr = 0x502000000;
+    b.allocation.cpu_address = b.image.allocation.cpu_address;
+    try t.expectError(error.Overlap, lease.acquire(&ctx, &b, &storage, &f));
+    b.allocation.cpu_address = 0x110000;
+    try t.expectEqual(@as(usize, 0), range_calls);
+    try t.expectEqual(@as(u64, 0), storage.queue_epoch);
+
+    try lease.acquire(&ctx, &b, &storage, &f);
+    const epoch = lease.generation();
+    try t.expect(epoch != 0 and range_calls == 1);
+    var moved = lease;
+    try t.expectEqual(@as(u64, 0), moved.generation());
+    try t.expect(!moved.releaseBeforeSubmission());
+    var duplicate: run.Lease = .{};
+    try t.expectError(error.Storage, duplicate.acquire(&ctx, &b, &storage, &f));
+    try t.expect(!b.close() and !b.image.close() and !f.close() and !f.device.close() and !storage.close());
+    try t.expect(f.complete and b.report != null and b.image.report != null and storage.report != null and close_calls == 0);
+    const inputs = try lease.inputs();
+    try t.expectEqual(init_report.init.libos_address, inputs.resume_args.libos_dma);
+    try t.expectEqual(@as(u32, 0x79), inputs.resume_args.app_version);
+    try t.expectEqual(f.device.prepared_plan.?.imem.base, inputs.fwsec.imem.base);
+    const port = try lease.transportPort();
+    var bytes: [32]u8 = @splat(0x79);
+    try port.read(port.context, .status, 0, &bytes);
+    try t.expect(std.mem.allEqual(u8, &bytes, 0));
+    const calls = range_calls;
+    b.mapping.handle += 1;
+    try t.expectEqual(@as(u64, 0), port.generation(port.context));
+    try t.expectError(error.Stale, port.read(port.context, .status, 0, &bytes));
+    try t.expect(!lease.releaseBeforeSubmission() and range_calls == calls);
+    b.mapping.handle -= 1; // Restore the model's injected descriptor corruption.
+    try lease.retainForDevice();
+    lease.invalidate();
+    try t.expectEqual(@as(u64, 0), port.generation(port.context));
+    try t.expect(!lease.releaseBeforeSubmission());
+    try t.expect(!b.close() and !b.image.close() and !f.close() and !f.device.close() and !storage.close());
+    try t.expect(close_calls == 0 and any(&maps) and any(&pins));
+    // Fixture disposal only: there is deliberately no production clear API
+    // until an actual native quiescence implementation can supply evidence.
+    lease.retained = false;
+    storage.device_access = false;
+    try t.expect(lease.releaseBeforeSubmission());
+    try t.expectEqual(@as(u64, 0), port.generation(port.context));
+    try t.expect(b.execution_owner == 0 and b.image.execution_owner == 0 and f.device.execution_owner == 0 and storage.execution_owner == 0);
+    try lease.acquire(&ctx, &b, &storage, &f);
+    try t.expect(lease.generation() != epoch);
+    range_failure = -79;
+    try t.expectError(error.Synchronization, port.read(port.context, .status, 0, &bytes));
+    try t.expectEqual(@as(u64, 0), lease.generation());
+    try t.expect(lease.releaseBeforeSubmission()); // No device submission.
+    range_failure = 0;
+    closing = true;
+    try t.expect(storage.close());
+    try t.expect(backing == null and !any(&maps) and !any(&pins));
+}
+
 test "firmware CPU storage GSP queue lease binds range I/O and retains all backing before device quiescence" {
     var table = apiTable();
     const ctx = r4os.r4dev.DriverContext.init(&table);

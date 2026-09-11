@@ -10,7 +10,38 @@ unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
 
-GA106-Core-Ausfuehrung und R4OS-MMIO-Port (Host)
+Gemeinsamer Besitzer fuer GSP-Speicher (NVIDIA 0.1.26)
+--------------------------------------------------
+gsp_run_memory.Lease haelt vier CPU-Allokationen und bis zu dreizehn
+GSP-/Boot-/Init-/FWSEC-DMA-Mappings unter einem exklusiven stabilen Besitzer.
+Vor dem Erwerb: abgeschlossene Stager, gleiche echte DriverApi, eindeutige
+Handles, getrennte CPU-/DMA-Bereiche und reale Queue-Besitzerpruefung.
+Alle verschachtelten Close-Pfade verweigern Abbau vor jeder Zustandsaenderung.
+Der Queue-Port prueft die gesamte Laufzeitbindung; Fehler sperren weiteres I/O.
+Vor moeglichem GPU-Zugriff muss die Haltesperre gesetzt sein. Nur ein noch
+nicht eingereichter passender Lauf darf freigeben; Timeout, InitDone und
+Falcon-Halt beweisen keine Quieszenz. Epoche ist keine Hardware-Resetnummer.
+
+Bootdaten behalten den gemappten FWSEC-Plan, echte Libos-DMA-Adresse und
+appVersion des zugelassenen Deskriptors. OssiPC/Kernel 0.1.149 bestaetigt im
+bestehenden boot-check vier Allokationen, dreizehn Mappings, beide 32-Byte-
+Header und vollstaendigen geordneten Abbau. NVIDIA 0.1.26 bleibt installiert;
+nach zwei Updateboots ist die vorherige passive Konfiguration bytegenau
+wiederhergestellt. Bootfb: 800x600, Generation 1/Reset 0/Besitzer 0. Kein GPU-
+Befehl/Firmwarestart; keine neue Bild-/Tonabnahme ohne den abwesenden User.
+
+48 Faelle im vorhandenen Besitzerstep und Modulbuild bestanden. Ein neuer
+gruppierter Fall nutzt die echte Init-Storage-/SDK-Fassade plus zugelassene
+GSP-/Boot-/FWSEC-Deskriptorfixtures. Kein neues Gate oder QEMU-Lauf.
+Modul: 286720 residente Bytes, acht unveraenderte Dateiressourcen. Core- und
+Sequencerausfuehrung bleiben ungelinkt; verwendet wird nur der Resume-Werttyp.
+FWSEC ist weiterhin als SB (0x19) vorbereitet, nicht als FRTS-Startkommando.
+Firmware und vollstaendige Lizenzressourcen sind unveraendert. Nativer Boot,
+VRAM/VGA/Recovery, Logleser, Erststart, IRQ, Health und bewiesene Quieszenz
+nach GPU-Nutzung bleiben offen. JSON: gsp_run_memory_checkpoint.
+Archiv: ExFiles/Reference/GFX/Nvidia/0.79.10/gsp-run-memory-20260911.
+
+Historisch: GA106-Core-Ausfuehrung und R4OS-MMIO-Port (Host)
 ----------------------------------------------
 gsp_core implementiert Reset, Start, Halt-Warten und SEC2-Resume gemaess dem
 gepinnten GA102/TU102-HAL. Reset: hoechstens 150us auf RESET_READY als Hinweis

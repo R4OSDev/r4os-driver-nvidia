@@ -21,6 +21,7 @@ pub const Error = error{ WrongSize, WrongHash, DescriptorVersion, UnsupportedDes
 pub const Range = struct { offset: u32, bytes: u32 };
 pub const Info = struct {
     version: u32,
+    app_version: u32,
     image_bytes: u32,
     bootloader: Range,
     parameters: Range,
@@ -61,6 +62,7 @@ pub fn inspect(bytes: []const u8, image_bytes: u32) Error!Info {
     };
     return .{
         .version = 5,
+        .app_version = at(bytes, 7),
         .image_bytes = image_bytes,
         .bootloader = ranges[0],
         .parameters = ranges[1],

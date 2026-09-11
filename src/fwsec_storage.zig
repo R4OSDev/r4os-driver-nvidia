@@ -32,6 +32,7 @@ pub const Storage = struct {
     }
 
     pub fn close(self: *Storage) bool {
+        if (self.device.execution_owner != 0) return false;
         self.complete = false;
         if (!self.device.close()) return false;
         if (self.allocation.handle != 0) {

@@ -10,6 +10,8 @@ pub const Mapping = struct {
     context: ?r4os.r4dev.DriverContext = null,
     pin: a.DmaPinnedBuffer = .{},
     mapping: a.DmaMapping = .{},
+    prepared_plan: ?load.Plan = null,
+    execution_owner: usize = 0,
 
     pub fn stage(self: *Mapping, ctx: *const r4os.r4dev.DriverContext, image: []const u8, prepared: *const preparation.Prepared) Error!load.Plan {
         if (self.context != null) return error.Busy;
@@ -37,10 +39,12 @@ pub const Mapping = struct {
             map.segment_count != 1 or map.reserved0 != 0 or map.reserved1 != 0 or
             (map.flags & ~a.dma_mapping_flag_bounced) != constraints.flags or
             map.segments[0].reserved != 0 or map.segments[0].bytes != image.len) return error.Descriptor;
-        return load.plan(prepared, map.segments[0].phys_addr, map.segments[0].bytes);
+        self.prepared_plan = try load.plan(prepared, map.segments[0].phys_addr, map.segments[0].bytes);
+        return self.prepared_plan.?;
     }
 
     pub fn close(self: *Mapping) bool {
+        if (self.execution_owner != 0) return false;
         const ctx = self.context orelse return self.pin.handle == 0 and self.mapping.handle == 0;
         // Keep the exact descriptors on a failed release, even if a callback
         // changed its in/out argument. Never unpin or free a mapped backing.

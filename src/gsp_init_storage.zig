@@ -50,6 +50,7 @@ pub const Storage = struct {
     report: ?Report = null,
     queue_epoch: u64 = 0,
     device_access: bool = false,
+    execution_owner: usize = 0,
     last_queue_status: i32 = 0,
 
     fn checkClock(self: *Storage) Error!void {
@@ -148,7 +149,7 @@ pub const Storage = struct {
     /// Exclusive borrowed port; caller keeps both Storage and QueueLease at
     /// stable addresses until the transport stops using them. No allocation.
     pub fn borrowQueues(self: *Storage) Error!QueueLease {
-        if (self.queue_epoch != 0 or self.device_access) return error.Busy;
+        if (self.queue_epoch != 0 or self.device_access or self.execution_owner != 0) return error.Busy;
         if (self.report == null or self.piece_count != max_mappings or self.allocation.handle == 0) return error.QueueClosed;
         const ctx = self.context orelse return error.QueueClosed;
         if (!ctx.supportsDriverApi(34, @offsetOf(a.DriverApi, "dma_sync_range_for_cpu") + @sizeOf(usize)) or
@@ -169,7 +170,7 @@ pub const Storage = struct {
     pub fn close(self: *Storage) bool {
         // Retain the whole dependency chain before touching report, maps,
         // pins or CPU backing. A failed port call does not prove GPU silence.
-        if (self.queue_epoch != 0 or self.device_access) return false;
+        if (self.queue_epoch != 0 or self.device_access or self.execution_owner != 0) return false;
         self.report = null;
         const ctx = self.context orelse return self.allocation.handle == 0;
         var index = self.piece_count;

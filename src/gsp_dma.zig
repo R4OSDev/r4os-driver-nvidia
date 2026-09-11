@@ -33,6 +33,9 @@ pub const Storage = struct {
     deadline: u64 = 0,
     last_clock: u64 = 0,
     report: ?Report = null,
+    // Stable gsp_run_memory.Lease address. Borrowing blocks every release,
+    // including calls through this nested image owner, before GPU submission.
+    execution_owner: usize = 0,
 
     fn checkClock(self: *Storage) Error!void {
         const now = self.clock.?.nowNs();
@@ -128,6 +131,7 @@ pub const Storage = struct {
     }
 
     pub fn close(self: *Storage) bool {
+        if (self.execution_owner != 0) return false;
         self.report = null;
         const ctx = self.context orelse return self.allocation.handle == 0;
         var index = self.piece_count;

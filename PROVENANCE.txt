@@ -1,6 +1,20 @@
 ﻿Original R4OS implementation for roadmap 0.79.9, 10.09.2026.
 Host/module scaffolding follows R4OS SDK and existing R4D owners.
 
+0.79.10 complete run-memory lease (NVIDIA 0.1.26), 11.09.2026:
+gsp_run_memory and nested lifetime guards are original Apache-2.0 R4OS code.
+The retained appVersion is field 7/byte 28 of the pinned 84-byte
+RM_RISCV_UCODE_DESC; its production profile remains value 0. The complete
+rmRiscvUcode.h and COPYING match the existing pinned source catalog and are
+preserved in gsp-run-memory-20260911. Previous original C ABI evidence is
+reused without a redundant rerun. Firmware and full packaged MIT notices
+are byte-identical. Only the gsp_core.Resume value type is referenced; core,
+sequencer and boot-event executable routines are not newly linked.
+48 owner cases/build pass; OssiPC verifies the actual complete DMA lease,
+header reads and cleanup, followed by exact passive configuration restore.
+The grouped ownership test uses actual init Storage/SDK callbacks and
+already-admitted descriptor fixtures, with no host GPU execution.
+
 0.79.10 GA106 core execution/MMIO binding (host), 11.09.2026:
 gsp_core.zig adapts kflcnReset/StartCpu/DisableCtxReq/WaitForHalt_TU102,
 kflcnPreResetWait/WaitForResetToFinish/SwitchToFalcon/ResetIntoRiscv_GA102,

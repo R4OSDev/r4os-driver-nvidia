@@ -30,6 +30,7 @@ pub const Report = struct {
     metadata_bytes: usize = wpr.bytes,
     pack_bytes: usize = pack_bytes,
     pack_bounced: bool,
+    app_version: u32 = 0,
 };
 pub const Storage = struct {
     context: ?r4os.r4dev.DriverContext = null,
@@ -42,6 +43,7 @@ pub const Storage = struct {
     pin: a.DmaPinnedBuffer = .{},
     mapping: a.DmaMapping = .{},
     report: ?Report = null,
+    execution_owner: usize = 0,
 
     fn checkClock(self: *Storage) Error!u64 {
         const now = self.clock.?.nowNs();
@@ -66,6 +68,7 @@ pub const Storage = struct {
             .signature_bytes = sources.signature.len,
         };
         _ = try wpr.prepare(&input);
+        const boot_info = try boot.inspect(sources.descriptor, @intCast(sources.boot_image.len));
         if (!ctx.supportsDriverApi(19, @offsetOf(a.DriverApi, "dma_unpin_buffer") + @sizeOf(usize))) return error.Api;
         self.context = ctx.*;
         self.clock = ctx.resources() orelse return error.Api;
@@ -131,11 +134,13 @@ pub const Storage = struct {
             .signature_address = address + signature_offset,
             .metadata_address = address + metadata_offset,
             .pack_bounced = map.flags & a.dma_mapping_flag_bounced != 0,
+            .app_version = boot_info.app_version,
         };
         return self.report.?;
     }
 
     pub fn close(self: *Storage) bool {
+        if (self.execution_owner != 0 or self.image.execution_owner != 0) return false;
         self.report = null;
         const ctx = self.context orelse return self.allocation.handle == 0 and self.image.context == null;
         // Close the pack that points at GSP first. Each allocation retains its

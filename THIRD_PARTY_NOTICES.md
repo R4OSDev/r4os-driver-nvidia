@@ -1,5 +1,13 @@
 ﻿# Third-Party Notices
 
+NVIDIA 0.1.26 adds original Apache-2.0 complete-run ownership code and retains
+the admitted descriptor appVersion. Firmware and full packaged notices remain
+byte-identical. The gsp_core.Resume value type introduces no executable core,
+sequencer or boot-event linkage; those methods remain host-qualified only.
+Complete descriptor source and COPYING: gsp-run-memory-20260911.
+
+Earlier core/MMIO notice:
+
 The host-qualified `gsp_core.zig` adapts the pinned GA102/TU102 Falcon/GSP
 implementations (NVIDIA 2017-2024,2021-2024) and published GA102 headers
 (2003-2021,2017-2021,2003-2022,2003-2024), NVIDIA CORPORATION & AFFILIATES.

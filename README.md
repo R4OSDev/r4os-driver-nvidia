@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-Passive NVIDIA display driver for R4OS. Module 0.1.25; original R4OS code is
+Passive NVIDIA display driver for R4OS. Module 0.1.26; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -10,7 +10,36 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
-GA106 core execution and R4OS MMIO binding (host qualification):
+Complete GSP run-memory lease (NVIDIA 0.1.26):
+
+`gsp_run_memory.Lease` holds all four CPU allocations and up to thirteen
+GSP/boot/init/FWSEC DMA mappings under one exclusive, stable owner. It checks
+completed stagers, actual DriverApi identity, unique handles and disjoint
+CPU/DMA ranges before borrowing the kernel-validated queue lease. Every nested
+close path refuses teardown before changing reports or releasing resources.
+The queue port revalidates the whole run; errors invalidate further I/O.
+Before any future GPU effect the run must latch retention. Only an unsubmitted
+matching run may release; timeout, INIT_DONE or Falcon halt cannot free DMA.
+
+Boot inputs now retain the mapped FWSEC plan, actual Libos DMA address and
+the admitted descriptor appVersion. The existing boot-check uses this lease.
+OssiPC/Kernel 0.1.149 confirms four allocations, thirteen mappings, both
+32-byte headers and complete ordered cleanup. NVIDIA 0.1.26 remains installed;
+the exact original passive configuration was restored after two update boots.
+Bootfb remains 800x600, generation 1/reset 0/owner 0. No GPU command or firmware
+start occurred; the user was unavailable for a new picture/sound acceptance.
+
+48 cases in the existing owner step and the module build pass. One grouped
+case covers ownership faults through actual init Storage/SDK callbacks plus
+admitted descriptor fixtures; it does not execute GPU hardware. No new gate
+or QEMU run. The module has 286720 resident bytes and eight unchanged file
+resources. Core/sequence execution remains unlinked; only the Resume value
+type is reused. The staged FWSEC command is still 0x19 (SB); it is not the
+FRTS startup command. Full firmware and notice bytes remain unchanged. Native
+boot/VRAM/VGA/recovery, log reader, firmware start, IRQ, health and verified
+post-submission quiescence remain open. Archive: gsp-run-memory-20260911.
+
+Earlier GA106 core execution and R4OS MMIO binding (host qualification):
 
 `gsp_core` implements reset, start, halt wait and SEC2 resume from the pinned
 GA102/TU102 HAL. Reset waits at most 150us for the RESET_READY hint, performs

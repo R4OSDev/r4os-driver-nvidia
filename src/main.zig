@@ -17,6 +17,7 @@ const boot_resources = @import("boot_resources.zig");
 const gsp_boot_storage = @import("gsp_boot_storage.zig");
 const gsp_init = @import("gsp_init.zig");
 const gsp_init_storage = @import("gsp_init_storage.zig");
+const gsp_run_memory = @import("gsp_run_memory.zig");
 const rm_heap = @import("rm_heap.zig");
 const rm_clock = @import("rm_clock.zig");
 const rm_semaphore = @import("rm_semaphore.zig");
@@ -38,7 +39,7 @@ var gsp_image: gsp_dma.Storage = .{};
 var boot_inputs: boot_resources.Inputs = .{};
 var boot_storage: gsp_boot_storage.Storage = .{};
 var init_storage: gsp_init_storage.Storage = .{};
-var init_queues: gsp_init_storage.QueueLease = .{};
+var run_memory: gsp_run_memory.Lease = .{};
 // Bounded resident scratch: do not copy the maximum boot SG list to the stack.
 var init_excluded: [gsp_init.max_excluded]gsp_init.Span = undefined;
 var checking_boot = false;
@@ -505,21 +506,22 @@ fn stageBootInit(ctx: *const r4os.r4dev.DriverContext, chip_id: u16) bool {
         report.init.libos_address, report.init.rm_address, report.init.queues_address, report.init.queue_page_count, gsp_init.ring_slots, gsp_init.ring_capacity,
     });
     ctx.logInfo("NVIDIA boot-init: arguments=to-device logs=bidirectional queues=bidirectional status-header=zero native-writes=disabled");
-    init_queues = init_storage.borrowQueues() catch |err| {
-        log("NVIDIA boot-init: rejected phase=queue-port reason={s} status={d} submitted=no", .{ @errorName(err), init_storage.last_queue_status });
+    run_memory.acquire(ctx, &boot_storage, &init_storage, &fwsec_cpu) catch |err| {
+        log("NVIDIA boot-init: rejected phase=run-memory reason={s} status={d} submitted=no", .{ @errorName(err), init_storage.last_queue_status });
         return false;
     };
-    const port = init_queues.port();
+    const bindings = run_memory.inputs() catch return false;
+    const port = run_memory.transportPort() catch return false;
     const before = port.now_ns(port.context);
     if (before == std.math.maxInt(u64) or before >= init_storage.deadline) return false;
     var command: [32]u8 = undefined;
     var status: [32]u8 = undefined;
     port.read(port.context, .command, 0, &command) catch |err| {
-        log("NVIDIA boot-init: rejected phase=command-header reason={s} status={d} submitted=no", .{ @errorName(err), init_queues.last_status });
+        log("NVIDIA boot-init: rejected phase=command-header reason={s} status={d} submitted=no", .{ @errorName(err), run_memory.queue.last_status });
         return false;
     };
     port.read(port.context, .status, 0, &status) catch |err| {
-        log("NVIDIA boot-init: rejected phase=status-header reason={s} status={d} submitted=no", .{ @errorName(err), init_queues.last_status });
+        log("NVIDIA boot-init: rejected phase=status-header reason={s} status={d} submitted=no", .{ @errorName(err), run_memory.queue.last_status });
         return false;
     };
     const after = port.now_ns(port.context);
@@ -528,12 +530,15 @@ fn stageBootInit(ctx: *const r4os.r4dev.DriverContext, chip_id: u16) bool {
     if (header.write != 0 or header.layout.flags != 1 or header.layout.rx_offset != 32 or
         header.layout.entries_offset != gsp_init.page_bytes or header.layout.slots != gsp_init.ring_slots or
         !std.mem.allEqual(u8, &status, 0)) return false;
-    log("NVIDIA boot-init: queue-port=OK epoch={d} command-bytes=32 status-bytes=32 status=zero writes=0 lease=held submitted=no", .{init_queues.generation()});
+    log("NVIDIA boot-init: queue-port=OK epoch={d} command-bytes=32 status-bytes=32 status=zero writes=0 lease=held submitted=no", .{run_memory.generation()});
+    log("NVIDIA boot-init: run-memory=held allocations=4 dma-mappings={d} libos-address={x} app-version={x} firmware-command=unsubmitted", .{
+        run_memory.mapped_count, bindings.resume_args.libos_dma, bindings.resume_args.app_version,
+    });
     return true;
 }
 
 fn closeBootInit() bool {
-    if (!init_queues.releaseBeforeSubmission()) return false;
+    if (!run_memory.releaseBeforeSubmission()) return false;
     return init_storage.close();
 }
 
