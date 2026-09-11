@@ -10,7 +10,42 @@ unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
 
-Fruehe Bootbildsicherung (Kernel 0.1.150 / NVIDIA 0.1.28)
+Aktuelle VGA-Speichersicherung (NVIDIA 0.1.29)
+--------------------------------------------
+Der vorhandene optionale Bootcheck haelt nun Bootbild und aktuellen GA106-
+VGA-Arbeitsbereich in echten privaten BOs. Unter der gemeinsamen Displaysperre
+werden die zulaessigen Enginezustaende erneut gelesen. BAR0_WINDOW wird ganz
+gesichert, der aktuelle VGA-Bereich in 4-KB-Schritten ueber PRAMIN kopiert und
+das urspruengliche Fenster mit Readback restauriert. Ausschliesslich dieses
+CPU-Fenster darf programmiert werden. Der geplante Firmware-Verlagerungsort
+ist keine Quelle fuer die Sicherung des aktuellen VGA-Speichers.
+
+Teilweise ausgefuehrte Writes, abgelaufene Capture-Frist und Freigabefehler
+behalten denselben Besitzer. Eine frische begrenzte Frist erlaubt den Restore;
+unbekanntes Fenster oder geaenderte VGA-Basis halten Bildsicherung und Sperre.
+Nach bestaetigtem Restore wird ein spaeterer MMIO-Freigabefehler ohne erneuten
+Registerwrite bereinigt. Dieser Callback gilt nur fuer das CPU-Fenster und
+beweist keine Recovery nach GPU-Firmware, DMA oder Scanout-Programmierung.
+Keine VGA-Verlagerung und kein Firmwarestart; Normalmodus bleibt passiv.
+
+51 vorhandene NVIDIA-Besitzerfaelle und Modulbuild bestanden. Bestehender
+Preflightfall um Fenster-/Adress-/Fristfehler erweitert; bestehender SDK-
+Lifecyclefall verwendet den echten BO/MMIO-Sicherungsbesitzer mit zwei BOs
+gegen Hostregisterspeicher. Ressourcenretention und anschliessende Freigabe
+bei genau zwei Fensterwrites nachgewiesen. Keine neue Fallzahl, kein Gate,
+kein Gastlauf. R4D: 24 nichtresidente Ressourcen, 372736 residente Bytes,
+3361 Relocations. Vollstaendige MIT-Hinweise aus fuenf gepinnten Originalen
+liegen im Modul sowie in der Distribution; alle 14 Pflichttexte gestagt.
+
+OssiPC ist laut User voruebergehend offline. Kein Zugriff, Update oder Reboot;
+NVIDIA 29 ist dort noch nicht installiert/geprueft. Letzter bestaetigter Stand:
+Kernel 150 / NVIDIA 28, passiv. Physischer VGA-/Fensterrestore sowie neue
+Bild-/Tonabnahmen bleiben offen. Ebenso fehlen exakter VRAM-Reservierungs-
+besitz, Firmwarebindung und vollstaendige GPU-Recovery. 0.79.10 bleibt offen.
+Beleg: boot_vram_checkpoint in Drivers/GrafikFirmware07910.json; Archiv:
+ExFiles/Reference/GFX/Nvidia/0.79.10/boot-vram-20260911.
+
+Historisch: Fruehe Bootbildsicherung (Kernel 0.1.150 / NVIDIA 0.1.28)
 ------------------------------------------------------
 Der gemeinsame Displaybesitzer kann normale Present-Aufrufe und direkte
 Firmware-Console-Schreiber vor Ausgangs-/Queue-Erkennung sperren. Er kopiert

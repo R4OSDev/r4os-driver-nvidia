@@ -1,11 +1,12 @@
 // Resident snapshot owner for the existing boot-check path. The kernel holds
 // every CPU writer during capture and retains an immutable BO read lease.
-// This probe never latches device effects and never claims GPU recovery.
+// A guarded caller supplies its actual recovery callback before any effects.
 const std = @import("std");
 const r4os = @import("r4os");
 const a = r4os.abi;
 pub const Error = error{ Busy, Unsupported, Display, Buffer, Hold, Map, Stale };
 pub const Report = struct { boot: a.GfxNativeBootInfo, hold_generation: u64, bytes: u64, sha256: [32]u8 };
+pub const Recovery = struct { context: u64, callback: *const fn (u64, u64, *const a.GfxNativeBootInfo) callconv(.c) i32 };
 pub const Snapshot = struct {
     memory: ?r4os.driver_memory.Context = null,
     display: ?r4os.driver_display.Context = null,
@@ -13,8 +14,13 @@ pub const Snapshot = struct {
     read: a.GfxBufferMap = .{},
     held_generation: u64 = 0,
     last_status: i32 = 0,
+    recovery_required: bool = false,
 
     pub fn capture(self: *Snapshot, ctx: *const r4os.r4dev.DriverContext, adapter: u32) Error!Report {
+        return self.captureGuarded(ctx, adapter, .{ .context = 0, .callback = refuseRecovery });
+    }
+
+    pub fn captureGuarded(self: *Snapshot, ctx: *const r4os.r4dev.DriverContext, adapter: u32, recovery: Recovery) Error!Report {
         if (self.reference.reference.id != 0 or self.held_generation != 0 or self.read.lease.id != 0) return error.Busy;
         const memory = ctx.memory() orelse return error.Unsupported;
         const display = ctx.graphicsDisplay() orelse return error.Unsupported;
@@ -32,7 +38,7 @@ pub const Snapshot = struct {
         if (self.last_status != a.gfx_buffer_result_ok) return error.Buffer;
         var state: a.GfxNativeState = .{};
         self.last_status = display.bootHold(&.{ .adapter_id = adapter, .generation = boot.generation,
-            .reference = self.reference.reference, .restore_callback = @intFromPtr(&refuseRecovery) }, &state);
+            .reference = self.reference.reference, .context = recovery.context, .restore_callback = @intFromPtr(recovery.callback) }, &state);
         // A handled capture/cleanup failure can still retain the real hold.
         if (state.retained != 0) self.held_generation = state.generation;
         if (self.last_status != a.gfx_output_ok or state.outcome != a.gfx_output_outcome_validated or state.retained != 1 or state.generation == 0) return error.Hold;
@@ -49,6 +55,16 @@ pub const Snapshot = struct {
         return .{ .boot = boot, .hold_generation = state.generation, .bytes = bytes, .sha256 = hash };
     }
 
+    pub fn latchEffects(self: *Snapshot) Error!void {
+        if (self.held_generation == 0 or self.recovery_required) return error.Hold;
+        const display = self.display orelse return error.Unsupported;
+        self.recovery_required = true; // A partial provider call must retain.
+        var state: a.GfxNativeState = .{};
+        self.last_status = display.bootFinish(self.held_generation, 1, &state);
+        if (self.last_status != a.gfx_output_ok or state.retained != 1 or state.generation != self.held_generation or
+            state.outcome != a.gfx_output_outcome_validated) return error.Hold;
+    }
+
     // The actual descriptor remains in this resident owner on every failed
     // cleanup. Shutdown retries this same order through the cached tables.
     pub fn close(self: *Snapshot) bool {
@@ -61,7 +77,7 @@ pub const Snapshot = struct {
         if (self.held_generation != 0) {
             const display = self.display orelse return false;
             var state: a.GfxNativeState = .{};
-            self.last_status = display.bootFinish(self.held_generation, 0, &state);
+            self.last_status = display.bootFinish(self.held_generation, if (self.recovery_required) 2 else 0, &state);
             if (self.last_status != a.gfx_output_ok or state.retained != 0 or state.outcome != a.gfx_output_outcome_old_preserved) return false;
             self.held_generation = 0;
         }

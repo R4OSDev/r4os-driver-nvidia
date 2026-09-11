@@ -876,4 +876,161 @@ test "NVIDIA actual driver lifecycle rejects writes and retains failed mappings 
     try t.expectEqual(@as(i32, 0), driver.nvidia_shutdown());
     try t.expect(!state.mapping);
     try t.expectEqual(@as(usize, 3), state.unmaps);
+    try checkBootVramOwner();
+}
+
+// Exercise the actual SDK/MMIO snapshot owner inside the existing lifecycle
+// case. Host RAM models the aperture; the pure preflight case checks address
+// selection and partial device effects independently. This is no GPU proof.
+const BootVramFixture = struct {
+    var registers: []u8 = &.{};
+    var buffers: [2]?[]u8 = .{ null, null };
+    var leases: [2]bool = .{ false, false };
+    var mapped: [0x900]bool = @splat(false);
+    var held = false;
+    var effects = false;
+    var request: a.GfxBootHoldRequest = .{};
+    var fail_unmap = false;
+    var fail_map = false;
+    fn info() a.GfxNativeBootInfo {
+        return .{ .generation = 7, .physical_address = 0xd0000000, .byte_length = 16384,
+            .width = 64, .height = 64, .pitch = 256, .state = if (held) 2 else 1 };
+    }
+    fn memoryQuery(out: *a.GfxDriverMemoryApi) callconv(.c) i32 {
+        out.* = .{ .buffer_create = @intFromPtr(&create), .buffer_map = @intFromPtr(&bufferMap),
+            .buffer_unmap = @intFromPtr(&bufferUnmap), .buffer_release = @intFromPtr(&release),
+            .mmio_map = @intFromPtr(&mapMmio), .mmio_unmap = @intFromPtr(&unmapMmio), .collect = @intFromPtr(&collectBuffers) };
+        return a.gfx_buffer_result_ok;
+    }
+    fn displayQuery(out: *a.GfxDriverDisplayApi) callconv(.c) i32 {
+        out.* = .{ .boot_info = @intFromPtr(&bootInfo), .boot_hold = @intFromPtr(&bootHold), .boot_finish = @intFromPtr(&bootFinish) };
+        return a.gfx_output_ok;
+    }
+    fn resourcesQuery(out: *a.DriverResourceApi) callconv(.c) i32 { out.* = .{ .now_ns = @intFromPtr(&now) }; return a.driver_resource_ok; }
+    fn now() callconv(.c) u64 { return 1000000; }
+    fn bootInfo(out: *a.GfxNativeBootInfo) callconv(.c) i32 { out.* = info(); return a.gfx_output_ok; }
+    fn bootHold(input: *const a.GfxBootHoldRequest, out: *a.GfxNativeState) callconv(.c) i32 {
+        std.debug.assert(!held and input.generation == 7 and input.reference.id == 1 and buffers[0] != null);
+        request = input.*;
+        held = true;
+        effects = false;
+        out.* = .{ .generation = 9, .state = 2, .outcome = a.gfx_output_outcome_validated, .retained = 1 };
+        return a.gfx_output_ok;
+    }
+    fn bootFinish(generation: u64, operation: u32, out: *a.GfxNativeState) callconv(.c) i32 {
+        std.debug.assert(held and generation == 9);
+        if (operation == 1) {
+            std.debug.assert(!effects);
+            effects = true;
+        } else if (effects) {
+            std.debug.assert(operation == 2);
+            const callback: *const fn (u64, u64, *const a.GfxNativeBootInfo) callconv(.c) i32 = @ptrFromInt(request.restore_callback);
+            if (callback(request.context, generation, &info()) == 1) held = false;
+        } else { std.debug.assert(operation == 0); held = false; }
+        out.* = .{ .generation = 9, .state = if (held) 2 else 1, .retained = @intFromBool(held),
+            .outcome = if (!held) a.gfx_output_outcome_old_preserved else if (operation == 1) a.gfx_output_outcome_validated else a.gfx_output_outcome_lost };
+        return a.gfx_output_ok;
+    }
+    fn create(input: *const a.GfxBufferDescriptor, out: *a.GfxBufferReference) callconv(.c) i32 {
+        for (&buffers, 0..) |*backing, index| if (backing.* == null) {
+            const bytes = std.heap.page_allocator.alloc(u8, @intCast(input.byte_length)) catch return a.gfx_buffer_error_budget;
+            @memset(bytes, 0x36);
+            backing.* = bytes;
+            out.* = .{ .reference = .{ .id = @intCast(index + 1), .generation = 3 } };
+            return a.gfx_buffer_result_ok;
+        };
+        return a.gfx_buffer_error_budget;
+    }
+    fn bufferMap(input: *const a.GfxBufferHandle, access: u32, offset: u64, bytes: u64, out: *a.GfxBufferMap) callconv(.c) i32 {
+        const index = input.id - 1;
+        std.debug.assert(index < 2 and buffers[index] != null and !leases[index] and offset == 0 and bytes == buffers[index].?.len);
+        std.debug.assert(access == a.gfx_buffer_map_read or access == a.gfx_buffer_map_write);
+        leases[index] = true;
+        out.* = .{ .lease = .{ .id = 101 + index, .generation = 4 }, .cpu_address = @intFromPtr(buffers[index].?.ptr), .byte_length = bytes };
+        return a.gfx_buffer_result_ok;
+    }
+    fn bufferUnmap(input: *const a.GfxBufferHandle) callconv(.c) i32 {
+        const index = input.id - 101;
+        std.debug.assert(index < 2 and leases[index]);
+        leases[index] = false;
+        return a.gfx_buffer_result_ok;
+    }
+    fn release(input: *const a.GfxBufferHandle) callconv(.c) i32 {
+        const index = input.id - 1;
+        std.debug.assert(index < 2 and !leases[index] and !(index == 0 and held));
+        std.heap.page_allocator.free(buffers[index].?);
+        buffers[index] = null;
+        return a.gfx_buffer_result_ok;
+    }
+    fn mapMmio(input: *const a.GfxMmioRequest, out: *a.GfxMmioWindow) callconv(.c) i32 {
+        std.debug.assert(input.resource_base == 0xe0000000 and input.resource_bytes == 0x1000000 and
+            input.byte_offset + input.byte_length <= registers.len and input.cache_policy == a.gfx_buffer_cache_uncached);
+        if (fail_map) return a.gfx_buffer_error_budget;
+        const index = input.byte_offset / 4096;
+        std.debug.assert(!mapped[index]);
+        mapped[index] = true;
+        out.* = .{ .handle = .{ .id = @intCast(index + 1), .generation = 3 }, .cpu_address = @intFromPtr(registers.ptr) + input.byte_offset,
+            .physical_address = input.resource_base + input.byte_offset, .byte_length = input.byte_length, .cache_policy = input.cache_policy };
+        return a.gfx_buffer_result_ok;
+    }
+    fn unmapMmio(input: *const a.GfxBufferHandle, quiesced: u32) callconv(.c) i32 {
+        const index = input.id - 1;
+        std.debug.assert(mapped[index] and quiesced == 1);
+        if (fail_unmap) return a.gfx_buffer_error_busy;
+        mapped[index] = false;
+        return a.gfx_buffer_result_ok;
+    }
+    fn collectBuffers() callconv(.c) i32 { return a.gfx_buffer_result_ok; }
+    fn put(address: usize, value: u32) void { std.mem.writeInt(u32, registers[address..][0..4], value, .little); }
+};
+
+fn checkBootVramOwner() !void {
+    const f = BootVramFixture;
+    f.registers = try std.heap.page_allocator.alloc(u8, 0x900000);
+    defer std.heap.page_allocator.free(f.registers);
+    @memset(f.registers, 0);
+    var raw = @import("fwsec_test.zig").preflightFixture();
+    raw.put(.bcr, 1);
+    raw.put(.riscv_cpuctl, 0x10);
+    raw.put(.vga, 0x10e08);
+    for (preflight.addresses, raw.values) |address, value| f.put(address, value);
+    f.put(0, 0xb76000a1);
+    f.put(0x1700, 0xc2000079);
+    @memset(f.registers[0x700000..0x720000], 0x5d);
+    var api = apiTable();
+    api.version = 34;
+    api.gfx_memory_query = f.memoryQuery;
+    api.gfx_display_query = f.displayQuery;
+    api.resource_query = f.resourcesQuery;
+    const ctx = r4os.r4dev.DriverContext.init(&api);
+    const id = @import("identity.zig");
+    var snapshot: id.Snapshot = .{ .pci = .{} };
+    snapshot.pci = .{ .bus_kind = 2, .bus = 9, .vendor_id = 0x10de, .device_id = 0x2504, .class_code = 3 };
+    snapshot.command = 2;
+    snapshot.bars[0] = .{ .kind = .memory32, .base = 0xe0000000, .bytes = 0x1000000 };
+    const chip = id.chip(0xb76000a1, 0).?;
+    var capture: @import("boot_vram.zig").Capture = .{};
+    defer _ = capture.close();
+    const report = try capture.capture(&ctx, &snapshot, chip);
+    var expected: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(f.registers[0x700000..0x720000], &expected, .{});
+    try t.expectEqualSlices(u8, &expected, &report.sha256);
+    try t.expectEqual(@as(u64, 0x10e0000), report.range.address);
+    try t.expect(report.window_restored and report.window_writes == 2 and f.held and f.leases[1]);
+    f.put(0x625f04, 0x10f08); // Unknown display change: retain every required owner.
+    try t.expect(!capture.close());
+    try t.expect(f.held and f.buffers[0] != null and f.buffers[1] != null and f.mapped[0x700] and f.leases[1]);
+    f.put(0x625f04, 0x10e08);
+    f.fail_unmap = true;
+    try t.expect(!capture.close());
+    try t.expect(!f.held and f.buffers[0] == null and f.buffers[1] == null and f.mapped[0x700]);
+    f.fail_unmap = false;
+    try t.expect(capture.window_writes == 2); // No repeated register restore for cleanup.
+    try t.expect(capture.close() and capture.close());
+    try t.expect(std.mem.allEqual(bool, &f.mapped, false));
+    f.fail_map = true;
+    try t.expectError(error.Mapping, capture.capture(&ctx, &snapshot, chip));
+    try t.expect(capture.close());
+    f.fail_map = false;
+    try t.expect(!f.held and f.buffers[0] == null and f.buffers[1] == null and !f.leases[0] and !f.leases[1]);
 }

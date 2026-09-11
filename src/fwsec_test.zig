@@ -86,6 +86,141 @@ test "FWSEC preflight rejects inaccessible state and bounds TCM against actual c
     try t.expectError(error.Capacity, decoded.checkTcm(&plan));
     plan.dmem.destination = 0xffffff00;
     try t.expectError(error.Capacity, decoded.checkTcm(&plan));
+    try checkPraminCapture();
+}
+
+// Extend the existing preflight owner case; no separate gate or case count.
+fn checkPraminCapture() !void {
+    const p = @import("pramin.zig");
+    const Hardware = struct {
+        epoch: u64 = 0x100000007,
+        clock: u64 = 100,
+        window: u32 = 0xc2000079,
+        vga: u32 = 0x10e08,
+        reads: u32 = 0,
+        writes: u32 = 0,
+        first_write: u32 = 0,
+        retained: bool = false,
+        deny_retain: bool = false,
+        fail_write: u32 = 0,
+        fail_data: ?u32 = null,
+        fn cast(raw: *anyopaque) *@This() { return @ptrCast(@alignCast(raw)); }
+        fn generation(raw: *anyopaque) u64 { return cast(raw).epoch; }
+        fn now(raw: *anyopaque) u64 { return cast(raw).clock; }
+        fn retain(raw: *anyopaque) !void {
+            const self = cast(raw);
+            self.retained = true;
+            if (self.deny_retain) return error.Retention;
+        }
+        fn read(raw: *anyopaque, address: u32) !u32 {
+            const self = cast(raw);
+            self.reads += 1;
+            return switch (address) {
+                0 => 0xb76000a1,
+                4 => 0,
+                p.window_register => self.window,
+                p.vga_register => self.vga,
+                else => blk: {
+                    try t.expect(address >= p.aperture and address < p.aperture + p.aperture_bytes and address & 3 == 0);
+                    const offset = address - p.aperture;
+                    if (self.fail_data) |fail| if (offset == fail) return error.DataRead;
+                    if (offset == 4) break :blk 0xffffffff;
+                    if (offset == 8) break :blk 0xbadf0000;
+                    break :blk @as(u32, @truncate((@as(u64, self.window & 0xffffff) << 16) + offset));
+                },
+            };
+        }
+        fn write(raw: *anyopaque, address: u32, value: u32) !void {
+            const self = cast(raw);
+            try t.expect(self.retained and address == p.window_register);
+            self.writes += 1;
+            if (self.writes == 1) self.first_write = value;
+            self.window = value;
+            if (self.writes == self.fail_write) return error.PartialWrite;
+        }
+        fn port(self: *@This()) p.Port { return .{ .context = self, .generation = generation, .now_ns = now, .retain = retain, .read32 = read, .write32 = write }; }
+        fn options(self: *@This()) !p.Options {
+            var raw = preflightFixture();
+            raw.put(.vga, self.vga);
+            raw.put(.bcr, 1);
+            raw.put(.riscv_cpuctl, 0x10);
+            return .{ .epoch = self.epoch, .deadline = 200, .boot0 = 0xb76000a1, .boot1 = 0,
+                .vga = self.vga, .range = try p.workspace(0x176, &raw) };
+        }
+    };
+    const output = try t.allocator.alloc(u8, 0x20000);
+    defer t.allocator.free(output);
+    for ([_]u32{ 0x10e08, 0x2fffe08 }) |vga| {
+        var hardware: Hardware = .{ .vga = vga };
+        var operation = try p.Capture.init(try hardware.options());
+        var steps: u32 = 1;
+        while (!try operation.step(hardware.port(), output)) : (steps += 1) {}
+        try t.expectEqual(@as(u32, 36), steps);
+        try t.expectEqual(@as(u32, 2), hardware.writes);
+        try t.expectEqual(@as(u32, if (vga == 0x10e08) 0xc000010e else 0xc002fffe), hardware.first_write);
+        try t.expectEqual(@as(u32, 0xc2000079), hardware.window);
+        try t.expect(operation.restored and operation.copied == output.len);
+        const base = @as(u64, vga >> 8) << 16;
+        try t.expectEqual(@as(u32, @truncate(base)), std.mem.readInt(u32, output[0..4], .little));
+        try t.expectEqual(@as(u32, 0xffffffff), std.mem.readInt(u32, output[4..8], .little));
+        try t.expectEqual(@as(u32, 0xbadf0000), std.mem.readInt(u32, output[8..12], .little));
+        try t.expectEqual(@as(u32, @truncate(base + output.len - 4)), std.mem.readInt(u32, output[output.len - 4 ..][0..4], .little));
+        try operation.restore(hardware.port(), 200);
+        try t.expectEqual(@as(u32, 2), hardware.writes); // No repeated restore write.
+        var moved = operation;
+        try t.expectError(error.Stale, moved.restore(hardware.port(), 200));
+    }
+    var hardware: Hardware = .{ .fail_write = 1 };
+    var operation = try p.Capture.init(try hardware.options());
+    try t.expect(!try operation.step(hardware.port(), output));
+    try t.expect(!try operation.step(hardware.port(), output));
+    try t.expectError(error.PartialWrite, operation.step(hardware.port(), output));
+    try t.expect(operation.effects_possible and hardware.window != 0xc2000079);
+    const reads = hardware.reads;
+    try t.expectError(error.PartialWrite, operation.step(hardware.port(), output));
+    try t.expectEqual(reads, hardware.reads); // Failed capture is never replayed.
+    hardware.fail_write = 2;
+    try t.expectError(error.PartialWrite, operation.restore(hardware.port(), 200));
+    try t.expect(!operation.restored and hardware.window == 0xc2000079);
+    try operation.restore(hardware.port(), 200);
+    try t.expectEqual(@as(u32, 2), hardware.writes); // Partial restore completed physically.
+
+    hardware = .{ .fail_data = 4096 };
+    operation = try p.Capture.init(try hardware.options());
+    for (0..4) |_| try t.expect(!try operation.step(hardware.port(), output));
+    try t.expectError(error.DataRead, operation.step(hardware.port(), output));
+    try t.expectEqual(@as(u32, 4096), operation.copied);
+    hardware.epoch += 1;
+    const before_stale = hardware.reads;
+    try t.expectError(error.Stale, operation.restore(hardware.port(), 200));
+    try t.expectEqual(before_stale, hardware.reads);
+    hardware.epoch -= 1;
+    hardware.vga ^= 0x100;
+    try t.expectError(error.Unstable, operation.restore(hardware.port(), 200));
+    try t.expectEqual(@as(u32, 1), hardware.writes);
+    hardware.vga ^= 0x100;
+    hardware.clock = 200;
+    try t.expectError(error.Deadline, operation.restore(hardware.port(), 200));
+    try operation.restore(hardware.port(), 300); // Fresh bounded recovery deadline.
+
+    hardware = .{ .deny_retain = true };
+    operation = try p.Capture.init(try hardware.options());
+    try t.expect(!try operation.step(hardware.port(), output));
+    try t.expectError(error.Retention, operation.step(hardware.port(), output));
+    try operation.restore(hardware.port(), 200);
+    try t.expectEqual(@as(u32, 0), hardware.writes);
+    hardware = .{ .window = 0xbadf0000 };
+    operation = try p.Capture.init(try hardware.options());
+    try t.expectError(error.Inaccessible, operation.step(hardware.port(), output));
+    try t.expectEqual(@as(u32, 0), hardware.writes);
+    var options = try hardware.options();
+    options.range.bytes = p.aperture_bytes + 4;
+    try t.expectError(error.Options, p.Capture.init(options));
+    var raw = preflightFixture();
+    try t.expectError(error.EngineState, p.workspace(0x176, &raw));
+    try t.expectError(error.Profile, p.workspace(0x170, &raw));
+    raw.put(.vga, 0);
+    try t.expectError(error.Unavailable, p.workspace(0x176, &raw));
 }
 
 test "FWSEC DMA plan preserves high address bits and rejects truncated or wrapping transfers" {

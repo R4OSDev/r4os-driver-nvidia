@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-Passive NVIDIA display driver for R4OS. Module 0.1.28; original R4OS code is
+Passive NVIDIA display driver for R4OS. Module 0.1.29; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -10,7 +10,34 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
-Early boot-display preservation (NVIDIA 0.1.28 / Kernel 0.1.150):
+Current VGA workspace preservation (NVIDIA 0.1.29):
+
+The existing opt-in boot-check now retains both the boot framebuffer and the
+current GA106 VGA workspace in real private BOs. Under the common display
+hold it rechecks the engine state, saves BAR0_WINDOW, copies through PRAMIN
+in bounded 4 KB steps and verifies restoration of the original window.
+The only permitted register writes select/restore that CPU aperture. The
+planned GSP relocation target is not confused with the current VGA base.
+
+Partial writes, expired capture deadlines and failed cleanup retain the same
+owner until verified recovery. A changed VGA base or unknown window refuses
+release. This aperture-only callback cannot recover executed GPU firmware,
+DMA or native scanout. Firmware execution and VGA relocation remain disabled;
+the normal passive mode is unchanged.
+
+51 existing owner cases and the module build pass. The existing SDK lifecycle
+case exercises the actual snapshot owner, two BOs, MMIO and retained recovery
+against a host register model. No new case count, gate or guest run. The module
+has 24 nonresident resources; full notices from five pinned MIT sources are
+included in the R4D and all 14 required Distribution legal files stage cleanly.
+
+OssiPC is temporarily offline per the user. NVIDIA 29 has not been installed
+or tested on it. Its last verified state remains Kernel 150 / NVIDIA 28 in
+passive mode; physical VGA capture/restore and image/audio acceptance are open.
+Evidence: `boot_vram_checkpoint` in `Docs/Drivers/GrafikFirmware07910.json`;
+archive `ExFiles/Reference/GFX/Nvidia/0.79.10/boot-vram-20260911`.
+
+Earlier boot-display preservation (NVIDIA 0.1.28 / Kernel 0.1.150):
 
 The common display owner can now freeze normal and firmware CPU writers
 before output/queue discovery. It copies every boot framebuffer row, including

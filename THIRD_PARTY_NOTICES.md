@@ -1,5 +1,20 @@
 ﻿# Third-Party Notices
 
+
+PRAMIN / VGA-workspace capture (NVIDIA 0.1.29, 2026-09-11):
+pramin.zig follows the GM107 BAR0 window semantics in kern_bus_gm107.c
+(NVIDIA 2004-2024), its published dev_bus.h/dev_ram.h register definitions
+(original NVIDIA copyright lines), and the VGA workspace profile/readback in
+kernel_gsp_tu102.c and kern_disp_0400.c. Full original MIT notices and
+copyright lines accompany the source. The 6,676-byte
+NVIDIA-570.144-PRAMIN-LICENSE.txt resource includes all five complete notices;
+Distribution carries the identical bytes. Stable ownership, bounded steps,
+recovery and SDK/BO/MMIO binding are original R4OS Apache-2.0 code. The
+executable PRAMIN capture is linked only through the explicit boot-check;
+normal passive binding remains read-only. No original RM or Nouveau C is
+linked. Full originals and dispatch evidence: vga-workspace-sources-20260911.
+Pin: https://github.com/NVIDIA/open-gpu-kernel-modules/tree/8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f
+
 Complete GA106 Falcon reset/TCM/upload composition (host, 2026-09-11):
 falcon_run.zig composes the existing NVIDIA-derived core/HS executors with
 original Apache-2.0 R4OS lifetime/admission. Its HWCFG IMEM/DMEM calculation
