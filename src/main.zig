@@ -15,6 +15,8 @@ const firmware_storage = @import("firmware_storage.zig");
 const gsp_dma = @import("gsp_dma.zig");
 const boot_resources = @import("boot_resources.zig");
 const gsp_boot_storage = @import("gsp_boot_storage.zig");
+const gsp_init = @import("gsp_init.zig");
+const gsp_init_storage = @import("gsp_init_storage.zig");
 const rm_heap = @import("rm_heap.zig");
 const rm_clock = @import("rm_clock.zig");
 const rm_semaphore = @import("rm_semaphore.zig");
@@ -35,6 +37,9 @@ var firmware_cpu: firmware_storage.Storage = .{};
 var gsp_image: gsp_dma.Storage = .{};
 var boot_inputs: boot_resources.Inputs = .{};
 var boot_storage: gsp_boot_storage.Storage = .{};
+var init_storage: gsp_init_storage.Storage = .{};
+// Bounded resident scratch: do not copy the maximum boot SG list to the stack.
+var init_excluded: [gsp_init.max_excluded]gsp_init.Span = undefined;
 var checking_boot = false;
 var boot_checked = false;
 var checking_runtime = false;
@@ -158,6 +163,7 @@ pub export fn nvidia_shutdown() callconv(.c) i32 {
     if (!semaphore_probe.shutdown(&ctx)) return -1;
     if (!thread_probe.shutdown(&ctx)) return -1;
     if (!runtime_probe.shutdown(&ctx)) return -1;
+    if (!init_storage.close()) return -1;
     if (!boot_storage.close()) return -1;
     boot_inputs.close();
     if (!gsp_image.close()) return -1;
@@ -460,6 +466,14 @@ fn checkBoot(ctx: *const r4os.r4dev.DriverContext, chip: identity.Chip, raw: fws
     log("NVIDIA boot-check: boot-address={x} signature-address={x} metadata-address={x} metadata-bytes={d} verified=0 boot-count=0 vram-reserved=no vga-relocated=no", .{
         report.boot_address, report.signature_address, report.metadata_address, report.metadata_bytes,
     });
+    if (!stageBootInit(ctx, chip.id)) return false;
+    // No GPU submission occurred. On failure leave this owner and all borrowed
+    // boot allocations for shutdown, which retries this same dependency order.
+    if (!init_storage.close()) {
+        ctx.logError("NVIDIA boot-init: cleanup=retained submitted=no");
+        return false;
+    }
+    ctx.logInfo("NVIDIA boot-init: cleanup=OK mappings=0 pins=0 cpu=0 submitted=no");
     if (!boot_storage.close()) {
         ctx.logError("NVIDIA boot-check: cleanup=retained submitted=no");
         return false;
@@ -468,6 +482,28 @@ fn checkBoot(ctx: *const r4os.r4dev.DriverContext, chip: identity.Chip, raw: fws
     if (!firmware_cpu.close()) return false;
     boot_checked = true;
     ctx.logInfo("NVIDIA boot-check: OK mappings=0 pins=0 cpu=0 native-writes=disabled fallback=preserved");
+    return true;
+}
+
+fn stageBootInit(ctx: *const r4os.r4dev.DriverContext, chip_id: u16) bool {
+    const image_spans = boot_storage.image.segments[0..boot_storage.image.segment_count];
+    @memcpy(init_excluded[0..image_spans.len], image_spans);
+    const pack = boot_storage.mapping.segments[0];
+    const security = fwsec_cpu.device.mapping.segments[0];
+    init_excluded[image_spans.len] = .{ .address = pack.phys_addr, .bytes = pack.bytes };
+    init_excluded[image_spans.len + 1] = .{ .address = security.phys_addr, .bytes = security.bytes };
+    const count = image_spans.len + 2;
+    const report = init_storage.stage(ctx, chip_id, init_excluded[0..count], 30 * std.time.ns_per_s) catch |err| {
+        log("NVIDIA boot-init: rejected phase=dma-init reason={s} submitted=no fallback=preserved", .{@errorName(err)});
+        return false;
+    };
+    log("NVIDIA boot-init: staged bytes={d} mappings={d} logs={d} queue-segments={d} bounced={d} excluded-spans={d} synchronized=yes submitted=no", .{
+        gsp_init.output_bytes, report.mappings, report.init.log_regions, report.queue_segments, report.bounced, count,
+    });
+    log("NVIDIA boot-init: libos-address={x} rm-address={x} queue-table={x} queue-pages={d} ring-slots={d} capacity={d} linked=no firmware-ready=no", .{
+        report.init.libos_address, report.init.rm_address, report.init.queues_address, report.init.queue_page_count, gsp_init.ring_slots, gsp_init.ring_capacity,
+    });
+    ctx.logInfo("NVIDIA boot-init: arguments=to-device logs=bidirectional queues=bidirectional status-header=zero native-writes=disabled");
     return true;
 }
 

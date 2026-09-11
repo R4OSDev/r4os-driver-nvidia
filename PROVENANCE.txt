@@ -3,7 +3,21 @@ Host/module scaffolding follows R4OS SDK and existing R4D owners.
 Firmware fixture bodies and signatures are synthetic. Selected measured
 table fields are explicit regression data, as described below.
 
-0.79.10 GSP init storage owner (host), 11.09.2026:
+0.79.10 integrated GSP init storage (NVIDIA 0.1.24), 11.09.2026:
+The explicit boot-check links the existing MIT-attributed gsp_init.zig encoder
+and original R4OS gsp_init_storage.zig owner. The central lock now pins twelve
+complete notice inputs; COPYING plus eleven original MIT comments produce
+the identical 33543-byte license resource in R4D and Distribution, SHA256
+034411c3bf35fa6c7df412070140d621affb15b0e4be2e286ff25c8fc1d69d25.
+The GA102 boot image/descriptor and GSP containers remain byte-identical.
+No original decoder, full RM or original msgq C implementation is linked.
+The existing optional host ABI probe executes original msgq and compares
+the complete initialized byte image; the existing owner step covers the new
+byte-extent exclusion admission for the retained 59904-byte FWSEC span.
+Runtime staging publishes no GPU address, firmware-ready or queue linkage.
+Source, licenses and evidence: ExFiles/Reference/GFX/Nvidia/0.79.10/boot-init-20260911.
+
+Historical 0.79.10 GSP init storage owner (host), 11.09.2026:
 gsp_init_storage.zig is original Apache-2.0 R4OS ownership/orchestration code
 using existing DriverApi heap, pin, map, synchronize, unmap and unpin calls.
 The previously qualified MIT-attributed gsp_init.zig encoding is unchanged.

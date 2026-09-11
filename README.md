@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-Passive NVIDIA display driver for R4OS. Module 0.1.23; original R4OS code is
+Passive NVIDIA display driver for R4OS. Module 0.1.24; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -10,22 +10,26 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
-Module 0.1.23 adds the explicit `OPTION NVIDIA mode=boot-check` diagnostic.
+Module 0.1.24 extends the explicit `OPTION NVIDIA mode=boot-check` diagnostic.
 After the actual GA106 board, fuse and FWSEC preflight, it admits the pinned
 24-KB boot image, 84-byte descriptor and complete license from the currently
 loaded R4D. Resource generation, exact lengths, hashes and a monotonic deadline
 are checked before any boot input is exposed. It then admits the GA10X GSP
 container and composes the existing image and boot-pack owners described below.
 Five DMA mappings hold the image, tables, bootloader, signature and 256-byte
-WPR metadata; final synchronization precedes the diagnostic report. All are
-released during init. No address is submitted to the GPU, no VRAM is reserved
+WPR metadata. Seven further mappings hold Libos/RM arguments, five logs and
+the shared queues, disjoint from every retained image, boot-pack and FWSEC
+span. FWSEC exclusions use their actual byte extent, without imposing the
+new GSP pages' alignment on them. Final synchronization precedes each report.
+Init mappings close before boot-pack/image mappings and then FWSEC; a failed
+release retains that dependency chain for shutdown. All close during init. No address is submitted to the GPU, no VRAM is reserved
 or changed, and the normal passive mode remains the default.
 
 `src/firmware-lock.json` is the single source for the boot artifacts and their
 complete provenance. The module now contains eight nonallocated resources.
-The new 25,885-byte license resource includes the unchanged full COPYING and
-five complete MIT notices covering the original boot source and adapted layout
-and metadata code. Distribution carries the identical notices in R4OS/LICENSES
+The 33,543-byte license resource includes the unchanged full COPYING and
+eleven complete MIT notices covering the boot source and adapted layout,
+metadata and initialization code. Distribution carries the identical notices in R4OS/LICENSES
 and its adjacent Legal directory. CPU hash admission is not GPU authentication.
 
 Provision already exported, pinned boot files without rebuilding RM or the
@@ -38,7 +42,18 @@ creates the ignored `BootFirmware/` package. It refuses a differing existing
 output. The ordinary module build verifies all three new resources together
 with the existing firmware package. No network or installer is used.
 
-OssiPC accepted this diagnostic on 2026-09-11: all three boot resources
+OssiPC accepted module 0.1.24 boot/init preparation on 2026-09-11: twelve
+GSP/boot/init mappings plus retained FWSEC, 36 GSP segments and
+1 queue segments, 0 bounced init mappings. Final synchronization and
+dependency-ordered cleanup succeeded; bootfb 800x600/generation 1/reset 0
+and all 14 services stayed available. Batches 15/16 and two reboots restored
+the exact original passive configuration. Full package roundtrip hashes,
+installed checks, inventory and unique runtime markers establish this proof;
+no independent installed-module hash or fresh visible-image/audio acceptance.
+The first package was rejected for an incorrect kernel requirement before
+staging; the temporary packaging substitution was fixed, module unchanged.
+
+Historical OssiPC acceptance of module 0.1.23 on 2026-09-11: all three boot resources
 matched, four image mappings contained 36 actual segments, and the
 contiguous boot pack needed no bounce. Final synchronization and complete
 cleanup succeeded. Bootfb remained 800x600 at generation 1/reset 0; all
@@ -61,10 +76,10 @@ the cached shutdown API. It does not own the other boot allocations supplied
 as exclusion spans. A future execution owner must prove actual quiescence
 before releasing any memory that has been submitted to the GPU.
 The existing host step passes 40 cases, including one new grouped case with
-17 storage scenarios and exact full-buffer bounce synchronization. This owner
-is not yet connected to module init; NVIDIA.R4D 0.1.23 and OssiPC stay unchanged.
+17 storage scenarios and exact full-buffer bounce synchronization. Module
+0.1.24 connects this owner to boot-check; normal passive mode does not stage it.
 
-The next host preparation, `gsp_init.zig`, encodes the pinned GA106 first-boot
+The separately qualified `gsp_init.zig` encoder prepares the pinned GA106 first-boot
 Libos and RM arguments, five 64-KB release log areas and two 256-KB message
 queues. The complete caller-owned image needs 844 KB. Its queue table includes
 its own page: 129 physical page addresses, then command/status queues. The
@@ -81,10 +96,12 @@ original DMEM-stack default. All padding and unused entries are cleared.
 
 The existing host ABI probe compares every byte with the original C types
 and executes the original `msgqInit`/`msgqTxCreate` on host memory. The existing
-owner step passes 39 cases; `inspect-gsp-layout` reports these requirements
-without inventing DMA addresses. This preparation does not change NVIDIA.R4D
-0.1.23, its packaged licenses or OssiPC. Runtime ownership, synchronization,
-queue linking, RPC/IRQ and hardware handoff remain open.
+owner step passes 40 cases; `inspect-gsp-layout` reports these requirements
+without inventing DMA addresses. Byte-sized exclusion admission adds four
+negative variants to the existing encoder case; all 844 KB still match the
+original-C comparison. Queue linking, receive synchronization, RPC/IRQ and
+hardware handoff remain open. Status headers stay zero and firmware-ready
+remains false; no live GSP producer or completion is inferred from staging.
 
 The preceding module 0.1.22 extended the existing `firmware-check` diagnostic mode with
 actual GSP image DMA staging. The admitted GA10X `.fwimage` is copied into

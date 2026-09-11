@@ -13,7 +13,7 @@ $owner=Split-Path -Parent $PSScriptRoot
 $lockPath=Join-Path $owner 'src/firmware-lock.json'
 $pin=Get-Content -Raw $lockPath|ConvertFrom-Json
 $sourcePin=Get-Content -Raw (Join-Path $PSScriptRoot 'Rm/Sources.json')|ConvertFrom-Json
-if($pin.schema -ne 1 -or $pin.source_commit -cne $sourcePin.source_commit -or $pin.boot.notices.Count -ne 6){throw 'Boot/source pin mismatch'}
+if($pin.schema -ne 1 -or $pin.source_commit -cne $sourcePin.source_commit -or $pin.boot.notices.Count -ne 12){throw 'Boot/source pin mismatch'}
 if([string]::IsNullOrWhiteSpace($OutputDirectory)){$OutputDirectory=Join-Path $owner 'BootFirmware'}
 foreach($path in @($SourceDirectory,$BootstrapDirectory,$ScratchDirectory,$OutputDirectory)){
     if(![IO.Path]::IsPathFullyQualified($path)){throw 'Provisioning paths must be absolute'}
@@ -43,7 +43,7 @@ try {
         Copy-Item -LiteralPath $original -Destination $target
         Test-NvidiaFirmwareArtifact $target $artifact
     }
-    $license="NVIDIA 570.144 GSP boot, WPR metadata and layout source notices`n`n"
+    $license="NVIDIA 570.144 GSP boot, WPR metadata, layout and initialization source notices`n`n"
     foreach($notice in $pin.boot.notices){
         if([IO.Path]::IsPathRooted($notice.path) -or $notice.path.Contains('../') -or $notice.path.Contains('\')){throw 'Invalid notice path'}
         $sourceFile=Get-Item -Force -LiteralPath (Join-Path $source $notice.path)
@@ -73,7 +73,7 @@ try {
         [IO.Directory]::CreateDirectory((Split-Path -Parent $output))|Out-Null
         [IO.Directory]::Move($stage,$output)
     }
-    Write-Host "NVIDIA boot package: production image/descriptor and all six complete notices verified at $output"
+    Write-Host "NVIDIA boot package: production image/descriptor and all twelve complete notices verified at $output"
 }finally{
     if(Test-Path -LiteralPath $stage){Remove-Item -LiteralPath $stage -Recurse -Force}
 }

@@ -25,14 +25,38 @@
     }
   ],
   "families": [
-    {"name": "ga10x", "artifact": 0},
-    {"name": "ad10x", "artifact": 0},
-    {"name": "gh100", "artifact": 0},
-    {"name": "gb10x", "artifact": 0},
-    {"name": "gb20x", "artifact": 0},
-    {"name": "tu10x", "artifact": 1},
-    {"name": "tu11x", "artifact": 1},
-    {"name": "ga100", "artifact": 1}
+    {
+      "name": "ga10x",
+      "artifact": 0
+    },
+    {
+      "name": "ad10x",
+      "artifact": 0
+    },
+    {
+      "name": "gh100",
+      "artifact": 0
+    },
+    {
+      "name": "gb10x",
+      "artifact": 0
+    },
+    {
+      "name": "gb20x",
+      "artifact": 0
+    },
+    {
+      "name": "tu10x",
+      "artifact": 1
+    },
+    {
+      "name": "tu11x",
+      "artifact": 1
+    },
+    {
+      "name": "ga100",
+      "artifact": 1
+    }
   ],
   "boot": {
     "source": {
@@ -55,8 +79,8 @@
     "license": {
       "file": "NVIDIA-570.144-GSP-BOOT-LICENSE.txt",
       "resource": "NVIDIA-570.144-GSP-BOOT-LICENSE.txt",
-      "bytes": 25885,
-      "sha256": "0e97ecfd623ea996e63a7a512f47b766305a0175fa653127da117b33efcc5c20"
+      "bytes": 33543,
+      "sha256": "034411c3bf35fa6c7df412070140d621affb15b0e4be2e286ff25c8fc1d69d25"
     },
     "notices": [
       {
@@ -88,6 +112,36 @@
         "path": "src/nvidia/inc/kernel/gpu/gsp/gsp_fw_heap.h",
         "bytes": 5556,
         "sha256": "f07842783c9c4dfaca7811c14dacb688282c25300162dc0f285550dcc71f99d0"
+      },
+      {
+        "path": "src/common/uproc/os/common/include/libos_init_args.h",
+        "bytes": 2263,
+        "sha256": "75174fb8b643fa28537acba0cf3d936f292e99a1590762ccd4936be093ae33a1"
+      },
+      {
+        "path": "src/nvidia/inc/kernel/gpu/gsp/gsp_init_args.h",
+        "bytes": 2037,
+        "sha256": "6d1117eaf4f4ca805715a95bd7edd46f1f87160b78b4e440936cae499d13631c"
+      },
+      {
+        "path": "src/nvidia/src/kernel/gpu/gsp/message_queue_cpu.c",
+        "bytes": 26090,
+        "sha256": "acefc9555e95cc5663f872c10fa796c9e8416e15ee292b78efd1e85d3a4a7816"
+      },
+      {
+        "path": "src/nvidia/inc/kernel/gpu/gsp/message_queue_priv.h",
+        "bytes": 5006,
+        "sha256": "cbb3aa6001524c75ba3f570dc0e92523f042a293aa6e3779ac00162c100a2980"
+      },
+      {
+        "path": "src/common/shared/msgq/msgq.c",
+        "bytes": 18028,
+        "sha256": "dfd7c7f13f5aad49279f4ac52bf1b0fd88be4c3f22a5d1e2c30feeeffae7bc75"
+      },
+      {
+        "path": "src/common/shared/msgq/inc/msgq/msgq_priv.h",
+        "bytes": 4119,
+        "sha256": "618c75304cb62800073a86b2ef10cc644e767844ca3fa81de94f24ec41808b34"
       }
     ]
   }

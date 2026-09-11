@@ -67,7 +67,8 @@ pub const Bindings = struct {
     logs: [log_count]Span,
     // Logical order, complete shared queue backing, possibly discontiguous.
     queues: []const Span,
-    // Other retained boot allocations. No address from an earlier closed probe.
+    // Other retained boot allocations, including byte-sized FWSEC mappings.
+    // No address from an earlier closed probe; these spans need no page layout.
     excluded: []const Span = &.{},
 };
 pub const Report = struct {
@@ -89,9 +90,12 @@ pub fn id8(name: []const u8) u64 {
     for (name) |c| result = (result << 8) | c;
     return result;
 }
-fn valid(span: Span) Error!void {
+fn validRange(span: Span) Error!void {
     if (span.address == 0 or span.bytes == 0 or span.address > radix.dma_mask or
         span.bytes - 1 > radix.dma_mask - span.address) return error.Address;
+}
+fn valid(span: Span) Error!void {
+    try validRange(span);
     if ((span.address | span.bytes) & (page_bytes - 1) != 0) return error.Alignment;
 }
 fn overlap(a: Span, b: Span) bool {
@@ -107,7 +111,7 @@ fn prepare(input: *const Bindings) Error!Prepared {
         try valid(span);
         for (fixed[0..index]) |previous| if (overlap(previous, span)) return error.Overlap;
     }
-    for (input.excluded) |span| try valid(span);
+    for (input.excluded) |span| try validRange(span);
     for (fixed) |span| for (input.excluded) |excluded| {
         if (overlap(span, excluded)) return error.Overlap;
     };

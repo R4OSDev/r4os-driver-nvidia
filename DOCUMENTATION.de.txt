@@ -9,63 +9,47 @@ Boardanschluesse. Die spaeteren PROM-Boots bestaetigen softwareseitig den
 unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
-Besitzer fuer GSP-Initialisierungsspeicher (Host)
-----------------------------------------------
-gsp_init_storage.zig besitzt den 844-KB-Initialisierungspuffer ueber die
-vorhandene R4D-Fassade: eine Heapallokation, ein zusammenhaengendes Mapping
-fuer beide Argumentseiten, fuenf fuer Logs und eines mit bis zu64 Segmenten
-fuer Queues. Argumente verwenden to-device; Logs/Queues bidirectional.
-Vor der ersten Abbildung wird alles genullt. Nach Kodierung werden alle
-sieben Abbildungen erneut synchronisiert, damit auch Bouncekopien die
-endgueltigen PTEs und Startdaten erhalten. Erst danach erscheint der Report.
+GSP-Initialisierung im Modul 0.1.24
+---------------------------------
+OPTION NVIDIA mode=boot-check bindet den vorhandenen 844-KB-Speicherbesitzer
+an den echten GA106-/FWSEC-Vorbereitungspfad an. Zusaetzlich zu vier GSP-
+Mappings und dem Bootpaket entstehen sieben Mappings: beide Argumentseiten
+zusammenhaengend to-device, fuenf 64-KB-Logs zusammenhaengend bidirectional,
+528384 Bytes Queuebereich mit bis zu 64 Segmenten ebenfalls bidirectional.
+Alle sieben werden nach Kodierung erneut synchronisiert. Die 129 Queue-PTEs
+enthalten die eigene Tabellenseite; 63 Ringslots, 62 nutzbar. Statusheader
+bleibt null, Queue noch nicht verbunden, Firmware nicht gestartet/bereit.
 
-Gemeinsame monotone Frist, exakte Deskriptorpruefung und geordneter Rueckbau:
-alle Mappings rueckwaerts, danach Pins rueckwaerts, zuletzt Heap. Fehlerhafte
-In-/Out-Freigaben verlieren keinen Besitzer; auch teilweise erfolgreiche
-Pin-/Map-Aufrufe bleiben fuer den naechsten Abschlussversuch erhalten.
-Die Heap-API bleibt fuer Shutdown gecacht. Fremde Bootbelegungen werden
-nur auf Ueberlappung geprueft, nicht von diesem Owner besessen/freigegeben.
+Saemtliche gehaltenen GSP-, Bootpaket- und FWSEC-Spannen sind ausgeschlossen.
+FWSEC belegt 59904 Bytes bei 256-Byte-Ausrichtung: Fuer solche fremden Spannen
+gilt die wirkliche Bytelaenge, fuer neue GSP-Seiten weiterhin 4-KB-Ausrichtung.
+Vollstaendige 49-Bit-Grenz-/Aliaspruefung vor Ausgabeaenderung; auch ein Byte
+Ueberlappung wird abgewiesen. Deadline und Teilfehler behalten exakte Besitzer.
+Cleanup schliesst zuerst die Initialisierung, dann Bootpaket/GSP und danach
+FWSEC. Bei Fehler bleibt die abhaengige Kette fuer Shutdown erhalten.
 
-40/40 Besitzerfaelle bestanden; ein neuer zusammengefasster Fall deckt17
-Szenarien ab: Teilallokation/-pin/-map, Deskriptor/Richtung, interne/externe
-Aliase, Adressgrenze, letzte Synchronisierung, Frist/Clock-Ruecklauf und
-Unmap-/Unpin-/Release-Retry. Der Bouncefall vergleicht den gesamten844KB-
-Geraetepuffer nach erneuter Synchronisierung. Originalencoder/C-ABI bleiben
-unveraendert; kein erneuter Dateipruefer/ABI-, Modul-, Gast- oder Hardwarelauf.
-Noch keine Modulanbindung, Empfangssynchronisierung, Queue-Aushandlung,
-RPC/IRQ oder GPU-Nutzung. Nach spaeterer Einreichung ist vor Freigabe echte
-Quieszenz durch den Ausfuehrungsbesitzer erforderlich.
+Der bestehende Besitzerlauf besteht 40/40 Faelle. Die 17 Speicherszenarien
+bleiben erhalten; der Encoderfall prueft jetzt 18 ungueltige Bindungen.
+Die bestehende Original-C-/msgq-Probe vergleicht alle 864256 Bytes erneut.
+Kein neues Gate, kein allgemeiner Gast- oder Langlauf. Die vollstaendige
+Lizenzressource umfasst jetzt 33543 Bytes: COPYING und elf volle MIT-Hinweise,
+identisch in R4D und Distribution. Bootabbild/Deskriptor bleiben bytegleich.
+Empfangssynchronisierung, Queue-Aushandlung, RPC/IRQ, VRAM-/VGA-Besitz und
+GPU-Ausfuehrung bleiben offen. Der regulaere Start verwendet weiter bootfb.
 
-GSP-Initialisierungsdaten (Host; NVIDIA 0.1.23 unveraendert)
----------------------------------------------------------
-gsp_init.zig kodiert fuer den gepinnten normalen GA106-Erststart Libos-
-Argumente, RM-Argumente, fuenf 64-KB-Logbereiche und zwei 256-KB-Queues.
-Der caller-eigene Gesamtpuffer ist 864256 Bytes (844 KB) gross. Libos
-belegt eine Seite mit sechs 32-Byte-Eintraegen, RM eine Seite mit seinem
-originalen 72-Byte-Typ. LOGINIT muss zuerst stehen; danach folgen LOGINTR,
-LOGRM, LOGMNOC, LOGKRNL und RMARGS. id8 ist ein numerisch aufgebauter Tag,
-keine ungepruefte ASCII-Kopie. Jeder Logbereich beginnt mit leerem Put-Zeiger
-und den 16 wirklichen physischen Seitenadressen.
+OssiPC bestaetigt zwoelf GSP-/Boot-/Init-Mappings plus gehaltenes FWSEC,
+36 GSP- und 1 Queue-Segmente sowie 0 gebouncte Init-Mappings.
+Libos ab 0x8e4f000, RM ab 0x8e50000, Queue-Tabelle ab
+0x8ea1000. Synchronisierung und vollstaendiger geordneter Cleanup
+bestanden; bootfb 800x600/Generation 1/Reset 0, alle 14 Dienste ohne Fehler.
+Nach Batch 15/16 und zwei Neustarts ist die vorherige 350-Byte-CONFIG
+bytegleich passiv. Paket-Roundtrip, installierte Nachpruefung, Katalog und
+Laufzeitmarker belegen den Stand; kein separater installierter Modulhash.
+Ein vorheriger Paketversuch wurde wegen falscher Kernelanforderung vor
+STAGE abgewiesen; temporaere Packskriptersetzung korrigiert, Treiber identisch.
+Der Hisense bleibt laut User aus und am Strom; keine neue Bild-/Tonabnahme.
 
-Die Queue-Abbildung umfasst 129 Seiten einschliesslich ihrer eigenen
-Seitentabelle. Beide Queues haben 63 Slots, davon 62 nutzbar. Nur der CPU-
-Commandheader wird initialisiert; Statusheader und Nutzdaten bleiben null.
-Das Swap-RX-Bit fordert die Aushandlung an, bestaetigt sie aber noch nicht.
-Alle Groessen, 49-Bit-Spannen, Ausrichtungen und Ueberlappungen werden vor
-der ersten Ausgabeaenderung geprueft. Fremde gehaltene Bootspannen koennen
-ausgeschlossen werden. Queue-Spannen duerfen verteilt sein, Logs/Argumente
-muessen zusammenhaengen. PM/Profiler/GPU-Instanz bleiben null; der originale
-Default verwendet den DMEM-Stack. Speicherbesitz/Synchronisierung fehlen noch.
-
-39/39 bestehende Besitzerfaelle bestanden, darunter ein neuer gemeinsamer
-Fall mit 14 ungueltigen Bindungen, kompletter Nullfuellung und aliassicherer
-Eingabeaufnahme. Die bestehende ABI-Probe vergleicht alle 844 KB mit den
-originalen C-Typen und fuehrt NVIDIAs msgqInit/msgqTxCreate nur am Host aus.
-inspect-gsp-layout besteht mit 3/3 Schritten und meldet die Anforderungen
-ohne erfundene DMA-Adressen. Kein neuer Testdatei-/Gate-/Gastlauf, Modulbau
-oder Hardwarekontakt. Der folgende OssiPC-Stand bleibt unveraendert.
-
-Bootressourcen und gemeinsamer Speicher im Modul 0.1.23
+Historische Bootressourcen und Speicherpruefung im Modul 0.1.23
 ------------------------------------------------------
 OPTION NVIDIA mode=boot-check fuehrt nach der aktuellen GA106-/FWSEC-
 Vorpruefung die gesamte Speichervorbereitung aus. Bootabbild (24576 Bytes),

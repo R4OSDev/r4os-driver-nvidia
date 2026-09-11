@@ -29,7 +29,7 @@ pub const Lock = struct {
         image: Artifact,
         descriptor: Artifact,
         license: Artifact,
-        notices: [6]Source,
+        notices: [12]Source,
     },
 };
 pub const Source = struct { path: []const u8, bytes: usize, sha256: []const u8 };

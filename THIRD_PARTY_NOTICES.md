@@ -14,7 +14,7 @@ their original licenses in the separate workspace reference archive.
 Fixture firmware bodies and signatures are synthetic; selected measured table
 metadata is regression data documented in PROVENANCE.txt.
 
-The subsequent host-only `gsp_init.zig` adapts first-boot field assignment
+Module 0.1.24 links `gsp_init.zig`, which adapts first-boot field assignment
 from the same pinned NVIDIA Libos/RM initialization and message-queue sources.
 It retains the complete NVIDIA MIT notice and copyright lines for
 libos_init_args.h (2018-2022), gsp_init_args.h (2020-2024), kernel_gsp.c and
@@ -23,17 +23,18 @@ msgq.c/msgq_priv.h (2018-2019). Original R4OS validation is Apache-2.0.
 The existing optional ABI verifier now compiles the original msgq implementation
 against its unchanged headers and compares the complete initialized image.
 All full original sources/notices accompany the separate gsp-init-20260911
-archive. This host preparation adds no code, firmware or license resource
-to NVIDIA.R4D 0.1.23; it does not change Distribution's packaged notices.
+archive. The current 33,543-byte boot notice bundle adds the complete notices
+from all six newly linked source inputs to the prior bundle. It is identical
+in NVIDIA.R4D and Distribution; original msgq C remains a host verifier only.
 
 Module 0.1.23 links the MIT-attributed layout and WPR metadata code described
 below. It adds the byte-identical 24-KB production GA102 boot image and its
 84-byte descriptor exported from the pinned original generated source
 `g_bindata_kgspGetBinArchiveGspRmBoot_GA102.c` (copyright 2016-2022 NVIDIA
 CORPORATION). `src/firmware-lock.json` pins these files and their exact source.
-The new `NVIDIA-570.144-GSP-BOOT-LICENSE.txt` resource contains full unchanged
-COPYING plus the complete MIT notice from that source and each of the four
-layout/metadata sources named below. The identical 25,885-byte file is in
+The `NVIDIA-570.144-GSP-BOOT-LICENSE.txt` resource contains full unchanged
+COPYING plus complete MIT notices from the boot, layout/metadata and init
+sources. Module 0.1.24 pins twelve inputs. The identical 33,543-byte file is in
 Distribution's R4OS/LICENSES and adjacent Legal output. Original R4OS resource
 and DMA ownership code remains Apache-2.0; the original decoder is not linked.
 The ignored `BootFirmware/` package is prepared only from verified exported

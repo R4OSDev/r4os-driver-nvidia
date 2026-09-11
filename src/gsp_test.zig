@@ -21,7 +21,8 @@ test "GSP initialization encodes self-mapped queues and ordered Libos logs witho
         .rm = .{ .address = 0x900001000, .bytes = 4096 },
         .logs = undefined,
         .queues = &queues,
-        .excluded = &.{.{ .address = 0xd00000000, .bytes = 65536 }},
+        // FWSEC uses a 256-byte-aligned, 59904-byte DMA span, not full pages.
+        .excluded = &.{.{ .address = 0xd00000100, .bytes = 59904 }},
     };
     for (&good.logs, 0..) |*span, i| span.* = .{ .address = 0x910000000 + i * 0x20000, .bytes = 65536 };
     const report = try init.encode(&good, output);
@@ -61,7 +62,7 @@ test "GSP initialization encodes self-mapped queues and ordered Libos logs witho
     // Includes the status header: no fabricated firmware-side queue/ready state.
     try t.expect(std.mem.allEqual(u8, queue[4096 + 32 ..], 0));
     @memset(output, 0xa5);
-    for (0..14) |case| {
+    for (0..18) |case| {
         var input = good;
         var spans = queues;
         input.queues = &spans;
@@ -118,9 +119,25 @@ test "GSP initialization encodes self-mapped queues and ordered Libos logs witho
                 spans[2].bytes += 4096;
                 break :blk error.Size;
             },
-            else => blk: {
+            13 => blk: {
                 spans[0].bytes -= 1;
                 break :blk error.Alignment;
+            },
+            14 => blk: {
+                input.excluded = &.{.{ .address = spans[2].address + spans[2].bytes - 1, .bytes = 59904 }};
+                break :blk error.Overlap;
+            },
+            15 => blk: {
+                input.excluded = &.{.{ .address = input.libos.address - 59903, .bytes = 59904 }};
+                break :blk error.Overlap;
+            },
+            16 => blk: {
+                input.excluded = &.{.{ .address = radix.dma_mask, .bytes = 2 }};
+                break :blk error.Address;
+            },
+            else => blk: {
+                input.excluded = &.{.{ .address = 1, .bytes = 0 }};
+                break :blk error.Address;
             },
         };
         try t.expectError(failure, init.encode(&input, output));
