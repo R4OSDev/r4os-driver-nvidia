@@ -10,6 +10,34 @@ unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
 
+RM-Monitorabfragen (Quellvorbereitung fuer 0.79.12, 11.09.2026)
+-----------------------------------------------------------
+gsp_display_rpc bildet die drei festen NV0073-Abfragen fuer unterstuetzte
+Displays, Verbindungsstatus und EDID ueber genau eine offene GSP-Anfrage ab.
+Nach bearbeitetem/bestaetigtem INIT_DONE geht die Queue an den Runtime-
+Besitzer; dieser kann echte RM-Objekte anlegen, bevor der Monitorpfad sie
+einmalig uebernimmt. Nur im bestaetigten Leerlauf geht der Besitz fuer den
+Objektabbau zurueck. Die API erzeugt oder beweist die RM-Handles nicht.
+
+Antworten pruefen Objekt, Befehl, Umfang und Flags; RPC- und RM-Fehler sind
+getrennt. Zwischenmeldungen brauchen ihren echten Handler vor Bestaetigung.
+Volle Queue und Lockdown verlaengern keine Deadline. Topologieaenderungen
+verwerfen ungesendete Folgeabfragen beziehungsweise veralten laufende und
+bereits zurueckgegebene Ergebnisse. EDID verlangt eine zuvor positive
+RM-Verbindungskennung. Maximal2048 geliehene Rohbytes sind noch keine
+vollstaendige/gueltige EDID oder generisch publizierte Monitorfaehigkeit.
+
+51 bestehende Besitzerfaelle bestanden; nach ebenfalls erfolgreichem Erstlauf
+wurde die Runtime-Besitzuebergabe ueberarbeitet und gezielt erneut geprueft.
+Ein Modulbuild bestaetigt das gesamte bisherige NVIDIA0.1.44-Artefakt als
+bytegleich. Neuer Control-Code bisher nur im Hosttest eingebunden; keine
+Versions-, Distributions- oder ABI-Aenderung. Kein neuer Fall/Gate, Inspektor,
+Gast oder Hardwarelauf.11 volle gepinnte Originale und vier vollstaendige
+MIT-Quellhinweise unter ExFiles/Reference/GFX/Nvidia/0.79.12/rm-control-20260911.
+Beleg: rm_display_control_checkpoint in GrafikFirmware07910.json. OssiPC
+offline/unberuehrt; native RM-Objekte, Queue/Interrupt, Handler, vollstaendige
+Empfaengererfassung und HDMI-Audio bleiben offen.
+
 Interne GPIO-Zuordnung (NVIDIA 0.1.44; Vorbereitung 0.79.12)
 ---------------------------------------------------------
 Der vorhandene VBIOS-Leser kopiert optionale GPIO-4.0/4.1-Tabellen mit bis

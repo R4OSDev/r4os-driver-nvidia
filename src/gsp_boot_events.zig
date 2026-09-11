@@ -136,9 +136,14 @@ pub fn decode(record: message.Record) Error!Event {
     }
 }
 
-pub const State = enum { waiting, dispatching, init_done, failed };
+pub const State = enum { waiting, dispatching, init_done, handed_off, failed };
 pub const Dispatch = struct { ticket: transport.Ticket, rpc: message.Rpc, event: Event };
 pub const Failure = struct { reason: Error, rpc: ?message.Rpc, ticket: ?transport.Ticket };
+/// Sole post-boot queue owner. The RM object allocator can drive this session
+/// and handle notifications (updating lockdown) before the next owner claims
+/// it. Do not copy this token or drive its session after claimed becomes true.
+/// Neither the handoff nor a claim creates RM objects or frees device backing.
+pub const Handoff = struct { session: *transport.Session, in_lockdown: bool, claimed: bool = false };
 pub const Boot = struct {
     session: *transport.Session,
     deadline: u64,
@@ -166,8 +171,19 @@ pub const Boot = struct {
         return reason;
     }
     fn guard(self: *Boot) Error!void {
-        if (self.state == .failed or self.state == .init_done) return error.State;
+        if (self.state == .failed or self.state == .init_done or self.state == .handed_off) return error.State;
         self.session.guard(self.deadline) catch |err| return self.fail(err);
+    }
+
+    /// Transfer the sole queue owner after INIT_DONE was handled and ACKed.
+    /// The new owner inherits lockdown and must retain all device backing.
+    /// This grants no RM handles, hardware readiness or quiescence proof.
+    pub fn handoff(self: *Boot, deadline: u64) Error!Handoff {
+        if (self.state != .init_done or self.pending != null or
+            self.session.state != .active or self.session.pending != null) return error.State;
+        self.session.guard(deadline) catch |err| return self.fail(err);
+        self.state = .handed_off;
+        return .{ .session = self.session, .in_lockdown = self.in_lockdown };
     }
 
     /// At most one record per call, no busy loop or implicit event handling.

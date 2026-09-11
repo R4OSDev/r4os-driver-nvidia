@@ -10,6 +10,32 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
+RM display queries (source preparation for roadmap 0.79.12, 2026-09-11):
+
+gsp_display_rpc now encodes the three fixed NV0073 supported/connected/EDID
+queries and owns one outstanding control on a retained GSP Session. Boot
+hands queue ownership to the runtime after acknowledged INIT_DONE; real RM
+object allocation may precede the display channel's single-use claim. An
+idle, acknowledged channel can return ownership for actual object cleanup.
+The API neither creates nor proves the supplied live RM handles.
+
+Responses validate object/command/size/flags and distinguish RPC from RM
+errors. Notifications require their real handler before ACK. Backpressure
+and lockdown preserve the deadline. Topology changes cancel unsent dependent
+queries or retire in-flight/deferred results. EDID requires a preceding
+positive RM connection bit and remains at most2048 raw borrowed bytes;
+complete EDID/checksum/CTA and connector-generation publication still follow.
+
+51 existing owner cases pass. The initial run passed; review of the runtime
+handoff prompted one targeted rerun, also successful. One canonical module
+build proves the entire NVIDIA0.1.44 artifact unchanged. New control code is
+host-linked preparation only; no version bump, Distribution or ABI change.
+No new case/gate, inspector, guest or physical run. Eleven full pinned
+originals and four complete MIT source notices accompany rm-control-20260911
+under ExFiles/Reference/GFX/Nvidia/0.79.12. See rm_display_control_checkpoint
+in Docs/Drivers/GrafikFirmware07910.json. OssiPC remains offline/untouched;
+native RM objects, queue/doorbell, handlers, receiver and audio remain open.
+
 Internal GPIO wiring (NVIDIA 0.1.44, roadmap 0.79.12 preparation):
 
 The existing VBIOS reader now snapshots optional GPIO 4.0/4.1 assignment

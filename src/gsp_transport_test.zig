@@ -2,6 +2,7 @@ const std = @import("std");
 const t = std.testing;
 const transport = @import("gsp_transport.zig");
 const boot_events = @import("gsp_boot_events.zig");
+const display_rpc = @import("gsp_display_rpc.zig");
 const sequencer = @import("gsp_sequencer.zig");
 const message = transport.message;
 const ring = transport.ring;
@@ -536,9 +537,278 @@ test "GSP boot events require explicit handling, valid original payloads and an 
     try t.expectEqual(before, model.count);
 }
 
+const display_object = display_rpc.Object{ .epoch = 7, .client = 0xc100, .display = 0xd073 };
+fn startDisplay(model: *Model, session: *transport.Session) !display_rpc.Channel {
+    var boot = try startBoot(model, session);
+    try t.expectError(error.State, boot.handoff(deadline));
+    try model.replyRpc(session, .{ .function = 0x1001, .result = 0 }, &.{ 0, 0, 0, 0 });
+    const event = (try boot.poll()).?;
+    try t.expectError(error.State, boot.handoff(deadline));
+    try boot.complete(event.ticket);
+    var runtime = try boot.handoff(deadline);
+    var wrong = display_object;
+    wrong.epoch += 1;
+    try t.expectError(error.Handle, display_rpc.Channel.init(&runtime, wrong, deadline));
+    try t.expect(!runtime.claimed);
+    const channel = try display_rpc.Channel.init(&runtime, display_object, deadline);
+    try t.expectEqual(boot_events.State.handed_off, boot.state);
+    try t.expect(runtime.claimed);
+    try t.expectError(error.State, display_rpc.Channel.init(&runtime, display_object, deadline));
+    try t.expectError(error.State, boot.handoff(deadline));
+    try t.expectError(error.State, boot.poll());
+    model.count = 0;
+    return channel;
+}
+fn displayReply(model: *Model, channel: *display_rpc.Channel, status: u32, value: u32) !void {
+    var bytes: [display_rpc.max_request_bytes]u8 = undefined;
+    const encoded = try display_rpc.encode(display_object, channel.request.?, &bytes);
+    put(&bytes, 12, status);
+    switch (channel.request.?) {
+        .supported => {
+            put(&bytes, 28, value);
+            put(&bytes, 32, value);
+        },
+        .connected => put(&bytes, 32, value),
+        .edid => {
+            put(&bytes, 32, value);
+            if (value <= 2048) for (bytes[40..][0..value], 0..) |*byte, i| {
+                byte.* = @truncate(i);
+            };
+        },
+    }
+    // The RPC sequence and private result deliberately do not echo the request.
+    try model.replyRpc(channel.session, .{ .function = 76, .result = 0, .result_private = 0x19283746, .sequence = 0xdeadbeef }, encoded);
+}
+fn readyDisplay(model: *Model, session: *transport.Session) !display_rpc.Channel {
+    var channel = try startDisplay(model, session);
+    try channel.begin(.supported, deadline);
+    try t.expect((try channel.poll(deadline)) == null);
+    try displayReply(model, &channel, 0, 0x80000005);
+    try channel.complete((try channel.poll(deadline)).?.ticket);
+    try channel.begin(.{ .connected = 0x80000005 }, deadline);
+    try t.expect((try channel.poll(deadline)) == null);
+    try displayReply(model, &channel, 0, 0x80000001);
+    try channel.complete((try channel.poll(deadline)).?.ticket);
+    return channel;
+}
+fn checkDisplayRpc(model: *Model) !void {
+    // Original-header byte offsets, sizes and command IDs are independent
+    // of the encoder, and travel through the real framing/queue model below.
+    var payload: [2089]u8 = undefined;
+    const queries = [_]display_rpc.Query{ .supported, .{ .connected = 0x80000005 }, .{ .edid = 0x80000000 } };
+    const sizes = [_]usize{ 36, 40, 2088 };
+    const commands = [_]u32{ 0x730107, 0x730108, 0x730245 };
+    for (queries, sizes, commands) |query, size, command| {
+        @memset(&payload, 0xa5);
+        const bytes = try display_rpc.encode(display_object, query, &payload);
+        try t.expectEqual(size, bytes.len);
+        try t.expectEqual(@as(u8, 0xa5), payload[size]);
+        for ([_]u32{ 0xc100, 0xd073, command, 0, @intCast(size - 24), 0, 0 }, 0..) |value, i|
+            try t.expectEqual(value, get(bytes, i * 4));
+        if (query == .connected) try t.expectEqual(@as(u32, 0x80000005), get(bytes, 32));
+        if (query == .edid) {
+            try t.expectEqual(@as(u32, 0x80000000), get(bytes, 28));
+            try t.expectEqual(@as(u32, 0), get(bytes, 32));
+            try t.expectEqual(@as(u32, 2), get(bytes, 36));
+            for (bytes[40..]) |byte| try t.expectEqual(@as(u8, 0), byte);
+        }
+        try t.expectError(error.Bounds, display_rpc.encode(display_object, query, payload[0 .. size - 1]));
+        _ = try display_rpc.encode(display_object, query, &payload);
+        const shape = try message.encode(profile, 0, .{ .function = 76, .result = 0 }, bytes, &model.frame);
+        try t.expectEqual(@as(u32, 1), shape.elements);
+        var record = try message.decode(profile, model.frame[0..shape.storage_bytes], 0);
+        for (0..size) |length| {
+            record.payload = bytes[0..length];
+            try t.expectError(error.Payload, display_rpc.decode(display_object, query, record));
+        }
+        record.payload = &payload;
+        try t.expectError(error.Payload, display_rpc.decode(display_object, query, record));
+        for ([_]usize{ 0, 4, 8, 16, 20, 24 }) |offset| {
+            _ = try display_rpc.encode(display_object, query, &payload);
+            put(&payload, offset, get(&payload, offset) ^ 1);
+            record.payload = payload[0..size];
+            const err = if (offset == 16 or offset == 20) error.Payload else error.Unexpected;
+            try t.expectError(err, display_rpc.decode(display_object, query, record));
+        }
+    }
+    for ([_]u32{ 0, 3, 0xffffffff }) |id|
+        try t.expectError(error.Query, display_rpc.encode(display_object, .{ .edid = id }, &payload));
+
+    var session: transport.Session = undefined;
+    var channel = try startDisplay(model, &session);
+    try t.expectError(error.Query, channel.begin(.{ .connected = 1 }, deadline));
+    try t.expectError(error.Query, channel.begin(.{ .edid = 1 }, deadline));
+    try t.expectEqual(@as(usize, 0), model.count);
+    try channel.begin(.supported, deadline);
+    try t.expectError(error.State, channel.begin(.supported, deadline + 1));
+    try t.expectError(error.State, channel.handoff(deadline));
+    try t.expect((try channel.poll(deadline)) == null);
+    const sent = try message.decode(profile, model.peer[0][4096..8192], 0);
+    try t.expectEqual(@as(u32, 76), sent.rpc.function);
+    try t.expectEqual(@as(usize, 36), sent.payload.len);
+    // A print message cannot be mistaken for a response, including when its
+    // raw RPC result is PENDING; the actual log handler still owns its ACK.
+    try model.replyRpc(&session, .{ .function = 0x100c }, &.{ 0, 0, 0, 0, 1, 0, 0, 0, 'x' });
+    var event = (try channel.poll(deadline)).?;
+    try t.expect(event.value == .notification);
+    try t.expectEqual(@as(u64, 1), channel.revision);
+    const before = model.count;
+    try t.expectError(error.Pending, channel.poll(deadline + 100));
+    var wrong = event.ticket;
+    wrong.serial += 1;
+    try t.expectError(error.Stale, channel.complete(wrong));
+    try t.expectEqual(before, model.count);
+    try channel.complete(event.ticket);
+    try t.expectEqual(display_rpc.Phase.waiting, channel.phase);
+    try displayReply(model, &channel, 0, 0x80000005);
+    event = (try channel.poll(deadline)).?;
+    try t.expect(channel.supported == null);
+    try channel.complete(event.ticket);
+    try t.expectEqual(@as(u32, 0x80000005), channel.supported.?.displays);
+    try t.expectError(error.Query, channel.begin(.{ .connected = 2 }, deadline));
+    try channel.begin(.{ .connected = 0x80000005 }, deadline);
+    try t.expect((try channel.poll(deadline)) == null);
+    try displayReply(model, &channel, 0, 0x80000001);
+    try channel.complete((try channel.poll(deadline)).?.ticket);
+    try t.expectError(error.Query, channel.begin(.{ .edid = 4 }, deadline));
+    try channel.begin(.{ .edid = 0x80000000 }, deadline);
+    try t.expect((try channel.poll(deadline)) == null);
+    try displayReply(model, &channel, 0, 2048);
+    event = (try channel.poll(deadline)).?;
+    try t.expectEqual(@as(usize, 2048), event.value.reply.edid.len);
+    try t.expectEqual(@as(u8, 255), event.value.reply.edid[2047]);
+    try channel.invalidate(); // Deferred consumers must re-borrow before use.
+    try t.expect((try channel.borrow(event.ticket)).value.reply == .obsolete);
+    try channel.complete(event.ticket);
+    try t.expectEqual(@as(u32, 0), channel.connected);
+
+    channel = try readyDisplay(model, &session);
+    try channel.begin(.{ .edid = 1 }, deadline);
+    const sent_before = session.tx_sequence;
+    try model.replyRpc(&session, .{ .function = 0x1003 }, "hotplug requires handler");
+    event = (try channel.poll(deadline)).?;
+    try channel.complete(event.ticket);
+    try t.expectError(error.Obsolete, channel.poll(deadline));
+    try t.expectEqual(sent_before, session.tx_sequence); // Never sent after invalidation.
+    try channel.begin(.{ .connected = 1 }, deadline);
+    try t.expect((try channel.poll(deadline)) == null);
+    try model.replyRpc(&session, .{ .function = 0x1003 }, "second hotplug");
+    try channel.complete((try channel.poll(deadline)).?.ticket);
+    try displayReply(model, &channel, 0, 1);
+    event = (try channel.poll(deadline)).?;
+    try t.expect(event.value.reply == .obsolete);
+    try channel.complete(event.ticket);
+    try t.expectEqual(@as(u32, 0), channel.connected);
+
+    channel = try readyDisplay(model, &session);
+    try channel.begin(.{ .connected = 1 }, deadline);
+    try t.expect((try channel.poll(deadline)) == null);
+    try displayReply(model, &channel, 66, 0xffffffff);
+    event = (try channel.poll(deadline)).?;
+    try t.expectEqual(@as(u32, 66), event.value.reply.control_error);
+    try channel.complete(event.ticket);
+    try t.expectError(error.Query, channel.begin(.{ .edid = 1 }, deadline));
+    try channel.begin(.supported, deadline);
+    try t.expect((try channel.poll(deadline)) == null);
+    try model.replyRpc(&session, .{ .function = 76, .result = 0x55 }, "");
+    event = (try channel.poll(deadline)).?;
+    try t.expectEqual(@as(u32, 0x55), event.value.reply.rpc_error);
+    try channel.complete(event.ticket);
+    try t.expectEqual(display_rpc.Phase.idle, channel.phase);
+    // The runtime can perform other RPCs between owners (e.g. object alloc/
+    // free). Here only the wire transaction is a fixture, not an RM allocation.
+    var runtime = try channel.handoff(deadline);
+    try t.expectError(error.State, channel.handoff(deadline));
+    try t.expectError(error.State, channel.poll(deadline));
+    const previous_sequence = session.tx_sequence;
+    try runtime.session.send(deadline, .{ .function = 103, .sequence = previous_sequence }, "allocator fixture");
+    try model.replyRpc(&session, .{ .function = 103, .result = 0 }, "allocator result");
+    try runtime.session.acknowledge(deadline, (try runtime.session.receive(deadline)).?.ticket);
+    runtime.in_lockdown = true; // The preceding owner handled a lockdown notice.
+    channel = try display_rpc.Channel.init(&runtime, display_object, deadline);
+    try t.expect(channel.in_lockdown);
+    try channel.begin(.supported, deadline);
+    try model.replyRpc(&session, .{ .function = 0x101c }, &.{0});
+    try channel.complete((try channel.poll(deadline)).?.ticket);
+    const cursor = session.tx_write;
+    try t.expect((try channel.poll(deadline)) == null);
+    const carried = try message.decode(profile, model.peer[0][4096 + @as(usize, cursor) * 4096 ..][0..4096], previous_sequence + 1);
+    try t.expectEqual(previous_sequence + 1, carried.rpc.sequence);
+
+    channel = try readyDisplay(model, &session);
+    try channel.begin(.{ .edid = 1 }, deadline);
+    try t.expect((try channel.poll(deadline)) == null);
+    try displayReply(model, &channel, 0, 2049);
+    try t.expectError(error.Payload, channel.poll(deadline));
+    try t.expect(session.pending != null);
+
+    for ([_]bool{ false, true }) |after| {
+        channel = try startDisplay(model, &session);
+        try channel.begin(.supported, deadline);
+        try t.expect((try channel.poll(deadline)) == null);
+        try displayReply(model, &channel, 0, 1);
+        event = (try channel.poll(deadline)).?;
+        model.fault = model.count + 1;
+        model.after = after;
+        try t.expectError(error.Io, channel.complete(event.ticket));
+        try t.expectEqual(display_rpc.Phase.failed, channel.phase);
+        try t.expect(channel.supported == null and session.pending != null and channel.pending != null);
+        const count = model.count;
+        try t.expectError(error.State, channel.complete(event.ticket));
+        try t.expectEqual(count, model.count);
+    }
+    channel = try startDisplay(model, &session);
+    try channel.begin(.supported, deadline);
+    // A full command queue is legitimate backpressure, with no deadline reset.
+    session.tx_write = 62;
+    put(&model.peer[0], 16, 62);
+    try t.expect((try channel.poll(deadline + 100)) == null);
+    try t.expectEqual(display_rpc.Phase.prepared, channel.phase);
+    model.now = deadline;
+    try t.expectError(error.Deadline, channel.poll(deadline + 100));
+    try t.expectEqual(@as(u32, 0), session.tx_sequence);
+
+    channel = try startDisplay(model, &session);
+    try model.replyRpc(&session, .{ .function = 0x101c }, &.{1});
+    event = (try channel.poll(deadline)).?;
+    try t.expect(channel.in_lockdown);
+    try channel.complete(event.ticket);
+    try channel.begin(.supported, deadline);
+    try t.expect((try channel.poll(deadline)) == null);
+    try t.expectEqual(@as(u32, 0), session.tx_sequence);
+    try model.replyRpc(&session, .{ .function = 0x101c }, &.{0});
+    event = (try channel.poll(deadline)).?;
+    try t.expect(channel.in_lockdown);
+    try channel.complete(event.ticket);
+    try t.expect(!channel.in_lockdown);
+    try t.expect((try channel.poll(deadline)) == null);
+    try t.expectEqual(@as(u32, 1), session.tx_sequence);
+
+    for ([_]message.Rpc{
+        .{ .function = 71, .result = 0 },
+        .{ .function = 76, .result = 0, .cpu_rm_gfid = 1 },
+        .{ .function = 76 },
+        .{ .function = 76, .result = 0 },
+    }, [_]anyerror{ error.Unexpected, error.Guest, error.Payload, error.Payload }) |rpc, err| {
+        channel = try startDisplay(model, &session);
+        try channel.begin(.supported, deadline);
+        try t.expect((try channel.poll(deadline)) == null);
+        try model.replyRpc(&session, rpc, "");
+        try t.expectError(err, channel.poll(deadline));
+        try t.expectEqual(display_rpc.Phase.failed, channel.phase);
+        try t.expect(session.pending != null and channel.failure.?.ticket != null);
+    }
+    channel = try startDisplay(model, &session);
+    try model.replyRpc(&session, .{ .function = 0x1003 }, "unimplemented event");
+    event = (try channel.poll(deadline)).?;
+    try t.expectError(error.Handler, channel.reject(event.ticket));
+    try t.expect(session.pending != null);
+}
+
 test "GSP transport orders range publication, explicit acknowledgement and terminal ambiguous failures" {
     const model = try t.allocator.create(Model);
     defer t.allocator.destroy(model);
+    try checkDisplayRpc(model);
     for (0..4) |flags| {
         var session = try model.start(@intCast(flags));
         // Device-only neighbour changes must survive CPU command publication.

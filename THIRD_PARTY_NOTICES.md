@@ -1,5 +1,15 @@
 ﻿# Third-Party Notices
 
+RM display-control source preparation (0.79.12, 2026-09-11):
+gsp_display_rpc.zig preserves four complete original MIT source notices:
+NVIDIA generated RPC structures(2008-2025), ctrl0073system(2005-2024),
+ctrl0073specific(1993-2025), and Nouveau r535/rpc.c(2023 Red Hat).
+Original R4OS bounded ownership/deadline/invalidation policy is Apache-2.0.
+Eleven full hash-pinned originals accompany rm-control-20260911. The new
+control code is host-linked preparation only; the entire production R4D
+and all packaged notices remain byte-identical to NVIDIA0.1.44.
+
+
 Internal GPIO metadata (NVIDIA 0.1.44, roadmap 0.79.12):
 The decoder preserves complete original MIT notices from Nouveau bios/gpio.c
 (2012 Red Hat) and gpio/base.c (2011 Red Hat), both Ben Skeggs. They also
