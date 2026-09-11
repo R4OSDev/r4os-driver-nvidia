@@ -27,7 +27,7 @@ Original-C/SB/FRTS/WPR/Init/Nachrichtenpruefungen ebenfalls bestanden.
 179 vollstaendige Originaldateien im Archiv gsp-ring-20260911; kein neues Gate,
 Gastlauf, Modulbau oder Hardwarekontakt. NVIDIA0.1.24 bleibt bytegleich.
 
-Live-Voraussetzung: Die bestehende DMA-API synchronisiert ganze Mappings.
+Historischer Stand DriverApi33: Die DMA-API synchronisiert ganze Mappings.
 Bei bidirektionalem Bounce kopiert sie die volle requested_bytes-Laenge;
 das kann laufende Firmware-Aenderungen ueberschreiben. Vor Live-Einbindung
 direkte kohaerente Mappings mit geordnetem Daten-/Cursor-Handshake verlangen
@@ -1158,3 +1158,9 @@ Nachweise: native_logging_checkpoint und
 ExFiles/Reference/GFX/Nvidia/0.79.10/native-logging. Release bleibt 0.79.9;
 0.79.10, der volle native RM-/NVKMS-Link, FWSEC/GSP/RPC, Thermik, native
 Anzeige, HDMI und ihre Hardwareabnahmen bleiben offen.
+
+Kernel0.1.148 / DriverApi34 stellt nun optionale Bereichssynchronisierung
+fuer vorhandene DMA-Mappings bereit, am Kernel-Besitzer und im normalen
+EXAMPLE-Fixture qualifiziert. Der GSP-Laufzeitbesitzer muss weiterhin Payload
+und Cursor geordnet publizieren, jeweils exklusive Bytes synchronisieren
+und vor Unmap Ruhe nachweisen. NVIDIA0.1.24 bindet Codec/Ring noch nicht live.

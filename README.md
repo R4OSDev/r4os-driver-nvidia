@@ -22,7 +22,7 @@ Neither operation publishes a cursor, sequence, acknowledgement or live link.
 The existing owner step now passes 42 cases. Eight fixtures match actual
 original msgq linking, slot lookup, submit and consume operations, including
 all four swap-flag combinations, RX offsets 32/64 and wraparound. This is host
-validation only. The current DMA API synchronizes entire mappings: live shared
+validation only. At the ring checkpoint, DriverApi33 synchronized entire mappings: live shared
 queues cannot use its bidirectional whole-buffer bounce copy. Before live
 integration, require direct coherent mappings with ordered publication or
 a proven range-sync contract. Pre-submission staging remains valid. No module,
@@ -754,3 +754,9 @@ original-source build checks 58 C conversions/statuses and 13 noreturn faults
 against the exact freestanding adapter objects on Linux. Partial links now
 include eight adapter objects; their private runtime providers intentionally
 remain unresolved. Full RM/NVKMS/GSP, native display and HDMI remain open.
+
+Kernel0.1.148 / DriverApi34 now provides optional byte-range synchronization
+for existing DMA mappings, qualified by its kernel owner and the ordinary
+EXAMPLE fixture. The GSP runtime must still order payload/cursor publication,
+limit each transfer to exclusively owned bytes and prove quiescence before
+unmap. NVIDIA0.1.24 does not yet bind the message/ring layers to live DMA.
