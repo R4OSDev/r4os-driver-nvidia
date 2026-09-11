@@ -440,6 +440,26 @@ fn inspectFwsecState(ctx: *const r4os.r4dev.DriverContext, snapshot: *const iden
     return true;
 }
 
+fn logBootScanout(raw: *const @import("boot_scanout.zig").Raw) void {
+    const scanout = @import("boot_scanout.zig");
+    const routed = scanout.routedHeads(raw);
+    log("NVIDIA boot-scanout: heads={x:0>2} sors={x:0>2} routed-heads={x:0>2} source=armed-mirror repeated=matched visible=unverified", .{ raw.headMask(), raw.sorMask(), routed });
+    for (0..scanout.max_sors) |sor| if (raw.sorMask() & (@as(u8, 1) << @intCast(sor)) != 0) {
+        log("NVIDIA boot-sor: id={d} heads={x:0>2} protocol={s} control={x:0>8}", .{ sor, raw.sors[sor] & 0xff, @tagName(scanout.protocol(raw.sors[sor])), raw.sors[sor] });
+    };
+    for (0..scanout.max_heads) |head| if (routed & (@as(u8, 1) << @intCast(head)) != 0) {
+        const timing = scanout.timing(&raw.heads[head]) catch |err| {
+            log("NVIDIA boot-head: id={d} timing=unknown reason={s} raw-state=retained", .{ head, @errorName(err) });
+            continue;
+        };
+        log("NVIDIA boot-head: id={d} active={d}x{d} total={d}x{d} viewport-in={d}x{d} viewport-out={d}x{d} pixel-hz={d}/{d} raster-microhz={d} depth-code={d} hdmi={}", .{
+            head, timing.active.x, timing.active.y, timing.total.x, timing.total.y,
+            timing.viewport_in.x, timing.viewport_in.y, timing.viewport_out.x, timing.viewport_out.y,
+            timing.pixel_clock_numerator, timing.pixel_clock_denominator, timing.raster_micro_hz, timing.depth_code, timing.hdmi_enabled,
+        });
+    };
+}
+
 fn checkBoot(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, chip: identity.Chip, raw: fwsec_state.Raw, source: FwsecSource) bool {
     const vram_copy = boot_vram.capture(ctx, snapshot, chip) catch |err| {
         log("NVIDIA boot-vram: rejected reason={s} status={d} window-writes={d} firmware-execution=disabled", .{
@@ -449,6 +469,7 @@ fn checkBoot(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Sna
         return false;
     };
     const display_copy = vram_copy.boot;
+    logBootScanout(&boot_vram.scanout_original.?);
     const snapshot_hash = std.fmt.bytesToHex(display_copy.sha256, .lower);
     log("NVIDIA boot-display: captured bytes={d} geometry={d}x{d} pitch={d} boot-generation={d} hold-generation={d} sha256={s} writers=revoked snapshot=immutable capture-phase=before-window", .{
         display_copy.bytes, display_copy.boot.width, display_copy.boot.height, display_copy.boot.pitch,

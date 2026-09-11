@@ -10,7 +10,38 @@ unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
 
-Boot-Zuordnung vollstaendig sichern (NVIDIA 0.1.34)
+Boot-Anzeigezustand erfassen (NVIDIA 0.1.35)
+------------------------------------------
+Der explizite Boot-Check erfasst vor dem ersten PRAMIN-Fensterzugriff den
+gespeicherten Head-/SOR-Zustand. Er leiht die vorhandene gesamte BAR0-Abbildung,
+liest nur vorhandene Einheiten und verlangt zwei vollstaendig gleiche
+Aufnahmen unter der gehaltenen Boot-Epoche und einer Sekunde Frist. Hoechstens
+208 Registerlesezugriffe, keine Display-Schreibzugriffe. Zehn Head-Felder,
+HDMI-Steuerung und SOR-Zuordnung bleiben erhalten. Gueltige progressive
+Timings enthalten auch die exakte 1000/1001-Pixeltaktkorrektur. TMDS, DP und
+das C67D-HDMI-FRL-Protokoll werden unterschieden; unbekannte Timings bleiben
+als Rohdaten erhalten. Armed-Zustand beweist weder sichtbares Bild noch
+Unterstuetzung durch einen angeschlossenen Monitor.
+
+Erneute Zulassung und bisherige Apertur-/Pixel-Recovery verlangen denselben
+Anzeigezustand. Aenderungen halten die Boot-Anzeige und ihre Ressourcen fest.
+Die native Wiederherstellung fehlt weiterhin: NVIDIAs alte Save-/Restore-
+Funktionen ueberspringen UEFI; NVKMS stellt die importierte Konsolenflaeche
+mit einem nativen Display-Core-Modeset dar. GSP-Reset, FWSEC-SB und BooterUnload
+allein stellen daher den UEFI-Scanout nicht wieder her. Vorarbeit fuer .13
+Aufgabe 1 und .10 Aufgabe 6; beide Aufgaben bleiben offen.
+
+51 bestehende Faelle und Modulbuild bestanden. Der vorhandene Lebenszyklusfall
+prueft zwei Heads/Routen, rationalen Takt, ungueltigen Zustand, gehaltene
+Recovery und rueckwaerts laufende Zeit vor dem ersten Lesen. Im Review wurde
+die Zeitgrenze nachgeschaerft; eine lokale Test-Namenskollision korrigiert.
+Keine neuen Faelle/Gates/Gastlaeufe. Alle 26 Ressourcen geprueft, vorherige
+25 Nutzdaten unveraendert. Zehn vollstaendige gepinnte Quellen mit vollen
+MIT-Hinweisen: ExFiles/Reference/GFX/Nvidia/0.79.10/boot-scanout-20260911.
+Beleg: boot_scanout_checkpoint in Docs/Drivers/GrafikFirmware07910.json.
+OssiPC offline/unveraendert; nativer Firmwarestart, Scanout und HDMI offen.
+
+Vorherige Boot-Zuordnung vollstaendig sichern (NVIDIA 0.1.34)
 -------------------------------------------------
 Der explizite Boot-Check loest die gesamte gehaltene Bootflaeche ueber den
 wirklichen gemeinsamen BAR0-/PRAMIN-Zugriff auf. Fuer die physische GA106

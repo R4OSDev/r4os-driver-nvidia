@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-Passive NVIDIA display driver for R4OS. Module 0.1.33; original R4OS code is
+Passive NVIDIA display driver for R4OS. Module 0.1.35; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -10,7 +10,34 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
-Boot mapping preservation (NVIDIA 0.1.34):
+Boot display state capture (NVIDIA 0.1.35):
+
+The explicit boot-check captures the armed head/SOR state before its first
+PRAMIN window write. It borrows the existing full BAR0 map, reads only fused
+slots, and requires two identical complete observations under the held boot
+epoch and a one-second deadline. At most 208 register reads; no display write.
+The snapshot preserves ten head fields, HDMI control and SOR routing.
+Valid progressive timing includes the exact 1000/1001 clock adjustment.
+TMDS, DisplayPort and the C67D HDMI-FRL protocol are distinguished; unknown
+timings remain raw. Armed state does not prove a visible image or sink support.
+
+Fresh admission and the existing aperture/pixel recovery require this same
+state. A change retains the common display and its resources. Native recovery
+is still missing: original NVIDIA legacy save/restore skips UEFI; NVKMS uses
+its native display core channel to restore an imported console surface.
+GSP reset, FWSEC-SB and BooterUnload alone cannot restore UEFI scanout.
+This supplies groundwork for .13 task 1 and .10 task 6, both still open.
+
+All 51 existing cases and the module build pass. The existing lifecycle case
+covers two heads/routes, rational timing, invalid state, held recovery and a
+clock rollback before the first read. Review tightened that clock guard;
+one test-local naming collision was corrected. No added case/gate/guest run.
+All 26 resources verified, previous 25 payloads unchanged. Ten complete
+pinned originals and full MIT notices: boot-scanout-20260911. Evidence:
+boot_scanout_checkpoint in Docs/Drivers/GrafikFirmware07910.json.
+OssiPC is offline and untouched; native firmware, scanout and HDMI remain open.
+
+Previous boot mapping preservation (NVIDIA 0.1.34):
 
 The explicit boot-check now resolves the entire held boot surface through
 actual shared BAR0/PRAMIN access. The physical GA106 register addresses are

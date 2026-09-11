@@ -1,6 +1,18 @@
 ﻿# Third-Party Notices
 
-GA106 BAR1/GMMU mapping and physical-function reader (NVIDIA 0.1.34):
+GA106 boot display observation (NVIDIA 0.1.35):
+boot_scanout.zig adapts Nouveau gv100 armed state/method mirrors (Red Hat,
+2018, MIT) and NVIDIA 570.144 C67D fields (NVIDIA, 2020, MIT). Both full
+original copyright/permission notices remain in the source. nv176 dispatch
+and ga102 implementation confirm the supported profile. Ten complete
+originals, including native UEFI console restoration context, accompany
+boot-scanout-20260911. Full per-file MIT notices are packaged as
+NVIDIA-BOOT-DISPLAY-LICENSE.txt in the nonallocated driver resource and the
+Distribution legal directory/staging list. Original R4OS bounds, lifetime,
+consistency and diagnostic policy remain Apache-2.0. Previous 25 resources
+are unchanged; read observation is linked, native display programming is not.
+
+Earlier GA106 BAR1/GMMU mapping and physical-function reader (NVIDIA 0.1.34):
 bar1_walk.zig and bar1_reader.zig adapt the pinned NVIDIA MIT BAR1/RAMIN,
 GMMU v2 and physical-function VREG definitions. TU102 PF adds 0xb80000;
 BLOCK/BIND_STATUS are 0xb80f40/0xb80f50. Complete copyright and MIT terms

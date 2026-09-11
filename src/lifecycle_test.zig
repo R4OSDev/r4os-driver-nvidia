@@ -915,10 +915,16 @@ const BootVramFixture = struct {
     var banked = false;
     var bank_window: u32 = 0;
     var clock: u64 = 1000000;
+    var clock_backwards = false;
     var delay_selected = false;
     var vram_pages: [6][4096]u8 = undefined;
     const addresses = [_]u64{ 0x100000, 0x201000, 0x302000, 0x403000, 0x504000, 0x605000 };
     fn now() callconv(.c) u64 {
+        if (clock_backwards) {
+            const value = clock;
+            clock -= 1;
+            return value;
+        }
         if (banked) {
             const window = std.mem.readInt(u32, registers[0x1700..][0..4], .little);
             if (window != bank_window) {
@@ -935,6 +941,23 @@ const BootVramFixture = struct {
             }
         }
         return clock;
+    }
+    fn setupScanout() void {
+        const scanout = @import("boot_scanout.zig");
+        put(scanout.capability_register, 0x303);
+        put(scanout.count_register, 0x202);
+        put(scanout.armed_base + 0x300, 0x101);
+        put(scanout.armed_base + 0x320, 0xc02); // C67D explicitly defines HDMI FRL.
+        const words = [_][scanout.head_methods.len]u32{
+            .{ 0x40, 0, 40000000, 1, (600 << 16) | 800, (600 << 16) | 800,
+                (628 << 16) | 1056, (3 << 16) | 127, (27 << 16) | 215, (627 << 16) | 1015 },
+            .{ 0x5c, 0, 0x80000000 | 148500000, 1, (1080 << 16) | 1920, (1080 << 16) | 1920,
+                (1125 << 16) | 2200, (4 << 16) | 43, (40 << 16) | 191, (1120 << 16) | 2111 },
+        };
+        for (words, 0..) |head, n| {
+            for (scanout.head_methods, head) |method, value| put(scanout.armed_base + method + n * 0x400, value);
+            put(0x6165c0 + n * 0x800, 0x40000000);
+        }
     }
     fn setupTables() void {
         for (&vram_pages) |*page| @memset(page, 0);
@@ -1251,7 +1274,26 @@ fn checkBootVramOwner() !void {
     const chip = id.chip(0xb76000a1, 0).?;
     var capture: @import("boot_vram.zig").Capture = .{};
     defer _ = capture.close();
+    f.setupScanout();
     const report = try capture.capture(&ctx, &snapshot, chip);
+    const scanout = @import("boot_scanout.zig");
+    const observed_scanout = capture.scanout_original.?;
+    try t.expect(observed_scanout.headCount() == 2 and observed_scanout.sorCount() == 2 and scanout.routedHeads(&observed_scanout) == 3);
+    try t.expect(scanout.headSors(&observed_scanout, 0) == 1 and scanout.headSors(&observed_scanout, 1) == 2);
+    try t.expect(scanout.protocol(observed_scanout.sors[1]) == .hdmi_frl);
+    const head = try scanout.timing(&observed_scanout.heads[1]);
+    try t.expect(head.active.x == 1920 and head.active.y == 1080 and head.total.x == 2200 and head.total.y == 1125);
+    try t.expect(head.pixel_clock_numerator == 148500000000 and head.pixel_clock_denominator == 1001 and head.raster_micro_hz == 59940059);
+    try t.expect(head.depth_code == 5 and head.hsync_negative and head.vsync_negative and head.hdmi_enabled);
+    var unknown = observed_scanout.heads[1];
+    unknown.words[@intFromEnum(scanout.Field.control)] = 1;
+    try t.expectError(error.Structure, scanout.timing(&unknown));
+    unknown = observed_scanout.heads[1];
+    unknown.words[@intFromEnum(scanout.Field.blank_start)] = unknown.get(.blank_end);
+    try t.expectError(error.Timing, scanout.timing(&unknown));
+    unknown = observed_scanout.heads[1];
+    unknown.words[@intFromEnum(scanout.Field.total)] |= 0x8000;
+    try t.expectError(error.Coordinate, scanout.timing(&unknown));
     var expected: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(f.registers[0x700000..0x720000], &expected, .{});
     try t.expectEqualSlices(u8, &expected, &report.sha256);
@@ -1397,6 +1439,28 @@ fn checkBootVramOwner() !void {
     try t.expect(mapped_boot.close());
     f.put(reader.bind_register, 0);
     f.banked = false;
+    // Admission time belongs to the same monotonic interval as the first read.
+    var clock_probe: scanout.Capture = .{};
+    defer _ = clock_probe.close();
+    f.clock_backwards = true;
+    const scanout_clock_result = clock_probe.readShared(&ctx, &snapshot, chip, &capture.registers,
+        .{ .context = &capture, .epoch = capture.boot.held_generation, .generation = f.nativeGeneration });
+    f.clock_backwards = false;
+    try t.expectError(error.Clock, scanout_clock_result);
+    try t.expect(clock_probe.reads == 0 and capture.registers.borrowedCount() == 2);
+    try t.expect(clock_probe.close() and capture.registers.borrowedCount() == 1);
+    f.put(scanout.count_register, 0x209); // Refuse topology beyond bounded eight heads.
+    try t.expectError(error.Topology, capture.reobserve());
+    try t.expect(capture.registers.borrowedCount() == 1);
+    f.put(scanout.count_register, 0x202);
+    f.put(scanout.armed_base + 0x300, 0x104); // Route cannot name a fused-off head.
+    try t.expectError(error.Routing, capture.reobserve());
+    f.put(scanout.armed_base + 0x300, 0x101);
+    f.put(scanout.armed_base + 0x200c, 40000001);
+    try t.expectError(error.ScanoutChanged, capture.reobserve());
+    try t.expect(!capture.close() and f.held and f.leases[1] and f.mapped[0]);
+    f.put(scanout.armed_base + 0x200c, 40000000);
+    _ = try capture.reobserve();
     f.put(0x625f04, 0x10f08); // Unknown display change: retain every required owner.
     try t.expect(!capture.close());
     try t.expect(f.held and f.buffers[0] != null and f.buffers[1] != null and f.mapped[0x700] and f.leases[1]);

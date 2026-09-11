@@ -11,6 +11,7 @@ const probe = @import("fwsec_state_probe.zig");
 const state = @import("fwsec_state.zig");
 const pramin = @import("pramin.zig");
 const bar0 = @import("bar0.zig");
+const scanout = @import("boot_scanout.zig");
 pub const Report = struct { boot: display.Report, range: pramin.Range, sha256: [32]u8, window_original: u32, window_restored: bool, window_writes: u32 };
 pub const Capture = struct {
     context: ?r4os.r4dev.DriverContext = null,
@@ -22,6 +23,8 @@ pub const Capture = struct {
     ready: bool = false,
     boot: display.Snapshot = .{},
     preflight: probe.Capture = .{},
+    scanout_probe: scanout.Capture = .{},
+    scanout_original: ?scanout.Raw = null,
     memory: ?r4os.driver_memory.Context = null,
     clock: ?r4os.r4dev.DriverResourceContext = null,
     registers: bar0.Owner = .{},
@@ -60,6 +63,7 @@ pub const Capture = struct {
         if (!self.preflight.close()) return error.Cleanup;
         const range = try pramin.workspace(chip.id, &raw);
         self.observation = raw;
+        self.scanout_original = try self.readScanout();
         const boot0 = try read32(self, 0);
         const boot1 = try read32(self, 4);
         const observed = identity.chip(boot0, boot1) orelse return error.Profile;
@@ -104,7 +108,22 @@ pub const Capture = struct {
             try raw.get(.vga) != operation.options.vga or try read32(self, 0) != operation.options.boot0 or
             try read32(self, 4) != operation.options.boot1 or try read32(self, pramin.window_register) != operation.original.?) return error.Unstable;
         self.observation = raw;
+        try self.checkScanout();
         return raw;
+    }
+
+    fn readScanout(self: *Capture) !scanout.Raw {
+        const raw = self.scanout_probe.readShared(&self.context.?, &self.snapshot.?, self.chip.?, &self.registers,
+            .{ .context = self, .epoch = self.boot.held_generation, .generation = generation }) catch |err| {
+            if (!self.scanout_probe.close()) return error.Cleanup;
+            return err;
+        };
+        if (!self.scanout_probe.close()) return error.Cleanup;
+        return raw;
+    }
+    fn checkScanout(self: *Capture) !void {
+        const original = self.scanout_original orelse return error.State;
+        if (!std.meta.eql(original, try self.readScanout())) return error.ScanoutChanged;
     }
 
     fn cast(raw: *anyopaque) *Capture { return @ptrCast(@alignCast(raw)); }
@@ -165,6 +184,7 @@ pub const Capture = struct {
             boot.width != original.width or boot.height != original.height or boot.pitch != original.pitch) return 0;
         const operation = if (self.operation) |*value| value else return 0;
         const until = self.deadline() catch return 0;
+        self.checkScanout() catch |err| { self.last_error = err; return 0; };
         operation.restore(self.port(), until) catch |err| { self.last_error = err; return 0; };
         // This owner can ONLY select/restore the CPU PRAMIN window. It has no
         // firmware command, device DMA binding or display-programming write.
@@ -176,6 +196,7 @@ pub const Capture = struct {
         if (self.self_address == 0) return true;
         if (self.self_address != @intFromPtr(self) or self.borrower != 0 or self.mapping_owner != 0) return false;
         if (!self.preflight.close()) return false;
+        if (!self.scanout_probe.close()) return false;
         const own_borrow: usize = if (self.register_access.owner != null) 1 else 0;
         if (self.registers.borrowedCount() != own_borrow or
             (own_borrow != 0 and !self.register_access.valid())) return false;
