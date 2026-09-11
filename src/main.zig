@@ -174,15 +174,10 @@ pub export fn nvidia_shutdown() callconv(.c) i32 {
     if (!semaphore_probe.shutdown(&ctx)) return -1;
     if (!thread_probe.shutdown(&ctx)) return -1;
     if (!runtime_probe.shutdown(&ctx)) return -1;
-    if (!closeBootInit()) return -1;
-    if (!security_fuses.close()) return -1;
-    if (!fwsec_frts.close()) return -1;
-    if (boot_vram_lease.self_address != 0 and !fwsec_cpu.close()) return -1;
-    if (!boot_vram_lease.releaseBeforeSubmission()) return -1;
-    if (!boot_storage.close()) return -1;
-    if (!closeBootMappings(&boot_context, &boot_mapping)) return -1;
-    if (!boot_vram.close()) return -1;
-    boot_inputs.close();
+    if (closeBootPreparation()) |phase| {
+        logBootCleanup(phase);
+        return -1;
+    }
     if (!gsp_image.close()) return -1;
     if (!firmware_cpu.close()) return -1;
     if (!fwsec_hardware.close()) return -1;
@@ -462,7 +457,13 @@ fn inspectFwsecState(ctx: *const r4os.r4dev.DriverContext, snapshot: *const iden
         return true;
     };
     ctx.logInfo("NVIDIA fwsec: preflight-tcm=fits snapshot=read-only mmio-cleanup=OK reset=unperformed execution=not-started");
-    if (checking_boot and !checkBoot(ctx, snapshot, chip, raw, source)) return false;
+    if (checking_boot and !checkBoot(ctx, snapshot, chip, raw, source)) {
+        // The kernel cannot begin unloading a driver that still holds the
+        // display. Recover our unsubmitted preparation while init owns it;
+        // waiting for DriverShutdown here would leave bootfb revoked forever.
+        logBootCleanup(closeBootPreparation());
+        return false;
+    }
     return true;
 }
 
@@ -470,6 +471,7 @@ fn logBootScanout(raw: *const @import("boot_scanout.zig").Raw) void {
     const scanout = @import("boot_scanout.zig");
     const routed = scanout.routedHeads(raw);
     log("NVIDIA boot-scanout: heads={x:0>2} sors={x:0>2} routed-heads={x:0>2} core-client={x} source=armed-mirror repeated=matched visible=unverified", .{ raw.headMask(), raw.sorMask(), routed, raw.core_client });
+    log("NVIDIA boot-instance: control={x:0>8} address={x:0>8} registers=610010/610014 source=two-identical-reads validity=unclassified", .{ raw.instance_control, raw.instance_address });
     log("NVIDIA boot-windows: count={d} mask={x:0>8} source=armed-mirror layout=unresolved", .{ raw.windowCount(), raw.window_mask });
     for (0..scanout.max_windows) |index| if (raw.window_mask & (@as(u32, 1) << @intCast(index)) != 0) {
         const display_window = &raw.windows[index];
@@ -677,27 +679,12 @@ fn checkBoot(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Sna
     }
     log("NVIDIA booters: resources=14 license=matched generation={d} reads={d} source=loaded-r4d gpu-authentication=unverified", .{ booters.generation, booters.reads });
     if (!stageBootInit(ctx, chip.id)) return false;
-    // No GPU submission occurred. On failure leave this owner and all borrowed
-    // boot allocations for shutdown, which retries this same dependency order.
-    if (!closeBootInit()) {
-        ctx.logError("NVIDIA boot-init: cleanup=retained submitted=no");
+    if (closeBootPreparation()) |phase| {
+        logBootCleanup(phase);
         return false;
     }
-    ctx.logInfo("NVIDIA boot-init: cleanup=OK mappings=0 pins=0 cpu=0 submitted=no");
-    if (!fwsec_frts.close()) return false;
-    if (!fwsec_cpu.close()) return false;
-    if (!boot_vram_lease.releaseBeforeSubmission()) return false;
-    if (!boot_storage.close()) {
-        ctx.logError("NVIDIA boot-check: cleanup=retained submitted=no");
-        return false;
-    }
-    boot_inputs.close();
     if (!firmware_cpu.close()) return false;
-    if (!closeBootMappings(&boot_context, &boot_mapping)) return false;
-    if (!boot_vram.close()) {
-        ctx.logError("NVIDIA boot-vram: cleanup=retained display-and-snapshot=held");
-        return false;
-    }
+    ctx.logInfo("NVIDIA boot-init: cleanup=OK mappings=0 pins=0 cpu=0 submitted=no");
     ctx.logInfo("NVIDIA boot-display: cleanup=OK writers=restored snapshot-references=0 aperture-recovery=verified firmware-recovery=unperformed");
     boot_checked = true;
     ctx.logInfo("NVIDIA boot-check: OK mappings=0 pins=0 cpu=0 firmware-execution=disabled fallback=preserved");
@@ -772,6 +759,32 @@ fn closeBootInit() bool {
 /// leaves the parent boot hold for its caller's later retry.
 pub fn closeBootMappings(context: *@import("boot_context.zig").Capture, mapping: *@import("boot_mapping.zig").Capture) bool {
     return context.close() and mapping.close();
+}
+
+/// One dependency order for successful preparation, init failure and
+/// shutdown. Every release is restricted to the unsubmitted preparation;
+/// uncertainty retains the exact owners and prevents kernel resource reuse.
+fn closeBootPreparation() ?[]const u8 {
+    if (!closeBootInit()) return "init";
+    if (!security_fuses.close()) return "fuses";
+    if (!fwsec_frts.close()) return "frts";
+    if (boot_vram_lease.self_address != 0 and !fwsec_cpu.close()) return "sb";
+    if (!boot_vram_lease.releaseBeforeSubmission()) return "vram-reservation";
+    if (!boot_storage.close()) return "boot-storage";
+    if (!closeBootSnapshots(&boot_context, &boot_mapping, &boot_vram)) return "snapshots";
+    boot_inputs.close();
+    return null;
+}
+
+pub fn closeBootSnapshots(context: *@import("boot_context.zig").Capture, mapping: *@import("boot_mapping.zig").Capture, capture: *@import("boot_vram.zig").Capture) bool {
+    return closeBootMappings(context, mapping) and capture.close();
+}
+
+fn logBootCleanup(phase: ?[]const u8) void {
+    log("NVIDIA boot-abort: cleanup={s} phase={s} display-hold={d} restore-error={s} display-status={d} buffer-status={d} firmware-execution=disabled", .{
+        if (phase == null) @as([]const u8, "OK") else "retained", phase orelse "complete", boot_vram.boot.held_generation,
+        if (boot_vram.last_error) |err| @errorName(err) else "none", boot_vram.boot.last_status, boot_vram.last_status,
+    });
 }
 
 const VbiosDiagnostic = struct {

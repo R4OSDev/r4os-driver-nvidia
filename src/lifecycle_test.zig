@@ -1805,4 +1805,26 @@ fn checkBootVramOwner() !void {
     try t.expect(capture.close());
     f.fail_map = false;
     try t.expect(!f.held and f.buffers[0] == null and f.buffers[1] == null and !f.leases[0] and !f.leases[1]);
+    // A failed init with a held display cannot rely on the kernel calling
+    // DriverShutdown. Exercise the same pre-return snapshot cleanup path.
+    for ([_]bool{ false, true }) |restore_failure| {
+        f.setupScanout();
+        f.put(display_decoder.instance_control_register, 1); // No valid instance.
+        _ = try capture.capture(&ctx, &snapshot, chip);
+        _ = try mapped_boot.capture(&capture);
+        try t.expectError(error.Control, display_context.capture(&capture));
+        try t.expect(f.held and capture.context_owner != 0 and capture.mapping_owner != 0);
+        if (restore_failure) {
+            f.put(0x625f04, 0x10f08);
+            try t.expect(!driver.closeBootSnapshots(&display_context, &mapped_boot, &capture));
+            try t.expect(f.held and capture.boot.held_generation != 0 and f.mapped[0] and
+                capture.context_owner == 0 and capture.mapping_owner == 0);
+            f.put(0x625f04, 0x10e08);
+        }
+        try t.expect(driver.closeBootSnapshots(&display_context, &mapped_boot, &capture));
+        try t.expect(driver.closeBootSnapshots(&display_context, &mapped_boot, &capture));
+        try t.expect(!f.held and std.mem.allEqual(bool, &f.mapped, false) and
+            std.mem.allEqual(bool, &f.leases, false));
+        for (&f.buffers) |buffer| try t.expect(buffer == null);
+    }
 }

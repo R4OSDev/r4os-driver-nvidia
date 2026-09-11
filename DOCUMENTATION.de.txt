@@ -3,6 +3,29 @@
 
 Stand: 11.09.2026; passive Hardwareaufnahme 0.79.9 abgeschlossen.
 
+Init-Abbruch gibt Bootanzeige selbst zurueck (NVIDIA 0.1.48)
+-----------------------------------------------------------
+Der Kernel beginnt keinen Treiberabbau bei gehaltenem Display. Ein
+Init-Abbruch durfte deshalb nicht erst auf DriverShutdown warten. Die
+unabgesendete Bootvorbereitung verwendet nun beim Erfolg, Init-Abbruch und
+Shutdown dieselbe Abbaureihenfolge. Fehler halten die echten Besitzer und
+melden Phase, Displaybesitz und Wiederherstellungsstatus. Kernel unveraendert.
+
+OssiPC bestaetigt den Fehlerpfad: Display-Kontext Control, danach cleanup=OK,
+display-hold=0 und unbind resources=0. Bootfb ist wieder frei, generation1 /
+reset0 / owner0, kein ausstehender Besitzer. 14 automatische Dienste ohne
+Fehler. Gemessen: Instanzsteuerung 0x00000001, Adresse0; laut GA102-Handbuch
+STATUS_INVALID. Alle acht Fenster unzugeordnet, vier Cursor aus, OLUT-Handles0.
+Die bisherige pauschale Forderung nach einer aktiven Instanz passt hier nicht.
+Eine inaktive Instanz benoetigt einen eigenen, widerspruchsfrei belegten Pfad.
+
+51 bestehende Faelle und Modulbuild bestanden. Der bestehende Besitzerfall
+prueft denselben Snapshot-Abbau bei Control-Abbruch sowie fehlgeschlagene
+Wiederherstellung und idempotenten Wiederholungsabbau; keine neuen Gates.
+SYSUPD-Batch8 stellt die bytegleiche passive Konfiguration wieder her.
+Kein Firmwareboot oder Bild-/Tonnachweis. Vollstaendige Quellen/Messdaten:
+ExFiles/Reference/GFX/Nvidia/0.79.10/boot-abort-20260911.
+
 PROM-Fenster vor Boot-Sicherung freigeben (NVIDIA 0.1.47)
 ----------------------------------------------------------
 Nach zwei identischen PROM-Lesungen wird das MMIO-Fenster freigegeben,
