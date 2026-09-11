@@ -169,6 +169,191 @@ fn apiTable() a.DriverApi {
     return table;
 }
 
+// The real native port reads/writes aligned host memory through the ordinary
+// DriverContext facade. This fixture supplies no hardware readiness proof.
+const QueueNative = struct {
+    const native = @import("gsp_sequencer_port.zig");
+    const run = @import("gsp_run_memory.zig");
+    const Case = enum { success, denied, retain_failure, posted_failure, late_write, lost_queue };
+    memory: *run.Lease,
+    words: []align(4096) u32,
+    case: Case,
+    mapped: bool = false,
+    quiet: bool = false,
+    retains: usize = 0,
+    queue_accesses: usize = 0,
+    flushes: usize = 0,
+    fn from(p: *anyopaque) *QueueNative {
+        return @ptrCast(@alignCast(p));
+    }
+    fn generation(p: *anyopaque) u64 {
+        return from(p).memory.generation();
+    }
+    fn admit(_: *anyopaque, _: @import("gsp_sequencer.zig").Command) error{ Denied, Unsupported }!void {}
+    fn access(p: *anyopaque, kind: native.Access, address_value: u32) anyerror!void {
+        const self = from(p);
+        const command = init.queues_offset + init.command_offset;
+        const cursor = std.mem.readInt(u32, backing.?[command + 16 ..][0..4], .little);
+        if (kind == .write and address_value == 0x110c00) {
+            self.queue_accesses += 1;
+            if (self.case == .denied) return error.Denied;
+            if (cursor != 0) {
+                try t.expect(self.memory.retained and self.retains == 1);
+                const record = try transport.message.decode(.{ .chip_id = 0x176 }, backing.?[command + 4096 ..][0..4096], 0);
+                try t.expectEqualStrings("native queue fixture", record.payload);
+                // After commandAdmission, during writeWithin's last access:
+                // the native run lasts longer than this individual request.
+                if (self.case == .late_write and self.queue_accesses == 5) clock = 500;
+            }
+        }
+        if (kind == .read and address_value == 0 and self.words[0x110c00 / 4] == 0) {
+            self.flushes += 1;
+            if (self.case == .posted_failure) self.words[0] = 0;
+        }
+    }
+    fn retain(p: *anyopaque) anyerror!void {
+        const self = from(p);
+        try t.expect(self.memory.retained);
+        self.retains += 1;
+        if (self.case == .retain_failure) return error.Retain;
+    }
+    fn quiesced(p: *anyopaque) bool {
+        return from(p).quiet;
+    }
+    fn owner(self: *QueueNative) native.Owner {
+        return .{ .context = self, .generation = generation, .admit = admit, .access = access, .retain = retain, .quiesced = quiesced, .queue_memory = self.memory };
+    }
+    fn query(out: *a.GfxDriverMemoryApi) callconv(.c) i32 {
+        out.* = .{ .mmio_map = @intFromPtr(&mapWindow), .mmio_unmap = @intFromPtr(&unmapWindow), .collect = @intFromPtr(&collect) };
+        return a.gfx_buffer_result_ok;
+    }
+    fn mapWindow(request: *const a.GfxMmioRequest, out: *a.GfxMmioWindow) callconv(.c) i32 {
+        std.debug.assert(!queue_native.mapped and request.byte_length == queue_native.words.len * 4);
+        queue_native.mapped = true;
+        out.* = .{ .handle = .{ .id = 5, .generation = 8 }, .cpu_address = @intFromPtr(queue_native.words.ptr), .physical_address = request.resource_base, .byte_length = request.byte_length, .cache_policy = a.gfx_buffer_cache_uncached };
+        return a.gfx_buffer_result_ok;
+    }
+    fn unmapWindow(_: *const a.GfxBufferHandle, quiet: u32) callconv(.c) i32 {
+        std.debug.assert(queue_native.mapped and quiet == 1);
+        queue_native.mapped = false;
+        return a.gfx_buffer_result_ok;
+    }
+    fn collect() callconv(.c) i32 {
+        return a.gfx_buffer_result_ok;
+    }
+};
+var queue_native: *QueueNative = undefined;
+
+fn checkNativeQueue(memory: *@import("gsp_run_memory.zig").Lease, ctx: *const r4os.r4dev.DriverContext, table: *a.DriverApi) !void {
+    const native = QueueNative.native;
+    const identity = @import("identity.zig");
+    const words = try t.allocator.alignedAlloc(u32, comptime std.mem.Alignment.fromByteUnits(4096), 0x842000 / 4);
+    defer t.allocator.free(words);
+    const tx = try t.allocator.create([transport.message.max_bytes]u8);
+    defer t.allocator.destroy(tx);
+    const rx = try t.allocator.create([transport.message.max_bytes]u8);
+    defer t.allocator.destroy(rx);
+    table.gfx_memory_query = QueueNative.query;
+    var snapshot: identity.Snapshot = .{ .pci = .{ .vendor_id = 0x10de, .device_id = 0x2504, .class_code = 3 }, .command = 2 };
+    snapshot.bars[0] = .{ .kind = .memory32, .base = 0xfb000000, .bytes = words.len * 4 };
+    const epoch = memory.generation();
+    const command = init.queues_offset + init.command_offset;
+    const status = init.queues_offset + init.status_offset;
+    const header: [32]u8 = backing.?[command..][0..32].*;
+    for (std.enums.values(QueueNative.Case)) |case| {
+        errdefer |err| std.debug.print("native queue fixture {s}: {s}\n", .{ @tagName(case), @errorName(err) });
+        clock = 100;
+        @memset(words, 0);
+        words[0] = 0xb76000a1;
+        words[0x110c00 / 4] = 0xaabbccdd; // Observable host-only register sentinel.
+        @memset(backing.?[command..][0..init.queue_bytes], 0);
+        @memset(backing.?[status..][0..init.queue_bytes], 0);
+        @memcpy(backing.?[command..][0..32], &header);
+        @memcpy(backing.?[status..][0..32], &header);
+        std.mem.writeInt(u32, backing.?[status + 24 ..][0..4], 64, .little);
+        var fixture: QueueNative = .{ .memory = memory, .words = words, .case = case };
+        queue_native = &fixture;
+        var port: native.Port = .{};
+        const run: native.Run = .{ .epoch = epoch, .deadline_ns = 1000 };
+        if (case == .success) {
+            var other = table.*;
+            const wrong_ctx = r4os.r4dev.DriverContext.init(&other);
+            try t.expectError(error.Stale, port.open(&wrong_ctx, &snapshot, words[0], 0, run, fixture.owner()));
+            var wrong_run = run;
+            wrong_run.epoch += 1;
+            try t.expectError(error.Stale, port.open(ctx, &snapshot, words[0], 0, wrong_run, fixture.owner()));
+            var absent = fixture.owner();
+            absent.queue_memory = null;
+            try port.open(ctx, &snapshot, words[0], 0, run, absent);
+            try t.expectError(error.Unsupported, port.transportPort());
+            try t.expect(fixture.retains == 0 and port.close());
+        }
+        try port.open(ctx, &snapshot, words[0], 0, run, fixture.owner());
+        const io = try port.transportPort();
+        var session = try transport.Session.init(io, .{ .chip_id = 0x176 }, epoch, tx, rx);
+        try session.connect(500);
+        if (case == .lost_queue) {
+            memory.boot_storage.?.mapping.handle += 1;
+            const calls = range_calls;
+            try t.expectError(error.Stale, session.send(500, .{ .function = 79 }, "native queue fixture"));
+            try t.expect(range_calls == calls and words[0x110c00 / 4] == 0xaabbccdd);
+            memory.boot_storage.?.mapping.handle -= 1; // Restore injected descriptor corruption.
+        } else if (case == .success) {
+            try session.send(500, .{ .function = 79 }, "native queue fixture");
+            try t.expect(words[0x110c00 / 4] == 0 and fixture.flushes == 1);
+            try t.expect(memory.retained and port.effects_possible and fixture.retains == 1);
+            words[0x110c00 / 4] = 0xaabbccdd;
+            _ = try transport.message.encode(.{ .chip_id = 0x176 }, 0, .{ .function = 0x1003 }, "notify", backing.?[status + 4096 ..][0..4096]);
+            std.mem.writeInt(u32, backing.?[status + 16 ..][0..4], 1, .little);
+            const received = (try session.receive(500)).?;
+            try session.acknowledge(500, received.ticket);
+            try t.expect(words[0x110c00 / 4] == 0xaabbccdd and fixture.flushes == 1);
+        } else {
+            try t.expectError(error.Io, session.send(500, .{ .function = 79 }, "native queue fixture"));
+            const published = case == .posted_failure or case == .late_write;
+            try t.expectEqual(@as(u32, if (published) 1 else 0), std.mem.readInt(u32, backing.?[command + 16 ..][0..4], .little));
+            try t.expectEqual(@as(u32, if (case == .posted_failure) 0 else 0xaabbccdd), words[0x110c00 / 4]);
+            try t.expectEqual(switch (case) {
+                .denied => error.Denied,
+                .retain_failure => error.Retain,
+                .posted_failure => error.IdentityChanged,
+                .late_write => error.Deadline,
+                else => unreachable,
+            }, session.last_io_error.?);
+            const calls = range_calls;
+            const accesses = fixture.queue_accesses;
+            try t.expectError(error.State, session.send(900, .{ .function = 79 }, "retry"));
+            try t.expect(range_calls == calls and fixture.queue_accesses == accesses);
+        }
+        if (port.effects_possible) try t.expect(!port.close() and fixture.mapped);
+        fixture.quiet = true; // Host fixture disposal only, no GPU was run.
+        try t.expect(port.close() and !fixture.mapped);
+        try t.expectEqual(@as(u64, 0), io.generation(io.context));
+    }
+    clock = 100;
+}
+
+const RangeNotification = struct {
+    lease: *@import("gsp_init_storage.zig").QueueLease,
+    calls: usize = 0,
+    fn from(p: *anyopaque) *RangeNotification {
+        return @ptrCast(@alignCast(p));
+    }
+    fn generation(p: *anyopaque) u64 {
+        return from(p).lease.generation();
+    }
+    fn prepare(_: *anyopaque, _: u64) anyerror!void {} // Pure host queue fixture.
+    fn submit(p: *anyopaque, _: u64) anyerror!void {
+        const self = from(p);
+        const device = if (fault == .bounce) shadow else backing.?;
+        const command = init.queues_offset + init.command_offset;
+        try t.expectEqual(@as(u32, 1), std.mem.readInt(u32, device[command + 16 ..][0..4], .little));
+        const record = try transport.message.decode(.{ .chip_id = 0x176 }, device[command + 4096 ..][0..4096], 0);
+        try t.expectEqualStrings("real range facade", record.payload);
+        self.calls += 1;
+    }
+};
+
 test "firmware CPU storage complete run lease retains all boot DMA owners" {
     const run = @import("gsp_run_memory.zig");
     const boot_storage = @import("gsp_boot_storage.zig");
@@ -255,9 +440,7 @@ test "firmware CPU storage complete run lease retains all boot DMA owners" {
     capture.mapping_owner = boot_mapping.self_address;
     const context_bytes = try std.testing.allocator.alloc(u8, 65536);
     defer std.testing.allocator.free(context_bytes);
-    var boot_context: @import("boot_context.zig").Capture = .{ .parent = &capture, .epoch = 9, .ready = true,
-        .reference = .{ .reference = .{ .id = 71, .generation = 1 } },
-        .map = .{ .lease = .{ .id = 72, .generation = 1 }, .cpu_address = @intFromPtr(context_bytes.ptr), .byte_length = context_bytes.len } };
+    var boot_context: @import("boot_context.zig").Capture = .{ .parent = &capture, .epoch = 9, .ready = true, .reference = .{ .reference = .{ .id = 71, .generation = 1 } }, .map = .{ .lease = .{ .id = 72, .generation = 1 }, .cpu_address = @intFromPtr(context_bytes.ptr), .byte_length = context_bytes.len } };
     boot_context.stamp = boot_context.map;
     boot_context.self_address = @intFromPtr(&boot_context);
     capture.context_owner = boot_context.self_address;
@@ -361,6 +544,7 @@ test "firmware CPU storage complete run lease retains all boot DMA owners" {
     try t.expectEqual(@as(u64, 0), lease.generation());
     try t.expect(!lease.releaseBeforeSubmission() and !s.close());
     s.command = 0x19;
+    try checkNativeQueue(&lease, &ctx, &table);
     try lease.retainForDevice();
     lease.invalidate();
     try t.expectEqual(@as(u64, 0), port.generation(port.context));
@@ -439,7 +623,9 @@ test "firmware CPU storage GSP queue lease binds range I/O and retains all backi
         try t.expect(lease.generation() != first_epoch);
         try t.expectEqual(@as(u64, 0), old_copy.generation());
         try t.expect(!old_copy.releaseBeforeSubmission());
-        const port = lease.port();
+        var port = lease.port();
+        var notification: RangeNotification = .{ .lease = &lease };
+        port.notification = .{ .context = &notification, .generation = RangeNotification.generation, .prepare = RangeNotification.prepare, .submit = RangeNotification.submit };
         var bytes: [80]u8 = @splat(0x5a);
         const calls = range_calls;
         try t.expectError(error.QueueRange, port.read(port.context, .status, init.queue_bytes, bytes[0..1]));
@@ -466,6 +652,7 @@ test "firmware CPU storage GSP queue lease binds range I/O and retains all backi
         var session = try transport.Session.init(port, .{ .chip_id = 0x176 }, lease.generation(), tx, rx);
         try session.connect(1000);
         try session.send(1000, .{ .function = 79 }, "real range facade");
+        try t.expectEqual(@as(usize, 1), notification.calls);
         const command_record = try transport.message.decode(.{ .chip_id = 0x176 }, device[command + 4096 ..][0..4096], 0);
         try t.expectEqualStrings("real range facade", command_record.payload);
         try t.expectEqual(@as(u8, 0x83), device[command + 36]);
@@ -477,6 +664,7 @@ test "firmware CPU storage GSP queue lease binds range I/O and retains all backi
         try t.expectEqual(@as(u32, 0), std.mem.readInt(u32, device[command + 32 ..][0..4], .little));
         try t.expect(!storage.close());
         try session.acknowledge(1000, received.ticket);
+        try t.expectEqual(@as(usize, 1), notification.calls);
         try t.expectEqual(@as(u32, 1), std.mem.readInt(u32, device[command + 32 ..][0..4], .little));
         try t.expectEqual(@as(u8, 0x83), device[command + 36]);
         // Model-only latch test: there is intentionally no production clear

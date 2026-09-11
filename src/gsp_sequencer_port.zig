@@ -1,3 +1,96 @@
+// Queue notification adapted from NVIDIA570.144 (MIT); R4OS owner/facade Apache-2.0.
+// src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
+// /*
+//  * SPDX-FileCopyrightText: Copyright (c) 2019-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//  * SPDX-License-Identifier: MIT
+//  *
+//  * Permission is hereby granted, free of charge, to any person obtaining a
+//  * copy of this software and associated documentation files (the "Software"),
+//  * to deal in the Software without restriction, including without limitation
+//  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//  * and/or sell copies of the Software, and to permit persons to whom the
+//  * Software is furnished to do so, subject to the following conditions:
+//  *
+//  * The above copyright notice and this permission notice shall be included in
+//  * all copies or substantial portions of the Software.
+//  *
+//  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+//  * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+//  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+//  * DEALINGS IN THE SOFTWARE.
+//  */
+// src/nvidia/src/kernel/gpu/gsp/arch/turing/kernel_gsp_tu102.c
+// /*
+//  * SPDX-FileCopyrightText: Copyright (c) 2017-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//  * SPDX-License-Identifier: MIT
+//  *
+//  * Permission is hereby granted, free of charge, to any person obtaining a
+//  * copy of this software and associated documentation files (the "Software"),
+//  * to deal in the Software without restriction, including without limitation
+//  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//  * and/or sell copies of the Software, and to permit persons to whom the
+//  * Software is furnished to do so, subject to the following conditions:
+//  *
+//  * The above copyright notice and this permission notice shall be included in
+//  * all copies or substantial portions of the Software.
+//  *
+//  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+//  * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+//  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+//  * DEALINGS IN THE SOFTWARE.
+//  */
+// src/common/inc/swref/published/ampere/ga102/dev_gsp.h
+// /*
+//  * SPDX-FileCopyrightText: Copyright (c) 2003-2021 NVIDIA CORPORATION & AFFILIATES
+//  * SPDX-License-Identifier: MIT
+//  *
+//  * Permission is hereby granted, free of charge, to any person obtaining a
+//  * copy of this software and associated documentation files (the "Software"),
+//  * to deal in the Software without restriction, including without limitation
+//  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//  * and/or sell copies of the Software, and to permit persons to whom the
+//  * Software is furnished to do so, subject to the following conditions:
+//  *
+//  * The above copyright notice and this permission notice shall be included in
+//  * all copies or substantial portions of the Software.
+//  *
+//  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+//  * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+//  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+//  * DEALINGS IN THE SOFTWARE.
+//  */
+// src/nvidia/inc/kernel/gpu/gsp/message_queue.h
+// /*
+//  * SPDX-FileCopyrightText: Copyright (c) 2019-2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//  * SPDX-License-Identifier: MIT
+//  *
+//  * Permission is hereby granted, free of charge, to any person obtaining a
+//  * copy of this software and associated documentation files (the "Software"),
+//  * to deal in the Software without restriction, including without limitation
+//  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//  * and/or sell copies of the Software, and to permit persons to whom the
+//  * Software is furnished to do so, subject to the following conditions:
+//  *
+//  * The above copyright notice and this permission notice shall be included in
+//  * all copies or substantial portions of the Software.
+//  *
+//  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+//  * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+//  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+//  * DEALINGS IN THE SOFTWARE.
+//  */
 //! R4OS x86_64 MMIO binding for gsp_sequencer and the GA106 core executor.
 //! Not opened by passive probing. The native boot owner must supply real run,
 //! register-policy, DMA-retention, log-reader and quiescence implementations.
@@ -9,6 +102,11 @@ const bar0 = @import("bar0.zig");
 const seq = @import("gsp_sequencer.zig");
 const core = @import("gsp_core.zig");
 const firmware_run = @import("falcon_run.zig");
+const transport = @import("gsp_transport.zig");
+const run_memory = @import("gsp_run_memory.zig");
+// Bare-metal RM queue 0, NV_PGSP_QUEUE_HEAD(0). This is not SWGEN0 or a
+// virtual-function doorbell. The memory cursor is published separately.
+pub const command_queue_head: u32 = 0x110c00;
 pub const Access = enum { read, write };
 pub const Owner = struct {
     context: *anyopaque,
@@ -37,6 +135,10 @@ pub const Owner = struct {
     // from this same run, plus full device/display recovery. No boolean caller
     // result or successful command alone grants these dependencies.
     admit_cold: ?*const fn (*anyopaque, core.Cold) anyerror!void = null,
+    // Exact retained storage run for native queue traffic. Frozen at open;
+    // its API and epoch must match this port, and every access rechecks it.
+    // The native owner still admits firmware readiness/lockdown/reset state.
+    queue_memory: ?*run_memory.Lease = null,
 };
 pub const Run = struct { epoch: u64, deadline_ns: u64, resume_args: ?core.Resume = null };
 pub const Port = struct {
@@ -79,6 +181,9 @@ pub const Port = struct {
             bar.bytes < 0x841000 or bar.bytes > 0x100000000 or bar.bytes % 4096 != 0 or
             bar.base > std.math.maxInt(u64) - bar.bytes) return error.Profile;
         if (run.epoch == 0 or run.deadline_ns == 0 or run.deadline_ns == std.math.maxInt(u64)) return error.Options;
+        if (owner.queue_memory) |memory| {
+            if (memory.api != ctx.api or memory.generation() != run.epoch) return error.Stale;
+        }
         self.self_address = @intFromPtr(self);
         errdefer |err| self.failure = err;
         self.run = run;
@@ -109,6 +214,62 @@ pub const Port = struct {
         if (!self.ready) return error.State;
         if (self.firmware_operation != null or self.cold_command != null) return error.Busy;
         return .{ .context = self, .generation = generation, .now_ns = nowNs, .admit = admit, .read32 = sequenceRead, .write32 = sequenceWrite, .core_step = coreStep };
+    }
+    /// One native queue facade over the same BAR0 and prepared DMA run. The
+    /// sole Session owns it; passive probing never opens or calls this path.
+    /// This does not renew the native run's deadline or establish RM readiness.
+    pub fn transportPort(self: *Port) !transport.Port {
+        _ = try self.queueMemory();
+        return .{ .context = self, .generation = generation, .now_ns = nowNs, .read = queueRead, .publish = queuePublish, .notification = .{ .context = self, .generation = generation, .prepare = prepareCommand, .submit = notifyCommand } };
+    }
+    fn queueMemory(self: *Port) !*run_memory.Lease {
+        try self.guard();
+        if (!self.ready) return error.State;
+        if (self.operation != null or self.firmware_operation != null or self.cold_command != null) return error.Busy;
+        return self.owner.?.queue_memory orelse error.Unsupported;
+    }
+    fn queueRead(p: *anyopaque, queue: transport.ring.Queue, offset: usize, bytes: []u8) anyerror!void {
+        const self = cast(p);
+        errdefer |err| self.failure = err;
+        const memory = try self.queueMemory();
+        const port = try memory.transportPort();
+        try port.read(port.context, queue, offset, bytes);
+        try self.guard();
+    }
+    fn queuePublish(p: *anyopaque, queue: transport.ring.Queue, offset: usize, bytes: []const u8) anyerror!void {
+        const self = cast(p);
+        errdefer |err| self.failure = err;
+        const memory = try self.queueMemory();
+        // ACK publication can be the first effect too. It needs retention,
+        // but does not ring the command queue notification register.
+        try self.retain();
+        const port = try memory.transportPort();
+        try port.publish(port.context, queue, offset, bytes);
+        try self.guard();
+    }
+    fn commandAdmission(self: *Port, deadline: u64) !void {
+        _ = try self.queueMemory();
+        if (deadline == std.math.maxInt(u64) or deadline <= self.last_clock or deadline > self.run.deadline_ns) return error.Deadline;
+        try self.access(.write, command_queue_head);
+        try self.access(.read, 0); // Required BOOT0 flush, admitted before TX.
+        if (deadline <= self.last_clock) return error.Deadline;
+    }
+    fn prepareCommand(p: *anyopaque, deadline: u64) anyerror!void {
+        const self = cast(p);
+        errdefer |err| self.failure = err;
+        try self.commandAdmission(deadline);
+        try self.retain();
+        try self.commandAdmission(deadline);
+    }
+    fn notifyCommand(p: *anyopaque, deadline: u64) anyerror!void {
+        const self = cast(p);
+        errdefer |err| self.failure = err;
+        try self.commandAdmission(deadline);
+        if (!self.retained) return error.State;
+        // write() fences prior DMA/cursor publication, performs the exact
+        // 32-bit zero write, then flushes PCI posted writes through BOOT0.
+        try self.writeWithin(command_queue_head, 0, deadline);
+        if (deadline <= self.last_clock) return error.Deadline;
     }
     pub fn beginFirmware(self: *Port, options: firmware_run.Options) !void {
         try self.guard();
@@ -176,8 +337,7 @@ pub const Port = struct {
         errdefer |err| self.failure = err;
         try self.guard();
         const operation = if (self.firmware_operation) |*op| op else return error.State;
-        const done = try operation.step(.{ .context = self, .generation = generation, .now_ns = nowNs, .admit = admitFirmware, .read32 = read32, .write32 = write32,
-            .log_polling = if (self.owner.?.log_polling != null) logs else null });
+        const done = try operation.step(.{ .context = self, .generation = generation, .now_ns = nowNs, .admit = admitFirmware, .read32 = read32, .write32 = write32, .log_polling = if (self.owner.?.log_polling != null) logs else null });
         if (!done) return null;
         const result = operation.result.?;
         self.firmware_operation = null;
@@ -197,6 +357,9 @@ pub const Port = struct {
         const self = cast(p);
         if (self.self_address != @intFromPtr(self) or !self.ready or self.failure != null or !self.mappingValid()) return 0;
         const owner = self.owner orelse return 0;
+        if (owner.queue_memory) |memory| {
+            if (memory.generation() != self.run.epoch) return 0;
+        }
         return owner.generation(owner.context);
     }
     fn nowNs(p: *anyopaque) u64 {
@@ -209,6 +372,9 @@ pub const Port = struct {
         if (!self.mappingValid()) return error.Stale;
         const owner = self.owner.?;
         if (owner.generation(owner.context) != self.run.epoch) return error.Stale;
+        if (owner.queue_memory) |memory| {
+            if (memory.generation() != self.run.epoch) return error.Stale;
+        }
         const now = self.clock.?.nowNs();
         if (now == std.math.maxInt(u64) or now < self.last_clock) return error.Clock;
         self.last_clock = now;
@@ -276,16 +442,21 @@ pub const Port = struct {
         if (self.retained) return;
         self.effects_possible = true; // Before a possibly partial callback.
         const owner = self.owner.?;
+        if (owner.queue_memory) |memory| try memory.retainForDevice();
         try owner.retain(owner.context);
         self.retained = true;
         try self.guard();
     }
     fn write(self: *Port, offset: u32, value: u32) !void {
+        return self.writeWithin(offset, value, self.run.deadline_ns);
+    }
+    fn writeWithin(self: *Port, offset: u32, value: u32, deadline: u64) !void {
         errdefer |err| self.failure = err;
         try self.access(.write, offset);
         try self.access(.read, 0); // Admit the mandatory flush before the write.
         try self.retain();
         try self.access(.write, offset);
+        if (deadline <= self.last_clock) return error.Deadline;
         fence();
         self.pointer(offset).* = value;
         fence();

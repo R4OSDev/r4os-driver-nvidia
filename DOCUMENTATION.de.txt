@@ -10,6 +10,33 @@ unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
 
+GSP-Queue-Benachrichtigung (Quellvorbereitung fuer0.79.10, 11.09.2026)
+-----------------------------------------------------------------
+Senden verlangt nun eine ausdruecklich gebundene Benachrichtigung. Queue
+und Registerpfad pruefen dieselbe Epoche. Vor jeder Datenveroeffentlichung
+werden Zugriff und Speicherbindung geprueft; erst nach Nutzdaten und
+synchronisiertem Schreibzeiger folgt genau eine Registerbenachrichtigung.
+Volle Queues und Empfangsbestaetigungen stossen keine neue Anfrage an.
+Unklare Fehler stoppen die Session ohne Wiederholung oder Speicherfreigabe.
+
+gsp_sequencer_port bindet die genaue run_memory-Lease, DriverApi und BAR0-
+Lebensdauer. RM-Queue0 erhaelt am Register0x110c00 den Wert0; x86-Fences und
+der bestehende BOOT0-Lesezugriff sichern die Reihenfolge. Die kuerzere
+Anfragefrist wird direkt vor dem Registerschreiben erneut geprueft. Auch
+ACK-Publikation haelt alle DMA-Besitzer. Firmwarebereitschaft, Phasenwechsel,
+Zugriffspolitik und vollstaendige GPU-Ruhe bleiben Aufgaben des nativen
+Besitzers; dessen Laufzeitgrenze wird hier nicht verlaengert.
+
+51 bestehende Faelle und ein Modulbuild bestanden. In zwei anfaenglichen
+Laeufen hatte die neue Host-Fixture den falschen Erfolgswert fuer die Grafik-
+Speicher-API geliefert; der Fixturefehler wurde korrigiert. Acht vollstaendige
+gehashte Originale unter ExFiles/Reference/GFX/Nvidia/0.79.10/queue-notify-
+20260911, volle MIT-Quellhinweise. Beleg queue_notification_checkpoint in
+GrafikFirmware07910.json. Gesamtes NVIDIA0.1.44-Artefakt bytegleich, Quelle
+bisher nur hostseitig eingebunden; passiver Einstieg aktiviert sie nicht.
+Keine neuen Faelle/Gates/Gast-/Hardwarelaeufe. OssiPC offline/unberuehrt;
+echter Boot-/Runtime-/Recoverypfad, Handler und Grafik-/Audioabnahme offen.
+
 RM-Objektlebenszyklus (Quellvorbereitung fuer0.79.12, 11.09.2026)
 -------------------------------------------------------------
 gsp_objects legt Client, Geraet, Subdevice und Display-Common in dieser

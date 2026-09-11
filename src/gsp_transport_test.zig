@@ -10,6 +10,7 @@ const ring = transport.ring;
 const profile = message.Profile{ .chip_id = 0x176 };
 const deadline = 1000;
 const Event = struct { write: bool, queue: ring.Queue, offset: usize, bytes: usize };
+const SignalPhase = enum { none, prepare, submit };
 const Model = struct {
     cpu: [2][ring.queue_bytes]u8 = @splat(@splat(0)),
     peer: [2][ring.queue_bytes]u8 = @splat(@splat(0)),
@@ -24,6 +25,14 @@ const Model = struct {
     after: bool = false,
     expire: usize = 0,
     change_epoch: usize = 0,
+    signal_epoch: ?u64 = null,
+    prepares: usize = 0,
+    notifications: usize = 0,
+    notify_pending: bool = false,
+    signal_fault: SignalPhase = .none,
+    signal_after: bool = false,
+    signal_expire: SignalPhase = .none,
+    signal_stale: SignalPhase = .none,
     fn ptr(context: *anyopaque) *Model {
         return @ptrCast(@alignCast(context));
     }
@@ -61,7 +70,34 @@ const Model = struct {
         try self.finish();
     }
     fn port(self: *Model) transport.Port {
-        return .{ .context = self, .generation = generation, .now_ns = clock, .read = read, .publish = publish };
+        return .{ .context = self, .generation = generation, .now_ns = clock, .read = read, .publish = publish, .notification = .{ .context = self, .generation = signalGeneration, .prepare = prepareSignal, .submit = submitSignal } };
+    }
+    fn signalGeneration(p: *anyopaque) u64 {
+        const self = ptr(p);
+        return self.signal_epoch orelse self.epoch;
+    }
+    fn signal(self: *Model, phase: SignalPhase, limit: u64) !void {
+        try t.expect(self.now < limit);
+        if (self.signal_fault == phase and !self.signal_after) return error.NotifyFailure;
+        if (phase == .prepare) {
+            try t.expect(!self.notify_pending);
+            self.prepares += 1;
+            self.notify_pending = true;
+        } else {
+            try t.expect(self.notify_pending);
+            try t.expectEqualDeep(Event{ .write = true, .queue = .command, .offset = 16, .bytes = 4 }, self.events[self.count - 1]);
+            self.notifications += 1;
+            self.notify_pending = false;
+        }
+        if (self.signal_expire == phase) self.now = limit;
+        if (self.signal_stale == phase) self.signal_epoch = self.epoch + 1;
+        if (self.signal_fault == phase and self.signal_after) return error.NotifyFailure;
+    }
+    fn prepareSignal(p: *anyopaque, limit: u64) anyerror!void {
+        return ptr(p).signal(.prepare, limit);
+    }
+    fn submitSignal(p: *anyopaque, limit: u64) anyerror!void {
+        return ptr(p).signal(.submit, limit);
     }
     fn reset(self: *Model, flags: u32) void {
         self.* = .{};
@@ -1047,6 +1083,7 @@ test "GSP transport orders range publication, explicit acknowledgement and termi
         try t.expectEqualDeep(Event{ .write = true, .queue = .command, .offset = 16, .bytes = 4 }, model.events[2]);
         try t.expectEqual(@as(u8, 0xa9), model.peer[0][36]);
         try t.expectEqual(@as(u32, 1), session.tx_sequence);
+        try t.expect(model.prepares == 1 and model.notifications == 1 and !model.notify_pending);
         try model.reply(&session, "opaque event");
         const received = (try session.receive(deadline)).?;
         try t.expectEqualStrings("opaque event", received.record.payload);
@@ -1064,6 +1101,7 @@ test "GSP transport orders range publication, explicit acknowledgement and termi
         try t.expectEqual(@as(u32, 1), session.rx_sequence);
         try t.expectError(error.Stale, session.acknowledge(deadline, received.ticket));
         try t.expect((try session.receive(deadline)) == null);
+        try t.expectEqual(@as(usize, 1), model.notifications); // ACK does not kick RM.
     }
     // Actual sequential progress reaches the ring end; publication uses two
     // exact payload spans followed by one cursor store, never a full sync.
@@ -1082,6 +1120,7 @@ test "GSP transport orders range publication, explicit acknowledgement and termi
     try t.expectEqual(@as(usize, 4096), model.events[1].bytes);
     try t.expectEqual(@as(usize, 15 * 4096), model.events[2].bytes);
     try t.expectEqual(@as(u32, 15), session.tx_write);
+    try t.expectEqual(@as(usize, 63), model.notifications); // One kick for all wrapped spans.
     // Four 16-slot replies also cross the RX ring end without early ack.
     for (0..4) |_| {
         try model.reply(&session, payload);
@@ -1099,6 +1138,39 @@ test "GSP transport orders range publication, explicit acknowledgement and termi
     try t.expectEqual(@as(u32, 62), session.tx_sequence);
     try t.expectEqual(@as(u32, 62), get(&model.peer[0], 16));
     try t.expectEqual(transport.State.active, session.state);
+    try t.expect(model.prepares == 62 and model.notifications == 62);
+
+    // Notification preflight precedes every command publication. Its own
+    // identity, failure and time are part of the same terminal session.
+    session = try model.start(3);
+    session.port.notification = null; // Explicit memory-only fixture.
+    try t.expectError(error.Notification, session.send(deadline, .{ .function = 79 }, "x"));
+    try t.expect(model.count == 0 and model.notifications == 0);
+    session = try model.start(3);
+    model.signal_epoch = model.epoch + 1;
+    try t.expectError(error.Stale, session.send(deadline, .{ .function = 79 }, "x"));
+    try t.expectEqual(@as(usize, 0), model.count);
+    for ([_]SignalPhase{ .prepare, .submit }) |phase| for ([_]bool{ false, true }) |after| {
+        session = try model.start(3);
+        model.signal_fault = phase;
+        model.signal_after = after;
+        try t.expectError(error.Io, session.send(deadline, .{ .function = 79 }, "x"));
+        try t.expectEqual(error.NotifyFailure, session.last_io_error.?);
+        try t.expectEqual(@as(u32, if (phase == .submit) 1 else 0), get(&model.peer[0], 16));
+        try t.expectEqual(@as(usize, if (phase == .submit and after) 1 else 0), model.notifications);
+        const calls = model.count;
+        const notifications = model.notifications;
+        try t.expectError(error.State, session.send(deadline + 100, .{ .function = 79 }, "retry"));
+        try t.expectEqual(calls, model.count);
+        try t.expectEqual(notifications, model.notifications);
+    };
+    for ([_]SignalPhase{ .prepare, .submit }) |phase| for ([_]bool{ false, true }) |stale| {
+        session = try model.start(3);
+        if (stale) model.signal_stale = phase else model.signal_expire = phase;
+        try t.expectError(if (stale) error.Stale else error.Deadline, session.send(deadline, .{ .function = 79 }, "x"));
+        try t.expectEqual(@as(u32, if (phase == .submit) 1 else 0), get(&model.peer[0], 16));
+        try t.expectEqual(@as(u32, 0), session.tx_sequence);
+    };
 
     // Every command read/data/cursor callback can fail before or after I/O.
     // Ambiguous publication is terminal and cannot duplicate the command.

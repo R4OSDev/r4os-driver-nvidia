@@ -179,6 +179,8 @@ pub const Lease = struct {
         for (&self.booter_storage.?.images, &result.booters) |*image, *input| input.* = .{ .prepared = image.prepared.?, .plan = image.device.prepared_plan.? };
         return result;
     }
+    /// Memory-only facade. Native sends must use gsp_sequencer_port's facade,
+    /// which binds this exact lease to the register owner and notification.
     pub fn transportPort(self: *Lease) !transport.Port {
         if (self.generation() == 0) return error.Stale;
         return .{ .context = self, .generation = portGeneration, .now_ns = portClock, .read = portRead, .publish = portPublish };

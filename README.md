@@ -10,6 +10,31 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
+GSP queue notification (source preparation for0.79.10, 2026-09-11):
+
+The transport now requires an explicit notification for sending. It checks
+both queue and notifier epochs, admits and retains before publishing bytes,
+then notifies once after the complete payload and synchronized write cursor.
+Full queues and receive acknowledgements do not ring the command register.
+Any ambiguous notification failure stops the Session without retry/free.
+
+gsp_sequencer_port binds the exact run_memory lease, DriverApi and BAR0 run.
+It writes zero to bare-metal RM queue0 at0x110c00, with x86 ordering and
+the existing BOOT0 posted-write flush. The shorter request deadline is
+checked immediately before the store. ACK writes also retain all DMA.
+The native owner still supplies firmware readiness/phase and access policy;
+this facade does not renew its run deadline or prove GPU quiescence.
+
+51 existing cases and one module build pass. The first two test runs found
+a wrong success constant in the new host fixture; that fixture is fixed.
+Eight complete pinned originals accompany queue-notify-20260911 under
+ExFiles/Reference/GFX/Nvidia/0.79.10. Full source MIT notices are retained.
+See queue_notification_checkpoint in Docs/Drivers/GrafikFirmware07910.json.
+The whole NVIDIA0.1.44 R4D remains byte-identical. This is host-linked source;
+passive main does not open it. No new case/gate, guest or physical run.
+OssiPC offline/untouched; actual bootstrap/runtime/recovery, notification
+handlers and physical graphics/receiver/audio acceptance remain open.
+
 RM object lifecycle (source preparation for0.79.12, 2026-09-11):
 
 gsp_objects now creates the fixed client/device/subdevice/display-common

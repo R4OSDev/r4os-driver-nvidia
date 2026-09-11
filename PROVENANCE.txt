@@ -1,5 +1,14 @@
 ﻿Original R4OS implementation for roadmap 0.79.9, 10.09.2026.
 
+GSP queue notification/source ownership (0.79.10, 2026-09-11):
+Four complete original NVIDIA MIT notices in gsp_sequencer_port.zig cover
+kernel_gsp.c, kernel_gsp_tu102.c, GA102/dev_gsp.h and message_queue.h.
+gsp_transport retains its original notice plus the complete kernel_gsp.c
+notice for notify-after-publication. Eight full pinned sources accompany
+queue-notify-20260911. Original R4OS ownership policy is Apache-2.0.
+Source is host-linked only; product R4D and packaged notices are unchanged.
+
+
 RM object/source ownership (0.79.12, 2026-09-11):
 gsp_objects.zig retains six complete original MIT notices: NVIDIA generated
 RPC structures plus cl0000/cl0080/cl2080/cl0073, and Nouveau2023 Red Hat

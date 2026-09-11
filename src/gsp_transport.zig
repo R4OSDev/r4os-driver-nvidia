@@ -1,5 +1,30 @@
+// Notify-after-publication follows NVIDIA570.144 kernel_gsp.c (MIT).
+// src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
+// /*
+//  * SPDX-FileCopyrightText: Copyright (c) 2019-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//  * SPDX-License-Identifier: MIT
+//  *
+//  * Permission is hereby granted, free of charge, to any person obtaining a
+//  * copy of this software and associated documentation files (the "Software"),
+//  * to deal in the Software without restriction, including without limitation
+//  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//  * and/or sell copies of the Software, and to permit persons to whom the
+//  * Software is furnished to do so, subject to the following conditions:
+//  *
+//  * The above copyright notice and this permission notice shall be included in
+//  * all copies or substantial portions of the Software.
+//  *
+//  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+//  * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+//  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+//  * DEALINGS IN THE SOFTWARE.
+//  */
 //! Single-owner GSP message transport over an externally retained range-I/O
-//! port. No allocation, polling loop, RPC dispatch, MMIO, reset or free.
+//! port and an explicit device notification. No allocation, polling loop,
+//! RPC dispatch, register policy, reset or free.
 //! The port must synchronize only the selected bytes and keep backing alive
 //! through actual device quiescence, including after this owner fails.
 // Publication/sequence rules adapted from NVIDIA 570.144 message_queue_cpu.c.
@@ -26,10 +51,20 @@
 const std = @import("std");
 pub const message = @import("gsp_message.zig");
 pub const ring = @import("gsp_ring.zig");
-pub const Error = ring.Error || error{ State, Stale, Deadline, Clock, Io, PeerProgress, Pending, Exhausted };
+pub const Error = ring.Error || error{ State, Stale, Deadline, Clock, Io, PeerProgress, Pending, Exhausted, Notification };
 pub const State = enum { linking, active, failed };
 pub const Ticket = struct { epoch: u64, serial: u64, sequence: u32, cursor: u32, next: u32 };
 pub const Received = struct { ticket: Ticket, record: message.Record };
+pub const Notification = struct {
+    context: *anyopaque,
+    generation: *const fn (*anyopaque) u64,
+    // Admit notification and retain the whole device run BEFORE publishing
+    // any command bytes. No queue pointer/scratch may escape these calls.
+    prepare: *const fn (*anyopaque, u64) anyerror!void,
+    // Order all preceding queue writes before one device notification. A
+    // failure may have notified firmware already; neither phase is retried.
+    submit: *const fn (*anyopaque, u64) anyerror!void,
+};
 pub const Port = struct {
     context: *anyopaque,
     generation: *const fn (*anyopaque) u64,
@@ -39,6 +74,9 @@ pub const Port = struct {
     // retain scratch pointers; failure may already have performed the I/O.
     read: *const fn (*anyopaque, ring.Queue, usize, []u8) anyerror!void,
     publish: *const fn (*anyopaque, ring.Queue, usize, []const u8) anyerror!void,
+    // A memory-only port supports receive/ACK. Sending without a bound
+    // notifier fails before any queue I/O; never silently rely on polling.
+    notification: ?Notification = null,
 };
 
 pub const Session = struct {
@@ -89,6 +127,9 @@ pub const Session = struct {
     fn check(self: *Session, deadline: u64) Error!void {
         if (self.state == .failed) return error.State;
         if (self.port.generation(self.port.context) != self.epoch) return self.fail(error.Stale);
+        if (self.port.notification) |notification| {
+            if (notification.generation(notification.context) != self.epoch) return self.fail(error.Stale);
+        }
         const now = self.port.now_ns(self.port.context);
         if (now == std.math.maxInt(u64) or now < self.last_clock) return self.fail(error.Clock);
         self.last_clock = now;
@@ -122,6 +163,16 @@ pub const Session = struct {
         std.mem.writeInt(u32, &bytes, value, .little);
         try self.publish(deadline, location.queue, location.offset, &bytes);
     }
+    fn signal(self: *Session, deadline: u64, prepare: bool) Error!void {
+        try self.check(deadline);
+        const notification = self.port.notification orelse return self.fail(error.Notification);
+        const callback = if (prepare) notification.prepare else notification.submit;
+        callback(notification.context, deadline) catch |err| {
+            self.last_io_error = err;
+            return self.fail(error.Io);
+        };
+        try self.check(deadline);
+    }
 
     /// One readiness attempt, no spin/retry loop. Firmware may still be
     /// constructing its header; caller reschedules within one absolute limit.
@@ -148,6 +199,7 @@ pub const Session = struct {
     pub fn send(self: *Session, deadline: u64, rpc: message.Rpc, payload: []const u8) Error!void {
         if (self.state != .active) return error.State;
         try self.check(deadline);
+        if (self.port.notification == null) return self.fail(error.Notification);
         const link = self.link.?;
         const encoded = try message.encode(self.profile, self.tx_sequence, rpc, payload, self.tx);
         const peer = try self.readWord(deadline, link.command_read);
@@ -156,12 +208,14 @@ pub const Session = struct {
             return self.fail(error.PeerProgress);
         self.tx_peer_read = peer;
         const plan = try ring.transmit(link.command.layout, self.tx_write, peer, encoded.elements);
+        try self.signal(deadline, true);
         var copied: usize = 0;
         for (plan.spans[0..plan.span_count]) |span| {
             try self.publish(deadline, .command, span.offset, self.tx[copied..][0..span.bytes]);
             copied += span.bytes;
         }
         try self.publishWord(deadline, .{ .queue = .command, .offset = 16 }, plan.next_cursor);
+        try self.signal(deadline, false);
         self.tx_write = plan.next_cursor;
         self.tx_sequence +%= 1;
     }
