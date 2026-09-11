@@ -72,8 +72,10 @@ pub const Port = struct {
     // Read acquires a stable CPU snapshot; publish completes the selected
     // bytes' device synchronization before returning. Neither callback may
     // retain scratch pointers; failure may already have performed the I/O.
-    read: *const fn (*anyopaque, ring.Queue, usize, []u8) anyerror!void,
-    publish: *const fn (*anyopaque, ring.Queue, usize, []const u8) anyerror!void,
+    // The absolute operation deadline travels with every callback. Providers
+    // must not replace it with a fresh duration or an unrelated boot limit.
+    read: *const fn (*anyopaque, u64, ring.Queue, usize, []u8) anyerror!void,
+    publish: *const fn (*anyopaque, u64, ring.Queue, usize, []const u8) anyerror!void,
     // A memory-only port supports receive/ACK. Sending without a bound
     // notifier fails before any queue I/O; never silently rely on polling.
     notification: ?Notification = null,
@@ -137,7 +139,7 @@ pub const Session = struct {
     }
     fn read(self: *Session, deadline: u64, queue: ring.Queue, offset: usize, output: []u8) Error!void {
         try self.check(deadline);
-        self.port.read(self.port.context, queue, offset, output) catch |err| {
+        self.port.read(self.port.context, deadline, queue, offset, output) catch |err| {
             self.last_io_error = err;
             return self.fail(error.Io);
         };
@@ -145,7 +147,7 @@ pub const Session = struct {
     }
     fn publish(self: *Session, deadline: u64, queue: ring.Queue, offset: usize, input: []const u8) Error!void {
         try self.check(deadline);
-        self.port.publish(self.port.context, queue, offset, input) catch |err| {
+        self.port.publish(self.port.context, deadline, queue, offset, input) catch |err| {
             self.last_io_error = err;
             return self.fail(error.Io);
         };

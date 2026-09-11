@@ -174,7 +174,7 @@ fn apiTable() a.DriverApi {
 const QueueNative = struct {
     const native = @import("gsp_sequencer_port.zig");
     const run = @import("gsp_run_memory.zig");
-    const Case = enum { success, denied, retain_failure, posted_failure, late_write, lost_queue };
+    const Case = enum { success, denied, retain_failure, posted_failure, late_write, lost_queue, runtime, runtime_missing, runtime_deny, runtime_late, runtime_idle_late, runtime_stale };
     memory: *run.Lease,
     words: []align(4096) u32,
     case: Case,
@@ -183,6 +183,8 @@ const QueueNative = struct {
     retains: usize = 0,
     queue_accesses: usize = 0,
     flushes: usize = 0,
+    runtime_admissions: usize = 0,
+    lockdown: bool = false,
     fn from(p: *anyopaque) *QueueNative {
         return @ptrCast(@alignCast(p));
     }
@@ -196,12 +198,12 @@ const QueueNative = struct {
         const cursor = std.mem.readInt(u32, backing.?[command + 16 ..][0..4], .little);
         if (kind == .write and address_value == 0x110c00) {
             self.queue_accesses += 1;
-            if (self.case == .denied) return error.Denied;
+            if (self.case == .denied or self.lockdown) return error.Denied;
             if (cursor != 0) {
                 try t.expect(self.memory.retained and self.retains == 1);
                 const record = try transport.message.decode(.{ .chip_id = 0x176 }, backing.?[command + 4096 ..][0..4096], 0);
                 try t.expectEqualStrings("native queue fixture", record.payload);
-                // After commandAdmission, during writeWithin's last access:
+                // After commandAdmission, during writeFor's last access:
                 // the native run lasts longer than this individual request.
                 if (self.case == .late_write and self.queue_accesses == 5) clock = 500;
             }
@@ -221,7 +223,15 @@ const QueueNative = struct {
         return from(p).quiet;
     }
     fn owner(self: *QueueNative) native.Owner {
-        return .{ .context = self, .generation = generation, .admit = admit, .access = access, .retain = retain, .quiesced = quiesced, .queue_memory = self.memory };
+        return .{ .context = self, .generation = generation, .admit = admit, .access = access, .retain = retain, .quiesced = quiesced, .queue_memory = self.memory, .admit_runtime = if (self.case == .runtime_missing) null else admitRuntime };
+    }
+    fn admitRuntime(p: *anyopaque, boot: *const @import("gsp_boot_events.zig").Boot) anyerror!void {
+        const self = from(p);
+        try t.expect(boot.state == .init_done and boot.pending == null and boot.session.pending == null);
+        try t.expect(boot.session.epoch == self.memory.generation() and self.memory.retained);
+        self.runtime_admissions += 1;
+        if (self.case == .runtime_deny) return error.Dependencies;
+        if (self.case == .runtime_late) clock = boot.deadline;
     }
     fn query(out: *a.GfxDriverMemoryApi) callconv(.c) i32 {
         out.* = .{ .mmio_map = @intFromPtr(&mapWindow), .mmio_unmap = @intFromPtr(&unmapWindow), .collect = @intFromPtr(&collect) };
@@ -291,8 +301,11 @@ fn checkNativeQueue(memory: *@import("gsp_run_memory.zig").Lease, ctx: *const r4
         try port.open(ctx, &snapshot, words[0], 0, run, fixture.owner());
         const io = try port.transportPort();
         var session = try transport.Session.init(io, .{ .chip_id = 0x176 }, epoch, tx, rx);
-        try session.connect(500);
-        if (case == .lost_queue) {
+        const runtime_case = @intFromEnum(case) >= @intFromEnum(QueueNative.Case.runtime);
+        if (!runtime_case) try session.connect(500);
+        if (runtime_case) {
+            try checkRuntimeHandoff(&port, &session, &fixture);
+        } else if (case == .lost_queue) {
             memory.boot_storage.?.mapping.handle += 1;
             const calls = range_calls;
             try t.expectError(error.Stale, session.send(500, .{ .function = 79 }, "native queue fixture"));
@@ -331,6 +344,121 @@ fn checkNativeQueue(memory: *@import("gsp_run_memory.zig").Lease, ctx: *const r4
         try t.expectEqual(@as(u64, 0), io.generation(io.context));
     }
     clock = 100;
+}
+
+fn nativeEvent(session: *transport.Session, function: u32, payload: []const u8) !void {
+    try t.expect(session.pending == null and payload.len < 4000);
+    const status = init.queues_offset + init.status_offset;
+    const cursor = std.mem.readInt(u32, backing.?[status + 16 ..][0..4], .little);
+    const start = status + 4096 + @as(usize, cursor) * 4096;
+    _ = try transport.message.encode(session.profile, session.rx_sequence, .{ .function = function, .result = 0 }, payload, backing.?[start..][0..4096]);
+    std.mem.writeInt(u32, backing.?[status + 16 ..][0..4], (cursor + 1) % 63, .little);
+}
+
+fn checkRuntimeHandoff(port: *QueueNative.native.Port, session: *transport.Session, fixture: *QueueNative) !void {
+    const events = @import("gsp_boot_events.zig");
+    const exchange = @import("gsp_exchange.zig");
+    const native = QueueNative.native;
+    const legacy = try port.sequencer();
+    const command = init.queues_offset + init.command_offset;
+    var boot = try events.Boot.init(session, 500);
+    try t.expectError(error.State, port.handoffBoot(&boot));
+    try t.expect((try boot.poll()) == null);
+    // The successful runtime retains an engaged lockdown through the handoff.
+    if (fixture.case == .runtime) {
+        try nativeEvent(session, 0x101c, &.{1});
+        const notice = (try boot.poll()).?;
+        fixture.lockdown = true;
+        try boot.complete(notice.ticket);
+    }
+    try nativeEvent(session, 0x1001, &.{ 0, 0, 0, 0 });
+    const init_done = (try boot.poll()).?;
+    try t.expect(init_done.event == .init_done);
+    try t.expectError(error.State, port.handoffBoot(&boot)); // Not yet ACKed.
+    try t.expectEqual(@as(usize, 0), fixture.runtime_admissions);
+    try boot.complete(init_done.ticket);
+    try t.expect(fixture.retains == 1 and fixture.memory.retained and port.effects_possible);
+    // Same epoch alone does not identify the native queue/notification port.
+    const saved = session.port;
+    session.port = try fixture.memory.transportPort();
+    try t.expectError(error.Binding, port.handoffBoot(&boot));
+    session.port = saved;
+    try t.expect(boot.state == .init_done and port.phase == .boot and port.failure == null);
+    if (fixture.case == .runtime_missing) {
+        try t.expectError(error.Unsupported, port.handoffBoot(&boot));
+        try t.expect(boot.state == .init_done and port.phase == .boot and fixture.runtime_admissions == 0);
+        return;
+    }
+    if (fixture.case == .runtime_idle_late) {
+        clock = 500;
+        try t.expectError(error.Deadline, port.handoffBoot(&boot));
+        try t.expect(boot.state == .init_done and port.phase == .boot and fixture.runtime_admissions == 0);
+        return;
+    }
+    if (fixture.case == .runtime_deny or fixture.case == .runtime_late) {
+        try t.expectError(if (fixture.case == .runtime_deny) error.Dependencies else error.Deadline, port.handoffBoot(&boot));
+        try t.expect(boot.state == .init_done and port.phase == .boot and fixture.runtime_admissions == 1);
+        try t.expect(port.failure != null and port.runtime_session == null);
+        try t.expectError(error.State, port.handoffBoot(&boot));
+        try t.expectEqual(@as(usize, 1), fixture.runtime_admissions);
+        return;
+    }
+    const window = port.window;
+    const epoch = fixture.memory.generation();
+    var token = try port.handoffBoot(&boot);
+    try t.expectEqualDeep(window, port.window);
+    try t.expectEqual(epoch, fixture.memory.generation());
+    try t.expect(boot.state == .handed_off and token.session == session and !token.claimed);
+    try t.expect(port.phase == .runtime and port.runtime_session == session and port.run.deadline_ns == 1000);
+    try t.expectEqual(@as(usize, 1), fixture.runtime_admissions);
+    var channel = try exchange.Exchange.init(&token, 2000);
+    // Old boot callbacks cannot affect the transferred runtime or reset cores.
+    try t.expectError(error.Phase, port.handoffBoot(&boot));
+    try t.expectError(error.State, boot.poll());
+    try t.expectError(error.Phase, port.transportPort());
+    try t.expectError(error.Phase, legacy.read32(legacy.context, 0));
+    try t.expectError(error.Phase, legacy.write32(legacy.context, native.command_queue_head, 0));
+    try t.expectError(error.Phase, port.stepFirmware());
+    try t.expectError(error.Phase, port.stepColdBoot());
+    try t.expect(port.failure == null and session.state == .active and fixture.retains == 1);
+    clock = 1200; // Beyond BOTH old boot deadlines; runtime request still valid.
+    try channel.begin(79, "native queue fixture", 2000);
+    if (fixture.case == .runtime_stale) {
+        fixture.memory.boot_storage.?.mapping.handle += 1;
+        const calls = range_calls;
+        try t.expectError(error.Stale, channel.poll(2000));
+        try t.expect(range_calls == calls and fixture.queue_accesses == 0);
+        fixture.memory.boot_storage.?.mapping.handle -= 1; // Restore injected corruption.
+        return;
+    }
+    try t.expect(channel.in_lockdown and token.in_lockdown);
+    try t.expect((try channel.poll(2000)) == null);
+    try t.expectEqual(@as(u32, 0), std.mem.readInt(u32, backing.?[command + 16 ..][0..4], .little));
+    try nativeEvent(session, 0x101c, &.{0});
+    const unlock = (try channel.poll(2000)).?;
+    try t.expect(!unlock.response and channel.in_lockdown and fixture.lockdown);
+    try channel.complete(unlock.ticket);
+    fixture.lockdown = false; // Actual host-model handler, only after successful ACK.
+    try t.expect(!channel.in_lockdown and (try channel.poll(2000)) == null);
+    try t.expectEqual(@as(u32, 1), session.tx_sequence);
+    try t.expect(fixture.words[native.command_queue_head / 4] == 0 and fixture.flushes == 1);
+    try nativeEvent(session, 79, "accepted fixture response");
+    const response = (try channel.poll(2000)).?;
+    try t.expect(response.response);
+    try t.expectEqualStrings("accepted fixture response", response.record.payload);
+    try channel.complete(response.ticket);
+    try t.expect(session.pending == null and channel.phase == .idle and port.failure == null);
+    // A new request owns a new finite budget; repeated polls cannot extend it.
+    try channel.begin(80, "native queue fixture", 1500);
+    clock = 1500;
+    const calls = range_calls;
+    const accesses = fixture.queue_accesses;
+    try t.expectError(error.Deadline, channel.poll(9000));
+    try t.expect(range_calls == calls and fixture.queue_accesses == accesses and session.state == .failed);
+    const io = session.port;
+    try t.expectEqual(@as(u64, 0), io.generation(io.context));
+    try t.expectError(error.Stale, io.publish(io.context, 9000, .command, 16, &.{ 0, 0, 0, 0 }));
+    try t.expectEqual(calls, range_calls); // Raw facade cannot revive a failed runtime.
 }
 
 const RangeNotification = struct {
@@ -524,12 +652,12 @@ test "firmware CPU storage complete run lease retains all boot DMA owners" {
     try t.expectEqual(f.device.prepared_plan.?.imem.base, inputs.fwsec.imem.base);
     const port = try lease.transportPort();
     var bytes: [32]u8 = @splat(0x79);
-    try port.read(port.context, .status, 0, &bytes);
+    try port.read(port.context, 1000, .status, 0, &bytes);
     try t.expect(std.mem.allEqual(u8, &bytes, 0));
     const calls = range_calls;
     b.mapping.handle += 1;
     try t.expectEqual(@as(u64, 0), port.generation(port.context));
-    try t.expectError(error.Stale, port.read(port.context, .status, 0, &bytes));
+    try t.expectError(error.Stale, port.read(port.context, 1000, .status, 0, &bytes));
     try t.expect(!lease.releaseBeforeSubmission() and range_calls == calls);
     b.mapping.handle -= 1;
     p.images[1].device.mapping.pin_handle += 1;
@@ -561,7 +689,7 @@ test "firmware CPU storage complete run lease retains all boot DMA owners" {
     try lease.acquire(&ctx, &b, &storage, &f, &s, &p);
     try t.expect(lease.generation() != epoch);
     range_failure = -79;
-    try t.expectError(error.Synchronization, port.read(port.context, .status, 0, &bytes));
+    try t.expectError(error.Synchronization, port.read(port.context, 1000, .status, 0, &bytes));
     try t.expectEqual(@as(u64, 0), lease.generation());
     try t.expect(lease.releaseBeforeSubmission()); // No device submission.
     range_failure = 0;
@@ -628,16 +756,16 @@ test "firmware CPU storage GSP queue lease binds range I/O and retains all backi
         port.notification = .{ .context = &notification, .generation = RangeNotification.generation, .prepare = RangeNotification.prepare, .submit = RangeNotification.submit };
         var bytes: [80]u8 = @splat(0x5a);
         const calls = range_calls;
-        try t.expectError(error.QueueRange, port.read(port.context, .status, init.queue_bytes, bytes[0..1]));
-        try t.expectError(error.QueueRange, port.publish(port.context, .command, 0, bytes[0..0]));
-        try t.expectError(error.QueueRange, port.read(port.context, .command, std.math.maxInt(usize), &bytes));
-        try t.expectError(error.QueueAlias, port.read(port.context, .status, 0, backing.?[0..4]));
-        try t.expectError(error.QueueAlias, port.publish(port.context, .command, 0, backing.?[0..4]));
+        try t.expectError(error.QueueRange, port.read(port.context, 1000, .status, init.queue_bytes, bytes[0..1]));
+        try t.expectError(error.QueueRange, port.publish(port.context, 1000, .command, 0, bytes[0..0]));
+        try t.expectError(error.QueueRange, port.read(port.context, 1000, .command, std.math.maxInt(usize), &bytes));
+        try t.expectError(error.QueueAlias, port.read(port.context, 1000, .status, 0, backing.?[0..4]));
+        try t.expectError(error.QueueAlias, port.publish(port.context, 1000, .command, 0, backing.?[0..4]));
         try t.expectEqual(calls, range_calls);
         const map_handle = storage.pieces[6].mapping.handle;
         storage.pieces[6].mapping.handle += 1;
         try t.expectEqual(@as(u64, 0), port.generation(port.context));
-        try t.expectError(error.QueueClosed, port.read(port.context, .status, 0, &bytes));
+        try t.expectError(error.QueueClosed, port.read(port.context, 1000, .status, 0, &bytes));
         storage.pieces[6].mapping.handle = map_handle;
         const device = if (case == .bounce) shadow else backing.?;
         const command = init.queues_offset + init.command_offset;
@@ -676,16 +804,16 @@ test "firmware CPU storage GSP queue lease binds range I/O and retains all backi
         storage.device_access = false; // Fixture only; no GPU ever submitted.
         range_failure = -123;
         @memset(&bytes, 0x5a);
-        try t.expectError(error.Synchronization, port.read(port.context, .status, 0, &bytes));
+        try t.expectError(error.Synchronization, port.read(port.context, 1000, .status, 0, &bytes));
         try t.expectEqual(@as(i32, -123), lease.last_status);
         try t.expect(std.mem.allEqual(u8, &bytes, 0x5a));
         try t.expect(!lease.retainForDevice());
-        try t.expectError(error.QueueClosed, port.publish(port.context, .command, 16, bytes[0..4]));
+        try t.expectError(error.QueueClosed, port.publish(port.context, 1000, .command, 16, bytes[0..4]));
         try t.expect(!storage.close());
         range_failure = 0;
         try t.expect(lease.releaseBeforeSubmission());
         try t.expectEqual(@as(u64, 0), port.generation(port.context));
-        try t.expectError(error.QueueClosed, port.read(port.context, .status, 0, &bytes));
+        try t.expectError(error.QueueClosed, port.read(port.context, 1000, .status, 0, &bytes));
         closing = true;
         try t.expect(storage.close());
         try t.expect(backing == null and !any(&maps) and !any(&pins));

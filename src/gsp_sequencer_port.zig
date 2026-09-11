@@ -104,10 +104,13 @@ const core = @import("gsp_core.zig");
 const firmware_run = @import("falcon_run.zig");
 const transport = @import("gsp_transport.zig");
 const run_memory = @import("gsp_run_memory.zig");
+const events = @import("gsp_boot_events.zig");
 // Bare-metal RM queue 0, NV_PGSP_QUEUE_HEAD(0). This is not SWGEN0 or a
 // virtual-function doorbell. The memory cursor is published separately.
 pub const command_queue_head: u32 = 0x110c00;
 pub const Access = enum { read, write };
+pub const Phase = enum { boot, runtime };
+const Scope = union(enum) { boot: void, request: u64 };
 pub const Owner = struct {
     context: *anyopaque,
     generation: *const fn (*anyopaque) u64,
@@ -139,6 +142,10 @@ pub const Owner = struct {
     // its API and epoch must match this port, and every access rechecks it.
     // The native owner still admits firmware readiness/lockdown/reset state.
     queue_memory: ?*run_memory.Lease = null,
+    // Pure admission of the actual same-run bootstrap and recovery bindings
+    // before leaving boot. The Boot passed here already handled/ACKed INIT_DONE.
+    // No callback or timer may manufacture firmware readiness from elapsed time.
+    admit_runtime: ?*const fn (*anyopaque, *const events.Boot) anyerror!void = null,
 };
 pub const Run = struct { epoch: u64, deadline_ns: u64, resume_args: ?core.Resume = null };
 pub const Port = struct {
@@ -162,6 +169,8 @@ pub const Port = struct {
     cold_command: ?core.Cold = null,
     cold_admitted: bool = false,
     core_phase: u32 = 0,
+    phase: Phase = .boot,
+    runtime_session: ?*transport.Session = null,
 
     /// Stable address, serialized init/Driver Work owner; not an IRQ callback
     /// or a dedicated task. Failure retains any partially returned mapping.
@@ -219,46 +228,78 @@ pub const Port = struct {
     /// sole Session owns it; passive probing never opens or calls this path.
     /// This does not renew the native run's deadline or establish RM readiness.
     pub fn transportPort(self: *Port) !transport.Port {
-        _ = try self.queueMemory();
+        try self.guard();
+        _ = try self.queueMemory(self.run.deadline_ns);
+        return self.boundTransport();
+    }
+    fn boundTransport(self: *Port) transport.Port {
         return .{ .context = self, .generation = generation, .now_ns = nowNs, .read = queueRead, .publish = queuePublish, .notification = .{ .context = self, .generation = generation, .prepare = prepareCommand, .submit = notifyCommand } };
     }
-    fn queueMemory(self: *Port) !*run_memory.Lease {
+    fn runtimeValid(self: *Port) bool {
+        if (self.phase != .runtime) return true;
+        const session = self.runtime_session orelse return false;
+        return session.state == .active and session.epoch == self.run.epoch and std.meta.eql(session.port, self.boundTransport());
+    }
+    /// Commit the one-way boot -> runtime transition only for the actual
+    /// bound Session after INIT_DONE and its ACK. No allocation, remapping,
+    /// new queue epoch, renewed boot deadline or release of backing occurs.
+    /// Return the same sole runtime token used by the RM object/exchange owner.
+    pub fn handoffBoot(self: *Port, boot: *events.Boot) !events.Handoff {
+        if (self.phase != .boot) return error.Phase;
         try self.guard();
+        if (!std.meta.eql(boot.session.port, try self.transportPort()) or boot.session.epoch != self.run.epoch) return error.Binding;
+        if (boot.state != .init_done or boot.pending != null or boot.session.pending != null or boot.session.state != .active) return error.State;
+        const admit_runtime = self.owner.?.admit_runtime orelse return error.Unsupported;
+        errdefer |err| self.failure = err;
+        const deadline = @min(boot.deadline, self.run.deadline_ns);
+        const memory = try self.queueMemory(deadline);
+        if (!self.retained or !memory.retained or !self.effects_possible) return error.State;
+        try admit_runtime(self.owner.?.context, boot);
+        _ = try self.queueMemory(deadline);
+        const handoff = try boot.handoff(deadline);
+        // Everything fallible completed while boot still owned the deadline.
+        self.runtime_session = boot.session;
+        self.phase = .runtime;
+        return handoff;
+    }
+    fn queueMemory(self: *Port, deadline: u64) !*run_memory.Lease {
+        try self.guardFor(.{ .request = deadline });
         if (!self.ready) return error.State;
         if (self.operation != null or self.firmware_operation != null or self.cold_command != null) return error.Busy;
-        return self.owner.?.queue_memory orelse error.Unsupported;
+        const memory = self.owner.?.queue_memory orelse return error.Unsupported;
+        if (self.phase == .runtime and (self.runtime_session == null or !self.retained or !memory.retained)) return error.State;
+        return memory;
     }
-    fn queueRead(p: *anyopaque, queue: transport.ring.Queue, offset: usize, bytes: []u8) anyerror!void {
+    fn queueRead(p: *anyopaque, deadline: u64, queue: transport.ring.Queue, offset: usize, bytes: []u8) anyerror!void {
         const self = cast(p);
         errdefer |err| self.failure = err;
-        const memory = try self.queueMemory();
+        const memory = try self.queueMemory(deadline);
         const port = try memory.transportPort();
-        try port.read(port.context, queue, offset, bytes);
-        try self.guard();
+        try port.read(port.context, deadline, queue, offset, bytes);
+        try self.guardFor(.{ .request = deadline });
     }
-    fn queuePublish(p: *anyopaque, queue: transport.ring.Queue, offset: usize, bytes: []const u8) anyerror!void {
+    fn queuePublish(p: *anyopaque, deadline: u64, queue: transport.ring.Queue, offset: usize, bytes: []const u8) anyerror!void {
         const self = cast(p);
         errdefer |err| self.failure = err;
-        const memory = try self.queueMemory();
+        const memory = try self.queueMemory(deadline);
         // ACK publication can be the first effect too. It needs retention,
         // but does not ring the command queue notification register.
-        try self.retain();
+        try self.retainFor(.{ .request = deadline });
         const port = try memory.transportPort();
-        try port.publish(port.context, queue, offset, bytes);
-        try self.guard();
+        try port.publish(port.context, deadline, queue, offset, bytes);
+        try self.guardFor(.{ .request = deadline });
     }
     fn commandAdmission(self: *Port, deadline: u64) !void {
-        _ = try self.queueMemory();
-        if (deadline == std.math.maxInt(u64) or deadline <= self.last_clock or deadline > self.run.deadline_ns) return error.Deadline;
-        try self.access(.write, command_queue_head);
-        try self.access(.read, 0); // Required BOOT0 flush, admitted before TX.
-        if (deadline <= self.last_clock) return error.Deadline;
+        _ = try self.queueMemory(deadline);
+        const scope: Scope = .{ .request = deadline };
+        try self.accessFor(scope, .write, command_queue_head);
+        try self.accessFor(scope, .read, 0); // Required BOOT0 flush, admitted before TX.
     }
     fn prepareCommand(p: *anyopaque, deadline: u64) anyerror!void {
         const self = cast(p);
         errdefer |err| self.failure = err;
         try self.commandAdmission(deadline);
-        try self.retain();
+        try self.retainFor(.{ .request = deadline });
         try self.commandAdmission(deadline);
     }
     fn notifyCommand(p: *anyopaque, deadline: u64) anyerror!void {
@@ -266,10 +307,9 @@ pub const Port = struct {
         errdefer |err| self.failure = err;
         try self.commandAdmission(deadline);
         if (!self.retained) return error.State;
-        // write() fences prior DMA/cursor publication, performs the exact
+        // writeFor() fences prior DMA/cursor publication, performs the exact
         // 32-bit zero write, then flushes PCI posted writes through BOOT0.
-        try self.writeWithin(command_queue_head, 0, deadline);
-        if (deadline <= self.last_clock) return error.Deadline;
+        try self.writeFor(.{ .request = deadline }, command_queue_head, 0);
     }
     pub fn beginFirmware(self: *Port, options: firmware_run.Options) !void {
         try self.guard();
@@ -306,6 +346,7 @@ pub const Port = struct {
     /// and only means prepared or RISC-V ACTIVE; boot notifications must still
     /// establish RM_INIT_DONE. Failures preserve the operation and raw state.
     pub fn stepColdBoot(self: *Port) !bool {
+        if (self.phase != .boot) return error.Phase;
         errdefer |err| self.failure = err;
         try self.guard();
         const command = self.cold_command orelse return error.State;
@@ -334,6 +375,7 @@ pub const Port = struct {
     /// generic runs return raw mailboxes. All DMA and this mapping stay held.
     /// Neither result establishes GSP readiness or device quiescence.
     pub fn stepFirmware(self: *Port) !?firmware_run.Result {
+        if (self.phase != .boot) return error.Phase;
         errdefer |err| self.failure = err;
         try self.guard();
         const operation = if (self.firmware_operation) |*op| op else return error.State;
@@ -355,7 +397,7 @@ pub const Port = struct {
     }
     fn generation(p: *anyopaque) u64 {
         const self = cast(p);
-        if (self.self_address != @intFromPtr(self) or !self.ready or self.failure != null or !self.mappingValid()) return 0;
+        if (self.self_address != @intFromPtr(self) or !self.ready or self.failure != null or !self.mappingValid() or !self.runtimeValid()) return 0;
         const owner = self.owner orelse return 0;
         if (owner.queue_memory) |memory| {
             if (memory.generation() != self.run.epoch) return 0;
@@ -368,8 +410,12 @@ pub const Port = struct {
         return self.clock.?.nowNs();
     }
     fn guard(self: *Port) !void {
+        return self.guardFor(.boot);
+    }
+    fn guardFor(self: *Port, scope: Scope) !void {
+        if (scope == .boot and self.phase != .boot) return error.Phase;
         if (self.self_address != @intFromPtr(self) or self.failure != null or self.owner == null or self.clock == null) return error.State;
-        if (!self.mappingValid()) return error.Stale;
+        if (!self.mappingValid() or !self.runtimeValid()) return error.Stale;
         const owner = self.owner.?;
         if (owner.generation(owner.context) != self.run.epoch) return error.Stale;
         if (owner.queue_memory) |memory| {
@@ -378,17 +424,24 @@ pub const Port = struct {
         const now = self.clock.?.nowNs();
         if (now == std.math.maxInt(u64) or now < self.last_clock) return error.Clock;
         self.last_clock = now;
-        if (now >= self.run.deadline_ns) return error.Deadline;
+        const deadline = switch (scope) {
+            .boot => self.run.deadline_ns,
+            .request => |limit| blk: {
+                if (self.phase == .boot and limit > self.run.deadline_ns) return error.Deadline;
+                break :blk limit;
+            },
+        };
+        if (deadline == std.math.maxInt(u64) or now >= deadline) return error.Deadline;
     }
     fn mappingValid(self: *const Port) bool {
         return self.shared.owner == null or (self.shared.valid() and std.meta.eql(self.window, self.shared.stamp));
     }
-    fn access(self: *Port, kind: Access, offset: u32) !void {
-        try self.guard();
+    fn accessFor(self: *Port, scope: Scope, kind: Access, offset: u32) !void {
+        try self.guardFor(scope);
         if (!self.supports(kind, offset)) return error.Register;
         const owner = self.owner.?;
         try owner.access(owner.context, kind, offset);
-        try self.guard();
+        try self.guardFor(scope);
     }
     fn supports(self: *const Port, kind: Access, offset: u32) bool {
         if (!self.ready or self.window.byte_length < 4 or offset % 4 != 0 or offset > self.window.byte_length - 4) return false;
@@ -430,37 +483,44 @@ pub const Port = struct {
         return @ptrFromInt(self.window.cpu_address + offset);
     }
     fn read(self: *Port, offset: u32) !u32 {
+        return self.readFor(.boot, offset);
+    }
+    fn readFor(self: *Port, scope: Scope, offset: u32) !u32 {
+        if (scope == .boot and self.phase != .boot) return error.Phase;
         errdefer |err| self.failure = err;
-        try self.access(.read, offset);
+        try self.accessFor(scope, .read, offset);
         fence();
         const value = self.pointer(offset).*;
         fence();
-        try self.guard();
+        try self.guardFor(scope);
         return value;
     }
     fn retain(self: *Port) !void {
+        return self.retainFor(.boot);
+    }
+    fn retainFor(self: *Port, scope: Scope) !void {
         if (self.retained) return;
         self.effects_possible = true; // Before a possibly partial callback.
         const owner = self.owner.?;
         if (owner.queue_memory) |memory| try memory.retainForDevice();
         try owner.retain(owner.context);
         self.retained = true;
-        try self.guard();
+        try self.guardFor(scope);
     }
     fn write(self: *Port, offset: u32, value: u32) !void {
-        return self.writeWithin(offset, value, self.run.deadline_ns);
+        return self.writeFor(.boot, offset, value);
     }
-    fn writeWithin(self: *Port, offset: u32, value: u32, deadline: u64) !void {
+    fn writeFor(self: *Port, scope: Scope, offset: u32, value: u32) !void {
+        if (scope == .boot and self.phase != .boot) return error.Phase;
         errdefer |err| self.failure = err;
-        try self.access(.write, offset);
-        try self.access(.read, 0); // Admit the mandatory flush before the write.
-        try self.retain();
-        try self.access(.write, offset);
-        if (deadline <= self.last_clock) return error.Deadline;
+        try self.accessFor(scope, .write, offset);
+        try self.accessFor(scope, .read, 0); // Admit mandatory flush before write.
+        try self.retainFor(scope);
+        try self.accessFor(scope, .write, offset);
         fence();
         self.pointer(offset).* = value;
         fence();
-        if (try self.read(0) != self.boot0) return error.IdentityChanged;
+        if (try self.readFor(scope, 0) != self.boot0) return error.IdentityChanged;
     }
     fn read32(p: *anyopaque, offset: u32) anyerror!u32 {
         return cast(p).read(offset);
@@ -486,6 +546,7 @@ pub const Port = struct {
     }
     fn coreStep(p: *anyopaque, opcode: seq.Opcode, state: *seq.CoreState, deadline: u64, _: *const [8]u32) anyerror!bool {
         const self = cast(p);
+        if (self.phase != .boot) return error.Phase;
         errdefer |err| self.failure = err;
         try self.guard();
         if (self.firmware_operation != null or self.cold_command != null) return error.Busy;

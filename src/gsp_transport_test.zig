@@ -53,16 +53,18 @@ const Model = struct {
         if (self.count == self.change_epoch) self.epoch += 1;
         if (self.count == self.fault and self.after) return error.PortFailure;
     }
-    fn read(context: *anyopaque, queue: ring.Queue, offset: usize, output: []u8) !void {
+    fn read(context: *anyopaque, limit: u64, queue: ring.Queue, offset: usize, output: []u8) !void {
         const self = ptr(context);
+        try t.expect(self.now < limit and limit != std.math.maxInt(u64));
         const index = @intFromEnum(queue);
         try self.record(false, queue, offset, output.len);
         @memcpy(self.cpu[index][offset..][0..output.len], self.peer[index][offset..][0..output.len]);
         @memcpy(output, self.cpu[index][offset..][0..output.len]);
         try self.finish();
     }
-    fn publish(context: *anyopaque, queue: ring.Queue, offset: usize, input: []const u8) !void {
+    fn publish(context: *anyopaque, limit: u64, queue: ring.Queue, offset: usize, input: []const u8) !void {
         const self = ptr(context);
+        try t.expect(self.now < limit and limit != std.math.maxInt(u64));
         const index = @intFromEnum(queue);
         try self.record(true, queue, offset, input.len);
         @memcpy(self.cpu[index][offset..][0..input.len], input);

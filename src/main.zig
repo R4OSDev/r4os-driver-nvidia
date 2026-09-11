@@ -740,11 +740,11 @@ fn stageBootInit(ctx: *const r4os.r4dev.DriverContext, chip_id: u16) bool {
     if (before == std.math.maxInt(u64) or before >= init_storage.deadline) return false;
     var command: [32]u8 = undefined;
     var status: [32]u8 = undefined;
-    port.read(port.context, .command, 0, &command) catch |err| {
+    port.read(port.context, init_storage.deadline, .command, 0, &command) catch |err| {
         log("NVIDIA boot-init: rejected phase=command-header reason={s} status={d} submitted=no", .{ @errorName(err), run_memory.queue.last_status });
         return false;
     };
-    port.read(port.context, .status, 0, &status) catch |err| {
+    port.read(port.context, init_storage.deadline, .status, 0, &status) catch |err| {
         log("NVIDIA boot-init: rejected phase=status-header reason={s} status={d} submitted=no", .{ @errorName(err), run_memory.queue.last_status });
         return false;
     };

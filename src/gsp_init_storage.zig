@@ -266,14 +266,16 @@ pub const QueueLease = struct {
             return error.Synchronization;
         }
     }
-    fn portRead(context: *anyopaque, queue: transport.ring.Queue, offset: usize, output: []u8) Error!void {
+    // This leaf performs one bounded range sync. Session/native facade own
+    // deadline checks before/after it; the Kernel callback is not abortable.
+    fn portRead(context: *anyopaque, _: u64, queue: transport.ring.Queue, offset: usize, output: []u8) Error!void {
         const self = from(context);
         const start = try self.offsetFor(queue, offset, output.len, output);
         try self.sync(start, output.len, true);
         const pointer: [*]const u8 = @ptrFromInt(self.owner.?.allocation.cpu_address + init.queues_offset + start);
         @memcpy(output, pointer[0..output.len]);
     }
-    fn portPublish(context: *anyopaque, queue: transport.ring.Queue, offset: usize, input: []const u8) Error!void {
+    fn portPublish(context: *anyopaque, _: u64, queue: transport.ring.Queue, offset: usize, input: []const u8) Error!void {
         const self = from(context);
         const start = try self.offsetFor(queue, offset, input.len, input);
         const pointer: [*]u8 = @ptrFromInt(self.owner.?.allocation.cpu_address + init.queues_offset + start);

@@ -1,5 +1,11 @@
 ﻿# Third-Party Notices
 
+GSP runtime handoff (0.79.10, 2026-09-11):
+Original R4OS phase/ownership/deadline code, Apache-2.0. No new wire format
+or register. Eight full pinned originals and all existing source MIT notices
+retained under runtime-handoff-20260911. Product R4D/resources byte-identical.
+
+
 GSP queue notification/source ownership (0.79.10, 2026-09-11):
 Four complete original NVIDIA MIT notices in gsp_sequencer_port.zig cover
 kernel_gsp.c, kernel_gsp_tu102.c, GA102/dev_gsp.h and message_queue.h.

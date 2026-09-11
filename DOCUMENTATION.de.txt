@@ -10,6 +10,33 @@ unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
 
+GSP-Uebergabe vom Boot in den Betrieb (Quellvorbereitung, 11.09.2026)
+----------------------------------------------------------------
+Der native Port uebergibt dieselbe Session erst nach verarbeitetem und
+bestaetigtem INIT_DONE, vollstaendiger Speicherbindung und nativer Zulassung.
+BAR0, DMA, Queue-Epoche, Zaehler und Lockdown bleiben erhalten. Jeder Queue-
+Callback erhaelt die feste Frist seines Vorgangs. Spaetere RM-Anfragen
+duerfen nach Ablauf der alten Boot-Frist laufen; diese wird nicht erneuert.
+Alte Boot-Aufrufe koennen den uebergebenen Betrieb weder zuruecksetzen noch
+stoppen. Eine fehlgeschlagene oder umgebundene Runtime-Session macht auch
+ihre native Queue-Fassade ungueltig; laengere Fristen beleben sie nicht neu.
+
+51 bestehende Faelle bestanden, inklusive Boot/INIT_DONE/ACK und Anfrage-
+Antwort ueber den nativen Port und gsp_exchange nach beiden alten Boot-
+Fristen. Fremde, offene, ununterstuetzte, abgelehnte und verspaetete Uebergabe,
+Lockdown, Epochenverlust und Fristverlaengerung werden geprueft. Ein Modulbuild
+bestaetigt NVIDIA0.1.44 vollstaendig bytegleich. Anfaenglicher Typvergleich
+und Status der simulierten INIT_DONE-Antwort korrigiert; alle Logs erhalten.
+Keine neuen Faelle/Gates/Gastlaeufe. Acht unveraenderte gepinnte Originale:
+ExFiles/Reference/GFX/Nvidia/0.79.10/runtime-handoff-20260911. Beleg:
+runtime_handoff_checkpoint in GrafikFirmware07910.json.
+
+Runtime weiterhin nur hostseitig eingebunden. Der passive Einstieg reicht
+seine vorhandene Frist an dieselben zwei Staging-Lesezugriffe weiter. Echter
+Boot-/Phasenbesitzer, Runtime-Sequencer-/Notification-Handler, vollstaendige
+Recovery und physische Grafik-/Audioabnahme bleiben offen. OssiPC bleibt
+offline/unberuehrt; keine neue Hardware- oder Firmwarebereitschaftsabnahme.
+
 GSP-Queue-Benachrichtigung (Quellvorbereitung fuer0.79.10, 11.09.2026)
 -----------------------------------------------------------------
 Senden verlangt nun eine ausdruecklich gebundene Benachrichtigung. Queue

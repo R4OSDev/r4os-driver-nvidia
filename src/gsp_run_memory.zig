@@ -223,20 +223,20 @@ pub const Lease = struct {
         if (self.generation() == 0) return std.math.maxInt(u64);
         return self.init_storage.?.clock.?.nowNs();
     }
-    fn portRead(p: *anyopaque, queue: transport.ring.Queue, offset: usize, out: []u8) anyerror!void {
+    fn portRead(p: *anyopaque, deadline: u64, queue: transport.ring.Queue, offset: usize, out: []u8) anyerror!void {
         const self = from(p);
         if (self.generation() == 0) return error.Stale;
         const port = self.queue.port();
-        port.read(port.context, queue, offset, out) catch |err| {
+        port.read(port.context, deadline, queue, offset, out) catch |err| {
             self.failed = true;
             return err;
         };
     }
-    fn portPublish(p: *anyopaque, queue: transport.ring.Queue, offset: usize, bytes: []const u8) anyerror!void {
+    fn portPublish(p: *anyopaque, deadline: u64, queue: transport.ring.Queue, offset: usize, bytes: []const u8) anyerror!void {
         const self = from(p);
         if (self.generation() == 0) return error.Stale;
         const port = self.queue.port();
-        port.publish(port.context, queue, offset, bytes) catch |err| {
+        port.publish(port.context, deadline, queue, offset, bytes) catch |err| {
             self.failed = true;
             return err;
         };

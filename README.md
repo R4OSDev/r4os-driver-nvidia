@@ -10,6 +10,31 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
+GSP boot/runtime handoff (source preparation for0.79.10, 2026-09-11):
+
+The native port now transfers the exact Session into runtime only after
+processed/ACKed INIT_DONE, complete retention and explicit native admission.
+The same BAR0/DMA/queue epoch, cursors and lockdown survive. Every queue
+callback carries its finite operation deadline; runtime requests may run
+after the original boot deadline without extending or replacing that limit.
+Old boot callbacks cannot reset or poison the transferred runtime. A failed
+or rebound runtime Session invalidates its native queue facade as well.
+
+51 existing cases pass, including an actual host Boot -> native handoff ->
+gsp_exchange request/reply after both old boot deadlines. Foreign/pending/
+missing/denied/late handoffs, lockdown, epoch loss and deadline renewal are
+covered. One module build proves the entire NVIDIA0.1.44 R4D unchanged.
+Initial pointer-type and synthetic INIT_DONE status errors were corrected;
+both successful and failed logs are archived. No new test case/gate/guest.
+
+Eight unchanged pinned originals accompany runtime-handoff-20260911 under
+ExFiles/Reference/GFX/Nvidia/0.79.10. See runtime_handoff_checkpoint in
+Docs/Drivers/GrafikFirmware07910.json. Runtime executor remains host-linked;
+passive main only passes its existing deadline to its two staging reads.
+Real native boot/phase admission, runtime CPU-sequencer and notification
+handlers, complete recovery and physical graphics/audio remain open.
+OssiPC remains offline/untouched; no hardware or firmware-ready claim.
+
 GSP queue notification (source preparation for0.79.10, 2026-09-11):
 
 The transport now requires an explicit notification for sending. It checks
