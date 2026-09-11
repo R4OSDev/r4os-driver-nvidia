@@ -9,6 +9,35 @@ Boardanschluesse. Die spaeteren PROM-Boots bestaetigen softwareseitig den
 unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
+GSP-Initialisierungsdaten (Host; NVIDIA 0.1.23 unveraendert)
+---------------------------------------------------------
+gsp_init.zig kodiert fuer den gepinnten normalen GA106-Erststart Libos-
+Argumente, RM-Argumente, fuenf 64-KB-Logbereiche und zwei 256-KB-Queues.
+Der caller-eigene Gesamtpuffer ist 864256 Bytes (844 KB) gross. Libos
+belegt eine Seite mit sechs 32-Byte-Eintraegen, RM eine Seite mit seinem
+originalen 72-Byte-Typ. LOGINIT muss zuerst stehen; danach folgen LOGINTR,
+LOGRM, LOGMNOC, LOGKRNL und RMARGS. id8 ist ein numerisch aufgebauter Tag,
+keine ungepruefte ASCII-Kopie. Jeder Logbereich beginnt mit leerem Put-Zeiger
+und den 16 wirklichen physischen Seitenadressen.
+
+Die Queue-Abbildung umfasst 129 Seiten einschliesslich ihrer eigenen
+Seitentabelle. Beide Queues haben 63 Slots, davon 62 nutzbar. Nur der CPU-
+Commandheader wird initialisiert; Statusheader und Nutzdaten bleiben null.
+Das Swap-RX-Bit fordert die Aushandlung an, bestaetigt sie aber noch nicht.
+Alle Groessen, 49-Bit-Spannen, Ausrichtungen und Ueberlappungen werden vor
+der ersten Ausgabeaenderung geprueft. Fremde gehaltene Bootspannen koennen
+ausgeschlossen werden. Queue-Spannen duerfen verteilt sein, Logs/Argumente
+muessen zusammenhaengen. PM/Profiler/GPU-Instanz bleiben null; der originale
+Default verwendet den DMEM-Stack. Speicherbesitz/Synchronisierung fehlen noch.
+
+39/39 bestehende Besitzerfaelle bestanden, darunter ein neuer gemeinsamer
+Fall mit 14 ungueltigen Bindungen, kompletter Nullfuellung und aliassicherer
+Eingabeaufnahme. Die bestehende ABI-Probe vergleicht alle 844 KB mit den
+originalen C-Typen und fuehrt NVIDIAs msgqInit/msgqTxCreate nur am Host aus.
+inspect-gsp-layout besteht mit 3/3 Schritten und meldet die Anforderungen
+ohne erfundene DMA-Adressen. Kein neuer Testdatei-/Gate-/Gastlauf, Modulbau
+oder Hardwarekontakt. Der folgende OssiPC-Stand bleibt unveraendert.
+
 Bootressourcen und gemeinsamer Speicher im Modul 0.1.23
 ------------------------------------------------------
 OPTION NVIDIA mode=boot-check fuehrt nach der aktuellen GA106-/FWSEC-

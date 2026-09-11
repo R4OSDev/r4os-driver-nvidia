@@ -14,6 +14,18 @@ their original licenses in the separate workspace reference archive.
 Fixture firmware bodies and signatures are synthetic; selected measured table
 metadata is regression data documented in PROVENANCE.txt.
 
+The subsequent host-only `gsp_init.zig` adapts first-boot field assignment
+from the same pinned NVIDIA Libos/RM initialization and message-queue sources.
+It retains the complete NVIDIA MIT notice and copyright lines for
+libos_init_args.h (2018-2022), gsp_init_args.h (2020-2024), kernel_gsp.c and
+message_queue_cpu.c (2019-2024), message_queue_priv.h (2019-2022), and
+msgq.c/msgq_priv.h (2018-2019). Original R4OS validation is Apache-2.0.
+The existing optional ABI verifier now compiles the original msgq implementation
+against its unchanged headers and compares the complete initialized image.
+All full original sources/notices accompany the separate gsp-init-20260911
+archive. This host preparation adds no code, firmware or license resource
+to NVIDIA.R4D 0.1.23; it does not change Distribution's packaged notices.
+
 Module 0.1.23 links the MIT-attributed layout and WPR metadata code described
 below. It adds the byte-identical 24-KB production GA102 boot image and its
 84-byte descriptor exported from the pinned original generated source

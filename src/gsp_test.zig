@@ -5,6 +5,141 @@ const layout = @import("gsp_layout.zig");
 const preflight = @import("fwsec_state.zig");
 const radix = @import("gsp_radix.zig");
 const wpr = @import("gsp_wpr.zig");
+const init = @import("gsp_init.zig");
+
+test "GSP initialization encodes self-mapped queues and ordered Libos logs without partial output" {
+    const output = try t.allocator.alignedAlloc(u8, comptime std.mem.Alignment.fromByteUnits(8), init.output_bytes);
+    defer t.allocator.free(output);
+    const queues = [_]init.Span{
+        .{ .address = 0xa00000000, .bytes = 4096 },
+        .{ .address = 0xb00000000, .bytes = 65536 },
+        .{ .address = 0xc00000000, .bytes = 112 * 4096 },
+    };
+    var good: init.Bindings = .{
+        .chip_id = 0x176,
+        .libos = .{ .address = 0x900000000, .bytes = 4096 },
+        .rm = .{ .address = 0x900001000, .bytes = 4096 },
+        .logs = undefined,
+        .queues = &queues,
+        .excluded = &.{.{ .address = 0xd00000000, .bytes = 65536 }},
+    };
+    for (&good.logs, 0..) |*span, i| span.* = .{ .address = 0x910000000 + i * 0x20000, .bytes = 65536 };
+    const report = try init.encode(&good, output);
+    try t.expectEqual(@as(usize, 864256), output.len);
+    try t.expectEqual(@as(u64, 0xa00000000), report.queues_address);
+    try t.expectEqual(@as(usize, 129), report.queue_page_count);
+    try t.expectEqual(@as(u64, 0x4c4f47494e4954), word(output, 0)); // LOGINIT numeric id, not an ASCII byte copy.
+    for (good.logs, 0..) |span, i| {
+        try t.expectEqual(span.address, word(output, i * 32 + 8));
+        try t.expectEqual(@as(u64, 65536), word(output, i * 32 + 16));
+        try t.expectEqualSlices(u8, &.{ 1, 1, 0, 0, 0, 0, 0, 0 }, output[i * 32 + 24 ..][0..8]);
+        const log = output[init.logs_offset + i * init.log_bytes ..][0..init.log_bytes];
+        try t.expectEqual(@as(u64, 0), word(log, 0));
+        for (0..16) |page| try t.expectEqual(span.address + page * 4096, word(log, 8 + page * 8));
+        try t.expect(std.mem.allEqual(u8, log[136..], 0));
+    }
+    try t.expectEqual(@as(u64, 0x524d41524753), word(output, 5 * 32));
+    try t.expectEqual(good.rm.address, word(output, 5 * 32 + 8));
+    try t.expect(std.mem.allEqual(u8, output[6 * 32 .. 4096], 0));
+    const rm = output[init.rm_offset..][0..4096];
+    try t.expectEqual(report.queues_address, word(rm, 0));
+    try t.expectEqual(@as(u64, 129), word(rm, 8));
+    try t.expectEqual(@as(u64, 4096), word(rm, 16));
+    try t.expectEqual(@as(u64, 0x41000), word(rm, 24));
+    try t.expect(std.mem.allEqual(u8, rm[32..48], 0));
+    try t.expectEqual(@as(u8, 1), rm[48]);
+    try t.expect(std.mem.allEqual(u8, rm[49..], 0));
+    const queue = output[init.queues_offset..];
+    try t.expectEqual(queues[0].address, word(queue, 0));
+    try t.expectEqual(queues[1].address, word(queue, 8));
+    try t.expectEqual(queues[2].address, word(queue, 17 * 8));
+    try t.expectEqual(queues[2].address + 111 * 4096, word(queue, 128 * 8));
+    try t.expect(std.mem.allEqual(u8, queue[129 * 8 .. 4096], 0));
+    const header = queue[init.command_offset..][0..32];
+    const expected = [_]u32{ 0, 262144, 4096, 63, 0, 1, 32, 4096 };
+    for (expected, 0..) |value, i| try t.expectEqual(value, std.mem.readInt(u32, header[i * 4 ..][0..4], .little));
+    // Includes the status header: no fabricated firmware-side queue/ready state.
+    try t.expect(std.mem.allEqual(u8, queue[4096 + 32 ..], 0));
+    @memset(output, 0xa5);
+    for (0..14) |case| {
+        var input = good;
+        var spans = queues;
+        input.queues = &spans;
+        const failure: anyerror = switch (case) {
+            0 => blk: {
+                input.chip_id = 0x174;
+                break :blk error.Profile;
+            },
+            1 => blk: {
+                input.libos.bytes = 8192;
+                break :blk error.Size;
+            },
+            2 => blk: {
+                input.logs[4].bytes = 32768;
+                break :blk error.Size;
+            },
+            3 => blk: {
+                input.rm.address = 0;
+                break :blk error.Address;
+            },
+            4 => blk: {
+                input.logs[0].address = radix.dma_mask - 4095;
+                break :blk error.Address;
+            },
+            5 => blk: {
+                input.libos.address += 1;
+                break :blk error.Alignment;
+            },
+            6 => blk: {
+                input.rm.address = input.libos.address;
+                break :blk error.Overlap;
+            },
+            7 => blk: {
+                input.logs[4].address = input.logs[0].address + 4096;
+                break :blk error.Overlap;
+            },
+            8 => blk: {
+                spans[2].address = spans[1].address;
+                break :blk error.Overlap;
+            },
+            9 => blk: {
+                spans[1].address = input.logs[0].address;
+                break :blk error.Overlap;
+            },
+            10 => blk: {
+                input.excluded = &.{.{ .address = spans[2].address + spans[2].bytes - 4096, .bytes = 4096 }};
+                break :blk error.Overlap;
+            },
+            11 => blk: {
+                spans[2].bytes -= 4096;
+                break :blk error.Size;
+            },
+            12 => blk: {
+                spans[2].bytes += 4096;
+                break :blk error.Size;
+            },
+            else => blk: {
+                spans[0].bytes -= 1;
+                break :blk error.Alignment;
+            },
+        };
+        try t.expectError(failure, init.encode(&input, output));
+        try t.expect(std.mem.allEqual(u8, output, 0xa5));
+    }
+    var bad = good;
+    bad.queues = &.{};
+    try t.expectError(error.Segments, init.encode(&bad, output));
+    try t.expectError(error.Size, init.encode(&good, output[1..]));
+    try t.expect(std.mem.allEqual(u8, output, 0xa5));
+    // The small input description may share caller storage: encoding completes
+    // validation and snapshots all values before clearing any destination byte.
+    const alias: *[3]init.Span = @ptrCast(@alignCast(output.ptr));
+    alias.* = queues;
+    var aliased = good;
+    aliased.queues = alias;
+    _ = try init.encode(&aliased, output);
+    try t.expectEqual(@as(u64, 0xc00000000), word(output, init.queues_offset + 17 * 8));
+}
 
 fn word(bytes: []const u8, offset: usize) u64 {
     return std.mem.readInt(u64, bytes[offset..][0..8], .little);

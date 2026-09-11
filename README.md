@@ -47,6 +47,28 @@ cleanup succeeded. Bootfb remained 800x600 at generation 1/reset 0; all
 inventory and unique runtime records establish the update; no separate
 installed-module download or fresh visible-image/audio acceptance was made.
 
+The next host preparation, `gsp_init.zig`, encodes the pinned GA106 first-boot
+Libos and RM arguments, five 64-KB release log areas and two 256-KB message
+queues. The complete caller-owned image needs 844 KB. Its queue table includes
+its own page: 129 physical page addresses, then command/status queues. The
+command ring has 63 slots and 62 usable entries; its initial swap-RX request
+is not a completed negotiation. Status metadata remains zero for GSP to create.
+
+All span sizes, full 49-bit addresses, alignment and overlap are checked
+before output changes. Queue pages may be physically scattered; log and
+argument spans must be contiguous. Other retained boot spans can be excluded.
+The log put pointer stays zero, with 16 actual page addresses immediately
+following it. LOGINIT is first; numeric id8 tags use the original encoding.
+The normal single-GPU profile keeps PM/profiler fields zero and selects the
+original DMEM-stack default. All padding and unused entries are cleared.
+
+The existing host ABI probe compares every byte with the original C types
+and executes the original `msgqInit`/`msgqTxCreate` on host memory. The existing
+owner step passes 39 cases; `inspect-gsp-layout` reports these requirements
+without inventing DMA addresses. This preparation does not change NVIDIA.R4D
+0.1.23, its packaged licenses or OssiPC. Runtime ownership, synchronization,
+queue linking, RPC/IRQ and hardware handoff remain open.
+
 The preceding module 0.1.22 extended the existing `firmware-check` diagnostic mode with
 actual GSP image DMA staging. The admitted GA10X `.fwimage` is copied into
 separate, page-aligned resident backing with its three-level Radix3 tables.

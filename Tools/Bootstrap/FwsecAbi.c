@@ -4,6 +4,75 @@
 #include <string.h>
 #include "FwsecAbi-original.h"
 #include "gsp_fw_wpr_meta.h"
+#include "libos_init_args.h"
+#include "gsp_init_args.h"
+#include "msgq/msgq_priv.h"
+
+_Static_assert(sizeof(LibosMemoryRegionInitArgument) == 32, "Libos entry including zero padding");
+_Static_assert(offsetof(LibosMemoryRegionInitArgument, kind) == 24, "Libos kind");
+_Static_assert(offsetof(LibosMemoryRegionInitArgument, loc) == 25, "Libos location");
+_Static_assert(sizeof(MESSAGE_QUEUE_INIT_ARGUMENTS) == 32, "native 64-bit queue arguments");
+_Static_assert(offsetof(MESSAGE_QUEUE_INIT_ARGUMENTS, cmdQueueOffset) == 16, "queue offset alignment");
+_Static_assert(sizeof(GSP_ARGUMENTS_CACHED) == 72, "complete RM arguments");
+_Static_assert(offsetof(GSP_ARGUMENTS_CACHED, srInitArguments) == 32, "PM arguments");
+_Static_assert(offsetof(GSP_ARGUMENTS_CACHED, gpuInstance) == 44, "GPU instance");
+_Static_assert(offsetof(GSP_ARGUMENTS_CACHED, bDmemStack) == 48, "default DMEM stack");
+_Static_assert(offsetof(GSP_ARGUMENTS_CACHED, profilerArgs) == 56, "profiler padding");
+_Static_assert(sizeof(msgqTxHeader) == 32 && sizeof(msgqRxHeader) == 4, "original queue headers");
+_Static_assert(offsetof(msgqTxHeader, rxHdrOff) == 24 && offsetof(msgqTxHeader, entryOff) == 28, "queue offsets");
+static int init_compared;
+
+static NvU64 init_id(const char *name)
+{
+    NvU64 id = 0;
+    for (unsigned i = 0; i < 8 && name[i]; ++i) id = (id << 8) | (unsigned char)name[i];
+    return id;
+}
+
+/* Original C types and actual upstream msgqInit/msgqTxCreate supply an
+ * independent host reference. No target callback or GPU is involved. */
+int r4nv_gsp_init_abi_check(const unsigned char *actual, size_t actual_len)
+{
+    enum { page = 4096, log_size = 65536, queue_size = 262144,
+           queue_start = 2 * page + 5 * log_size, total = queue_start + page + 2 * queue_size };
+    static _Alignas(4096) unsigned char expected[total];
+    static const char *names[] = {"LOGINIT", "LOGINTR", "LOGRM", "LOGMNOC", "LOGKRNL"};
+    init_compared = 0;
+    if (actual_len != sizeof(expected)) return 1;
+    memset(expected, 0, sizeof(expected));
+    LibosMemoryRegionInitArgument *regions = (void *)expected;
+    for (unsigned i = 0; i < 6; ++i)
+    {
+        regions[i].kind = LIBOS_MEMORY_REGION_CONTIGUOUS;
+        regions[i].loc = LIBOS_MEMORY_REGION_LOC_SYSMEM;
+        regions[i].id8 = init_id(i < 5 ? names[i] : "RMARGS");
+        regions[i].pa = i < 5 ? 0x910000000ULL + i * 0x20000 : 0x900001000ULL;
+        regions[i].size = i < 5 ? log_size : page;
+        if (i < 5)
+        {
+            NvU64 *log = (void *)(expected + 2 * page + i * log_size);
+            for (unsigned p = 0; p < 16; ++p) log[p + 1] = regions[i].pa + p * page;
+        }
+    }
+    GSP_ARGUMENTS_CACHED *rm = (void *)(expected + page);
+    rm->messageQueueInitArguments.sharedMemPhysAddr = 0xa00000000ULL;
+    rm->messageQueueInitArguments.pageTableEntryCount = 129;
+    rm->messageQueueInitArguments.cmdQueueOffset = page;
+    rm->messageQueueInitArguments.statQueueOffset = page + queue_size;
+    rm->bDmemStack = NV_TRUE;
+    NvU64 *table = (void *)(expected + queue_start);
+    table[0] = 0xa00000000ULL;
+    for (unsigned i = 1; i < 129; ++i)
+        table[i] = i < 17 ? 0xb00000000ULL + (i - 1) * page : 0xc00000000ULL + (i - 17) * page;
+    msgqMetadata tracking;
+    msgqHandle handle;
+    if (msgqInit(&handle, &tracking) != 0 ||
+        msgqTxCreate(handle, expected + queue_start + page, queue_size, page, 4, 12, MSGQ_FLAGS_SWAP_RX) != 0) return 2;
+    if (tracking.tx.msgCount != 63 || tracking.txFree != 62 || tracking.rxLinked || tracking.rxSwapped) return 3;
+    if (memcmp(actual, expected, sizeof(expected))) return 4;
+    init_compared = 1;
+    return 0;
+}
 
 _Static_assert(sizeof(FALCON_APPLICATION_INTERFACE_HEADER_V1) == 4, "interface header");
 _Static_assert(sizeof(FALCON_APPLICATION_INTERFACE_ENTRY_V1) == 8, "interface entry");
@@ -26,6 +95,7 @@ int r4nv_fwsec_abi_check(const unsigned char *sb, size_t sb_len, unsigned sb_id,
                         const unsigned char *frts, size_t frts_len, unsigned frts_id,
                         const unsigned char *wpr, size_t wpr_len)
 {
+    if (!init_compared) return 4;
     FWSECLIC_READ_VBIOS_DESC read;
     FWSECLIC_FRTS_CMD command;
     memset(&read, 0, sizeof(read));
@@ -79,6 +149,10 @@ int r4nv_fwsec_abi_check(const unsigned char *sb, size_t sb_len, unsigned sb_id,
          "\"gsp_wpr_bytes\":256,\"gsp_wpr_byte_comparison\":true,"
          "\"gsp_wpr_crash_queue_offset\":224,\"gsp_wpr_verified_offset\":248,"
          "\"gsp_wpr_flags_zero\":true,\"synthetic_dma_bindings\":true,"
+         "\"gsp_init_byte_comparison\":true,\"gsp_init_bytes\":864256,"
+         "\"libos_entry_bytes\":32,\"rm_arguments_bytes\":72,"
+         "\"queue_pages_self_mapped\":129,\"queue_ring_slots\":63,\"queue_capacity\":62,"
+         "\"original_msgq_create_executed_on_host\":true,\"status_queue_zero\":true,"
          "\"gpu_executed\":false}");
     return 0;
 }

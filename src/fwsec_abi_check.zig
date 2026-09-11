@@ -2,8 +2,28 @@
 const preparation = @import("fwsec_prepare.zig");
 const std = @import("std");
 const wpr = @import("gsp_wpr.zig");
+const gsp_init = @import("gsp_init.zig");
 extern fn r4nv_fwsec_abi_check([*]const u8, usize, c_uint, [*]const u8, usize, c_uint, [*]const u8, usize) c_int;
+extern fn r4nv_gsp_init_abi_check([*]const u8, usize) c_int;
 pub fn main() !void {
+    // Heap backing belongs only to this host comparison, never to a target
+    // driver or its bounded stack. All DMA addresses below are synthetic.
+    const init_output = try std.heap.page_allocator.alloc(u8, gsp_init.output_bytes);
+    defer std.heap.page_allocator.free(init_output);
+    var bindings: gsp_init.Bindings = .{
+        .chip_id = 0x176,
+        .libos = .{ .address = 0x900000000, .bytes = 4096 },
+        .rm = .{ .address = 0x900001000, .bytes = 4096 },
+        .logs = undefined,
+        .queues = &.{
+            .{ .address = 0xa00000000, .bytes = 4096 },
+            .{ .address = 0xb00000000, .bytes = 65536 },
+            .{ .address = 0xc00000000, .bytes = 112 * 4096 },
+        },
+    };
+    for (&bindings.logs, 0..) |*span, index| span.* = .{ .address = 0x910000000 + index * 0x20000, .bytes = 65536 };
+    _ = try gsp_init.encode(&bindings, init_output);
+    if (r4nv_gsp_init_abi_check(init_output.ptr, init_output.len) != 0) return error.OriginalInitMismatch;
     const sb = try preparation.commandBytes(.sb);
     const frts = try preparation.commandBytes(.{ .frts = 0x123456000 });
     // Production descriptor values and captured GA106 register values; the

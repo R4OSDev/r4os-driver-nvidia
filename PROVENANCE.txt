@@ -3,6 +3,30 @@ Host/module scaffolding follows R4OS SDK and existing R4D owners.
 Firmware fixture bodies and signatures are synthetic. Selected measured
 table fields are explicit regression data, as described below.
 
+0.79.10 Libos/RM/log/queue initialization (host), 11.09.2026:
+gsp_init.zig adapts format and initial field assignments from the pinned
+libos_init_args.h (2018-2022), gsp_init_args.h (2020-2024), kernel_gsp.c
+and message_queue_cpu.c (2019-2024), message_queue_priv.h (2019-2022),
+msgq.c/msgq_priv.h (2018-2019), NVIDIA CORPORATION & AFFILIATES. That file
+retains the complete MIT notice; original admission/interfaces are Apache-2.0.
+The original Libos structures, complete 72-byte RM argument type and actual
+msgqInit/msgqTxCreate are compared against the complete 864256-byte encoding
+by the existing explicit ABI step. The original msgq implementation runs only
+in that host verifier, never in NVIDIA.R4D. Its complete source and header
+notices accompany the private verified source snapshot and reference archive.
+
+The queue's 129-entry page table includes its own page. Logs and arguments
+follow the production GA10X profile, with LOGINIT first, five release-sized
+logs, first-boot DMEM stack and no PM/profiler override. Original nvrm_registry.h,
+HAL declarations and nv-firmware.h establish the defaults/family count.
+The latter lies outside the partial RM source-build catalog and was fetched
+separately from the same exact official commit, matching the local source
+byte-for-byte; its URL/hash and full MIT notice are retained explicitly.
+There are 25 complete original source/notice files plus derived ABI headers
+and prior boot resources in ExFiles/Reference/GFX/Nvidia/0.79.10/gsp-init-20260911.
+This host step leaves module 0.1.23, its resource pin and distributed notices
+unchanged. It grants no DMA ownership, queue linkage or GPU execution.
+
 0.79.10 loaded boot resources (NVIDIA 0.1.23), 11.09.2026:
 The single firmware-lock.json now pins the already exported GA102 production
 boot image (24576 bytes), descriptor (84 bytes), full license bundle (25885

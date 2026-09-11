@@ -4,6 +4,7 @@ const boot = @import("gsp_boot.zig");
 const layout = @import("gsp_layout.zig");
 const radix = @import("gsp_radix.zig");
 const wpr = @import("gsp_wpr.zig");
+const gsp_init = @import("gsp_init.zig");
 const preflight = @import("fwsec_state.zig");
 const identity = @import("identity.zig");
 
@@ -101,6 +102,25 @@ pub fn main(init: std.process.Init) !void {
         .plan = plan,
         .radix3 = try radix.requirements(verified.layout.image.bytes),
         .metadata_bytes = layout.metadata_bytes,
+        .init_memory = .{
+            .profile = "ga106-first-boot-release-no-pm-or-profiler",
+            .libos_bytes = gsp_init.page_bytes,
+            .libos_entry_bytes = gsp_init.libos_entry_bytes,
+            .rm_page_bytes = gsp_init.page_bytes,
+            .rm_argument_bytes = gsp_init.rm_argument_bytes,
+            .log_names = gsp_init.log_names,
+            .log_bytes_each = gsp_init.log_bytes,
+            .queue_bytes_each = gsp_init.queue_bytes,
+            .queue_pages_including_table = gsp_init.queue_pages,
+            .queue_allocation_bytes = gsp_init.queue_allocation_bytes,
+            .ring_slots = gsp_init.ring_slots,
+            .ring_capacity = gsp_init.ring_capacity,
+            .total_bytes = gsp_init.output_bytes,
+            .dmem_stack = true,
+            .status_queue_initialized = false,
+            .dma_owned = false,
+            .messages_submitted = false,
+        },
         .wpr_metadata = .{
             .profile = "unbound-first-boot-template",
             .magic = wpr.magic,
