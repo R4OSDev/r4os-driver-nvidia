@@ -1,7 +1,8 @@
 ﻿# NVIDIA.R4D
 
-Passive NVIDIA display driver for R4OS. Module 0.1.22; original R4OS code is
-Apache-2.0, with selected original MIT headers and separately licensed firmware.
+Passive NVIDIA display driver for R4OS. Module 0.1.23; original R4OS code is
+Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
+headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
 subsystem 1458:4074, VBIOS 94.06.2f.00.d6. Preparation for 0.79.10 continues.
 This owner inventories NVIDIA display functions once through
@@ -9,7 +10,44 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
-Module 0.1.22 extends the existing `firmware-check` diagnostic mode with
+Module 0.1.23 adds the explicit `OPTION NVIDIA mode=boot-check` diagnostic.
+After the actual GA106 board, fuse and FWSEC preflight, it admits the pinned
+24-KB boot image, 84-byte descriptor and complete license from the currently
+loaded R4D. Resource generation, exact lengths, hashes and a monotonic deadline
+are checked before any boot input is exposed. It then admits the GA10X GSP
+container and composes the existing image and boot-pack owners described below.
+Five DMA mappings hold the image, tables, bootloader, signature and 256-byte
+WPR metadata; final synchronization precedes the diagnostic report. All are
+released during init. No address is submitted to the GPU, no VRAM is reserved
+or changed, and the normal passive mode remains the default.
+
+`src/firmware-lock.json` is the single source for the boot artifacts and their
+complete provenance. The module now contains eight nonallocated resources.
+The new 25,885-byte license resource includes the unchanged full COPYING and
+five complete MIT notices covering the original boot source and adapted layout
+and metadata code. Distribution carries the identical notices in R4OS/LICENSES
+and its adjacent Legal directory. CPU hash admission is not GPU authentication.
+
+Provision already exported, pinned boot files without rebuilding RM or the
+original decoder, using absolute paths and a fresh scratch directory:
+
+    ./Build.sh prepare-boot-firmware -- -SourceDirectory ORIGINAL_RM -BootstrapDirectory REFERENCE_PACKAGE -ScratchDirectory WORKSPACE/Temp/boot-resources
+
+This verifies the original source records and exported bytes and atomically
+creates the ignored `BootFirmware/` package. It refuses a differing existing
+output. The ordinary module build verifies all three new resources together
+with the existing firmware package. No network or installer is used.
+
+OssiPC accepted this diagnostic on 2026-09-11: all three boot resources
+matched, four image mappings contained 36 actual segments, and the
+contiguous boot pack needed no bounce. Final synchronization and complete
+cleanup succeeded. Bootfb remained 800x600 at generation 1/reset 0; all
+14 automatic services ran. A second SYSUPD batch/reboot restored the exact
+350-byte passive configuration. Package roundtrip hashes, installed checks,
+inventory and unique runtime records establish the update; no separate
+installed-module download or fresh visible-image/audio acceptance was made.
+
+The preceding module 0.1.22 extended the existing `firmware-check` diagnostic mode with
 actual GSP image DMA staging. The admitted GA10X `.fwimage` is copied into
 separate, page-aligned resident backing with its three-level Radix3 tables.
 The pinned image needs 63,676,416 bytes including 132 KB of tables. Four
@@ -27,10 +65,11 @@ Cleanup closes every mapping, then every pin, then the resident allocation;
 the admitted source container stays alive through the preparation call.
 The existing mode line is `OPTION NVIDIA mode=firmware-check`; it remains
 an explicit diagnostic and falls through to the same passive board inventory.
-This stages only the GSP image and its page tables. Bootloader, signature and
-WPR-metadata ownership, VGA recovery and firmware execution remain open.
+This older mode stages only the GSP image and its page tables. The new
+boot-check mode also owns bootloader, signature and WPR metadata. VGA recovery,
+actual VRAM ownership and firmware execution remain open.
 
-The next host preparation adds `gsp_wpr.zig`: a pinned 256-byte first-boot
+The separately qualified `gsp_wpr.zig` supplies a pinned 256-byte first-boot
 metadata template and checked DMA address binding. `inspect-gsp-layout`
 now reports the unbound little-endian template with zero device addresses,
 boot count, clock flags and Booter verification marker. Encoding live bindings
@@ -39,7 +78,8 @@ and signature spans; an optional contiguous crash queue uses the original
 union layout. The encoder confers no memory ownership or authentication.
 The existing explicit bootstrap ABI probe compares all 256 encoded bytes
 with the original NVIDIA C structure, including padding and the crash union.
-This host preparation leaves NVIDIA.R4D 0.1.22 and OssiPC unchanged.
+The original host checkpoint left NVIDIA.R4D 0.1.22 unchanged; module 0.1.23
+now uses this encoder after the actual preflight.
 
 `gsp_boot_storage.zig` now composes the image owner with one page-aligned
 32-KB boot pack: 24 KB boot image, 4 KB signature, then a 4-KB page containing
@@ -48,8 +88,8 @@ bounced, covers the pack. The full pack, including its metadata page, must
 not overlap any GSP span. A second synchronization publishes the completed
 metadata after actual addresses exist. Pack cleanup precedes image cleanup;
 failed releases retain both owners for retry. The caller admits the complete
-firmware inputs first. This owner is tested through the R4D facade on the
-host; loading boot resources and integrating it into the module remain open.
+firmware inputs first. This owner was first tested through the R4D facade on the host and is now
+used by the explicit boot-check mode with admitted module resources.
 
 The CPU-only FWSEC catalog resolves BIT 'p', full 32-bit token pointers and
 the original RM expansion-ROM bias. V2 loader and V3 signed-image descriptors,

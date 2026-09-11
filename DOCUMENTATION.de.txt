@@ -9,7 +9,47 @@ Boardanschluesse. Die spaeteren PROM-Boots bestaetigen softwareseitig den
 unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
-Gemeinsamer GSP-Bootspeicher (Host, R4D 0.1.22 unveraendert)
+Bootressourcen und gemeinsamer Speicher im Modul 0.1.23
+------------------------------------------------------
+OPTION NVIDIA mode=boot-check fuehrt nach der aktuellen GA106-/FWSEC-
+Vorpruefung die gesamte Speichervorbereitung aus. Bootabbild (24576 Bytes),
+Deskriptor (84 Bytes) und vollstaendige Lizenz (25885 Bytes) kommen nur aus
+der Ressourcentabelle desselben geladenen Moduls. Header, Generation,
+exakte Laenge, SHA256 und monotone Frist werden vor Freigabe der Eingaben
+geprueft. Danach wird der GA10X-GSP-Container zugelassen und kopiert.
+
+Fuenf DMA-Mappings halten GSP und den 32-KB-Puffer fuer Boot, Signatur und
+WPR-Metadaten. Erst nach der abschliessenden Synchronisierung werden die
+Adressen gemeldet; anschliessend werden Mappings, Pins und CPU-Speicher
+geordnet freigegeben. An die GPU geht keine Adresse. Die Aufnahme der
+Bootparameter reserviert keinen VRAM, verlagert kein VGA und startet keine
+Firmware. Der regulaere Start bleibt passiv mit bestehendem bootfb.
+
+Der zentrale Firmware-Pin benennt jetzt auch die Bootdateien und sechs
+Originalquellen fuer deren Herkunft/Lizenz. prepare-boot-firmware uebernimmt
+die bereits originalgetreu exportierten Dateien, prueft Quell- und Dateihashes
+und erzeugt atomar BootFirmware/. Ein erneuter RM-/Decoderbau entfaellt.
+Der vorhandene Modulbau prueft alle acht nicht resident geladenen Ressourcen.
+Die neue Lizenzressource enthaelt das vollstaendige COPYING und fuenf volle
+MIT-Hinweise fuer Bootquelle, Layout und Metadaten; Distribution fuehrt die
+identische Datei im System und im begleitenden Legal-Verzeichnis.
+
+Der vorhandene Besitzerlauf besteht 38/38 Faelle in 12/12 Schritten,
+der Modulbau 7/7. Ein zusaetzlicher zusammengefasster Ressourcenfall deckt
+zehn Fehler-/Erfolgsszenarien sowie Busy, Abschluss und ungueltige Frist ab.
+Kein neues Gate und kein allgemeiner Gast-, Browser- oder Langlauf.
+
+OssiPC bestaetigt am 11.09.2026 alle drei Ressourcen und fuenf Mappings:
+36 GSP-Segmente, Radixwurzel 0x149c000, Bootpaket ohne Bounce ab
+0x8e3b000, Signatur ab 0x8e41000, Metadaten ab 0x8e42000.
+Vollstaendiger Cleanup, bootfb 800x600/Generation 1/Reset 0 und alle 14
+automatischen Dienste ohne Fehler. Nach dem zweiten SYSUPD-Neustart ist die
+urspruengliche 350-Byte-CONFIG.R4S bytegleich passiv. Paket-Roundtrip,
+installierte Nachpruefung/Katalog und neue Laufzeitmarker belegen den Stand;
+kein separater Download des installierten Moduls. Hisense aus, keine neue
+Bild-/Tonabnahme und weiterhin keine Firmwareausfuehrung oder VRAM-Aenderung.
+
+Historischer gemeinsamer GSP-Bootspeicher (Host, R4D 0.1.22)
 --------------------------------------------------------
 gsp_boot_storage.zig besitzt den grossen GSP-DMA-Speicher und einen eigenen
 32-KB-Puffer: 24 KB Bootabbild ab 0, 4 KB Signatur ab 24576, Metadatenseite
@@ -42,7 +82,7 @@ fehlgeschlagenes Unmap/Unpin/Release und Bounce. Keine neue Gate-/Gastvariante,
 kein RM-/Modulbau oder Hardwareupdate. Die Runtime-Ressourcenbereitstellung
 und Anbindung dieses Owners an NVIDIA.R4D sind noch offen.
 
-GSP-WPR-Metadaten (Host, NVIDIA.R4D 0.1.22 unveraendert)
+Historische GSP-WPR-Metadaten (Host, NVIDIA.R4D 0.1.22)
 ------------------------------------------------------
 gsp_wpr.zig bildet den normalen GA106-Erststart auf die originalen 256 Bytes
 von GspFwWprMeta ab. prepare prueft den gepinnten Produktionsdeskriptor

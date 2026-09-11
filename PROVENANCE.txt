@@ -3,7 +3,29 @@ Host/module scaffolding follows R4OS SDK and existing R4D owners.
 Firmware fixture bodies and signatures are synthetic. Selected measured
 table fields are explicit regression data, as described below.
 
-0.79.10 combined GSP boot storage (host qualification), 11.09.2026:
+0.79.10 loaded boot resources (NVIDIA 0.1.23), 11.09.2026:
+The single firmware-lock.json now pins the already exported GA102 production
+boot image (24576 bytes), descriptor (84 bytes), full license bundle (25885
+bytes) and all six source/notice inputs under the same 570.144 source commit.
+PrepareBootFirmware.ps1 verifies existing exported artifacts and original
+source hashes, retains the complete COPYING and five complete MIT notices,
+and provisions an ignored BootFirmware/ directory atomically. The original
+decoder and RM are not rebuilt or newly linked. No firmware body is vendored
+into this public source repository.
+
+Module 0.1.23 includes three new nonallocated resources and a revised lock;
+the prior four firmware/header/license payloads remain unchanged. It now
+links the separately qualified MIT-attributed gsp_layout.zig and gsp_wpr.zig
+with original R4OS boot resource admission and storage orchestration.
+The same 25885-byte notice file accompanies Distribution and its Legal output.
+The explicit boot-check mode consumes only matching-generation R4D resources
+after actual GA106 preflight. Neither hashes nor DMA preparation authenticate
+or execute GPU code. Existing owner tests use synthetic resource bytes for
+failure injection; production bytes are verified by provisioning/module build.
+Full original sources, licenses and proof accompany the separate checkpoint
+ExFiles/Reference/GFX/Nvidia/0.79.10/boot-resources-20260911.
+
+Historical 0.79.10 combined GSP boot storage (host qualification), 11.09.2026:
 gsp_boot_storage.zig is original Apache-2.0 R4OS orchestration of the existing
 GSP DMA owner and one resident 32-KB boot/signature/WPR pack. It uses only
 existing R4D heap, pin/map/sync/unmap/unpin and clock facades. The format

@@ -24,10 +24,18 @@ pub const Lock = struct {
     license: Artifact,
     firmware: [2]Firmware,
     families: [8]struct { name: []const u8, artifact: usize },
+    boot: struct {
+        source: Source,
+        image: Artifact,
+        descriptor: Artifact,
+        license: Artifact,
+        notices: [6]Source,
+    },
 };
+pub const Source = struct { path: []const u8, bytes: usize, sha256: []const u8 };
 pub const lock: Lock = blk: {
     @setEvalBranchQuota(500000);
-    var storage: [16384]u8 = undefined;
+    var storage: [32768]u8 = undefined;
     var allocator = std.heap.FixedBufferAllocator.init(&storage);
     break :blk std.json.parseFromSliceLeaky(Lock, allocator.allocator(), @embedFile("firmware-lock.json"), .{}) catch
         @compileError("invalid NVIDIA firmware lock");

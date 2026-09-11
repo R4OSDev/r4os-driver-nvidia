@@ -1,10 +1,11 @@
 ﻿# Third-Party Notices
 
-The driver, parser, adapters, tests and inspector are original R4OS Apache-2.0
-code. The selected original NVIDIA MIT headers described below retain their
-own terms. No full NVIDIA RM/NVKMS host implementation, Linux driver or
+Original R4OS driver, parser, adapter, test and inspector code is Apache-2.0.
+The attributed layout/metadata adaptations and selected original NVIDIA
+headers described below retain their MIT terms. No full NVIDIA RM/NVKMS host implementation, Linux driver or
 envytools implementation is linked into the R4OS driver. The packaged module
-also contains the two original GSP firmware containers described below.
+also contains the two original GSP firmware containers and the production
+GA102 boot image/descriptor described below.
 
 Register and binary-format facts were checked against the NVIDIA-published
 register headers and DCB specification and the selected MIT-licensed BIOS
@@ -13,13 +14,21 @@ their original licenses in the separate workspace reference archive.
 Fixture firmware bodies and signatures are synthetic; selected measured table
 metadata is regression data documented in PROVENANCE.txt.
 
-Module 0.1.22 links the original R4OS Radix3 encoder and a new original
-DMA-ownership controller in its explicit firmware-check mode. Both remain
-Apache-2.0. The MIT-derived host layout calculation described below remains
-outside the module. All five packaged resources, original headers and
-distributed license files remain byte-identical; no boot firmware is added.
+Module 0.1.23 links the MIT-attributed layout and WPR metadata code described
+below. It adds the byte-identical 24-KB production GA102 boot image and its
+84-byte descriptor exported from the pinned original generated source
+`g_bindata_kgspGetBinArchiveGspRmBoot_GA102.c` (copyright 2016-2022 NVIDIA
+CORPORATION). `src/firmware-lock.json` pins these files and their exact source.
+The new `NVIDIA-570.144-GSP-BOOT-LICENSE.txt` resource contains full unchanged
+COPYING plus the complete MIT notice from that source and each of the four
+layout/metadata sources named below. The identical 25,885-byte file is in
+Distribution's R4OS/LICENSES and adjacent Legal output. Original R4OS resource
+and DMA ownership code remains Apache-2.0; the original decoder is not linked.
+The ignored `BootFirmware/` package is prepared only from verified exported
+files and complete original source notices. Neither this repository nor the
+module relabels upstream code or firmware under the R4OS license.
 
-The subsequent host-only WPR metadata encoder in `src/gsp_wpr.zig` retains
+The WPR metadata encoder in `src/gsp_wpr.zig` retains
 NVIDIA's complete MIT notice for the field layout/assignment adapted from
 `gsp_fw_wpr_meta.h` (2021-2024) and `kernel_gsp_tu102.c` (2017-2024),
 NVIDIA CORPORATION & AFFILIATES. Original R4OS admission and validation are
@@ -27,24 +36,25 @@ Apache-2.0. The existing optional ABI probe compiles the complete original
 WPR header and compares the C structure with the actual Zig encoding.
 All original references and notices accompany the separate
 `ExFiles/Reference/GFX/Nvidia/0.79.10/wpr-metadata-20260911` checkpoint.
-No part of this metadata preparation is linked into NVIDIA.R4D 0.1.22.
+The earlier host checkpoint did not change NVIDIA.R4D 0.1.22; its metadata
+encoder is now linked in the explicit boot-check path of 0.1.23.
 
-The host-only GSP layout calculation in `src/gsp_layout.zig` adapts the
+The GSP layout calculation in `src/gsp_layout.zig` adapts the
 MIT-licensed NVIDIA 570.144 layout and heap algorithms from
 `kernel_gsp_tu102.c` (copyright 2017-2024), `kernel_gsp.c` (2019-2024) and
 `gsp_fw_heap.h` (2022-2024), NVIDIA CORPORATION & AFFILIATES. That file retains
 the original copyright lines and full MIT permission/disclaimer. Original
-R4OS admission checks and interfaces remain Apache-2.0. This preparation is
-not linked into the current NVIDIA.R4D.
+R4OS admission checks and interfaces remain Apache-2.0. This calculation is
+now linked into NVIDIA.R4D 0.1.23 with its complete source notices retained.
 
 The boot descriptor validator and scatter/gather Radix3 encoder are original
 R4OS code based on the format facts in `rmRiscvUcode.h`,
 `gsp_fw_wpr_meta.h`, `libos_init_args.h` and the same pinned RM implementation.
-The production boot image and descriptor remain external reference inputs,
-with their full original generated source and MIT notice. All complete
+The production boot image and descriptor were initially external reference
+inputs; 0.1.23 includes their unchanged bytes with the complete notice above. All complete
 sources, notices, hashes and original bootstrap metadata accompany
 `ExFiles/Reference/GFX/Nvidia/0.79.10/gsp-memory-layout-20260911`.
-No additional firmware or original header is packaged into NVIDIA.R4D.
+No additional original C header is packaged by this integration.
 
 The 0.1.21 GSP/VRAM preflight is original R4OS code. Register facts come
 from the same pinned NVIDIA sources and Nouveau's MIT-noticed
@@ -96,8 +106,9 @@ notices, source files and complete COPYING accompany the 26 byte-identical
 decoded artifacts. The host executable links NVIDIA's original utilGz decoder
 in `src/nvidia/src/lib/zlib/inflate.c`; its NVIDIA and Jean-loup Gailly/Mark
 Adler zlib notices and accompanying header are retained verbatim. The R4OS
-exporter and scripts are original code. No bootstrap binary or original
-decoder implementation is vendored into this repository or added to the R4D.
+exporter and scripts are original code. No original decoder implementation is vendored or linked into the R4D.
+The new separate prepare-boot-firmware step provisions two of the already
+exported artifacts as the explicit 0.1.23 resources described above.
 
 The same optional step extracts the unchanged FWSEC command typedefs from
 `kernel_gsp_frts_tu102.c` into a private derived header, preserving the complete

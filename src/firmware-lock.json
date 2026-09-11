@@ -33,5 +33,62 @@
     {"name": "tu10x", "artifact": 1},
     {"name": "tu11x", "artifact": 1},
     {"name": "ga100", "artifact": 1}
-  ]
+  ],
+  "boot": {
+    "source": {
+      "path": "src/nvidia/generated/g_bindata_kgspGetBinArchiveGspRmBoot_GA102.c",
+      "bytes": 232808,
+      "sha256": "35f1c06663979d77f7dd176115d36af0032a79b7509a7623928470f3e1c9372a"
+    },
+    "image": {
+      "file": "GspRmBoot-GA102-ucode_image_prod.bin",
+      "resource": "GSP-570.144-GA102-BOOT.bin",
+      "bytes": 24576,
+      "sha256": "3df651acb174fd5f5561a1996965b192f50c5d763168446ed0d4ead19d895768"
+    },
+    "descriptor": {
+      "file": "GspRmBoot-GA102-ucode_desc_prod.bin",
+      "resource": "GSP-570.144-GA102-BOOT-DESC.bin",
+      "bytes": 84,
+      "sha256": "cc5a3fc1f4c47f2fe107b1b68f0176d8a448e6dec84b575e5560ccef5262bf15"
+    },
+    "license": {
+      "file": "NVIDIA-570.144-GSP-BOOT-LICENSE.txt",
+      "resource": "NVIDIA-570.144-GSP-BOOT-LICENSE.txt",
+      "bytes": 25885,
+      "sha256": "0e97ecfd623ea996e63a7a512f47b766305a0175fa653127da117b33efcc5c20"
+    },
+    "notices": [
+      {
+        "path": "COPYING",
+        "bytes": 19391,
+        "sha256": "d8e96d29bc323000e7ba56102d77c88226a7a3d0d94e2081cb4b071ae9de4a06"
+      },
+      {
+        "path": "src/nvidia/generated/g_bindata_kgspGetBinArchiveGspRmBoot_GA102.c",
+        "bytes": 232808,
+        "sha256": "35f1c06663979d77f7dd176115d36af0032a79b7509a7623928470f3e1c9372a"
+      },
+      {
+        "path": "src/nvidia/arch/nvalloc/common/inc/gsp/gsp_fw_wpr_meta.h",
+        "bytes": 8040,
+        "sha256": "69bfe477d74a6a09217caa57eda872425c45d9581038467e5d035e0c14dd425a"
+      },
+      {
+        "path": "src/nvidia/src/kernel/gpu/gsp/arch/turing/kernel_gsp_tu102.c",
+        "bytes": 45126,
+        "sha256": "6eb2e2702f956053a960e26a7bd7917ddb1a8b0fcbbdd0fac2eeebbd73b69303"
+      },
+      {
+        "path": "src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c",
+        "bytes": 168764,
+        "sha256": "5b99422b7e5cf424e4b782d9a9b2389118f9bd9d74085e49223b1c5170e5f018"
+      },
+      {
+        "path": "src/nvidia/inc/kernel/gpu/gsp/gsp_fw_heap.h",
+        "bytes": 5556,
+        "sha256": "f07842783c9c4dfaca7811c14dacb688282c25300162dc0f285550dcc71f99d0"
+      }
+    ]
+  }
 }

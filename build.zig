@@ -27,6 +27,12 @@ pub fn build(b: *std.Build) void {
     // Verification precedes packaging and installation, not a parallel
     // check which could publish an invalid module before reporting failure.
     module.output.generated.file.step.dependOn(&verify.step);
+    const boot_parameters = [_][]const u8{ "-BootImagePath", "-BootDescriptorPath", "-BootLicensePath" };
+    const boot_names = [_][]const u8{ pin.boot.image.resource, pin.boot.descriptor.resource, pin.boot.license.resource };
+    for (boot_parameters, boot_names) |parameter, name| {
+        verify.addArg(parameter);
+        verify.addFileArg(b.path(b.pathJoin(&.{ "BootFirmware", name })));
+    }
     const unit = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/tests.zig"),
         .target = b.graph.host,
@@ -100,6 +106,10 @@ pub fn build(b: *std.Build) void {
     prepare.addArtifactArg(firmware_inspector);
     if (b.args) |args| prepare.addArgs(args);
     b.step("prepare-firmware", "Prepare local firmware: -- -SourceDirectory PATH -ScratchDirectory Temp/PATH [-OutputDirectory PATH]").dependOn(&prepare.step);
+    const prepare_boot = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-File" });
+    prepare_boot.addFileArg(b.path("Tools/PrepareBootFirmware.ps1"));
+    if (b.args) |args| prepare_boot.addArgs(args);
+    b.step("prepare-boot-firmware", "Provision admitted boot files/notices: -- -SourceDirectory PATH -BootstrapDirectory PATH -ScratchDirectory PATH [-OutputDirectory PATH]").dependOn(&prepare_boot.step);
     const bootstrap = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-File" });
     bootstrap.addFileArg(b.path("Tools/PrepareBootstrap.ps1"));
     bootstrap.addArgs(&.{ "-Compiler", b.graph.zig_exe });

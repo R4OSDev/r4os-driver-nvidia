@@ -10,19 +10,13 @@ comptime {
         !std.mem.eql(u8, firmware.lock.rm_version, "570.144"))
         @compileError("review GSP boot/layout against the new central firmware pin");
 }
-pub const source_path = "src/nvidia/generated/g_bindata_kgspGetBinArchiveGspRmBoot_GA102.c";
-pub const image = firmware.Artifact{
-    .file = "GspRmBoot-GA102-ucode_image_prod.bin",
-    .resource = "ucode_image_prod",
-    .bytes = 24576,
-    .sha256 = "3df651acb174fd5f5561a1996965b192f50c5d763168446ed0d4ead19d895768",
-};
-pub const descriptor = firmware.Artifact{
-    .file = "GspRmBoot-GA102-ucode_desc_prod.bin",
-    .resource = "ucode_desc_prod",
-    .bytes = 84,
-    .sha256 = "cc5a3fc1f4c47f2fe107b1b68f0176d8a448e6dec84b575e5560ccef5262bf15",
-};
+pub const source_path = firmware.lock.boot.source.path;
+pub const image = firmware.lock.boot.image;
+pub const descriptor = firmware.lock.boot.descriptor;
+comptime {
+    if (image.bytes != 24576 or descriptor.bytes != 84)
+        @compileError("review production boot ABI when changing the artifact profile");
+}
 pub const Error = error{ WrongSize, WrongHash, DescriptorVersion, UnsupportedDescriptor, Bounds, Overlap };
 pub const Range = struct { offset: u32, bytes: u32 };
 pub const Info = struct {

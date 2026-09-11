@@ -13,6 +13,8 @@ const firmware_resources = @import("firmware_resources.zig");
 const firmware = @import("firmware.zig");
 const firmware_storage = @import("firmware_storage.zig");
 const gsp_dma = @import("gsp_dma.zig");
+const boot_resources = @import("boot_resources.zig");
+const gsp_boot_storage = @import("gsp_boot_storage.zig");
 const rm_heap = @import("rm_heap.zig");
 const rm_clock = @import("rm_clock.zig");
 const rm_semaphore = @import("rm_semaphore.zig");
@@ -31,6 +33,10 @@ var window: a.GfxMmioWindow = .{};
 var mapping_cleanup_needed = false;
 var firmware_cpu: firmware_storage.Storage = .{};
 var gsp_image: gsp_dma.Storage = .{};
+var boot_inputs: boot_resources.Inputs = .{};
+var boot_storage: gsp_boot_storage.Storage = .{};
+var checking_boot = false;
+var boot_checked = false;
 var checking_runtime = false;
 var board_rom: vbios_probe.Capture = .{};
 var security_fuses: fwsec_probe.Capture = .{};
@@ -53,8 +59,10 @@ pub export fn nvidia_init(api: *const a.DriverApi) callconv(.c) i32 {
     rm_log.bind(&ctx);
     const mode = std.mem.span(ctx.getOption("NVIDIA", "mode"));
     const check_firmware = std.ascii.eqlIgnoreCase(mode, "firmware-check");
+    checking_boot = std.ascii.eqlIgnoreCase(mode, "boot-check");
+    boot_checked = false;
     checking_runtime = std.ascii.eqlIgnoreCase(mode, "runtime-check");
-    if (mode.len != 0 and !std.ascii.eqlIgnoreCase(mode, "passive") and !check_firmware and !checking_runtime) {
+    if (mode.len != 0 and !std.ascii.eqlIgnoreCase(mode, "passive") and !check_firmware and !checking_runtime and !checking_boot) {
         ctx.logError("NVIDIA bind: rejected reason=unsupported-mode native-writes=disabled");
         return -2;
     }
@@ -68,7 +76,7 @@ pub export fn nvidia_init(api: *const a.DriverApi) callconv(.c) i32 {
         log("NVIDIA resource: lock=verified bytes={d} module-generation={d} source=loaded-r4d native-writes=disabled", .{ firmware_resources.lock_bytes.len, generation });
     } else {
         ctx.logInfo("NVIDIA resource: unavailable firmware-loading=disabled passive-probe=available");
-        if (check_firmware) return -6;
+        if (check_firmware or checking_boot) return -6;
     }
     if (checking_runtime) {
         if (!wait_probe.start(&ctx) or !native_probe.start(&ctx) or !rm_semaphore_probe.start(&ctx) or !semaphore_probe.start(&ctx) or !thread_probe.start(&ctx) or !runtime_probe.start(&ctx) or !thread_probe.prepareClose(&ctx) or !semaphore_probe.prepareClose(&ctx) or !rm_semaphore_probe.prepareClose(&ctx) or !native_probe.prepareFault(&ctx)) {
@@ -133,6 +141,10 @@ pub export fn nvidia_init(api: *const a.DriverApi) callconv(.c) i32 {
             if (!readVbios(&ctx, &snapshot, chip.?)) return -10;
         } else log("NVIDIA vbios=unavailable rom-base={x} rom-enabled={} reason=identity-or-range-unmeasured board-name=unmeasured display-generation=unmeasured", .{ snapshot.rom_base, snapshot.rom_enabled });
     }
+    if (checking_boot and !boot_checked) {
+        ctx.logError("NVIDIA boot-check: unavailable reason=no-admitted-preflight native-writes=disabled fallback=preserved");
+        return -11;
+    }
     log("NVIDIA bind: passive devices={d} resources=0 native-writes=disabled fallback=preserved", .{count});
     return 0;
 }
@@ -146,6 +158,8 @@ pub export fn nvidia_shutdown() callconv(.c) i32 {
     if (!semaphore_probe.shutdown(&ctx)) return -1;
     if (!thread_probe.shutdown(&ctx)) return -1;
     if (!runtime_probe.shutdown(&ctx)) return -1;
+    if (!boot_storage.close()) return -1;
+    boot_inputs.close();
     if (!gsp_image.close()) return -1;
     if (!firmware_cpu.close()) return -1;
     if (!security_fuses.close()) return -1;
@@ -163,6 +177,8 @@ pub export fn nvidia_shutdown() callconv(.c) i32 {
     rm_heap.unbind();
     rm_clock.unbind();
     checking_runtime = false;
+    checking_boot = false;
+    boot_checked = false;
     driver_api = null;
     return 0;
 }
@@ -396,6 +412,62 @@ fn inspectFwsecState(ctx: *const r4os.r4dev.DriverContext, snapshot: *const iden
         return true;
     };
     ctx.logInfo("NVIDIA fwsec: preflight-tcm=fits snapshot=read-only mmio-cleanup=OK reset=unperformed execution=not-started");
+    if (checking_boot and !checkBoot(ctx, chip, raw)) return false;
+    return true;
+}
+
+fn checkBoot(ctx: *const r4os.r4dev.DriverContext, chip: identity.Chip, raw: fwsec_state.Raw) bool {
+    const inputs = boot_inputs.load(ctx, 30 * std.time.ns_per_s) catch |err| {
+        log("NVIDIA boot-check: rejected phase=boot-resources reason={s} fallback=preserved", .{@errorName(err)});
+        boot_inputs.close();
+        return false;
+    };
+    log("NVIDIA boot-resource: verified image-bytes={d} descriptor-bytes={d} license=matched generation={d} reads={d} source=loaded-r4d gpu-authentication=unverified", .{
+        inputs.image.len, inputs.descriptor.len, boot_inputs.generation, boot_inputs.reads,
+    });
+    firmware_cpu.begin(ctx, .ga10x, 30 * std.time.ns_per_s) catch |err| {
+        log("NVIDIA boot-check: rejected phase=gsp-resource reason={s} fallback=preserved", .{@errorName(err)});
+        boot_inputs.close();
+        _ = firmware_cpu.close();
+        return false;
+    };
+    while (firmware_cpu.ready() == null) {
+        _ = firmware_cpu.step() catch |err| {
+            log("NVIDIA boot-check: rejected phase=gsp-admission reason={s} fallback=preserved", .{@errorName(err)});
+            boot_inputs.close();
+            _ = firmware_cpu.close();
+            return false;
+        };
+    }
+    const verified = firmware_cpu.ready().?;
+    const report = boot_storage.stageAdmitted(ctx, &.{
+        .chip_id = chip.id,
+        .raw = raw,
+        .image = verified.layout.image.slice(verified.container),
+        .boot_image = inputs.image,
+        .descriptor = inputs.descriptor,
+        .signature = verified.layout.signature.slice(verified.container),
+    }, 30 * std.time.ns_per_s) catch |err| {
+        log("NVIDIA boot-check: rejected phase=dma-pack reason={s} submitted=no fallback=preserved", .{@errorName(err)});
+        _ = boot_storage.close();
+        boot_inputs.close();
+        _ = firmware_cpu.close();
+        return false;
+    };
+    log("NVIDIA boot-check: staged image-bytes={d} image-mappings={d} image-segments={d} radix-root={x} pack-bytes={d} pack-bounced={} synchronized=yes submitted=no", .{
+        report.image.image_bytes, report.image.mappings, report.image.segments, report.image.root_address, report.pack_bytes, report.pack_bounced,
+    });
+    log("NVIDIA boot-check: boot-address={x} signature-address={x} metadata-address={x} metadata-bytes={d} verified=0 boot-count=0 vram-reserved=no vga-relocated=no", .{
+        report.boot_address, report.signature_address, report.metadata_address, report.metadata_bytes,
+    });
+    if (!boot_storage.close()) {
+        ctx.logError("NVIDIA boot-check: cleanup=retained submitted=no");
+        return false;
+    }
+    boot_inputs.close();
+    if (!firmware_cpu.close()) return false;
+    boot_checked = true;
+    ctx.logInfo("NVIDIA boot-check: OK mappings=0 pins=0 cpu=0 native-writes=disabled fallback=preserved");
     return true;
 }
 
