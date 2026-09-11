@@ -43,6 +43,9 @@ pub const Options = struct {
     // Bind the matching retained Load/Unload image and these exact arguments
     // in native admission. FWSEC and Booter purposes are mutually exclusive.
     booter: ?booter_result.Command = null,
+    // Teardown keeps its real log reader stopped after Booter Unload. Normal
+    // load/unload retains the original polling-resume behavior by default.
+    keep_logs_suspended: bool = false,
 
     fn upload(self: *const Options, hwcfg: u32) hs.Options {
         return .{ .engine = self.engine, .boot0 = self.boot0, .epoch = self.epoch, .deadline = self.deadline, .plan = self.plan, .mailboxes = self.mailboxes, .imem_capacity = (hwcfg & 0x1ff) << 8, .dmem_capacity = (hwcfg & 0x3fe00) >> 1 };
@@ -83,6 +86,7 @@ pub const Operation = struct {
     failure: ?anyerror = null,
 
     pub fn init(options: Options) !Operation {
+        if (options.keep_logs_suspended and (options.booter == null or options.booter.? != .normal_unload)) return error.Options;
         const booter_report = if (options.booter) |command| blk: {
             if (options.engine != .sec2 or options.fwsec != null) return error.Options;
             if (!std.meta.eql(options.mailboxes, try booter_result.arguments(command))) return error.Options;
@@ -270,7 +274,7 @@ pub const Operation = struct {
                 self.phase = .restore_logs;
             },
             .restore_logs => {
-                try self.logs(io, true);
+                if (!self.options.keep_logs_suspended) try self.logs(io, true);
                 self.result = .{ .mailboxes = self.halt_result.?.mailboxes, .blocks = self.halt_result.?.blocks, .booter = self.booter_report };
                 self.phase = .complete;
             },

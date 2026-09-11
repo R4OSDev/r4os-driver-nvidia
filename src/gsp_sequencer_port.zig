@@ -111,8 +111,18 @@ const display_rpc = @import("gsp_display_rpc.zig");
 // virtual-function doorbell. The memory cursor is published separately.
 pub const command_queue_head: u32 = 0x110c00;
 pub const Access = enum { read, write };
-pub const Phase = enum { boot, runtime };
+pub const Phase = enum { boot, runtime, recovery };
 const Scope = union(enum) { boot: void, request: u64 };
+pub const RecoveryOwner = struct {
+    // Independent of the failed queue epoch: the actual attached device and
+    // its unchanged reset/display owner must still match this retained run.
+    generation: *const fn (*anyopaque) u64,
+    // The serialized work owner stops ordinary dispatch/IRQs and admits all
+    // saved display/VRAM dependencies before the one-way handoff. No callback
+    // supplied by passive boot-check can grant firmware recovery authority.
+    admit: *const fn (*anyopaque, *const Port) anyerror!void,
+    access: *const fn (*anyopaque, Access, u32) anyerror!void,
+};
 pub const Owner = struct {
     context: *anyopaque,
     generation: *const fn (*anyopaque) u64,
@@ -148,6 +158,7 @@ pub const Owner = struct {
     // before leaving boot. The Boot passed here already handled/ACKed INIT_DONE.
     // No callback or timer may manufacture firmware readiness from elapsed time.
     admit_runtime: ?*const fn (*anyopaque, *const events.Boot) anyerror!void = null,
+    recovery: ?RecoveryOwner = null,
 };
 pub const Run = struct { epoch: u64, deadline_ns: u64, resume_args: ?core.Resume = null };
 pub const Port = struct {
@@ -155,9 +166,11 @@ pub const Port = struct {
     clock: ?r4os.r4dev.DriverResourceContext = null,
     owner: ?Owner = null,
     window: a.GfxMmioWindow = .{},
+    window_stamp: a.GfxMmioWindow = .{},
     shared: bar0.Lease = .{},
     run: Run = .{ .epoch = 0, .deadline_ns = 0 },
     boot0: u32 = 0,
+    boot1: u32 = 0,
     self_address: usize = 0,
     last_clock: u64 = 0,
     cleanup_needed: bool = false,
@@ -174,6 +187,10 @@ pub const Port = struct {
     phase: Phase = .boot,
     runtime_session: ?*transport.Session = null,
     runtime_sequence: ?*RuntimeSequencer = null,
+    recovery_owner: usize = 0,
+    recovery_deadline: u64 = 0,
+    recovery_last_clock: u64 = 0,
+    recovery_failure: ?anyerror = null,
 
     /// Stable address, serialized init/Driver Work owner; not an IRQ callback
     /// or a dedicated task. Failure retains any partially returned mapping.
@@ -197,10 +214,11 @@ pub const Port = struct {
             if (memory.api != ctx.api or memory.generation() != run.epoch) return error.Stale;
         }
         self.self_address = @intFromPtr(self);
-        errdefer |err| self.failure = err;
+        errdefer |err| self.recordFailure(err);
         self.run = run;
         self.owner = owner;
         self.boot0 = boot0;
+        self.boot1 = boot1;
         self.clock = ctx.resources() orelse return error.Api;
         try self.guard();
         self.memory = ctx.memory() orelse return error.Api;
@@ -217,6 +235,7 @@ pub const Port = struct {
         if (w.version != 1 or w.size < @sizeOf(a.GfxMmioWindow) or w.handle.id == 0 or w.handle.generation == 0 or
             w.cpu_address == 0 or w.cpu_address % 4096 != 0 or w.cpu_address > std.math.maxInt(u64) - bar.bytes or
             w.physical_address != bar.base or w.byte_length != bar.bytes or w.cache_policy != a.gfx_buffer_cache_uncached) return error.Mapping;
+        self.window_stamp = self.window;
         self.ready = true;
         if (try self.read(0) != boot0 or try self.read(4) != boot1) return error.IdentityChanged;
         try self.guard();
@@ -253,7 +272,7 @@ pub const Port = struct {
         if (!std.meta.eql(boot.session.port, try self.transportPort()) or boot.session.epoch != self.run.epoch) return error.Binding;
         if (boot.state != .init_done or boot.pending != null or boot.session.pending != null or boot.session.state != .active) return error.State;
         const admit_runtime = self.owner.?.admit_runtime orelse return error.Unsupported;
-        errdefer |err| self.failure = err;
+        errdefer |err| self.recordFailure(err);
         const deadline = @min(boot.deadline, self.run.deadline_ns);
         const memory = try self.queueMemory(deadline);
         if (!self.retained or !memory.retained or !self.effects_possible) return error.State;
@@ -276,7 +295,7 @@ pub const Port = struct {
     fn queueRead(p: *anyopaque, deadline: u64, queue: transport.ring.Queue, offset: usize, bytes: []u8) anyerror!void {
         const self = cast(p);
         if (self.runtime_sequence != null) return error.Busy;
-        errdefer |err| self.failure = err;
+        errdefer |err| self.recordFailure(err);
         const memory = try self.queueMemory(deadline);
         const port = try memory.transportPort();
         try port.read(port.context, deadline, queue, offset, bytes);
@@ -285,7 +304,7 @@ pub const Port = struct {
     fn queuePublish(p: *anyopaque, deadline: u64, queue: transport.ring.Queue, offset: usize, bytes: []const u8) anyerror!void {
         const self = cast(p);
         if (self.runtime_sequence) |execution| if (!execution.permitsAck(deadline, queue, offset, bytes)) return error.Busy;
-        errdefer |err| self.failure = err;
+        errdefer |err| self.recordFailure(err);
         const memory = try self.queueMemory(deadline);
         // ACK publication can be the first effect too. It needs retention,
         // but does not ring the command queue notification register.
@@ -304,7 +323,7 @@ pub const Port = struct {
     fn prepareCommand(p: *anyopaque, deadline: u64) anyerror!void {
         const self = cast(p);
         if (self.runtime_sequence != null) return error.Busy;
-        errdefer |err| self.failure = err;
+        errdefer |err| self.recordFailure(err);
         try self.commandAdmission(deadline);
         try self.retainFor(.{ .request = deadline });
         try self.commandAdmission(deadline);
@@ -312,7 +331,7 @@ pub const Port = struct {
     fn notifyCommand(p: *anyopaque, deadline: u64) anyerror!void {
         const self = cast(p);
         if (self.runtime_sequence != null) return error.Busy;
-        errdefer |err| self.failure = err;
+        errdefer |err| self.recordFailure(err);
         try self.commandAdmission(deadline);
         if (!self.retained) return error.State;
         // writeFor() fences prior DMA/cursor publication, performs the exact
@@ -355,7 +374,7 @@ pub const Port = struct {
     /// establish RM_INIT_DONE. Failures preserve the operation and raw state.
     pub fn stepColdBoot(self: *Port) !bool {
         if (self.phase != .boot) return error.Phase;
-        errdefer |err| self.failure = err;
+        errdefer |err| self.recordFailure(err);
         try self.guard();
         const command = self.cold_command orelse return error.State;
         const operation = if (self.operation) |*op| op else return error.State;
@@ -384,7 +403,7 @@ pub const Port = struct {
     /// Neither result establishes GSP readiness or device quiescence.
     pub fn stepFirmware(self: *Port) !?firmware_run.Result {
         if (self.phase != .boot) return error.Phase;
-        errdefer |err| self.failure = err;
+        errdefer |err| self.recordFailure(err);
         try self.guard();
         const operation = if (self.firmware_operation) |*op| op else return error.State;
         const done = try operation.step(.{ .context = self, .generation = generation, .now_ns = nowNs, .admit = admitFirmware, .read32 = read32, .write32 = write32, .log_polling = if (self.owner.?.log_polling != null) logs else null });
@@ -405,7 +424,7 @@ pub const Port = struct {
     }
     fn generation(p: *anyopaque) u64 {
         const self = cast(p);
-        if (self.self_address != @intFromPtr(self) or !self.ready or self.failure != null or !self.mappingValid() or !self.runtimeValid()) return 0;
+        if (self.phase == .recovery or self.self_address != @intFromPtr(self) or !self.ready or self.failure != null or !self.mappingValid() or !self.runtimeValid()) return 0;
         const owner = self.owner orelse return 0;
         if (owner.queue_memory) |memory| {
             if (memory.generation() != self.run.epoch) return 0;
@@ -421,6 +440,7 @@ pub const Port = struct {
         return self.guardFor(.boot);
     }
     fn guardFor(self: *Port, scope: Scope) !void {
+        if (self.phase == .recovery) return error.Phase;
         if (scope == .boot and self.phase != .boot) return error.Phase;
         if (self.self_address != @intFromPtr(self) or self.failure != null or self.owner == null or self.clock == null) return error.State;
         if (!self.mappingValid() or !self.runtimeValid()) return error.Stale;
@@ -442,7 +462,11 @@ pub const Port = struct {
         if (deadline == std.math.maxInt(u64) or now >= deadline) return error.Deadline;
     }
     fn mappingValid(self: *const Port) bool {
+        if (self.ready and !std.meta.eql(self.window, self.window_stamp)) return false;
         return self.shared.owner == null or (self.shared.valid() and std.meta.eql(self.window, self.shared.stamp));
+    }
+    fn recordFailure(self: *Port, err: anyerror) void {
+        if (self.failure == null and self.phase != .recovery) self.failure = err;
     }
     fn accessFor(self: *Port, scope: Scope, kind: Access, offset: u32) !void {
         try self.guardFor(scope);
@@ -495,7 +519,7 @@ pub const Port = struct {
     }
     fn readFor(self: *Port, scope: Scope, offset: u32) !u32 {
         if (scope == .boot and self.phase != .boot) return error.Phase;
-        errdefer |err| self.failure = err;
+        errdefer |err| self.recordFailure(err);
         try self.accessFor(scope, .read, offset);
         fence();
         const value = self.pointer(offset).*;
@@ -520,7 +544,7 @@ pub const Port = struct {
     }
     fn writeFor(self: *Port, scope: Scope, offset: u32, value: u32) !void {
         if (scope == .boot and self.phase != .boot) return error.Phase;
-        errdefer |err| self.failure = err;
+        errdefer |err| self.recordFailure(err);
         try self.accessFor(scope, .write, offset);
         try self.accessFor(scope, .read, 0); // Admit mandatory flush before write.
         try self.retainFor(scope);
@@ -555,7 +579,7 @@ pub const Port = struct {
     fn coreStep(p: *anyopaque, opcode: seq.Opcode, state: *seq.CoreState, deadline: u64, _: *const [8]u32) anyerror!bool {
         const self = cast(p);
         if (self.phase != .boot) return error.Phase;
-        errdefer |err| self.failure = err;
+        errdefer |err| self.recordFailure(err);
         try self.guard();
         if (self.firmware_operation != null or self.cold_command != null) return error.Busy;
         if (deadline > self.run.deadline_ns or deadline <= self.last_clock) return error.Deadline;
@@ -572,12 +596,83 @@ pub const Port = struct {
         if (done) self.operation = null;
         return done;
     }
+    /// Fresh, finite recovery budget on the SAME BAR0 mapping and retained
+    /// DMA run. Old failure/operations/receipts remain intact for diagnosis;
+    /// every ordinary facade is permanently fenced. Serialized worker only.
+    pub fn beginRecovery(self: *Port, borrower: usize, deadline: u64) !void {
+        if (borrower == 0 or self.recovery_owner != 0 or self.phase == .recovery) return error.Busy;
+        if (self.self_address != @intFromPtr(self) or !self.ready or !self.mappingValid() or
+            self.owner == null or self.clock == null or !self.effects_possible) return error.State;
+        const owner = self.owner.?;
+        const hooks = owner.recovery orelse return error.Unsupported;
+        const memory = owner.queue_memory orelse return error.Unsupported;
+        _ = try memory.retainedInputs();
+        if (memory.queue.epoch != self.run.epoch or hooks.generation(owner.context) != self.run.epoch) return error.Stale;
+        const now = self.clock.?.nowNs();
+        if (now == 0 or now == std.math.maxInt(u64) or now < self.last_clock) return error.Clock;
+        if (deadline == std.math.maxInt(u64) or deadline <= now) return error.Deadline;
+        try hooks.admit(owner.context, self);
+        const after = self.clock.?.nowNs();
+        if (after == std.math.maxInt(u64) or after < now) return error.Clock;
+        if (after >= deadline) return error.Deadline;
+        if (!self.mappingValid() or hooks.generation(owner.context) != self.run.epoch) return error.Stale;
+        try memory.beginRecovery(borrower);
+        self.recovery_owner = borrower;
+        self.recovery_deadline = deadline;
+        self.recovery_last_clock = after;
+        self.phase = .recovery;
+    }
+    pub fn recoveryEpoch(self: *const Port, borrower: usize) u64 {
+        if (borrower == 0 or self.recovery_owner != borrower or self.phase != .recovery or
+            self.self_address != @intFromPtr(self) or !self.ready or self.recovery_failure != null or !self.mappingValid()) return 0;
+        const owner = self.owner orelse return 0;
+        const hooks = owner.recovery orelse return 0;
+        const memory = owner.queue_memory orelse return 0;
+        if (memory.recoveryEpoch(borrower) != self.run.epoch or hooks.generation(owner.context) != self.run.epoch) return 0;
+        return self.run.epoch;
+    }
+    pub fn checkRecovery(self: *Port, borrower: usize) !void {
+        if (self.recoveryEpoch(borrower) == 0) return error.Stale;
+        const now = self.clock.?.nowNs();
+        if (now == std.math.maxInt(u64) or now < self.recovery_last_clock) return error.Clock;
+        self.recovery_last_clock = now;
+        if (now >= self.recovery_deadline) return error.Deadline;
+    }
+    fn recoveryAccess(self: *Port, borrower: usize, kind: Access, address: u32) !void {
+        try self.checkRecovery(borrower);
+        if (!self.supports(kind, address)) return error.Register;
+        const owner = self.owner.?;
+        try owner.recovery.?.access(owner.context, kind, address);
+        try self.checkRecovery(borrower);
+    }
+    pub fn recoveryRead(self: *Port, borrower: usize, address: u32) !u32 {
+        errdefer |err| { if (self.recovery_failure == null) self.recovery_failure = err; }
+        try self.recoveryAccess(borrower, .read, address);
+        fence();
+        const value = self.pointer(address).*;
+        fence();
+        try self.checkRecovery(borrower);
+        return value;
+    }
+    pub fn recoveryWrite(self: *Port, borrower: usize, address: u32, value: u32) !void {
+        errdefer |err| { if (self.recovery_failure == null) self.recovery_failure = err; }
+        try self.recoveryAccess(borrower, .write, address);
+        try self.recoveryAccess(borrower, .read, 0);
+        try self.recoveryAccess(borrower, .write, address);
+        fence();
+        self.pointer(address).* = value;
+        fence();
+        if (try self.recoveryRead(borrower, 0) != self.boot0) return error.IdentityChanged;
+    }
     /// Retryable mapping cleanup. Ambiguous device effects keep this port and
     /// every external DMA owner alive until the native owner proves quiescence.
     /// Invalidates outstanding callback copies before the first unmap attempt.
     pub fn close(self: *Port) bool {
         if (self.self_address == 0) return true;
         if (self.self_address != @intFromPtr(self)) return false;
+        // Firmware teardown alone cannot release BAR0 or the recovery loan.
+        // Device/display restoration and post-submit release remain separate.
+        if (self.recovery_owner != 0) return false;
         if (self.runtime_sequence != null) return false;
         if (self.effects_possible) {
             const owner = self.owner orelse return false;

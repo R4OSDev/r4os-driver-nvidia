@@ -201,6 +201,11 @@ const QueueNative = struct {
     log_calls: usize = 0,
     logs_enabled: bool = true,
     lockdown: bool = false,
+    recovery_case: enum { success, skip, sb_error, unload_error, timeout, dma_timeout, clock_regression, stale, mapping, mmio, plan, posted, denied } = .success,
+    recovery_epoch: u64 = 0,
+    recovery_writes: usize = 0,
+    sec_writes: usize = 0,
+    recovery_admissions: usize = 0,
     fn from(p: *anyopaque) *QueueNative {
         return @ptrCast(@alignCast(p));
     }
@@ -241,6 +246,32 @@ const QueueNative = struct {
     fn owner(self: *QueueNative) native.Owner {
         return .{ .context = self, .generation = generation, .admit = admit, .access = access, .retain = retain, .quiesced = quiesced, .queue_memory = self.memory, .admit_runtime = if (self.case == .runtime_missing) null else admitRuntime, .log_polling = if (self.case == .runtime_seq_resume) logPolling else null };
     }
+    fn recoveryGeneration(p: *anyopaque) u64 { return from(p).recovery_epoch; }
+    fn recoveryAdmit(p: *anyopaque, port: *const native.Port) !void {
+        const self = from(p);
+        try t.expect(port.failure.? == error.Deadline and self.memory.retained);
+        self.recovery_admissions += 1;
+        if (self.recovery_case == .denied) return error.Dependencies;
+    }
+    fn recoveryAccess(p: *anyopaque, kind: native.Access, address_value: u32) !void {
+        const self = from(p);
+        const hs = @import("falcon_hs.zig");
+        const core = @import("gsp_core.zig");
+        if (kind == .write) {
+            self.recovery_writes += 1;
+            if (address_value >= hs.reg.sec2 and address_value < hs.reg.sec2 + 0x2000) self.sec_writes += 1;
+        }
+        if (kind == .read and (address_value == hs.reg.gsp + hs.reg.dma_command or address_value == hs.reg.sec2 + hs.reg.dma_command)) {
+            self.words[address_value / 4] = hs.bits.idle;
+            if (self.recovery_case == .dma_timeout) clock = 100000000;
+            if (self.recovery_case == .clock_regression) clock = 100;
+        }
+        if (kind == .read and address_value == core.reg.sec_mailbox0) {
+            self.words[address_value / 4] = if (self.recovery_case == .unload_error) 7 else 0;
+            self.words[0x1fa828 / 4] = 0;
+        }
+        if (self.recovery_case == .posted and kind == .read and address_value == 0 and self.recovery_writes != 0) self.words[0] = 0;
+    }
     fn logPolling(p: *anyopaque, enable: bool) anyerror!void {
         const self = from(p);
         try t.expect(self.retains == 1 and self.memory.retained);
@@ -275,6 +306,121 @@ const QueueNative = struct {
     }
 };
 var queue_native: *QueueNative = undefined;
+
+fn checkNativeTeardown(memory: *@import("gsp_run_memory.zig").Lease, ctx: *const r4os.r4dev.DriverContext, table: *a.DriverApi) !void {
+    const teardown = @import("gsp_teardown.zig");
+    const native = QueueNative.native;
+    const core = @import("gsp_core.zig");
+    const hs = @import("falcon_hs.zig");
+    const identity = @import("identity.zig");
+    const words = try t.allocator.alignedAlloc(u32, comptime std.mem.Alignment.fromByteUnits(4096), 0x842000 / 4);
+    defer t.allocator.free(words);
+    table.gfx_memory_query = QueueNative.query;
+    var snapshot: identity.Snapshot = .{ .pci = .{ .vendor_id = 0x10de, .device_id = 0x2504, .class_code = 3 }, .command = 2 };
+    snapshot.bars[0] = .{ .kind = .memory32, .base = 0xfb000000, .bytes = words.len * 4 };
+    for (std.enums.values(@FieldType(QueueNative, "recovery_case"))) |case| {
+        errdefer |err| std.debug.print("native teardown fixture {s}: {s}\n", .{ @tagName(case), @errorName(err) });
+        clock = 100;
+        @memset(words, 0);
+        words[0] = 0xb76000a1;
+        for ([_]u32{ hs.reg.gsp, hs.reg.sec2 }) |base| {
+            words[(base + 0xf4) / 4] = core.bits.reset_ready;
+            words[(base + 0x108) / 4] = 0x20100;
+            words[(base + hs.reg.cpu_control) / 4] = hs.bits.cpu_alias | hs.bits.cpu_halted;
+        }
+        words[0x118128 / 4] = 1;
+        words[0x118234 / 4] = 0xff;
+        words[0x1454 / 4] = if (case == .sb_error) 1 else 0;
+        words[0x1fa828 / 4] = if (case == .skip) 0 else 0x500000;
+        var fixture: QueueNative = .{ .memory = memory, .words = words, .case = .success,
+            .recovery_case = case, .recovery_epoch = memory.generation() };
+        queue_native = &fixture;
+        var port: native.Port = .{};
+        var owner = fixture.owner();
+        owner.recovery = .{ .generation = QueueNative.recoveryGeneration, .admit = QueueNative.recoveryAdmit, .access = QueueNative.recoveryAccess };
+        try port.open(ctx, &snapshot, words[0], 0, .{ .epoch = memory.generation(), .deadline_ns = 1000 }, owner);
+        const old_port = try port.transportPort();
+        const old_leaf = memory.queue.port();
+        var reader: @import("gsp_logs.zig").Reader = .{};
+        try reader.open(memory);
+        try memory.retainForDevice();
+        port.retained = true;
+        port.effects_possible = true;
+        port.failure = error.Deadline; // Retain the actual prior failure.
+        memory.invalidate(); // Recovery must tolerate a failed transport.
+        clock = 2000; // The old boot budget has expired.
+        var recovery: teardown.Recovery = .{};
+        if (case == .denied) {
+            try t.expectError(error.Dependencies, recovery.open(&port, &reader, 100000000));
+            try t.expect(port.phase == .boot and memory.recovery_owner == 0 and fixture.recovery_writes == 0);
+        } else {
+            try recovery.open(&port, &reader, 100000000);
+            try t.expect(port.phase == .recovery and memory.recovery_owner == @intFromPtr(&recovery));
+            try t.expect(!reader.enabled and port.failure.? == error.Deadline and memory.failed and memory.queue.failed);
+            try t.expectEqual(@as(u64, 0), old_port.generation(old_port.context));
+            var output: [8]u8 = undefined;
+            try t.expectError(error.Phase, old_port.read(old_port.context, 100000000, .status, 0, &output));
+            try t.expectError(error.QueueClosed, old_leaf.read(old_leaf.context, 100000000, .status, 0, &output));
+            try t.expectError(error.Stale, reader.setPolling(true));
+            try t.expectError(error.Busy, port.beginRecovery(@intFromPtr(&recovery), 200000000));
+            var copy = recovery;
+            try t.expectError(error.State, copy.step());
+            try t.expect(port.recovery_failure == null);
+            if (case == .timeout) clock = 100000000;
+            if (case == .stale) fixture.recovery_epoch += 1;
+            if (case == .mapping) memory.boot_storage.?.mapping.handle += 1;
+            if (case == .mmio) port.window.handle.generation += 1;
+            if (case == .plan) memory.fwsec_sb_storage.?.device.prepared_plan.?.ucode_id += 1;
+            const result: ?anyerror = blk: {
+                for (0..10000) |_| {
+                    const done = recovery.step() catch |err| break :blk err;
+                    if (done) break :blk null;
+                    clock += 1000;
+                }
+                return error.Unbounded;
+            };
+            switch (case) {
+                .success, .skip => {
+                    try t.expect(result == null and recovery.report != null and recovery.phase == .complete);
+                    try t.expectEqual(case == .skip, recovery.report.?.unload.booter.?.skipped);
+                    try t.expect(recovery.report.?.sb.fwsec.?.command == .sb and !reader.enabled);
+                    try t.expect((fixture.sec_writes == 0) == (case == .skip));
+                },
+                .sb_error, .unload_error, .timeout, .dma_timeout, .clock_regression, .stale, .mapping, .mmio, .plan, .posted => {
+                    try t.expectEqual(@as(?anyerror, switch (case) {
+                        .sb_error => error.SbError, .unload_error => error.BooterError,
+                        .timeout, .dma_timeout => error.Deadline, .clock_regression => error.Clock,
+                        .stale, .mapping, .mmio => error.Stale, .plan => error.Binding,
+                        .posted => error.IdentityChanged, else => unreachable,
+                    }), result);
+                    const writes = fixture.recovery_writes;
+                    try t.expectError(error.State, recovery.step());
+                    try t.expect(recovery.report == null and writes == fixture.recovery_writes);
+                    if (case == .sb_error) try t.expect(fixture.sec_writes == 0);
+                },
+                .denied => unreachable,
+            }
+            if (case == .mapping) memory.boot_storage.?.mapping.handle -= 1;
+            if (case == .mmio) port.window.handle.generation -= 1;
+            if (case == .plan) memory.fwsec_sb_storage.?.device.prepared_plan.?.ucode_id -= 1;
+            try t.expect(fixture.recovery_admissions == 1 and port.failure.? == error.Deadline);
+        }
+        try t.expect(!port.close() and !memory.releaseBeforeSubmission() and !memory.init_storage.?.close());
+        try t.expect(reader.close());
+        // Host-only register model disposal. There is no production API for
+        // declaring quiescence, releasing a submitted run or retrying it.
+        port.recovery_owner = 0;
+        fixture.quiet = true;
+        try t.expect(port.close());
+        memory.recovery_owner = 0;
+        memory.failed = false;
+        memory.queue.failed = false;
+        memory.retained = false;
+        memory.init_storage.?.device_access = false;
+        try t.expect(fixture.mapped == false and close_calls == 0);
+    }
+    clock = 100;
+}
 
 fn checkNativeQueue(memory: *@import("gsp_run_memory.zig").Lease, ctx: *const r4os.r4dev.DriverContext, table: *a.DriverApi) !void {
     const native = QueueNative.native;
@@ -824,6 +970,8 @@ test "firmware CPU storage complete run lease retains all boot DMA owners" {
     s.device.prepared_plan = f.device.prepared_plan;
     s.device.prepared_plan.?.imem.base = 0x505000000;
     s.device.prepared_plan.?.dmem.base = 0x505001000;
+    s.device.prepared_plan.?.engine_mask = 0x400;
+    s.device.prepared_plan.?.ucode_id = 9;
     s.device.mapping = .{ .handle = 206, .pin_handle = 306, .segment_count = 1 };
     s.device.mapping.segments[0] = .{ .phys_addr = 0x505000000, .bytes = 65536 };
     const wpr = @import("gsp_wpr.zig");
@@ -935,6 +1083,7 @@ test "firmware CPU storage complete run lease retains all boot DMA owners" {
     try t.expectEqual(init_report.init.libos_address, inputs.resume_args.libos_dma);
     try t.expectEqual(@as(u32, 0x79), inputs.resume_args.app_version);
     try t.expectEqual(f.device.prepared_plan.?.imem.base, inputs.fwsec.imem.base);
+    try checkNativeTeardown(&lease, &ctx, &table);
     try checkLogReader(&lease);
     try t.expect(lease.failed and lease.log_owner == 0);
     try t.expect(lease.releaseBeforeSubmission());

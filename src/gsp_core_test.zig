@@ -435,11 +435,11 @@ test "firmware CPU storage GA106 core sequencing and native MMIO ownership" {
     sec_options.plan.imem.source_offset = 256;
     sec_options.plan.boot_vector = 256;
     sec_options.plan.dmem.base += 256;
-    // The old core-only aperture ends before SEC2's BROM page. No admission
-    // callback or preceding DMA write may run for that truncated mapping.
+    // Truncating an already opened aperture invalidates its retained mapping
+    // stamp before firmware admission or any preceding DMA write.
     const full_aperture = port.window.byte_length;
     port.window.byte_length = 0x841000;
-    try t.expectError(error.Register, port.beginFirmware(sec_options));
+    try t.expectError(error.Stale, port.beginFirmware(sec_options));
     port.window.byte_length = full_aperture;
     try t.expectEqual(@as(u32, 0), fixture.hs_admissions);
     try port.beginFirmware(hs_options);

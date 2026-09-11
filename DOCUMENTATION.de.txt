@@ -3,6 +3,35 @@
 
 Stand: 11.09.2026; passive Hardwareaufnahme 0.79.9 abgeschlossen.
 
+Einmaliger Firmware-Abbau nach Fehlern (NVIDIA 0.1.51)
+----------------------------------------------------
+Der native Port kann einen bereits gehaltenen Lauf einmalig in einen eigenen,
+endlich befristeten Wiederherstellungspfad uebergeben. Der alte Fehler und
+angefangene Operationen bleiben erhalten. Normale Queue-/Sequencer-Zugriffe
+werden gesperrt; unveraenderte MMIO-/DMA-Bindungen und der echte pausierte
+Libos-Leser bleiben Voraussetzung jeder weiteren Operation.
+
+Der Abbau fuehrt FWSEC-SB und danach normalen Booter Unload ueber die
+vorhandenen Reset-/Upload-/Halt- und Ergebnispruefungen aus. Beide Abbilder
+stammen aus genau diesem gehaltenen Lauf. WPR-down darf Unload ueberspringen;
+ein SB- oder Unload-Fehler stoppt weitere Schritte ohne Wiederholung. Der
+Leser bleibt pausiert. Firmware-Ergebnisse allein geben weder Speicher noch
+Displaybesitz frei und behaupten keine wiederhergestellte Anzeige.
+
+51 bestehende Testfaelle und Modulbuild bestanden; keine neue Testgruppe/Gates.
+Die vorhandene Besitzergruppe prueft Erfolg, WPR-down, Firmwarefehler,
+Fristablauf vor und waehrend MMIO, Uhrenregression, verlorene Epochen und
+Mappings, veraenderte Plaene, Fehler nach Writes sowie verweigerte Zulassung.
+Alte Zugriffe und kopierte Besitzer koennen keinen zweiten Versuch starten.
+Die bestehende Apertur-Testfixture erwartet nun Stale, weil jede Aenderung
+des bereits geoeffneten Mappingdeskriptors vor Firmwarezulassung abbricht.
+
+Der neue Abbau-Controller ist noch nicht im produktiven DriverWork verdrahtet.
+Produktive Recovery-Zulassung, vollstaendige Anzeige-/Geraetewiederherstellung
+und GPU-Ruhebeweis bleiben offen. Deshalb wurde kein GPU-Firmwarelauf und
+kein Update auf OssiPC ausgefuehrt; dort bleibt NVIDIA 0.1.50 passiv.
+Quellen und Belege: ExFiles/Reference/GFX/Nvidia/0.79.10/teardown-20260911.
+
 GSP-Protokollringe am gemeinsamen Lauf (NVIDIA 0.1.50)
 ------------------------------------------------------
 Der begrenzte Leser verwendet die fuenf bereits gehaltenen Libos-DMA-Ringe.

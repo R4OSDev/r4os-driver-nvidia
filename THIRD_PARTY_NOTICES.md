@@ -1,5 +1,11 @@
 ﻿# Third-Party Notices
 
+Firmware teardown (0.79.10, NVIDIA 0.1.51, 2026-09-11):
+Ordering follows the pinned MIT kgspTeardown_TU102; its complete original
+notice is retained in gsp_teardown.zig. Existing Falcon/Booter notices remain
+unchanged. Seven complete NVIDIA originals and their hashes are archived in
+0.79.10/teardown-20260911. R4OS lifetime/binding code is Apache-2.0.
+
 GSP raw firmware log reader (0.79.10, NVIDIA0.1.50, 2026-09-11):
 The Libos PUT counter and8191-word ring layout follow the pinned original
 570.144 liblogdecode.c. Its complete MIT notice (Rich Felker et al. and

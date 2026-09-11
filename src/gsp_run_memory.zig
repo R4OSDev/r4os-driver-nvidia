@@ -37,6 +37,7 @@ pub const Lease = struct {
     mappings: [map_count]Stamp = undefined,
     mapped_count: usize = 0,
     log_owner: usize = 0,
+    recovery_owner: usize = 0,
     last_log_status: i32 = 0,
     retained: bool = false,
     failed: bool = false,
@@ -170,16 +171,45 @@ pub const Lease = struct {
     /// storage/run epoch, not a claim to have observed a hardware reset counter.
     /// Native lost-device/reset handling must invalidate the run immediately.
     pub fn generation(self: *const Lease) u64 {
-        return if (!self.failed and self.matches()) self.queue.epoch else 0;
+        return if (!self.failed and self.recovery_owner == 0 and self.matches()) self.queue.epoch else 0;
     }
     pub fn inputs(self: *const Lease) !Inputs {
         if (self.generation() == 0) return error.Stale;
+        return self.boundInputs();
+    }
+    fn boundInputs(self: *const Lease) Inputs {
         const b = self.boot_storage.?.report.?;
         const i = self.init_storage.?.report.?;
         const f = self.fwsec_storage.?;
         var result: Inputs = .{ .boot = b, .init = i, .fwsec = f.device.prepared_plan.?, .fwsec_command = f.command, .frts = f.frts_binding, .fwsec_sb = self.fwsec_sb_storage.?.device.prepared_plan.?, .booters = undefined, .resume_args = .{ .libos_dma = i.init.libos_address, .app_version = b.app_version } };
         for (&self.booter_storage.?.images, &result.booters) |*image, *input| input.* = .{ .prepared = image.prepared.?, .plan = image.device.prepared_plan.? };
         return result;
+    }
+    /// One-way handoff of an already retained run. A failed transport may
+    /// still own valid mappings; it must never be revived to perform recovery.
+    /// The native port separately admits the real device/display owner. This
+    /// does not release memory or establish any kind of GPU quiescence.
+    pub fn beginRecovery(self: *Lease, owner: usize) !void {
+        if (owner == 0 or self.recovery_owner != 0) return error.Busy;
+        if (!self.retained or !self.matches() or !self.init_storage.?.device_access) return error.Stale;
+        self.recovery_owner = owner;
+        self.failed = true;
+        self.queue.failed = true; // Also invalidate copies of the leaf facade.
+    }
+    pub fn recoveryEpoch(self: *const Lease, owner: usize) u64 {
+        return if (owner != 0 and self.recovery_owner == owner and self.retained and
+            self.matches() and self.init_storage.?.device_access) self.queue.epoch else 0;
+    }
+    pub fn recoveryInputs(self: *const Lease, owner: usize) !Inputs {
+        if (self.recoveryEpoch(owner) == 0) return error.Stale;
+        return self.boundInputs();
+    }
+    /// Validate retained identities before the irreversible handoff, including
+    /// after a queue or log error. Never exposes a usable transport epoch.
+    pub fn retainedInputs(self: *const Lease) !Inputs {
+        if (!self.retained or self.recovery_owner != 0 or !self.matches() or
+            !self.init_storage.?.device_access) return error.Stale;
+        return self.boundInputs();
     }
     /// Memory-only facade. Native sends must use gsp_sequencer_port's facade,
     /// which binds this exact lease to the register owner and notification.
@@ -240,7 +270,7 @@ pub const Lease = struct {
     /// and verified. Lost-device, timeout and INIT_DONE do not authorize reuse.
     pub fn releaseBeforeSubmission(self: *Lease) bool {
         if (self.self_address == 0) return true;
-        if (self.retained or self.log_owner != 0 or !self.matches()) return false;
+        if (self.retained or self.log_owner != 0 or self.recovery_owner != 0 or !self.matches()) return false;
         if (!self.queue.releaseBeforeSubmission()) return false;
         self.boot_storage.?.execution_owner = 0;
         self.boot_storage.?.image.execution_owner = 0;

@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-Passive NVIDIA display driver for R4OS. Module 0.1.50; original R4OS code is
+Passive NVIDIA display driver for R4OS. Module 0.1.51; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -11,6 +11,26 @@ Starting with R4OS 0.79.9, `IMAGE_SCOPE=slim` includes the current module in
 Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
+
+One-shot firmware teardown (NVIDIA 0.1.51, 2026-09-11):
+
+The native port hands its retained run to a separate finite recovery budget,
+preserving the original failure and partial operations. Ordinary queue and
+sequencer access stays fenced; exact MMIO/DMA bindings and the actual paused
+Libos reader are checked throughout. FWSEC-SB precedes normal Booter Unload
+using the same run's prepared images and existing reset/upload/halt/result
+executors. Errors stop without retry. WPR-down can skip Unload; the reader
+stays stopped. No result frees submitted memory or restores the display.
+
+All 51 existing cases and the module build pass. The existing complete-run
+group covers success/skip, firmware faults, clocks and in-access timeouts,
+changed mappings/plans, lost epochs, posted writes and denied admission.
+The old truncated-aperture fixture now expects Stale before firmware access.
+The teardown controller is not yet called by production DriverWork.
+No new grouped case, gate, guest run or OssiPC update. Production recovery
+admission, full device/console restoration and DMA quiescence remain open;
+OssiPC stays on passive NVIDIA 0.1.50. Full originals and validation receipts:
+0.79.10/teardown-20260911 under ExFiles/Reference/GFX/Nvidia.
 
 Bounded GSP raw log reader (NVIDIA 0.1.50, 2026-09-11):
 
