@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-Passive NVIDIA display driver for R4OS. Module 0.1.31; original R4OS code is
+Passive NVIDIA display driver for R4OS. Module 0.1.32; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -10,7 +10,33 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
-Normal Booter completion and log-reader lifetime (host qualified):
+Retain both FWSEC images before boot (NVIDIA 0.1.32):
+
+The opt-in boot-check keeps its original immutable SB CPU/DMA image for normal
+teardown and prepares FRTS in a separate resident owner. The complete run now
+requires seven distinct CPU allocations and both synchronized FWSEC mappings.
+FRTS must name the exact live reservation belonging to this boot backing; SB
+must be a separate complete command 0x19 image. Wrong roles, missing storage,
+other APIs/backing, duplicate pins and CPU/DMA overlaps refuse before queue
+ownership. Both images remain held through execution failure. The init plan
+excludes both mappings; its bounded capacity is 261 spans. Unsubmitted cleanup
+closes FRTS and SB before releasing the boot reservation and snapshots.
+
+All 51 existing owner cases and the module build pass. The existing lifecycle
+case compares actual simultaneous SB/FRTS CPU/DMA bytes across ten scenarios;
+every FRTS preparation/cleanup failure preserves SB. The run-lease case checks
+paired ownership, live metadata, aliasing, role/pin changes and retained close.
+An initial first-boot fixture state/cleanup error was corrected; log retained.
+No new gate, case count or guest run. NVIDIA 0.1.32 has 385024 resident bytes and 3567
+relocations; all 24 pinned resource payloads remain unchanged. New binding is
+original R4OS code; three complete reference originals/notices are archived.
+
+OssiPC is offline and untouched; last physical evidence is Kernel150/NVIDIA28
+passive. No firmware is executed. Full native GPU/scanout recovery, GSP startup
+and HDMI remain open. Ordinary passive mode still prepares only SB. Evidence:
+`fwsec_pair_checkpoint`; archive `fwsec-pair-20260911`.
+
+Earlier normal Booter completion and log-reader lifetime (host qualified):
 
 The native executor now distinguishes normal cold Load and Unload. It checks
 the complete metadata DMA page and exact mailbox arguments before effects,
@@ -51,7 +77,7 @@ before linkage. OssiPC is offline and untouched; actual firmware execution,
 full GPU recovery, Booter results and HDMI remain open.
 Evidence: `fwsec_result_checkpoint`; archive `fwsec-result-20260911`.
 
-Current linked FWSEC-FRTS preparation bound to retained VRAM (NVIDIA 0.1.31):
+Earlier linked FWSEC-FRTS preparation bound to retained VRAM (NVIDIA 0.1.31):
 
 The opt-in boot-check now closes its earlier SB CPU/DMA image and prepares
 a fresh immutable FRTS image from the retained VBIOS. Command 0x15 names the

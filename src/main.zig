@@ -52,6 +52,7 @@ var checking_runtime = false;
 var board_rom: vbios_probe.Capture = .{};
 var security_fuses: fwsec_probe.Capture = .{};
 var fwsec_cpu: fwsec_storage.Storage = .{};
+var fwsec_frts: fwsec_storage.Storage = .{};
 var fwsec_hardware: fwsec_state_probe.Capture = .{};
 
 comptime {
@@ -172,6 +173,7 @@ pub export fn nvidia_shutdown() callconv(.c) i32 {
     if (!thread_probe.shutdown(&ctx)) return -1;
     if (!runtime_probe.shutdown(&ctx)) return -1;
     if (!closeBootInit()) return -1;
+    if (!fwsec_frts.close()) return -1;
     if (boot_vram_lease.self_address != 0 and !fwsec_cpu.close()) return -1;
     if (!boot_vram_lease.releaseBeforeSubmission()) return -1;
     if (!boot_storage.close()) return -1;
@@ -505,22 +507,27 @@ fn checkBoot(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Sna
     log("NVIDIA boot-check: boot-address={x} signature-address={x} metadata-address={x} metadata-bytes={d} verified=0 boot-count=0 vram-reserved=boot-owner vga-relocated=no", .{
         report.boot_address, report.signature_address, report.metadata_address, report.metadata_bytes,
     });
-    // The earlier passive SB image must be fully unmapped/freed before a new
-    // immutable FRTS image is constructed and synchronized for the device.
-    if (!fwsec_cpu.close()) return false;
-    const security = fwsec_cpu.prepareFrts(ctx, source.rom, source.board, source.fuses, &boot_vram_lease) catch |err| {
+    // Keep the original immutable SB image for normal teardown. FRTS uses
+    // separate CPU/DMA storage; no later recovery path must reallocate SB.
+    if (!fwsec_cpu.preparationValid() or fwsec_cpu.command != 0x19) return false;
+    const sb_plan = fwsec_cpu.device.prepared_plan orelse return false;
+    const security = fwsec_frts.prepareFrts(ctx, source.rom, source.board, source.fuses, &boot_vram_lease) catch |err| {
         log("NVIDIA boot-frts: rejected phase=cpu-preparation reason={s} submitted=no", .{@errorName(err)});
         return false;
     };
-    const security_plan = fwsec_cpu.device.stage(ctx, security.image, &security.metadata) catch |err| {
+    const security_plan = fwsec_frts.device.stage(ctx, security.image, &security.metadata) catch |err| {
         log("NVIDIA boot-frts: rejected phase=dma-preparation reason={s} submitted=no", .{@errorName(err)});
         return false;
     };
     const current = fwsec_state.decode(&boot_vram.observation.?) catch return false;
     current.checkTcm(&security_plan) catch return false;
-    if (!fwsec_cpu.preparationValid()) return false;
+    current.checkTcm(&sb_plan) catch return false;
+    if (!fwsec_frts.preparationValid()) return false;
     log("NVIDIA boot-frts: staged command={x} input-bytes=48 target-address={x} target-bytes={d} epoch={d} serial={d} dma-address={x} synchronized=yes submitted=no", .{
-        security.metadata.command, frts.range.offset, frts.range.bytes, frts.epoch, frts.serial, fwsec_cpu.device.mapping.segments[0].phys_addr,
+        security.metadata.command, frts.range.offset, frts.range.bytes, frts.epoch, frts.serial, fwsec_frts.device.mapping.segments[0].phys_addr,
+    });
+    log("NVIDIA boot-sb: retained command=19 bytes={d} dma-address={x} purpose=normal-teardown synchronized=yes submitted=no", .{
+        fwsec_cpu.allocation.byte_length, fwsec_cpu.device.mapping.segments[0].phys_addr,
     });
     const fuses = security_fuses.readBooter(ctx, snapshot, chip) catch |err| {
         log("NVIDIA booters: rejected phase=fuses reason={s} submitted=no", .{@errorName(err)});
@@ -552,6 +559,7 @@ fn checkBoot(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Sna
         return false;
     }
     ctx.logInfo("NVIDIA boot-init: cleanup=OK mappings=0 pins=0 cpu=0 submitted=no");
+    if (!fwsec_frts.close()) return false;
     if (!fwsec_cpu.close()) return false;
     if (!boot_vram_lease.releaseBeforeSubmission()) return false;
     if (!boot_storage.close()) {
@@ -574,14 +582,16 @@ fn stageBootInit(ctx: *const r4os.r4dev.DriverContext, chip_id: u16) bool {
     const image_spans = boot_storage.image.segments[0..boot_storage.image.segment_count];
     @memcpy(init_excluded[0..image_spans.len], image_spans);
     const pack = boot_storage.mapping.segments[0];
-    const security = fwsec_cpu.device.mapping.segments[0];
+    const security = fwsec_frts.device.mapping.segments[0];
+    const sb = fwsec_cpu.device.mapping.segments[0];
     init_excluded[image_spans.len] = .{ .address = pack.phys_addr, .bytes = pack.bytes };
     init_excluded[image_spans.len + 1] = .{ .address = security.phys_addr, .bytes = security.bytes };
+    init_excluded[image_spans.len + 2] = .{ .address = sb.phys_addr, .bytes = sb.bytes };
     for (&booters.images, 0..) |*image, n| {
         const segment = image.device.mapping.segments[0];
-        init_excluded[image_spans.len + 2 + n] = .{ .address = segment.phys_addr, .bytes = segment.bytes };
+        init_excluded[image_spans.len + 3 + n] = .{ .address = segment.phys_addr, .bytes = segment.bytes };
     }
-    const count = image_spans.len + 4;
+    const count = image_spans.len + 5;
     const report = init_storage.stage(ctx, chip_id, init_excluded[0..count], 30 * std.time.ns_per_s) catch |err| {
         log("NVIDIA boot-init: rejected phase=dma-init reason={s} submitted=no fallback=preserved", .{@errorName(err)});
         return false;
@@ -593,7 +603,7 @@ fn stageBootInit(ctx: *const r4os.r4dev.DriverContext, chip_id: u16) bool {
         report.init.libos_address, report.init.rm_address, report.init.queues_address, report.init.queue_page_count, gsp_init.ring_slots, gsp_init.ring_capacity,
     });
     ctx.logInfo("NVIDIA boot-init: arguments=to-device logs=bidirectional queues=bidirectional status-header=zero native-writes=disabled");
-    run_memory.acquire(ctx, &boot_storage, &init_storage, &fwsec_cpu, &booters) catch |err| {
+    run_memory.acquire(ctx, &boot_storage, &init_storage, &fwsec_frts, &fwsec_cpu, &booters) catch |err| {
         log("NVIDIA boot-init: rejected phase=run-memory reason={s} status={d} submitted=no", .{ @errorName(err), init_storage.last_queue_status });
         return false;
     };
@@ -619,7 +629,7 @@ fn stageBootInit(ctx: *const r4os.r4dev.DriverContext, chip_id: u16) bool {
         header.layout.entries_offset != gsp_init.page_bytes or header.layout.slots != gsp_init.ring_slots or
         !std.mem.allEqual(u8, &status, 0)) return false;
     log("NVIDIA boot-init: queue-port=OK epoch={d} command-bytes=32 status-bytes=32 status=zero writes=0 lease=held submitted=no", .{run_memory.generation()});
-    log("NVIDIA boot-init: run-memory=held allocations=6 dma-mappings={d} libos-address={x} app-version={x} firmware-command=unsubmitted", .{
+    log("NVIDIA boot-init: run-memory=held allocations=7 dma-mappings={d} libos-address={x} app-version={x} fwsec=frts+sb firmware-command=unsubmitted", .{
         run_memory.mapped_count, bindings.resume_args.libos_dma, bindings.resume_args.app_version,
     });
     return true;

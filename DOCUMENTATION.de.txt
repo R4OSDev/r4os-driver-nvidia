@@ -10,7 +10,35 @@ unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
 
-Normale Booter-Ergebnisse und Log-Lebensdauer (Hostnachweis)
+Beide FWSEC-Abbilder vor dem Start halten (NVIDIA 0.1.32)
+-------------------------------------------------------
+Der optionale Bootcheck behaelt sein urspruengliches unveraenderliches SB-
+Abbild samt DMA fuer den normalen Abbau. FRTS bekommt einen getrennten
+residenten Besitzer. Der gemeinsame Lauf verlangt jetzt sieben getrennte
+CPU-Allokationen und beide synchronisierten FWSEC-Mappings. FRTS muss die
+lebende Reservierung genau dieses Bootspeichers benennen; SB muss separat
+und vollstaendig als Befehl 0x19 vorliegen. Falsche Rollen, fehlende Abbilder,
+andere APIs/Bootspeicher, doppelte Pins und CPU-/DMA-Ueberlappungen werden
+vor Queue-Besitz abgewiesen. Beide Abbilder bleiben bei Ausfuehrungsfehlern
+gehalten. Der Initplan schliesst beide DMA-Bereiche aus; Grenze 261 Spannen.
+Ohne Submission zuerst FRTS und SB abbauen, danach Reservierung und Sicherungen.
+
+51 vorhandene Besitzerfaelle und Modulbuild bestanden. Der Lifecyclefall
+vergleicht gleichzeitige echte SB-/FRTS-CPU-/DMA-Bytes in zehn Szenarien;
+alle FRTS-Vorbereitungs-/Abbaufehler erhalten SB. Der Run-Lease-Fall prueft
+Besitzpaar, lebende Metadaten, Aliase, Rollen-/Pinwechsel und gehaltenen Abbau.
+Ein anfangs falscher First-Boot-Fixturezustand samt Fehlerabbau wurde korrigiert;
+Log erhalten. Keine neue Fallzahl, kein Gate/Gastlauf. NVIDIA 0.1.32: 385024
+residente Bytes, 3567 Relocations, 24 unveraenderte gepinnte Ressourcen.
+Neue Bindung ist originaler R4OS-Code; drei komplette Referenzen/Lizenzen archiviert.
+
+OssiPC offline/unveraendert; letzter physischer Stand Kernel150/NVIDIA28 passiv.
+Keine Firmwareausfuehrung. Vollstaendige native GPU-/Scanout-Recovery, GSP-Start
+und HDMI bleiben offen. Im normalen passiven Modus weiterhin nur SB.
+Beleg: fwsec_pair_checkpoint. Archiv:
+ExFiles/Reference/GFX/Nvidia/0.79.10/fwsec-pair-20260911.
+
+Historisch: Normale Booter-Ergebnisse und Log-Lebensdauer (Hostnachweis)
 ---------------------------------------------------------
 Der vorbereitete native Executor unterscheidet normalen Kaltstart und Unload.
 Er prueft die komplette Metadaten-DMA-Seite und exakte Mailboxargumente vor
@@ -55,7 +83,7 @@ vollstaendige GPU-Recovery, Booter-Ergebnisse und HDMI bleiben offen.
 Beleg: fwsec_result_checkpoint. Archiv:
 ExFiles/Reference/GFX/Nvidia/0.79.10/fwsec-result-20260911.
 
-Aktuell eingebunden: FWSEC-FRTS an gehaltenen VRAM binden (NVIDIA 0.1.31)
+Historisch eingebunden: FWSEC-FRTS an gehaltenen VRAM binden (NVIDIA 0.1.31)
 -------------------------------------------------
 Der optionale Bootcheck schliesst zuerst sein bisheriges SB-Abbild samt DMA
 und bereitet aus dem gehaltenen VBIOS ein neues unveraenderliches FRTS-Abbild

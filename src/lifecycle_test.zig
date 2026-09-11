@@ -990,60 +990,71 @@ const BootVramFixture = struct {
 const FrtsFixture = struct {
     const Fault = enum { none, short_input, allocation, pin, map, unmap, unpin, cpu_free, late_borrow_release, bounce };
     var fault: Fault = .none;
-    var backing: ?[]align(256) u8 = null;
-    var pinned = false;
-    var mapped = false;
+    var backing: [2]?[]align(256) u8 = @splat(null);
+    var pinned: [2]bool = @splat(false);
+    var mapped: [2]bool = @splat(false);
     var allocations: u32 = 0;
     var frees: u32 = 0;
-    var copied: [1280]u8 = undefined;
+    var copied: [2][1280]u8 = undefined;
     fn heapQuery(out: *a.DriverHeapApi) callconv(.c) i32 {
         out.* = .{ .allocate = @intFromPtr(&allocateImage), .release = @intFromPtr(&releaseImage) };
         return a.driver_heap_ok;
     }
     fn allocateImage(bytes: u64, alignment: u32, out: *a.DriverHeapAllocation) callconv(.c) i32 {
-        std.debug.assert(bytes == 1280 and alignment == 256 and backing == null);
-        backing = std.heap.page_allocator.alignedAlloc(u8, comptime std.mem.Alignment.fromByteUnits(256), @intCast(bytes)) catch return -1;
-        @memset(backing.?, 0xa5);
+        std.debug.assert(bytes == 1280 and alignment == 256);
+        var index: usize = 0;
+        while (index < backing.len and backing[index] != null) : (index += 1) {}
+        std.debug.assert(index < backing.len);
+        backing[index] = std.heap.page_allocator.alignedAlloc(u8, comptime std.mem.Alignment.fromByteUnits(256), @intCast(bytes)) catch return -1;
+        @memset(backing[index].?, 0xa5);
         allocations += 1;
-        out.* = .{ .handle = 0x310000001, .cpu_address = @intFromPtr(backing.?.ptr), .byte_length = bytes, .alignment = alignment };
+        out.* = .{ .handle = 0x310000001 + index * 4, .cpu_address = @intFromPtr(backing[index].?.ptr), .byte_length = bytes, .alignment = alignment };
         return if (fault == .allocation) -1 else a.driver_heap_ok;
     }
     fn releaseImage(handle: u64) callconv(.c) i32 {
-        std.debug.assert(handle == 0x310000001 and backing != null and !pinned and !mapped);
+        const index = (handle - 0x310000001) / 4;
+        std.debug.assert(index < 2 and handle == 0x310000001 + index * 4 and backing[index] != null and !pinned[index] and !mapped[index]);
         if (fault == .cpu_free) return -1;
-        std.heap.page_allocator.free(backing.?);
-        backing = null;
+        std.heap.page_allocator.free(backing[index].?);
+        backing[index] = null;
         frees += 1;
         return a.driver_heap_ok;
     }
     fn pinImage(address: u64, bytes: u32, flags: u32, out: *a.DmaPinnedBuffer) callconv(.c) i32 {
-        std.debug.assert(backing != null and !pinned and !mapped and address == @intFromPtr(backing.?.ptr) and bytes == 1280 and flags == 0);
-        pinned = true;
-        out.* = .{ .handle = 0x310000002, .virt_addr = address, .bytes = bytes, .page_count = @intCast(((address & 4095) + bytes + 4095) / 4096) };
+        var index: usize = 0;
+        while (index < backing.len) : (index += 1) {
+            if (backing[index] != null and @intFromPtr(backing[index].?.ptr) == address) break;
+        }
+        std.debug.assert(index < 2 and !pinned[index] and !mapped[index] and bytes == 1280 and flags == 0);
+        pinned[index] = true;
+        out.* = .{ .handle = 0x310000002 + index * 4, .virt_addr = address, .bytes = bytes, .page_count = @intCast(((address & 4095) + bytes + 4095) / 4096) };
         return if (fault == .pin) -1 else 0;
     }
     fn mapImage(pin: *const a.DmaPinnedBuffer, constraints: *const a.DmaConstraints, direction: u32, out: *a.DmaMapping) callconv(.c) i32 {
-        std.debug.assert(pinned and !mapped and backing != null and pin.handle == 0x310000002 and direction == a.dma_direction_to_device);
+        const index = (pin.handle - 0x310000002) / 4;
+        std.debug.assert(index < 2 and pin.handle == 0x310000002 + index * 4 and pinned[index] and !mapped[index] and backing[index] != null and direction == a.dma_direction_to_device);
         std.debug.assert(constraints.alignment == 256 and constraints.max_segments == 1 and constraints.max_segment_bytes == 1280 and constraints.flags == 5);
-        mapped = true;
-        @memcpy(&copied, backing.?);
-        out.* = .{ .handle = 0x310000003, .pin_handle = pin.handle, .requested_bytes = pin.bytes, .mapped_bytes = pin.bytes,
+        mapped[index] = true;
+        @memcpy(&copied[index], backing[index].?);
+        out.* = .{ .handle = 0x310000003 + index * 4, .pin_handle = pin.handle, .requested_bytes = pin.bytes, .mapped_bytes = pin.bytes,
             .direction = direction, .flags = constraints.flags | (if (fault == .bounce) a.dma_mapping_flag_bounced else @as(u32, 0)), .segment_count = 1 };
-        out.segments[0] = .{ .phys_addr = 0x4123456700, .bytes = pin.bytes };
+        out.segments[0] = .{ .phys_addr = 0x4123456700 + index * 65536, .bytes = pin.bytes };
         return if (fault == .map) -1 else 0;
     }
     fn unmapImage(descriptor: *a.DmaMapping) callconv(.c) i32 {
-        std.debug.assert(mapped and pinned and backing != null and descriptor.handle == 0x310000003);
+        const index = (descriptor.handle - 0x310000003) / 4;
+        std.debug.assert(index < 2 and descriptor.handle == 0x310000003 + index * 4 and mapped[index] and pinned[index] and backing[index] != null);
         descriptor.* = .{};
         if (fault == .unmap) return -1;
-        mapped = false;
+        mapped[index] = false;
         return 0;
     }
     fn unpinImage(descriptor: *a.DmaPinnedBuffer) callconv(.c) i32 {
-        std.debug.assert(!mapped and pinned and backing != null and descriptor.handle == 0x310000002);
+        const index = (descriptor.handle - 0x310000002) / 4;
+        std.debug.assert(index < 2 and descriptor.handle == 0x310000002 + index * 4 and !mapped[index] and pinned[index] and backing[index] != null);
         descriptor.* = .{};
         if (fault == .unpin) return -1;
-        pinned = false;
+        pinned[index] = false;
         return 0;
     }
     fn wordAt(data: []const u8, offset: usize) u32 { return std.mem.readInt(u32, data[offset..][0..4], .little); }
@@ -1057,7 +1068,7 @@ fn checkFrtsStorage(ctx: *const r4os.r4dev.DriverContext, owner: *@import("boot_
     const target = try owner.binding(.frts);
     const fuses: selection.Fuses = .{ .debug_disable_raw = 1, .ucode_version_raw = 8, .ucode_id = 9 };
     for (std.meta.tags(f.Fault)) |fault| {
-        f.fault = fault;
+        f.fault = .none;
         var rom = input.ga106Fixture();
         const board = try vbios.parse(&rom, 0x2504);
         const entry = (try selection.select(&rom, &board, fuses)).entry;
@@ -1065,12 +1076,24 @@ fn checkFrtsStorage(ctx: *const r4os.r4dev.DriverContext, owner: *@import("boot_
         const original = rom;
         const allocation_count = f.allocations;
         const free_count = f.frees;
+        var sb: cpu.Storage = .{};
+        defer { f.fault = .none; _ = sb.close(); }
+        const saved = try sb.prepare(ctx, &rom, &board, fuses);
+        _ = try sb.device.stage(ctx, saved.image, &saved.metadata);
+        const saved_bytes = f.copied[0];
+        const input_offset = entry.interface.command_input.offset - entry.image.offset;
+        const mapper = entry.interface.mapper.offset - entry.image.offset;
+        try t.expect(saved.metadata.command == 0x19 and sb.preparationValid());
+        try t.expectEqual(@as(u32, 0x19), f.wordAt(saved.image, mapper + 44));
+        try t.expectEqual(@as(u32, 24), f.wordAt(saved.image, input_offset + 4));
+        try t.expect(owner.frts_consumer == 0);
+        f.fault = fault; // Faults affect the separate FRTS path, never the retained SB image.
         var image: cpu.Storage = .{};
         defer { f.fault = .none; _ = image.close(); }
         var other_api = ctx.api.*;
         const other = r4os.r4dev.DriverContext.init(&other_api);
         try t.expectError(error.Vram, image.prepareFrts(&other, &rom, &board, fuses, owner));
-        try t.expect(f.allocations == allocation_count and owner.frts_consumer == 0);
+        try t.expect(f.allocations == allocation_count + 1 and owner.frts_consumer == 0);
         const prepared = image.prepareFrts(ctx, &rom, &board, fuses, owner);
         if (fault == .short_input or fault == .allocation) {
             try t.expectError(if (fault == .short_input) error.Capacity else error.Memory, prepared);
@@ -1078,8 +1101,6 @@ fn checkFrtsStorage(ctx: *const r4os.r4dev.DriverContext, owner: *@import("boot_
         } else {
             const value = try prepared;
             try t.expect(image.preparationValid() and value.metadata.command == 0x15);
-            const input_offset = entry.interface.command_input.offset - entry.image.offset;
-            const mapper = entry.interface.mapper.offset - entry.image.offset;
             try t.expectEqual(@as(u32, 0x15), f.wordAt(value.image, mapper + 44));
             try t.expectEqual(@as(u32, @intCast(target.range.offset / 4096)), f.wordAt(value.image, input_offset + 32));
             try t.expectEqual(@as(u32, 0x100), f.wordAt(value.image, input_offset + 36));
@@ -1097,11 +1118,16 @@ fn checkFrtsStorage(ctx: *const r4os.r4dev.DriverContext, owner: *@import("boot_
             } else {
                 const plan = try staged;
                 try t.expect(plan.imem.base != target.range.offset and image.device.mapping.segments[0].phys_addr != image.allocation.cpu_address);
-                try t.expectEqualSlices(u8, value.image, &f.copied);
+                try t.expectEqualSlices(u8, value.image, &f.copied[1]);
+                try t.expect(image.allocation.handle != sb.allocation.handle and
+                    image.allocation.cpu_address != sb.allocation.cpu_address and
+                    image.device.mapping.segments[0].phys_addr != sb.device.mapping.segments[0].phys_addr);
                 try t.expectEqual(fault == .bounce, image.device.mapping.flags & a.dma_mapping_flag_bounced != 0);
                 image.device.execution_owner = 99;
-                try t.expect(!image.close() and image.preparationValid() and f.backing != null);
+                sb.device.execution_owner = 99;
+                try t.expect(!image.close() and !sb.close() and image.preparationValid() and sb.preparationValid() and f.backing[1] != null);
                 image.device.execution_owner = 0;
+                sb.device.execution_owner = 0;
             }
         }
         try t.expectEqualSlices(u8, &original, &rom);
@@ -1112,16 +1138,23 @@ fn checkFrtsStorage(ctx: *const r4os.r4dev.DriverContext, owner: *@import("boot_
             try t.expect(!image.close());
             try t.expect(owner.frts_consumer == @intFromPtr(&image) and !owner.releaseBeforeSubmission());
             if (fault == .late_borrow_release) {
-                try t.expect(f.backing == null and f.frees == free_count + 1);
+                try t.expect(f.backing[1] == null and f.frees == free_count + 1);
                 owner.backing.?.execution_owner = 0;
-            } else try t.expect(f.backing != null);
+            } else try t.expect(f.backing[1] != null);
         }
         f.fault = .none;
         try t.expect(image.close() and image.close());
         try t.expect(owner.frts_consumer == 0 and owner.validates(target));
-        try t.expect(f.backing == null and !f.pinned and !f.mapped);
-        try t.expectEqual(allocation_count + @intFromBool(fault != .short_input), f.allocations);
-        try t.expectEqual(free_count + @intFromBool(fault != .short_input), f.frees);
+        try t.expect(f.backing[1] == null and !f.pinned[1] and !f.mapped[1]);
+        // Creating, staging and closing FRTS (including every partial failure)
+        // must preserve the original SB bytes and its separately owned DMA.
+        try t.expect(sb.preparationValid() and f.backing[0] != null and f.pinned[0] and f.mapped[0]);
+        try t.expectEqualSlices(u8, &saved_bytes, saved.image);
+        try t.expectEqualSlices(u8, &saved_bytes, &f.copied[0]);
+        try t.expect(sb.close() and sb.close());
+        try t.expect(f.backing[0] == null and !f.pinned[0] and !f.mapped[0]);
+        try t.expectEqual(allocation_count + 1 + @intFromBool(fault != .short_input), f.allocations);
+        try t.expectEqual(free_count + 1 + @intFromBool(fault != .short_input), f.frees);
     }
 }
 
