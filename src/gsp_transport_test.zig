@@ -405,6 +405,65 @@ test "GSP sequencer admits the entire stream and finishes bounded effects before
     try t.expect(boot.pending != null and session.pending != null);
     try t.expectError(error.State, execution.step());
     try t.expectEqual(@as(usize, 1), device.writes);
+    try checkRuntimeSequencer(model, limits);
+}
+
+fn checkRuntimeSequencer(model: *Model, limits: sequencer.Limits) !void {
+    const exchange = @import("gsp_exchange.zig");
+    // The same handler works while idle, before a request is sent, and while
+    // waiting for its response. Completing the notification preserves that
+    // request and does not publish a second one or grant a fresh deadline.
+    for (0..5) |scenario| {
+        var session: transport.Session = undefined;
+        var boot = try startBootAt(model, &session, 1000);
+        try model.replyRpc(&session, .{ .function = 0x1001, .result = 0 }, &.{ 0, 0, 0, 0 });
+        try boot.complete((try boot.poll()).?.ticket);
+        var token = try boot.handoff(1000);
+        var owner = try exchange.Exchange.init(&token, 100000);
+        model.now = 2000; // Boot has expired; this notification has its own budget.
+        if (scenario != 0) {
+            try owner.begin(79, "runtime request", 100000);
+            if (scenario >= 2) try t.expect((try owner.poll(100000)) == null);
+        }
+        var payload: [64]u8 = undefined;
+        const words: []const u32 = if (scenario == 3) &.{ 0, 0, 0x79, 3, 2 } else &.{ 0, 0, 0x79 };
+        try model.replyRpc(&session, .{ .function = 0x1002, .result = 0 }, sequencerPayload(&payload, words));
+        const dispatch = (try owner.poll(100000)).?;
+        var device = SequencerDevice{ .queue = model };
+        var execution = try sequencer.DispatchExecution.initRuntime(&owner, device.port(), limits);
+        const phase = owner.phase;
+        const sends = model.notifications;
+        const cursor = model.peerWord(session.link.?.status_read);
+        if (scenario == 3) {
+            try t.expect((try execution.step()) == .advanced);
+            try t.expectEqual(@as(u64, 4000), (try execution.step()).wait_until);
+            try t.expectError(error.Pending, owner.poll(3000)); // Tightens, cannot consume another event.
+            try t.expectEqual(@as(u64, 3000), (try execution.step()).wait_until);
+            try t.expectEqual(@as(u64, 4000), execution.runner.delay_until.?); // Mandatory delay stays whole.
+            model.now = 3000;
+            try t.expectError(error.Deadline, execution.step());
+            try t.expect(owner.phase == .failed and session.pending != null);
+            try t.expectEqual(cursor, model.peerWord(session.link.?.status_read));
+        } else if (scenario == 4) {
+            model.fault = model.count + 1;
+            model.after = true;
+            try t.expectError(error.Io, execution.step());
+            try t.expect(execution.runner.state == .complete and !execution.acknowledged);
+            try t.expectEqual(dispatch.ticket.next, model.peerWord(session.link.?.status_read));
+            try t.expect(owner.phase == .failed and owner.pending != null);
+        } else {
+            try t.expect((try execution.step()) == .complete);
+            try t.expect(execution.acknowledged and owner.pending == null and session.pending == null);
+            try t.expectEqual(phase, owner.phase);
+            if (scenario == 0) try t.expect(owner.deadline == null) else try t.expectEqual(@as(u64, 100000), owner.deadline.?);
+        }
+        try t.expectEqual(@as(usize, 1), device.writes);
+        try t.expectEqual(sends, model.notifications);
+        const queue_calls = model.count;
+        if (execution.failed) try t.expectError(error.State, execution.step()) else try t.expect((try execution.step()) == .complete);
+        try t.expectEqual(@as(usize, 1), device.writes);
+        try t.expectEqual(queue_calls, model.count);
+    }
 }
 fn badBootEvent(model: *Model, rpc: message.Rpc, payload: []const u8, expected: boot_events.Error) !void {
     var session: transport.Session = undefined;

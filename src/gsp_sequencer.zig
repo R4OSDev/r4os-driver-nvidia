@@ -28,6 +28,7 @@
 // DEALINGS IN THE SOFTWARE.
 const std = @import("std");
 const events = @import("gsp_boot_events.zig");
+const exchange = @import("gsp_exchange.zig");
 const message = @import("gsp_message.zig");
 pub const Error = error{ Profile, Options, Payload, Opcode, Register, Slot, Denied, Unsupported, State, Stale, Clock, Deadline, Timeout, Io };
 pub const Opcode = enum(u32) { write = 0, modify, poll, delay_us, store, core_reset, core_start, core_halt, core_resume };
@@ -282,10 +283,51 @@ pub const Runner = struct {
     }
 };
 
-pub const DispatchError = Error || events.Error;
+pub const DispatchError = Error || events.Error || exchange.Error;
 pub const Limits = struct { default_timeout_ns: u64, poll_interval_ns: u64, register_bytes: u64 };
-pub const DispatchExecution = struct {
+const Source = union(enum) {
     boot: *events.Boot,
+    runtime: *exchange.Exchange,
+
+    fn session(self: Source) *@import("gsp_transport.zig").Session {
+        return switch (self) {
+            .boot => |owner| owner.session,
+            .runtime => |owner| owner.session,
+        };
+    }
+    fn deadline(self: Source) DispatchError!u64 {
+        return switch (self) {
+            .boot => |owner| owner.deadline,
+            .runtime => |owner| owner.deadline orelse error.State,
+        };
+    }
+    fn borrow(self: Source, ticket: @import("gsp_transport.zig").Ticket) DispatchError!events.Sequencer {
+        const event = switch (self) {
+            .boot => |owner| (try owner.borrow(ticket)).event,
+            .runtime => |owner| blk: {
+                const dispatch = try owner.borrow(ticket);
+                if (dispatch.response or dispatch.record.rpc.function != @intFromEnum(events.Kind.cpu_sequencer)) return error.State;
+                break :blk try events.decode(dispatch.record);
+            },
+        };
+        if (event != .cpu_sequencer) return error.State;
+        return event.cpu_sequencer;
+    }
+    fn complete(self: Source, ticket: @import("gsp_transport.zig").Ticket) DispatchError!void {
+        return switch (self) {
+            .boot => |owner| owner.complete(ticket),
+            .runtime => |owner| owner.complete(ticket),
+        };
+    }
+    fn reject(self: Source, ticket: @import("gsp_transport.zig").Ticket) void {
+        switch (self) {
+            .boot => |owner| owner.reject(ticket) catch {},
+            .runtime => |owner| owner.reject(ticket) catch {},
+        }
+    }
+};
+pub const DispatchExecution = struct {
+    source: Source,
     ticket: @import("gsp_transport.zig").Ticket,
     runner: Runner,
     acknowledged: bool = false,
@@ -298,39 +340,61 @@ pub const DispatchExecution = struct {
         const pending = boot.pending orelse return error.State;
         const dispatch = try boot.borrow(pending.ticket);
         if (dispatch.event != .cpu_sequencer) return error.State;
-        const runner = Runner.init(dispatch.event.cpu_sequencer, port, .{
-            .profile = boot.session.profile,
-            .epoch = boot.session.epoch,
-            .deadline_ns = boot.deadline,
+        return initSource(.{ .boot = boot }, pending.ticket, port, limits);
+    }
+    /// The runtime exchange owns the same receipt and possibly an outstanding
+    /// RM request. No nested receive/send or second queue pump is introduced.
+    pub fn initRuntime(owner: *exchange.Exchange, port: Port, limits: Limits) DispatchError!DispatchExecution {
+        const pending = owner.pending orelse return error.State;
+        if (pending.response or pending.record.rpc.function != @intFromEnum(events.Kind.cpu_sequencer)) return error.State;
+        return initSource(.{ .runtime = owner }, pending.ticket, port, limits);
+    }
+    fn initSource(source: Source, ticket: @import("gsp_transport.zig").Ticket, port: Port, limits: Limits) DispatchError!DispatchExecution {
+        errdefer source.reject(ticket);
+        const stream = try source.borrow(ticket);
+        const session = source.session();
+        const runner = try Runner.init(stream, port, .{
+            .profile = session.profile,
+            .epoch = session.epoch,
+            .deadline_ns = try source.deadline(),
             .default_timeout_ns = limits.default_timeout_ns,
             .poll_interval_ns = limits.poll_interval_ns,
             .register_bytes = limits.register_bytes,
-        }) catch |err| {
-            boot.reject(dispatch.ticket) catch {};
-            return err;
-        };
-        return .{ .boot = boot, .ticket = dispatch.ticket, .runner = runner };
+        });
+        return .{ .source = source, .ticket = ticket, .runner = runner };
     }
-    /// Advance one bounded step, retaining the boot receipt throughout. The
+    /// Advance one bounded step, retaining the exact source receipt throughout. The
     /// queue ACK occurs exactly once, after the real port completed ALL effects.
     /// On failure, keep runner/dispatch diagnostics and let the native lifetime
     /// owner establish quiescence/recovery. Never replay effects to retry ACK.
     pub fn step(self: *DispatchExecution) DispatchError!Progress {
         if (self.failed) return error.State;
         if (self.acknowledged) return .complete;
-        _ = self.boot.borrow(self.ticket) catch |err| {
+        _ = self.source.borrow(self.ticket) catch |err| {
             self.failed = true;
             self.runner.callback_error = err;
             self.runner.stop(error.State);
+            self.source.reject(self.ticket);
             return err;
         };
+        // A pending exchange can tighten its current budget. It cannot renew
+        // an admitted stream or a poll/core phase; mandatory delays stay whole.
+        const deadline = self.source.deadline() catch |err| {
+            self.failed = true;
+            self.runner.callback_error = err;
+            self.runner.stop(error.State);
+            self.source.reject(self.ticket);
+            return err;
+        };
+        self.runner.options.deadline_ns = @min(self.runner.options.deadline_ns, deadline);
+        if (self.runner.phase_deadline) |limit| self.runner.phase_deadline = @min(limit, self.runner.options.deadline_ns);
         const result = self.runner.step() catch |err| {
             self.failed = true;
-            self.boot.reject(self.ticket) catch {};
+            self.source.reject(self.ticket);
             return err;
         };
         if (result == .complete) {
-            self.boot.complete(self.ticket) catch |err| {
+            self.source.complete(self.ticket) catch |err| {
                 self.failed = true;
                 // Hardware effects completed; acknowledgement may already
                 // be visible. Preserve completion, never execute it again.
@@ -338,6 +402,6 @@ pub const DispatchExecution = struct {
             };
             self.acknowledged = true;
         }
-        return result;
+        return if (result == .wait_until) .{ .wait_until = @min(result.wait_until, self.runner.options.deadline_ns) } else result;
     }
 };

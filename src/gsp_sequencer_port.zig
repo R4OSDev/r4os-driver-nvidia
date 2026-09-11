@@ -105,6 +105,7 @@ const firmware_run = @import("falcon_run.zig");
 const transport = @import("gsp_transport.zig");
 const run_memory = @import("gsp_run_memory.zig");
 const events = @import("gsp_boot_events.zig");
+const exchange = @import("gsp_exchange.zig");
 // Bare-metal RM queue 0, NV_PGSP_QUEUE_HEAD(0). This is not SWGEN0 or a
 // virtual-function doorbell. The memory cursor is published separately.
 pub const command_queue_head: u32 = 0x110c00;
@@ -171,6 +172,7 @@ pub const Port = struct {
     core_phase: u32 = 0,
     phase: Phase = .boot,
     runtime_session: ?*transport.Session = null,
+    runtime_sequence: ?*RuntimeSequencer = null,
 
     /// Stable address, serialized init/Driver Work owner; not an IRQ callback
     /// or a dedicated task. Failure retains any partially returned mapping.
@@ -272,6 +274,7 @@ pub const Port = struct {
     }
     fn queueRead(p: *anyopaque, deadline: u64, queue: transport.ring.Queue, offset: usize, bytes: []u8) anyerror!void {
         const self = cast(p);
+        if (self.runtime_sequence != null) return error.Busy;
         errdefer |err| self.failure = err;
         const memory = try self.queueMemory(deadline);
         const port = try memory.transportPort();
@@ -280,6 +283,7 @@ pub const Port = struct {
     }
     fn queuePublish(p: *anyopaque, deadline: u64, queue: transport.ring.Queue, offset: usize, bytes: []const u8) anyerror!void {
         const self = cast(p);
+        if (self.runtime_sequence) |execution| if (!execution.permitsAck(deadline, queue, offset, bytes)) return error.Busy;
         errdefer |err| self.failure = err;
         const memory = try self.queueMemory(deadline);
         // ACK publication can be the first effect too. It needs retention,
@@ -290,6 +294,7 @@ pub const Port = struct {
         try self.guardFor(.{ .request = deadline });
     }
     fn commandAdmission(self: *Port, deadline: u64) !void {
+        if (self.runtime_sequence != null) return error.Busy;
         _ = try self.queueMemory(deadline);
         const scope: Scope = .{ .request = deadline };
         try self.accessFor(scope, .write, command_queue_head);
@@ -297,6 +302,7 @@ pub const Port = struct {
     }
     fn prepareCommand(p: *anyopaque, deadline: u64) anyerror!void {
         const self = cast(p);
+        if (self.runtime_sequence != null) return error.Busy;
         errdefer |err| self.failure = err;
         try self.commandAdmission(deadline);
         try self.retainFor(.{ .request = deadline });
@@ -304,6 +310,7 @@ pub const Port = struct {
     }
     fn notifyCommand(p: *anyopaque, deadline: u64) anyerror!void {
         const self = cast(p);
+        if (self.runtime_sequence != null) return error.Busy;
         errdefer |err| self.failure = err;
         try self.commandAdmission(deadline);
         if (!self.retained) return error.State;
@@ -570,6 +577,7 @@ pub const Port = struct {
     pub fn close(self: *Port) bool {
         if (self.self_address == 0) return true;
         if (self.self_address != @intFromPtr(self)) return false;
+        if (self.runtime_sequence != null) return false;
         if (self.effects_possible) {
             const owner = self.owner orelse return false;
             if (!owner.quiesced(owner.context)) return false;
@@ -590,6 +598,184 @@ pub const Port = struct {
                 self.memory_status = memory.collect();
                 if (self.memory_status != a.gfx_buffer_result_ok) return false;
             }
+        }
+        self.* = .{};
+        return true;
+    }
+};
+
+/// One borrowed CPU-sequencer notification in an admitted runtime. Keep this
+/// value, the exchange and its immutable receipt at stable addresses; discard
+/// all borrowed callback copies before close/reuse. No new mapping or DMA owner.
+pub const RuntimeSequencer = struct {
+    self_address: usize = 0,
+    device: ?*Port = null,
+    owner: ?*exchange.Exchange = null,
+    ticket: ?transport.Ticket = null,
+    epoch: u64 = 0,
+    deadline: u64 = 0,
+    execution: ?seq.DispatchExecution = null,
+    operation: ?core.Operation = null,
+    core_phase: u32 = 0,
+    complete: bool = false,
+    failed: bool = false,
+    failure: ?anyerror = null,
+
+    pub fn begin(self: *RuntimeSequencer, device: *Port, owner: *exchange.Exchange, limits: seq.Limits) !void {
+        if (self.self_address != 0 or device.runtime_sequence != null) return error.Busy;
+        if (device.phase != .runtime or device.runtime_session != owner.session) return error.State;
+        const pending = owner.pending orelse return error.State;
+        if (pending.response or pending.record.rpc.function != @intFromEnum(events.Kind.cpu_sequencer)) return error.State;
+        _ = try owner.borrow(pending.ticket);
+        const deadline = owner.deadline orelse return error.State;
+        _ = try device.queueMemory(deadline);
+        if (limits.register_bytes != device.window.byte_length) return error.Options;
+        self.* = .{ .self_address = @intFromPtr(self), .device = device, .owner = owner, .ticket = pending.ticket, .epoch = owner.session.epoch, .deadline = deadline };
+        device.runtime_sequence = self;
+        errdefer |err| {
+            self.failed = true;
+            self.failure = err;
+        }
+        // Whole-stream admission runs before any register read/write/core step.
+        self.execution = try seq.DispatchExecution.initRuntime(owner, self.io(), limits);
+    }
+    fn from(p: *anyopaque) *RuntimeSequencer {
+        return @ptrCast(@alignCast(p));
+    }
+    fn generation(p: *anyopaque) u64 {
+        const self = from(p);
+        if (self.self_address != @intFromPtr(self) or self.failed or self.complete) return 0;
+        const device = self.device orelse return 0;
+        const owner = self.owner orelse return 0;
+        const ticket = self.ticket orelse return 0;
+        const pending = owner.pending orelse return 0;
+        if (device.phase != .runtime or device.runtime_sequence != self or device.runtime_session != owner.session or
+            Port.generation(device) != self.epoch or pending.response or !std.meta.eql(ticket, pending.ticket) or
+            pending.record.rpc.function != @intFromEnum(events.Kind.cpu_sequencer)) return 0;
+        return self.epoch;
+    }
+    fn now(p: *anyopaque) u64 {
+        const self = from(p);
+        const device = self.device orelse return std.math.maxInt(u64);
+        return Port.nowNs(device);
+    }
+    fn guard(self: *RuntimeSequencer) !u64 {
+        if (self.failed or self.complete) return error.State;
+        if (generation(self) != self.epoch) return error.Stale;
+        const owner = self.owner.?;
+        _ = try owner.borrow(self.ticket.?);
+        var limit = @min(self.deadline, owner.deadline orelse return error.State);
+        if (self.execution) |*execution| {
+            limit = @min(limit, execution.runner.options.deadline_ns);
+            if (execution.runner.phase_deadline) |phase| limit = @min(limit, phase);
+        }
+        try self.device.?.guardFor(.{ .request = limit });
+        return limit;
+    }
+    fn io(self: *RuntimeSequencer) seq.Port {
+        return .{ .context = self, .generation = generation, .now_ns = now, .admit = admit, .read32 = read, .write32 = write, .core_step = coreStep };
+    }
+    fn admit(p: *anyopaque, command: seq.Command) error{ Denied, Unsupported }!void {
+        const self = from(p);
+        const deadline = self.guard() catch return error.Denied;
+        const device = self.device.?;
+        const allowed = switch (command) {
+            .write => |v| device.supports(.write, v.address),
+            .modify => |v| device.supports(.read, v.address) and device.supports(.write, v.address),
+            .poll => |v| device.supports(.read, v.address),
+            .store => |v| device.supports(.read, v.address),
+            else => true,
+        };
+        if (!allowed) return error.Denied;
+        if (command == .core_resume) {
+            if (device.owner.?.log_polling == null) return error.Unsupported;
+            _ = core.Operation.init(.core_resume, self.epoch, deadline, device.boot0, device.run.resume_args) catch return error.Unsupported;
+        }
+        try device.owner.?.admit(device.owner.?.context, command);
+        _ = self.guard() catch return error.Denied;
+    }
+    fn read(p: *anyopaque, address: u32) anyerror!u32 {
+        const self = from(p);
+        const limit = try self.guard();
+        const value = try self.device.?.readFor(.{ .request = limit }, address);
+        _ = try self.guard();
+        return value;
+    }
+    fn write(p: *anyopaque, address: u32, value: u32) anyerror!void {
+        const self = from(p);
+        const limit = try self.guard();
+        try self.device.?.writeFor(.{ .request = limit }, address, value);
+        _ = try self.guard();
+    }
+    fn logs(p: *anyopaque, enable: bool) anyerror!void {
+        const self = from(p);
+        const limit = try self.guard();
+        const device = self.device.?;
+        try device.retainFor(.{ .request = limit });
+        const owner = device.owner.?;
+        try (owner.log_polling orelse return error.Resume)(owner.context, enable);
+        _ = try self.guard();
+    }
+    fn coreStep(p: *anyopaque, opcode: seq.Opcode, state: *seq.CoreState, deadline: u64, _: *const [8]u32) anyerror!bool {
+        const self = from(p);
+        const limit = @min(deadline, try self.guard());
+        const device = self.device.?;
+        if (state.phase == 0) {
+            if (self.operation != null) return error.Busy;
+            self.operation = try core.Operation.init(opcode, self.epoch, limit, device.boot0, device.run.resume_args);
+            self.core_phase = 0;
+        }
+        const operation = if (self.operation) |*value| value else return error.State;
+        if (state.phase != self.core_phase or opcode != operation.opcode or state.phase == std.math.maxInt(u32)) return error.State;
+        operation.deadline = @min(operation.deadline, limit); // A tightened exchange cannot renew this phase.
+        const done = try operation.step(.{ .context = self, .generation = generation, .now_ns = now, .read32 = read, .write32 = write, .log_polling = logs });
+        state.phase += 1;
+        self.core_phase = state.phase;
+        if (done) self.operation = null;
+        return done;
+    }
+    fn permitsAck(self: *RuntimeSequencer, deadline: u64, queue: transport.ring.Queue, offset: usize, bytes: []const u8) bool {
+        if (generation(self) != self.epoch or bytes.len != 4 or deadline > self.deadline) return false;
+        const execution = if (self.execution) |*value| value else return false;
+        if (execution.failed or execution.acknowledged or execution.runner.state != .complete or self.operation != null) return false;
+        const owner = self.owner.?;
+        if (owner.deadline == null or deadline > owner.deadline.?) return false;
+        const ticket = owner.session.pending orelse return false;
+        const location = (owner.session.link orelse return false).status_read;
+        return std.meta.eql(ticket, self.ticket.?) and queue == location.queue and offset == location.offset and
+            std.mem.readInt(u32, bytes[0..4], .little) == ticket.next;
+    }
+    pub fn step(self: *RuntimeSequencer) !seq.Progress {
+        if (self.failed or self.self_address != @intFromPtr(self)) return error.State;
+        if (self.complete) return .complete;
+        errdefer |err| {
+            self.failed = true;
+            self.failure = err;
+        }
+        const execution = if (self.execution) |*value| value else return error.State;
+        // Dispatch owns receipt/deadline failures; Runner checks the bound
+        // native generation and its phase timeout before every bounded step.
+        // Do not preempt that diagnostic with a generic native guard failure.
+        const result = try execution.step();
+        if (result == .complete) {
+            self.complete = true;
+            self.device.?.runtime_sequence = null;
+        }
+        return result;
+    }
+    /// Dispose only completed metadata or a failed/cancelled dispatch after
+    /// the actual native owner established quiescence. This never frees DMA,
+    /// acknowledges an event, resumes logs or performs recovery itself.
+    pub fn close(self: *RuntimeSequencer) bool {
+        if (self.self_address == 0) return true;
+        if (self.self_address != @intFromPtr(self)) return false;
+        const device = self.device orelse return false;
+        if (!self.complete) {
+            if (device.runtime_sequence != self) return false;
+            const owner = device.owner orelse return false;
+            if (!owner.quiesced(owner.context)) return false;
+            self.owner.?.session.stop();
+            device.runtime_sequence = null;
         }
         self.* = .{};
         return true;

@@ -10,6 +10,31 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
+GSP runtime CPU sequencer (source preparation for0.79.10, 2026-09-11):
+
+The sequencer now handles notifications owned by the shared runtime exchange,
+using the existing complete-stream admission and bounded execution. An open
+RM request keeps its identity and deadline while its notification executes.
+The native RuntimeSequencer borrows that exact receipt, Session, epoch and
+retained BAR0/DMA run. Queue traffic is held until all effects complete; only
+the matching receipt cursor can then be acknowledged. Poll/core phases and
+mandatory delays cannot acquire a fresh budget when the exchange tightens it.
+
+Failed MMIO, timeout, stale mapping or ACK stops the execution without replay.
+Incomplete native metadata needs actual device quiescence before disposal;
+close never acknowledges, resumes suspended logs, frees DMA or resets cores.
+The existing GA106 core executor is reused, including CORE_RESUME's retained
+Libos arguments and log suspension. Native runtime admission remains required.
+
+51 existing cases and one module build pass; NVIDIA0.1.44 remains byte-identical.
+New fixture type errors and the order of a terminal DMA-failure scenario were
+corrected; all logs are archived. No new grouped case, gate or guest run.
+Twelve complete pinned originals and evidence: runtime-sequencer-20260911 in
+ExFiles/Reference/GFX/Nvidia/0.79.10; runtime_sequencer_checkpoint in
+Docs/Drivers/GrafikFirmware07910.json. Native runtime remains host-linked.
+Production bootstrap/dispatch, restoration/quiescence and physical display/
+audio acceptance remain open. OssiPC is offline and has not been contacted.
+
 GSP boot/runtime handoff (source preparation for0.79.10, 2026-09-11):
 
 The native port now transfers the exact Session into runtime only after

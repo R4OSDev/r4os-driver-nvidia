@@ -1,5 +1,12 @@
 ﻿Original R4OS implementation for roadmap 0.79.9, 10.09.2026.
 
+GSP runtime sequencer (0.79.10, 2026-09-11):
+Original R4OS receipt/ownership/deadline integration, Apache-2.0. Existing
+sequencer and GA106 core semantics reused, no new register or wire layout.
+Twelve full hash-pinned originals under runtime-sequencer-20260911; existing
+source MIT notices retained. NVIDIA0.1.44 R4D/resources remain byte-identical.
+
+
 GSP runtime handoff (0.79.10, 2026-09-11):
 Original R4OS phase/ownership/deadline code, Apache-2.0. No new wire format
 or register. Eight full pinned originals and all existing source MIT notices

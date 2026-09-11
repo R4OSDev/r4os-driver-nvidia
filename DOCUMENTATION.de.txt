@@ -10,6 +10,32 @@ unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
 
+CPU-Sequencer im GSP-Betrieb (Quellvorbereitung, 11.09.2026)
+--------------------------------------------------------
+Der bestehende Sequencer verarbeitet nun auch Meldungen des gemeinsamen
+Runtime-Exchange. Eine offene RM-Anfrage behaelt dabei Identitaet und Frist.
+RuntimeSequencer bindet die genaue Meldung, Session, Epoche sowie denselben
+BAR0-/DMA-Besitzer. Die vollstaendige Befehlsfolge wird vor MMIO zugelassen.
+Weitere Queue-Zugriffe bleiben gesperrt; erst nach Abschluss aller Effekte
+darf genau der zugehoerige Lesezeiger bestaetigt werden. Verkuerzte Fristen
+erneuern weder Poll-/Core-Phasen noch verkuerzen sie vorgeschriebene Delays.
+
+Timeout, veraltete Bindung, MMIO- oder ACK-Fehler stoppen ohne Wiederholung.
+Unvollstaendige native Ausfuehrungsdaten bleiben bis zur echten Hardware-
+Ruhe gebunden. Close bestaetigt keine Meldung, aktiviert keine angehaltenen
+Logs, gibt kein DMA frei und setzt keine Cores zurueck. Der bestehende
+GA106-Core-Automat wird wiederverwendet, einschliesslich CORE_RESUME mit
+gebundenen Libos-Argumenten und Log-Pause. Native Zulassung bleibt noetig.
+
+51 bestehende Faelle und ein Modulbuild bestanden; NVIDIA0.1.44 bytegleich.
+Typfehler neuer Testhilfen und die Reihenfolge eines terminalen DMA-Fehlers
+korrigiert; alle Logs erhalten. Keine neuen Faelle/Gates/Gastlaeufe. Zwoelf
+vollstaendige gepinnte Originale und Belege: runtime-sequencer-20260911 unter
+ExFiles/Reference/GFX/Nvidia/0.79.10; runtime_sequencer_checkpoint in
+GrafikFirmware07910.json. Native Runtime weiterhin nur hostseitig eingebunden.
+Produktiver Boot-/Dispatchbesitzer, Wiederherstellung/Hardware-Ruhe und echte
+Grafik-/Audioabnahme bleiben offen. OssiPC bleibt offline und unberuehrt.
+
 GSP-Uebergabe vom Boot in den Betrieb (Quellvorbereitung, 11.09.2026)
 ----------------------------------------------------------------
 Der native Port uebergibt dieselbe Session erst nach verarbeitetem und
