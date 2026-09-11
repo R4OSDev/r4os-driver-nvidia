@@ -1,5 +1,17 @@
 ﻿# Third-Party Notices
 
+Normal GA106 Booter arguments/results (host qualified, 2026-09-11):
+booter_result.zig adapts normal cold-load/unload argument/result semantics of
+kernel_gsp_booter_tu102.c (NVIDIA2022-2024) and kgspIsWpr2Up_TU102 in
+kernel_gsp_tu102.c (NVIDIA2017-2024), both MIT. Both original copyright lines
+and complete terms remain in the adaptation. Bounded phases, DMA admission,
+failure retention and real log-reader callbacks are original R4OS Apache-2.0.
+Six complete pinned originals/notices accompany booter-result-20260911.
+Normal execution remains unlinked; NVIDIA0.1.31 and all resource bytes are
+unchanged. Before executable linkage, package complete additional core/HS/
+FWSEC/Booter result notices in the module and distribution. This profile does
+not implement suspend/resume or GC6 state and does not prove GPU quiescence.
+
 FWSEC post-halt completion checks (host qualified, 2026-09-11):
 fwsec_result.zig adapts the command-specific result checks of
 kgspExecuteFwsec_TU102 in kernel_gsp_frts_tu102.c (NVIDIA2021-2023, MIT).

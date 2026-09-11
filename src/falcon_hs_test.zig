@@ -4,6 +4,7 @@ const hs = @import("falcon_hs.zig");
 const core = @import("gsp_core.zig");
 const run = @import("falcon_run.zig");
 const fwsec_result = @import("fwsec_result.zig");
+const booter_result = @import("booter_result.zig");
 const r = hs.reg;
 const b = hs.bits;
 
@@ -37,6 +38,7 @@ const Model = struct {
     mailbox_writes: u32 = 0,
     started: bool = false,
     halt_observed: bool = false,
+    result_mailboxes: [2]u32 = .{ 0xffffffff, 0xbadf7777 },
     alias: bool = true,
     deny: bool = false,
     hold_full: bool = false,
@@ -90,8 +92,8 @@ const Model = struct {
                 if (self.started and !self.hold_halt) self.halt_observed = true;
                 break :blk (if (self.alias) @as(u32, b.cpu_alias) else 0) | (if (self.halt_observed) @as(u32, b.cpu_halted) else 0);
             },
-            r.mailbox0 => if (self.started) 0xffffffff else error.EarlyMailbox,
-            r.mailbox1 => if (self.started) 0xbadf7777 else error.EarlyMailbox,
+            r.mailbox0 => if (self.started) self.result_mailboxes[0] else error.EarlyMailbox,
+            r.mailbox1 => if (self.started) self.result_mailboxes[1] else error.EarlyMailbox,
             else => error.UnexpectedRead,
         };
     }
@@ -297,6 +299,15 @@ const RunModel = struct {
     expire_result: ?usize = null,
     stale_result: ?usize = null,
     fail_result: ?usize = null,
+    booter: ?booter_result.Command = null,
+    wpr_before: u32 = 0x2fffff9,
+    wpr_after: u32 = 0xf,
+    wpr_reads: u8 = 0,
+    logs_enabled: bool = true,
+    logs_calls: u32 = 0,
+    fail_logs: ?bool = null,
+    expire_logs: ?bool = null,
+    expire_wpr: bool = false,
 
     fn cast(p: *anyopaque) *RunModel {
         return @ptrCast(@alignCast(p));
@@ -309,7 +320,7 @@ const RunModel = struct {
     }
     fn config(self: *const RunModel) run.Options {
         const c = self.dma.config;
-        return .{ .engine = c.engine, .boot0 = c.boot0, .epoch = c.epoch, .deadline = c.deadline, .plan = c.plan, .mailboxes = c.mailboxes, .fwsec = self.fwsec };
+        return .{ .engine = c.engine, .boot0 = c.boot0, .epoch = c.epoch, .deadline = c.deadline, .plan = c.plan, .mailboxes = c.mailboxes, .fwsec = self.fwsec, .booter = self.booter };
     }
     fn admit(p: *anyopaque, config_: *const run.Options) anyerror!void {
         const self = cast(p);
@@ -320,6 +331,15 @@ const RunModel = struct {
     fn read(p: *anyopaque, address: u32) anyerror!u32 {
         const self = cast(p);
         try t.expectEqual(@as(u32, 1), self.dma.admits);
+        if (self.booter != null and address == booter_result.wpr_hi_register) {
+            try t.expect(self.booter.? == .normal_unload and self.wpr_reads < 2);
+            const after = self.wpr_reads != 0;
+            if (after) try t.expect(self.dma.halt_observed and !self.logs_enabled) else
+                try t.expect(self.reset_edges == 0 and self.logs_calls == 0 and !self.dma.started);
+            self.wpr_reads += 1;
+            if (after and self.expire_wpr) self.dma.clock = self.dma.config.deadline;
+            return if (after) self.wpr_after else self.wpr_before;
+        }
         if (self.fwsec) |command| {
             const registers = if (command == .frts) fwsec_result.frts_registers else fwsec_result.sb_registers;
             for (registers, 0..) |expected, index| {
@@ -353,6 +373,7 @@ const RunModel = struct {
     fn write(p: *anyopaque, address: u32, value: u32) anyerror!void {
         const self = cast(p);
         try t.expectEqual(@as(u32, 1), self.dma.admits);
+        if (self.booter != null) try t.expect(!self.logs_enabled and self.logs_calls == 1);
         switch (address - self.dma.base()) {
             0x3c0 => {
                 if (self.reset_edges == 0) try t.expectEqual(@as(u32, 0x85), value) else {
@@ -379,7 +400,17 @@ const RunModel = struct {
         }
     }
     fn io(self: *RunModel) run.Io {
-        return .{ .context = self, .generation = generation, .now_ns = now, .admit = admit, .read32 = read, .write32 = write };
+        return .{ .context = self, .generation = generation, .now_ns = now, .admit = admit, .read32 = read, .write32 = write, .log_polling = logs };
+    }
+    fn logs(p: *anyopaque, enable: bool) anyerror!void {
+        const self = cast(p);
+        try t.expect(self.booter != null);
+        if (enable) try t.expect(self.dma.halt_observed and !self.logs_enabled) else
+            try t.expect(self.reset_edges == 0 and !self.dma.started);
+        self.logs_enabled = enable;
+        self.logs_calls += 1;
+        if (self.fail_logs == enable) return error.LogChange;
+        if (self.expire_logs == enable) self.dma.clock = self.dma.config.deadline;
     }
     fn drive(self: *RunModel, operation: *run.Operation) !void {
         for (0..192) |_| {
@@ -392,6 +423,7 @@ const RunModel = struct {
 
 fn checkCompleteRun() !void {
     try checkFwsecResults();
+    try checkBooterResults();
     for ([_]hs.Engine{ .gsp, .sec2 }) |engine| {
         for ([_]bool{ false, true }) |riscv| {
             var model: RunModel = .{ .dma = .{ .config = options(engine) }, .riscv = riscv };
@@ -401,7 +433,7 @@ fn checkCompleteRun() !void {
             try t.expectEqual(@as(u32, 65536), operation.hs_operation.?.options.imem_capacity);
             try t.expectEqual(@as(u32, 65536), operation.hs_operation.?.options.dmem_capacity);
             try t.expectEqual(@as(u32, 0xffffffff), operation.result.?.mailboxes[0].?);
-            try t.expect(operation.result.?.fwsec == null and model.result_reads == 0);
+            try t.expect(operation.result.?.fwsec == null and operation.result.?.booter == null and model.result_reads == 0 and model.logs_calls == 0);
             const writes = model.dma.writes;
             try t.expect(try operation.step(model.io()));
             model.dma.epoch += 1;
@@ -480,6 +512,94 @@ fn checkCompleteRun() !void {
     model.dma.clock = model.dma.config.deadline;
     try t.expectError(error.Deadline, operation.step(model.io()));
     try t.expectEqual(@as(u32, 0), model.reset_edges);
+}
+
+fn booterModel(command: booter_result.Command) !RunModel {
+    var model: RunModel = .{ .dma = .{ .config = options(.sec2) }, .booter = command };
+    model.dma.config.mailboxes = try booter_result.arguments(command);
+    model.dma.result_mailboxes = .{ 0, 0xffffffff };
+    return model;
+}
+
+fn checkBooterResults() !void {
+    for ([_]booter_result.Command{ .{ .normal_load = 0x123456000 }, .{ .normal_load = 0x100000000 }, .normal_unload }) |command| {
+        var model = try booterModel(command);
+        var operation = try run.Operation.init(model.config());
+        for (0..192) |_| {
+            if (operation.phase == .restore_logs) break;
+            try t.expect(!(try operation.step(model.io())));
+        }
+        try t.expect(operation.phase == .restore_logs and operation.result == null and operation.logs_suspended);
+        try t.expect(model.dma.halt_observed and model.dma.mailbox_writes == 2 and !model.logs_enabled);
+        try t.expect(try operation.step(model.io()));
+        const report = operation.result.?.booter.?;
+        try t.expectEqualDeep(command, report.command);
+        try t.expect(!report.skipped and model.logs_enabled and !operation.logs_suspended and model.logs_calls == 2);
+        try t.expectEqual(@as(?u32, 0xffffffff), operation.result.?.mailboxes[1]);
+        if (command == .normal_unload) {
+            try t.expectEqual(@as(u8, 2), model.wpr_reads);
+            try t.expectEqual(@as(?u32, 0xf), report.wpr_hi_after);
+            try t.expectEqual(@as(?u32, 0xff), operation.options.mailboxes[0]);
+            try t.expectEqual(@as(?u32, 0xff), operation.options.mailboxes[1]);
+        } else {
+            try t.expect(model.wpr_reads == 0 and report.wpr_hi_before == null and report.wpr_hi_after == null);
+            try t.expectEqual(command.normal_load, @as(u64, operation.options.mailboxes[0].?) | (@as(u64, operation.options.mailboxes[1].?) << 32));
+        }
+        const writes = model.dma.writes;
+        try t.expect(try operation.step(model.io()));
+        try t.expect(model.dma.writes == writes and model.logs_calls == 2);
+    }
+    var model = try booterModel(.normal_unload);
+    model.wpr_before = 0xf; // Non-address low bits do not mean WPR is up.
+    var operation = try run.Operation.init(model.config());
+    try model.drive(&operation);
+    try t.expect(operation.result.?.booter.?.skipped and operation.result.?.blocks == 0 and operation.halt_result == null);
+    try t.expect(operation.result.?.mailboxes[0] == null and model.wpr_reads == 1 and model.logs_calls == 0);
+    try t.expect(model.reset_edges == 0 and model.dma.writes == 0 and !model.dma.started);
+    const Fault = enum { unreadable_before, logs_stop, transfer, mailbox, wpr_still_up, unreadable_after, deadline, logs_restore, restore_deadline };
+    for (std.meta.tags(Fault)) |fault| {
+        model = try booterModel(.normal_unload);
+        const expected: anyerror = switch (fault) {
+            .unreadable_before => blk: { model.wpr_before = 0xbadf1234; break :blk error.RegisterUnavailable; },
+            .logs_stop => blk: { model.fail_logs = false; break :blk error.LogChange; },
+            .transfer => blk: { model.dma.fail_write = r.dma_command; break :blk error.PostedFailure; },
+            .mailbox => blk: { model.dma.result_mailboxes[0] = 0xffffffff; break :blk error.BooterError; },
+            .wpr_still_up => blk: { model.wpr_after = 0x10; break :blk error.WprStillUp; },
+            .unreadable_after => blk: { model.wpr_after = 0xffffffff; break :blk error.RegisterUnavailable; },
+            .deadline => blk: { model.expire_wpr = true; break :blk error.Deadline; },
+            .logs_restore => blk: { model.fail_logs = true; break :blk error.LogChange; },
+            .restore_deadline => blk: { model.expire_logs = true; break :blk error.Deadline; },
+        };
+        operation = try run.Operation.init(model.config());
+        try t.expectError(expected, model.drive(&operation));
+        try t.expect(operation.result == null);
+        try t.expectEqual(expected, operation.failure.?);
+        if (fault == .unreadable_before) try t.expect(model.reset_edges == 0 and model.logs_calls == 0) else {
+            try t.expectEqual(fault != .restore_deadline, operation.logs_suspended);
+            if (fault != .logs_restore and fault != .restore_deadline) try t.expect(!model.logs_enabled and model.logs_calls == 1);
+        }
+        if (fault == .mailbox) try t.expectEqual(@as(?u32, 0xffffffff), operation.halt_result.?.mailboxes[0]);
+        const writes = model.dma.writes;
+        const calls = model.logs_calls;
+        try t.expectError(error.State, operation.step(model.io()));
+        try t.expect(model.dma.writes == writes and model.logs_calls == calls);
+    }
+    model = try booterModel(.{ .normal_load = 0x123456000 });
+    operation = try run.Operation.init(model.config());
+    var io = model.io(); io.log_polling = null;
+    try t.expectError(error.Logs, operation.step(io));
+    try t.expect(model.dma.admits == 0 and model.reset_edges == 0 and model.logs_calls == 0);
+    var invalid = model.config(); invalid.engine = .gsp;
+    try t.expectError(error.Options, run.Operation.init(invalid));
+    invalid = model.config(); invalid.fwsec = .sb;
+    try t.expectError(error.Options, run.Operation.init(invalid));
+    invalid = model.config(); invalid.mailboxes[1] = 0;
+    try t.expectError(error.Options, run.Operation.init(invalid));
+    for ([_]u64{ 0, 0x123456001, @as(u64, 1) << 49 }) |address| {
+        invalid = model.config(); invalid.booter = .{ .normal_load = address };
+        try t.expectError(error.Address, run.Operation.init(invalid));
+    }
+    try t.expectError(error.Mailbox, booter_result.checkMailboxes(.{ 0, null }));
 }
 
 fn resultModel(command: fwsec_result.Command) RunModel {

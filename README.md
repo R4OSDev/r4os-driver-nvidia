@@ -10,7 +10,29 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
-FWSEC completion checks after the actual Falcon run (host qualified):
+Normal Booter completion and log-reader lifetime (host qualified):
+
+The native executor now distinguishes normal cold Load and Unload. It checks
+the complete metadata DMA page and exact mailbox arguments before effects,
+uses SEC2 and suspends the real log reader before reset. Unload is skipped
+without reset or log changes when the observed WPR2 address field is zero.
+After HS halt, mailbox0 must be zero; normal unload must also clear WPR2.
+Raw mailboxes/WPR remain available on failure. Log reading resumes only after
+the checked result. Failed operations cannot replay or release retained DMA.
+Every added step shares the original clock/epoch. Suspend/resume and GC6
+need separate state; this profile does not silently select those modes.
+
+Final 51 existing owner cases and module build pass. Existing Falcon and
+actual SDK/MMIO cases exercise commands, skipped unload, log coordination
+and failures; the SEC2 model also handles absent RESET_READY with an advancing
+clock. No new case count, gate or guest run. Six complete pinned originals
+and licenses archived. Native execution remains unlinked, so NVIDIA0.1.31 and
+its 24 resources are byte-identical. Package complete additional execution
+notices before linkage. OssiPC is offline and untouched; full GPU recovery,
+physical execution/authentication, GSP startup and HDMI remain open.
+Evidence: `booter_result_checkpoint`; archive `booter-result-20260911`.
+
+Earlier FWSEC completion checks after the actual Falcon run (host qualified):
 
 The prepared native executor can now check command-specific FWSEC results
 after its own reset, measured TCM, upload/start/halt sequence. FRTS checks the

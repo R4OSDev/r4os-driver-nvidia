@@ -123,6 +123,11 @@ const NativeRig = struct {
     fail_unmap: bool = false,
     wrong_map: bool = false,
     hs_admissions: u32 = 0,
+    booter_active: bool = false,
+    booter_unload: bool = false,
+    booter_mailboxes: u32 = 0,
+    logs_enabled: bool = true,
+    logs_calls: u32 = 0,
     fn cast(p: *anyopaque) *NativeRig {
         return @ptrCast(@alignCast(p));
     }
@@ -135,7 +140,12 @@ const NativeRig = struct {
     fn admit(_: *anyopaque, _: seq.Command) error{ Denied, Unsupported }!void {}
     fn admitFirmware(p: *anyopaque, options: *const firmware_run.Options) anyerror!void {
         const self = cast(p);
-        try t.expect(options.epoch == self.epoch and options.engine == .gsp);
+        try t.expect(options.epoch == self.epoch);
+        if (options.booter) |command| {
+            try t.expect(options.engine == .sec2);
+            self.booter_active = true;
+            self.booter_unload = command == .normal_unload;
+        } else try t.expect(options.engine == .gsp);
         self.hs_admissions += 1;
     }
     fn access(p: *anyopaque, kind: native.Access, address: u32) anyerror!void {
@@ -144,7 +154,13 @@ const NativeRig = struct {
         if (kind == .read and (address == r.cpuctl_alias or address == r.sec_cpuctl_alias)) return error.WriteOnly;
         // Host register model only: completed DMA and the existing halted
         // CPU word allow exercising actual MMIO wrappers without a real GPU.
-        if (self.hs_admissions != 0 and kind == .read and address == hs.reg.gsp + hs.reg.dma_command) self.words[address / 4] = hs.bits.idle;
+        if (self.hs_admissions != 0 and kind == .read and (address == hs.reg.gsp + hs.reg.dma_command or address == hs.reg.sec2 + hs.reg.dma_command)) self.words[address / 4] = hs.bits.idle;
+        if (self.booter_active and kind == .read and address == hs.reg.sec2 + hs.reg.mailbox0) {
+            try t.expect(!self.logs_enabled);
+            self.booter_mailboxes += 1;
+            self.words[address / 4] = 0; // Host model of a successful Booter.
+            if (self.booter_unload) self.words[0x1fa828 / 4] = 0;
+        }
         if (kind == .read and address == 0 and self.retains != 0) {
             self.flushes += 1;
             if (self.wrong_flush) self.words[0] = 0;
@@ -155,6 +171,13 @@ const NativeRig = struct {
     }
     fn quiesced(p: *anyopaque) bool {
         return cast(p).quiet;
+    }
+    fn logs(p: *anyopaque, enable: bool) anyerror!void {
+        const self = cast(p);
+        try t.expect(self.booter_active and self.retains != 0);
+        if (enable) try t.expect(!self.logs_enabled and self.booter_mailboxes != 0);
+        self.logs_enabled = enable;
+        self.logs_calls += 1;
     }
     fn owner(self: *NativeRig) native.Owner {
         return .{ .context = self, .generation = generation, .admit = admit, .access = access, .retain = retain, .quiesced = quiesced };
@@ -261,7 +284,7 @@ test "firmware CPU storage GA106 core sequencing and native MMIO ownership" {
     try t.expectError(error.Deadline, operation.step(model.io()));
     try t.expectEqual(reads, model.reads);
 
-    const words = try t.allocator.alignedAlloc(u32, comptime std.mem.Alignment.fromByteUnits(4096), 0x841000 / 4);
+    const words = try t.allocator.alignedAlloc(u32, comptime std.mem.Alignment.fromByteUnits(4096), 0x842000 / 4);
     defer t.allocator.free(words);
     var fixture: NativeRig = .{ .words = words };
     rig = &fixture;
@@ -325,7 +348,10 @@ test "firmware CPU storage GA106 core sequencing and native MMIO ownership" {
     sec_options.plan.dmem.base += 256;
     // The old core-only aperture ends before SEC2's BROM page. No admission
     // callback or preceding DMA write may run for that truncated mapping.
+    const full_aperture = port.window.byte_length;
+    port.window.byte_length = 0x841000;
     try t.expectError(error.Register, port.beginFirmware(sec_options));
+    port.window.byte_length = full_aperture;
     try t.expectEqual(@as(u32, 0), fixture.hs_admissions);
     try port.beginFirmware(hs_options);
     try t.expectError(error.Busy, port.beginFirmware(hs_options));
@@ -365,6 +391,43 @@ test "firmware CPU storage GA106 core sequencing and native MMIO ownership" {
         try t.expect(hs_result != null and hs_result.?.fwsec != null);
         try t.expectEqualSlices(u32, &expected, &hs_result.?.fwsec.?.raw);
         try t.expect(fixture.retains == 1 and !port.close() and fixture.unmaps == 0);
+    }
+    const boot_check = @import("booter_result.zig");
+    words[(hs.reg.sec2 + firmware_run.hwcfg_offset) / 4] = 0x20100;
+    words[(hs.reg.sec2 + hs.reg.cpu_control) / 4] = b.alias | b.halted;
+    for ([_]boot_check.Command{ .{ .normal_load = 0x123456000 }, .normal_unload }) |command| {
+        var boot_options = sec_options;
+        boot_options.booter = command;
+        boot_options.mailboxes = try boot_check.arguments(command);
+        boot_options.deadline = fixture.clock + 2 * std.time.ns_per_ms;
+        words[boot_check.wpr_hi_register / 4] = 0x2fffff9;
+        const prior_logs = fixture.logs_calls;
+        if (command == .normal_load) {
+            try t.expectError(error.Unsupported, port.beginFirmware(boot_options));
+            port.owner.?.log_polling = NativeRig.logs;
+        }
+        try port.beginFirmware(boot_options);
+        hs_result = null;
+        for (0..192) |_| {
+            hs_result = try port.stepFirmware();
+            if (hs_result != null) break;
+            // SEC2 leaves RESET_READY clear in this model. Advance the real
+            // accessor clock so the documented hint wait can expire normally.
+            fixture.clock += 10 * std.time.ns_per_us;
+        }
+        try t.expect(hs_result != null and hs_result.?.booter != null and !hs_result.?.booter.?.skipped);
+        try t.expect(fixture.logs_enabled and fixture.logs_calls == prior_logs + 2);
+        try t.expect(hs_result.?.mailboxes[0].? == 0 and hs_result.?.blocks == 4);
+        try t.expect(fixture.retains == 1 and !port.close() and fixture.unmaps == 0);
+        if (command == .normal_unload) {
+            try t.expectEqual(@as(?u32, 0), hs_result.?.booter.?.wpr_hi_after);
+            const flushes = fixture.flushes;
+            try port.beginFirmware(boot_options);
+            try t.expect((try port.stepFirmware()) == null);
+            const skipped = (try port.stepFirmware()).?;
+            try t.expect(skipped.booter.?.skipped and skipped.blocks == 0 and skipped.mailboxes[0] == null);
+            try t.expect(fixture.logs_calls == prior_logs + 2 and fixture.flushes == flushes);
+        }
     }
     // An invalid flush comes AFTER the write: preserve the actual effect and
     // keep the MMIO/DMA owner alive. Subsequent callbacks cannot write again.

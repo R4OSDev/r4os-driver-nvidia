@@ -27,6 +27,7 @@ const core = @import("gsp_core.zig");
 const hs = @import("falcon_hs.zig");
 const load = @import("fwsec_load.zig");
 const security_result = @import("fwsec_result.zig");
+const booter_result = @import("booter_result.zig");
 pub const hwcfg_offset = 0x108;
 pub const max_tcm_bytes = 0x1ff00;
 pub const Options = struct {
@@ -39,6 +40,9 @@ pub const Options = struct {
     // Owner admission must bind this command/target to the actual retained
     // prepared image. Null keeps generic raw-mailbox/Booter interpretation.
     fwsec: ?security_result.Command = null,
+    // Bind the matching retained Load/Unload image and these exact arguments
+    // in native admission. FWSEC and Booter purposes are mutually exclusive.
+    booter: ?booter_result.Command = null,
 
     fn upload(self: *const Options, hwcfg: u32) hs.Options {
         return .{ .engine = self.engine, .boot0 = self.boot0, .epoch = self.epoch, .deadline = self.deadline, .plan = self.plan, .mailboxes = self.mailboxes, .imem_capacity = (hwcfg & 0x1ff) << 8, .dmem_capacity = (hwcfg & 0x3fe00) >> 1 };
@@ -54,9 +58,12 @@ pub const Io = struct {
     admit: *const fn (*anyopaque, *const Options) anyerror!void,
     read32: *const fn (*anyopaque, u32) anyerror!u32,
     write32: *const fn (*anyopaque, u32, u32) anyerror!void,
+    // Required for Booter execution. The real log reader must acknowledge
+    // suspension; partial failure leaves recovery responsible for its state.
+    log_polling: ?*const fn (*anyopaque, bool) anyerror!void = null,
 };
-pub const Result = struct { mailboxes: [2]?u32, blocks: u32, fwsec: ?security_result.Report = null };
-pub const Phase = enum { admission, reset, hwcfg, status, engine, core_select, stable_hwcfg, upload, fwsec_result, complete };
+pub const Result = struct { mailboxes: [2]?u32, blocks: u32, fwsec: ?security_result.Report = null, booter: ?booter_result.Report = null };
+pub const Phase = enum { admission, booter_presence, suspend_logs, reset, hwcfg, status, engine, core_select, stable_hwcfg, upload, fwsec_result, booter_mailboxes, booter_wpr, restore_logs, complete };
 pub const Operation = struct {
     options: Options,
     reset: core.Operation,
@@ -70,10 +77,17 @@ pub const Operation = struct {
     hwcfg2: u32 = 0,
     halt_result: ?hs.Result = null,
     fwsec_check: ?security_result.Observer = null,
+    booter_report: ?booter_result.Report = null,
+    logs_suspended: bool = false,
     result: ?Result = null,
     failure: ?anyerror = null,
 
     pub fn init(options: Options) !Operation {
+        const booter_report = if (options.booter) |command| blk: {
+            if (options.engine != .sec2 or options.fwsec != null) return error.Options;
+            if (!std.meta.eql(options.mailboxes, try booter_result.arguments(command))) return error.Options;
+            break :blk booter_result.Report{ .command = command };
+        } else null;
         const fwsec_check = if (options.fwsec) |command| blk: {
             if (options.engine != .gsp or options.mailboxes[0] != null or options.mailboxes[1] != null) return error.Options;
             break :blk try security_result.Observer.init(command);
@@ -84,7 +98,7 @@ pub const Operation = struct {
         upload.imem_capacity = max_tcm_bytes;
         upload.dmem_capacity = max_tcm_bytes;
         try hs.validate(&upload);
-        return .{ .options = options, .fwsec_check = fwsec_check, .reset = try core.Operation.initReset(options.engine, options.epoch, options.deadline, options.boot0) };
+        return .{ .options = options, .fwsec_check = fwsec_check, .booter_report = booter_report, .reset = try core.Operation.initReset(options.engine, options.epoch, options.deadline, options.boot0) };
     }
     pub fn base(self: *const Operation) u32 {
         return if (self.options.engine == .gsp) hs.reg.gsp else hs.reg.sec2;
@@ -93,6 +107,8 @@ pub const Operation = struct {
         if (self.failure != null or self.self_address != @intFromPtr(self)) return error.State;
         if ((self.options.fwsec == null) != (self.fwsec_check == null)) return error.State;
         if (self.fwsec_check) |check| if (!std.meta.eql(check.command, self.options.fwsec.?)) return error.State;
+        if ((self.options.booter == null) != (self.booter_report == null)) return error.State;
+        if (self.booter_report) |report| if (!std.meta.eql(report.command, self.options.booter.?)) return error.State;
         if (io.generation(io.context) != self.options.epoch) return error.Stale;
         const now = io.now_ns(io.context);
         if (now == std.math.maxInt(u64) or now < self.last_clock) return error.Clock;
@@ -108,6 +124,23 @@ pub const Operation = struct {
         try self.guard(io);
         if (value == 0xffffffff or value & 0xffff0000 == 0xbadf0000 or value & 0xffff0000 == 0xffff0000) return error.RegisterUnavailable;
         return value;
+    }
+    fn observe(self: *Operation, io: Io, address: u32) !u32 {
+        try self.guard(io);
+        self.last_address = address;
+        self.last_value = null;
+        const value = try io.read32(io.context, address);
+        self.last_value = value;
+        try self.guard(io);
+        return value;
+    }
+    fn logs(self: *Operation, io: Io, enable: bool) !void {
+        try self.guard(io);
+        const callback = io.log_polling orelse return error.Logs;
+        if (!enable) self.logs_suspended = true;
+        try callback(io.context, enable);
+        if (enable) self.logs_suspended = false;
+        try self.guard(io);
     }
     // The nested HS executor uses this same stable operation's proven reset
     // and post-reset observations. All actual reads/writes still go through
@@ -154,7 +187,22 @@ pub const Operation = struct {
         try self.guard(io);
         switch (self.phase) {
             .admission => {
+                if (self.options.booter != null and io.log_polling == null) return error.Logs;
                 try io.admit(io.context, &self.options);
+                self.phase = if (self.options.booter) |command|
+                    (if (command == .normal_unload) .booter_presence else .suspend_logs) else .reset;
+            },
+            .booter_presence => {
+                const value = try self.observe(io, booter_result.wpr_hi_register);
+                self.booter_report.?.wpr_hi_before = value;
+                if (try booter_result.wprUp(value)) self.phase = .suspend_logs else {
+                    self.booter_report.?.skipped = true;
+                    self.result = .{ .mailboxes = .{ null, null }, .blocks = 0, .booter = self.booter_report };
+                    self.phase = .complete;
+                }
+            },
+            .suspend_logs => {
+                try self.logs(io, false);
                 self.phase = .reset;
             },
             .reset => {
@@ -191,7 +239,7 @@ pub const Operation = struct {
                 const operation = &self.hs_operation.?;
                 if (try operation.step(.{ .context = &adapter, .generation = generation, .now_ns = nowNs, .admit = admitUpload, .read32 = read32, .write32 = write32 })) {
                     self.halt_result = operation.result;
-                    if (self.fwsec_check != null) self.phase = .fwsec_result else {
+                    if (self.fwsec_check != null) self.phase = .fwsec_result else if (self.booter_report != null) self.phase = .booter_mailboxes else {
                         self.result = .{ .mailboxes = operation.result.mailboxes, .blocks = operation.result.blocks };
                         self.phase = .complete;
                     }
@@ -202,17 +250,29 @@ pub const Operation = struct {
                 // after this same operation completed reset/upload/start/halt.
                 const observer = &self.fwsec_check.?;
                 if (self.halt_result == null or self.hs_operation.?.phase != .complete or self.hs_operation.?.failure != null) return error.State;
-                self.last_address = observer.nextRegister() orelse return error.State;
-                self.last_value = null;
-                const value = try io.read32(io.context, self.last_address.?);
-                self.last_value = value;
-                try self.guard(io);
+                const value = try self.observe(io, observer.nextRegister() orelse return error.State);
                 // Scratch words carry arbitrary unrelated bits: do not apply
                 // the engine-control register's stricter upper-half filter.
                 if (try observer.accept(value)) {
                     self.result = .{ .mailboxes = self.halt_result.?.mailboxes, .blocks = self.halt_result.?.blocks, .fwsec = try observer.report() };
                     self.phase = .complete;
                 }
+            },
+            .booter_mailboxes => {
+                if (!self.logs_suspended or self.halt_result == null or self.hs_operation.?.phase != .complete or self.hs_operation.?.failure != null) return error.State;
+                try booter_result.checkMailboxes(self.halt_result.?.mailboxes);
+                self.phase = if (self.options.booter.? == .normal_unload) .booter_wpr else .restore_logs;
+            },
+            .booter_wpr => {
+                const value = try self.observe(io, booter_result.wpr_hi_register);
+                self.booter_report.?.wpr_hi_after = value;
+                if (try booter_result.wprUp(value)) return error.WprStillUp;
+                self.phase = .restore_logs;
+            },
+            .restore_logs => {
+                try self.logs(io, true);
+                self.result = .{ .mailboxes = self.halt_result.?.mailboxes, .blocks = self.halt_result.?.blocks, .booter = self.booter_report };
+                self.phase = .complete;
             },
             .complete => {},
         }

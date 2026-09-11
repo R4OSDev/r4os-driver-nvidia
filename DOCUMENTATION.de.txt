@@ -10,7 +10,30 @@ unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
 
-FWSEC-Ergebnisse nach dem echten Falcon-Ablauf pruefen (Hostnachweis)
+Normale Booter-Ergebnisse und Log-Lebensdauer (Hostnachweis)
+---------------------------------------------------------
+Der vorbereitete native Executor unterscheidet normalen Kaltstart und Unload.
+Er prueft die komplette Metadaten-DMA-Seite und exakte Mailboxargumente vor
+Effekten, verwendet SEC2 und haelt den echten Log-Leser vor Reset an. Fehlt
+WPR2 bereits, entfaellt Unload ohne Reset oder Log-Aenderung. Nach HS-Halt
+muss Mailbox0 null sein; normales Unload muss zusaetzlich WPR2 abbauen.
+Rohe Mailbox-/WPR-Werte bleiben bei Fehler erhalten. Logs werden erst nach
+geprueftem Ergebnis wieder gelesen. Fehler duerfen weder den Lauf wiederholen
+noch gehaltenes DMA freigeben. Jeder Zusatzschritt behaelt Epoche und Frist.
+Suspend/Resume und GC6 brauchen eigene Zustaende und werden nicht ausgewaehlt.
+
+Final 51 bestehende Besitzerfaelle und Modulbuild bestanden. Vorhandene
+Falcon- und echte SDK/MMIO-Faelle pruefen beide Befehle, uebersprungenes Unload,
+Log-Abstimmung und Fehler; SEC2 ohne RESET_READY mit fortschreitender Hostuhr.
+Keine neue Fallzahl, kein Gate/Gastlauf. Sechs komplette gepinnte Originale
+samt Lizenzen archiviert. Ausfuehrung bleibt ungelinkt; NVIDIA0.1.31 und seine
+24 Ressourcen sind bytegleich. Vor Einbindung volle zusaetzliche Hinweise
+paketieren. OssiPC offline/unveraendert. Vollstaendige GPU-Recovery, physische
+Ausfuehrung/Authentifizierung, GSP-Start und HDMI bleiben offen.
+Beleg: booter_result_checkpoint. Archiv:
+ExFiles/Reference/GFX/Nvidia/0.79.10/booter-result-20260911.
+
+Historisch: FWSEC-Ergebnisse nach dem echten Falcon-Ablauf pruefen (Hostnachweis)
 ------------------------------------------------------------------
 Der vorbereitete native Ausfuehrungspfad prueft FWSEC-Ergebnisse erst nach
 seinem eigenen Reset, gemessenen TCM und Upload/Start/Halt. FRTS verlangt

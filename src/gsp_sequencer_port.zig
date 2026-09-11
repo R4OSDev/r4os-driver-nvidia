@@ -26,7 +26,7 @@ pub const Owner = struct {
     // and handled log-reader suspension. No timeout or Falcon halt substitutes.
     quiesced: *const fn (*anyopaque) bool,
     log_polling: ?*const fn (*anyopaque, bool) anyerror!void = null,
-    // Bind exact firmware/DMA, optional FWSEC command/target and VRAM/VGA/
+    // Bind exact firmware/DMA, FWSEC or Booter command/arguments and VRAM/VGA/
     // display recovery before reset, including post-halt register reads.
     // The executor performs reset and measures TCM itself. Pure admission;
     // absent capability refuses the entire operation before device effects.
@@ -100,16 +100,18 @@ pub const Port = struct {
         // Admission itself remains an explicit phase in the stable stored
         // operation, so failure is preserved before any register mutation.
         if (self.owner.?.admit_firmware == null) return error.Unsupported;
+        if (options.booter != null and self.owner.?.log_polling == null) return error.Unsupported;
         self.firmware_operation = operation;
     }
-    /// FWSEC completion includes command-specific post-halt register checks;
+    /// FWSEC/Booter completion includes the command-specific result checks;
     /// generic runs return raw mailboxes. All DMA and this mapping stay held.
     /// Neither result establishes GSP readiness or device quiescence.
     pub fn stepFirmware(self: *Port) !?firmware_run.Result {
         errdefer |err| self.failure = err;
         try self.guard();
         const operation = if (self.firmware_operation) |*op| op else return error.State;
-        const done = try operation.step(.{ .context = self, .generation = generation, .now_ns = nowNs, .admit = admitFirmware, .read32 = read32, .write32 = write32 });
+        const done = try operation.step(.{ .context = self, .generation = generation, .now_ns = nowNs, .admit = admitFirmware, .read32 = read32, .write32 = write32,
+            .log_polling = if (self.owner.?.log_polling != null) logs else null });
         if (!done) return null;
         const result = operation.result.?;
         self.firmware_operation = null;
