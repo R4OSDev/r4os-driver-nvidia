@@ -1,5 +1,18 @@
 ﻿# Third-Party Notices
 
+The host-qualified `gsp_core.zig` adapts the pinned GA102/TU102 Falcon/GSP
+implementations (NVIDIA 2017-2024,2021-2024) and published GA102 headers
+(2003-2021,2017-2021,2003-2022,2003-2024), NVIDIA CORPORATION & AFFILIATES.
+It preserves the full MIT permission/disclaimer and all copyright lines.
+R4OS cooperative state, ownership and `gsp_sequencer_port` are Apache-2.0.
+Thirty register constants match complete original C headers; the algorithm
+tests use host hardware models. 205 complete originals/notices are retained
+in gsp-core-20260911. No original HAL binary or these new executable methods
+are linked into NVIDIA 0.1.25. The unchanged packaged notice bundle must gain
+all new full notices before executable linkage and distribution.
+
+Earlier sequencer notice:
+
 The host-qualified `gsp_sequencer.zig` adapts opcode/operation semantics from
 rmgspseq.h (2019-2020), kernel_gsp.c (2019-2024) and the executed timeout
 contract in gpu_timeout.c (1993-2023), NVIDIA CORPORATION & AFFILIATES, from

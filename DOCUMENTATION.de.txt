@@ -10,7 +10,39 @@ unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
 
-GSP-CPU-Sequencer und Empfangsbindung (Host)
+GA106-Core-Ausfuehrung und R4OS-MMIO-Port (Host)
+----------------------------------------------
+gsp_core implementiert Reset, Start, Halt-Warten und SEC2-Resume gemaess dem
+gepinnten GA102/TU102-HAL. Reset: hoechstens 150us auf RESET_READY als Hinweis
+warten, zehn Propagationsreads je Resetflanke, HWCFG2-Scrubbing abwarten,
+danach Corewechsel. FALCON_RM erhaelt den ganzen BOOT0-Wert; Start nutzt bei
+Bedarf den schreib-only CPUCTL-Alias. Resume haelt den Logleser an, setzt
+GSP auf RISC-V, schreibt die behaltene Libos-DMA-Adresse und startet SEC2.
+Handoff und Mailbox muessen stimmen, bevor Logs/FALCON_OS/aktive CPU folgen.
+Pro Aufruf eine begrenzte Phase; Fehler behalten Zustand und genaue Ursache.
+
+gsp_sequencer_port verbindet den Sequencer mit diesen vier Implementierungen
+und den wirklichen R4OS-MMIO-Aufrufen. Gemessener BAR0 und UC-Mapping werden
+geprueft. Volatile-u32-Zugriffe erhalten x86-Ordnung; gepostete Writes werden
+ueber BOOT0 ausgelesen, nie ueber den schreib-only Alias. Der native Besitzer
+muss Befehle zulassen, aktuelle Register-/Lockdownregeln pruefen, DMA halten
+und Logleser/Quieszenz bereitstellen. Fehler nach Effekten und beim Unmap
+behalten das Mapping. Ein Timeout oder Falcon-Halt beweist keine GPU-Ruhe.
+Zur PCI-Ordnung: https://docs.kernel.org/driver-api/device-io.html
+
+47/47 Faelle im vorhandenen Besitzerstep bestanden, ein gruppierter Fall
+ergaenzt. 30 Registeradressen/Bitfelder/Konstanten stimmen mit Original-C-
+Headern ueberein. Core-Hardware ist im Test modelliert; echte MMIO-Accessor-
+Funktionen laufen dabei auf Hostspeicher durch die SDK-Mapping-Fassade.
+Noch keine Aktivierung in main.zig oder ausfuehrbare Einbindung in 0.1.25.
+Native Boot-/VRAM-/VGA-/Recovery-/Logbesitzer, Firmware-Erststart, IRQ und
+Healthcheck bleiben offen. Kein Gastlauf/Hardwarekontakt; Modul/Lizenzpaket
+unveraendert. Vor Einbindung alle weiteren MIT-Hinweise ins Paket aufnehmen.
+205 vollstaendige Originalquellen/Header/Lizenzen samt Hashes archiviert.
+Archiv: ExFiles/Reference/GFX/Nvidia/0.79.10/gsp-core-20260911.
+JSON: gsp_core_checkpoint; 0.79.10 bleibt offen.
+
+Vorheriger GSP-CPU-Sequencer und Empfangsbindung (Host)
 ------------------------------------------
 gsp_sequencer prueft den gesamten Befehlsstrom vor dem ersten Geraetezugriff:
 neun Opcodeformen, Operanden, ausgerichtete Register in der gemessenen Apertur,

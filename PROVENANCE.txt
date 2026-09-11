@@ -1,6 +1,24 @@
 ﻿Original R4OS implementation for roadmap 0.79.9, 10.09.2026.
 Host/module scaffolding follows R4OS SDK and existing R4D owners.
 
+0.79.10 GA106 core execution/MMIO binding (host), 11.09.2026:
+gsp_core.zig adapts kflcnReset/StartCpu/DisableCtxReq/WaitForHalt_TU102,
+kflcnPreResetWait/WaitForResetToFinish/SwitchToFalcon/ResetIntoRiscv_GA102,
+kgspResetHw_TU102 and kgspExecuteSequencerCommand_GA102 from RM570.144 commit
+8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f. HAL generated dispatch files confirm
+GA106 selection; GA102 SEC2 configuration supplies its register base.
+Full MIT notice/copyright retained; original R4OS cooperative phases,
+lifetime and actual SDK/MMIO binding remain Apache-2.0. 30 register values
+independently match complete original headers; 150us hint timeout is sourced
+from kernel_falcon_ga102.c, propagation 10 from falcon_common.h.
+The complete 3156-file pin was verified before the original C comparison.
+205 full dependencies/context sources/notices accompany gsp-core-20260911.
+Native accessors are tested on host memory, core behavior on hardware models.
+No GPU execution, packaged module 0.1.25 change or hardware contact occurred.
+Native boot/VRAM/VGA/recovery/log owners and first upload/start remain open.
+Before executable linkage, extend the packaged complete MIT notice bundle.
+
+
 0.79.10 GSP sequencer execution (host), 11.09.2026:
 gsp_sequencer.zig adapts all nine opcode forms and register semantics from
 rmgspseq.h (NVIDIA 2019-2020) and kernel_gsp.c (2019-2024). Poll duration uses

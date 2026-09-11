@@ -7,6 +7,8 @@ const message = @import("gsp_message.zig");
 const ring = @import("gsp_ring.zig");
 const boot_events = @import("gsp_boot_events.zig");
 const sequencer = @import("gsp_sequencer.zig");
+const core = @import("gsp_core.zig");
+extern fn r4nv_gsp_core_abi_check([*]const u32, usize) c_int;
 extern fn r4nv_fwsec_abi_check([*]const u8, usize, c_uint, [*]const u8, usize, c_uint, [*]const u8, usize) c_int;
 extern fn r4nv_gsp_init_abi_check([*]const u8, usize) c_int;
 extern fn r4nv_gsp_message_abi_check([*]const u8, usize, c_uint) c_int;
@@ -14,6 +16,16 @@ extern fn r4nv_gsp_ring_abi_check([*]const u32, usize, c_uint) c_int;
 extern fn r4nv_gsp_event_abi_fixture(c_uint, [*]u8, usize) usize;
 extern fn r4nv_gsp_sequence_abi_fixture([*]u8, usize) usize;
 pub fn main() !void {
+    const r = core.reg;
+    const b = core.bits;
+    const core_values = [_]u32{
+        r.hwcfg2,       r.engine,               r.rm,          r.fbif,      r.dmactl,        r.cpuctl,     r.cpuctl_alias,
+        r.bcr,          r.riscv_cpuctl,         r.mailbox0,    r.mailbox1,  r.os,            r.sec_cpuctl, r.sec_cpuctl_alias,
+        r.sec_mailbox0, r.handoff,              b.reset_ready, b.scrubbing, b.riscv_enabled, b.reset,      b.allow_phys,
+        b.start,        b.alias,                b.halted,      b.bcr_riscv, b.bcr_valid,     b.bcr_boot,   b.active,
+        b.handoff_done, core.propagation_reads,
+    };
+    if (r4nv_gsp_core_abi_check(&core_values, core_values.len) != 0) return error.OriginalCoreMismatch;
     // Heap backing belongs only to this host comparison, never to a target
     // driver or its bounded stack. All DMA addresses below are synthetic.
     const init_output = try std.heap.page_allocator.alloc(u8, gsp_init.output_bytes);

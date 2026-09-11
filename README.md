@@ -10,6 +10,36 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
+GA106 core execution and R4OS MMIO binding (host qualification):
+
+`gsp_core` implements reset, start, halt wait and SEC2 resume from the pinned
+GA102/TU102 HAL. Reset waits at most 150us for the RESET_READY hint, performs
+ten propagation reads after each reset edge, waits for HWCFG2 scrubbing, then
+switches core. FALCON_RM receives full BOOT0; CPU start selects the write-only
+alias when required. Resume suspends the log reader, selects RISC-V, programs
+the retained Libos DMA address, starts SEC2 and checks handoff/mailbox before
+restoring logs, FALCON_OS and the active-CPU check. Each call advances one
+bounded phase; errors preserve effects and cannot restart the operation.
+
+`gsp_sequencer_port` binds these implementations to actual R4OS MMIO mapping
+and sequencer callbacks. It validates the measured uncached BAR0 mapping,
+orders volatile accesses and drains posted writes through read-only BOOT0.
+The boot owner supplies pure command admission, current register/lockdown
+policy, DMA retention, log-reader coordination and real quiescence. A failed
+write or cleanup retains the mapping; no timeout grants device quiescence.
+See https://docs.kernel.org/driver-api/device-io.html for PCI write ordering.
+
+The existing owner step passes 47/47 cases; one grouped core/MMIO case was
+added. All 30 register addresses/fields/constants match original C headers.
+These are host models, including the real accessors operating on host memory.
+The code is not activated in main.zig or linked into NVIDIA 0.1.25. Native
+boot/VRAM/VGA/recovery/log owners, first firmware upload/start, IRQ and health
+remain open. No guest run or hardware contact. Archive gsp-core-20260911
+retains 205 complete originals/notices. Future executable linkage must extend
+the packaged MIT notices before distribution. Subversion 0.79.10 remains open.
+
+Earlier sequencer checkpoint (host):
+
 The host-qualified `gsp_sequencer.DispatchExecution` now holds a CPU-sequencer
 boot event through complete execution. It checks all nine opcode forms, operand
 extents, register alignment/aperture, save slots and mandatory delay totals

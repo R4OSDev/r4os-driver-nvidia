@@ -20,6 +20,55 @@
 #include "ctrl/ctrl2080/ctrl2080nvd.h"
 #include "rmgspseq.h"
 #include "gpu/gpu_timeout.h"
+#include "gpu/falcon/falcon_common.h"
+#include "published/ampere/ga102/dev_gsp.h"
+#include "published/ampere/ga102/dev_gsp_addendum.h"
+#include "published/ampere/ga102/dev_sec_pri.h"
+#include "published/ampere/ga102/dev_falcon_v4.h"
+#include "published/ampere/ga102/dev_falcon_v4_addendum.h"
+#include "published/ampere/ga102/dev_fbif_v4.h"
+#include "published/ampere/ga102/dev_riscv_pri.h"
+#include "published/ampere/ga102/dev_gc6_island.h"
+#include "published/ampere/ga102/dev_gc6_island_addendum.h"
+
+int r4nv_gsp_core_abi_check(const unsigned *actual, size_t count)
+{
+    const NvU32 expected[] = {
+        DRF_BASE(NV_PGSP) + NV_PFALCON_FALCON_HWCFG2,
+        NV_PGSP_FALCON_ENGINE,
+        DRF_BASE(NV_PGSP) + NV_PFALCON_FALCON_RM,
+        NV_PGSP_FBIF_BASE + NV_PFALCON_FBIF_CTL,
+        DRF_BASE(NV_PGSP) + NV_PFALCON_FALCON_DMACTL,
+        DRF_BASE(NV_PGSP) + NV_PFALCON_FALCON_CPUCTL,
+        DRF_BASE(NV_PGSP) + NV_PFALCON_FALCON_CPUCTL_ALIAS,
+        NV_FALCON2_GSP_BASE + NV_PRISCV_RISCV_BCR_CTRL,
+        NV_FALCON2_GSP_BASE + NV_PRISCV_RISCV_CPUCTL,
+        NV_PGSP_FALCON_MAILBOX0, NV_PGSP_FALCON_MAILBOX1,
+        DRF_BASE(NV_PGSP) + NV_PFALCON_FALCON_OS,
+        DRF_BASE(NV_PSEC) + NV_PFALCON_FALCON_CPUCTL,
+        DRF_BASE(NV_PSEC) + NV_PFALCON_FALCON_CPUCTL_ALIAS,
+        DRF_BASE(NV_PSEC) + NV_PFALCON_FALCON_MAILBOX0,
+        NV_PGC6_BSI_SECURE_SCRATCH_14,
+        DRF_DEF(_PFALCON, _FALCON_HWCFG2, _RESET_READY, _TRUE),
+        DRF_SHIFTMASK(NV_PFALCON_FALCON_HWCFG2_MEM_SCRUBBING),
+        DRF_DEF(_PFALCON, _FALCON_HWCFG2, _RISCV, _ENABLE),
+        DRF_DEF(_PGSP, _FALCON_ENGINE, _RESET, _TRUE),
+        DRF_DEF(_PFALCON, _FBIF_CTL, _ALLOW_PHYS_NO_CTX, _ALLOW),
+        DRF_DEF(_PFALCON, _FALCON_CPUCTL, _STARTCPU, _TRUE),
+        DRF_DEF(_PFALCON, _FALCON_CPUCTL, _ALIAS_EN, _TRUE),
+        DRF_DEF(_PFALCON, _FALCON_CPUCTL, _HALTED, _TRUE),
+        DRF_DEF(_PRISCV_RISCV, _BCR_CTRL, _CORE_SELECT, _RISCV),
+        DRF_DEF(_PRISCV_RISCV, _BCR_CTRL, _VALID, _TRUE),
+        DRF_DEF(_PRISCV_RISCV, _BCR_CTRL, _CORE_SELECT, _RISCV) |
+          DRF_DEF(_PRISCV_RISCV, _BCR_CTRL, _VALID, _TRUE) |
+          DRF_DEF(_PRISCV_RISCV, _BCR_CTRL, _BRFETCH, _TRUE),
+        DRF_DEF(_PRISCV_RISCV, _CPUCTL, _ACTIVE_STAT, _ACTIVE),
+        DRF_DEF(_PGC6, _BSI_SECURE_SCRATCH_14, _BOOT_STAGE_3_HANDOFF, _VALUE_DONE),
+        FLCN_RESET_PROPAGATION_DELAY_COUNT
+    };
+    return count != sizeof(expected) / sizeof(expected[0]) ||
+           memcmp(actual, expected, sizeof(expected)) != 0;
+}
 
 _Static_assert(sizeof(rpc_message_header_v) == 32, "complete original RPC header");
 _Static_assert(sizeof(GSP_MSG_QUEUE_ELEMENT) == 80, "minimum message");
