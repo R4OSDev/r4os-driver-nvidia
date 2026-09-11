@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-Passive NVIDIA display driver for R4OS. Module 0.1.41; original R4OS code is
+Passive NVIDIA display driver for R4OS. Module 0.1.42; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -10,7 +10,23 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
-Fresh BAR1 mapping admission (NVIDIA 0.1.41):
+Boot-check completion cleanup (NVIDIA 0.1.42):
+
+Normal boot-check completion omitted the display-context close, leaving
+context_owner held and making final boot_vram.close fail. Normal completion
+and shutdown now share the same context/payload-before-BAR1 cleanup helper,
+followed by parent boot-hold release. Failure stops the chain for retry.
+The existing lifecycle case calls this exact driver helper with held
+owners: active VRAM borrow and failed payload unmap retain all three BOs;
+retry succeeds and is idempotent. Both actual call sites are inspected.
+51 existing cases and one module build pass first invocation; 29 resources
+unchanged. This validates cleanup, not the full firmware boot-check entry
+or a physical GPU. No new case/gate/guest/hardware run. Evidence:
+display_cleanup_checkpoint in Docs/Drivers/GrafikFirmware07910.json;
+ExFiles/Reference/GFX/Nvidia/0.79.10/display-cleanup-20260911.
+OssiPC remains offline/untouched; native recovery/bringup remains open.
+
+Previous fresh BAR1 mapping admission (NVIDIA 0.1.41):
 
 Before the first-boot VRAM lease publishes any borrow, the mapping owner
 now compares the current BAR1 control and every complete saved dependency

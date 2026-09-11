@@ -1670,7 +1670,7 @@ fn checkBootVramOwner() !void {
     try t.expect(display_context.valid(&capture) and capture.borrower == 0 and capture.registers.borrowedCount() == 1);
     f.display_instance[65535] ^= 1;
     try held.acquire(&capture, &backing, &mapped_boot, &display_context);
-    try t.expect(!display_context.close());
+    try t.expect(!driver.closeBootMappings(&display_context, &mapped_boot));
     try t.expect(!mapped_boot.close());
     const frts = try held.binding(.frts);
     try checkFrtsStorage(&ctx, &held);
@@ -1703,10 +1703,11 @@ fn checkBootVramOwner() !void {
     try t.expectError(error.Exhausted, held.acquire(&capture, &backing, &mapped_boot, &display_context));
     try t.expect(capture.borrower == 0 and backing.vram_owner == 0 and f.mapped[0x625]);
     f.fail_asset_unmap = true;
-    try t.expect(!display_context.close() and !capture.close() and f.buffers[3] != null and f.leases[3] and f.buffers[4] != null and f.leases[4]);
+    try t.expect(!driver.closeBootMappings(&display_context, &mapped_boot) and !capture.close() and
+        f.buffers[2] != null and f.leases[2] and f.buffers[3] != null and f.leases[3] and f.buffers[4] != null and f.leases[4]);
     f.fail_asset_unmap = false;
-    try t.expect(display_context.close() and display_context.close() and f.buffers[3] == null and !f.leases[3] and f.buffers[4] == null and !f.leases[4]);
-    try t.expect(mapped_boot.close() and f.buffers[2] == null and !f.leases[2]);
+    try t.expect(driver.closeBootMappings(&display_context, &mapped_boot) and driver.closeBootMappings(&display_context, &mapped_boot) and
+        f.buffers[2] == null and !f.leases[2] and f.buffers[3] == null and !f.leases[3] and f.buffers[4] == null and !f.leases[4]);
     // Direct BAR1 mode needs no table BO and still covers the complete span.
     f.put(reader.block_register, 0x4321);
     const direct = try mapped_boot.capture(&capture);

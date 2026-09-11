@@ -180,8 +180,7 @@ pub export fn nvidia_shutdown() callconv(.c) i32 {
     if (boot_vram_lease.self_address != 0 and !fwsec_cpu.close()) return -1;
     if (!boot_vram_lease.releaseBeforeSubmission()) return -1;
     if (!boot_storage.close()) return -1;
-    if (!boot_context.close()) return -1;
-    if (!boot_mapping.close()) return -1;
+    if (!closeBootMappings(&boot_context, &boot_mapping)) return -1;
     if (!boot_vram.close()) return -1;
     boot_inputs.close();
     if (!gsp_image.close()) return -1;
@@ -669,7 +668,7 @@ fn checkBoot(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Sna
     }
     boot_inputs.close();
     if (!firmware_cpu.close()) return false;
-    if (!boot_mapping.close()) return false;
+    if (!closeBootMappings(&boot_context, &boot_mapping)) return false;
     if (!boot_vram.close()) {
         ctx.logError("NVIDIA boot-vram: cleanup=retained display-and-snapshot=held");
         return false;
@@ -741,6 +740,13 @@ fn closeBootInit() bool {
     if (!run_memory.releaseBeforeSubmission()) return false;
     if (!init_storage.close()) return false;
     return booters.close();
+}
+
+/// Shared by successful boot-check completion and shutdown. The display
+/// context/payload copies must close before BAR1 dependencies; either failure
+/// leaves the parent boot hold for its caller's later retry.
+pub fn closeBootMappings(context: *@import("boot_context.zig").Capture, mapping: *@import("boot_mapping.zig").Capture) bool {
+    return context.close() and mapping.close();
 }
 
 const VbiosDiagnostic = struct {

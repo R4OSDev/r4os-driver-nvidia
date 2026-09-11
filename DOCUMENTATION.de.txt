@@ -10,7 +10,25 @@ unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
 
-BAR1-Zuordnung vor der VRAM-Leihe erneut pruefen (NVIDIA 0.1.41)
+Erfolgreichen Boot-Check vollstaendig aufraeumen (NVIDIA 0.1.42)
+---------------------------------------------------------------
+Im normalen Erfolgspfad fehlte das Schliessen des Displaykontexts; dessen
+context_owner verhinderte danach boot_vram.close und den Erfolgsstatus.
+Normaler Abschluss und Shutdown verwenden nun dieselbe Folge: Display-
+Instanz/Nutzdaten vor BAR1-Abhaengigkeiten schliessen, danach Elternhold.
+Fehler stoppen die Folge und behalten die noetigen Besitzer fuer Retry.
+Der bestehende Lebenszyklusfall nutzt genau diesen Treiberhelfer mit
+echten Modellbesitzern: aktive VRAM-Leihe und fehlerhaftes Nutzdaten-Unmap
+erhalten alle drei BOs; Retry gelingt und bleibt idempotent. Beide echten
+Aufrufstellen sind geprueft.51 bestehende Faelle und ein Modulbuild erster
+Aufruf bestanden,29 Ressourcen unveraendert. Geprueft ist die Aufraeumfolge,
+nicht der ganze Firmware-Boot-Check oder reale GPU. Keine neuen Faelle/
+Gates/Gast-/Hardwarelaeufe. Beleg display_cleanup_checkpoint in
+Docs/Drivers/GrafikFirmware07910.json; Archiv display-cleanup-20260911 unter
+ExFiles/Reference/GFX/Nvidia/0.79.10. OssiPC offline/unberuehrt; native
+Recovery/Bringup weiter offen.
+
+Vorherige BAR1-Zuordnungspruefung (NVIDIA 0.1.41)
 ---------------------------------------------------------------
 Vor dem Veroeffentlichen der ersten VRAM-Leihe vergleicht der Mapping-
 Besitzer nun die aktuelle BAR1-Steuerung und jede ganze gesicherte
