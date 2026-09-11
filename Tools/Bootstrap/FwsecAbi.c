@@ -21,6 +21,7 @@ _Static_assert(offsetof(GSP_ARGUMENTS_CACHED, profilerArgs) == 56, "profiler pad
 _Static_assert(sizeof(msgqTxHeader) == 32 && sizeof(msgqRxHeader) == 4, "original queue headers");
 _Static_assert(offsetof(msgqTxHeader, rxHdrOff) == 24 && offsetof(msgqTxHeader, entryOff) == 28, "queue offsets");
 static int init_compared;
+extern int r4nv_gsp_message_abi_complete(void);
 
 static NvU64 init_id(const char *name)
 {
@@ -95,7 +96,7 @@ int r4nv_fwsec_abi_check(const unsigned char *sb, size_t sb_len, unsigned sb_id,
                         const unsigned char *frts, size_t frts_len, unsigned frts_id,
                         const unsigned char *wpr, size_t wpr_len)
 {
-    if (!init_compared) return 4;
+    if (!init_compared || !r4nv_gsp_message_abi_complete()) return 4;
     FWSECLIC_READ_VBIOS_DESC read;
     FWSECLIC_FRTS_CMD command;
     memset(&read, 0, sizeof(read));
@@ -153,6 +154,10 @@ int r4nv_fwsec_abi_check(const unsigned char *sb, size_t sb_len, unsigned sb_id,
          "\"libos_entry_bytes\":32,\"rm_arguments_bytes\":72,"
          "\"queue_pages_self_mapped\":129,\"queue_ring_slots\":63,\"queue_capacity\":62,"
          "\"original_msgq_create_executed_on_host\":true,\"status_queue_zero\":true,"
+         "\"gsp_message_byte_comparison\":true,\"gsp_message_fixtures\":6,"
+         "\"gsp_message_outer_bytes\":48,\"gsp_rpc_header_bytes\":32,"
+         "\"gsp_message_min_bytes\":80,\"gsp_message_max_bytes\":65536,"
+         "\"original_gsp_checksum_executed_on_host\":true,"
          "\"gpu_executed\":false}");
     return 0;
 }

@@ -14,6 +14,18 @@ their original licenses in the separate workspace reference archive.
 Fixture firmware bodies and signatures are synthetic; selected measured table
 metadata is regression data documented in PROVENANCE.txt.
 
+The host-qualified `src/gsp_message.zig` adapts the pinned message framing
+and checksum from message_queue_priv.h (2019-2022), message_queue_cpu.c
+(2019-2024), g_rpc-message-header.h (2008-2025), rpc_headers.h (2017-2024)
+and rpc_common.c (2020-2024), NVIDIA CORPORATION & AFFILIATES. It retains the
+complete MIT notice and copyright lines; original R4OS admission is Apache-2.0.
+The existing optional host ABI verifier includes the complete original types
+and checksum implementation. All 177 original dependencies/source/notice
+files are preserved byte-for-byte in the gsp-message-20260911 reference archive.
+Original checked assertions are enabled; host failure callbacks abort.
+This codec is not yet linked into NVIDIA.R4D 0.1.24. The distributed license
+bundle is unchanged and must gain these complete notices before linkage.
+
 Module 0.1.24 links `gsp_init.zig`, which adapts first-boot field assignment
 from the same pinned NVIDIA Libos/RM initialization and message-queue sources.
 It retains the complete NVIDIA MIT notice and copyright lines for

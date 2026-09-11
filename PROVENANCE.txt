@@ -3,6 +3,23 @@ Host/module scaffolding follows R4OS SDK and existing R4D owners.
 Firmware fixture bodies and signatures are synthetic. Selected measured
 table fields are explicit regression data, as described below.
 
+0.79.10 GSP message framing (host), 11.09.2026:
+gsp_message.zig adapts header fields/assignment and checksum from the pinned
+message_queue_priv.h (2019-2022), message_queue_cpu.c (2019-2024),
+g_rpc-message-header.h (2008-2025), rpc_headers.h (2017-2024) and rpc_common.c
+(2020-2024), NVIDIA CORPORATION & AFFILIATES. The complete MIT permission,
+disclaimer and copyright lines are retained; original admission is Apache-2.0.
+The host oracle compiles the complete generated RPC types/union and invokes
+the original checksum for six complete-slot fixtures. The original Makefile
+include order/defines and checked assertions are retained. Only the existing
+NV_R4OS version-header guard adaptation is applied; three assertion/debug
+failure callbacks abort the host verifier. No shadow vendor types, success
+callbacks, live queue or GPU execution. The archive preserves all 177 original
+dependency/source/license files with pinned catalog hashes and official URLs:
+ExFiles/Reference/GFX/Nvidia/0.79.10/gsp-message-20260911.
+NVIDIA.R4D0.1.24 and its packaged notices remain unchanged; this codec is
+host-qualified only. Future module linkage must extend the complete notices.
+
 0.79.10 integrated GSP init storage (NVIDIA 0.1.24), 11.09.2026:
 The explicit boot-check links the existing MIT-attributed gsp_init.zig encoder
 and original R4OS gsp_init_storage.zig owner. The central lock now pins twelve

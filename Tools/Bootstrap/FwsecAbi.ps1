@@ -1,4 +1,35 @@
 # Called only after PrepareBootstrap verified the complete private snapshot.
+function New-GspMessageAbiObject([string]$Compiler,[string]$Source,[string]$Run,[string]$Derived){
+    $owner=Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+    $pin=Get-Content -Raw -LiteralPath (Join-Path $owner 'src/firmware-lock.json')|ConvertFrom-Json
+    $original=[IO.File]::ReadAllText((Join-Path $Source 'src/common/inc/nvUnixVersion.h'))
+    $needle='#if defined(NV_LINUX) || defined(NV_BSD)'
+    if(([regex]::Matches($original,[regex]::Escape($needle))).Count -ne 1){throw 'Unexpected upstream version guard'}
+    # Same version-only platform adaptation as the original RM build. Preserve
+    # its complete notice; no shadow vendor types or host OS emulation headers.
+    [IO.File]::WriteAllText((Join-Path $Derived 'nvUnixVersion.h'),$original.Replace($needle,'#if defined(NV_R4OS) || defined(NV_LINUX) || defined(NV_BSD)'),[Text.UTF8Encoding]::new($false))
+    $flags=@('-std=gnu11','-O2','-g0','-fno-strict-aliasing','-Werror=implicit-function-declaration',
+        '-DNV_UNIX','-DNV_R4OS','-DNV_X86_64','-DNV_ARCH_BITS=64',('-DNV_VERSION_STRING="'+$pin.rm_version+'"'),('-I'+$Derived))
+    $unitRoot=Join-Path $Source 'src/nvidia'
+    foreach($line in Get-Content -LiteralPath (Join-Path $unitRoot 'Makefile')){
+        if($line -match '^\s*CFLAGS \+= -I (.+)$'){
+            $relative=$Matches[1].Replace('$(SRC_COMMON)','../common').Trim()
+            if($relative.Contains('$')){throw 'Unresolved original GSP ABI include'}
+            $flags+='-I'+[IO.Path]::GetFullPath((Join-Path $unitRoot $relative))
+        }
+        if($line -match '^\s*CFLAGS \+= (-D[^ ]+)$'){
+            $define=$Matches[1].Replace('\"','"')
+            if($define.Contains('$')){throw 'Unresolved original GSP ABI define'}
+            $flags+=$define
+        }
+    }
+    $object=Join-Path $Run 'gsp-message-abi.o'
+    $arguments=@('cc')+$flags+@('-MMD','-MF',(Join-Path $Run 'gsp-message-abi.d'),'-c',(Join-Path $PSScriptRoot 'GspMessageAbi.c'),'-o',$object)
+    $result=Invoke-RmNative -Executable $Compiler -Arguments $arguments -WorkingDirectory $Run -LogPath (Join-Path $Run 'gsp-message-abi-compile.log') -TimeoutSeconds 90
+    if($result -ne 0){throw 'Complete original GSP message ABI headers did not compile'}
+    return $object
+}
+
 function Confirm-FwsecAbi([string]$Compiler,[string]$Source,[string]$Run,[string]$Stage){
     $relative='src/nvidia/src/kernel/gpu/gsp/arch/turing/kernel_gsp_frts_tu102.c'
     $original=Get-Content -Raw -LiteralPath (Join-Path $Source $relative)
@@ -24,14 +55,15 @@ function Confirm-FwsecAbi([string]$Compiler,[string]$Source,[string]$Run,[string
     $owner=Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
     $suffix=if($IsWindows){'.exe'}else{''}
     $exe=Join-Path $Run ('fwsec-abi'+$suffix)
+    $messageObject=New-GspMessageAbiObject -Compiler $Compiler -Source $Source -Run $Run -Derived $derived
     $compilerArguments=@('build-exe','-OReleaseSafe','-lc',
         '-I',(Join-Path $Source 'src/common/sdk/nvidia/inc'),'-I',$derived,'-I',(Join-Path $msgq 'inc'),
-        (Join-Path $owner 'src/fwsec_abi_check.zig'),(Join-Path $PSScriptRoot 'FwsecAbi.c'),(Join-Path $msgq 'msgq.c'),("-femit-bin=$exe"))
+        (Join-Path $owner 'src/fwsec_abi_check.zig'),(Join-Path $PSScriptRoot 'FwsecAbi.c'),(Join-Path $msgq 'msgq.c'),$messageObject,("-femit-bin=$exe"))
     $result=Invoke-RmNative -Executable $Compiler -Arguments $compilerArguments -WorkingDirectory $Run -LogPath (Join-Path $Run 'fwsec-abi-compile.log') -TimeoutSeconds 90
     if($result -ne 0){throw 'Original FWSEC ABI comparison did not compile'}
     $result=Invoke-RmNative -Executable $exe -Arguments @() -WorkingDirectory $Run -LogPath (Join-Path $Stage 'fwsec-abi.json') -TimeoutSeconds 20
-    if($result -ne 0){throw 'Zig firmware command or WPR bytes differ from original NVIDIA C structures'}
+    if($result -ne 0){throw 'Zig firmware command, memory or message bytes differ from original NVIDIA C structures'}
     $abi=Get-Content -Raw (Join-Path $Stage 'fwsec-abi.json')|ConvertFrom-Json
-    if(!$abi.zig_c_byte_comparison -or !$abi.gsp_wpr_byte_comparison -or !$abi.gsp_init_byte_comparison -or !$abi.original_msgq_create_executed_on_host -or $abi.gpu_executed){throw 'Firmware ABI result invalid'}
+    if(!$abi.zig_c_byte_comparison -or !$abi.gsp_wpr_byte_comparison -or !$abi.gsp_init_byte_comparison -or !$abi.original_msgq_create_executed_on_host -or !$abi.gsp_message_byte_comparison -or $abi.gsp_message_fixtures -ne 6 -or !$abi.original_gsp_checksum_executed_on_host -or $abi.gpu_executed){throw 'Firmware ABI result invalid'}
     return $abi
 }

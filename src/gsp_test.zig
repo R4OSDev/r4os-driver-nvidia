@@ -6,6 +6,76 @@ const preflight = @import("fwsec_state.zig");
 const radix = @import("gsp_radix.zig");
 const wpr = @import("gsp_wpr.zig");
 const init = @import("gsp_init.zig");
+const message = @import("gsp_message.zig");
+
+test "GSP message framing bounds complete records before checksum and preserves caller state" {
+    const profile = message.Profile{ .chip_id = 0x176 };
+    const rpc = message.Rpc{ .function = 0xdeadbeef, .sequence = 0x12345678 };
+    const output = try t.allocator.alloc(u8, message.max_bytes);
+    defer t.allocator.free(output);
+    const payload = try t.allocator.alloc(u8, message.max_bytes);
+    defer t.allocator.free(payload);
+    for (payload, 0..) |*byte, index| byte.* = @truncate(index * 37 + 11);
+    for ([_]usize{ 0, 1, 7, 4016, 4017, message.max_payload_bytes }, 0..) |length, index| {
+        @memset(output, 0xa5);
+        const sequence: u32 = std.math.maxInt(u32) - @as(u32, @intCast(index));
+        const shape = try message.encode(profile, sequence, rpc, payload[0..length], output);
+        const prefix = try message.inspectPrefix(profile, output[0..message.header_bytes]);
+        try t.expectEqualDeep(shape, prefix);
+        const record = try message.decode(profile, output[0..shape.storage_bytes], sequence);
+        try t.expectEqualDeep(rpc, record.rpc);
+        try t.expectEqual(sequence, record.queue_sequence);
+        try t.expectEqualSlices(u8, payload[0..length], record.payload);
+        try t.expect(std.mem.allEqual(u8, output[shape.message_bytes..shape.storage_bytes], 0));
+        try t.expect(std.mem.allEqual(u8, output[shape.storage_bytes..], 0xa5));
+        try t.expectError(error.Sequence, message.decode(profile, output[0..shape.storage_bytes], sequence +% 1));
+        try t.expectError(error.Length, message.decode(profile, output[0 .. shape.storage_bytes - 1], sequence));
+    }
+    const sequence = 0x99887766;
+    const shape = try message.encode(profile, sequence, rpc, payload[0..1], output);
+    const baseline = try t.allocator.dupe(u8, output[0..shape.storage_bytes]);
+    defer t.allocator.free(baseline);
+    const Invalid = struct { offset: usize, value: u32, failure: anyerror };
+    const invalid = [_]Invalid{
+        .{ .offset = 40, .value = 0, .failure = error.Elements },
+        .{ .offset = 40, .value = 17, .failure = error.Elements },
+        .{ .offset = 40, .value = 2, .failure = error.Elements },
+        .{ .offset = 56, .value = 0, .failure = error.Length },
+        .{ .offset = 56, .value = 31, .failure = error.Length },
+        .{ .offset = 56, .value = 65489, .failure = error.Length },
+        .{ .offset = 56, .value = 0xffffffff, .failure = error.Length },
+        .{ .offset = 48, .value = 0x03010000, .failure = error.Version },
+        .{ .offset = 52, .value = 0, .failure = error.Signature },
+        .{ .offset = 32, .value = std.mem.readInt(u32, baseline[32..36], .little) ^ 1, .failure = error.Checksum },
+    };
+    for (invalid) |case| {
+        @memcpy(output[0..baseline.len], baseline);
+        std.mem.writeInt(u32, output[case.offset..][0..4], case.value, .little);
+        try t.expectError(case.failure, message.decode(profile, output[0..baseline.len], sequence));
+    }
+    @memcpy(output[0..baseline.len], baseline);
+    output[shape.message_bytes] = 1;
+    try t.expectError(error.Padding, message.decode(profile, output[0..baseline.len], sequence));
+    @memcpy(output[0..baseline.len], baseline);
+    output[message.header_bytes] ^= 1;
+    try t.expectError(error.Checksum, message.decode(profile, output[0..baseline.len], sequence));
+    @memcpy(output[0..baseline.len], baseline);
+    output[baseline.len - 1] = 0x7f; // Stale bytes beyond the checksummed message are not payload.
+    _ = try message.decode(profile, output[0..baseline.len], sequence);
+    output[0] ^= 0x12; // Cleartext auth/AAD bytes are opaque, never evidence of authentication.
+    output[32] ^= 0x12;
+    _ = try message.decode(profile, output[0..baseline.len], sequence);
+    try t.expectError(error.Profile, message.decode(.{ .chip_id = 0x176, .confidential_compute = true }, output[0..baseline.len], sequence));
+    try t.expectError(error.Length, message.inspectPrefix(profile, output[0 .. message.header_bytes - 1]));
+    try t.expectError(error.Length, message.decode(profile, output, sequence));
+    @memset(output, 0xa5);
+    try t.expectError(error.Profile, message.encode(.{ .chip_id = 0x177 }, 0, rpc, payload[0..1], output));
+    try t.expectError(error.Profile, message.encode(.{ .chip_id = 0x176, .confidential_compute = true }, 0, rpc, payload[0..1], output));
+    try t.expectError(error.Length, message.encode(profile, 0, rpc, payload, output));
+    try t.expectError(error.Output, message.encode(profile, 0, rpc, &.{}, output[0..4095]));
+    try t.expectError(error.Overlap, message.encode(profile, 0, rpc, output[128..129], output));
+    try t.expect(std.mem.allEqual(u8, output, 0xa5));
+}
 
 test "GSP initialization encodes self-mapped queues and ordered Libos logs without partial output" {
     const output = try t.allocator.alignedAlloc(u8, comptime std.mem.Alignment.fromByteUnits(8), init.output_bytes);

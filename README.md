@@ -10,6 +10,25 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
+The host-qualified `gsp_message.zig` codec now frames the pinned cleartext
+GA106 GSP/RPC messages: a 48-byte outer header, 32-byte RPC header and at most
+16 complete 4-KB slots. Prefix admission bounds both element count and RPC
+length before gathering; complete-record admission checks exact slot extent,
+version/signature, zero eight-byte padding, checksum and expected sequence.
+RPC function/result and auth/AAD fields remain opaque; a valid checksum is
+neither authentication nor a dispatch decision. Unused final-slot bytes are
+not payload. Encoding rejects overlapping input and leaves output unchanged
+on admission failure, using caller storage without a hidden allocation.
+
+The existing owner step passes 41 cases. Six boundary fixtures, including the
+64-KB maximum, match complete original NVIDIA C structures and the original
+checksum byte-for-byte. Checked-build assertions remain enabled; host-only
+failure callbacks abort. The optional ABI step retains the previous complete
+init/WPR/SB/FRTS comparisons. The codec requires stable CPU snapshots; it owns
+no ring, cursor, acknowledgement, DMA synchronization or RPC/IRQ dispatch.
+NVIDIA.R4D 0.1.24 and its packaged licenses remain byte-identical. Future codec
+linkage must add its full original notices to the pinned resource bundle.
+
 Module 0.1.24 extends the explicit `OPTION NVIDIA mode=boot-check` diagnostic.
 After the actual GA106 board, fuse and FWSEC preflight, it admits the pinned
 24-KB boot image, 84-byte descriptor and complete license from the currently

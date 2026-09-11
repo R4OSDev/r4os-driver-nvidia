@@ -9,6 +9,33 @@ Boardanschluesse. Die spaeteren PROM-Boots bestaetigen softwareseitig den
 unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
+GSP-Nachrichtenformat (Host; Modul 0.1.24 unveraendert)
+----------------------------------------------------
+gsp_message.zig prueft normale unverschluesselte GA106-Nachrichten fuer den
+festen RM570.144-Vertrag. 48 Bytes aeusserer Header, 32 Bytes RPC-Header,
+hoechstens 16 Slots zu 4 KB; maximal 65456 Bytes Nutzdaten. Bereits vor dem
+Zusammentragen werden Slotzahl und RPC-Laenge begrenzt. Der vollstaendige
+Datensatz braucht exakt die zugehoerige Slotspanne; Version, Signatur,
+Nullpadding bis acht Bytes, XOR-Pruefsumme und Sequenz muessen stimmen.
+Ungenutzte Slotreste gehoeren nicht zur Nachricht. Funktion/Resultat und
+Auth-/AAD-Felder bleiben opak; die Pruefsumme ist keine Authentifizierung.
+
+Der Encoder nutzt caller-eigenen Speicher ohne versteckte Allokation. Alle
+Zulassungsfehler erhalten die Ausgabe unveraendert; Payload-Aliase werden
+abgewiesen. Eingaben muessen stabile CPU-Snapshots sein, keine laufend durch
+DMA geaenderten Ansichten. Kein Queuebesitz, Sequenzfortschritt oder Ack.
+
+41/41 vorhandene Besitzerfaelle bestanden. Sechs Grenzformate bis 64 KB
+stimmen vollstaendig mit Original-C-Typen und originaler _checkSum32 ueberein.
+Die urspruenglichen Assertions bleiben aktiv; drei Host-Fehlercallbacks
+brechen ab. Vorheriger SB-/FRTS-/WPR-/844-KB-Init-Vergleich ebenfalls bestanden.
+177 vollstaendige Originaldateien einschliesslich Headerabhaengigkeiten und
+Lizenzen liegen unter ExFiles/Reference/GFX/Nvidia/0.79.10/gsp-message-20260911.
+Keine neue Test-/Gatevariante, kein Gastlauf, Modulbau oder Hardwarekontakt. Der Codec
+ist noch nicht in NVIDIA.R4D eingebunden; spaetere Einbindung ergaenzt die
+vollstaendigen gepinnten Lizenzhinweise. Empfangssynchronisierung, Ringbesitz,
+RPC/IRQ und Firmwarestart bleiben offen. OssiPC bleibt auf dem folgenden Stand.
+
 GSP-Initialisierung im Modul 0.1.24
 ---------------------------------
 OPTION NVIDIA mode=boot-check bindet den vorhandenen 844-KB-Speicherbesitzer

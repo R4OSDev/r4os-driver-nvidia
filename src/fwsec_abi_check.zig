@@ -3,8 +3,10 @@ const preparation = @import("fwsec_prepare.zig");
 const std = @import("std");
 const wpr = @import("gsp_wpr.zig");
 const gsp_init = @import("gsp_init.zig");
+const message = @import("gsp_message.zig");
 extern fn r4nv_fwsec_abi_check([*]const u8, usize, c_uint, [*]const u8, usize, c_uint, [*]const u8, usize) c_int;
 extern fn r4nv_gsp_init_abi_check([*]const u8, usize) c_int;
+extern fn r4nv_gsp_message_abi_check([*]const u8, usize, c_uint) c_int;
 pub fn main() !void {
     // Heap backing belongs only to this host comparison, never to a target
     // driver or its bounded stack. All DMA addresses below are synthetic.
@@ -24,6 +26,15 @@ pub fn main() !void {
     for (&bindings.logs, 0..) |*span, index| span.* = .{ .address = 0x910000000 + index * 0x20000, .bytes = 65536 };
     _ = try gsp_init.encode(&bindings, init_output);
     if (r4nv_gsp_init_abi_check(init_output.ptr, init_output.len) != 0) return error.OriginalInitMismatch;
+    const message_output = try std.heap.page_allocator.alloc(u8, message.max_bytes);
+    defer std.heap.page_allocator.free(message_output);
+    const payload = try std.heap.page_allocator.alloc(u8, message.max_payload_bytes);
+    defer std.heap.page_allocator.free(payload);
+    for (payload, 0..) |*byte, index| byte.* = @truncate(index * 37 + 11);
+    for ([_]usize{ 0, 1, 7, 4016, 4017, message.max_payload_bytes }, 0..) |length, index| {
+        const shape = try message.encode(.{ .chip_id = 0x176 }, std.math.maxInt(u32) - @as(u32, @intCast(index)), .{ .function = 0xdeadbeef, .sequence = 0x12345678 }, payload[0..length], message_output);
+        if (r4nv_gsp_message_abi_check(message_output.ptr, shape.storage_bytes, @intCast(index)) != 0) return error.OriginalMessageMismatch;
+    }
     const sb = try preparation.commandBytes(.sb);
     const frts = try preparation.commandBytes(.{ .frts = 0x123456000 });
     // Production descriptor values and captured GA106 register values; the
