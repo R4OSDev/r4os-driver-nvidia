@@ -10,6 +10,7 @@ const event_objects = @import("gsp_event_objects.zig");
 const rm_graph = @import("gsp_rm_graph.zig");
 const rm_names = @import("gsp_rm_names.zig");
 const receiver = @import("gsp_receiver.zig");
+const topology = @import("gsp_topology.zig");
 const message = transport.message;
 const ring = transport.ring;
 const profile = message.Profile{ .chip_id = 0x176 };
@@ -678,6 +679,7 @@ fn displayReply(model: *Model, channel: *display_rpc.Channel, status: u32, value
                 byte.* = @truncate(i);
             };
         },
+        .connectors, .resource, .buses => unreachable, // Dedicated bounded topology fixture below.
     }
     // The RPC sequence and private result deliberately do not echo the request.
     try model.replyRpc(channel.exchange.session, .{ .function = 76, .result = 0, .result_private = 0x19283746, .sequence = 0xdeadbeef }, encoded);
@@ -698,9 +700,9 @@ fn checkDisplayRpc(model: *Model) !void {
     // Original-header byte offsets, sizes and command IDs are independent
     // of the encoder, and travel through the real framing/queue model below.
     var payload: [2089]u8 = undefined;
-    const queries = [_]display_rpc.Query{ .supported, .{ .connected = 0x80000005 }, .{ .edid = 0x80000000 } };
-    const sizes = [_]usize{ 36, 40, 2088 };
-    const commands = [_]u32{ 0x730107, 0x730108, 0x730245 };
+    const queries = [_]display_rpc.Query{ .supported, .{ .connected = 0x80000005 }, .{ .edid = 0x80000000 }, .{ .connectors = 0x80000000 }, .{ .resource = 0x80000000 }, .{ .buses = 0x80000000 } };
+    const sizes = [_]usize{ 36, 40, 2088, 96, 80, 40 };
+    const commands = [_]u32{ 0x730107, 0x730108, 0x730245, 0x730250, 0x73028b, 0x730211 };
     for (queries, sizes, commands) |query, size, command| {
         @memset(&payload, 0xa5);
         const bytes = try display_rpc.encode(display_object, query, &payload);
@@ -714,6 +716,10 @@ fn checkDisplayRpc(model: *Model) !void {
             try t.expectEqual(@as(u32, 0), get(bytes, 32));
             try t.expectEqual(@as(u32, 2), get(bytes, 36));
             for (bytes[40..]) |byte| try t.expectEqual(@as(u8, 0), byte);
+        }
+        if (query == .connectors or query == .resource or query == .buses) {
+            try t.expectEqual(@as(u32, 0x80000000), get(bytes, 28));
+            for (bytes[32..]) |byte| try t.expectEqual(@as(u8, 0), byte);
         }
         try t.expectError(error.Bounds, display_rpc.encode(display_object, query, payload[0 .. size - 1]));
         _ = try display_rpc.encode(display_object, query, &payload);
@@ -1881,6 +1887,183 @@ fn checkReceiver(model: *Model) !void {
     }
 }
 
+fn topologyReply(model: *Model, probe: *topology.Discovery, status: u32, mask: u32) !void {
+    const query = probe.channel.request.?;
+    // A replying firmware peer has consumed this command. Advance its read
+    // cursor so discovery of all 32 IDs exercises real ring wraparound,
+    // instead of injecting responses to requests blocked by a full ring.
+    try t.expect(probe.channel.exchange.phase == .waiting);
+    model.peerPut(probe.channel.exchange.session.link.?.command_read, get(&model.peer[0], 16));
+    if (query == .supported) return displayReply(model, &probe.channel, status, mask);
+    var bytes: [display_rpc.max_request_bytes]u8 = undefined;
+    const payload = try display_rpc.encode(probe.channel.object, query, &bytes);
+    put(&bytes, 12, status);
+    switch (query) {
+        .connectors => {
+            put(&bytes, 32, 1);
+            put(&bytes, 36, 0x80000005);
+            put(&bytes, 40, 2);
+            put(&bytes, 44, 17); // RM physical ID differs from DCB connector index.
+            put(&bytes, 48, 0x61);
+            put(&bytes, 52, 4);
+            put(&bytes, 56, 19);
+            put(&bytes, 60, 0xffffffff); // Unknown type preserved, not HDMI by default.
+            put(&bytes, 64, 2);
+            put(&bytes, 92, 7);
+        },
+        .resource => |id| {
+            put(&bytes, 32, 0xffffffff); // RM may have no assigned SOR yet.
+            put(&bytes, 36, 2);
+            put(&bytes, 40, 1);
+            put(&bytes, 56, 4);
+            put(&bytes, 60, 27); // DCB slot differs from log2(display ID).
+            std.mem.writeInt(u64, bytes[64..72], 0x123456789abcdef0, .little);
+            bytes[72] = 1;
+            bytes[73] = if (id == 0x80000000) 1 else 0;
+            @memset(bytes[74..80], 0xcc); // Arbitrary C padding.
+        },
+        .buses => {
+            put(&bytes, 32, 0); // NONE, not physical bus zero.
+            put(&bytes, 36, 37); // An RM ID, not an I2C controller index.
+        },
+        else => unreachable,
+    }
+    try model.replyRpc(probe.channel.exchange.session, .{ .function = 76, .result = 0 }, payload);
+}
+fn checkTopology(model: *Model) !void {
+    // Validate semantic fields beyond the shared framing/length checks. All
+    // four connector records survive; flags=NO keeps DDC partners but cannot
+    // establish a physical socket. Unknown scalar values are retained.
+    var raw: [96]u8 = undefined;
+    var encoded = try display_rpc.encode(display_object, .{ .connectors = 1 }, &raw);
+    put(&raw, 36, 0x80000001);
+    put(&raw, 40, 4);
+    put(&raw, 80, 0xfedcba98);
+    const shape = try message.encode(profile, 0, .{ .function = 76, .result = 0 }, encoded, &model.frame);
+    var record = try message.decode(profile, model.frame[0..shape.storage_bytes], 0);
+    record.payload = encoded;
+    const connectors = (try display_rpc.decode(display_object, .{ .connectors = 1 }, record)).connectors;
+    try t.expect(!connectors.present() and connectors.count == 4 and connectors.ddc_partners == 0x80000001 and connectors.data[3].index == 0xfedcba98);
+    put(&raw, 40, 5);
+    try t.expectError(error.Payload, display_rpc.decode(display_object, .{ .connectors = 1 }, record));
+    put(&raw, 12, 0x1234);
+    try t.expectEqual(@as(u32, 0x1234), (try display_rpc.decode(display_object, .{ .connectors = 1 }, record)).control_error);
+    encoded = try display_rpc.encode(display_object, .{ .resource = 1 }, &raw);
+    record.payload = encoded;
+    raw[73] = 2;
+    try t.expectError(error.Payload, display_rpc.decode(display_object, .{ .resource = 1 }, record));
+    raw[73] = 0;
+    raw[72] = 2;
+    try t.expectError(error.Payload, display_rpc.decode(display_object, .{ .resource = 1 }, record));
+    for ([_]display_rpc.Query{ .{ .connectors = 0 }, .{ .resource = 3 }, .{ .buses = 0xffffffff } }) |query| try t.expectError(error.Query, display_rpc.encode(display_object, query, &raw));
+
+    const catalog = try t.allocator.create(topology.Catalog);
+    defer t.allocator.destroy(catalog);
+    const Case = enum { valid, empty, full, changed, partial, verify_error, hpd, canceled, ack, expiry, release_expired };
+    for (std.enums.values(Case)) |case| {
+        var session: transport.Session = undefined;
+        var boot = try startBoot(model, &session);
+        try model.replyRpc(&session, .{ .function = 0x1001, .result = 0 }, &.{ 0, 0, 0, 0 });
+        try boot.complete((try boot.poll()).?.ticket);
+        var token = try boot.handoff(deadline);
+        var owner = try rm_graph.Owner.init(&token, 1, "topology", deadline);
+        try graphCreate(model, &owner);
+        model.count = 0;
+        var probe = try topology.Discovery.init(&owner, catalog, deadline);
+        try t.expectError(error.Query, probe.channel.begin(.{ .connectors = 1 }, deadline));
+        try probe.release(deadline);
+        try t.expect(owner.state == .ready and model.count == 0);
+        probe = try topology.Discovery.init(&owner, catalog, deadline);
+        const mask: u32 = switch (case) {
+            .empty => 0,
+            .full => 0xffffffff,
+            else => 0x80000005,
+        };
+        var steps: usize = 0;
+        while (probe.state != .complete and probe.state != .obsolete and probe.state != .failed) : (steps += 1) {
+            try t.expect(steps < 110);
+            model.count = 0;
+            try t.expectError(error.State, probe.borrow(deadline));
+            if (case == .canceled and probe.state == .resource) {
+                try probe.invalidate();
+                try t.expect((try probe.poll()) == null and probe.state == .obsolete and model.count == 0);
+                break;
+            }
+            try t.expect((try probe.poll()) == null);
+            if (probe.state == .complete) break; // Final idle drain.
+            var copy = probe;
+            try t.expectError(error.Stale, copy.poll());
+            try t.expect(session.state == .active);
+            try t.expectError(error.State, probe.release(deadline));
+            if (case == .hpd and probe.state == .resource) {
+                var post: [40]u8 = undefined;
+                const bytes = registeredPost(&post, .hotplug, true);
+                put(&post, 0, owner.reservation.client);
+                put(&post, 4, try owner.reservation.object(3));
+                try model.replyRpc(&session, .{ .function = 0x1003, .result = 0 }, bytes);
+                _ = (try probe.poll()).?;
+                try t.expectError(error.Pending, probe.poll());
+                var dispatch = try runtime_events.Dispatch.initDisplay(&probe.channel, try owner.eventSink());
+                try dispatch.step();
+                try t.expect(probe.channel.exchange.phase == .waiting);
+            }
+            const status: u32 = if ((case == .partial and probe.state == .connectors) or (case == .verify_error and probe.state == .verify)) 0x55 else 0;
+            try topologyReply(model, &probe, status, if (case == .changed and probe.state == .verify) 1 else mask);
+            if (case == .ack and probe.state == .resource) {
+                model.fault = model.count + 4;
+                model.after = true;
+            }
+            if (case == .expiry and probe.state == .resource) model.now = deadline;
+            if ((case == .ack or case == .expiry) and probe.state == .resource) {
+                try t.expectError(if (case == .ack) error.Io else error.Deadline, probe.poll());
+                try t.expect(probe.state == .failed and session.state == .failed and owner.state == .loaned);
+                const calls = model.count;
+                try t.expectError(error.State, probe.poll());
+                try t.expectError(error.State, probe.release(deadline + 100));
+                try t.expectEqual(calls, model.count);
+                break;
+            }
+            try t.expect((try probe.poll()) == null);
+        }
+        if (probe.state == .failed) continue;
+        if (case == .hpd or case == .changed or case == .canceled) {
+            try t.expect(probe.state == .obsolete and session.pending == null);
+            try t.expectError(error.State, probe.borrow(deadline));
+        } else {
+            const value = try probe.borrow(deadline);
+            try t.expect(value.epoch == session.epoch and value.client == owner.reservation.client and value.receipt_serial != 0);
+            try t.expectEqual(@as(usize, if (case == .verify_error) 0 else @popCount(mask)), value.count);
+            if (case == .verify_error) try t.expect(value.rejected.?.control.? == 0x55 and value.supported == null);
+            if (case == .valid or case == .partial) {
+                const first = &value.routes[0];
+                const dynamic = &value.routes[2];
+                try t.expect(first.id == 1 and dynamic.id == 0x80000000 and first.resource.?.index == 0xffffffff and first.buses.?.communication == 0 and first.buses.?.ddc == 37);
+                if (case == .partial) try t.expect(first.connectors == null and first.rejections[0].?.control.? == 0x55) else try t.expect(first.connectors.?.present() and first.connectors.?.count == 2 and first.connectors.?.data[0].index == dynamic.connectors.?.data[0].index);
+                var rom: @import("vbios.zig").Result = .{};
+                rom.port_count = 1;
+                rom.ports[0] = .{ .index = 27, .kind = 2, .connector = 3, .heads = 5, .or_mask = 6, .i2c = 1, .aux = 2 };
+                try t.expectEqual(@as(u8, 3), topology.relate(first, &rom).static.connector);
+                try t.expectEqual(@as(u32, 4), topology.relate(dynamic, &rom).dynamic);
+                rom.port_count = 0;
+                try t.expect(topology.relate(first, &rom) == .missing);
+                rom.port_count = 2;
+                rom.ports[1] = rom.ports[0];
+                try t.expect(topology.relate(first, &rom) == .ambiguous);
+            }
+            if (case == .release_expired) {
+                model.now = deadline;
+                try t.expectError(error.Deadline, probe.release(deadline));
+                try t.expect(probe.failure.? == error.Deadline and probe.state == .failed and session.state == .failed and owner.state == .loaned);
+                continue;
+            }
+        }
+        model.now = deadline + 1;
+        if (probe.state == .complete) _ = try probe.borrow(deadline + 100);
+        try probe.release(deadline + 100);
+        try t.expect(owner.state == .ready and session.state == .active);
+    }
+}
+
 test "GSP transport orders range publication, explicit acknowledgement and terminal ambiguous failures" {
     const model = try t.allocator.create(Model);
     defer t.allocator.destroy(model);
@@ -1890,6 +2073,7 @@ test "GSP transport orders range publication, explicit acknowledgement and termi
     try checkEventObjects(model);
     try checkRmGraph(model);
     try checkReceiver(model);
+    try checkTopology(model);
     for (0..4) |flags| {
         var session = try model.start(@intCast(flags));
         // Device-only neighbour changes must survive CPU command publication.

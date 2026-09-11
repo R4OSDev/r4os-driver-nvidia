@@ -10,6 +10,30 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
+RM connector/resource topology (source preparation, 2026-09-11):
+
+A bounded graph-owned discovery reads up to 32 RM display IDs and all four
+possible connector records per ID, OR resource details and I2C port IDs.
+RM displays, physical connector indices, DCB slots, current OR assignments
+and communication IDs remain distinct. Dynamic displays retain their root
+port; shared connectors stay shared. PRESENT=NO, unknown values, empty or
+rejected fields never establish a physical socket or connected monitor.
+
+The explicit RM dcb_index relates to the original passive VBIOS slot, never
+log2(display ID). Returned VBIOS heads/SOR/CCB data remain candidates, not
+active assignments. RM and VBIOS connector indices are not assumed equal.
+A final Supported/DDC comparison and idle notification drain guard the
+catalog; HPD invalidates it and pending responses still complete their ACK.
+Errors retain exact status, and ambiguous failures retain graph ownership.
+
+51 existing cases pass after correcting command consumption in the full
+32-ID synthetic responder; one targeted original C ABI comparison and one
+module build pass. NVIDIA 0.1.44 stays byte-identical. Six complete original
+references/logs: ExFiles/Reference/GFX/Nvidia/0.79.12/topology-20260911;
+topology_checkpoint in Docs/Drivers/GrafikFirmware07910.json. No new gate.
+Native integration, hardware corroboration, head assignment, receiver/
+catalog publication and physical HDMI/audio remain open. OssiPC untouched.
+
 Coherent receiver refresh with shared R4GFX parser (source preparation, 2026-09-11):
 
 The canonical RM graph now lends a bounded receiver reader its sole runtime

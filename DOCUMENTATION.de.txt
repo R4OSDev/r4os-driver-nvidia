@@ -10,6 +10,31 @@ unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
 
+RM-Anschluss- und Ressourcenzuordnung (11.09.2026)
+------------------------------------------------
+Der begrenzte Leser am kanonischen RM-Graph erfasst bis zu 32 Anzeige-IDs,
+jeweils alle bis zu vier Anschlussdatensaetze, OR-Ressourcen und I2C-Port-IDs.
+RM-Anzeigen, physische Anschlussindizes, DCB-Slots, aktuelle OR-Zuordnung
+und Kommunikations-IDs bleiben getrennt. Dynamische Anzeigen behalten
+ihren Root-Port; gemeinsame Anschluesse bleiben gemeinsame Anschluesse.
+PRESENT=NO, unbekannte Werte und leere/abgelehnte Angaben erzeugen weder
+eine physische Buchse noch die Annahme eines angeschlossenen Monitors.
+
+Der gemeldete dcb_index verweist auf den originalen passiven VBIOS-Slot,
+nicht auf log2(Anzeige-ID). VBIOS-Heads/SOR/CCB bleiben Kandidaten und sind
+keine aktive Zuweisung. RM- und VBIOS-Anschlussindizes werden nicht einfach
+gleichgesetzt. Erneute Supported-/DDC-Pruefung und leere Meldungsabfrage
+sichern den Katalog ab. HPD verwirft ihn; offene Antworten brauchen weiter
+ihr ACK. Fehler erhalten den Status, unklare Fehler halten den Graph fest.
+
+51 bestehende Faelle bestanden nach Korrektur des Befehlsverbrauchs beim
+simulierten 32-ID-Empfaenger. Ein Abgleich der originalen C-Strukturen und
+ein Modulbuild bestanden; NVIDIA 0.1.44 bytegleich, kein neues Gate.
+Sechs Originale/Logs: ExFiles/Reference/GFX/Nvidia/0.79.12/topology-20260911;
+topology_checkpoint in GrafikFirmware07910.json. Native Einbindung, echte
+Zuordnungspruefung, Heads, Empfaenger-/Katalogpublikation sowie physisches
+HDMI/Audio bleiben offen. OssiPC offline und unberuehrt.
+
 Zusammengehoerige Empfaengerdaten mit R4GFX-Parser (11.09.2026)
 --------------------------------------------------------------
 Der kanonische RM-Graph leiht einem begrenzten Empfaengerleser den einzigen

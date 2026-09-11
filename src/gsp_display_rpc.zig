@@ -106,13 +106,43 @@ pub const function: u32 = 76;
 pub const header_bytes = 24;
 pub const max_edid_bytes = 2048;
 pub const max_request_bytes = header_bytes + 16 + max_edid_bytes;
-pub const Command = enum(u32) { supported = 0x730107, connected = 0x730108, edid = 0x730245 };
-pub const Query = union(Command) { supported: void, connected: u32, edid: u32 };
+pub const Command = enum(u32) { supported = 0x730107, connected = 0x730108, edid = 0x730245, connectors = 0x730250, resource = 0x73028b, buses = 0x730211 };
+pub const Query = union(Command) { supported: void, connected: u32, edid: u32, connectors: u32, resource: u32, buses: u32 };
 pub const Object = struct { epoch: u64, client: u32, display: u32 };
 pub const Supported = struct { displays: u32, ddc: u32 };
+pub const Connector = struct { index: u32 = 0, kind: u32 = 0, location: u32 = 0 };
+pub const Connectors = struct {
+    flags: u32,
+    ddc_partners: u32,
+    count: u32,
+    data: [4]Connector = @splat(.{}),
+    platform: u32,
+    pub fn present(self: Connectors) bool {
+        return self.flags & 1 != 0;
+    }
+};
+pub const Resource = struct {
+    // The current RM resource index can be unassigned (ffffffff); it is
+    // neither a VBIOS candidate mask nor proof of a live head assignment.
+    index: u32,
+    kind: u32,
+    protocol: u32,
+    dither_type: u32,
+    dither_algo: u32,
+    location: u32,
+    root_port_id: u32,
+    dcb_index: u32,
+    vbios_address: u64,
+    lit_by_vbios: bool,
+    dynamic: bool,
+};
+pub const Buses = struct { communication: u32, ddc: u32 }; // RM port IDs; zero means NONE, not CCB index 0.
 pub const Reply = union(enum) {
     supported: Supported,
     connected: u32,
+    connectors: Connectors,
+    resource: Resource,
+    buses: Buses,
     // Raw, bounded bytes only. An empty blob is not an EDID; the receiver
     // parser must validate the header, all advertised blocks and checksums.
     edid: []const u8,
@@ -139,6 +169,9 @@ fn paramsSize(query: Query) usize {
         .supported => 12,
         .connected => 16,
         .edid => 16 + max_edid_bytes,
+        .connectors => 72,
+        .resource => 56,
+        .buses => 16,
     };
 }
 fn oneBit(mask: u32) bool {
@@ -153,7 +186,7 @@ pub fn encode(object: Object, query: Query, output: []u8) Error![]const u8 {
     switch (query) {
         .supported => {},
         .connected => |mask| if (mask == 0) return error.Query,
-        .edid => |id| if (!oneBit(id)) return error.Query,
+        .edid, .connectors, .resource, .buses => |id| if (!oneBit(id)) return error.Query,
     }
     const size = paramsSize(query);
     if (output.len < header_bytes + size) return error.Bounds;
@@ -169,6 +202,7 @@ pub fn encode(object: Object, query: Query, output: []u8) Error![]const u8 {
     switch (query) {
         .supported => {},
         .connected => |mask| put(bytes, header_bytes + 8, mask),
+        .connectors, .resource, .buses => |id| put(bytes, header_bytes + 4, id),
         .edid => |id| {
             put(bytes, header_bytes + 4, id);
             put(bytes, header_bytes + 12, 2);
@@ -212,6 +246,24 @@ pub fn decode(object: Object, query: Query, record: message.Record) Error!Reply 
             if (count > max_edid_bytes) return error.Payload;
             break :blk .{ .edid = params[16..][0..count] };
         },
+        .connectors => |id| blk: {
+            if (word(params, 4) != id) return error.Unexpected;
+            const count = word(params, 16);
+            if (count > 4) return error.Payload;
+            var value = Connectors{ .flags = word(params, 8), .ddc_partners = word(params, 12), .count = count, .platform = word(params, 68) };
+            for (value.data[0..count], 0..) |*item, i| item.* = .{ .index = word(params, 20 + i * 12), .kind = word(params, 24 + i * 12), .location = word(params, 28 + i * 12) };
+            break :blk .{ .connectors = value };
+        },
+        .resource => |id| blk: {
+            if (word(params, 4) != id) return error.Unexpected;
+            if (params[48] > 1 or params[49] > 1) return error.Payload;
+            // Six trailing C padding bytes carry no fields or constraints.
+            break :blk .{ .resource = .{ .index = word(params, 8), .kind = word(params, 12), .protocol = word(params, 16), .dither_type = word(params, 20), .dither_algo = word(params, 24), .location = word(params, 28), .root_port_id = word(params, 32), .dcb_index = word(params, 36), .vbios_address = std.mem.readInt(u64, params[40..48], .little), .lit_by_vbios = params[48] != 0, .dynamic = params[49] != 0 } };
+        },
+        .buses => |id| blk: {
+            if (word(params, 4) != id) return error.Unexpected;
+            break :blk .{ .buses = .{ .communication = word(params, 8), .ddc = word(params, 12) } };
+        },
     };
 }
 
@@ -251,6 +303,10 @@ pub const Channel = struct {
                 if (mask == 0 or mask & ~available.displays != 0) return error.Query;
             },
             .edid => |id| if (!oneBit(id) or id & self.connected == 0) return error.Query,
+            .connectors, .resource, .buses => |id| {
+                const available = self.supported orelse return error.Query;
+                if (!oneBit(id) or id & available.displays == 0) return error.Query;
+            },
         }
         const bytes = try encode(self.object, query, &self.request_bytes);
         try self.exchange.begin(function, bytes, deadline);
@@ -278,7 +334,7 @@ pub const Channel = struct {
         var dispatch = Dispatch{ .ticket = received.ticket, .rpc = received.record.rpc, .value = undefined };
         if (received.response) {
             var reply = decode(self.object, self.request.?, received.record) catch |err| return self.fail(err);
-            if ((reply == .connected or reply == .edid) and self.request_revision != self.exchange.revision) reply = .obsolete;
+            if (reply != .supported and self.request_revision != self.exchange.revision) reply = .obsolete;
             dispatch.value = .{ .reply = reply };
         } else {
             dispatch.value = .{ .notification = received.record.payload };
@@ -293,7 +349,7 @@ pub const Channel = struct {
         };
         var dispatch = self.pending orelse return error.Stale;
         if (dispatch.value == .reply and
-            (dispatch.value.reply == .connected or dispatch.value.reply == .edid) and self.request_revision != self.exchange.revision)
+            dispatch.value.reply != .supported and self.request_revision != self.exchange.revision)
         {
             dispatch.value = .{ .reply = .obsolete };
             self.pending = dispatch;

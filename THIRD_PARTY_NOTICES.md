@@ -1,5 +1,14 @@
 ﻿# Third-Party Notices
 
+RM topology discovery (0.79.12, 2026-09-11):
+Six complete pinned NVIDIA/NVKMS/Nouveau originals under topology-20260911.
+Three full original MIT notices accompany the new owner; display controls
+retain their existing ctrl0073specific notice. Exact C declarations and
+comparison retain the source notice and full original headers. Original
+R4OS relations/lifetime/synthetic fixtures: Apache-2.0. No new resource;
+NVIDIA 0.1.44 remains byte-identical.
+
+
 Receiver refresh/shared parser (0.79.12, 2026-09-11):
 Nine complete reference/shared-library files under receiver-20260911.
 NVIDIA/Nouveau query prerequisites and sequence retain three full MIT notices.
