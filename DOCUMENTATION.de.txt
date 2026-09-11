@@ -9,6 +9,32 @@ Boardanschluesse. Die spaeteren PROM-Boots bestaetigen softwareseitig den
 unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
+GSP-Transportbesitzer und geordnete Publikation (Host)
+---------------------------------------------------
+gsp_transport.zig verwaltet einen GA106-Klartextlauf ueber einen expliziten
+synchronen Bereichs-I/O-Port. Ein Ausfuehrungsbesitzer leiht zwei64-KB-Puffer.
+Connect prueft einmalig den Header; spaetere Versuche verlaengern dessen erste
+absolute Frist nicht. Generation und monotone Frist werden vor/nach jedem I/O
+geprueft. Datenbereiche sind vor dem4-Byte-Schreibcursor fertig synchronisiert.
+Ein vollstaendig gepruefter Empfang bleibt bis zum expliziten generation- und
+seriengebundenen Ack geliehen. Unbekannte RPCs werden weder quittiert noch
+verworfen. Unmoeglicher Peerfortschritt wird abgewiesen.
+
+Ein moeglicherweise bereits ausgefuehrter Zugriff mit Fehler verriegelt den
+Lauf; keine blinde Wiederholung. Ein fehlgeschlagenes Ack behaelt den offenen
+Empfang. Kein Freigabe-/Resetaufruf und keine behauptete GPU-Ruhe. Protokoll-
+sequenzen laufen als u32 ueber, Empfangstickets als u64 niemals. Ein neuer
+zusammengefasster Fall im vorhandenen Besitzerstep prueft vier Swaprouten,
+maximale Nachrichten am Ringende, volle Queues,14 Vorher-/Nachher-I/O-Fehler,
+spaeten Frist-/Generationsverlust, alte Acks und Headerbereitschaft:43/43
+Faelle bestanden. Kein neues Gate, Gastlauf, Modul- oder kompletter RM-Bau.
+
+Der Port ist derzeit ein Hostmodell. Reale DriverApi34-/Storage-Anbindung,
+DMA-Lebensdauer/Resetgeneration, RPC/IRQ und GPU-Start bleiben offen.
+NVIDIA0.1.24 bleibt unveraendert. Die vollstaendige MIT-Notice aus dem gepinnten
+message_queue_cpu.c steht im Quellcode und Referenzarchiv gsp-transport-20260911;
+vor spaeterer Einbindung muss das Lizenzbuendel alle neuen Notices enthalten.
+
 GSP-Ringe und begrenzte Datensatzkopien (Host)
 --------------------------------------------
 gsp_ring.zig prueft die Geometrie beider 256-KB-Queues und deren getrennte

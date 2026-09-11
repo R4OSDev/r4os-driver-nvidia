@@ -6,6 +6,7 @@ comptime {
     _ = @import("wait_policy.zig");
     _ = @import("fwsec_test.zig");
     _ = @import("gsp_test.zig");
+    _ = @import("gsp_transport_test.zig");
 }
 
 test "PROM IFR versions and private ROM subimages stay within the supplied aperture" {

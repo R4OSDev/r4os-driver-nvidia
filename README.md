@@ -10,6 +10,29 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
+The host-qualified `gsp_transport.zig` owns one cleartext GA106 queue session
+over an explicit synchronous range-I/O port. One execution owner borrows two
+64-KB scratch buffers. Connection makes one readiness attempt with a deadline
+that later attempts cannot extend; each operation checks the real port epoch
+and monotonic limit before and after I/O. Payload ranges finish publication
+before the four-byte producer cursor. Full validation yields a receipt whose
+explicit acknowledgement alone advances the consumer cursor and RX sequence.
+Unknown RPC functions/results remain opaque; nothing is automatically dropped.
+
+Impossible peer progress is refused. Errors after a possibly completed copy,
+cursor store or acknowledgement latch failure and prohibit retries. Pending
+receipts remain retained; no reset/free operation can invent device quiescence.
+Protocol u32 sequences wrap; generation-bound u64 receipt identities never do.
+The existing owner step passes 43 cases, including one grouped transport case
+with all swap routes, maximum frames across ring end, full queues, fourteen
+before/after callback failures, late deadline/generation loss and stale acks.
+
+This port is currently a host model, not a DriverApi34/storage binding. Real
+DMA backing/epoch retention, RPC/IRQ dispatch and native bringup remain open.
+NVIDIA0.1.24 and its packaged licenses are unchanged. The source keeps the full
+MIT notice from the pinned message_queue_cpu.c; hardware linkage must carry
+all message/ring/transport notices into the distributed bundle.
+
 The host-qualified `gsp_ring.zig` layer admits command/status geometry and
 computes swap routing using each side's own RX-header offset. A zero peer
 header means not ready; unknown flags, invalid offsets/counts and out-of-range

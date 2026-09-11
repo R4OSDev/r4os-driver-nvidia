@@ -14,6 +14,15 @@ their original licenses in the separate workspace reference archive.
 Fixture firmware bodies and signatures are synthetic; selected measured table
 metadata is regression data documented in PROVENANCE.txt.
 
+The host-qualified `src/gsp_transport.zig` adapts ordered payload/cursor
+publication and protocol sequence advancement from the pinned NVIDIA570.144
+message_queue_cpu.c (2019-2024 NVIDIA CORPORATION & AFFILIATES). Its complete
+MIT notice is retained in the source; original R4OS port, deadline, receipt
+and failure interfaces are Apache-2.0. Four complete original source/notice
+files accompany gsp-transport-20260911, linked to the prior full reference set.
+The model does not execute original RM or a real GPU. It is not linked into
+NVIDIA.R4D0.1.24; the distributed bundle must include all new notices on linkage.
+
 The host-qualified `src/gsp_ring.zig` adapts geometry, swap routing and
 cursor arithmetic from the pinned msgq.c/msgq_priv.h (2018-2019 NVIDIA
 CORPORATION & AFFILIATES) under the complete retained MIT notice. Original
