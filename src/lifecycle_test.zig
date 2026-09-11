@@ -884,8 +884,8 @@ test "NVIDIA actual driver lifecycle rejects writes and retains failed mappings 
 // selection and partial device effects independently. This is no GPU proof.
 const BootVramFixture = struct {
     var registers: []u8 = &.{};
-    var buffers: [3]?[]u8 = @splat(null);
-    var leases: [3]bool = @splat(false);
+    var buffers: [4]?[]u8 = @splat(null);
+    var leases: [4]bool = @splat(false);
     var mapped: [0x1000]bool = @splat(false);
     var map_pages: [0x1000]usize = @splat(0);
     var maps: usize = 0;
@@ -920,6 +920,8 @@ const BootVramFixture = struct {
     var scanout_guard_calls: u32 = 0;
     var delay_selected = false;
     var vram_pages: [6][4096]u8 = undefined;
+    var display_instance: [65536]u8 = undefined;
+    const display_address: u64 = 0x1000000;
     const addresses = [_]u64{ 0x100000, 0x201000, 0x302000, 0x403000, 0x504000, 0x605000 };
     fn now() callconv(.c) u64 {
         if (scanout_mutate_at != 0) {
@@ -944,6 +946,8 @@ const BootVramFixture = struct {
                         if (address >= base and address + 4096 <= base + 0x100000)
                             @memcpy(registers[0x700000 + address - base ..][0..4096], page);
                     }
+                    if (display_address >= base and display_address + display_instance.len <= base + 0x100000)
+                        @memcpy(registers[0x700000 + display_address - base ..][0..display_instance.len], &display_instance);
                     if (delay_selected) { clock += 6 * std.time.ns_per_s; delay_selected = false; }
                 }
             }
@@ -953,6 +957,8 @@ const BootVramFixture = struct {
     fn setupScanout() void {
         const scanout = @import("boot_scanout.zig");
         put(scanout.capability_register, 0x303);
+        put(0x610010, 9);
+        put(0x610014, @intCast(display_address >> 16));
         put(scanout.window_capability_register, 0x81);
         put(scanout.count_register, 0x800202);
         put(scanout.armed_base + 0x300, 0x101);
@@ -971,7 +977,8 @@ const BootVramFixture = struct {
             put(scanout.armed_base + 0x1000 + window * 0x80, @intCast(head));
             const base = scanout.window_armed_base + window * 0x1000;
             put(base + 0x224, (600 << 16) | 800);
-            put(base + 0x228, 0);
+            put(base + 0x228, if (window == 7) 2 else 0);
+            put(0x610b2c + (1 + window) * 16, if (window == 0) 0x2a3 else 0x155);
             put(base + 0x22c, 0xcf);
             put(base + 0x230, 64); // Units stay unresolved without context layout.
             put(base + 0x298, (600 << 16) | 800);
@@ -982,7 +989,24 @@ const BootVramFixture = struct {
             }
         }
     }
+    fn setupInstance() void {
+        @memset(&display_instance, 0);
+        const d = @import("display_context.zig");
+        for ([_]usize{ 0, 7 }, 0..) |window, index| {
+            const client: u14 = if (index == 0) 0x2a3 else 0x155;
+            const handle: u32 = @intCast(0x100 + window * 0x10);
+            const channel: u7 = @intCast(1 + window);
+            const slot: usize = d.hash(client, handle, channel);
+            const object: u32 = @intCast(0x2000 + index * 32);
+            std.mem.writeInt(u32, display_instance[slot * 8 ..][0..4], handle, .little);
+            std.mem.writeInt(u32, display_instance[slot * 8 + 4 ..][0..4], @as(u32, channel) << 25 | (object >> 5) << 14 | client, .little);
+            const address: u64 = if (index == 0) 0x2000000 else 0x4000000;
+            const values = [_]u32{ if (index == 0) 0x45 else 0x100045, @intCast(address >> 8), 0, @intCast((address + 0x800000 - 1) >> 8), 0 };
+            for (values, 0..) |value, word_index| std.mem.writeInt(u32, display_instance[object + word_index * 4 ..][0..4], value, .little);
+        }
+    }
     fn setupTables() void {
+        setupInstance();
         for (&vram_pages) |*page| @memset(page, 0);
         std.mem.writeInt(u64, vram_pages[0][0x200..][0..8], addresses[1] | 0x400, .little);
         std.mem.writeInt(u64, vram_pages[0][0x208..][0..8], 0xfffffff, .little);
@@ -1388,6 +1412,37 @@ fn checkBootVramOwner() !void {
     try t.expect(capture.registers.borrowedCount() == 1 and f.maps == 1);
     var moved_mapping = mapped_boot;
     try t.expect(!moved_mapping.valid(&capture) and !moved_mapping.close());
+    const display_decoder = @import("display_context.zig");
+    var display_context: @import("boot_context.zig").Capture = .{};
+    defer _ = display_context.close();
+    const context_report = try display_context.capture(&capture);
+    try t.expect(context_report.address == f.display_address and context_report.bytes == 65536 and context_report.surfaces == 2);
+    try t.expect(display_context.valid(&capture) and f.buffers[3] != null and f.leases[3] and !capture.close());
+    var display_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&f.display_instance, &display_digest, .{});
+    try t.expectEqualSlices(u8, &display_digest, &context_report.sha256);
+    try t.expect(display_context.surfaces[0].image.span.address == 0x2020000 and display_context.surfaces[0].image.span.bytes == 4096 * 600);
+    try t.expect(display_context.surfaces[1].image.span.address == 0x4027000 and display_context.surfaces[1].image.span.bytes == 4096 * 608);
+    try t.expect(display_context.surfaces[1].image.layout == .block_linear and display_context.surfaces[1].context.offset == 0x2020);
+    // Other clients/channels with the same handle are not aliases.
+    try t.expectError(error.Missing, display_decoder.lookup(&f.display_instance, 0x155, 0x100, 1));
+    try t.expectError(error.Missing, display_decoder.lookup(&f.display_instance, 0x2a3, 0x100, 8));
+    const original_entry: usize = display_context.surfaces[0].context.entry;
+    const duplicate_entry = (original_entry + 1) % display_decoder.entries;
+    @memcpy(f.display_instance[duplicate_entry * 8 ..][0..8], f.display_instance[original_entry * 8 ..][0..8]);
+    try t.expectError(error.Duplicate, display_decoder.lookup(&f.display_instance, 0x2a3, 0x100, 1));
+    @memset(f.display_instance[duplicate_entry * 8 ..][0..8], 0);
+    try t.expectError(error.Target, display_decoder.instance(10, 0x100, 0x100000000));
+    try t.expectError(error.Control, display_decoder.instance(1, 0x100, 0x100000000));
+    try t.expectError(error.Bounds, display_decoder.instance(9, 0x100, f.display_address + 4096));
+    const iso_context = display_context.surfaces[0].context.descriptor;
+    try t.expectError(error.Bounds, display_decoder.surface(iso_context, 0x800000, 800, 600, 64, 0, try display_decoder.format(0xcf), 0, 0x100000000));
+    try t.expectError(error.Pitch, display_decoder.surface(iso_context, 0, 800, 600, 1, 0, try display_decoder.format(0xcf), 0, 0x100000000));
+    const chroma = try display_decoder.surface(iso_context, 0, 641, 481, 21, 0, try display_decoder.format(0x58), 1, 0x100000000);
+    try t.expect(chroma.row_bytes == 1344 and chroma.rows == 240 and chroma.span.bytes == 322560);
+    try t.expect((try display_decoder.format(0x3b)).count == 3 and (try display_decoder.eyes(0x1000)) == 2);
+    try t.expectError(error.Format, display_decoder.format(0));
+    try t.expectError(error.Stereo, display_decoder.eyes(0x3000));
     // The existing host fixture supplies prepared boot metadata; actual DMA
     // packing/synchronization remains covered by gsp_boot_storage_test.zig.
     // Here the production reservation borrows the actual BO/display capture.
@@ -1411,22 +1466,35 @@ fn checkBootVramOwner() !void {
             .boot_address = 0x300000000, .signature_address = 0x300006000, .metadata_address = 0x300007000, .pack_bounced = false } };
     var held: reservation.Lease = .{};
     pack[boot_storage.metadata_offset + 19 * 8] ^= 1;
-    try t.expectError(error.MetadataChanged, held.acquire(&capture, &backing, &mapped_boot));
+    try t.expectError(error.MetadataChanged, held.acquire(&capture, &backing, &mapped_boot, &display_context));
     try t.expect(capture.borrower == 0 and backing.vram_owner == 0 and f.mapped[0x625]);
     pack[boot_storage.metadata_offset + 19 * 8] ^= 1;
     f.put(0x1183a4, (try raw.get(.fb_mb)) - 1024);
-    try t.expectError(error.PlanChanged, held.acquire(&capture, &backing, &mapped_boot));
+    try t.expectError(error.PlanChanged, held.acquire(&capture, &backing, &mapped_boot, &display_context));
     try t.expect(capture.borrower == 0 and backing.vram_owner == 0);
     f.put(0x1183a4, try raw.get(.fb_mb));
     const original_range = mapped_boot.ranges[0];
     mapped_boot.ranges[0].address = prepared.plan.frts.offset;
-    try t.expectError(error.BootSurfaceCollision, held.acquire(&capture, &backing, &mapped_boot));
+    try t.expectError(error.BootSurfaceCollision, held.acquire(&capture, &backing, &mapped_boot, &display_context));
     mapped_boot.ranges[0] = original_range;
     const original_page = mapped_boot.pages[0];
     mapped_boot.pages[0] = prepared.plan.metadata_reservation.offset;
-    try t.expectError(error.BootTableCollision, held.acquire(&capture, &backing, &mapped_boot));
+    try t.expectError(error.BootTableCollision, held.acquire(&capture, &backing, &mapped_boot, &display_context));
     mapped_boot.pages[0] = original_page;
-    try held.acquire(&capture, &backing, &mapped_boot);
+    const original_instance_span = display_context.span;
+    display_context.span.address = prepared.plan.frts.offset;
+    try t.expectError(error.DisplayContextCollision, held.acquire(&capture, &backing, &mapped_boot, &display_context));
+    display_context.span = original_instance_span;
+    const original_display_span = display_context.surfaces[0].image.span;
+    display_context.surfaces[0].image.span.address = prepared.plan.metadata_reservation.offset;
+    try t.expectError(error.DisplaySurfaceCollision, held.acquire(&capture, &backing, &mapped_boot, &display_context));
+    display_context.surfaces[0].image.span = original_display_span;
+    f.display_instance[65535] ^= 1; // Even an unused instance byte must match before reservation.
+    try t.expectError(error.Unstable, held.acquire(&capture, &backing, &mapped_boot, &display_context));
+    try t.expect(display_context.valid(&capture) and capture.borrower == 0 and capture.registers.borrowedCount() == 1);
+    f.display_instance[65535] ^= 1;
+    try held.acquire(&capture, &backing, &mapped_boot, &display_context);
+    try t.expect(!display_context.close());
     try t.expect(!mapped_boot.close());
     const frts = try held.binding(.frts);
     try checkFrtsStorage(&ctx, &held);
@@ -1435,7 +1503,7 @@ fn checkBootVramOwner() !void {
     try t.expect(f.held and f.buffers[0] != null and f.buffers[1] != null and f.leases[0] and f.leases[1]);
     try t.expectError(error.State, capture.reobserve());
     var duplicate: reservation.Lease = .{};
-    try t.expectError(error.Owner, duplicate.acquire(&capture, &backing, &mapped_boot));
+    try t.expectError(error.Owner, duplicate.acquire(&capture, &backing, &mapped_boot, &display_context));
     var moved = held;
     try t.expect(!moved.validates(frts) and !moved.releaseBeforeSubmission());
     var wrong = frts;
@@ -1451,13 +1519,14 @@ fn checkBootVramOwner() !void {
     try t.expect(!held.validates(frts) and !held.releaseBeforeSubmission());
     capture.boot.held_generation -= 1;
     try t.expect(held.releaseBeforeSubmission() and held.releaseBeforeSubmission());
-    try held.acquire(&capture, &backing, &mapped_boot);
+    try held.acquire(&capture, &backing, &mapped_boot, &display_context);
     try t.expect(!held.validates(frts)); // Same display hold, new reservation serial.
     try t.expect(held.validates(try held.binding(.frts)));
     try t.expect(held.releaseBeforeSubmission());
     held.serial = std.math.maxInt(u64);
-    try t.expectError(error.Exhausted, held.acquire(&capture, &backing, &mapped_boot));
+    try t.expectError(error.Exhausted, held.acquire(&capture, &backing, &mapped_boot, &display_context));
     try t.expect(capture.borrower == 0 and backing.vram_owner == 0 and f.mapped[0x625]);
+    try t.expect(display_context.close() and display_context.close() and f.buffers[3] == null and !f.leases[3]);
     try t.expect(mapped_boot.close() and f.buffers[2] == null and !f.leases[2]);
     // Direct BAR1 mode needs no table BO and still covers the complete span.
     f.put(reader.block_register, 0x4321);
@@ -1501,20 +1570,20 @@ fn checkBootVramOwner() !void {
     const unassigned_raw = try unassigned.readShared(&ctx, &snapshot, chip, &capture.registers,
         .{ .context = &capture, .epoch = capture.boot.held_generation, .generation = f.nativeGeneration });
     try t.expect(try scanout.windowHead(&unassigned_raw.windows[0]) == null);
-    try t.expect(unassigned.reads == 188 and unassigned.reads <= scanout.max_read_count);
+    try t.expect(unassigned.reads == 208 and unassigned.reads <= scanout.max_read_count);
     try t.expect(unassigned.close());
     f.put(scanout.armed_base + 0x1000, 0);
     const last_binding_address = scanout.window_armed_base + 7 * 0x1000 + 0x254;
     // Change a plane at the boundary between the two complete observations.
     f.scanout_guard_calls = 0;
-    f.scanout_mutate_at = 190;
+    f.scanout_mutate_at = 210;
     var changing: scanout.Capture = .{};
     defer _ = changing.close();
     const changing_result = changing.readShared(&ctx, &snapshot, chip, &capture.registers,
         .{ .context = &capture, .epoch = capture.boot.held_generation, .generation = f.nativeGeneration });
     f.scanout_mutate_at = 0;
     try t.expectError(error.Unstable, changing_result);
-    try t.expect(changing.reads == 188 and capture.registers.borrowedCount() == 2);
+    try t.expect(changing.reads == 208 and capture.registers.borrowedCount() == 2);
     try t.expect(changing.close() and capture.registers.borrowedCount() == 1);
     f.put(last_binding_address, 0x175);
     f.put(last_binding_address, 0x87654321);

@@ -166,6 +166,7 @@ const r4os = @import("r4os");
 const identity = @import("identity.zig");
 const state = @import("fwsec_state.zig");
 const bar0 = @import("bar0.zig");
+const display_context = @import("display_context.zig");
 pub const max_heads = 8;
 pub const max_sors = 8;
 pub const max_windows = 8;
@@ -183,7 +184,7 @@ pub const window_methods = [_]u32{
     0x240, 0x244, 0x248, 0x24c, 0x250, 0x254,
     0x260, 0x264, 0x268, 0x26c, 0x270, 0x274,
     0x290, 0x298, 0x2a4, 0x2a8, 0x2ec, 0x2f0,
-    0x2f4,
+    0x2f4, 0x308, 0x294,
 };
 pub const WindowField = enum {
     size,
@@ -211,8 +212,11 @@ pub const WindowField = enum {
     composition,
     alpha,
     factors,
+    present,
+    point_right,
 };
 pub const Window = struct {
+    client: u32 = 0,
     core: [window_core_methods.len]u32 = @splat(0),
     words: [window_methods.len]u32 = @splat(0),
     pub fn get(self: *const Window, field: WindowField) u32 {
@@ -237,8 +241,8 @@ pub fn windowHead(window: *const Window) !?u3 {
     if (owner >= max_heads) return error.Routing;
     return @intCast(owner);
 }
-pub const max_read_count = 2 * (10 + max_sors + max_heads * (head_methods.len + 1) +
-    max_windows * (window_core_methods.len + window_methods.len));
+pub const max_read_count = 2 * (14 + max_sors + max_heads * (head_methods.len + 1) +
+    max_windows * (1 + window_core_methods.len + window_methods.len));
 pub const Head = struct {
     words: [head_methods.len]u32 = @splat(0),
     hdmi: u32 = 0,
@@ -252,6 +256,8 @@ pub const Raw = struct {
     capabilities: u32 = 0,
     window_mask: u32 = 0,
     counts: u32 = 0,
+    instance_control: u32 = 0,
+    instance_address: u32 = 0,
     heads: [max_heads]Head = @splat(.{}),
     sors: [max_sors]u32 = @splat(0),
     windows: [max_windows]Window = @splat(.{}),
@@ -389,6 +395,7 @@ pub const Capture = struct {
         if (now >= self.deadline) return error.Deadline;
     }
     fn permitted(address: u32) bool {
+        if (address == display_context.instance_control_register or address == display_context.instance_address_register) return true;
         if (address == 0 or address == 4 or address == capability_register or address == window_capability_register or address == count_register) return true;
         for (0..max_heads) |head| {
             const offset: u32 = @intCast(head * 0x400);
@@ -397,6 +404,7 @@ pub const Capture = struct {
         }
         for (0..max_sors) |sor| if (address == armed_base + 0x300 + sor * 0x20) return true;
         for (0..max_windows) |window| {
+            if (address == display_context.client_register + (1 + window) * 16) return true;
             for (window_core_methods) |method| if (address == armed_base + method + window * 0x80) return true;
             for (window_methods) |method| if (address == window_armed_base + method + window * 0x1000) return true;
         }
@@ -421,6 +429,8 @@ pub const Capture = struct {
         const observed = identity.chip(out.boot0, out.boot1) orelse return error.Profile;
         if (observed.id != chip.id or observed.revision != chip.revision) return error.Unstable;
         out.capabilities = try self.read(capability_register);
+        out.instance_control = try self.read(display_context.instance_control_register);
+        out.instance_address = try self.read(display_context.instance_address_register);
         out.window_mask = try self.read(window_capability_register);
         out.counts = try self.read(count_register);
         if (out.headCount() == 0 or out.headCount() > max_heads or out.sorCount() == 0 or out.sorCount() > max_sors or
@@ -439,6 +449,7 @@ pub const Capture = struct {
         for (0..max_windows) |window| if (out.window_mask & (@as(u32, 1) << @intCast(window)) != 0) {
             const offset: u32 = @intCast(window);
             const target = &out.windows[window];
+            target.client = try self.read(display_context.client_register + (1 + offset) * 16);
             for (window_core_methods, 0..) |method, index| target.core[index] = try self.read(armed_base + method + offset * 0x80);
             if (try windowHead(target)) |head| {
                 if (out.headMask() & (@as(u8, 1) << head) == 0) return error.Routing;
@@ -447,7 +458,8 @@ pub const Capture = struct {
         };
         if (try self.read(0) != out.boot0 or try self.read(4) != out.boot1 or
             try self.read(capability_register) != out.capabilities or try self.read(window_capability_register) != out.window_mask or
-            try self.read(count_register) != out.counts) return error.Unstable;
+            try self.read(count_register) != out.counts or try self.read(display_context.instance_control_register) != out.instance_control or
+            try self.read(display_context.instance_address_register) != out.instance_address) return error.Unstable;
     }
     pub fn close(self: *Capture) bool {
         if (self.self_address == 0) return true;

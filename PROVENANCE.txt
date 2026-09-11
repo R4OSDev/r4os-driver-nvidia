@@ -1,7 +1,19 @@
 ﻿Original R4OS implementation for roadmap 0.79.9, 10.09.2026.
 Host/module scaffolding follows R4OS SDK and existing R4D owners.
 
-GA106 window/plane observation (NVIDIA 0.1.36):
+GA106 display instance/context decoding (NVIDIA 0.1.37):
+display_context adapts the pinned GA102 manual, RM v03 instance layout/hash
+and NVKMS format/surface layout definitions under their original MIT terms.
+Twelve additional complete per-source notices remain in the decoder and
+NVIDIA-DISPLAY-CONTEXT-LICENSE.txt (14984 bytes), also packaged by Distribution.
+28 complete verified originals accompany display-context-20260911: nine
+Nouveau files, eighteen NVIDIA 570.144 files including COPYING, and one
+GA102 manual. Generated RM dispatch is reference-only, with no copied
+generated implementation. Previous 26 resource payloads remain unchanged.
+R4OS capture, ownership and validation policy remain Apache-2.0. This work
+does not provide native context programming, firmware start or full recovery.
+
+Earlier GA106 window/plane observation (NVIDIA 0.1.36):
 boot_scanout extends its MIT-attributed adaptation with explicit gv100/nv50
 window mirror mapping, C67D/C67E definitions and Nouveau/NVKMS plane/offset
 semantics. Five additional complete source notices remain in the code and

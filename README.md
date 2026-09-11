@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-Passive NVIDIA display driver for R4OS. Module 0.1.36; original R4OS code is
+Passive NVIDIA display driver for R4OS. Module 0.1.37; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -10,7 +10,38 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
-Boot window and plane metadata (NVIDIA 0.1.36):
+Display instance and used surface contexts (NVIDIA 0.1.37):
+
+The explicit boot-check now backs up all 64KB of display instance memory
+through the existing shared BAR0/PRAMIN reader, compares every page twice,
+and retains a read-only BO under the exact held display owner and epoch.
+MEM0/MEM1, each window client, stereo mode and both source points join the
+two complete register observations: at most 748 reads in one second.
+
+The bounded RAMHT lookup matches client, handle and channel, using the
+original RM hash. Exactly 20 descriptor bytes establish target, physical
+base/limit and pitch or block-linear layout. Present mode and all 27 C67E
+formats select used planes/eyes; old nonzero unused handles are ignored.
+RGB/YUV storage widths, pitch, decimation, source geometry and GOB row
+alignment determine full spans, checked against context and VRAM bounds.
+The instance and used spans must avoid every GSP reservation target.
+Another complete instance comparison precedes publishing the VRAM lease,
+which holds the context backup throughout its existing DMA/FWSEC lifetime.
+
+51 existing owner cases and the module build pass on the first invocation.
+Existing lifecycle/DMA groups cover actual capture, wrong/duplicate keys,
+pitch/block-linear/YUV extents, collisions, changed unused instance bytes,
+retention and cleanup. No new case/gate/guest run. All 27 resources verified;
+previous 26 unchanged. The new full MIT context notice is 14984 bytes.
+28 complete pinned originals: display-context-20260911. Current evidence:
+display_context_checkpoint in Docs/Drivers/GrafikFirmware07910.json.
+
+This saves context bytes and protects used image ranges; additional image
+pixels, remaining color/cursor state and full native display/device recovery
+still need work. Firmware start, native modesetting and HDMI remain open.
+OssiPC is offline and untouched; no physical acceptance for this change.
+
+Previous boot window and plane metadata (NVIDIA 0.1.36):
 
 The held display snapshot now includes every fused window within a bounded
 eight-slot profile: five core and 25 window words, including all six ISO

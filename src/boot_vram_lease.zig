@@ -10,12 +10,14 @@ const layout = @import("gsp_layout.zig");
 const boot = @import("gsp_boot.zig");
 const wpr = @import("gsp_wpr.zig");
 const mapping = @import("boot_mapping.zig");
+const contexts = @import("boot_context.zig");
 pub const Target = enum { non_wpr_heap, metadata, heap, firmware, boot_image, frts, vga };
 pub const Binding = struct { owner: usize, epoch: u64, serial: u64, target: Target, range: layout.Range };
 pub const Lease = struct {
     self_address: usize = 0,
     display: ?*capture.Capture = null,
     boot_mapping: ?*mapping.Capture = null,
+    boot_context: ?*contexts.Capture = null,
     backing: ?*storage.Storage = null,
     epoch: u64 = 0,
     serial: u64 = 0,
@@ -29,7 +31,7 @@ pub const Lease = struct {
 
     /// Serialized native init/work owner. Reject every stale input before
     /// publishing either borrow; no fallible operation follows publication.
-    pub fn acquire(self: *Lease, display: *capture.Capture, backing: *storage.Storage, boot_mapping: *mapping.Capture) !void {
+    pub fn acquire(self: *Lease, display: *capture.Capture, backing: *storage.Storage, boot_mapping: *mapping.Capture, boot_context: *contexts.Capture) !void {
         if (self.self_address != 0) return error.Busy;
         if (self.serial == std.math.maxInt(u64)) return error.Exhausted;
         if (!display.ready or display.self_address != @intFromPtr(display) or display.borrower != 0 or
@@ -49,9 +51,10 @@ pub const Lease = struct {
         try boot_mapping.admit(display, &plan);
         const data: [*]const u8 = @ptrFromInt(allocation.cpu_address);
         if (!wpr.matchesPlan(data[storage.metadata_offset..][0..wpr.bytes], &plan)) return error.MetadataChanged;
+        try boot_context.admit(display, &plan);
         const epoch = display.boot.held_generation;
         if (epoch == 0) return error.Owner;
-        self.* = .{ .self_address = @intFromPtr(self), .display = display, .boot_mapping = boot_mapping, .backing = backing, .epoch = epoch, .serial = self.serial + 1, .plan = plan,
+        self.* = .{ .self_address = @intFromPtr(self), .display = display, .boot_mapping = boot_mapping, .boot_context = boot_context, .backing = backing, .epoch = epoch, .serial = self.serial + 1, .plan = plan,
             .allocation = allocation.handle, .mapping = backing.mapping.handle, .pin = backing.pin.handle,
             .cpu_address = allocation.cpu_address, .metadata_address = report.metadata_address };
         display.borrower = self.self_address;
@@ -63,8 +66,9 @@ pub const Lease = struct {
         const display = self.display orelse return false;
         const backing = self.backing orelse return false;
         const boot_mapping = self.boot_mapping orelse return false;
+        const boot_context = self.boot_context orelse return false;
         const report = backing.report orelse return false;
-        return boot_mapping.valid(display) and display.self_address == @intFromPtr(display) and display.ready and display.borrower == self.self_address and
+        return boot_mapping.valid(display) and boot_context.valid(display) and display.self_address == @intFromPtr(display) and display.ready and display.borrower == self.self_address and
             display.boot.held_generation == self.epoch and backing.vram_owner == self.self_address and
             backing.context != null and display.context != null and backing.context.?.api == display.context.?.api and
             backing.allocation.handle == self.allocation and backing.allocation.cpu_address == self.cpu_address and

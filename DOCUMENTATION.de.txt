@@ -10,7 +10,42 @@ unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
 
-Boot-Bildflaechen und Plane-Metadaten (NVIDIA 0.1.36)
+Display-Instanz und genutzte Flaechenkontexte (NVIDIA 0.1.37)
+----------------------------------------------------------
+Der ausdrueckliche Boot-Check sichert nun die gesamten 64 KB Display-Instanz
+ueber den vorhandenen gemeinsamen BAR0-/PRAMIN-Leser. Alle Seiten werden
+erneut verglichen und als nur lesbar gemappter BO unter dem gehaltenen
+Anzeige-Besitzer samt Epoche erhalten. MEM0/MEM1, Window-Client, Stereomodus
+und beide Quellpunkte erweitern die zwei vollstaendigen Registeraufnahmen:
+hoechstens 748 Reads innerhalb einer Sekunde.
+
+Die begrenzte RAMHT-Suche vergleicht Client, Handle und Channel mit dem
+Original-RM-Hash. Genau 20 Deskriptorbytes bestimmen Speicherziel, physische
+Basis/Grenze und Pitch- oder Blocklinear-Layout. Present-Modus und alle
+27 C67E-Formate waehlen genutzte Planes/Augen; alte ungenutzte Handles gelten
+nicht als aktive Puffer. RGB-/YUV-Speicherbreiten, Pitch, Unterabtastung,
+Quellgeometrie und GOB-Zeilengrenzen bestimmen die ganzen Flaechenbereiche.
+Kontext- und VRAM-Grenzen muessen passen. Instanz und benutzte Flaechen
+duerfen keine GSP-Reservierung ueberlappen. Vor Veroeffentlichung der VRAM-
+Leihe werden nochmals alle Instanzseiten und die Anzeige verglichen. Die
+Leihe haelt den Kontext-BO auch in der bestehenden DMA-/FWSEC-Lebensdauer.
+
+51 vorhandene Besitzerfaelle und Modulbuild beim ersten Aufruf bestanden.
+Bestehende Lebenszyklus-/DMA-Gruppen decken reale Capture-Implementierung,
+falsche/doppelte Zuordnung, Pitch-/Blocklinear-/YUV-Bereiche, Kollisionen,
+veraenderte ungenutzte Instanzbytes, Retention und Abbau ab. Keine neuen
+Faelle/Gates/Gastlaeufe. Alle 27 Ressourcen geprueft, vorherige 26 unveraendert;
+neuer vollstaendiger MIT-Kontexthinweis 14984 Bytes. 28 vollstaendige gepinnte
+Originaldateien: ExFiles/Reference/GFX/Nvidia/0.79.10/display-context-20260911.
+Beleg: display_context_checkpoint in Docs/Drivers/GrafikFirmware07910.json.
+
+Gesichert werden Kontextbytes und die Belegung genutzter Bildbereiche.
+Zusaetzliche Bildpixel, verbleibender Farb-/Cursorzustand und die gesamte
+native Anzeige-/Geraetewiederherstellung fehlen weiterhin. Firmwarestart,
+native Modesets und HDMI bleiben offen. OssiPC offline/unveraendert;
+fuer diesen Stand liegt keine physische Abnahme vor.
+
+Vorherige Boot-Bildflaechen und Plane-Metadaten (NVIDIA 0.1.36)
 --------------------------------------------------
 Die gehaltene Anzeigeaufnahme umfasst nun alle vorhandenen Windows innerhalb
 des begrenzten Acht-Slot-Profils: fuenf Core- und 25 Window-Woerter samt allen

@@ -253,7 +253,15 @@ test "firmware CPU storage complete run lease retains all boot DMA owners" {
     var boot_mapping: @import("boot_mapping.zig").Capture = .{ .parent = &capture, .epoch = 9, .ready = true };
     boot_mapping.self_address = @intFromPtr(&boot_mapping);
     capture.mapping_owner = boot_mapping.self_address;
-    var held: reservation.Lease = .{ .display = &capture, .boot_mapping = &boot_mapping, .backing = &b, .epoch = 9, .serial = 7, .plan = prepared.plan, .allocation = b.allocation.handle, .cpu_address = b.allocation.cpu_address, .mapping = b.mapping.handle, .pin = b.pin.handle, .metadata_address = b.report.?.metadata_address };
+    const context_bytes = try std.testing.allocator.alloc(u8, 65536);
+    defer std.testing.allocator.free(context_bytes);
+    var boot_context: @import("boot_context.zig").Capture = .{ .parent = &capture, .epoch = 9, .ready = true,
+        .reference = .{ .reference = .{ .id = 71, .generation = 1 } },
+        .map = .{ .lease = .{ .id = 72, .generation = 1 }, .cpu_address = @intFromPtr(context_bytes.ptr), .byte_length = context_bytes.len } };
+    boot_context.stamp = boot_context.map;
+    boot_context.self_address = @intFromPtr(&boot_context);
+    capture.context_owner = boot_context.self_address;
+    var held: reservation.Lease = .{ .display = &capture, .boot_mapping = &boot_mapping, .boot_context = &boot_context, .backing = &b, .epoch = 9, .serial = 7, .plan = prepared.plan, .allocation = b.allocation.handle, .cpu_address = b.allocation.cpu_address, .mapping = b.mapping.handle, .pin = b.pin.handle, .metadata_address = b.report.?.metadata_address };
     held.self_address = @intFromPtr(&held);
     capture.borrower = held.self_address;
     b.vram_owner = held.self_address;
