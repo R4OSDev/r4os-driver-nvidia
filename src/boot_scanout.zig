@@ -41,11 +41,126 @@
 //  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 //  * DEALINGS IN THE SOFTWARE.
 //  */
+// nouveau/drivers/gpu/drm/nouveau/nvkm/engine/disp/nv50.c
+// /*
+//  * Copyright 2012 Red Hat Inc.
+//  *
+//  * Permission is hereby granted, free of charge, to any person obtaining a
+//  * copy of this software and associated documentation files (the "Software"),
+//  * to deal in the Software without restriction, including without limitation
+//  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//  * and/or sell copies of the Software, and to permit persons to whom the
+//  * Software is furnished to do so, subject to the following conditions:
+//  *
+//  * The above copyright notice and this permission notice shall be included in
+//  * all copies or substantial portions of the Software.
+//  *
+//  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+//  * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
+//  * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+//  * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+//  * OTHER DEALINGS IN THE SOFTWARE.
+//  *
+//  * Authors: Ben Skeggs
+//  */
+// nouveau/drivers/gpu/drm/nouveau/dispnv50/wndwc67e.c
+// /*
+//  * Copyright 2021 Red Hat Inc.
+//  *
+//  * Permission is hereby granted, free of charge, to any person obtaining a
+//  * copy of this software and associated documentation files (the "Software"),
+//  * to deal in the Software without restriction, including without limitation
+//  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//  * and/or sell copies of the Software, and to permit persons to whom the
+//  * Software is furnished to do so, subject to the following conditions:
+//  *
+//  * The above copyright notice and this permission notice shall be included in
+//  * all copies or substantial portions of the Software.
+//  *
+//  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+//  * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
+//  * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+//  * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+//  * OTHER DEALINGS IN THE SOFTWARE.
+//  */
+// nvidia/src/common/sdk/nvidia/inc/class/clc67e.h
+// /*
+//  * SPDX-FileCopyrightText: Copyright (c) 2020 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//  * SPDX-License-Identifier: MIT
+//  *
+//  * Permission is hereby granted, free of charge, to any person obtaining a
+//  * copy of this software and associated documentation files (the "Software"),
+//  * to deal in the Software without restriction, including without limitation
+//  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//  * and/or sell copies of the Software, and to permit persons to whom the
+//  * Software is furnished to do so, subject to the following conditions:
+//  *
+//  * The above copyright notice and this permission notice shall be included in
+//  * all copies or substantial portions of the Software.
+//  *
+//  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+//  * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+//  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+//  * DEALINGS IN THE SOFTWARE.
+//  */
+// nvidia/src/nvidia-modeset/src/nvkms-evo3.c
+// /*
+//  * SPDX-FileCopyrightText: Copyright (c) 2010-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//  * SPDX-License-Identifier: MIT
+//  *
+//  * Permission is hereby granted, free of charge, to any person obtaining a
+//  * copy of this software and associated documentation files (the "Software"),
+//  * to deal in the Software without restriction, including without limitation
+//  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//  * and/or sell copies of the Software, and to permit persons to whom the
+//  * Software is furnished to do so, subject to the following conditions:
+//  *
+//  * The above copyright notice and this permission notice shall be included in
+//  * all copies or substantial portions of the Software.
+//  *
+//  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+//  * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+//  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+//  * DEALINGS IN THE SOFTWARE.
+//  */
+// nvidia/src/nvidia-modeset/include/nvkms-utils.h
+// /*
+//  * SPDX-FileCopyrightText: Copyright (c) 2014-2015 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//  * SPDX-License-Identifier: MIT
+//  *
+//  * Permission is hereby granted, free of charge, to any person obtaining a
+//  * copy of this software and associated documentation files (the "Software"),
+//  * to deal in the Software without restriction, including without limitation
+//  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//  * and/or sell copies of the Software, and to permit persons to whom the
+//  * Software is furnished to do so, subject to the following conditions:
+//  *
+//  * The above copyright notice and this permission notice shall be included in
+//  * all copies or substantial portions of the Software.
+//  *
+//  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+//  * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+//  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+//  * DEALINGS IN THE SOFTWARE.
+//  */
 //! Held GA106 display-state observation for boot takeover/recovery planning.
 //! Reads only fused topology and the armed method-state mirrors. This neither
 //! proves visible scanout nor supplies a restore recipe or modeset authority.
 // Mirror offsets/GA106 dispatch: Nouveau ga102/gv100 (MIT). Field meanings:
-// NVIDIA 570.144 C67D (MIT). Original R4OS lifetime/validation: Apache-2.0.
+// NVIDIA 570.144 C67D/C67E and NVKMS (MIT). Original R4OS lifetime/validation: Apache-2.0.
 const std = @import("std");
 const r4os = @import("r4os");
 const identity = @import("identity.zig");
@@ -53,12 +168,77 @@ const state = @import("fwsec_state.zig");
 const bar0 = @import("bar0.zig");
 pub const max_heads = 8;
 pub const max_sors = 8;
+pub const max_windows = 8;
 pub const capability_register: u32 = 0x610060;
+pub const window_capability_register: u32 = 0x610064;
 pub const count_register: u32 = 0x610074;
 pub const armed_base: u32 = 0x688000;
 // C67D methods in the armed RAM mirror, not channel submit addresses.
 pub const head_methods = [_]u32{ 0x2004, 0x2008, 0x200c, 0x201c, 0x204c, 0x2058, 0x2064, 0x2068, 0x206c, 0x2070 };
 pub const Field = enum { output, control, clock, clock_config, viewport_in, viewport_out, total, sync_end, blank_end, blank_start };
+pub const window_core_methods = [_]u32{ 0x1000, 0x1004, 0x1008, 0x100c, 0x1010 };
+pub const window_armed_base: u32 = 0x690800;
+pub const window_methods = [_]u32{
+    0x224, 0x228, 0x22c, 0x230, 0x234, 0x238,
+    0x240, 0x244, 0x248, 0x24c, 0x250, 0x254,
+    0x260, 0x264, 0x268, 0x26c, 0x270, 0x274,
+    0x290, 0x298, 0x2a4, 0x2a8, 0x2ec, 0x2f0,
+    0x2f4,
+};
+pub const WindowField = enum {
+    size,
+    storage,
+    params,
+    pitch0,
+    pitch1,
+    pitch2,
+    dma0,
+    dma1,
+    dma2,
+    dma3,
+    dma4,
+    dma5,
+    offset0,
+    offset1,
+    offset2,
+    offset3,
+    offset4,
+    offset5,
+    point_left,
+    input,
+    output,
+    scaler,
+    composition,
+    alpha,
+    factors,
+};
+pub const Window = struct {
+    core: [window_core_methods.len]u32 = @splat(0),
+    words: [window_methods.len]u32 = @splat(0),
+    pub fn get(self: *const Window, field: WindowField) u32 {
+        return self.words[@intFromEnum(field)];
+    }
+    /// Context-relative offsets, never physical or BAR1 addresses. Layout and
+    /// pitch units require the ISO context descriptor, not SET_STORAGE.
+    pub fn binding(self: *const Window, plane: u2, eye: u1) !Binding {
+        if (plane >= 3) return error.Plane;
+        const index = @as(usize, eye) + (@as(usize, plane) << 1);
+        return .{ .handle = self.words[@intFromEnum(WindowField.dma0) + index], .offset_bytes = @as(u64, self.words[@intFromEnum(WindowField.offset0) + index]) << 8 };
+    }
+    pub fn dimensions(self: *const Window, field: WindowField) Size {
+        const value = self.get(field);
+        return .{ .x = @truncate(value), .y = @truncate(value >> 16) };
+    }
+};
+pub const Binding = struct { handle: u32, offset_bytes: u64 };
+pub fn windowHead(window: *const Window) !?u3 {
+    const owner = window.core[0] & 15;
+    if (owner == 15) return null;
+    if (owner >= max_heads) return error.Routing;
+    return @intCast(owner);
+}
+pub const max_read_count = 2 * (10 + max_sors + max_heads * (head_methods.len + 1) +
+    max_windows * (window_core_methods.len + window_methods.len));
 pub const Head = struct {
     words: [head_methods.len]u32 = @splat(0),
     hdmi: u32 = 0,
@@ -70,9 +250,11 @@ pub const Raw = struct {
     boot0: u32 = 0,
     boot1: u32 = 0,
     capabilities: u32 = 0,
+    window_mask: u32 = 0,
     counts: u32 = 0,
     heads: [max_heads]Head = @splat(.{}),
     sors: [max_sors]u32 = @splat(0),
+    windows: [max_windows]Window = @splat(.{}),
     pub fn headMask(self: *const Raw) u8 {
         return @truncate(self.capabilities);
     }
@@ -84,6 +266,9 @@ pub const Raw = struct {
     }
     pub fn sorCount(self: *const Raw) u4 {
         return @truncate(self.counts >> 8);
+    }
+    pub fn windowCount(self: *const Raw) u6 {
+        return @truncate(self.counts >> 20);
     }
 };
 pub const Protocol = enum { lvds, tmds_a, tmds_b, tmds_dual, dp_a, dp_b, hdmi_frl, custom, unknown };
@@ -204,13 +389,17 @@ pub const Capture = struct {
         if (now >= self.deadline) return error.Deadline;
     }
     fn permitted(address: u32) bool {
-        if (address == 0 or address == 4 or address == capability_register or address == count_register) return true;
+        if (address == 0 or address == 4 or address == capability_register or address == window_capability_register or address == count_register) return true;
         for (0..max_heads) |head| {
             const offset: u32 = @intCast(head * 0x400);
             for (head_methods) |method| if (address == armed_base + method + offset) return true;
             if (address == 0x6165c0 + head * 0x800) return true;
         }
         for (0..max_sors) |sor| if (address == armed_base + 0x300 + sor * 0x20) return true;
+        for (0..max_windows) |window| {
+            for (window_core_methods) |method| if (address == armed_base + method + window * 0x80) return true;
+            for (window_methods) |method| if (address == window_armed_base + method + window * 0x1000) return true;
+        }
         return false;
     }
     fn read(self: *Capture, address: u32) !u32 {
@@ -232,8 +421,11 @@ pub const Capture = struct {
         const observed = identity.chip(out.boot0, out.boot1) orelse return error.Profile;
         if (observed.id != chip.id or observed.revision != chip.revision) return error.Unstable;
         out.capabilities = try self.read(capability_register);
+        out.window_mask = try self.read(window_capability_register);
         out.counts = try self.read(count_register);
         if (out.headCount() == 0 or out.headCount() > max_heads or out.sorCount() == 0 or out.sorCount() > max_sors or
+            out.windowCount() == 0 or out.windowCount() > max_windows or
+            @as(u64, out.window_mask) >> out.windowCount() != 0 or
             @as(u16, out.headMask()) >> out.headCount() != 0 or @as(u16, out.sorMask()) >> out.sorCount() != 0) return error.Topology;
         for (0..max_sors) |sor| if (out.sorMask() & (@as(u8, 1) << @intCast(sor)) != 0) {
             out.sors[sor] = try self.read(armed_base + 0x300 + @as(u32, @intCast(sor)) * 0x20);
@@ -244,8 +436,18 @@ pub const Capture = struct {
             for (head_methods, 0..) |method, index| out.heads[head].words[index] = try self.read(armed_base + method + offset);
             out.heads[head].hdmi = try self.read(0x6165c0 + @as(u32, @intCast(head)) * 0x800);
         };
+        for (0..max_windows) |window| if (out.window_mask & (@as(u32, 1) << @intCast(window)) != 0) {
+            const offset: u32 = @intCast(window);
+            const target = &out.windows[window];
+            for (window_core_methods, 0..) |method, index| target.core[index] = try self.read(armed_base + method + offset * 0x80);
+            if (try windowHead(target)) |head| {
+                if (out.headMask() & (@as(u8, 1) << head) == 0) return error.Routing;
+            }
+            for (window_methods, 0..) |method, index| target.words[index] = try self.read(window_armed_base + method + offset * 0x1000);
+        };
         if (try self.read(0) != out.boot0 or try self.read(4) != out.boot1 or
-            try self.read(capability_register) != out.capabilities or try self.read(count_register) != out.counts) return error.Unstable;
+            try self.read(capability_register) != out.capabilities or try self.read(window_capability_register) != out.window_mask or
+            try self.read(count_register) != out.counts) return error.Unstable;
     }
     pub fn close(self: *Capture) bool {
         if (self.self_address == 0) return true;

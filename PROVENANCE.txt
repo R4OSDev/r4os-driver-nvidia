@@ -1,7 +1,17 @@
 ﻿Original R4OS implementation for roadmap 0.79.9, 10.09.2026.
 Host/module scaffolding follows R4OS SDK and existing R4D owners.
 
-GA106 boot display observation (NVIDIA 0.1.35):
+GA106 window/plane observation (NVIDIA 0.1.36):
+boot_scanout extends its MIT-attributed adaptation with explicit gv100/nv50
+window mirror mapping, C67D/C67E definitions and Nouveau/NVKMS plane/offset
+semantics. Five additional complete source notices remain in the code and
+NVIDIA-BOOT-DISPLAY-LICENSE.txt (17645 bytes), identical in the driver and
+Distribution. Fifteen full originals/pins accompany boot-planes-20260911.
+All previous 25 resource payloads remain unchanged. R4OS observation,
+consistency and lifetime policy remain Apache-2.0. ISO handles/offsets do
+not establish physical addresses; native channels/recovery remain open.
+
+Earlier GA106 boot display observation (NVIDIA 0.1.35):
 boot_scanout.zig adapts Nouveau gv100 armed state/method mirrors (Red Hat,
 2018, MIT) and NVIDIA 570.144 C67D fields (NVIDIA, 2020, MIT). Both full
 original copyright/permission notices remain in the source. nv176 dispatch

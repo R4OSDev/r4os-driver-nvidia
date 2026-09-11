@@ -10,7 +10,37 @@ unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
 
-Boot-Anzeigezustand erfassen (NVIDIA 0.1.35)
+Boot-Bildflaechen und Plane-Metadaten (NVIDIA 0.1.36)
+--------------------------------------------------
+Die gehaltene Anzeigeaufnahme umfasst nun alle vorhandenen Windows innerhalb
+des begrenzten Acht-Slot-Profils: fuenf Core- und 25 Window-Woerter samt allen
+sechs ISO-Kontextkennungen/Offsets fuer drei Planes und zwei Augen. Erhalten
+bleiben Flaechen-/Eingangs-/Ausgangsgroessen, Quellpunkt, Format, Storage,
+codierter Pitch und Kompositionsparameter. Alle 30 Methodenadressen stehen
+explizit in den Originaltabellen. Gleiche Epoche, eine Sekunde Frist und zwei
+ganze Aufnahmen umfassen jetzt hoechstens 692 Registerlesezugriffe. Erneute
+Zulassung und bisherige Apertur-/Pixel-Recovery vergleichen auch die Windows.
+
+Window-Besitzer sind Head-Indizes oder NONE. Ungueltige/fehlende Heads und
+uebergrosse Topologie werden abgewiesen. Offsets gelten relativ zum Kontext
+in 256-Byte-Einheiten. Ampere besitzt SET_STORAGE.MEMORY_LAYOUT nicht mehr;
+Pitch kann daher Bloecke oder 64-Byte-Einheiten bedeuten. Die Diagnose laesst
+Layout und Speicherzuordnung offen, bis ISO-Kontextdeskriptoren ausgewertet
+sind. Keine physische Adresse oder lineare Flaeche wird daraus abgeleitet.
+
+51 bestehende Faelle und Modulbuild bestanden. Der Lebenszyklusfall prueft
+Windows 0/7, alle sechs Bindungen, ungueltige/NONE-Besitzer, Topologiegrenzen,
+Aenderung zwischen ganzen Aufnahmen und gehaltene Recovery bei neuer Bindung.
+Eine lokale Diagnose-Namenskollision korrigiert; keine neuen Faelle/Gates/
+Gastlaeufe. Alle 26 Ressourcen geprueft, vorherige 25 unveraendert; volle
+Display-Lizenzhinweise erweitert. 15 vollstaendige gepinnte Originaldateien:
+ExFiles/Reference/GFX/Nvidia/0.79.10/boot-planes-20260911. Aktueller Beleg:
+boot_planes_checkpoint in Docs/Drivers/GrafikFirmware07910.json.
+
+Physische Kontext-/Flaechenzuordnung, Farb-/Cursorzustand, native Recovery,
+Modesets und Firmwarestart bleiben offen. OssiPC offline/unveraendert.
+
+Vorheriger Boot-Anzeigezustand (NVIDIA 0.1.35)
 ------------------------------------------
 Der explizite Boot-Check erfasst vor dem ersten PRAMIN-Fensterzugriff den
 gespeicherten Head-/SOR-Zustand. Er leiht die vorhandene gesamte BAR0-Abbildung,

@@ -916,10 +916,18 @@ const BootVramFixture = struct {
     var bank_window: u32 = 0;
     var clock: u64 = 1000000;
     var clock_backwards = false;
+    var scanout_mutate_at: u32 = 0;
+    var scanout_guard_calls: u32 = 0;
     var delay_selected = false;
     var vram_pages: [6][4096]u8 = undefined;
     const addresses = [_]u64{ 0x100000, 0x201000, 0x302000, 0x403000, 0x504000, 0x605000 };
     fn now() callconv(.c) u64 {
+        if (scanout_mutate_at != 0) {
+            scanout_guard_calls += 1;
+            if (scanout_guard_calls == scanout_mutate_at) {
+                put(@import("boot_scanout.zig").window_armed_base + 7 * 0x1000 + 0x254, 0x87654321);
+            }
+        }
         if (clock_backwards) {
             const value = clock;
             clock -= 1;
@@ -945,7 +953,8 @@ const BootVramFixture = struct {
     fn setupScanout() void {
         const scanout = @import("boot_scanout.zig");
         put(scanout.capability_register, 0x303);
-        put(scanout.count_register, 0x202);
+        put(scanout.window_capability_register, 0x81);
+        put(scanout.count_register, 0x800202);
         put(scanout.armed_base + 0x300, 0x101);
         put(scanout.armed_base + 0x320, 0xc02); // C67D explicitly defines HDMI FRL.
         const words = [_][scanout.head_methods.len]u32{
@@ -957,6 +966,20 @@ const BootVramFixture = struct {
         for (words, 0..) |head, n| {
             for (scanout.head_methods, head) |method, value| put(scanout.armed_base + method + n * 0x400, value);
             put(0x6165c0 + n * 0x800, 0x40000000);
+        }
+        for ([_]usize{ 0, 7 }, 0..) |window, head| {
+            put(scanout.armed_base + 0x1000 + window * 0x80, @intCast(head));
+            const base = scanout.window_armed_base + window * 0x1000;
+            put(base + 0x224, (600 << 16) | 800);
+            put(base + 0x228, 0);
+            put(base + 0x22c, 0xcf);
+            put(base + 0x230, 64); // Units stay unresolved without context layout.
+            put(base + 0x298, (600 << 16) | 800);
+            put(base + 0x2a4, (1080 << 16) | 1920);
+            for (0..6) |slot| {
+                put(base + 0x240 + slot * 4, @intCast(0x100 + window * 0x10 + slot));
+                put(base + 0x260 + slot * 4, @intCast(0x200 + window * 0x10 + slot));
+            }
         }
     }
     fn setupTables() void {
@@ -1278,6 +1301,16 @@ fn checkBootVramOwner() !void {
     const report = try capture.capture(&ctx, &snapshot, chip);
     const scanout = @import("boot_scanout.zig");
     const observed_scanout = capture.scanout_original.?;
+    try t.expect(observed_scanout.windowCount() == 8 and observed_scanout.window_mask == 0x81);
+    const last_window = &observed_scanout.windows[7];
+    try t.expect((try scanout.windowHead(last_window)).? == 1);
+    for (0..3) |plane| for (0..2) |eye| {
+        const binding = try last_window.binding(@intCast(plane), @intCast(eye));
+        const slot = eye + (plane << 1);
+        try t.expect(binding.handle == 0x170 + slot and binding.offset_bytes == (0x270 + slot) * 256);
+    };
+    try t.expectError(error.Plane, last_window.binding(3, 0));
+    try t.expect(last_window.dimensions(.size).x == 800 and last_window.dimensions(.output).y == 1080);
     try t.expect(observed_scanout.headCount() == 2 and observed_scanout.sorCount() == 2 and scanout.routedHeads(&observed_scanout) == 3);
     try t.expect(scanout.headSors(&observed_scanout, 0) == 1 and scanout.headSors(&observed_scanout, 1) == 2);
     try t.expect(scanout.protocol(observed_scanout.sors[1]) == .hdmi_frl);
@@ -1449,10 +1482,46 @@ fn checkBootVramOwner() !void {
     try t.expectError(error.Clock, scanout_clock_result);
     try t.expect(clock_probe.reads == 0 and capture.registers.borrowedCount() == 2);
     try t.expect(clock_probe.close() and capture.registers.borrowedCount() == 1);
-    f.put(scanout.count_register, 0x209); // Refuse topology beyond bounded eight heads.
+    f.put(scanout.count_register, 0x800209); // Refuse topology beyond bounded eight heads.
     try t.expectError(error.Topology, capture.reobserve());
     try t.expect(capture.registers.borrowedCount() == 1);
-    f.put(scanout.count_register, 0x202);
+    f.put(scanout.count_register, 0x900202); // More than eight windows is not silently truncated.
+    try t.expectError(error.Topology, capture.reobserve());
+    f.put(scanout.count_register, 0x800202);
+    f.put(scanout.window_capability_register, 0x181);
+    try t.expectError(error.Topology, capture.reobserve());
+    f.put(scanout.window_capability_register, 0x81);
+    f.put(scanout.armed_base + 0x1000, 2); // Existing head count does not include head 2.
+    try t.expectError(error.Routing, capture.reobserve());
+    f.put(scanout.armed_base + 0x1000, 8); // Reserved owner is not head 0 or none.
+    try t.expectError(error.Routing, capture.reobserve());
+    f.put(scanout.armed_base + 0x1000, 15); // Unassigned window is retained faithfully.
+    var unassigned: scanout.Capture = .{};
+    defer _ = unassigned.close();
+    const unassigned_raw = try unassigned.readShared(&ctx, &snapshot, chip, &capture.registers,
+        .{ .context = &capture, .epoch = capture.boot.held_generation, .generation = f.nativeGeneration });
+    try t.expect(try scanout.windowHead(&unassigned_raw.windows[0]) == null);
+    try t.expect(unassigned.reads == 188 and unassigned.reads <= scanout.max_read_count);
+    try t.expect(unassigned.close());
+    f.put(scanout.armed_base + 0x1000, 0);
+    const last_binding_address = scanout.window_armed_base + 7 * 0x1000 + 0x254;
+    // Change a plane at the boundary between the two complete observations.
+    f.scanout_guard_calls = 0;
+    f.scanout_mutate_at = 190;
+    var changing: scanout.Capture = .{};
+    defer _ = changing.close();
+    const changing_result = changing.readShared(&ctx, &snapshot, chip, &capture.registers,
+        .{ .context = &capture, .epoch = capture.boot.held_generation, .generation = f.nativeGeneration });
+    f.scanout_mutate_at = 0;
+    try t.expectError(error.Unstable, changing_result);
+    try t.expect(changing.reads == 188 and capture.registers.borrowedCount() == 2);
+    try t.expect(changing.close() and capture.registers.borrowedCount() == 1);
+    f.put(last_binding_address, 0x175);
+    f.put(last_binding_address, 0x87654321);
+    try t.expectError(error.ScanoutChanged, capture.reobserve());
+    try t.expect(!capture.close() and f.held and f.leases[1] and f.mapped[0]);
+    f.put(last_binding_address, 0x175);
+    _ = try capture.reobserve();
     f.put(scanout.armed_base + 0x300, 0x104); // Route cannot name a fused-off head.
     try t.expectError(error.Routing, capture.reobserve());
     f.put(scanout.armed_base + 0x300, 0x101);

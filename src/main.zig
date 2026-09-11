@@ -444,6 +444,26 @@ fn logBootScanout(raw: *const @import("boot_scanout.zig").Raw) void {
     const scanout = @import("boot_scanout.zig");
     const routed = scanout.routedHeads(raw);
     log("NVIDIA boot-scanout: heads={x:0>2} sors={x:0>2} routed-heads={x:0>2} source=armed-mirror repeated=matched visible=unverified", .{ raw.headMask(), raw.sorMask(), routed });
+    log("NVIDIA boot-windows: count={d} mask={x:0>8} source=armed-mirror layout=unresolved", .{ raw.windowCount(), raw.window_mask });
+    for (0..scanout.max_windows) |index| if (raw.window_mask & (@as(u32, 1) << @intCast(index)) != 0) {
+        const display_window = &raw.windows[index];
+        const owner = scanout.windowHead(display_window) catch continue;
+        if (owner) |head| {
+            const size = display_window.dimensions(.size);
+            const input = display_window.dimensions(.input);
+            const output = display_window.dimensions(.output);
+            log("NVIDIA boot-window: id={d} head={d} surface={d}x{d} input={d}x{d} output={d}x{d} format={x:0>2} storage={x:0>8} pitch-raw={x:0>8}/{x:0>8}/{x:0>8}", .{
+                index, head, size.x, size.y, input.x, input.y, output.x, output.y,
+                display_window.get(.params) & 0xff, display_window.get(.storage), display_window.get(.pitch0), display_window.get(.pitch1), display_window.get(.pitch2),
+            });
+            for (0..3) |plane| for (0..2) |eye| {
+                const binding = display_window.binding(@intCast(plane), @intCast(eye)) catch continue;
+                if (binding.handle != 0) log("NVIDIA boot-plane: window={d} plane={d} eye={d} context={x:0>8} offset-bytes={x} address=unresolved", .{
+                    index, plane, eye, binding.handle, binding.offset_bytes,
+                });
+            };
+        } else log("NVIDIA boot-window: id={d} head=none raw-state=retained", .{index});
+    };
     for (0..scanout.max_sors) |sor| if (raw.sorMask() & (@as(u8, 1) << @intCast(sor)) != 0) {
         log("NVIDIA boot-sor: id={d} heads={x:0>2} protocol={s} control={x:0>8}", .{ sor, raw.sors[sor] & 0xff, @tagName(scanout.protocol(raw.sors[sor])), raw.sors[sor] });
     };

@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-Passive NVIDIA display driver for R4OS. Module 0.1.35; original R4OS code is
+Passive NVIDIA display driver for R4OS. Module 0.1.36; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -10,7 +10,34 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
-Boot display state capture (NVIDIA 0.1.35):
+Boot window and plane metadata (NVIDIA 0.1.36):
+
+The held display snapshot now includes every fused window within a bounded
+eight-slot profile: five core and 25 window words, including all six ISO
+context handles/offsets for three planes and two eyes. It retains surface,
+source/input/output geometry, format/storage/pitch and composition fields.
+Thirty method addresses match explicit original tables. The same epoch,
+one-second deadline and two complete observations now cover at most 692 reads.
+Fresh admission and existing aperture/pixel recovery compare windows too.
+
+Window owners are head indices or NONE; invalid/missing heads and excess
+topology refuse. Offsets are context-relative 256-byte units. Ampere removed
+SET_STORAGE.MEMORY_LAYOUT, so encoded pitch may mean blocks or 64-byte units.
+Diagnostics explicitly leave layout/backing unresolved until ISO context
+descriptors are decoded. No physical address or linear surface is inferred.
+
+51 existing cases and module build pass. The lifecycle case covers sparse
+windows 0/7, all six bindings, invalid/NONE owners, bounded topology, a change
+between full passes and retained recovery after a binding change. One local
+diagnostic name collision was fixed; no new case/gate/guest run. All 26
+resources verified, previous 25 unchanged; full display notices extended.
+Fifteen complete originals: boot-planes-20260911. Current evidence:
+boot_planes_checkpoint in Docs/Drivers/GrafikFirmware07910.json.
+
+Physical surface/context resolution, color/cursor preservation, native
+recovery/modesetting and firmware start remain open. OssiPC offline/untouched.
+
+Previous boot display state capture (NVIDIA 0.1.35):
 
 The explicit boot-check captures the armed head/SOR state before its first
 PRAMIN window write. It borrows the existing full BAR0 map, reads only fused
