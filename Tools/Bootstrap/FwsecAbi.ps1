@@ -64,6 +64,6 @@ function Confirm-FwsecAbi([string]$Compiler,[string]$Source,[string]$Run,[string
     $result=Invoke-RmNative -Executable $exe -Arguments @() -WorkingDirectory $Run -LogPath (Join-Path $Stage 'fwsec-abi.json') -TimeoutSeconds 20
     if($result -ne 0){throw 'Zig firmware command, memory or message bytes differ from original NVIDIA C structures'}
     $abi=Get-Content -Raw (Join-Path $Stage 'fwsec-abi.json')|ConvertFrom-Json
-    if(!$abi.zig_c_byte_comparison -or !$abi.gsp_wpr_byte_comparison -or !$abi.gsp_init_byte_comparison -or !$abi.original_msgq_create_executed_on_host -or !$abi.gsp_message_byte_comparison -or $abi.gsp_message_fixtures -ne 6 -or !$abi.original_gsp_checksum_executed_on_host -or $abi.gpu_executed){throw 'Firmware ABI result invalid'}
+    if(!$abi.zig_c_byte_comparison -or !$abi.gsp_wpr_byte_comparison -or !$abi.gsp_init_byte_comparison -or !$abi.original_msgq_create_executed_on_host -or !$abi.gsp_message_byte_comparison -or $abi.gsp_message_fixtures -ne 6 -or !$abi.original_gsp_checksum_executed_on_host -or !$abi.gsp_ring_original_comparison -or $abi.gsp_ring_fixtures -ne 8 -or !$abi.original_msgq_link_submit_consume_executed_on_host -or $abi.gpu_executed){throw 'Firmware ABI result invalid'}
     return $abi
 }

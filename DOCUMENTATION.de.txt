@@ -9,6 +9,31 @@ Boardanschluesse. Die spaeteren PROM-Boots bestaetigen softwareseitig den
 unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
+GSP-Ringe und begrenzte Datensatzkopien (Host)
+--------------------------------------------
+gsp_ring.zig prueft die Geometrie beider 256-KB-Queues und deren getrennte
+RX-Headerpositionen. Swap gilt nur bei beidseitiger Zustimmung. Nullheader
+meldet NotReady; unbekannte Flags, ungueltige Offsets/Slotzahlen und Cursor
+werden abgewiesen. Normal sind63 Slots/62 nutzbar. Jede Nachricht belegt
+hoechstens16 Slots, verteilt auf maximal zwei zusammenhaengende Kopierbereiche.
+Gather prueft erst verfuegbare Slots und Prefix, dann den ganzen Datensatz.
+Scatter laesst den Queue-Schatten bei Zulassungsfehlern unveraendert. Kein
+Cursor-/Sequenzfortschritt, Ack oder echter Queue-Link; keine Allokationen.
+
+42/42 bestehende Besitzerfaelle bestanden. Acht Vergleichsfaelle mit originalen
+msgq-Instanzen bestaetigen alle vier Swap-Kombinationen, RX-Offsets32/64 sowie
+Slotpositionen und tatsaechlichen Submit-/Consume-Fortschritt am Ringende.
+Original-C/SB/FRTS/WPR/Init/Nachrichtenpruefungen ebenfalls bestanden.
+179 vollstaendige Originaldateien im Archiv gsp-ring-20260911; kein neues Gate,
+Gastlauf, Modulbau oder Hardwarekontakt. NVIDIA0.1.24 bleibt bytegleich.
+
+Live-Voraussetzung: Die bestehende DMA-API synchronisiert ganze Mappings.
+Bei bidirektionalem Bounce kopiert sie die volle requested_bytes-Laenge;
+das kann laufende Firmware-Aenderungen ueberschreiben. Vor Live-Einbindung
+direkte kohaerente Mappings mit geordnetem Daten-/Cursor-Handshake verlangen
+oder eine nachgewiesene Bereichssynchronisierung bereitstellen. Die bisherige
+Vorbereitung vor GPU-Einreichung bleibt gueltig. Noch kein Live-Bounce-Support.
+
 GSP-Nachrichtenformat (Host; Modul 0.1.24 unveraendert)
 ----------------------------------------------------
 gsp_message.zig prueft normale unverschluesselte GA106-Nachrichten fuer den

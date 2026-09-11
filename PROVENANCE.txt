@@ -3,6 +3,19 @@ Host/module scaffolding follows R4OS SDK and existing R4D owners.
 Firmware fixture bodies and signatures are synthetic. Selected measured
 table fields are explicit regression data, as described below.
 
+0.79.10 GSP ring admission and copy plans (host), 11.09.2026:
+gsp_ring.zig adapts layout, swap routing and cursor arithmetic from original
+msgq.c/msgq_priv.h (2018-2019 NVIDIA CORPORATION & AFFILIATES), preserving
+the full MIT notice. Original bounded admission/copy interfaces are Apache-2.0.
+The existing host ABI verifier operates two original msgq instances and compares
+eight routing/slot/submit/consume fixtures, without hardware callbacks.
+179 full original source/header/license files and the unchanged R4OS DMA owners
+are retained in ExFiles/Reference/GFX/Nvidia/0.79.10/gsp-ring-20260911.
+The current whole-mapping bounce synchronization cannot safely implement a live
+shared queue. This is a live-integration prerequisite, not a staging failure.
+The planner/CPU copies publish no cursors, acknowledgements or live linkage.
+NVIDIA.R4D0.1.24 and its packaged notices remain unchanged.
+
 0.79.10 GSP message framing (host), 11.09.2026:
 gsp_message.zig adapts header fields/assignment and checksum from the pinned
 message_queue_priv.h (2019-2022), message_queue_cpu.c (2019-2024),

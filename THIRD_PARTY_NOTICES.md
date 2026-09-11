@@ -14,6 +14,14 @@ their original licenses in the separate workspace reference archive.
 Fixture firmware bodies and signatures are synthetic; selected measured table
 metadata is regression data documented in PROVENANCE.txt.
 
+The host-qualified `src/gsp_ring.zig` adapts geometry, swap routing and
+cursor arithmetic from the pinned msgq.c/msgq_priv.h (2018-2019 NVIDIA
+CORPORATION & AFFILIATES) under the complete retained MIT notice. Original
+R4OS admission/copy interfaces are Apache-2.0. The existing optional ABI
+verifier executes original msgq operations only on host memory. All 179 full
+original dependency/source/license files accompany the gsp-ring-20260911 archive.
+This layer is not linked into NVIDIA.R4D0.1.24; packaged notices are unchanged.
+
 The host-qualified `src/gsp_message.zig` adapts the pinned message framing
 and checksum from message_queue_priv.h (2019-2022), message_queue_cpu.c
 (2019-2024), g_rpc-message-header.h (2008-2025), rpc_headers.h (2017-2024)

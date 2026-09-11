@@ -10,6 +10,24 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
+The host-qualified `gsp_ring.zig` layer admits command/status geometry and
+computes swap routing using each side's own RX-header offset. A zero peer
+header means not ready; unknown flags, invalid offsets/counts and out-of-range
+cursors are refused. The pinned queues hold 256 KB each, normally 63 slots
+with one slot reserved. Transfers cover at most 16 slots and two contiguous
+spans, including wraparound. Gathering accepts a complete validated message;
+scattering leaves the CPU queue shadow unchanged on admission failure.
+Neither operation publishes a cursor, sequence, acknowledgement or live link.
+
+The existing owner step now passes 42 cases. Eight fixtures match actual
+original msgq linking, slot lookup, submit and consume operations, including
+all four swap-flag combinations, RX offsets 32/64 and wraparound. This is host
+validation only. The current DMA API synchronizes entire mappings: live shared
+queues cannot use its bidirectional whole-buffer bounce copy. Before live
+integration, require direct coherent mappings with ordered publication or
+a proven range-sync contract. Pre-submission staging remains valid. No module,
+packaged license or OssiPC change was needed for this checkpoint.
+
 The host-qualified `gsp_message.zig` codec now frames the pinned cleartext
 GA106 GSP/RPC messages: a 48-byte outer header, 32-byte RPC header and at most
 16 complete 4-KB slots. Prefix admission bounds both element count and RPC

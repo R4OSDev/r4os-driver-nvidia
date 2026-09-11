@@ -7,6 +7,95 @@ const radix = @import("gsp_radix.zig");
 const wpr = @import("gsp_wpr.zig");
 const init = @import("gsp_init.zig");
 const message = @import("gsp_message.zig");
+const ring = @import("gsp_ring.zig");
+
+test "GSP rings admit peer geometry and plan whole records without publishing cursors" {
+    var command: [32]u8 = undefined;
+    var status: [32]u8 = undefined;
+    for ([_]u32{ 0, 262144, 4096, 63, 0, 1, 32, 4096 }, 0..) |value, index| put(&command, index, value);
+    status = command;
+    put(&status, 6, 64);
+    for (0..4) |flags| {
+        put(&command, 5, @intCast(flags & 1));
+        put(&status, 5, @intCast((flags >> 1) & 1));
+        const link = try ring.inspectLink(&command, &status);
+        try t.expectEqual(flags == 3, link.swapped);
+        try t.expectEqualDeep(ring.Location{ .queue = if (flags == 3) .status else .command, .offset = if (flags == 3) 64 else 32 }, link.command_read);
+        try t.expectEqualDeep(ring.Location{ .queue = if (flags == 3) .command else .status, .offset = if (flags == 3) 32 else 64 }, link.status_read);
+    }
+    const geometry = (try ring.inspect(&command)).layout;
+    const zero: [32]u8 = @splat(0);
+    try t.expectError(error.NotReady, ring.inspectLink(&command, &zero));
+    try t.expectError(error.Length, ring.inspect(command[0..31]));
+    const Invalid = struct { index: usize, value: u32, failure: anyerror = error.Header };
+    for ([_]Invalid{
+        .{ .index = 0, .value = 1 },          .{ .index = 1, .value = 262143 },                      .{ .index = 2, .value = 8192 },
+        .{ .index = 3, .value = 64 },         .{ .index = 4, .value = 63, .failure = error.Cursor }, .{ .index = 5, .value = 2 },
+        .{ .index = 6, .value = 31 },         .{ .index = 6, .value = 33 },                          .{ .index = 6, .value = 4096 },
+        .{ .index = 6, .value = 0xfffffffc }, .{ .index = 7, .value = 4095 },                        .{ .index = 7, .value = 0xfffff000 },
+    }) |case| {
+        var bad = status;
+        put(&bad, case.index, case.value);
+        try t.expectError(case.failure, ring.inspect(&bad));
+    }
+    try t.expectEqual(@as(u32, 62), (try ring.transmit(geometry, 0, 0, 16)).available_before);
+    try t.expectError(error.Unavailable, ring.transmit(geometry, 62, 0, 1));
+    try t.expectError(error.Unavailable, ring.receive(geometry, 0, 0, 1));
+    try t.expectError(error.Cursor, ring.receive(geometry, 63, 0, 1));
+    try t.expectError(error.Cursor, ring.transmit(geometry, 0, 63, 1));
+    try t.expectError(error.Elements, ring.receive(geometry, 0, 40, 0));
+    try t.expectError(error.Elements, ring.receive(geometry, 0, 40, 17));
+    try t.expectEqual(@as(u32, 0), (try ring.transmit(geometry, 62, 40, 1)).next_cursor);
+    var invalid_layout = geometry;
+    invalid_layout.slots = 0;
+    try t.expectError(error.Header, ring.receive(invalid_layout, 0, 0, 1));
+    const profile = message.Profile{ .chip_id = 0x176 };
+    const queue = try t.allocator.alloc(u8, ring.queue_bytes);
+    defer t.allocator.free(queue);
+    const encoded = try t.allocator.alloc(u8, message.max_bytes);
+    defer t.allocator.free(encoded);
+    const scratch = try t.allocator.alloc(u8, message.max_bytes);
+    defer t.allocator.free(scratch);
+    @memset(scratch, 0x39);
+    _ = try message.encode(profile, 0xffffffff, .{ .function = 0x1234 }, scratch[0..message.max_payload_bytes], encoded);
+    @memset(queue, 0xa5);
+    const sent = try ring.scatter(profile, geometry, 60, 40, 0xffffffff, encoded, queue);
+    try t.expectEqual(@as(u32, 42), sent.available_before);
+    try t.expectEqual(@as(u32, 13), sent.next_cursor);
+    try t.expectEqual(@as(usize, 2), sent.span_count);
+    try t.expectEqualDeep(ring.Span{ .offset = 61 * 4096, .bytes = 3 * 4096 }, sent.spans[0]);
+    try t.expectEqualDeep(ring.Span{ .offset = 4096, .bytes = 13 * 4096 }, sent.spans[1]);
+    try t.expect(std.mem.allEqual(u8, queue[0..4096], 0xa5));
+    try t.expect(std.mem.allEqual(u8, queue[14 * 4096 .. 61 * 4096], 0xa5));
+    const received = try ring.gather(profile, geometry, 60, 14, 0xffffffff, queue, scratch);
+    try t.expectEqual(@as(u32, 17), received.plan.available_before);
+    try t.expectEqual(@as(u32, 13), received.plan.next_cursor);
+    try t.expectEqualSlices(u8, encoded, scratch);
+    try t.expect(std.mem.allEqual(u8, received.record.payload, 0x39));
+    const baseline = try t.allocator.dupe(u8, queue);
+    defer t.allocator.free(baseline);
+    try t.expectError(error.Unavailable, ring.scatter(profile, geometry, 60, 61, 0xffffffff, encoded, queue));
+    try t.expectError(error.Sequence, ring.scatter(profile, geometry, 60, 40, 0, encoded, queue));
+    try t.expectEqualSlices(u8, baseline, queue);
+    @memset(scratch, 0xa5);
+    try t.expectError(error.Unavailable, ring.gather(profile, geometry, 60, 12, 0xffffffff, queue, scratch));
+    try t.expect(std.mem.allEqual(u8, scratch, 0xa5));
+    try t.expectError(error.Output, ring.gather(profile, geometry, 60, 14, 0xffffffff, queue, scratch[0..65535]));
+    try t.expectError(error.Overlap, ring.gather(profile, geometry, 60, 14, 0xffffffff, queue, queue[0..65536]));
+    try t.expectError(error.Sequence, ring.gather(profile, geometry, 60, 14, 0, queue, scratch));
+    queue[61 * 4096 + 32] ^= 1;
+    try t.expectError(error.Checksum, ring.gather(profile, geometry, 60, 14, 0xffffffff, queue, scratch));
+    queue[61 * 4096 + 32] ^= 1;
+    try t.expectEqualSlices(u8, baseline, queue);
+    put(queue[61 * 4096 ..], 10, 17);
+    @memset(scratch, 0xa5);
+    try t.expectError(error.Elements, ring.gather(profile, geometry, 60, 14, 0xffffffff, queue, scratch));
+    try t.expect(std.mem.allEqual(u8, scratch, 0xa5));
+    @memcpy(queue[4096..][0..encoded.len], encoded);
+    @memcpy(baseline, queue);
+    try t.expectError(error.Overlap, ring.scatter(profile, geometry, 0, 40, 0xffffffff, queue[4096..][0..encoded.len], queue));
+    try t.expectEqualSlices(u8, baseline, queue);
+}
 
 test "GSP message framing bounds complete records before checksum and preserves caller state" {
     const profile = message.Profile{ .chip_id = 0x176 };
