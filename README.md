@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-Passive NVIDIA display driver for R4OS. Module 0.1.44; original R4OS code is
+Passive NVIDIA display driver for R4OS. Module 0.1.47; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -11,6 +11,32 @@ Starting with R4OS 0.79.9, `IMAGE_SCOPE=slim` includes the current module in
 Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
+
+PROM lifetime (NVIDIA 0.1.47, 2026-09-11):
+
+The verified PROM window is released before the retained CPU copy reaches
+FWSEC/boot-check, allowing its shared BAR0 map. Cleanup failure retains the
+window state and allocation. The existing lifecycle fixture now checks this
+order, including failed unmap/collect; all 51 owner cases and the build pass.
+OssiPC captures the boot image, VGA workspace and direct BAR1 mapping, then
+rejects the display instance with Control. The display hold remained pending;
+full boot-check and automatic recovery are still unverified. A config-only
+SYSUPD restore returned the machine to passive bootfb with zero pending owner.
+No GPU firmware was executed. Details and complete evidence are maintained
+in the 0.79.10 prom-release-20260911 checkpoint.
+
+GPIO4.1 compatibility (NVIDIA 0.1.46, 2026-09-11):
+
+The measured GA106 advertises GPIO header `41 06 24 06`: 36 entries with
+six bytes each. The reader accepts this form alongside the existing four-
+and five-byte formats. It follows the declared stride, decodes the known
+prefix and preserves the sixth byte as opaque `extension_byte` metadata.
+The complete table remains bounds/overlap checked. The rejection trace now
+includes its GPIO header; inspect-vbios schema 5 exposes the retained byte.
+This adds no native GPIO access, display takeover or firmware execution.
+The existing owner case covers all 36 records, truncated input and the
+last byte; no extra test case or gate was added. Hardware evidence and
+source references are recorded with the 0.79.10 integration checkpoint.
 
 RM connector/resource topology (source preparation, 2026-09-11):
 

@@ -65,6 +65,7 @@ pub fn inspect(rom: []const u8, sink: anytype) void {
     smallTable(image, selected_offset, dcb_offset, "dcb", sink);
     smallTable(image, selected_offset, le16(dcb, 4), "ccb", sink);
     smallTable(image, selected_offset, le16(dcb, 0x14), "connectors", sink);
+    smallTable(image, selected_offset, le16(dcb, 0x0a), "gpio", sink);
 }
 
 fn smallTable(image: []const u8, base: usize, offset: usize, label: []const u8, sink: anytype) void {

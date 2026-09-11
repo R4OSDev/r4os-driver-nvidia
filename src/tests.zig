@@ -399,6 +399,36 @@ fn checkGpioTopology(rom: *const [1024]u8) !void {
     checksum(&image, 1023);
     const board = try vbios.parse(&image, 0x2504);
     try t.expectEqualDeep(saved.hpd, board.gpio_table.?.hpd);
+    // OssiPC GPIO header: 41 06 24 06. The sixth byte is opaque, while
+    // records must advance by six rather than aliasing the next entry.
+    var extended: [6 + 36 * 6]u8 = .{0} ** (6 + 36 * 6);
+    @memcpy(extended[0..4], &[_]u8{ 0x41, 6, 36, 6 });
+    for (0..36) |i| {
+        extended[6 + i * 6 + 1] = 0xff;
+        extended[6 + i * 6 + 5] = @intCast(i + 128);
+    }
+    for (0..7) |i| @memcpy(extended[6 + i * 6 ..][0..5], table[6 + i * 5 ..][0..5]);
+    const extended_saved = try gpio.parse(&extended, 0);
+    try t.expectEqual(@as(u16, extended.len), extended_saved.byte_length);
+    try t.expectEqualDeep(saved.hpd, extended_saved.hpd);
+    for (0..36) |i| {
+        const item = try extended_saved.entry(i);
+        try t.expectEqual(@as(?u8, @intCast(i + 128)), item.extension_byte);
+        try t.expectEqualSlices(u8, extended[6 + i * 6 ..][0..6], &extended_saved.raw[i]);
+    }
+    try t.expect((try saved.entry(0)).extension_byte == null);
+    try t.expectError(error.Bounds, extended_saved.entry(36));
+    for (0..extended.len) |len| try t.expectError(error.Bounds, gpio.parse(extended[0..len], 0));
+    @memcpy(image[0x220..][0..extended.len], &extended);
+    checksum(&image, 1023);
+    const extended_board = try vbios.parse(&image, 0x2504);
+    var expected_extended = extended_saved;
+    expected_extended.offset = 0x220;
+    try t.expectEqualDeep(expected_extended, extended_board.gpio_table.?);
+    extended[6 + 35 * 6 + 5] = 0;
+    try t.expectEqual(@as(?u8, 163), (try extended_saved.entry(35)).extension_byte);
+    try t.expectError(error.Bounds, gpio.decode(0x40, extended_saved.raw[0][0..6]));
+    try t.expectError(error.Bounds, gpio.decode(0x41, extended_saved.raw[0][0..4]));
     table[7] = 0xff;
     try t.expectEqual(@as(u8, 7), (try saved.entry(0)).function);
     table[7] = 7;

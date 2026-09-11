@@ -57,6 +57,10 @@ pub const hpd_functions = [_]u8{ 7, 8, 81, 82, 94, 95, 96 };
 pub const Entry = struct {
     raw: u32,
     extra: ?u8,
+    // Six-byte GPIO4.1 entries are present on the measured GA106. Nouveau
+    // advances by the advertised stride and decodes the same five-byte
+    // prefix. Retain the remaining byte without inventing its semantics.
+    extension_byte: ?u8,
     line: u8,
     function: u8,
     dedicated_lock: bool,
@@ -99,25 +103,26 @@ pub const Catalog = struct {
     // External expander tables are not read/resolved by this internal table
     // reader. A missing internal function is not proof it is absent there.
     external_table_offset: ?u16 = null,
-    raw: [max_entries][5]u8 = .{[_]u8{0} ** 5} ** max_entries,
+    raw: [max_entries][6]u8 = .{[_]u8{0} ** 6} ** max_entries,
     hpd: [7]Hpd = .{Hpd{}} ** 7,
 
     pub fn entry(self: *const Catalog, index: usize) Error!Entry {
         if (index >= self.count) return error.Bounds;
-        if (self.entry_bytes > 5) return error.Limit;
+        if (self.entry_bytes > 6) return error.Limit;
         return decode(self.version, self.raw[index][0..self.entry_bytes]);
     }
 };
 
 pub fn decode(version: u8, bytes: []const u8) Error!Entry {
     if (version != 0x40 and version != 0x41) return error.Version;
-    if (bytes.len != (if (version == 0x41) @as(usize, 5) else 4)) return error.Bounds;
+    if (!supportedStride(version, bytes.len)) return error.Bounds;
     const raw = std.mem.readInt(u32, bytes[0..4], .little);
     const modern = version == 0x41;
     const extra: u8 = if (modern) bytes[4] else 0;
     return .{
         .raw = raw,
         .extra = if (modern) extra else null,
+        .extension_byte = if (bytes.len == 6) bytes[5] else null,
         .line = @intCast(raw & (if (modern) @as(u32, 63) else 31)),
         .function = @truncate(raw >> 8),
         .dedicated_lock = modern and raw & 64 != 0,
@@ -142,7 +147,7 @@ pub fn parse(image: []const u8, offset: u16) Error!Catalog {
     const size = header[1];
     const count = header[2];
     const stride = header[3];
-    if (size < 6 or size > 64 or stride != (if (version == 0x41) @as(u8, 5) else 4)) return error.Limit;
+    if (size < 6 or size > 64 or !supportedStride(version, stride)) return error.Limit;
     const length = @as(usize, size) + @as(usize, count) * stride;
     const bytes = try span(image, offset, length);
     const external = std.mem.readInt(u16, bytes[4..6], .little);
@@ -178,6 +183,10 @@ pub fn parse(image: []const u8, offset: u16) Error!Catalog {
         }
     }
     return result;
+}
+
+fn supportedStride(version: u8, bytes: usize) bool {
+    return if (version == 0x41) bytes == 5 or bytes == 6 else bytes == 4;
 }
 
 fn span(bytes: []const u8, offset: usize, length: usize) Error![]const u8 {

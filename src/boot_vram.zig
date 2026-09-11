@@ -57,7 +57,9 @@ pub const Capture = struct {
         const adapter = 0x01000000 | (@as(u32, snapshot.pci.bus) << 8) | (@as(u32, snapshot.pci.device) << 3) | snapshot.pci.function;
         const boot = try self.boot.captureGuarded(ctx, adapter, .{ .context = @intFromPtr(self), .callback = recoverWindow });
         self.original_boot = boot.boot;
-        try self.registers.open(ctx, snapshot, chip);
+        const mapped = self.registers.open(ctx, snapshot, chip);
+        self.last_status = self.registers.last_status;
+        try mapped;
         try self.register_access.acquire(&self.registers, ctx, snapshot, chip);
         // Reobserve the complete supported preflight under the held display.
         const raw = try self.preflight.readShared(ctx, snapshot, chip, &self.registers);

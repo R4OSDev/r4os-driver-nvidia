@@ -440,7 +440,10 @@ fn apiTable() a.DriverApi {
 fn log(text: [*:0]const u8) callconv(.c) void {
     if (std.mem.indexOf(u8, std.mem.span(text), "chip=GA106") != null) state.chip_reported = true;
     if (std.mem.indexOf(u8, std.mem.span(text), "lock=verified") != null) state.lock_verified = true;
-    if (std.mem.indexOf(u8, std.mem.span(text), "vbios: verified source=PROM") != null) state.rom_reported = true;
+    if (std.mem.indexOf(u8, std.mem.span(text), "vbios: verified source=PROM") != null) {
+        std.debug.assert(!state.prom_mapping and !state.private_mapping and cpu_backing != null);
+        state.rom_reported = true;
+    }
     if (std.mem.indexOf(u8, std.mem.span(text), "fwsec: catalog=parsed") != null) state.fwsec_reported = true;
     if (std.mem.indexOf(u8, std.mem.span(text), "fwsec: unavailable") != null) state.fwsec_rejected = true;
     if (std.mem.indexOf(u8, std.mem.span(text), "fwsec: cpu-image=prepared") != null) state.stage_prepared = true;
@@ -579,7 +582,7 @@ fn map(request: *const a.GfxMmioRequest, output: *a.GfxMmioWindow) callconv(.c) 
     }
     if (request.byte_offset == 0x820000 or request.byte_offset == 0x824000) {
         const index: usize = if (request.byte_offset == 0x820000) 0 else 1;
-        std.debug.assert(state.fuse_fixture and state.prom_mapping and !state.mapping and !state.fuse_mapping[index] and
+        std.debug.assert(state.fuse_fixture and state.prom_seen and !state.prom_mapping and !state.mapping and !state.fuse_mapping[index] and
             request.resource_base == 0xe0000000 and request.resource_bytes == 16 * 1024 * 1024 and
             request.byte_length == 4096 and request.cache_policy == a.gfx_buffer_cache_uncached);
         state.maps += 1;
@@ -808,7 +811,7 @@ test "NVIDIA actual driver lifecycle reads bounded PROM and retains each failed 
         }
         const result = driver.nvidia_init(&api);
         try t.expectEqual(@as(i32, if (fault == 0 or fault >= 8) 0 else -10), result);
-        try t.expectEqual(fault == 0 or (fault >= 4 and fault <= 6) or fault >= 8, state.rom_reported);
+        try t.expectEqual(fault == 0 or fault == 6 or fault >= 8, state.rom_reported);
         try t.expectEqual(fault == 8, state.fwsec_reported);
         if (fault == 0 or fault == 9) try t.expect(state.fwsec_rejected);
         if (fault == 1) try t.expect(state.full_rom_record);

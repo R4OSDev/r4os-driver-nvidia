@@ -6,7 +6,7 @@ const identity = @import("identity.zig");
 const vbios = @import("vbios.zig");
 const a = r4os.abi;
 pub const prom_offset = 0x300000;
-pub const Error = error{ UnmeasuredRange, Api, Memory, Mapping, Clock, Deadline, Unstable };
+pub const Error = error{ UnmeasuredRange, Api, Memory, Mapping, Clock, Deadline, Unstable, Cleanup };
 
 pub fn admitted(snapshot: *const identity.Snapshot, chip: identity.Chip) bool {
     const bar = snapshot.bars[0];
@@ -68,15 +68,16 @@ pub const Capture = struct {
         const finish = clock.nowNs();
         if (finish == std.math.maxInt(u64) or finish < previous) return error.Clock;
         if (finish >= deadline) return error.Deadline;
+        // FWSEC uses only the CPU copy. Its shared BAR0 owner also covers
+        // PROM, so release the window before exposing the copy to callers.
+        // Failed cleanup retains the window and CPU allocation for shutdown.
+        if (!self.releaseWindow()) return error.Cleanup;
         self.complete = true;
         const bytes: [*]const u8 = @ptrFromInt(self.allocation.cpu_address);
         return bytes[0..vbios.max_rom_bytes];
     }
 
-    // The caller must finish parsing/logging before close invalidates the view.
-    // Failed unmap/collect/free retains its exact state for the same shutdown.
-    pub fn close(self: *Capture) bool {
-        self.complete = false;
+    fn releaseWindow(self: *Capture) bool {
         if (self.memory) |memory| {
             if (self.window.handle.id != 0) {
                 if (memory.mmioUnmap(&self.window.handle, 1) != a.gfx_buffer_result_ok) return false;
@@ -85,6 +86,14 @@ pub const Capture = struct {
             if (self.cleanup_needed and memory.collect() != a.gfx_buffer_result_ok) return false;
             self.cleanup_needed = false;
         }
+        return self.window.handle.id == 0 and !self.cleanup_needed;
+    }
+
+    // The caller must finish parsing/logging before close invalidates the view.
+    // Failed unmap/collect/free retains its exact state for the same shutdown.
+    pub fn close(self: *Capture) bool {
+        self.complete = false;
+        if (!self.releaseWindow()) return false;
         if (self.allocation.handle != 0) {
             const heap = self.heap orelse return false;
             if (heap.release(self.allocation.handle) != a.driver_heap_ok) return false;

@@ -1,5 +1,12 @@
 ﻿Original R4OS implementation for roadmap 0.79.9, 10.09.2026.
 
+GPIO stride compatibility (NVIDIA 0.1.46, 2026-09-11):
+Measured OssiPC header 41 06 24 06 plus the existing pinned Nouveau gpio.c
+stride/prefix reader and NVIDIA DCB specification. Complete existing MIT
+notices remain in the source, R4D resource and Distribution. The sixth byte
+is retained without assigned semantics. R4OS bounds and synthetic fixtures
+are Apache-2.0. No newly imported code or firmware resource.
+
 RM topology discovery (0.79.12, 2026-09-11):
 Six complete pinned NVIDIA/NVKMS/Nouveau originals under topology-20260911.
 Three full original MIT notices accompany the new owner; display controls

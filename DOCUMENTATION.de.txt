@@ -2,6 +2,58 @@
 ===================================
 
 Stand: 11.09.2026; passive Hardwareaufnahme 0.79.9 abgeschlossen.
+
+PROM-Fenster vor Boot-Sicherung freigeben (NVIDIA 0.1.47)
+----------------------------------------------------------
+Nach zwei identischen PROM-Lesungen wird das MMIO-Fenster freigegeben,
+bevor der Aufrufer die weiterhin gehaltene CPU-Kopie erhaelt. Damit kann
+boot-check den gemeinsamen BAR0-Besitzer oeffnen. Fehlgeschlagene Unmap- /
+Collect-Aufrufe behalten ihren Zustand fuer den Abbau; boot_vram meldet
+jetzt auch den urspruenglichen BAR0-Fehlerstatus. 51 bestehende Besitzer-
+faelle und die beiden gezielten NVIDIA-/DISPLAYD-Modulbuilds bestanden.
+
+OssiPC: Sicherung von 8294400 Bootbild-Bytes und 131072 VGA-/VRAM-Bytes,
+zwei zurueckgestellte PRAMIN-Fensterwrites; BAR1 ist direkt physisch mit
+einem Bereich und ohne Tabellenseiten. Danach Abbruch bei Display-Kontext
+Control. Der Zustand blieb preparing/pending-owner8; automatischer Abbau
+ist fuer diesen Pfad NICHT bestaetigt. Keine GPU-Firmwareausfuehrung.
+SYSUPD-Batch6 stellte die bytegleiche passive Konfiguration wieder her:
+NVIDIA47/DISPLAYD10, bootfb1920x1080, generation1/reset0/owner0, kein
+pending-owner, 14 automatische Dienste ohne Fehler. Hisense bleibt aus.
+
+DISPLAYD /NVIDIA [Text] filtert vollstaendige Bootzeilen ohne Beachtung
+der Gross-/Kleinschreibung, maximal128 Filterbytes. Treffer und Nichttreffer
+sind physisch belegt. Vollstaendige Kataloge werden per SFTP gesichert;
+lange Konsolenausgaben koennen abgeschnitten sein. Naechster Schritt:
+Instanz-Steuerwerte und gehaltene Abbauphase gezielt erfassen. Belege:
+ExFiles/Reference/GFX/Nvidia/0.79.10/prom-release-20260911.
+
+GPIO4.1-Sechs-Byte-Eintraege (NVIDIA 0.1.46; 11.09.2026)
+--------------------------------------------------------
+Der Startfehler nach dem Release-Update ist behoben. Diagnose0.1.45 liest
+auf OssiPC den Header 41 06 24 06 bei 0x3fcf: Version4.1, Header6,36
+Eintraege mit je6 Bytes.0.1.44 hatte ausschliesslich5 Bytes akzeptiert.
+Der Leser folgt nun der gemessenen Schrittweite und dem bekannten
+Fuenf-Byte-Praefix des gepinnten Nouveau-Lesers. Das sechste Byte bleibt
+als extension_byte ohne erfundene Bedeutung erhalten. Vollstaendige
+Bereichs-/Ueberlappungspruefung und unabhaengige Kopien bleiben bestehen.
+inspect-vbios verwendet Schema5; die Ablehnungsdiagnose zeigt auch GPIO.
+
+51 bestehende Faelle, gezielter Modulbuild und vorhandener Inspektor
+bestanden; keine neuen Faelle/Gates. Die bestehende Probe deckt jetzt
+36 Sechs-Byte-Eintraege, nichtnull Erweiterungen, letzten Eintrag,
+Kopierisolation und abgeschnittene Eingaben ab. Ein falscher erwarteter
+Fixture-Offset wurde vor dem erfolgreichen Lauf korrigiert.
+
+OssiPC: erfolgreicher passiver Bind mit222 GPIO-Bytes/36 Eintraegen,
+resources=0, bootfb1920x1080/generation1/reset0/owner0 und14 automatische
+Dienste ohne Fehler. Vier HPD-Funktionen sind vorhanden, nach derzeitiger
+Praefixpruefung aber kein gueltiger Eingang; Pegel/Verbindung bleiben
+ungemessen. Kein Firmwareboot oder sichtbarer Bild-/Tonnachweis.
+Belege und zwei vollstaendige gepinnte Quellen:
+ExFiles/Reference/GFX/Nvidia/0.79.10/gpio-stride-20260911.
+Die folgenden Zwischenstaende dokumentieren die Historie.
+
 GA106/A1, Subsystem 1458:4074 und aktuelle ReBAR-Bereiche wurden mit
 NVIDIA 0.1.11 / Kernel 0.1.147 gemessen; der User bestaetigt normales Bild.
 NVIDIA 0.1.14 liest VBIOS 94.06.2f.00.d6 und sechs DCB-Routen fuer vier

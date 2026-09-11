@@ -42,7 +42,7 @@ pub fn main(init: std.process.Init) !void {
         gpio_entries[i] = try gpio.entry(i);
     };
     const report = .{
-        .schema = 4,
+        .schema = 5,
         .source = "supplied-file",
         .sha256 = digest_hex[0..],
         .hardware_verified = false,
