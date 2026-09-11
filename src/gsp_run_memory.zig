@@ -36,6 +36,8 @@ pub const Lease = struct {
     allocations: [7]u64 = @splat(0),
     mappings: [map_count]Stamp = undefined,
     mapped_count: usize = 0,
+    log_owner: usize = 0,
+    last_log_status: i32 = 0,
     retained: bool = false,
     failed: bool = false,
 
@@ -185,6 +187,43 @@ pub const Lease = struct {
         if (self.generation() == 0) return error.Stale;
         return .{ .context = self, .generation = portGeneration, .now_ns = portClock, .read = portRead, .publish = portPublish };
     }
+    /// Single serialized log reader. It borrows the same run as queues; no
+    /// additional allocation, task or device-lifetime authority is created.
+    pub fn borrowLogs(self: *Lease, owner: usize) !u64 {
+        if (owner == 0 or self.log_owner != 0) return error.Busy;
+        const epoch = self.generation();
+        if (epoch == 0) return error.Stale;
+        self.log_owner = owner;
+        return epoch;
+    }
+    pub fn releaseLogs(self: *Lease, owner: usize, epoch: u64) bool {
+        if (owner == 0 or self.log_owner != owner or self.queue.epoch != epoch or !self.matches()) return false;
+        self.log_owner = 0;
+        return true;
+    }
+    pub fn validateLogOutput(self: *const Lease, owner: usize, epoch: u64, output: []const u8) !void {
+        if (owner == 0 or self.log_owner != owner or epoch == 0 or self.generation() != epoch) return error.Stale;
+        const pointer = @intFromPtr(output.ptr);
+        if (pointer > std.math.maxInt(usize) - output.len) return error.LogAlias;
+        for (allocationsFor(self.boot_storage.?, self.init_storage.?, self.fwsec_storage.?, self.fwsec_sb_storage.?, self.booter_storage.?)) |allocation| {
+            if (overlap(pointer, output.len, allocation.cpu_address, allocation.byte_length)) return error.LogAlias;
+        }
+    }
+    pub fn logRead(self: *Lease, owner: usize, epoch: u64, index: usize, offset: usize, output: []u8) !void {
+        const geometry = @import("gsp_init.zig");
+        if (owner == 0 or self.log_owner != owner or epoch == 0 or self.generation() != epoch) return error.Stale;
+        if (index >= geometry.log_count or output.len == 0 or output.len > 4096 or
+            offset > geometry.log_bytes or output.len > geometry.log_bytes - offset) return error.LogRange;
+        try self.validateLogOutput(owner, epoch, output);
+        const storage = self.init_storage.?;
+        self.last_log_status = storage.context.?.syncDmaRangeForCpu(&storage.pieces[index + 1].mapping, @intCast(offset), @intCast(output.len));
+        if (self.last_log_status != 0) {
+            self.failed = true;
+            return error.Synchronization;
+        }
+        const source: [*]const u8 = @ptrFromInt(storage.allocation.cpu_address + geometry.logs_offset + index * geometry.log_bytes + offset);
+        @memcpy(output, source[0..output.len]);
+    }
     pub fn retainForDevice(self: *Lease) !void {
         if (self.generation() == 0) return error.Stale;
         self.retained = true; // Before the underlying latch, even on failure.
@@ -201,7 +240,7 @@ pub const Lease = struct {
     /// and verified. Lost-device, timeout and INIT_DONE do not authorize reuse.
     pub fn releaseBeforeSubmission(self: *Lease) bool {
         if (self.self_address == 0) return true;
-        if (self.retained or !self.matches()) return false;
+        if (self.retained or self.log_owner != 0 or !self.matches()) return false;
         if (!self.queue.releaseBeforeSubmission()) return false;
         self.boot_storage.?.execution_owner = 0;
         self.boot_storage.?.image.execution_owner = 0;

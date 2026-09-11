@@ -1,5 +1,15 @@
 ﻿# Third-Party Notices
 
+GSP raw firmware log reader (0.79.10, NVIDIA0.1.50, 2026-09-11):
+The Libos PUT counter and8191-word ring layout follow the pinned original
+570.144 liblogdecode.c. Its complete MIT notice (Rich Felker et al. and
+NVIDIA) remains in gsp_logs.zig and NVIDIA-GSP-LOG-LICENSE.txt, carried both
+as an R4D resource and in the Distribution legal directory. The official
+file was re-fetched and byte-matched; six complete references are retained
+under GFX/Nvidia/0.79.10/gsp-logs-20260911. No printf implementation, ELF
+metadata decoder or firmware string is newly imported. Original bounded
+R4OS observation, lifecycle and DMA integration: Apache-2.0.
+
 RM topology discovery (0.79.12, 2026-09-11):
 Six complete pinned NVIDIA/NVKMS/Nouveau originals under topology-20260911.
 Three full original MIT notices accompany the new owner; display controls

@@ -3,6 +3,36 @@
 
 Stand: 11.09.2026; passive Hardwareaufnahme 0.79.9 abgeschlossen.
 
+GSP-Protokollringe am gemeinsamen Lauf (NVIDIA 0.1.50)
+------------------------------------------------------
+Der begrenzte Leser verwendet die fuenf bereits gehaltenen Libos-DMA-Ringe.
+Je 64 KB enthalten einen PUT-Zaehler und 8191 Rohwoerter. Neue Woerter werden
+chronologisch kopiert; verlorene Woerter bleiben sichtbar. Ein erneuter
+PUT-Vergleich verwirft bewegte Proben ohne Fortschritt. Zaehlerregression
+und DMA-Synchronisationsfehler machen den gemeinsamen Lauf ungueltig.
+
+Maximal 4096 Bytes pro Zugriff, endliche Uhrpruefung davor/danach; keine
+Allokation, IRQ-Arbeit, Firmwarewrites oder Rueckschreibung des Zaehlers.
+Ausgabepuffer duerfen keine der sieben Laufallokationen ueberlappen. Der
+Leser haelt die Elternressourcen bis zum eigenen Abschluss; Polling kann
+pausieren. Rohproben sind weder atomare Firmware-Snapshots noch entschluesselte
+Protokollzeilen oder ein Health-/Ruhebeweis. ELF-Metadaten fehlen weiterhin.
+
+OssiPC: alle fuenf initialen Zaehler mit insgesamt 80 lesenden DMA-Bytes als
+null bestaetigt; vollstaendiger boot-check und Abbau mappings0/pins0/cpu0
+bestanden. Batch 11 prueft, Batch 12 stellt die bytegleiche passive Konfiguration
+wieder her: bootfb1920x1080, generation1/reset0/owner0, kein pending-owner,
+14 Dienste ohne Fehler. Hisense aus und mit Strom; kein Firmwareboot/Bild/Ton.
+
+51 bestehende Faelle, Modulbuild und vorhandene Distributions-Lizenzpruefung
+bestanden. Die gleiche Besitzergruppe deckt alle Ringe, Bounce-Lesen,
+Umlauf/Verlust, konkurrierende PUT-Aenderung, Pausen, Kopier-/Aliasfehler,
+Fristen und behaltene Ressourcen ab. Kein neues Gate. Original-Lizenzblock
+vor dem erfolgreichen Build in Zig-Zeilenkommentare umgesetzt. Die komplette
+MIT-Lizenz liegt im R4D und bytegleich in der Image-Injection; R4U lehnt
+allgemeine Datenpayloads ab. Sechs Originale samt Livebelegen:
+ExFiles/Reference/GFX/Nvidia/0.79.10/gsp-logs-20260911.
+
 Inaktive Displayinstanz und vollstaendige Vorbereitung (NVIDIA 0.1.49)
 --------------------------------------------------------------------
 STATUS_INVALID erzeugt einen explizit leeren Instanz-Snapshot. Bekannte

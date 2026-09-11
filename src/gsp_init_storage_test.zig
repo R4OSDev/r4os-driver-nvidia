@@ -20,6 +20,8 @@ var closing = false;
 var clock: u64 = 100;
 var range_failure: i32 = 0;
 var range_calls: usize = 0;
+const LogFault = enum { none, producer, timeout, regression };
+var log_fault: LogFault = .none;
 const offsets = [_]usize{ 0, 8192, 73728, 139264, 204800, 270336, 335872 };
 const lengths = [_]usize{ 8192, 65536, 65536, 65536, 65536, 65536, 528384 };
 fn address(index: usize) u64 {
@@ -136,12 +138,23 @@ fn unpin(pin_info: *a.DmaPinnedBuffer) callconv(.c) i32 {
 }
 
 fn rangeSync(mapping: *const a.DmaMapping, offset: u32, bytes: u32, cpu: bool) i32 {
-    std.debug.assert(mapping.handle == 0x2006 and maps[6] and pins[6]);
-    std.debug.assert(bytes != 0 and bytes <= 65536 and offset <= init.queue_allocation_bytes - bytes);
+    const index = mapping.handle - 0x2000;
+    std.debug.assert(index >= 1 and index <= 6 and maps[index] and pins[index]);
+    std.debug.assert(bytes != 0 and bytes <= 65536 and offset <= lengths[index] - bytes);
     range_calls += 1;
     if (range_failure != 0) return range_failure;
+    const device = if (fault == .bounce) shadow else backing.?;
+    if (index < 6) {
+        std.debug.assert(cpu); // Log readers must never publish or acknowledge.
+        if (offset != 0) switch (log_fault) {
+            .producer => { const put = device[offsets[index]..][0..8]; std.mem.writeInt(u64, put, std.mem.readInt(u64, put, .little) + 1, .little); },
+            .timeout => clock = 1000,
+            .regression => clock = 1,
+            .none => {},
+        };
+    }
     if (fault == .bounce) {
-        const start = init.queues_offset + offset;
+        const start = offsets[index] + offset;
         if (cpu) @memcpy(backing.?[start..][0..bytes], shadow[start..][0..bytes]) else @memcpy(shadow[start..][0..bytes], backing.?[start..][0..bytes]);
     }
     return 0;
@@ -641,6 +654,117 @@ const RangeNotification = struct {
     }
 };
 
+fn fillRawLog(index: usize, next: u64) void {
+    const logs = @import("gsp_logs.zig");
+    const device = if (fault == .bounce) shadow else backing.?;
+    const bytes = device[offsets[index + 1]..][0..init.log_bytes];
+    const first = next - @min(next, logs.capacity);
+    for (first..next) |word| std.mem.writeInt(u64, bytes[8 + (word % logs.capacity) * 8 ..][0..8], word ^ (@as(u64, index) << 48), .little);
+    std.mem.writeInt(u64, bytes[0..8], next, .little);
+}
+fn checkLogReader(memory: *@import("gsp_run_memory.zig").Lease) !void {
+    const logs = @import("gsp_logs.zig");
+    const output = try t.allocator.alloc(u8, logs.output_bytes);
+    defer t.allocator.free(output);
+    shadow = try t.allocator.alloc(u8, init.output_bytes);
+    defer t.allocator.free(shadow);
+    for ([_]Fault{ .none, .bounce }) |kind| {
+        fault = kind;
+        @memcpy(shadow, backing.?);
+        for (0..init.log_count) |index| fillRawLog(index, 0);
+        var reader: logs.Reader = .{};
+        try reader.open(memory);
+        var other: logs.Reader = .{};
+        try t.expectError(error.Busy, other.open(memory));
+        var copy = reader;
+        try t.expect(copy.generation() == 0 and !copy.close());
+        try t.expect(!memory.releaseBeforeSubmission() and !memory.init_storage.?.close());
+        const calls = range_calls;
+        try t.expectError(error.LogRange, reader.capture(init.log_count, 1000, output));
+        try t.expectError(error.LogRange, reader.capture(0, 1000, output[0..8]));
+        try t.expectError(error.LogAlias, reader.capture(0, 1000, backing.?[0..logs.output_bytes]));
+        const pack = memory.boot_storage.?.allocation;
+        const aliased: [*]u8 = @ptrFromInt(pack.cpu_address);
+        try t.expectError(error.LogAlias, reader.capture(0, 1000, aliased[0..logs.output_bytes]));
+        try reader.setPolling(false);
+        try t.expectError(error.Suspended, reader.capture(0, 1000, output));
+        try t.expect(!memory.releaseBeforeSubmission());
+        try reader.setPolling(true);
+        reader.busy = true; // Serialized reentrancy simulation, no second task.
+        try t.expectError(error.Busy, reader.capture(0, 1000, output));
+        try t.expectError(error.Busy, reader.setPolling(false));
+        try t.expect(!reader.close());
+        reader.busy = false;
+        try t.expectEqual(calls, range_calls);
+        const mapping = &memory.init_storage.?.pieces[5].mapping;
+        mapping.handle += 1;
+        try t.expectError(error.Stale, reader.capture(0, 1000, output));
+        try t.expect(!reader.close());
+        mapping.handle -= 1;
+        for (0..init.log_count) |index| {
+            const empty = try reader.capture(index, 1000, output);
+            try t.expect(empty.word_count == 0 and empty.next_word == 0 and empty.lost_words == 0);
+            const put = 3 + index;
+            fillRawLog(index, put);
+            const observed = try reader.capture(index, 1000, output);
+            try t.expect(observed.epoch == memory.generation() and observed.log == index and observed.first_word == 0 and observed.word_count == put);
+            for (0..put) |word| try t.expectEqual(word ^ (@as(u64, index) << 48), std.mem.readInt(u64, output[word * 8 ..][0..8], .little));
+            try t.expect((try reader.capture(index, 1000, output)).word_count == 0);
+        }
+        fillRawLog(0, logs.capacity + 7);
+        const wrapped = try reader.capture(0, 1000, output);
+        try t.expect(wrapped.first_word == 7 and wrapped.lost_words == 4 and wrapped.word_count == logs.capacity);
+        for (0..wrapped.word_count) |word| try t.expectEqual(@as(u64, word + 7), std.mem.readInt(u64, output[word * 8 ..][0..8], .little));
+        for ([_]LogFault{ .producer, .timeout, .regression }) |injection| {
+            const prior = reader.previous[0];
+            fillRawLog(0, prior + 4);
+            log_fault = injection;
+            @memset(output, 0x5a);
+            const expected = switch (injection) { .producer => error.ProducerChanged, .timeout => error.Timeout, .regression => error.ClockRegression, .none => unreachable };
+            try t.expectError(expected, reader.capture(0, 1000, output));
+            try t.expect(reader.previous[0] == prior and !reader.busy and !memory.failed);
+            try t.expect(std.mem.allEqual(u8, output, 0));
+            log_fault = .none;
+            clock = 100;
+            fillRawLog(0, prior + 4);
+            try t.expect((try reader.capture(0, 1000, output)).word_count == 4);
+        }
+        const before_deadline = range_calls;
+        try t.expectError(error.Timeout, reader.capture(0, 100, output));
+        try t.expectError(error.InvalidDeadline, reader.capture(0, std.math.maxInt(u64), output));
+        try t.expectEqual(before_deadline, range_calls);
+        try t.expect(reader.close() and reader.close() and memory.log_owner == 0);
+        try t.expectError(error.Stale, reader.capture(0, 1000, output));
+    }
+    fault = .none;
+    // Counter overflow is not silently folded into a new producer epoch.
+    var reader: logs.Reader = .{};
+    try reader.open(memory);
+    fillRawLog(0, std.math.maxInt(u64));
+    const edge = try reader.capture(0, 1000, output);
+    try t.expectEqual(std.math.maxInt(u64) - logs.capacity, edge.lost_words);
+    fillRawLog(0, 1);
+    try t.expectError(error.CounterRegression, reader.capture(0, 1000, output));
+    try t.expect(memory.failed and reader.generation() == 0 and !memory.releaseBeforeSubmission());
+    try reader.setPolling(false);
+    try t.expectError(error.Stale, reader.setPolling(true));
+    try t.expect(reader.close());
+}
+fn checkLogSyncFailure(memory: *@import("gsp_run_memory.zig").Lease) !void {
+    const logs = @import("gsp_logs.zig");
+    const output = try t.allocator.alloc(u8, logs.output_bytes);
+    defer t.allocator.free(output);
+    var reader: logs.Reader = .{};
+    try reader.open(memory);
+    range_failure = -123;
+    try t.expectError(error.Synchronization, reader.capture(0, 1000, output));
+    try t.expectEqual(@as(i32, -123), memory.last_log_status);
+    try t.expect(reader.previous[0] == 0 and memory.failed and !memory.releaseBeforeSubmission());
+    try t.expect(reader.close());
+    try t.expectError(error.Stale, reader.open(memory));
+    range_failure = 0;
+}
+
 test "firmware CPU storage complete run lease retains all boot DMA owners" {
     const run = @import("gsp_run_memory.zig");
     const boot_storage = @import("gsp_boot_storage.zig");
@@ -811,6 +935,10 @@ test "firmware CPU storage complete run lease retains all boot DMA owners" {
     try t.expectEqual(init_report.init.libos_address, inputs.resume_args.libos_dma);
     try t.expectEqual(@as(u32, 0x79), inputs.resume_args.app_version);
     try t.expectEqual(f.device.prepared_plan.?.imem.base, inputs.fwsec.imem.base);
+    try checkLogReader(&lease);
+    try t.expect(lease.failed and lease.log_owner == 0);
+    try t.expect(lease.releaseBeforeSubmission());
+    try lease.acquire(&ctx, &b, &storage, &f, &s, &p);
     const port = try lease.transportPort();
     var bytes: [32]u8 = @splat(0x79);
     try port.read(port.context, 1000, .status, 0, &bytes);
@@ -850,6 +978,9 @@ test "firmware CPU storage complete run lease retains all boot DMA owners" {
     try t.expect(b.execution_owner == 0 and b.image.execution_owner == 0 and f.device.execution_owner == 0 and s.device.execution_owner == 0 and storage.execution_owner == 0 and p.images[0].device.execution_owner == 0 and p.images[1].device.execution_owner == 0);
     try lease.acquire(&ctx, &b, &storage, &f, &s, &p);
     try t.expect(lease.generation() != epoch);
+    try checkLogSyncFailure(&lease);
+    try t.expect(lease.releaseBeforeSubmission());
+    try lease.acquire(&ctx, &b, &storage, &f, &s, &p);
     range_failure = -79;
     try t.expectError(error.Synchronization, port.read(port.context, 1000, .status, 0, &bytes));
     try t.expectEqual(@as(u64, 0), lease.generation());

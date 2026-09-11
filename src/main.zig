@@ -41,6 +41,8 @@ var boot_inputs: boot_resources.Inputs = .{};
 var boot_storage: gsp_boot_storage.Storage = .{};
 var init_storage: gsp_init_storage.Storage = .{};
 var run_memory: gsp_run_memory.Lease = .{};
+var firmware_logs: @import("gsp_logs.zig").Reader = .{};
+var firmware_log_words: [@import("gsp_logs.zig").output_bytes]u8 = undefined;
 var booters: booter_storage.Pair = .{};
 var boot_vram: @import("boot_vram.zig").Capture = .{};
 var boot_mapping: @import("boot_mapping.zig").Capture = .{};
@@ -720,6 +722,21 @@ fn stageBootInit(ctx: *const r4os.r4dev.DriverContext, chip_id: u16) bool {
         log("NVIDIA boot-init: rejected phase=run-memory reason={s} status={d} submitted=no", .{ @errorName(err), init_storage.last_queue_status });
         return false;
     };
+    firmware_logs.open(&run_memory) catch |err| {
+        log("NVIDIA boot-logs: rejected phase=owner reason={s} submitted=no", .{@errorName(err)});
+        return false;
+    };
+    for (0..gsp_init.log_count) |index| {
+        const observed = firmware_logs.capture(index, init_storage.deadline, &firmware_log_words) catch |err| {
+            log("NVIDIA boot-logs: rejected phase=read index={d} reason={s} status={d} submitted=no", .{ index, @errorName(err), run_memory.last_log_status });
+            return false;
+        };
+        if (observed.next_word != 0 or observed.word_count != 0 or observed.lost_words != 0) {
+            log("NVIDIA boot-logs: rejected phase=initial-state index={d} put={d} submitted=no", .{ index, observed.next_word });
+            return false;
+        }
+    }
+    log("NVIDIA boot-logs: reader=OK logs={d} capacity-words={d} counters=zero bytes=80 dma=read-only epoch={d} firmware-execution=disabled", .{ gsp_init.log_count, @import("gsp_logs.zig").capacity, firmware_logs.generation() });
     const bindings = run_memory.inputs() catch return false;
     if (bindings.fwsec_command != 0x15 or bindings.frts == null or !boot_vram_lease.validates(bindings.frts.?)) return false;
     const port = run_memory.transportPort() catch return false;
@@ -749,6 +766,7 @@ fn stageBootInit(ctx: *const r4os.r4dev.DriverContext, chip_id: u16) bool {
 }
 
 fn closeBootInit() bool {
+    if (!firmware_logs.close()) return false;
     if (!run_memory.releaseBeforeSubmission()) return false;
     if (!init_storage.close()) return false;
     return booters.close();

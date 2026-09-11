@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-Passive NVIDIA display driver for R4OS. Module 0.1.49; original R4OS code is
+Passive NVIDIA display driver for R4OS. Module 0.1.50; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -11,6 +11,26 @@ Starting with R4OS 0.79.9, `IMAGE_SCOPE=slim` includes the current module in
 Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
+
+Bounded GSP raw log reader (NVIDIA 0.1.50, 2026-09-11):
+
+One reader borrows the actual run across its five Libos DMA rings. It copies
+chronological raw words with 4096-byte reads, finite clocks and a final PUT
+comparison. Overwritten words are explicit; changed producers discard the
+sample, counter regression/DMA failures invalidate the run. Suspension keeps
+the loan; cleanup cannot release the parent until the reader closes. Output
+must not alias any of the seven run allocations. Raw observations do not
+establish atomic firmware snapshots, decoded strings, health or quiescence.
+
+All 51 existing cases and the module build pass; the existing complete-run
+case covers rings, bounce reads, loss/wrap, deadlines, aliases, suspension
+and retained cleanup. OssiPC reads all 5 initial counters (80 bytes) as zero,
+completes boot-check and releases all resources. Batch 12 restores the exact
+passive configuration; bootfb1920x1080 and 14 services without failure.
+Native firmware boot/IRQ/log/health integration and complete recovery remain
+open. Six complete originals, full MIT notices and hardware receipts are in
+0.79.10/gsp-logs-20260911. The license is embedded and staged in Distribution;
+standalone data payloads are unsupported by the current R4U contract.
 
 Inactive display instance (NVIDIA 0.1.49, 2026-09-11):
 
