@@ -7,6 +7,8 @@ const objects = @import("gsp_objects.zig");
 const sequencer = @import("gsp_sequencer.zig");
 const runtime_events = @import("gsp_runtime_events.zig");
 const event_objects = @import("gsp_event_objects.zig");
+const rm_graph = @import("gsp_rm_graph.zig");
+const rm_names = @import("gsp_rm_names.zig");
 const message = transport.message;
 const ring = transport.ring;
 const profile = message.Profile{ .chip_id = 0x176 };
@@ -661,7 +663,7 @@ fn startDisplay(model: *Model, session: *transport.Session) !display_rpc.Channel
 }
 fn displayReply(model: *Model, channel: *display_rpc.Channel, status: u32, value: u32) !void {
     var bytes: [display_rpc.max_request_bytes]u8 = undefined;
-    const encoded = try display_rpc.encode(display_object, channel.request.?, &bytes);
+    const encoded = try display_rpc.encode(channel.object, channel.request.?, &bytes);
     put(&bytes, 12, status);
     switch (channel.request.?) {
         .supported => {
@@ -1541,6 +1543,142 @@ fn checkEventObjects(model: *Model) !void {
     }
 }
 
+fn graphOperation(model: *Model, owner: *rm_graph.Owner, status: u32) !void {
+    try t.expect((try owner.poll()) == null);
+    switch (owner.state) {
+        .base_creating, .base_destroying => {
+            if (owner.base.outstanding == null) return;
+            try objectReply(model, &owner.base, status, false);
+        },
+        .events_creating, .events_destroying => {
+            if (owner.subscriptions.?.outstanding == null) return;
+            try eventReply(model, &owner.subscriptions.?, status);
+        },
+        .closed => return,
+        else => return error.InvalidGraphProgress,
+    }
+    try t.expect((try owner.poll()) == null);
+}
+fn graphCreate(model: *Model, owner: *rm_graph.Owner) !void {
+    for (0..9) |_| try graphOperation(model, owner, 0);
+    try t.expect(owner.state == .ready and owner.base.state == .loaned and owner.subscriptions.?.state == .ready);
+}
+fn graphDestroy(model: *Model, owner: *rm_graph.Owner) !boot_events.Handoff {
+    try owner.beginDestroy(deadline);
+    for (0..9) |_| try graphOperation(model, owner, 0);
+    try t.expect(owner.state == .closed and owner.base.state == .objects_closed);
+    return owner.finish(deadline);
+}
+fn checkRmGraph(model: *Model) !void {
+    // Bounded bookkeeping capacity is separate from consumed wire IDs.
+    var ledger = try rm_names.Ledger.init(7);
+    var leases: [rm_names.max_clients]rm_names.Lease = undefined;
+    for (&leases, 0..) |*lease, i| {
+        lease.* = try ledger.reserve(5);
+        try t.expectEqual(@as(u32, 0xc1d00000) + @as(u32, @intCast(i)), lease.client);
+        try t.expectEqual(@as(u32, 0x10000000) + @as(u32, @intCast(i * 5)), try lease.object(0));
+        try t.expectError(error.Bounds, lease.object(5));
+    }
+    const next_client = ledger.next_client;
+    const next_object = ledger.next_object;
+    try t.expectError(error.Exhausted, ledger.reserve(5));
+    try t.expect(next_client == ledger.next_client and next_object == ledger.next_object);
+    try ledger.retain(leases[0]);
+    try t.expectError(error.Retained, ledger.retire(leases[0]));
+    try ledger.retire(leases[1]);
+    const replacement = try ledger.reserve(5);
+    try t.expect(replacement.slot == leases[1].slot and replacement.client > leases[1].client and replacement.first_object > leases[1].first_object);
+    try t.expectError(error.Stale, ledger.validate(leases[1]));
+    var stale = replacement;
+    stale.epoch += 1;
+    try t.expectError(error.Stale, ledger.retire(stale));
+    var limits = try rm_names.Ledger.init(7);
+    try t.expectError(error.Bounds, limits.reserve(0));
+    limits.next_object = rm_names.object_end - 4;
+    try t.expectError(error.Exhausted, limits.reserve(5));
+    try t.expectEqual(@as(u32, 0), limits.next_client);
+    const last = try limits.reserve(4);
+    try t.expectEqual(rm_names.object_end - 1, try last.object(3));
+    try t.expectError(error.Exhausted, limits.reserve(1));
+    limits = try rm_names.Ledger.init(7);
+    limits.next_client = rm_names.client_mask;
+    try t.expectEqual(@as(u32, 0xc1d0ffff), (try limits.reserve(1)).client);
+    try t.expectError(error.Exhausted, limits.reserve(1));
+
+    var session: transport.Session = undefined;
+    var boot = try startBoot(model, &session);
+    try model.replyRpc(&session, .{ .function = 0x1001, .result = 0 }, &.{ 0, 0, 0, 0 });
+    try boot.complete((try boot.poll()).?.ticket);
+    var token = try boot.handoff(deadline);
+    try t.expectError(error.Payload, rm_graph.Owner.init(&token, 1, "bad\x00name", deadline));
+    try t.expect(!token.claimed and session.rm_names.next_client == 0);
+    var owner = try rm_graph.Owner.init(&token, 1, "R4OS display", deadline);
+    const canceled = owner.reservation;
+    const unsubmitted_calls = model.count;
+    token = try owner.cancelUnsubmitted(deadline);
+    try t.expect(model.count == unsubmitted_calls and !token.claimed and owner.state == .finished);
+    try t.expectError(error.Stale, session.rm_names.validate(canceled));
+    try t.expectError(error.State, owner.cancelUnsubmitted(deadline));
+    owner = try rm_graph.Owner.init(&token, 1, "R4OS display", deadline);
+    const first = owner.reservation;
+    try t.expect(first.client != canceled.client and first.first_object != canceled.first_object);
+    try t.expectError(error.State, rm_graph.Owner.init(&token, 1, "second", deadline));
+    try t.expectEqual(@as(u32, 2), session.rm_names.next_client);
+    try graphCreate(model, &owner);
+    var copied = owner;
+    try t.expectError(error.Stale, copied.loan(deadline));
+    try t.expect(session.state == .active);
+    var loan = try owner.loan(deadline);
+    var channel = try display_rpc.Channel.init(&loan.runtime, loan.object, deadline);
+    try t.expectError(error.State, owner.poll());
+    try t.expectError(error.State, owner.reclaim(&loan.runtime, deadline));
+    try channel.begin(.supported, deadline);
+    try t.expect((try channel.poll(deadline)) == null);
+    try displayReply(model, &channel, 0, 0x80000001);
+    try channel.complete((try channel.poll(deadline)).?.ticket);
+    var post: [40]u8 = undefined;
+    const payload = registeredPost(&post, .hotplug, true);
+    put(&post, 0, first.client);
+    put(&post, 4, try first.object(3));
+    try model.replyRpc(&session, .{ .function = 0x1003, .result = 0 }, payload);
+    _ = (try channel.poll(deadline)).?;
+    var delivery = try runtime_events.Dispatch.initDisplay(&channel, try owner.eventSink());
+    try delivery.step();
+    try t.expectEqual(@as(u32, 0x80000001), (try owner.takeChanges(deadline)).plug);
+    var returned = try channel.handoff(deadline);
+    try owner.reclaim(&returned, deadline);
+    model.count = 0;
+    token = try graphDestroy(model, &owner);
+    try t.expect(owner.state == .finished and !token.claimed and session.state == .active);
+    try t.expectError(error.Stale, session.rm_names.validate(first));
+    // A confirmed root rejection burns all reserved IDs, but retires the
+    // bookkeeping only after the explicit empty graph cleanup transition.
+    owner = try rm_graph.Owner.init(&token, 2, "rejected", deadline);
+    const rejected = owner.reservation;
+    try t.expect(rejected.client != first.client and rejected.first_object != first.first_object);
+    try graphOperation(model, &owner, 0x51);
+    try t.expect(owner.state == .rejected);
+    try session.rm_names.validate(rejected);
+    try owner.beginDestroy(deadline);
+    try t.expect((try owner.poll()) == null and owner.state == .closed);
+    token = try owner.finish(deadline);
+    try t.expectError(error.Stale, session.rm_names.validate(rejected));
+    owner = try rm_graph.Owner.init(&token, 3, "retained", deadline);
+    try t.expect(owner.reservation.client != rejected.client and owner.reservation.first_object != rejected.first_object);
+    model.count = 0;
+    try graphCreate(model, &owner);
+    try owner.beginDestroy(deadline);
+    try t.expect((try owner.poll()) == null);
+    try eventReply(model, &owner.subscriptions.?, 0x55);
+    try t.expectError(error.FirmwareResult, owner.poll());
+    try t.expect(owner.state == .failed and session.state == .failed and owner.base.state == .loaned);
+    try t.expectError(error.Retained, session.rm_names.retire(owner.reservation));
+    const calls = model.count;
+    try t.expectError(error.State, owner.finish(deadline));
+    try t.expectError(error.State, owner.poll());
+    try t.expectEqual(calls, model.count);
+}
+
 test "GSP transport orders range publication, explicit acknowledgement and terminal ambiguous failures" {
     const model = try t.allocator.create(Model);
     defer t.allocator.destroy(model);
@@ -1548,6 +1686,7 @@ test "GSP transport orders range publication, explicit acknowledgement and termi
     try checkObjects(model);
     try checkRuntimeEvents(model);
     try checkEventObjects(model);
+    try checkRmGraph(model);
     for (0..4) |flags| {
         var session = try model.start(@intCast(flags));
         // Device-only neighbour changes must survive CPU command publication.

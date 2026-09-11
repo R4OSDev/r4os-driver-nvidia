@@ -100,6 +100,9 @@ pub const Session = struct {
     rx_sequence: u32 = 0,
     next_ticket: u64 = 1,
     pending: ?Ticket = null,
+    // The sole RM namespace survives all Boot/Exchange/display handoffs.
+    // Only the serialized graph owner mutates it; transport I/O never does.
+    rm_names: @import("gsp_rm_names.zig").Ledger,
 
     /// Backing, port, scratch and this value are borrowed by one execution
     /// owner. Do not copy/rebind an active session or overlap its scratch with
@@ -110,7 +113,7 @@ pub const Session = struct {
         const a = @intFromPtr(tx);
         const b = @intFromPtr(rx);
         if ((if (a >= b) a - b else b - a) < message.max_bytes) return error.Overlap;
-        return .{ .port = port, .profile = profile, .epoch = epoch, .tx = tx, .rx = rx };
+        return .{ .port = port, .profile = profile, .epoch = epoch, .tx = tx, .rx = rx, .rm_names = try @import("gsp_rm_names.zig").Ledger.init(epoch) };
     }
     fn fail(self: *Session, err: Error) Error {
         self.state = .failed;

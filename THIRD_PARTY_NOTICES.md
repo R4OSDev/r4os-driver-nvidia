@@ -1,5 +1,12 @@
 ﻿# Third-Party Notices
 
+Session RM namespace and graph (0.79.12, 2026-09-11):
+Eight full pinned originals under rm-namespace-20260911. NVIDIA generated
+range definitions retain full MIT notices; Nouveau client/handle headers
+retain original copyright/SPDX plus the complete original Linux MIT text.
+R4OS bounded namespace/graph lifetime: Apache-2.0. NVIDIA44 byte-identical.
+
+
 RM display event objects (0.79.12, 2026-09-11):
 NVIDIA 570.144 event/RPC wire definitions and Nouveau allocation/routing: MIT.
 Thirteen full pinned originals under event-objects-20260911; eight full

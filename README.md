@@ -10,6 +10,28 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
+Session RM namespace and complete graph (source preparation, 2026-09-11):
+
+One namespace ledger now stays in the GSP Session across runtime handoffs.
+The canonical graph reserves root/device/subdevice/display/HPD/DP names
+before RM I/O, then owns creation, display loans and reverse cleanup through
+the existing protocol owners. Bookkeeping retires only after complete graph
+cleanup. Rejected allocations and unsubmitted cancellation consume IDs;
+uncertain teardown retains the graph and reservation. No within-run ID reuse.
+The client range follows Nouveau; object IDs avoid NVIDIA's RM/firmware
+generated ranges.64 simultaneous graphs and monotonic counters are bounded;
+exhaustion cannot partially consume a reservation. Live owner copies fail.
+Routing between multiple live graph sinks remains higher runtime owner work.
+
+51 existing cases and one module build pass; NVIDIA 0.1.44 remains byte-identical.
+Eight complete pinned originals, source notices and logs: ExFiles/Reference/
+GFX/Nvidia/0.79.12/rm-namespace-20260911. See rm_namespace_checkpoint in
+Docs/Drivers/GrafikFirmware07910.json. Two declaration-shadowing names were
+corrected before the passing rerun. No new grouped case/gate, ABI probe or
+guest run. Native bootstrap, internal RM/display-instance initialization,
+monitor refresh/recovery and physical graphics/audio remain open. OssiPC
+offline and untouched. A new Session still requires a new/quiesced GPU run.
+
 RM display event objects (source preparation for 0.79.12, 2026-09-11):
 
 The driver now owns bounded allocation, enable, disable and free sequences

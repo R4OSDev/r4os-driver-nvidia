@@ -10,6 +10,29 @@ unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
 
+Session-Namensraum und vollstaendiger RM-Graph (11.09.2026)
+----------------------------------------------------------
+Ein Namensverzeichnis bleibt jetzt in der GSP-Session ueber alle Uebergaben
+erhalten. Der kanonische Graph reserviert Root/Device/Subdevice/Display/HPD/
+DP vor RM-I/O und besitzt Erzeugung, Display-Ausleihe und rueckwaertigen
+Abbau ueber die vorhandenen Protokollbesitzer. Erst der vollstaendige Abbau
+gibt den Verwaltungseintrag frei. Abgelehnte Erzeugungen und ungesendete
+Abbrueche verbrauchen IDs; unklarer Abbau haelt Graph und Reservierung fest.
+Keine ID-Wiederverwendung im selben Lauf. Clientbereich nach Nouveau;
+Objekt-IDs liegen ausserhalb der generierten RM-/Firmwarebereiche.64 aktive
+Graphen und monotone Zaehler sind begrenzt; Erschoepfung verbraucht keine
+Teilreservierung. Kopierte aktive Besitzer werden vor Queue-Zugriff abgewiesen.
+Die Zuordnung zu mehreren lebenden Graph-Empfaengern bleibt weitere Arbeit.
+
+51 bestehende Faelle und ein Modulbuild bestanden; NVIDIA 0.1.44 bytegleich.
+Acht vollstaendige gepinnte Originale, Lizenzen und Logs: ExFiles/Reference/
+GFX/Nvidia/0.79.12/rm-namespace-20260911. Siehe rm_namespace_checkpoint in
+GrafikFirmware07910.json. Zwei Zig-Namensueberdeckungen vor dem erfolgreichen
+Wiederholungslauf korrigiert. Keine neuen Faelle/Gates/ABI-Proben/Gastlaeufe.
+Nativer Boot, interne RM-/Display-Instanzinitialisierung, Monitor-Refresh/
+Recovery und physische Grafik-/Audioabnahme offen. OssiPC offline/unberuehrt.
+Eine neue Session verlangt weiterhin einen neuen/nachweislich ruhenden Lauf.
+
 RM-Display-Eventobjekte (Quellvorbereitung fuer 0.79.12, 11.09.2026)
 -----------------------------------------------------------------
 Der Treiber besitzt nun begrenzte Allocate-/Enable-/Disable-/Free-Ablaeufe
