@@ -538,11 +538,15 @@ fn checkBoot(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Sna
         context_copy.address, context_copy.bytes, context_copy.surfaces, context_hash, context_copy.window_writes,
     });
     for (boot_context.surfaces[0..boot_context.surface_count]) |*surface| {
-        log("NVIDIA boot-surface: window={d} plane={d} eye={d} handle={x} instance-offset={x} vram={x} bytes={d} row-bytes={d} rows={d} layout={s}", .{
+        log("NVIDIA boot-surface: window={d} plane={d} eye={d} handle={x} instance-offset={x} vram={x} bytes={d} row-bytes={d} rows={d} layout={s} backup-offset={d}", .{
             surface.window, surface.plane, surface.eye, surface.handle, surface.context.offset,
-            surface.image.span.address, surface.image.span.bytes, surface.image.row_bytes, surface.image.rows, @tagName(surface.image.layout),
+            surface.image.span.address, surface.image.span.bytes, surface.image.row_bytes, surface.image.rows, @tagName(surface.image.layout), surface.backup_offset,
         });
     }
+    const payload_hash = std.fmt.bytesToHex(context_copy.payload_sha256, .lower);
+    log("NVIDIA boot-payload: image-bindings={d} asset-bindings={d} unique-ranges={d} bytes={d} sha256={s} immutable=yes native-restore=incomplete", .{
+        context_copy.surfaces, context_copy.assets, context_copy.payload_ranges, context_copy.payload_bytes, payload_hash,
+    });
     const asset_hash = std.fmt.bytesToHex(context_copy.asset_sha256, .lower);
     log("NVIDIA boot-assets: count={d} bytes={d} sha256={s} immutable=yes target=vram indexed-tables=unresolved recovery=incomplete", .{
         context_copy.assets, context_copy.asset_bytes, asset_hash,

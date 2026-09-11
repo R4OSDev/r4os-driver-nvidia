@@ -924,6 +924,8 @@ const BootVramFixture = struct {
     var display_instance: [65536]u8 = undefined;
     var asset_pixels: [4][16384]u8 = undefined;
     var asset_selections: usize = 0;
+    var image_changed = false;
+    const image_last_address: u64 = 0x4027000 + 4096 * 608 - 1;
     const asset_addresses = [_]u64{ 0x6002000, 0x6240000, 0x6420000, 0x66fff00 };
     const asset_sizes = [_]usize{ 16384, 1029 * 8, 261 * 8, 517 * 8 };
     const display_address: u64 = 0x1000000;
@@ -961,6 +963,8 @@ const BootVramFixture = struct {
                             @memcpy(registers[0x700000 + begin - base ..][0..end - begin], pixels[begin - address ..][0..end - begin]);
                         }
                     }
+                    if (image_last_address >= base and image_last_address < base + 0x100000)
+                        registers[0x700000 + image_last_address - base] = if (image_changed) 0x5c else 0x5d;
                     if (delay_selected) { clock += 6 * std.time.ns_per_s; delay_selected = false; }
                 }
             }
@@ -1487,7 +1491,7 @@ fn checkBootVramOwner() !void {
     try t.expectError(error.AssetSystemMemory, display_context.capture(&capture));
     try t.expect(!display_context.ready and display_context.asset_catalog.count == 4 and
         display_context.asset_catalog.items[1].memory.target == .pci and
-        display_context.asset_reference.reference.id == 0 and f.asset_selections == 0 and !capture.close());
+        display_context.payload_reference.reference.id == 0 and f.asset_selections == 0 and !capture.close());
     try t.expect(display_context.close());
     f.display_instance[0x2060] = 0x45;
     const context_report = try display_context.capture(&capture);
@@ -1497,15 +1501,49 @@ fn checkBootVramOwner() !void {
     std.crypto.hash.sha2.Sha256.hash(&f.display_instance, &display_digest, .{});
     try t.expectEqualSlices(u8, &display_digest, &context_report.sha256);
     try t.expect(context_report.assets == 4 and context_report.asset_bytes == 30840 and f.buffers[4] != null and f.leases[4]);
+    try t.expect(context_report.payload_ranges == 6 and context_report.payload_bytes == 4978808);
+    var payload_hash = std.crypto.hash.sha2.Sha256.init(.{});
+    for (display_context.surfaces[0..display_context.surface_count]) |*surface| {
+        const bytes = display_context.payloadData()[surface.backup_offset..][0..surface.image.span.bytes];
+        try t.expect(std.mem.allEqual(u8, bytes, 0x5d));
+        payload_hash.update(bytes);
+    }
     var asset_hash = std.crypto.hash.sha2.Sha256.init(.{});
     for (&f.asset_pixels, f.asset_sizes, f.asset_addresses, display_context.asset_catalog.items[0..4]) |*pixels, bytes, address, asset| {
         try t.expect(asset.memory.target == .vram and asset.memory.span.address == address and asset.memory.span.bytes == bytes);
-        try t.expectEqualSlices(u8, pixels[0..bytes], display_context.assetData()[asset.backup_offset..][0..bytes]);
+        try t.expectEqualSlices(u8, pixels[0..bytes], display_context.payloadData()[asset.backup_offset..][0..bytes]);
         asset_hash.update(pixels[0..bytes]);
+        payload_hash.update(pixels[0..bytes]);
     }
     var asset_digest: [32]u8 = undefined;
     asset_hash.final(&asset_digest);
     try t.expectEqualSlices(u8, &asset_digest, &context_report.asset_sha256);
+    var payload_digest: [32]u8 = undefined;
+    payload_hash.final(&payload_digest);
+    try t.expectEqualSlices(u8, &payload_digest, &context_report.payload_sha256);
+    // Unique physical bytes, independent of binding order or aliases.
+    const payload = @import("display_memory.zig");
+    var union_plan: payload.Plan = .{};
+    for ([_]payload.Span{ .{ .address = 0x3000, .bytes = 0x1000 }, .{ .address = 0x1000, .bytes = 0x1000 },
+        .{ .address = 0x2800, .bytes = 0x1000 }, .{ .address = 0x2000, .bytes = 0x800 },
+        .{ .address = 0x1800, .bytes = 0x400 }, .{ .address = 0x6000, .bytes = 4 } }) |span| try union_plan.add(span, 0x10000);
+    try t.expect(union_plan.count == 2 and union_plan.bytes == 0x3004 and union_plan.spans[0].address == 0x1000 and union_plan.spans[0].bytes == 0x3000);
+    try t.expectEqual(@as(usize, 0x1800), try union_plan.offset(.{ .address = 0x2800, .bytes = 0x1000 }));
+    try t.expectEqual(@as(usize, 0x3000), try union_plan.offset(.{ .address = 0x6000, .bytes = 4 }));
+    try t.expectError(error.PayloadMissing, union_plan.offset(.{ .address = 0x3ffc, .bytes = 8 }));
+    try t.expectError(error.PayloadBounds, union_plan.add(.{ .address = std.math.maxInt(u64) - 3, .bytes = 8 }, std.math.maxInt(u64)));
+    try t.expect(union_plan.count == 2 and union_plan.bytes == 0x3004);
+    var full_plan: payload.Plan = .{};
+    for (0..payload.max_spans) |index| try full_plan.add(.{ .address = index * 16, .bytes = 4 }, 0x10000);
+    try t.expectError(error.PayloadCapacity, full_plan.add(.{ .address = 0x8000, .bytes = 4 }, 0x10000));
+    try t.expect(full_plan.count == payload.max_spans and full_plan.bytes == payload.max_spans * 4);
+    try full_plan.add(.{ .address = 0, .bytes = payload.max_spans * 16 }, 0x10000);
+    try t.expect(full_plan.count == 1 and full_plan.bytes == payload.max_spans * 16);
+    var budget_plan: payload.Plan = .{};
+    try budget_plan.add(.{ .address = 0, .bytes = payload.max_bytes }, 0x40000000);
+    try budget_plan.add(.{ .address = 0x1000, .bytes = 0x1000 }, 0x40000000);
+    try t.expectError(error.PayloadBudget, budget_plan.add(.{ .address = payload.max_bytes, .bytes = 4 }, 0x40000000));
+    try t.expect(budget_plan.count == 1 and budget_plan.bytes == payload.max_bytes);
     const assets = @import("display_assets.zig");
     for (0..4) |size_index| {
         const encoded: u32 = @as(u32, @intCast(size_index)) << 8;
@@ -1610,9 +1648,13 @@ fn checkBootVramOwner() !void {
     try t.expectError(error.DisplayAssetCollision, held.acquire(&capture, &backing, &mapped_boot, &display_context));
     display_context.asset_catalog.items[3].memory.span = original_asset_span;
     f.asset_pixels[3][f.asset_sizes[3] - 1] ^= 1; // Last LUT byte after a 1-MB aperture boundary.
-    try t.expectError(error.AssetChanged, held.acquire(&capture, &backing, &mapped_boot, &display_context));
+    try t.expectError(error.PayloadChanged, held.acquire(&capture, &backing, &mapped_boot, &display_context));
     try t.expect(display_context.valid(&capture) and capture.borrower == 0 and f.leases[4] and capture.registers.borrowedCount() == 1);
     f.asset_pixels[3][f.asset_sizes[3] - 1] ^= 1;
+    f.image_changed = true; // Include the final padded row of block-linear backing.
+    try t.expectError(error.PayloadChanged, held.acquire(&capture, &backing, &mapped_boot, &display_context));
+    try t.expect(display_context.valid(&capture) and capture.borrower == 0 and f.leases[4] and capture.registers.borrowedCount() == 1);
+    f.image_changed = false;
     f.display_instance[65535] ^= 1; // Even an unused instance byte must match before reservation.
     try t.expectError(error.Unstable, held.acquire(&capture, &backing, &mapped_boot, &display_context));
     try t.expect(display_context.valid(&capture) and capture.borrower == 0 and capture.registers.borrowedCount() == 1);

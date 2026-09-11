@@ -10,7 +10,43 @@ unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
 
-Cursor- und Farbtabelleninhalte im VRAM (NVIDIA 0.1.39)
+Aktive VRAM-Bildflaechen vollstaendig sichern (NVIDIA 0.1.40)
+------------------------------------------------------------
+Der gemeinsame unveraenderliche Nutzdaten-BO enthaelt nun auch alle bereits
+aufgeloesten aktiven ISO-Bildebenen und -Augen, einschliesslich Pitch- und
+Block-Linear-Zeilenbereichen. Eine sortierte Intervallvereinigung fasst
+Aliase, Ueberlappungen und angrenzende Bereiche zusammen: dieselben
+physischen Bytes werden nur einmal kopiert. Jede Bild-/Cursor-/LUT-Bindung
+behaelt ihren eigenen Offset. Adress-, Anzahl- und Bytepruefungen erfolgen
+vor der Planaenderung; abgewiesene Ergaenzungen lassen den Plan unveraendert.
+Grenze: 88 Eingangsbindungen, 256 MB eindeutige Nutzdaten.
+
+Aufnahme und frische VRAM-Zulassung vergleichen jedes Bild-/Assetbyte,
+die ganze Instanz und die Anzeigeparameter. Gesamt- und Asset-SHA256 werden
+getrennt gemeldet. Lesebloecke bleiben an 4-KB-/1-MB-Grenzen gebunden;
+gehaltene Epoche, bestehende fuenf Sekunden Lesefrist, nur lesbares BO-
+Siegel und DMA-/FWSEC-/Unmap-Rueckhaltung bleiben erhalten. Der physische
+Durchsatz dieses Pfades ist noch nicht gemessen.
+
+Der bestehende Lebenszyklusfall sichert sechs Bereiche/4978808 Byte aus
+zwei Bildflaechen und vier Cursor-/LUT-Bindungen. Geprueft sind Bildbytes,
+unabhaengiger Gesamthash, Aenderung des letzten aufgefuellten Bildbytes
+und bisherige Asset-/Kollisions-/Lebenszyklusfehler. Die Intervallproben
+pruefen ungeordnete Ueberlappung/Aliase, Nachbarschaft, Luecken, Ueberlauf,
+Zusammenfassung bei voller Tabelle und abgewiesenes Budget ohne Mutation.
+Alle 51 Faelle und ein Modulbuild beim ersten Aufruf bestanden; keine
+neuen Faelle/Gates/Gast-/Hardwarelaeufe. Alle 29 Ressourcen bytegleich zu
+NVIDIA39. Neuer Intervall-/BO-Code ist originales R4OS unter Apache-2.0;
+bisherige Fremdlizenzen unveraendert. Beleg: display_images_checkpoint in
+Docs/Drivers/GrafikFirmware07910.json; Archiv display-images-20260911 unter
+ExFiles/Reference/GFX/Nvidia/0.79.10.
+
+Native Wiederherstellung bleibt offen. Systemziele werden weiter explizit
+abgewiesen; indizierte LUT-/Skaliertabellen und ganze UEFI-/Geraete-Recovery
+fehlen noch. Aus Rohbytes wird kein weiterer Kompressions-/Geraetezustand
+abgeleitet. OssiPC bleibt offline/unberuehrt; keine neue Bild-/Tonabnahme.
+
+Vorherige Cursor- und Farbtabelleninhalte im VRAM (NVIDIA 0.1.39)
 -----------------------------------------------------
 Die gehaltene Displayinstanz loest Cursor, Ausgangs-/Eingangs-LUT und
 Tone-Mapping-Tabelle ueber den genauen Client-/Handle-/Channel-Schluessel

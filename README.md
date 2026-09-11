@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-Passive NVIDIA display driver for R4OS. Module 0.1.39; original R4OS code is
+Passive NVIDIA display driver for R4OS. Module 0.1.40; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -10,7 +10,40 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
-VRAM cursor and color-table payloads (NVIDIA 0.1.39):
+Complete active VRAM image backing (NVIDIA 0.1.40):
+
+The existing immutable payload BO now also contains all resolved active
+ISO image planes and eyes, including pitch/block-linear backing rows.
+A sorted interval union merges aliases, overlaps and adjacent ranges, so
+the same physical bytes are copied once. Each image and cursor/LUT binding
+retains its own offset into that union. Address/count/byte limits are checked
+before changing the plan; failed additions leave the original plan intact.
+The bound is 88 input bindings and 256 MB of unique backing.
+
+Capture and fresh VRAM admission compare every image and asset byte, plus
+the complete instance and parent scanout. Whole-payload and asset-specific
+SHA256 hashes are reported. Existing 4-KB/1-MB PRAMIN chunk limits, held
+epoch, five-second read deadline, read-only BO sealing and downstream
+DMA/FWSEC/unmap retention remain in force. Native throughput is unmeasured.
+
+The existing lifecycle case captures six unique ranges / 4978808 bytes:
+two image surfaces and four cursor/LUT attachments. It checks all image
+bytes, the concatenated payload hash, changed final padded image byte and
+the prior asset, collision and lifetime failures. Union checks cover
+unordered overlap/aliases, adjacency, gaps, overflow, full-capacity merge
+and rejected budget changes. All 51 cases and one module build pass on
+their first invocation; no added case/gate/guest/hardware run. All 29
+resources match NVIDIA39 exactly. The new interval/BO code is original
+R4OS Apache-2.0; prior source licenses remain unchanged. Evidence:
+display_images_checkpoint in Docs/Drivers/GrafikFirmware07910.json;
+ExFiles/Reference/GFX/Nvidia/0.79.10/display-images-20260911.
+
+Native restoration is still incomplete. System-memory targets remain
+explicitly unsupported; indexed LUT/scaler tables and full UEFI/device
+recovery are still required. No extra compression/device state is inferred
+from raw backing bytes. OssiPC remains offline and untouched.
+
+Previous VRAM cursor and color-table payloads (NVIDIA 0.1.39):
 
 The held display instance now resolves cursor, output/input LUT and tone-map
 attachments using their exact client, handle and channel. Active mono/stereo

@@ -1,4 +1,4 @@
-//! Resident display instance and VRAM cursor/LUT payload backup; used ISO spans.
+//! Resident display instance and complete active VRAM image/cursor/LUT backup.
 //! No native display programming. Preserve every instance byte, including
 //! opaque unused objects; decoded ranges constrain GSP VRAM reservations.
 const std = @import("std");
@@ -11,10 +11,12 @@ const reader = @import("bar1_reader.zig");
 const layout = @import("gsp_layout.zig");
 const asset_decoder = @import("display_assets.zig");
 const pramin = @import("pramin.zig");
+const payload = @import("display_memory.zig");
 pub const max_surfaces = scanout.max_windows * 6;
-pub const Surface = struct { window: u8, plane: u2, eye: u1, handle: u32, context: decoder.Resolved, image: decoder.Surface };
+pub const Surface = struct { window: u8, plane: u2, eye: u1, handle: u32, context: decoder.Resolved, image: decoder.Surface, backup_offset: usize = 0 };
 pub const Report = struct { address: u64, bytes: u64, surfaces: usize, sha256: [32]u8, window_writes: u32,
-    assets: usize, asset_bytes: usize, asset_sha256: [32]u8 };
+    assets: usize, asset_bytes: usize, asset_sha256: [32]u8,
+    payload_bytes: usize, payload_ranges: usize, payload_sha256: [32]u8 };
 pub const Capture = struct {
     self_address: usize = 0,
     parent: ?*boot.Capture = null,
@@ -29,9 +31,10 @@ pub const Capture = struct {
     surfaces: [max_surfaces]Surface = undefined,
     surface_count: usize = 0,
     asset_catalog: asset_decoder.Catalog = .{},
-    asset_reference: a.GfxBufferReference = .{},
-    asset_map: a.GfxBufferMap = .{},
-    asset_stamp: a.GfxBufferMap = .{},
+    payload_plan: payload.Plan = .{},
+    payload_reference: a.GfxBufferReference = .{},
+    payload_map: a.GfxBufferMap = .{},
+    payload_stamp: a.GfxBufferMap = .{},
     scratch: [4096]u8 = undefined,
     ready: bool = false,
     last_status: i32 = 0,
@@ -62,19 +65,34 @@ pub const Capture = struct {
         // addresses are not CPU pointers and this reader only admits VRAM.
         for (self.asset_catalog.items[0..self.asset_catalog.count]) |*asset|
             if (asset.memory.target != .vram) return error.AssetSystemMemory;
-        if (self.asset_catalog.bytes != 0) {
-            self.last_status = self.memory.?.bufferCreate(&.{ .byte_length = self.asset_catalog.bytes, .alignment = 4096,
-                .usage = a.gfx_buffer_usage_cpu_read | a.gfx_buffer_usage_cpu_write }, &self.asset_reference);
+        for (self.surfaces[0..self.surface_count]) |*surface|
+            try self.payload_plan.add(surface.image.span, self.framebuffer_bytes);
+        for (self.asset_catalog.items[0..self.asset_catalog.count]) |*asset|
+            try self.payload_plan.add(asset.memory.span, self.framebuffer_bytes);
+        // Distinct image planes/eyes and assets can alias the same physical
+        // storage. Retain each binding but back up the unique byte union once.
+        for (self.surfaces[0..self.surface_count]) |*surface|
+            surface.backup_offset = try self.payload_plan.offset(surface.image.span);
+        for (self.asset_catalog.items[0..self.asset_catalog.count]) |*asset|
+            asset.backup_offset = try self.payload_plan.offset(asset.memory.span);
+        if (self.payload_plan.bytes != 0) {
+            self.last_status = self.memory.?.bufferCreate(&.{ .byte_length = self.payload_plan.bytes, .alignment = 4096,
+                .usage = a.gfx_buffer_usage_cpu_read | a.gfx_buffer_usage_cpu_write }, &self.payload_reference);
             if (self.last_status != a.gfx_buffer_result_ok) return error.Buffer;
-            try self.mapAssets(a.gfx_buffer_map_write);
-            try self.transferAssets(false);
-            try self.transferAssets(true);
+            try self.mapPayload(a.gfx_buffer_map_write);
+            try self.transferPayload(false);
+            try self.transferPayload(true);
         }
         try self.comparePages(); // Bindings must remain identical across payload capture too.
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(self.data(), &digest, .{});
+        var payload_digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(self.payloadData(), &payload_digest, .{});
+        var asset_hash = std.crypto.hash.sha2.Sha256.init(.{});
+        for (self.asset_catalog.items[0..self.asset_catalog.count]) |*asset|
+            asset_hash.update(self.payloadData()[asset.backup_offset..][0..asset.memory.span.bytes]);
         var asset_digest: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(self.assetData(), &asset_digest, .{});
+        asset_hash.final(&asset_digest);
         const writes = self.io.window_writes;
         if (!self.io.close()) return error.Cleanup;
         _ = try parent.reobserve();
@@ -83,55 +101,57 @@ pub const Capture = struct {
         self.map = .{};
         self.stamp = .{};
         try self.mapBackup(a.gfx_buffer_map_read);
-        if (self.asset_catalog.bytes != 0) {
-            if (!self.unmapAssets()) return error.Buffer;
-            try self.mapAssets(a.gfx_buffer_map_read);
+        if (self.payload_plan.bytes != 0) {
+            if (!self.unmapPayload()) return error.Buffer;
+            try self.mapPayload(a.gfx_buffer_map_read);
         }
         self.ready = true;
         return .{ .address = self.span.address, .bytes = self.span.bytes, .surfaces = self.surface_count, .sha256 = digest, .window_writes = writes,
-            .assets = self.asset_catalog.count, .asset_bytes = self.asset_catalog.bytes, .asset_sha256 = asset_digest };
+            .assets = self.asset_catalog.count, .asset_bytes = self.asset_catalog.bytes, .asset_sha256 = asset_digest,
+            .payload_bytes = self.payload_plan.bytes, .payload_ranges = self.payload_plan.count, .payload_sha256 = payload_digest };
     }
-    pub fn assetData(self: *const Capture) []const u8 {
-        if (self.asset_catalog.bytes == 0) return &.{};
-        const bytes: [*]const u8 = @ptrFromInt(self.asset_map.cpu_address);
-        return bytes[0..self.asset_catalog.bytes];
+    pub fn payloadData(self: *const Capture) []const u8 {
+        if (self.payload_plan.bytes == 0) return &.{};
+        const bytes: [*]const u8 = @ptrFromInt(self.payload_map.cpu_address);
+        return bytes[0..self.payload_plan.bytes];
     }
-    fn mapAssets(self: *Capture, access: u32) !void {
-        self.last_status = self.memory.?.bufferMap(&self.asset_reference.reference, access, 0, self.asset_catalog.bytes, &self.asset_map);
-        self.asset_stamp = self.asset_map;
-        if (self.last_status != a.gfx_buffer_result_ok or self.asset_map.lease.id == 0 or self.asset_map.cpu_address == 0 or
-            self.asset_map.byte_length != self.asset_catalog.bytes or self.asset_map.cpu_address > std.math.maxInt(u64) - self.asset_catalog.bytes) return error.Buffer;
+    fn mapPayload(self: *Capture, access: u32) !void {
+        self.last_status = self.memory.?.bufferMap(&self.payload_reference.reference, access, 0, self.payload_plan.bytes, &self.payload_map);
+        self.payload_stamp = self.payload_map;
+        if (self.last_status != a.gfx_buffer_result_ok or self.payload_map.lease.id == 0 or self.payload_map.cpu_address == 0 or
+            self.payload_map.byte_length != self.payload_plan.bytes or self.payload_map.cpu_address > std.math.maxInt(u64) - self.payload_plan.bytes) return error.Buffer;
     }
-    fn unmapAssets(self: *Capture) bool {
-        if (!std.meta.eql(self.asset_map, self.asset_stamp)) return false;
-        if (self.asset_map.lease.id != 0) {
-            self.last_status = self.memory.?.bufferUnmap(&self.asset_map.lease);
+    fn unmapPayload(self: *Capture) bool {
+        if (!std.meta.eql(self.payload_map, self.payload_stamp)) return false;
+        if (self.payload_map.lease.id != 0) {
+            self.last_status = self.memory.?.bufferUnmap(&self.payload_map.lease);
             if (self.last_status != a.gfx_buffer_result_ok) return false;
-            self.asset_map = .{};
-            self.asset_stamp = .{};
+            self.payload_map = .{};
+            self.payload_stamp = .{};
         }
         return true;
     }
-    fn transferAssets(self: *Capture, compare: bool) !void {
-        for (self.asset_catalog.items[0..self.asset_catalog.count]) |*asset| {
-            if (asset.memory.target != .vram) return error.AssetSystemMemory;
+    fn transferPayload(self: *Capture, compare: bool) !void {
+        var prior: usize = 0;
+        for (self.payload_plan.spans[0..self.payload_plan.count]) |*span| {
             var offset: usize = 0;
-            while (offset < asset.memory.span.bytes) {
-                const address = asset.memory.span.address + offset;
+            while (offset < span.bytes) {
+                const address = span.address + offset;
                 // LUTs can start only 256-byte aligned, including 256 bytes
                 // before the aperture edge. Never cross that edge in one read.
-                const count: usize = @intCast(@min(self.scratch.len, asset.memory.span.bytes - offset,
+                const count: usize = @intCast(@min(self.scratch.len, span.bytes - offset,
                     pramin.aperture_bytes - (address & (pramin.aperture_bytes - 1))));
-                const start = asset.backup_offset + offset;
+                const start = prior + offset;
                 try self.io.read(address, self.scratch[0..count]);
                 if (compare) {
-                    if (!std.mem.eql(u8, self.scratch[0..count], self.assetData()[start..][0..count])) return error.AssetChanged;
+                    if (!std.mem.eql(u8, self.scratch[0..count], self.payloadData()[start..][0..count])) return error.PayloadChanged;
                 } else {
-                    const output: [*]u8 = @ptrFromInt(self.asset_map.cpu_address);
+                    const output: [*]u8 = @ptrFromInt(self.payload_map.cpu_address);
                     @memcpy(output[start..][0..count], self.scratch[0..count]);
                 }
                 offset += count;
             }
+            prior += @intCast(span.bytes);
         }
     }
     fn data(self: *const Capture) []const u8 {
@@ -182,16 +202,17 @@ pub const Capture = struct {
         }
     }
     pub fn valid(self: *const Capture, parent: *const boot.Capture) bool {
-        const assets_valid = if (self.asset_catalog.bytes == 0)
-            self.asset_catalog.count == 0 and self.asset_reference.reference.id == 0 and self.asset_map.lease.id == 0
-        else self.asset_catalog.count > 0 and self.asset_catalog.count <= asset_decoder.max_assets and
-            self.asset_catalog.bytes <= asset_decoder.max_payload_bytes and self.asset_reference.reference.id != 0 and
-            self.asset_map.lease.id != 0 and self.asset_map.cpu_address != 0 and self.asset_map.byte_length == self.asset_catalog.bytes;
+        const payload_valid = if (self.payload_plan.bytes == 0)
+            self.payload_plan.count == 0 and self.surface_count == 0 and self.asset_catalog.count == 0 and
+                self.payload_reference.reference.id == 0 and self.payload_map.lease.id == 0
+        else self.payload_plan.count > 0 and self.payload_plan.count <= payload.max_spans and
+            self.payload_plan.bytes <= payload.max_bytes and self.payload_reference.reference.id != 0 and
+            self.payload_map.lease.id != 0 and self.payload_map.cpu_address != 0 and self.payload_map.byte_length == self.payload_plan.bytes;
         return self.self_address == @intFromPtr(self) and self.ready and self.parent == parent and
             parent.self_address == @intFromPtr(parent) and parent.ready and parent.context_owner == self.self_address and
             parent.boot.held_generation == self.epoch and self.epoch != 0 and self.io.self_address == 0 and
             self.reference.reference.id != 0 and self.map.lease.id != 0 and std.meta.eql(self.map, self.stamp) and
-            assets_valid and std.meta.eql(self.asset_map, self.asset_stamp);
+            payload_valid and std.meta.eql(self.payload_map, self.payload_stamp);
     }
     fn overlaps(span: decoder.Span, reserved: layout.Range) bool {
         return span.address < reserved.end() and reserved.offset < span.address + span.bytes;
@@ -199,7 +220,7 @@ pub const Capture = struct {
     fn reobserve(self: *Capture, parent: *boot.Capture) !void {
         try self.io.open(parent);
         try self.comparePages();
-        try self.transferAssets(true);
+        try self.transferPayload(true);
         try self.comparePages();
         if (!self.io.close()) return error.Cleanup;
         _ = try parent.reobserve();
@@ -224,11 +245,11 @@ pub const Capture = struct {
         const parent = self.parent orelse return false;
         if (self.self_address != @intFromPtr(self) or parent.self_address != @intFromPtr(parent) or
             parent.context_owner != self.self_address or parent.borrower != 0 or parent.boot.held_generation != self.epoch) return false;
-        if (!self.io.close() or !std.meta.eql(self.map, self.stamp) or !self.unmapAssets()) return false;
-        if (self.asset_reference.reference.id != 0) {
-            self.last_status = self.memory.?.bufferRelease(&self.asset_reference.reference);
+        if (!self.io.close() or !std.meta.eql(self.map, self.stamp) or !self.unmapPayload()) return false;
+        if (self.payload_reference.reference.id != 0) {
+            self.last_status = self.memory.?.bufferRelease(&self.payload_reference.reference);
             if (self.last_status != a.gfx_buffer_result_ok) return false;
-            self.asset_reference = .{};
+            self.payload_reference = .{};
         }
         if (self.map.lease.id != 0) {
             self.last_status = self.memory.?.bufferUnmap(&self.map.lease);
