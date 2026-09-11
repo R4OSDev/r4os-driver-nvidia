@@ -1,4 +1,5 @@
 const std = @import("std");
+pub const topology = @import("vbios_topology.zig");
 
 pub const max_rom_bytes = 1024 * 1024;
 pub const max_ports = 32;
@@ -41,6 +42,11 @@ pub const Result = struct {
     dcb_offset: u16 = 0,
     dcb_version: u8 = 0,
     ccb_version: u8 = 0,
+    communication_count: u8 = 0,
+    communications: [topology.max_entries]topology.Communication = .{topology.Communication{}} ** topology.max_entries,
+    connector_version: u8 = 0,
+    connector_count: u8 = 0,
+    connectors: [topology.max_entries]topology.Connector = .{topology.Connector{}} ** topology.max_entries,
     port_count: u8 = 0,
     ports: [max_ports]Port = .{Port{}} ** max_ports,
 };
@@ -271,9 +277,14 @@ fn parseDcb(image: []const u8, ranges: *Ranges, result: *Result) Error!void {
     if (ccb) |value| {
         if (value.version != 0x41) return error.Version;
         result.ccb_version = value.version;
+        result.communication_count = value.count;
+        for (0..value.count) |i| result.communications[i] = try topology.communication(@intCast(i), value.records[i * value.stride ..][0..value.stride]);
     }
     if (connectors) |value| {
         if (value.version != 0x30 and value.version != 0x40) return error.Version;
+        result.connector_version = value.version;
+        result.connector_count = value.count;
+        for (0..value.count) |i| result.connectors[i] = try topology.connector(@intCast(i), value.records[i * value.stride ..][0..value.stride]);
     }
     for (0..count) |index| {
         const entry = table[size + index * stride ..][0..8];
@@ -298,16 +309,24 @@ fn parseDcb(image: []const u8, ranges: *Ranges, result: *Result) Error!void {
         if (port.ccb != 0xf) {
             const comms = ccb orelse return error.Reference;
             if (port.ccb >= comms.count) return error.Reference;
-            const raw = u32le(comms.records, @as(usize, port.ccb) * comms.stride);
-            const i2c: u8 = @truncate(raw & 0x1f);
-            const aux: u8 = @truncate((raw >> 5) & 0x1f);
-            port.i2c = if (i2c == 0x1f) null else i2c;
-            port.aux = if (aux == 0x1f) null else aux;
+            const communication = &result.communications[port.ccb];
+            port.i2c = communication.i2c;
+            port.aux = communication.aux;
+            communication.display_paths |= @as(u32, 1) << @as(u5, @intCast(index));
+            if (port.connector != 0xf) communication.connector_mask |= @as(u16, 1) << @as(u4, @intCast(port.connector));
         }
         if (port.connector != 0xf) {
             const physical = connectors orelse return error.Reference;
             if (port.connector >= physical.count) return error.Reference;
-            port.connector_type = physical.records[@as(usize, port.connector) * physical.stride];
+            const connector = &result.connectors[port.connector];
+            // A skipped physical entry cannot supply a usable connector.
+            if (connector.kind == 0xff) return error.Reference;
+            port.connector_type = connector.kind;
+            connector.display_paths |= @as(u32, 1) << @as(u5, @intCast(index));
+            connector.heads |= port.heads;
+            connector.or_mask |= port.or_mask;
+            connector.logical_bus_mask |= @as(u16, 1) << @as(u4, @intCast(port.bus));
+            if (port.ccb != 0xf) connector.ccb_mask |= @as(u16, 1) << @as(u4, @intCast(port.ccb));
         }
         result.ports[result.port_count] = port;
         result.port_count += 1;

@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-Passive NVIDIA display driver for R4OS. Module 0.1.42; original R4OS code is
+Passive NVIDIA display driver for R4OS. Module 0.1.43; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -10,7 +10,33 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
-Boot-check completion cleanup (NVIDIA 0.1.42):
+Physical connector wiring (NVIDIA 0.1.43, roadmap 0.79.12 preparation):
+
+The existing VBIOS reader now retains bounded physical connector and CCB
+catalogs. DP/TMDS alternatives share original path masks instead of implying
+another socket. Catalogs preserve candidate heads/SORs, logical exclusion
+buses, pad references, HPD function masks and maximum DDC speed metadata.
+Short records keep unavailable extended fields null; absent references
+stay absent. A path referencing a skipped connector is rejected.
+The same data appears in passive PROM diagnostics and inspect-vbios schema 3.
+These are wiring declarations, not live HPD, active routing or EDID data.
+
+Source research confirms GA106's gm200_i2c constructor refuses a separate
+I2C driver when GSP/RM is active. The pinned RM GET_EDID_V2 control is the
+planned firmware route for TMDS; its 2048-byte limit, connected single-ID
+requirement and raw/no-cache flags remain explicit. No bus transaction,
+new MMIO access, firmware call or common output publication was added.
+51 existing owner cases pass after correcting an initial Zig table-type
+compile error; the final module build and the existing synthetic VBIOS inspector
+pass. No added case/gate or guest/hardware run. Eleven full pinned sources
+and complete MIT notices accompany connectors-20260911 under
+ExFiles/Reference/GFX/Nvidia/0.79.12. Previous 29 resources are identical;
+one 2620-byte notice resource and its Distribution copy were added.
+Current evidence: connector_topology_checkpoint in
+Docs/Drivers/GrafikFirmware07910.json. OssiPC remains offline/untouched;
+native firmware, recovery and complete real receiver acceptance stay open.
+
+Previous boot-check completion cleanup (NVIDIA 0.1.42):
 
 Normal boot-check completion omitted the display-context close, leaving
 context_owner held and making final boot_vram.close fail. Normal completion

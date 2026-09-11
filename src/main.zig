@@ -318,6 +318,18 @@ fn readVbios(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Sna
             if (port.connector_type) |value| @as(u16, value) else @as(u16, 256), if (port.i2c) |value| @as(u16, value) else @as(u16, 256), if (port.aux) |value| @as(u16, value) else @as(u16, 256), port.raw_path, port.raw_config,
         });
     }
+    log("NVIDIA topology: source=VBIOS connectors={d} ccb={d} live-HPD=unknown active-route=unknown receiver=unread", .{ result.connector_count, result.communication_count });
+    for (result.communications[0..result.communication_count]) |*comms| {
+        log("NVIDIA ccb={d} bytes={d} raw={x:0>8} speed-code={x} max-hz={d} reserved={x} paths={x} connectors={x}", .{
+            comms.index, comms.entry_bytes, comms.raw, comms.speed_code, comms.max_i2c_hz orelse 0, comms.reserved_bits, comms.display_paths, comms.connector_mask,
+        });
+    }
+    for (result.connectors[0..result.connector_count]) |*connector| {
+        log("NVIDIA connector={d} bytes={d} type={x} location={d} raw={x:0>8} HPD-mask={x} DP-DVI-mask={x} mux-mask={d} paths={x} heads={x} or={x} buses={x} ccb={x}", .{
+            connector.index, connector.entry_bytes, connector.kind, connector.location, connector.raw, connector.hpd_mask, connector.dp_dvi_mask,
+            if (connector.mux_mask) |value| @as(u16, value) else @as(u16, 256), connector.display_paths, connector.heads, connector.or_mask, connector.logical_bus_mask, connector.ccb_mask,
+        });
+    }
     if (!inspectFwsec(ctx, snapshot, chip, bytes[start.offset..][0..result.rom_bytes], &result)) return false;
     if (!board_rom.close()) return false;
     ctx.logInfo("NVIDIA vbios: cleanup=OK resources=0 PROM-writes=disabled fallback=preserved");

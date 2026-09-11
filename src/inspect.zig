@@ -38,7 +38,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     const report = .{
-        .schema = 2,
+        .schema = 3,
         .source = "supplied-file",
         .sha256 = digest_hex[0..],
         .hardware_verified = false,
@@ -62,6 +62,10 @@ pub fn main(init: std.process.Init) !void {
         .dcb_offset = result.dcb_offset,
         .dcb_version = result.dcb_version,
         .ccb_version = result.ccb_version,
+        .communications = result.communications[0..result.communication_count],
+        .connector_version = result.connector_version,
+        .connectors = result.connectors[0..result.connector_count],
+        .topology_state = "VBIOS-wiring-only; live HPD, active routing and receiver data unknown",
         .ports = result.ports[0..result.port_count],
         .fwsec = .{
             .catalog_parsed = catalog != null,

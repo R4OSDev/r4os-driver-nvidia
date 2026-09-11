@@ -274,6 +274,7 @@ test "modern BIT DCB CCB and connector extraction keeps raw facts and null ports
     try t.expectEqual(@as(?u8, null), info.ports[1].i2c);
     try t.expectEqual(@as(?u8, 0x61), info.ports[0].connector_type);
     try t.expectEqual(@as(?u8, 0x46), info.ports[1].connector_type);
+    try checkConnectorTopology(&rom, &info);
     try t.expectEqualSlices(u8, &before, &rom);
     try t.expectError(error.Identity, vbios.parse(&rom, 0xbeef));
     try t.expectError(error.Limit, vbios.parse(rom[0..0], null));
@@ -285,6 +286,86 @@ test "modern BIT DCB CCB and connector extraction keeps raw facts and null ports
     var sink: DiagnosticSink = .{ .rom = &rom };
     @import("vbios_diagnostic.zig").inspect(&rom, &sink);
     try t.expect(sink.records >= 7);
+}
+
+fn checkConnectorTopology(rom: *const [1024]u8, info: *const vbios.Result) !void {
+    const wiring = vbios.topology;
+    try t.expectEqual(@as(u8, 2), info.communication_count);
+    try t.expectEqual(@as(u8, 2), info.connector_count);
+    try t.expectEqual(@as(u8, 0x40), info.connector_version);
+    try t.expectEqual(@as(u32, 1), info.connectors[0].display_paths);
+    try t.expectEqual(@as(u32, 2), info.connectors[1].display_paths);
+    try t.expectEqual(@as(u16, 2), info.communications[1].connector_mask);
+    try t.expectEqual(@as(?u32, null), info.communications[0].max_i2c_hz);
+    // DP and TMDS alternatives share one physical connector and one pad.
+    var paired = rom.*;
+    put32(&paired, 0x11f, 0x02070206);
+    checksum(&paired, 1023);
+    const pair = try vbios.parse(&paired, 0x2504);
+    try t.expectEqual(@as(u32, 3), pair.connectors[0].display_paths);
+    try t.expectEqual(@as(u8, 3), pair.connectors[0].heads);
+    try t.expectEqual(@as(u8, 3), pair.connectors[0].or_mask);
+    try t.expectEqual(@as(u16, 0x81), pair.connectors[0].logical_bus_mask);
+    try t.expectEqual(@as(u16, 1), pair.connectors[0].ccb_mask);
+    try t.expectEqual(@as(u32, 3), pair.communications[0].display_paths);
+    try t.expectEqual(@as(u16, 1), pair.communications[0].connector_mask);
+    try t.expectEqual(@as(u32, 0), pair.connectors[1].display_paths);
+    paired[0x117] = 0xf;
+    checksum(&paired, 1023);
+    const skipped = try vbios.parse(&paired, null);
+    try t.expectEqual(@as(u32, 2), skipped.connectors[0].display_paths);
+    try t.expectEqual(@as(u32, 2), skipped.communications[0].display_paths);
+    paired[0x1c4] = 0xff;
+    checksum(&paired, 1023);
+    try t.expectError(error.Reference, vbios.parse(&paired, null));
+    // Explicitly absent references do not alias physical connector/pad zero.
+    paired = rom.*;
+    put32(&paired, 0x11f, 0x0200f2f6);
+    checksum(&paired, 1023);
+    const absent = try vbios.parse(&paired, null);
+    try t.expectEqual(@as(?u8, null), absent.ports[1].connector_type);
+    try t.expectEqual(@as(?u8, null), absent.ports[1].aux);
+    try t.expectEqual(@as(u32, 1), absent.communications[0].display_paths);
+    try t.expectEqual(@as(u32, 0), absent.communications[1].display_paths);
+    try t.expectEqual(@as(u32, 0), absent.connectors[1].display_paths);
+
+    const speeds = [_]?u32{ null, 100_000, 200_000, 400_000, 800_000, 1_600_000, 3_400_000, 60_000, 300_000, null, null, null, null, null, null, null };
+    for (speeds, 0..) |hz, code| {
+        var raw: [4]u8 = undefined;
+        put32(&raw, 0, (@as(u32, @intCast(code)) << 28) | 0x400 | (5 << 5) | 4);
+        const comms = try wiring.communication(15, &raw);
+        try t.expectEqual(hz, comms.max_i2c_hz);
+        try t.expectEqual(@as(u8, @intCast(code)), comms.speed_code);
+        try t.expectEqual(@as(u32, 0x400), comms.reserved_bits);
+        try t.expectEqual(@as(?u8, 4), comms.i2c);
+        try t.expectEqual(@as(?u8, 5), comms.aux);
+    }
+    const unused = try wiring.communication(0, &.{ 0xff, 3, 0, 0 });
+    try t.expect(unused.i2c == null and unused.aux == null);
+    const full = try wiring.connector(15, &.{ 0x61, 0xf9, 0xff, 0xff });
+    try t.expectEqual(@as(u8, 0x7f), full.hpd_mask);
+    try t.expectEqual(@as(u8, 15), full.dp_dvi_mask);
+    try t.expectEqual(@as(?u8, 15), full.mux_mask);
+    try t.expectEqual(@as(?bool, true), full.self_refresh);
+    try t.expectEqual(@as(?u8, 7), full.lcd_id);
+    try t.expectEqual(@as(u32, 0x80000000), full.reserved_bits);
+    try t.expectEqual(@as(u8, 9), full.location);
+    // High HPD functions are not GPIO pin indices; retain each distinct bit.
+    for ([_]u5{ 12, 13, 16, 17, 24, 25, 26 }, 0..) |shift, bit| {
+        var raw: [4]u8 = undefined;
+        put32(&raw, 0, (@as(u32, 1) << shift) | 0x61);
+        const item = try wiring.connector(0, &raw);
+        try t.expectEqual(@as(u8, 1) << @as(u3, @intCast(bit)), item.hpd_mask);
+    }
+    for (2..4) |len| {
+        const short = try wiring.connector(0, (&[_]u8{ 0x61, 0x91, 0xff })[0..len]);
+        try t.expectEqual(@as(u8, 1), short.hpd_mask);
+        try t.expectEqual(@as(u8, 2), short.dp_dvi_mask);
+        try t.expect(short.mux_mask == null and short.lcd_id == null and short.self_refresh == null);
+    }
+    try t.expectError(error.Bounds, wiring.connector(16, &.{ 0x61, 0 }));
+    try t.expectError(error.Bounds, wiring.connector(0, &.{0x61}));
+    try t.expectError(error.Bounds, wiring.communication(0, &.{ 1, 2, 3 }));
 }
 
 const DiagnosticSink = struct {

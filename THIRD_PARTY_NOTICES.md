@@ -1,5 +1,15 @@
 ﻿# Third-Party Notices
 
+Connector/CCB metadata (NVIDIA 0.1.43, roadmap 0.79.12):
+The wiring decoder retains both complete Nouveau bios/i2c.c and conn.c
+MIT notices, also in NVIDIA-CONNECTORS-LICENSE.txt and Distribution.
+The R4OS bounded catalog/grouping is Apache-2.0. Eleven full hash-verified
+originals accompany ExFiles/Reference/GFX/Nvidia/0.79.12/connectors-20260911.
+NVIDIA DCB speed/function-mask facts and GSP/RM EDID ownership are documented
+there. Firmware/RM display controls and register I2C remain reference-only;
+no imported C implementation, native DDC transaction or live HPD is linked.
+
+
 GA106 cursor and memory-LUT payloads (NVIDIA 0.1.39):
 display_assets uses the original MIT C67D/C67E fields, NVKMS LUT layout
 and pitch semantics, and Nouveau's GA102 cursor dispatch to its shared

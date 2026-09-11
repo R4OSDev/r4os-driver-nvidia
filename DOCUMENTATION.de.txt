@@ -10,7 +10,38 @@ unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
 
-Erfolgreichen Boot-Check vollstaendig aufraeumen (NVIDIA 0.1.42)
+Physische Anschlusszuordnung (NVIDIA 0.1.43; Vorbereitung 0.79.12)
+--------------------------------------------------------------
+Der bestehende VBIOS-Leser bewahrt nun die begrenzten Connector- und CCB-
+Tabellen. DP/TMDS-Alternativen derselben Buchse teilen sich die originalen
+DCB-Pfadmasken. Kandidaten fuer Heads/SORs, logische Ausschlussbusse und
+CCB-Pads bleiben getrennt. Hotplug A..G, DP-DVI A..D und DPAUX/I2C-Mux sind
+Funktionsmasken, keine GPIO-Pinnummern oder gemessenen Pegel. CCB4.1 liefert
+I2C/AUX-Indizes, Speedcode, spezifizierte Hoechstfrequenz und reservierte
+Bits; Default/Unbekannt ist null, niemals unbegrenzte Geschwindigkeit.
+Kurze Connector-Eintraege halten nicht vorhandene Zusatzfelder null.
+Fehlende Referenzen bleiben leer; eine referenzierte Skip-Buchse wird
+verworfen. Gemeinsame Tabellen erscheinen im passiven PROM-Log und im
+bestehenden inspect-vbios-Werkzeug mit Schema 3. Noch keine Live-Anschluesse.
+
+Die elf vollstaendigen, hashgeprueften Quellen zeigen auch: GA106 waehlt
+gm200_i2c, dessen Konstruktor bei aktivem GSP/RM einen separaten I2C-Treiber
+ablehnt. Fuer TMDS ist daher RM GET_EDID_V2 vorgesehen: genau eine aktuell
+verbundene RM-Display-ID, maximal 2048 Bytes, RAW/ohne Cache moeglich. Eine
+vollstaendige Generation verlangt zusaetzlich Laengen-/Block-/Checksum-
+Pruefung; EDID-Ausfall allein bedeutet weder sicher TV-aus noch abgezogen.
+RM-Objektlebensdauer, Control-Transport, Live-HPD/DDC/AUX und Publikation
+sind weiterhin offen. Kein neuer Bus-/MMIO-Zugriff oder Firmwareaufruf.
+
+51 bestehende Besitzerfaelle nach Korrektur eines initialen Zig-Typfehlers,
+der finale Modulbuild und der bestehende synthetische VBIOS-Inspektor bestanden.
+Keine neuen Faelle/Gates oder Gast-/Hardwarelaeufe. 29 bisherige Ressourcen
+unveraendert; eine 2620-Byte-Quelldateilizenz in Modul und Distribution.
+Archiv ExFiles/Reference/GFX/Nvidia/0.79.12/connectors-20260911;
+connector_topology_checkpoint in GrafikFirmware07910.json. Keine neue
+OssiPC-ROM-/Bild-/Audioabnahme; OssiPC offline/unberuehrt. .10/.12/.13 offen.
+
+Vorheriger Boot-Check-Abschluss (NVIDIA 0.1.42)
 ---------------------------------------------------------------
 Im normalen Erfolgspfad fehlte das Schliessen des Displaykontexts; dessen
 context_owner verhinderte danach boot_vram.close und den Erfolgsstatus.
