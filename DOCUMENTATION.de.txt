@@ -10,6 +10,34 @@ unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
 
+Zusammengehoerige Empfaengerdaten mit R4GFX-Parser (11.09.2026)
+--------------------------------------------------------------
+Der kanonische RM-Graph leiht einem begrenzten Empfaengerleser den einzigen
+Runtime-Token. Supported-/Verbindungsabfrage vor RAW-EDID; erneute Verbindung
+und abschliessende leere Meldungsabfrage vor Zugriff auf das Ergebnis.
+Rohbytes und unveraenderter R4GFX-EDID-/CTA-Bericht liegen im Aufruferpuffer.
+Manifest und benannter Bibliotheksbaustein binden denselben Parser ein;
+kein zweiter Decoder und keine neue Bibliotheksversion.
+
+Status trennt unbekannte/getrennte Anzeige, fehlende/abgelehnte EDID sowie
+ungueltige, nicht verarbeitbare, unvollstaendige und gueltige Daten. V2-RPC
+begrenzt EDID auf2048 Bytes, der gemeinsame Parser erlaubt4096. Fehlende
+angekuendigte Bloecke bleiben sichtbar; groessere native DDC-/AUX-Lesewege
+stehen aus. Keine Ableitung von TV-Stromzustand oder HDMI-Audiofunktion.
+HPD oder geaenderte Abschlussverbindung verwerfen den Kandidaten; offene
+Anfragen werden trotzdem bis zum ACK abgearbeitet. Meldungen brauchen ihre
+echten Besitzer. ACK-/Fristfehler halten den Lauf fest. Fehler bei spaeterem
+Zugriff/Abschluss speichern den ersten Fehler; gueltiger spaeterer Zugriff
+und Rueckgabe erhalten eine eigene endliche Frist.
+
+51 bestehende Faelle und ein Modulbuild bestanden; keine neuen Faelle/Gates/
+ABI-Proben/Gastlaeufe. NVIDIA0.1.44 bytegleich, Bibliotheksrepository unveraendert.
+Neun Original-/Bibliotheksdateien und Logs: ExFiles/Reference/GFX/Nvidia/
+0.79.12/receiver-20260911; receiver_checkpoint in GrafikFirmware07910.json.
+Testdaten stammen von fiktiven RFO-Anzeigen. Nativer Boot/RM, Portzuordnung,
+Mehrgraph-Zustellung, groessere Lesewege und Plattformkatalog-Publikation
+sowie physische Hisense-/HDMI-/ELD-/Audioabnahme offen. OssiPC unberuehrt.
+
 Session-Namensraum und vollstaendiger RM-Graph (11.09.2026)
 ----------------------------------------------------------
 Ein Namensverzeichnis bleibt jetzt in der GSP-Session ueber alle Uebergaben

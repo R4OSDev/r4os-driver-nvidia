@@ -1,5 +1,13 @@
 ﻿Original R4OS implementation for roadmap 0.79.9, 10.09.2026.
 
+Receiver refresh/shared parser (0.79.12, 2026-09-11):
+Nine complete reference/shared-library files under receiver-20260911.
+NVIDIA/Nouveau query prerequisites and sequence retain three full MIT notices.
+The unchanged R4GFX parser/timings and original library LICENSE/NOTICE and
+third-party notices are pinned alongside them. Original R4OS capture policy
+and synthetic RFO fixtures: Apache-2.0. NVIDIA44 product remains byte-identical.
+
+
 Session RM namespace and graph (0.79.12, 2026-09-11):
 Eight full pinned originals under rm-namespace-20260911. NVIDIA generated
 range definitions retain full MIT notices; Nouveau client/handle headers

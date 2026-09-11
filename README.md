@@ -10,6 +10,33 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
+Coherent receiver refresh with shared R4GFX parser (source preparation, 2026-09-11):
+
+The canonical RM graph now lends a bounded receiver reader its sole runtime
+token. Supported/current-connect checks precede RAW EDID; a second connect
+query and final idle notification drain precede capture access. Raw bytes
+and the unchanged R4GFX EDID/CTA report live in caller-owned storage. The
+manifest and named library module provide the shared parser; no duplicate
+decoder or separate library version was introduced.
+
+Statuses separate unsupported/disconnected, missing/rejected EDID, invalid/
+unsupported data and incomplete/valid EDID. GET_EDID_V2 is limited to2048
+bytes; the shared parser allows4096. Missing advertised blocks stay explicit;
+larger native DDC/AUX reads remain open. No monitor-power/audio inference.
+HPD or a changed final connection rejects the candidate while preserving
+the outstanding request until ACK. Notifications still need real handlers.
+ACK/deadline errors retain the run; failed observation/release records the
+first failure. Later valid observation/cleanup uses its own finite budget.
+
+51 existing cases and one module build pass; no new case/gate/ABI probe/guest.
+NVIDIA0.1.44 is byte-identical and the library repository is unchanged.
+Nine complete references/shared sources and logs: ExFiles/Reference/GFX/
+Nvidia/0.79.12/receiver-20260911; receiver_checkpoint in
+Docs/Drivers/GrafikFirmware07910.json. Fixtures are synthetic RFO displays.
+Native bootstrap/RM, port mapping, multi-graph routing, larger reads and
+platform catalog publication remain open, as do physical Hisense/HDMI/ELD/
+audio acceptance. OssiPC offline and untouched.
+
 Session RM namespace and complete graph (source preparation, 2026-09-11):
 
 One namespace ledger now stays in the GSP Session across runtime handoffs.

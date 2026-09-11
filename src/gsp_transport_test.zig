@@ -9,6 +9,7 @@ const runtime_events = @import("gsp_runtime_events.zig");
 const event_objects = @import("gsp_event_objects.zig");
 const rm_graph = @import("gsp_rm_graph.zig");
 const rm_names = @import("gsp_rm_names.zig");
+const receiver = @import("gsp_receiver.zig");
 const message = transport.message;
 const ring = transport.ring;
 const profile = message.Profile{ .chip_id = 0x176 };
@@ -1679,6 +1680,207 @@ fn checkRmGraph(model: *Model) !void {
     try t.expectEqual(calls, model.count);
 }
 
+fn receiverFixture(bytes: []u8) void {
+    @memset(bytes, 0);
+    @memcpy(bytes[0..8], &[_]u8{ 0, 255, 255, 255, 255, 255, 255, 0 });
+    bytes[8] = 0x48;
+    bytes[9] = 0xcf; // Synthetic RFO identity, not a real monitor.
+    bytes[18] = 1;
+    bytes[19] = 4;
+    bytes[20] = 0x80;
+    @memset(bytes[38..54], 1);
+    for (0..4) |i| bytes[54 + i * 18 + 3] = 0x10;
+    if (bytes.len > 128) {
+        bytes[126] = @intCast(bytes.len / 128 - 1);
+        const cta = bytes[128..256];
+        @memcpy(cta[0..16], &[_]u8{ 2, 3, 16, 0x40, 0x41, 16, 0x23, 0x09, 7, 7, 0x65, 3, 12, 0, 0x10, 0 });
+        for (2..bytes.len / 128) |i| bytes[i * 128] = 0x99; // Unknown extensions retained by the shared parser.
+    }
+    for (0..bytes.len / 128) |i| receiverChecksum(bytes[i * 128 ..][0..128]);
+}
+fn receiverChecksum(bytes: []u8) void {
+    bytes[127] = 0;
+    var sum: u8 = 0;
+    for (bytes) |byte| sum +%= byte;
+    bytes[127] = 0 -% sum;
+}
+fn receiverEdidReply(model: *Model, refresh: *receiver.Refresh, status: u32, blob: []const u8) !void {
+    var bytes: [display_rpc.max_request_bytes]u8 = undefined;
+    const payload = try display_rpc.encode(refresh.channel.object, refresh.channel.request.?, &bytes);
+    put(&bytes, 12, status);
+    put(&bytes, 32, @intCast(blob.len));
+    @memcpy(bytes[40..][0..blob.len], blob);
+    try model.replyRpc(refresh.channel.exchange.session, .{ .function = 76, .result = 0 }, payload);
+}
+fn checkReceiver(model: *Model) !void {
+    const capture = try t.allocator.create(receiver.Capture);
+    defer t.allocator.destroy(capture);
+    const Case = enum { valid, base_only, missing, missing_extension, checksum, invalid_base, truncated, edid_rejected, verify_rejected, disconnected, not_supported, changed, hpd, late_hpd, canceled, ack, expired, release_expired };
+    for (std.enums.values(Case)) |case| {
+        var session: transport.Session = undefined;
+        var boot = try startBoot(model, &session);
+        try model.replyRpc(&session, .{ .function = 0x1001, .result = 0 }, &.{ 0, 0, 0, 0 });
+        try boot.complete((try boot.poll()).?.ticket);
+        var token = try boot.handoff(deadline);
+        var owner = try rm_graph.Owner.init(&token, 1, "receiver", deadline);
+        try graphCreate(model, &owner);
+        model.count = 0;
+        try t.expectError(error.Query, receiver.Refresh.init(&owner, 3, capture, deadline));
+        var refresh = try receiver.Refresh.init(&owner, 0x80000000, capture, deadline);
+        // An unstarted read returns the graph without querying hardware.
+        try refresh.release(deadline);
+        try t.expect(owner.state == .ready and model.count == 0);
+        refresh = try receiver.Refresh.init(&owner, 0x80000000, capture, deadline);
+        try t.expectError(error.State, refresh.borrow(deadline));
+        try t.expect((try refresh.poll()) == null);
+        var copied = refresh;
+        try t.expectError(error.Stale, copied.poll());
+        try t.expect(session.state == .active);
+        try displayReply(model, &refresh.channel, 0, if (case == .not_supported) 1 else 0x80000001);
+        try t.expect((try refresh.poll()) == null);
+        if (case == .not_supported) {
+            try t.expect(refresh.state == .drain and capture.status == .not_supported and capture.connected == null);
+        } else {
+            try t.expect(refresh.state == .connected);
+            try t.expect((try refresh.poll()) == null);
+            try displayReply(model, &refresh.channel, 0, if (case == .disconnected) 0 else 0x80000000);
+            try t.expect((try refresh.poll()) == null);
+            if (case == .disconnected) {
+                try t.expect(refresh.state == .drain and capture.status == .disconnected and capture.connected.? == false);
+            } else {
+                try t.expect(refresh.state == .edid);
+                try t.expect((try refresh.poll()) == null);
+                try t.expectError(error.State, refresh.release(deadline));
+                var blob: [2048]u8 = undefined;
+                const size: usize = switch (case) {
+                    .base_only, .missing_extension => 128,
+                    .missing => 0,
+                    .truncated => 2048,
+                    else => 256,
+                };
+                receiverFixture(&blob);
+                if (size != 0) receiverFixture(blob[0..size]);
+                if (case == .missing_extension or case == .truncated) {
+                    blob[126] += 1;
+                    receiverChecksum(blob[0..128]);
+                }
+                if (case == .checksum) blob[255] ^= 1;
+                if (case == .invalid_base) blob[0] = 1;
+                if (case == .hpd) {
+                    var post: [40]u8 = undefined;
+                    const bytes = registeredPost(&post, .hotplug, true);
+                    put(&post, 0, owner.reservation.client);
+                    put(&post, 4, try owner.reservation.object(3));
+                    try model.replyRpc(&session, .{ .function = 0x1003, .result = 0 }, bytes);
+                    const notice = (try refresh.poll()).?;
+                    try t.expect(notice.value == .notification and session.pending != null);
+                    try t.expectError(error.Pending, refresh.poll());
+                    var dispatch = try runtime_events.Dispatch.initDisplay(&refresh.channel, try owner.eventSink());
+                    try dispatch.step();
+                    try t.expect(refresh.channel.exchange.phase == .waiting);
+                }
+                if (case == .canceled) {
+                    try refresh.invalidate();
+                    try t.expect((try refresh.poll()) == null and refresh.channel.exchange.phase == .waiting);
+                }
+                try receiverEdidReply(model, &refresh, if (case == .edid_rejected) 0x55 else 0, blob[0..size]);
+                if (case == .ack) {
+                    model.fault = model.count + 4;
+                    model.after = true;
+                }
+                if (case == .expired) model.now = deadline;
+                if (case == .ack or case == .expired) {
+                    try t.expectError(if (case == .ack) error.Io else error.Deadline, refresh.poll());
+                    try t.expect(refresh.state == .failed and session.state == .failed and owner.state == .loaned);
+                    if (case == .ack) try t.expect(session.pending != null);
+                    const calls = model.count;
+                    try t.expectError(error.State, refresh.borrow(deadline + 100));
+                    try t.expectError(error.State, refresh.poll());
+                    try t.expectError(error.State, refresh.release(deadline + 100));
+                    try t.expectEqual(calls, model.count);
+                    continue;
+                }
+                try t.expect((try refresh.poll()) == null);
+                if (case == .hpd or case == .canceled) {
+                    try t.expect(refresh.state == .obsolete and refresh.channel.exchange.phase == .idle and session.pending == null);
+                    try t.expectError(error.State, refresh.borrow(deadline));
+                    try refresh.release(deadline);
+                    try t.expect(owner.state == .ready);
+                    continue;
+                }
+                try t.expect(refresh.state == .verify);
+                try t.expect((try refresh.poll()) == null);
+                try displayReply(model, &refresh.channel, if (case == .verify_rejected) 0x56 else 0, if (case == .changed) 0 else 0x80000000);
+                try t.expect((try refresh.poll()) == null);
+                if (case == .changed) {
+                    try t.expect(refresh.state == .obsolete);
+                    try t.expectError(error.State, refresh.borrow(deadline));
+                    try refresh.release(deadline);
+                    continue;
+                }
+            }
+        }
+        try t.expectError(error.State, refresh.borrow(deadline)); // Still no completed capture before final drain.
+        if (case == .late_hpd) {
+            var post: [40]u8 = undefined;
+            const bytes = registeredPost(&post, .hotplug, false);
+            put(&post, 0, owner.reservation.client);
+            put(&post, 4, try owner.reservation.object(3));
+            try model.replyRpc(&session, .{ .function = 0x1003, .result = 0 }, bytes);
+            _ = (try refresh.poll()).?;
+            var dispatch = try runtime_events.Dispatch.initDisplay(&refresh.channel, try owner.eventSink());
+            try dispatch.step();
+            try t.expect((try refresh.poll()) == null and refresh.state == .obsolete);
+            try refresh.release(deadline);
+            continue;
+        }
+        try t.expect((try refresh.poll()) == null and refresh.state == .complete);
+        const result = try refresh.borrow(deadline);
+        const expected: receiver.Status = switch (case) {
+            .valid, .base_only, .release_expired => .valid_edid,
+            .missing => .edid_missing,
+            .missing_extension, .checksum, .truncated => .incomplete_edid,
+            .invalid_base => .invalid_edid,
+            .edid_rejected => .edid_rejected,
+            .verify_rejected => .query_rejected,
+            .disconnected => .disconnected,
+            .not_supported => .not_supported,
+            else => unreachable,
+        };
+        try t.expectEqual(expected, result.status);
+        try t.expect(result.receipt_serial != 0 and result.epoch == session.epoch and result.client == owner.reservation.client);
+        if (case == .valid) try t.expect(result.report.hdmi and result.report.basic_audio and result.report.audio_count == 1 and result.report.mode_count == 1 and result.report.complete());
+        if (case == .base_only or case == .missing or case == .checksum or case == .invalid_base or case == .verify_rejected) try t.expect(!result.report.hdmi and !result.report.basic_audio and result.report.audio_count == 0);
+        if (case == .missing_extension or case == .truncated) try t.expect(result.report.warnings & receiver.edid.Warning.missing != 0);
+        if (case == .edid_rejected) try t.expectEqual(@as(u32, 0x55), result.control_status.?);
+        if (case == .verify_rejected) try t.expect(result.connected == null and result.edid_bytes == 0 and result.report.mode_count == 0);
+        if (case == .valid) {
+            @memset(&model.rx, 0xcc);
+            try t.expectEqual(@as(u8, 0), result.bytes[0]);
+            // Completed capture access/release has a fresh observation budget;
+            // it must not reuse the expired deadline of an already-finished RPC.
+            model.now = deadline + 1;
+            _ = try refresh.borrow(deadline + 100);
+        }
+        if (case == .release_expired) {
+            model.now = deadline;
+            try t.expectError(error.Deadline, refresh.release(deadline));
+            try t.expect(refresh.state == .failed and refresh.failure.? == error.Deadline and owner.state == .loaned and session.state == .failed);
+            const calls = model.count;
+            try t.expectError(error.State, refresh.release(deadline + 100));
+            try t.expectError(error.State, refresh.borrow(deadline + 100));
+            try t.expectEqual(calls, model.count);
+            continue;
+        }
+        try refresh.release(deadline + 100);
+        try t.expect(owner.state == .ready and session.state == .active);
+        const calls = model.count;
+        try t.expectError(error.State, refresh.borrow(deadline + 100));
+        try t.expectError(error.State, refresh.poll());
+        try t.expectEqual(calls, model.count);
+    }
+}
+
 test "GSP transport orders range publication, explicit acknowledgement and terminal ambiguous failures" {
     const model = try t.allocator.create(Model);
     defer t.allocator.destroy(model);
@@ -1687,6 +1889,7 @@ test "GSP transport orders range publication, explicit acknowledgement and termi
     try checkRuntimeEvents(model);
     try checkEventObjects(model);
     try checkRmGraph(model);
+    try checkReceiver(model);
     for (0..4) |flags| {
         var session = try model.start(@intCast(flags));
         // Device-only neighbour changes must survive CPU command publication.
