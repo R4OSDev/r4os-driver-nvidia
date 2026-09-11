@@ -886,7 +886,10 @@ const BootVramFixture = struct {
     var registers: []u8 = &.{};
     var buffers: [2]?[]u8 = .{ null, null };
     var leases: [2]bool = .{ false, false };
-    var mapped: [0x900]bool = @splat(false);
+    var mapped: [0x1000]bool = @splat(false);
+    var map_pages: [0x1000]usize = @splat(0);
+    var maps: usize = 0;
+    var unmaps: usize = 0;
     var held = false;
     var effects = false;
     var request: a.GfxBootHoldRequest = .{};
@@ -967,8 +970,13 @@ const BootVramFixture = struct {
             input.byte_offset + input.byte_length <= registers.len and input.cache_policy == a.gfx_buffer_cache_uncached);
         if (fail_map) return a.gfx_buffer_error_budget;
         const index = input.byte_offset / 4096;
-        std.debug.assert(!mapped[index]);
-        mapped[index] = true;
+        const pages = input.byte_length / 4096;
+        // Match the kernel's rejection of every overlapping live range,
+        // including partial probes into a previously mapped full BAR0.
+        if (!std.mem.allEqual(bool, mapped[index..][0..pages], false)) return a.gfx_buffer_error_busy;
+        @memset(mapped[index..][0..pages], true);
+        map_pages[index] = pages;
+        maps += 1;
         out.* = .{ .handle = .{ .id = @intCast(index + 1), .generation = 3 }, .cpu_address = @intFromPtr(registers.ptr) + input.byte_offset,
             .physical_address = input.resource_base + input.byte_offset, .byte_length = input.byte_length, .cache_policy = input.cache_policy };
         return a.gfx_buffer_result_ok;
@@ -977,11 +985,23 @@ const BootVramFixture = struct {
         const index = input.id - 1;
         std.debug.assert(mapped[index] and quiesced == 1);
         if (fail_unmap) return a.gfx_buffer_error_busy;
-        mapped[index] = false;
+        @memset(mapped[index..][0..map_pages[index]], false);
+        map_pages[index] = 0;
+        unmaps += 1;
         return a.gfx_buffer_result_ok;
     }
     fn collectBuffers() callconv(.c) i32 { return a.gfx_buffer_result_ok; }
     fn put(address: usize, value: u32) void { std.mem.writeInt(u32, registers[address..][0..4], value, .little); }
+    fn nativeGeneration(raw: *anyopaque) u64 {
+        const capture: *@import("boot_vram.zig").Capture = @ptrCast(@alignCast(raw));
+        return capture.boot.held_generation;
+    }
+    fn nativeAdmit(_: *anyopaque, _: @import("gsp_sequencer.zig").Command) error{ Denied, Unsupported }!void { return error.Unsupported; }
+    fn nativeAccess(_: *anyopaque, kind: @import("gsp_sequencer_port.zig").Access, address: u32) anyerror!void {
+        if (kind != .read or (address != 0 and address != 4)) return error.Register;
+    }
+    fn nativeRetain(_: *anyopaque) anyerror!void { return error.Unsupported; }
+    fn nativeQuiet(_: *anyopaque) bool { return false; }
 };
 
 // The existing lifecycle case uses a real FWSEC CPU allocation and the SDK
@@ -1160,7 +1180,7 @@ fn checkFrtsStorage(ctx: *const r4os.r4dev.DriverContext, owner: *@import("boot_
 
 fn checkBootVramOwner() !void {
     const f = BootVramFixture;
-    f.registers = try std.heap.page_allocator.alloc(u8, 0x900000);
+    f.registers = try std.heap.page_allocator.alloc(u8, 0x1000000);
     defer std.heap.page_allocator.free(f.registers);
     @memset(f.registers, 0);
     var raw = @import("fwsec_test.zig").preflightFixture();
@@ -1196,6 +1216,30 @@ fn checkBootVramOwner() !void {
     try t.expectEqualSlices(u8, &expected, &report.sha256);
     try t.expectEqual(@as(u64, 0x10e0000), report.range.address);
     try t.expect(report.window_restored and report.window_writes == 2 and f.held and f.leases[1]);
+    // Capture, native identity reads and Booter fuse reads coexist through one
+    // actual SDK mapping. These callbacks cannot admit any native mutation.
+    var native_port: @import("gsp_sequencer_port.zig").Port = .{};
+    defer _ = native_port.close();
+    try native_port.openShared(&ctx, &snapshot, 0xb76000a1, 0, .{ .epoch = 9, .deadline_ns = 10000000 },
+        .{ .context = &capture, .generation = f.nativeGeneration, .admit = f.nativeAdmit, .access = f.nativeAccess,
+            .retain = f.nativeRetain, .quiesced = f.nativeQuiet }, &capture.registers);
+    const native_io = try native_port.sequencer();
+    try t.expectEqual(@as(u32, 0xb76000a1), try native_io.read32(native_io.context, 0));
+    try t.expect(f.maps == 1 and f.unmaps == 0 and capture.registers.borrowedCount() == 2);
+    try t.expect(!capture.registers.close() and !capture.close() and f.held and f.leases[0] and f.leases[1]);
+    try t.expectError(error.State, capture.reobserve());
+    const fuse_probe = @import("fwsec_probe.zig");
+    var fuse_capture: fuse_probe.Capture = .{};
+    defer _ = fuse_capture.close();
+    f.put(fuse_probe.debug_register, 1);
+    f.put(fuse_probe.version_register + 8, 1);
+    const fuses = try fuse_capture.readBooterShared(&ctx, &snapshot, chip, &capture.registers);
+    try t.expect(fuses.ucode_id == 3 and fuses.ucode_version_raw == 1);
+    try t.expect(capture.registers.borrowedCount() == 3 and f.maps == 1);
+    try t.expect(native_port.close() and f.unmaps == 0 and !capture.close() and f.held);
+    try t.expect(fuse_capture.close() and capture.registers.borrowedCount() == 1 and f.unmaps == 0);
+    _ = try capture.reobserve();
+    try t.expect(f.maps == 1);
     // The existing host fixture supplies prepared boot metadata; actual DMA
     // packing/synchronization remains covered by gsp_boot_storage_test.zig.
     // Here the production reservation borrows the actual BO/display capture.
@@ -1268,6 +1312,7 @@ fn checkBootVramOwner() !void {
     try t.expect(capture.window_writes == 2); // No repeated register restore for cleanup.
     try t.expect(capture.close() and capture.close());
     try t.expect(std.mem.allEqual(bool, &f.mapped, false));
+    try t.expect(f.maps == 1 and f.unmaps == 1 and capture.registers.serial != 0);
     f.fail_map = true;
     try t.expectError(error.Mapping, capture.capture(&ctx, &snapshot, chip));
     try t.expect(capture.close());

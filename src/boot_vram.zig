@@ -10,9 +10,8 @@ const display = @import("boot_display.zig");
 const probe = @import("fwsec_state_probe.zig");
 const state = @import("fwsec_state.zig");
 const pramin = @import("pramin.zig");
+const bar0 = @import("bar0.zig");
 pub const Report = struct { boot: display.Report, range: pramin.Range, sha256: [32]u8, window_original: u32, window_restored: bool, window_writes: u32 };
-const offsets = [_]u32{ 0, 0x1000, 0x625000, pramin.aperture };
-const lengths = [_]u32{ 4096, 4096, 4096, pramin.aperture_bytes };
 pub const Capture = struct {
     context: ?r4os.r4dev.DriverContext = null,
     snapshot: ?identity.Snapshot = null,
@@ -24,13 +23,13 @@ pub const Capture = struct {
     preflight: probe.Capture = .{},
     memory: ?r4os.driver_memory.Context = null,
     clock: ?r4os.r4dev.DriverResourceContext = null,
-    windows: [offsets.len]a.GfxMmioWindow = @splat(.{}),
+    registers: bar0.Owner = .{},
+    register_access: bar0.Lease = .{},
     reference: a.GfxBufferReference = .{},
     map: a.GfxBufferMap = .{},
     operation: ?pramin.Capture = null,
     original_boot: ?a.GfxNativeBootInfo = null,
     self_address: usize = 0,
-    cleanup_needed: bool = false,
     effects_latched: bool = false,
     window_writes: u32 = 0,
     last_status: i32 = 0,
@@ -53,23 +52,13 @@ pub const Capture = struct {
         const adapter = 0x01000000 | (@as(u32, snapshot.pci.bus) << 8) | (@as(u32, snapshot.pci.device) << 3) | snapshot.pci.function;
         const boot = try self.boot.captureGuarded(ctx, adapter, .{ .context = @intFromPtr(self), .callback = recoverWindow });
         self.original_boot = boot.boot;
+        try self.registers.open(ctx, snapshot, chip);
+        try self.register_access.acquire(&self.registers, ctx, snapshot, chip);
         // Reobserve the complete supported preflight under the held display.
-        const raw = try self.preflight.read(ctx, snapshot, chip);
+        const raw = try self.preflight.readShared(ctx, snapshot, chip, &self.registers);
         if (!self.preflight.close()) return error.Cleanup;
         const range = try pramin.workspace(chip.id, &raw);
         self.observation = raw;
-        for (offsets, lengths, 0..) |offset, bytes, index| {
-            const request: a.GfxMmioRequest = .{ .resource_base = bar.base, .resource_bytes = bar.bytes,
-                .byte_offset = offset, .byte_length = bytes, .cache_policy = a.gfx_buffer_cache_uncached };
-            const window = &self.windows[index];
-            self.cleanup_needed = true;
-            self.last_status = self.memory.?.mmioMap(&request, window);
-            if (self.last_status != a.gfx_buffer_result_ok) return error.Mapping;
-            if (window.version != 1 or window.size < @sizeOf(a.GfxMmioWindow) or window.handle.id == 0 or window.handle.generation == 0 or
-                window.cpu_address == 0 or window.cpu_address & 3 != 0 or window.cpu_address > std.math.maxInt(u64) - @as(u64, bytes) or
-                window.byte_length != bytes or window.physical_address != bar.base + offset or
-                window.cache_policy != a.gfx_buffer_cache_uncached) return error.Mapping;
-        }
         const boot0 = try read32(self, 0);
         const boot1 = try read32(self, 4);
         const observed = identity.chip(boot0, boot1) orelse return error.Profile;
@@ -103,10 +92,11 @@ pub const Capture = struct {
     /// hold are still owned. A borrower freezes this observation until release.
     pub fn reobserve(self: *Capture) !state.Raw {
         if (self.self_address != @intFromPtr(self) or !self.ready or self.borrower != 0 or
-            self.boot.held_generation == 0 or self.map.lease.id == 0) return error.State;
+            self.boot.held_generation == 0 or self.map.lease.id == 0 or
+            !self.register_access.valid() or self.registers.borrowedCount() != 1) return error.State;
         const operation = if (self.operation) |*value| value else return error.State;
         if (!operation.restored or operation.phase != .done or operation.failure != null) return error.State;
-        const raw = try self.preflight.readWithVga(&self.context.?, &self.snapshot.?, self.chip.?, &self.windows[2]);
+        const raw = try self.preflight.readShared(&self.context.?, &self.snapshot.?, self.chip.?, &self.registers);
         if (!self.preflight.close()) return error.Cleanup;
         const range = try pramin.workspace(self.chip.?.id, &raw);
         if (range.address != operation.options.range.address or range.bytes != operation.options.range.bytes or
@@ -140,13 +130,8 @@ pub const Capture = struct {
         if (self.self_address != @intFromPtr(self) or self.boot.held_generation == 0 or address & 3 != 0) return error.Stale;
         if (address != 0 and address != 4 and address != pramin.window_register and address != pramin.vga_register and
             !(address >= pramin.aperture and address < pramin.aperture + pramin.aperture_bytes)) return error.Register;
-        for (offsets, lengths, 0..) |offset, bytes, index| {
-            if (address < offset or address - offset >= bytes) continue;
-            const window = &self.windows[index];
-            if (window.handle.id == 0 or window.byte_length != bytes) return error.Mapping;
-            return @ptrFromInt(window.cpu_address + address - offset);
-        }
-        return error.Register;
+        const view = try self.register_access.view(address, 4);
+        return @ptrFromInt(view.cpu_address);
     }
     fn read32(raw: *anyopaque, address: u32) !u32 {
         const pointer_value = try cast(raw).pointer(address);
@@ -189,10 +174,13 @@ pub const Capture = struct {
     pub fn close(self: *Capture) bool {
         if (self.self_address == 0) return true;
         if (self.self_address != @intFromPtr(self) or self.borrower != 0) return false;
+        if (!self.preflight.close()) return false;
+        const own_borrow: usize = if (self.register_access.owner != null) 1 else 0;
+        if (self.registers.borrowedCount() != own_borrow or
+            (own_borrow != 0 and !self.register_access.valid())) return false;
         // Recovery needs all MMIO and snapshot leases. It runs before any
         // resource release; a failed callback retains the common display.
         if (!self.boot.close()) return false;
-        if (!self.preflight.close()) return false;
         if (self.memory) |memory| {
             if (self.map.lease.id != 0) {
                 self.last_status = memory.bufferUnmap(&self.map.lease);
@@ -204,21 +192,10 @@ pub const Capture = struct {
                 if (self.last_status != a.gfx_buffer_result_ok) return false;
                 self.reference = .{};
             }
-            var left = self.windows.len;
-            while (left != 0) {
-                left -= 1;
-                const window = &self.windows[left];
-                if (window.handle.id == 0) continue;
-                self.last_status = memory.mmioUnmap(&window.handle, 1);
-                if (self.last_status != a.gfx_buffer_result_ok) return false;
-                window.* = .{};
-            }
-            if (self.cleanup_needed) {
-                self.last_status = memory.collect();
-                if (self.last_status != a.gfx_buffer_result_ok) return false;
-            }
         }
-        self.* = .{};
+        if (!self.register_access.release()) return false;
+        if (!self.registers.close()) { self.last_status = self.registers.last_status; return false; }
+        self.* = .{ .registers = .{ .serial = self.registers.serial } };
         return true;
     }
 };

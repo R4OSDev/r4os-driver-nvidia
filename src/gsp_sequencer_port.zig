@@ -5,6 +5,7 @@ const std = @import("std");
 const r4os = @import("r4os");
 const a = r4os.abi;
 const identity = @import("identity.zig");
+const bar0 = @import("bar0.zig");
 const seq = @import("gsp_sequencer.zig");
 const core = @import("gsp_core.zig");
 const firmware_run = @import("falcon_run.zig");
@@ -43,6 +44,7 @@ pub const Port = struct {
     clock: ?r4os.r4dev.DriverResourceContext = null,
     owner: ?Owner = null,
     window: a.GfxMmioWindow = .{},
+    shared: bar0.Lease = .{},
     run: Run = .{ .epoch = 0, .deadline_ns = 0 },
     boot0: u32 = 0,
     self_address: usize = 0,
@@ -62,6 +64,14 @@ pub const Port = struct {
     /// Stable address, serialized init/Driver Work owner; not an IRQ callback
     /// or a dedicated task. Failure retains any partially returned mapping.
     pub fn open(self: *Port, ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, boot0: u32, boot1: u32, run: Run, owner: Owner) !void {
+        return self.openUsing(ctx, snapshot, boot0, boot1, run, owner, null);
+    }
+    /// Borrow the capture's existing BAR0 window. Close retains this borrow
+    /// through ambiguous effects; only the mapping owner can unmap it.
+    pub fn openShared(self: *Port, ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, boot0: u32, boot1: u32, run: Run, owner: Owner, shared: *bar0.Owner) !void {
+        return self.openUsing(ctx, snapshot, boot0, boot1, run, owner, shared);
+    }
+    fn openUsing(self: *Port, ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, boot0: u32, boot1: u32, run: Run, owner: Owner, shared: ?*bar0.Owner) !void {
         if (self.self_address != 0) return error.Busy;
         const chip = identity.chip(boot0, boot1) orelse return error.Profile;
         const bar = snapshot.bars[0];
@@ -77,10 +87,15 @@ pub const Port = struct {
         self.clock = ctx.resources() orelse return error.Api;
         try self.guard();
         self.memory = ctx.memory() orelse return error.Api;
-        const request: a.GfxMmioRequest = .{ .resource_base = bar.base, .resource_bytes = bar.bytes, .byte_length = bar.bytes, .cache_policy = a.gfx_buffer_cache_uncached };
-        self.cleanup_needed = true;
-        self.memory_status = self.memory.?.mmioMap(&request, &self.window);
-        if (self.memory_status != a.gfx_buffer_result_ok) return error.Mapping;
+        if (shared) |mapping| {
+            try self.shared.acquire(mapping, ctx, snapshot, chip);
+            self.window = try self.shared.whole();
+        } else {
+            const request: a.GfxMmioRequest = .{ .resource_base = bar.base, .resource_bytes = bar.bytes, .byte_length = bar.bytes, .cache_policy = a.gfx_buffer_cache_uncached };
+            self.cleanup_needed = true;
+            self.memory_status = self.memory.?.mmioMap(&request, &self.window);
+            if (self.memory_status != a.gfx_buffer_result_ok) return error.Mapping;
+        }
         const w = &self.window;
         if (w.version != 1 or w.size < @sizeOf(a.GfxMmioWindow) or w.handle.id == 0 or w.handle.generation == 0 or
             w.cpu_address == 0 or w.cpu_address % 4096 != 0 or w.cpu_address > std.math.maxInt(u64) - bar.bytes or
@@ -180,7 +195,7 @@ pub const Port = struct {
     }
     fn generation(p: *anyopaque) u64 {
         const self = cast(p);
-        if (self.self_address != @intFromPtr(self) or !self.ready or self.failure != null) return 0;
+        if (self.self_address != @intFromPtr(self) or !self.ready or self.failure != null or !self.mappingValid()) return 0;
         const owner = self.owner orelse return 0;
         return owner.generation(owner.context);
     }
@@ -191,12 +206,16 @@ pub const Port = struct {
     }
     fn guard(self: *Port) !void {
         if (self.self_address != @intFromPtr(self) or self.failure != null or self.owner == null or self.clock == null) return error.State;
+        if (!self.mappingValid()) return error.Stale;
         const owner = self.owner.?;
         if (owner.generation(owner.context) != self.run.epoch) return error.Stale;
         const now = self.clock.?.nowNs();
         if (now == std.math.maxInt(u64) or now < self.last_clock) return error.Clock;
         self.last_clock = now;
         if (now >= self.run.deadline_ns) return error.Deadline;
+    }
+    fn mappingValid(self: *const Port) bool {
+        return self.shared.owner == null or (self.shared.valid() and std.meta.eql(self.window, self.shared.stamp));
     }
     fn access(self: *Port, kind: Access, offset: u32) !void {
         try self.guard();
@@ -324,6 +343,11 @@ pub const Port = struct {
             if (!owner.quiesced(owner.context)) return false;
         }
         self.ready = false;
+        if (self.shared.owner != null) {
+            if (!self.mappingValid() or !self.shared.release()) return false;
+            self.* = .{};
+            return true;
+        }
         if (self.memory) |memory| {
             if (self.window.handle.id != 0) {
                 self.memory_status = memory.mmioUnmap(&self.window.handle, 1);

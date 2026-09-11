@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-Passive NVIDIA display driver for R4OS. Module 0.1.32; original R4OS code is
+Passive NVIDIA display driver for R4OS. Module 0.1.33; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -10,7 +10,33 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
-Normal cold GSP core preparation and completion (host qualified):
+Shared BAR0 ownership (NVIDIA 0.1.33):
+
+The opt-in boot-check now keeps one full measured GA106 BAR0 UC mapping.
+Boot/VGA capture, repeated preflight and Booter fuse reads borrow this owner;
+the native port can use the same mapping through openShared. This resolves
+the live-window overlap rejected by the Kernel. Eight bounded leases bind
+the exact API/device/resource/window, stable addresses and monotonic serials.
+Each consumer keeps its existing register policy; mapping grants no execution.
+
+Any external borrower prevents capture close or reobservation. Native effects
+retain the port's borrow until its native owner proves quiescence. Child close
+never unmaps the parent; partial map, unmap and collect failures retain cleanup
+state. Capture keeps its own borrow through the existing PRAMIN restoration.
+That recovery still covers only the aperture, not firmware or scanout changes.
+
+All51 existing owner cases passed on the first targeted run, followed by the
+module build. The two existing lifecycle/MMIO groups cover shared capture,
+native identity and fuse reads with exactly one mapping, overlapping-range
+rejection, stale ownership, bounded views and failed cleanup. No new case count
+or gate. NVIDIA0.1.33 keeps the same385024 resident bytes and24 unchanged
+firmware/legal resource payloads. Original R4OS code; Kernel remains150.
+
+Native GPU execution remains unlinked. Full recovery, same-run firmware
+admission and physical INIT_DONE/scanout/HDMI remain open. OssiPC is offline
+and untouched. Evidence: shared_bar0_checkpoint; archive shared-bar0-20260911.
+
+Previous host checkpoint: normal cold GSP core preparation and completion:
 
 After checked FRTS, the cold prepare stage resets directly into RISC-V,
 programs BCR0x111 and passes the bound Libos DMA page low32/high32. After
@@ -37,7 +63,7 @@ Full GPU/scanout recovery and physical execution/INIT_DONE remain open.
 OssiPC is offline and untouched. Evidence: `cold_core_checkpoint`; archive
 `cold-core-20260911`.
 
-Current linked: retain both FWSEC images before boot (NVIDIA 0.1.32):
+Earlier linked checkpoint: retain both FWSEC images before boot (NVIDIA 0.1.32):
 
 The opt-in boot-check keeps its original immutable SB CPU/DMA image for normal
 teardown and prepares FRTS in a separate resident owner. The complete run now

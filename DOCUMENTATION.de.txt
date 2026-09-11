@@ -10,7 +10,35 @@ unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
 
-Normalen GSP-Kaltstart vorbereiten und pruefen (Hostnachweis)
+Gemeinsamer BAR0-Besitz (NVIDIA 0.1.33)
+-------------------------------------
+Der optionale Boot-Check haelt jetzt ein vollstaendiges gemessenes GA106-
+BAR0-Mapping mit UC-Cachetyp. Boot-/VGA-Sicherung, erneute Zustandspruefung
+und Booter-Fuses leihen daraus ihre Bereiche; openShared stellt denselben
+Besitz dem nativen Port bereit. Damit entfallen die vom Kernel abgewiesenen
+ueberlappenden Fenster. Acht begrenzte Leihen binden API, Geraet, Ressource,
+Mappingstempel, feste Adressen und fortlaufende Seriennummern. Die bisherigen
+Registerregeln gelten weiterhin; das Mapping erlaubt keine GPU-Ausfuehrung.
+
+Jeder externe Nutzer verhindert Schliessen oder erneute Beobachtung der
+Sicherung. Nach moeglichen nativen Effekten bleibt die Port-Leihe bis zum
+Quieszenznachweis gehalten. Nur der Mappingbesitzer gibt das Fenster frei;
+partielle Mappingfehler und fehlgeschlagene Unmap-/Collect-Aufrufe bleiben
+wiederholbar bereinigbar. Die eigene Capture-Leihe bleibt bis zur bisherigen
+PRAMIN-Wiederherstellung bestehen. Diese sichert weiterhin nur die Apertur.
+
+51 bestehende Faelle beim ersten gezielten Lauf und der Modulbuild bestanden.
+Zwei vorhandene Lifecycle-/MMIO-Gruppen pruefen gemeinsame Sicherung, native
+Identitaet und Fuses mit genau einem Mapping sowie Besitz-, Bereichs- und
+Bereinigungsfehler. Keine neue Fallzahl/Gates. NVIDIA0.1.33 belegt weiterhin
+385024 residente Bytes; alle24 Firmware-/Lizenzressourcen bytegleich.
+Originaler R4OS-Code, Kernel150 unveraendert. Native Ausfuehrung bleibt
+ungelinkt; Gesamt-Recovery, reale Firmwarezulassung und physischer Start/
+INIT_DONE, Scanout und HDMI offen. OssiPC offline und unveraendert.
+Beleg: shared_bar0_checkpoint; Archiv:
+ExFiles/Reference/GFX/Nvidia/0.79.10/shared-bar0-20260911.
+
+Vorheriger Hostnachweis: GSP-Kaltstart vorbereiten und pruefen
 ----------------------------------------------------------
 Nach geprueftem FRTS setzt die Prepare-Phase GSP direkt nach RISC-V zurueck,
 programmiert BCR0x111 und uebergibt die gehaltene Libos-DMA-Seite low32/high32.
@@ -38,7 +66,7 @@ erforderlich. Vollstaendige GPU-/Scanout-Recovery und physischer Start/INIT_DONE
 offen. OssiPC offline/unveraendert. Beleg: cold_core_checkpoint. Archiv:
 ExFiles/Reference/GFX/Nvidia/0.79.10/cold-core-20260911.
 
-Aktuell eingebunden: Beide FWSEC-Abbilder vor dem Start halten (NVIDIA 0.1.32)
+Frueherer eingebundener Stand: Beide FWSEC-Abbilder vor dem Start halten (NVIDIA 0.1.32)
 -------------------------------------------------------
 Der optionale Bootcheck behaelt sein urspruengliches unveraenderliches SB-
 Abbild samt DMA fuer den normalen Abbau. FRTS bekommt einen getrennten

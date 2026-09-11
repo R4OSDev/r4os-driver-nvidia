@@ -124,6 +124,8 @@ const NativeRig = struct {
     wrong_flush: bool = false,
     fail_unmap: bool = false,
     wrong_map: bool = false,
+    partial_map: bool = false,
+    fail_collect: bool = false,
     hs_admissions: u32 = 0,
     booter_active: bool = false,
     booter_unload: bool = false,
@@ -211,6 +213,7 @@ const NativeRig = struct {
         std.debug.assert(!rig.mapped and request.byte_length == rig.words.len * 4 and request.cache_policy == a.gfx_buffer_cache_uncached);
         rig.mapped = true;
         out.* = .{ .handle = .{ .id = 5, .generation = 8 }, .cpu_address = @intFromPtr(rig.words.ptr), .physical_address = request.resource_base, .byte_length = request.byte_length, .cache_policy = if (rig.wrong_map) a.gfx_buffer_cache_write_back else a.gfx_buffer_cache_uncached };
+        if (rig.partial_map) return a.gfx_buffer_error_budget;
         return a.gfx_buffer_result_ok;
     }
     fn unmap(handle: *const a.GfxBufferHandle, quiet: u32) callconv(.c) i32 {
@@ -222,6 +225,7 @@ const NativeRig = struct {
     }
     fn collect() callconv(.c) i32 {
         std.debug.assert(!rig.mapped);
+        if (rig.fail_collect) return a.gfx_buffer_error_busy;
         return a.gfx_buffer_result_ok;
     }
     fn table() a.DriverApi {
@@ -621,4 +625,75 @@ test "firmware CPU storage GA106 core sequencing and native MMIO ownership" {
         }
         try t.expect(port.close() and !fixture.mapped and fixture.unmaps == 1);
     }
+    checkpoint = "shared-bar0-lifetime";
+    const bar0 = @import("bar0.zig");
+    const chip = identity.chip(boot0, 0).?;
+    @memset(words, 0);
+    words[0] = boot0;
+    fixture = .{ .words = words };
+    var mapping: bar0.Owner = .{};
+    defer _ = mapping.close();
+    try mapping.open(&ctx, &snapshot, chip);
+    var borrows: [bar0.max_borrowers]bar0.Lease = @splat(.{});
+    for (&borrows) |*borrow| try borrow.acquire(&mapping, &ctx, &snapshot, chip);
+    defer for (&borrows) |*borrow| { _ = borrow.release(); };
+    var extra: bar0.Lease = .{};
+    try t.expectError(error.Capacity, extra.acquire(&mapping, &ctx, &snapshot, chip));
+    try t.expectError(error.Busy, borrows[0].acquire(&mapping, &ctx, &snapshot, chip));
+    try t.expectError(error.Bounds, borrows[0].view(mapping.window.byte_length, 4));
+    try t.expectError(error.Bounds, borrows[0].view(0, 0));
+    const last = try borrows[0].view(mapping.window.byte_length - 4, 4);
+    try t.expectEqual(@intFromPtr(words.ptr) + words.len * 4 - 4, last.cpu_address);
+    var moved = borrows[0];
+    try t.expect(!moved.valid() and !moved.release() and !mapping.close());
+    mapping.window.handle.generation += 1;
+    try t.expect(!borrows[0].valid() and !borrows[0].release() and !mapping.close());
+    mapping.window.handle.generation -= 1;
+    for (&borrows) |*borrow| try t.expect(borrow.release());
+    var wrong = snapshot;
+    wrong.pci.function += 1;
+    try t.expectError(error.Stale, extra.acquire(&mapping, &ctx, &wrong, chip));
+    wrong = snapshot;
+    wrong.bars[0].bytes -= 4096;
+    try t.expectError(error.Stale, extra.acquire(&mapping, &ctx, &wrong, chip));
+    var other_api = api;
+    const other_ctx = r4os.r4dev.DriverContext.init(&other_api);
+    try t.expectError(error.Stale, extra.acquire(&mapping, &other_ctx, &snapshot, chip));
+    port = .{};
+    try port.openShared(&ctx, &snapshot, boot0, 0, .{ .epoch = 9, .deadline_ns = 10000000 }, fixture.owner(), &mapping);
+    const shared_io = try port.sequencer();
+    port.window.handle.generation += 1;
+    try t.expectError(error.Stale, shared_io.read32(shared_io.context, 0));
+    try t.expect(!port.close() and !mapping.close());
+    port.window.handle.generation -= 1;
+    try t.expect(port.close() and fixture.mapped and fixture.unmaps == 0);
+    try port.openShared(&ctx, &snapshot, boot0, 0, .{ .epoch = 9, .deadline_ns = 10000000 }, fixture.owner(), &mapping);
+    const effect_io = try port.sequencer();
+    // Retention is exercised through an actual posted MMIO write. These
+    // callbacks model host storage disposal, never real GPU quiescence.
+    try effect_io.write32(effect_io.context, r.os, 0xaabb);
+    try t.expect(!port.close() and !mapping.close() and fixture.unmaps == 0);
+    fixture.quiet = true;
+    try t.expect(port.close() and mapping.borrowedCount() == 0 and fixture.mapped and fixture.unmaps == 0);
+    const serial = mapping.serial;
+    fixture.fail_unmap = true;
+    try t.expect(!mapping.close() and mapping.window.handle.id == 5);
+    fixture.fail_unmap = false;
+    fixture.fail_collect = true;
+    try t.expect(!mapping.close() and !fixture.mapped and mapping.window.handle.id == 0);
+    fixture.fail_collect = false;
+    try t.expect(mapping.close() and mapping.serial == serial and mapping.close());
+    // Partial or invalid mapping responses remain owned until cleanup; no
+    // consumer receives a live view. Serial exhaustion cannot recycle a lease.
+    for (0..2) |fault| {
+        fixture = .{ .words = words, .partial_map = fault == 0, .wrong_map = fault == 1 };
+        try t.expectError(error.Mapping, mapping.open(&ctx, &snapshot, chip));
+        try t.expectError(error.Stale, extra.acquire(&mapping, &ctx, &snapshot, chip));
+        try t.expect(mapping.close() and fixture.unmaps == 1);
+    }
+    fixture = .{ .words = words };
+    mapping.serial = std.math.maxInt(u64);
+    try mapping.open(&ctx, &snapshot, chip);
+    try t.expectError(error.Exhausted, extra.acquire(&mapping, &ctx, &snapshot, chip));
+    try t.expect(mapping.close() and mapping.serial == std.math.maxInt(u64));
 }

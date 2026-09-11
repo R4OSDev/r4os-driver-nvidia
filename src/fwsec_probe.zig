@@ -5,27 +5,32 @@ const r4os = @import("r4os");
 const identity = @import("identity.zig");
 const fwsec = @import("fwsec.zig");
 const preparation = @import("fwsec_prepare.zig");
+const bar0 = @import("bar0.zig");
 const a = r4os.abi;
 pub const debug_register: u32 = 0x82074c;
 pub const version_register: u32 = 0x8241c0;
-pub const Error = preparation.Error || error{ UnmeasuredRange, Api, Mapping, Clock, Deadline, Unstable, Busy };
+pub const Error = preparation.Error || bar0.Error || error{ UnmeasuredRange, Api, Mapping, Clock, Deadline, Unstable, Busy };
 
 pub const Capture = struct {
     memory: ?r4os.driver_memory.Context = null,
     windows: [2]a.GfxMmioWindow = .{ .{}, .{} },
     cleanup_needed: bool = false,
+    shared: bar0.Lease = .{},
 
     pub fn read(self: *Capture, ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, chip: identity.Chip, catalog: *const fwsec.Catalog) Error!preparation.Fuses {
-        return self.readSelected(ctx, snapshot, chip, catalog, 0);
+        return self.readSelected(ctx, snapshot, chip, catalog, 0, null);
     }
 
     /// SEC2 Booter has its own one-indexed fuse ID; the prior FWSEC result
     /// must not be reused. Reads and retained MMIO cleanup use the same owner.
     pub fn readBooter(self: *Capture, ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, chip: identity.Chip) Error!preparation.Fuses {
-        return self.readSelected(ctx, snapshot, chip, null, 3);
+        return self.readSelected(ctx, snapshot, chip, null, 3, null);
+    }
+    pub fn readBooterShared(self: *Capture, ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, chip: identity.Chip, shared: *bar0.Owner) Error!preparation.Fuses {
+        return self.readSelected(ctx, snapshot, chip, null, 3, shared);
     }
 
-    fn readSelected(self: *Capture, ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, chip: identity.Chip, catalog: ?*const fwsec.Catalog, fixed_id: u8) Error!preparation.Fuses {
+    fn readSelected(self: *Capture, ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, chip: identity.Chip, catalog: ?*const fwsec.Catalog, fixed_id: u8, shared: ?*bar0.Owner) Error!preparation.Fuses {
         const bar = snapshot.bars[0];
         if (identity.decision(snapshot) != .identity_words_only or chip.id != 0x176 or
             bar.bytes < 0x825000 or bar.base > std.math.maxInt(u64) - bar.bytes) return error.UnmeasuredRange;
@@ -42,22 +47,27 @@ pub const Capture = struct {
         const deadline = std.math.add(u64, start, std.time.ns_per_s) catch return error.Clock;
         var previous = start;
         self.memory = ctx.memory() orelse return error.Api;
+        if (shared) |owner| try self.shared.acquire(owner, ctx, snapshot, chip);
         try self.map(0, bar.base, bar.bytes, debug_register & ~@as(u32, 0xfff));
         try checkClock(clock, &previous, deadline);
-        const debug = self.word(0, debug_register);
+        const debug = try self.word(0, debug_register);
         const debug_enabled = try preparation.debugEnabled(debug);
         const ucode_id = if (catalog) |entries| (try preparation.variant(entries, debug_enabled)).ucode_id else fixed_id;
         const address = version_register + 4 * (@as(u32, ucode_id) - 1);
         try self.map(1, bar.base, bar.bytes, address & ~@as(u32, 0xfff));
         try checkClock(clock, &previous, deadline);
-        const version = self.word(1, address);
-        if (self.word(0, debug_register) != debug or self.word(1, address) != version) return error.Unstable;
+        const version = try self.word(1, address);
+        if (try self.word(0, debug_register) != debug or try self.word(1, address) != version) return error.Unstable;
         try checkClock(clock, &previous, deadline);
         _ = try preparation.fuseVersion(version);
         return .{ .debug_disable_raw = debug, .ucode_version_raw = version, .ucode_id = ucode_id };
     }
 
     fn map(self: *Capture, index: usize, base: u64, bytes: u64, offset: u32) Error!void {
+        if (self.shared.owner != null) {
+            _ = try self.shared.view(offset, 4096);
+            return;
+        }
         const request: a.GfxMmioRequest = .{ .resource_base = base, .resource_bytes = bytes, .byte_offset = offset, .byte_length = 4096, .cache_policy = a.gfx_buffer_cache_uncached };
         self.cleanup_needed = true; // Failed maps can retain unpublished pages.
         const window = &self.windows[index];
@@ -66,12 +76,18 @@ pub const Capture = struct {
             window.cpu_address > std.math.maxInt(u64) - 4096 or window.byte_length != 4096 or
             window.physical_address != base + offset or window.cache_policy != a.gfx_buffer_cache_uncached) return error.Mapping;
     }
-    fn word(self: *const Capture, index: usize, address: u32) u32 {
-        const words: [*]const volatile u32 = @ptrFromInt(self.windows[index].cpu_address);
+    fn word(self: *const Capture, index: usize, address: u32) Error!u32 {
+        const cpu = if (self.shared.owner != null) (try self.shared.view(address & ~@as(u32, 0xfff), 4096)).cpu_address else self.windows[index].cpu_address;
+        const words: [*]const volatile u32 = @ptrFromInt(cpu);
         return words[(address & 0xfff) / 4];
     }
 
     pub fn close(self: *Capture) bool {
+        if (self.shared.owner != null) {
+            if (!self.shared.release()) return false;
+            self.* = .{};
+            return true;
+        }
         if (self.memory) |memory| {
             var remaining = self.windows.len;
             while (remaining != 0) {

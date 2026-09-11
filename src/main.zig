@@ -173,6 +173,7 @@ pub export fn nvidia_shutdown() callconv(.c) i32 {
     if (!thread_probe.shutdown(&ctx)) return -1;
     if (!runtime_probe.shutdown(&ctx)) return -1;
     if (!closeBootInit()) return -1;
+    if (!security_fuses.close()) return -1;
     if (!fwsec_frts.close()) return -1;
     if (boot_vram_lease.self_address != 0 and !fwsec_cpu.close()) return -1;
     if (!boot_vram_lease.releaseBeforeSubmission()) return -1;
@@ -181,7 +182,6 @@ pub export fn nvidia_shutdown() callconv(.c) i32 {
     boot_inputs.close();
     if (!gsp_image.close()) return -1;
     if (!firmware_cpu.close()) return -1;
-    if (!security_fuses.close()) return -1;
     if (!fwsec_hardware.close()) return -1;
     if (!fwsec_cpu.close()) return -1;
     if (!board_rom.close()) return -1;
@@ -529,7 +529,7 @@ fn checkBoot(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Sna
     log("NVIDIA boot-sb: retained command=19 bytes={d} dma-address={x} purpose=normal-teardown synchronized=yes submitted=no", .{
         fwsec_cpu.allocation.byte_length, fwsec_cpu.device.mapping.segments[0].phys_addr,
     });
-    const fuses = security_fuses.readBooter(ctx, snapshot, chip) catch |err| {
+    const fuses = security_fuses.readBooterShared(ctx, snapshot, chip, &boot_vram.registers) catch |err| {
         log("NVIDIA booters: rejected phase=fuses reason={s} submitted=no", .{@errorName(err)});
         _ = security_fuses.close();
         return false;
