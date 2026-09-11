@@ -10,6 +10,37 @@ unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
 
+RM-Objektlebenszyklus (Quellvorbereitung fuer0.79.12, 11.09.2026)
+-------------------------------------------------------------
+gsp_objects legt Client, Geraet, Subdevice und Display-Common in dieser
+Reihenfolge an und baut sie umgekehrt ab. Objektverwaltung und Monitor-
+abfrage nutzen denselben gsp_exchange-Besitzer. Erst nach gepruefter
+RM-Antwort und Queue-Bestaetigung wird ein Name lebend/frei. Der Runtime-
+Besitz kann fuer Monitorabfragen ausgeliehen und zum Abbau zurueckgenommen
+werden; offene/fehlgeschlagene Arbeit ist nicht uebertragbar. Ein alter
+Besitzer kann die bereits uebergebene Session nicht mehr stoppen.
+
+Eine bestaetigt abgelehnte Allokation erlaubt expliziten Abbau der zuvor
+erzeugten Eltern. Unklare Publikation/Antwort/Bestaetigung und fehlgeschlagenes
+Free halten betroffene Namen und verbliebene Eltern fest. Anlage und Abbau
+haben jeweils eine feste Gesamtfrist. Der Abschluss betrifft vier RM-Namen,
+nicht GPU-Ruhe oder DMA-Freigabe. Globale Namensreservierung und echte native
+Zulassung inklusive interner RM-Initialisierung und Display-Instanzbindung
+muessen weiterhin vom spaeteren nativen Aufrufer geliefert werden.
+
+Der570.144-Client hat120 Byte einschliesslich Null-OS-PID-Pointer; der alte
+Nouveau535-Auszug mit108 Byte wird nicht als ABI uebernommen. Nur vier feste
+Strukturen mit Nullpadding werden kodiert.26 volle gepinnte Originale unter
+ExFiles/Reference/GFX/Nvidia/0.79.12/rm-objects-20260911; sechs vollstaendige
+Objekt-Quellhinweise plus vier erhaltene Hinweise im gemeinsamen Exchange.
+
+51 bestehende Besitzerfaelle und ein Modulbuild im ersten Lauf bestanden.
+Gesamtes NVIDIA0.1.44-Produktartefakt bytegleich; neuer Objektcode bisher nur
+hostseitig eingebunden. Kein neuer Fall/Gate, Gast, Inspektor, Hardwarelauf,
+Versions-/ABI-/Distributionswechsel. Beleg rm_object_checkpoint in
+GrafikFirmware07910.json. OssiPC offline/unberuehrt; native Firmware-/Bus-/
+Handleranbindung und echte vollstaendige Empfaenger-/Audioabnahme offen.
+
 RM-Monitorabfragen (Quellvorbereitung fuer 0.79.12, 11.09.2026)
 -----------------------------------------------------------
 gsp_display_rpc bildet die drei festen NV0073-Abfragen fuer unterstuetzte

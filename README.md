@@ -10,6 +10,36 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
+RM object lifecycle (source preparation for0.79.12, 2026-09-11):
+
+gsp_objects now creates the fixed client/device/subdevice/display-common
+hierarchy and destroys it in reverse order, over the same gsp_exchange
+owner as display queries. Each name becomes live/free only after its
+validated RM response and queue ACK. The object owner can lend the runtime
+to the display channel and reclaim it for destruction. Pending/failed work
+cannot transfer, and an old owner cannot stop an already-transferred session.
+
+Confirmed allocation rejection permits explicit cleanup of the live prefix.
+Ambiguous sends, replies or ACKs and failed free retain the affected name
+and remaining ancestors. Each create/destroy phase has one fixed deadline.
+Completion releases four RM names; firmware and DMA queues remain active.
+Global name reservation, actual native admission/internal RM initialization
+and display-instance binding remain responsibilities of the future caller.
+
+The570.144 client structure is120 bytes, including a zero OS PID pointer;
+the older Nouveau535 excerpt is108 bytes and is not copied as the wire ABI.
+Only the four selected fixed structures are encoded, with zero padding.
+26 full pinned originals and six complete object-source notices accompany
+rm-objects-20260911 under ExFiles/Reference/GFX/Nvidia/0.79.12. Shared exchange
+retains the four original source notices of the prior display channel.
+
+51 existing owner cases and one module build pass on the first attempt.
+The entire NVIDIA0.1.44 product artifact remains byte-identical. New object
+code remains host-linked preparation; no new case/gate, guest, inspector,
+hardware, version, ABI or Distribution change. See rm_object_checkpoint in
+Docs/Drivers/GrafikFirmware07910.json. OssiPC remains offline/untouched;
+native firmware/transport/handlers, complete receiver and audio remain open.
+
 RM display queries (source preparation for roadmap 0.79.12, 2026-09-11):
 
 gsp_display_rpc now encodes the three fixed NV0073 supported/connected/EDID

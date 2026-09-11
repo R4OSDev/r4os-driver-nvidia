@@ -98,7 +98,8 @@
 //! The native caller must supply an actually allocated, retained RM object.
 const std = @import("std");
 const boot_events = @import("gsp_boot_events.zig");
-const transport = @import("gsp_transport.zig");
+const exchange = @import("gsp_exchange.zig");
+const transport = exchange.transport;
 const message = transport.message;
 pub const Error = boot_events.Error || error{ Handle, Query, Unexpected, Obsolete, Bounds };
 pub const function: u32 = 76;
@@ -124,8 +125,8 @@ pub const Dispatch = struct {
     rpc: message.Rpc,
     value: union(enum) { reply: Reply, notification: []const u8 },
 };
-pub const Phase = enum { idle, prepared, waiting, handed_off, failed };
-pub const Failure = struct { reason: Error, rpc: ?message.Rpc, ticket: ?transport.Ticket };
+pub const Phase = exchange.Phase;
+pub const Failure = exchange.Failure;
 
 fn word(bytes: []const u8, offset: usize) u32 {
     return std.mem.readInt(u32, bytes[offset..][0..4], .little);
@@ -215,60 +216,34 @@ pub fn decode(object: Object, query: Query, record: message.Record) Error!Reply 
 }
 
 pub const Channel = struct {
-    session: *transport.Session,
+    exchange: exchange.Exchange,
     object: Object,
-    phase: Phase = .idle,
-    deadline: ?u64 = null,
     request: ?Query = null,
     request_bytes: [max_request_bytes]u8 = undefined,
-    request_size: usize = 0,
     request_revision: u64 = 0,
-    revision: u64 = 1,
     supported: ?Supported = null,
     connected: u32 = 0,
-    in_lockdown: bool,
     pending: ?Dispatch = null,
-    last_rpc: ?message.Rpc = null,
-    failure: ?Failure = null,
 
-    /// Claim the post-boot runtime queue once, after its preceding owner has
-    /// allocated the RM client and NV04_DISPLAY_COMMON object. Keep those
-    /// actual handles and all backing alive in this epoch. This API does not
-    /// allocate or prove handles; it permits the required allocation phase
-    /// between INIT_DONE and display controls without a second queue owner.
+    /// Claim the sole runtime queue after actual RM object allocation. Handles
+    /// and all backing remain retained in this epoch; this API does not create
+    /// them. Keep this value stable while a request or dispatch is outstanding.
     pub fn init(runtime: *boot_events.Handoff, object: Object, deadline: u64) Error!Channel {
-        const session = runtime.session;
-        if (runtime.claimed or session.state != .active or session.pending != null) return error.State;
-        if (object.epoch != session.epoch or object.client == 0 or object.display == 0) return error.Handle;
-        try session.guard(deadline);
-        runtime.claimed = true;
-        return .{ .session = session, .object = object, .in_lockdown = runtime.in_lockdown };
+        if (object.epoch != runtime.session.epoch or object.client == 0 or object.display == 0) return error.Handle;
+        return .{ .exchange = try exchange.Exchange.init(runtime, deadline), .object = object };
     }
     fn fail(self: *Channel, reason: Error) Error {
-        self.failure = .{ .reason = reason, .rpc = if (self.session.pending != null) self.last_rpc else null, .ticket = self.session.pending };
-        self.phase = .failed;
         self.connected = 0;
-        self.session.stop();
-        return reason;
+        return self.exchange.fail(reason);
     }
-    fn guard(self: *Channel, end: u64) Error!void {
-        if (self.phase == .failed or self.phase == .handed_off) return error.State;
-        self.session.guard(end) catch |err| return self.fail(err);
-    }
-    /// Invalidate discovery after a topology/lifetime event, including one
-    /// received outside this dispatcher. An in-flight result then stays obsolete
-    /// even if its bytes arrive successfully; explicit fresh queries are needed.
     pub fn invalidate(self: *Channel) Error!void {
-        if (self.phase == .failed or self.phase == .handed_off) return error.State;
-        if (self.revision == std.math.maxInt(u64)) return self.fail(error.Exhausted);
-        self.revision += 1;
+        try self.exchange.invalidate();
         self.connected = 0;
     }
     pub fn begin(self: *Channel, query: Query, deadline: u64) Error!void {
-        if (self.phase != .idle) return error.State;
+        if (self.exchange.phase != .idle) return error.State;
         if (self.pending != null) return error.Pending;
-        const end = @min(self.deadline orelse deadline, deadline);
-        try self.guard(end);
+        self.exchange.guard(@min(self.exchange.deadline orelse deadline, deadline)) catch |err| return self.fail(err);
         switch (query) {
             .supported => {},
             .connected => |mask| {
@@ -278,95 +253,56 @@ pub const Channel = struct {
             .edid => |id| if (!oneBit(id) or id & self.connected == 0) return error.Query,
         }
         const bytes = try encode(self.object, query, &self.request_bytes);
-        self.request_size = bytes.len;
+        try self.exchange.begin(function, bytes, deadline);
         self.request = query;
-        self.request_revision = self.revision;
-        self.deadline = end;
-        self.phase = .prepared;
-        // An unsuccessful fresh probe cannot leave the queried displays marked
-        // connected using the preceding probe's result.
+        self.request_revision = self.exchange.revision;
         if (query == .connected) self.connected &= ~query.connected;
     }
-
-    /// One receive or send attempt. Drain notifications before publishing a
-    /// prepared command. Busy queues and lockdown keep the original deadline;
-    /// callers may shorten but never extend it through rescheduling. Idle polls
-    /// use their own budget, pinned until a returned dispatch is completed.
     pub fn poll(self: *Channel, deadline: u64) Error!?Dispatch {
-        const end = @min(self.deadline orelse deadline, deadline);
-        try self.guard(end);
-        self.deadline = end;
-        if (self.pending != null) return error.Pending;
-        const received = self.session.receive(end) catch |err| {
-            if (err == error.NotReady) return null;
-            return self.fail(err);
-        };
-        if (received) |item| {
-            const rpc = item.record.rpc;
-            self.last_rpc = rpc;
-            if (rpc.cpu_rm_gfid != 0) return self.fail(error.Guest);
-            var dispatch = Dispatch{ .ticket = item.ticket, .rpc = rpc, .value = undefined };
-            if (rpc.function == function) {
-                if (self.phase != .waiting) return self.fail(error.Unexpected);
-                var reply = decode(self.object, self.request.?, item.record) catch |err| return self.fail(err);
-                if ((reply == .connected or reply == .edid) and self.request_revision != self.revision) reply = .obsolete;
-                dispatch.value = .{ .reply = reply };
-            } else {
-                // Pinned event range excludes sentinels and a second INIT_DONE.
-                // Other RPC functions (including continuation 71) are never
-                // silently treated as notifications or matching responses.
-                if (rpc.function < 0x1002 or rpc.function >= 0x1023) return self.fail(error.Unexpected);
-                if (rpc.function == @intFromEnum(boot_events.Kind.lockdown)) {
-                    const bytes = item.record.payload;
-                    if (bytes.len != 1 or bytes[0] > 1) return self.fail(error.Payload);
-                    if (bytes[0] == 1) self.in_lockdown = true;
-                }
-                // Text-only LIBOS output cannot change topology. All other
-                // events conservatively retire discovery; their actual effects
-                // still require the caller's matching handler before ACK.
-                if (rpc.function != @intFromEnum(boot_events.Kind.libos_print)) try self.invalidate();
-                dispatch.value = .{ .notification = item.record.payload };
-            }
-            self.pending = dispatch;
-            return dispatch;
-        }
-        if (self.phase == .prepared and self.request.? != .supported and self.request_revision != self.revision) {
+        if (self.exchange.phase == .prepared and self.pending == null and
+            self.request.? != .supported and self.request_revision != self.exchange.revision)
+        {
+            const end = @min(self.exchange.deadline.?, deadline);
+            self.exchange.guard(end) catch |err| return self.fail(err);
+            self.exchange.deadline = end;
+            self.exchange.cancelPrepared() catch |err| return self.fail(err);
             self.request = null;
-            self.phase = .idle;
-            self.deadline = null;
             return error.Obsolete;
         }
-        if (self.phase == .prepared and !self.in_lockdown) {
-            // Diagnostic RPC sequence follows this retained session's complete
-            // publication count, including the preceding object-owner traffic.
-            self.session.send(end, .{ .function = function, .sequence = self.session.tx_sequence }, self.request_bytes[0..self.request_size]) catch |err| {
-                if (err == error.Unavailable) return null;
-                return self.fail(err);
-            };
-            self.phase = .waiting;
+        const old_revision = self.exchange.revision;
+        const received = self.exchange.poll(deadline) catch |err| {
+            if (err == error.Pending) return err;
+            return self.fail(err);
+        } orelse return null;
+        if (self.exchange.revision != old_revision) self.connected = 0;
+        var dispatch = Dispatch{ .ticket = received.ticket, .rpc = received.record.rpc, .value = undefined };
+        if (received.response) {
+            var reply = decode(self.object, self.request.?, received.record) catch |err| return self.fail(err);
+            if ((reply == .connected or reply == .edid) and self.request_revision != self.exchange.revision) reply = .obsolete;
+            dispatch.value = .{ .reply = reply };
+        } else {
+            dispatch.value = .{ .notification = received.record.payload };
         }
-        if (self.phase == .idle) self.deadline = null;
-        return null;
+        self.pending = dispatch;
+        return dispatch;
     }
-
     pub fn borrow(self: *Channel, ticket: transport.Ticket) Error!Dispatch {
+        _ = self.exchange.borrow(ticket) catch |err| {
+            if (err == error.Stale and self.exchange.phase != .failed) return err;
+            return self.fail(err);
+        };
         var dispatch = self.pending orelse return error.Stale;
-        try self.guard(self.deadline.?);
-        if (!std.meta.eql(dispatch.ticket, ticket)) return error.Stale;
         if (dispatch.value == .reply and
-            (dispatch.value.reply == .connected or dispatch.value.reply == .edid) and self.request_revision != self.revision)
+            (dispatch.value.reply == .connected or dispatch.value.reply == .edid) and self.request_revision != self.exchange.revision)
         {
             dispatch.value = .{ .reply = .obsolete };
             self.pending = dispatch;
         }
         return dispatch;
     }
-    /// Reply bytes have been consumed, or the notification's actual handler
-    /// completed. Parsing a notification does not satisfy this contract.
-    /// An ambiguous ACK retains all receipts/backing and is never retried.
     pub fn complete(self: *Channel, ticket: transport.Ticket) Error!void {
         const dispatch = try self.borrow(ticket);
-        self.session.acknowledge(self.deadline.?, ticket) catch |err| return self.fail(err);
+        self.exchange.complete(ticket) catch |err| return self.fail(err);
         switch (dispatch.value) {
             .reply => |reply| {
                 switch (reply) {
@@ -378,28 +314,20 @@ pub const Channel = struct {
                     else => {},
                 }
                 self.request = null;
-                self.phase = .idle;
             },
-            .notification => |bytes| {
-                if (dispatch.rpc.function == @intFromEnum(boot_events.Kind.lockdown)) self.in_lockdown = bytes[0] == 1;
-            },
+            .notification => {},
         }
         self.pending = null;
-        if (self.phase == .idle) self.deadline = null;
     }
     pub fn reject(self: *Channel, ticket: transport.Ticket) Error!void {
         _ = try self.borrow(ticket);
         return self.fail(error.Handler);
     }
-    /// Return sole queue ownership to the runtime, e.g. for actual RM object
-    /// destruction. Only an idle, fully acknowledged channel can transfer.
-    /// Failed or in-flight work cannot be recycled into another live owner.
     pub fn handoff(self: *Channel, deadline: u64) Error!boot_events.Handoff {
-        if (self.phase != .idle or self.pending != null or self.session.pending != null) return error.State;
-        try self.guard(@min(self.deadline orelse deadline, deadline));
-        self.phase = .handed_off;
+        if (self.pending != null) return error.State;
+        const runtime = try self.exchange.handoff(deadline);
         self.connected = 0;
         self.supported = null;
-        return .{ .session = self.session, .in_lockdown = self.in_lockdown };
+        return runtime;
     }
 };

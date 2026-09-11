@@ -1,5 +1,14 @@
 ﻿# Third-Party Notices
 
+RM object/source ownership (0.79.12, 2026-09-11):
+gsp_objects.zig retains six complete original MIT notices: NVIDIA generated
+RPC structures plus cl0000/cl0080/cl2080/cl0073, and Nouveau2023 Red Hat
+alloc.c. gsp_exchange preserves all four original notices of its previous
+gsp_display_rpc source.26 complete pinned originals accompany rm-objects-
+20260911. Original R4OS bounded ledger/ownership policy is Apache-2.0.
+New code is host-linked only; product R4D/packaged notices remain unchanged.
+
+
 RM display-control source preparation (0.79.12, 2026-09-11):
 gsp_display_rpc.zig preserves four complete original MIT source notices:
 NVIDIA generated RPC structures(2008-2025), ctrl0073system(2005-2024),

@@ -3,6 +3,7 @@ const t = std.testing;
 const transport = @import("gsp_transport.zig");
 const boot_events = @import("gsp_boot_events.zig");
 const display_rpc = @import("gsp_display_rpc.zig");
+const objects = @import("gsp_objects.zig");
 const sequencer = @import("gsp_sequencer.zig");
 const message = transport.message;
 const ring = transport.ring;
@@ -577,7 +578,7 @@ fn displayReply(model: *Model, channel: *display_rpc.Channel, status: u32, value
         },
     }
     // The RPC sequence and private result deliberately do not echo the request.
-    try model.replyRpc(channel.session, .{ .function = 76, .result = 0, .result_private = 0x19283746, .sequence = 0xdeadbeef }, encoded);
+    try model.replyRpc(channel.exchange.session, .{ .function = 76, .result = 0, .result_private = 0x19283746, .sequence = 0xdeadbeef }, encoded);
 }
 fn readyDisplay(model: *Model, session: *transport.Session) !display_rpc.Channel {
     var channel = try startDisplay(model, session);
@@ -651,7 +652,7 @@ fn checkDisplayRpc(model: *Model) !void {
     try model.replyRpc(&session, .{ .function = 0x100c }, &.{ 0, 0, 0, 0, 1, 0, 0, 0, 'x' });
     var event = (try channel.poll(deadline)).?;
     try t.expect(event.value == .notification);
-    try t.expectEqual(@as(u64, 1), channel.revision);
+    try t.expectEqual(@as(u64, 1), channel.exchange.revision);
     const before = model.count;
     try t.expectError(error.Pending, channel.poll(deadline + 100));
     var wrong = event.ticket;
@@ -659,7 +660,7 @@ fn checkDisplayRpc(model: *Model) !void {
     try t.expectError(error.Stale, channel.complete(wrong));
     try t.expectEqual(before, model.count);
     try channel.complete(event.ticket);
-    try t.expectEqual(display_rpc.Phase.waiting, channel.phase);
+    try t.expectEqual(display_rpc.Phase.waiting, channel.exchange.phase);
     try displayReply(model, &channel, 0, 0x80000005);
     event = (try channel.poll(deadline)).?;
     try t.expect(channel.supported == null);
@@ -714,7 +715,7 @@ fn checkDisplayRpc(model: *Model) !void {
     event = (try channel.poll(deadline)).?;
     try t.expectEqual(@as(u32, 0x55), event.value.reply.rpc_error);
     try channel.complete(event.ticket);
-    try t.expectEqual(display_rpc.Phase.idle, channel.phase);
+    try t.expectEqual(display_rpc.Phase.idle, channel.exchange.phase);
     // The runtime can perform other RPCs between owners (e.g. object alloc/
     // free). Here only the wire transaction is a fixture, not an RM allocation.
     var runtime = try channel.handoff(deadline);
@@ -726,7 +727,7 @@ fn checkDisplayRpc(model: *Model) !void {
     try runtime.session.acknowledge(deadline, (try runtime.session.receive(deadline)).?.ticket);
     runtime.in_lockdown = true; // The preceding owner handled a lockdown notice.
     channel = try display_rpc.Channel.init(&runtime, display_object, deadline);
-    try t.expect(channel.in_lockdown);
+    try t.expect(channel.exchange.in_lockdown);
     try channel.begin(.supported, deadline);
     try model.replyRpc(&session, .{ .function = 0x101c }, &.{0});
     try channel.complete((try channel.poll(deadline)).?.ticket);
@@ -751,7 +752,7 @@ fn checkDisplayRpc(model: *Model) !void {
         model.fault = model.count + 1;
         model.after = after;
         try t.expectError(error.Io, channel.complete(event.ticket));
-        try t.expectEqual(display_rpc.Phase.failed, channel.phase);
+        try t.expectEqual(display_rpc.Phase.failed, channel.exchange.phase);
         try t.expect(channel.supported == null and session.pending != null and channel.pending != null);
         const count = model.count;
         try t.expectError(error.State, channel.complete(event.ticket));
@@ -763,7 +764,7 @@ fn checkDisplayRpc(model: *Model) !void {
     session.tx_write = 62;
     put(&model.peer[0], 16, 62);
     try t.expect((try channel.poll(deadline + 100)) == null);
-    try t.expectEqual(display_rpc.Phase.prepared, channel.phase);
+    try t.expectEqual(display_rpc.Phase.prepared, channel.exchange.phase);
     model.now = deadline;
     try t.expectError(error.Deadline, channel.poll(deadline + 100));
     try t.expectEqual(@as(u32, 0), session.tx_sequence);
@@ -771,16 +772,16 @@ fn checkDisplayRpc(model: *Model) !void {
     channel = try startDisplay(model, &session);
     try model.replyRpc(&session, .{ .function = 0x101c }, &.{1});
     event = (try channel.poll(deadline)).?;
-    try t.expect(channel.in_lockdown);
+    try t.expect(channel.exchange.in_lockdown);
     try channel.complete(event.ticket);
     try channel.begin(.supported, deadline);
     try t.expect((try channel.poll(deadline)) == null);
     try t.expectEqual(@as(u32, 0), session.tx_sequence);
     try model.replyRpc(&session, .{ .function = 0x101c }, &.{0});
     event = (try channel.poll(deadline)).?;
-    try t.expect(channel.in_lockdown);
+    try t.expect(channel.exchange.in_lockdown);
     try channel.complete(event.ticket);
-    try t.expect(!channel.in_lockdown);
+    try t.expect(!channel.exchange.in_lockdown);
     try t.expect((try channel.poll(deadline)) == null);
     try t.expectEqual(@as(u32, 1), session.tx_sequence);
 
@@ -795,8 +796,8 @@ fn checkDisplayRpc(model: *Model) !void {
         try t.expect((try channel.poll(deadline)) == null);
         try model.replyRpc(&session, rpc, "");
         try t.expectError(err, channel.poll(deadline));
-        try t.expectEqual(display_rpc.Phase.failed, channel.phase);
-        try t.expect(session.pending != null and channel.failure.?.ticket != null);
+        try t.expectEqual(display_rpc.Phase.failed, channel.exchange.phase);
+        try t.expect(session.pending != null and channel.exchange.failure.?.ticket != null);
     }
     channel = try startDisplay(model, &session);
     try model.replyRpc(&session, .{ .function = 0x1003 }, "unimplemented event");
@@ -805,10 +806,237 @@ fn checkDisplayRpc(model: *Model) !void {
     try t.expect(session.pending != null);
 }
 
+fn objectPlan() !objects.Plan {
+    return objects.Plan.init(7, .{ .client = 0xc100, .device = 0xd080, .subdevice = 0xd208, .display = 0xd073 }, 0xffffffff, "R4OS display");
+}
+fn startObjects(model: *Model, session: *transport.Session) !objects.Owner {
+    var boot = try startBoot(model, session);
+    try model.replyRpc(session, .{ .function = 0x1001, .result = 0 }, &.{ 0, 0, 0, 0 });
+    try boot.complete((try boot.poll()).?.ticket);
+    var runtime = try boot.handoff(deadline);
+    const owner = try objects.Owner.init(&runtime, try objectPlan(), deadline);
+    try t.expectError(error.State, objects.Owner.init(&runtime, try objectPlan(), deadline));
+    model.count = 0;
+    return owner;
+}
+fn objectReply(model: *Model, owner: *objects.Owner, status: u32, full: bool) !void {
+    var bytes: [152]u8 = undefined;
+    const operation = owner.outstanding.?;
+    const request = try objects.encode(&owner.plan, operation, &bytes);
+    put(&bytes, if (operation == .allocate) 16 else 12, status);
+    const count = if (operation == .allocate and !full) 32 else request.bytes.len;
+    try model.replyRpc(owner.exchange.session, .{ .function = request.function, .result = 0, .sequence = 0x99887766, .result_private = 0x1234 }, bytes[0..count]);
+}
+fn createOne(model: *Model, owner: *objects.Owner, kind: objects.Kind) !void {
+    try t.expect((try owner.poll()) == null);
+    try t.expectEqual(kind, owner.outstanding.?.allocate);
+    try t.expectEqual(objects.Slot.creating, owner.slots[@intFromEnum(kind)]);
+    try objectReply(model, owner, 0, kind == .device);
+    try t.expect((try owner.poll()) == null);
+    try t.expectEqual(objects.Slot.live, owner.slots[@intFromEnum(kind)]);
+}
+fn createAll(model: *Model, owner: *objects.Owner) !void {
+    for (0..4) |i| try createOne(model, owner, @enumFromInt(i));
+    try t.expectEqual(objects.State.objects_ready, owner.state);
+}
+fn checkObjects(model: *Model) !void {
+    const plan = try objectPlan();
+    var payload: [153]u8 = undefined;
+    const ids = [_]u32{ 0xc100, 0xd080, 0xd208, 0xd073 };
+    const classes = [_]u32{ 0, 0x80, 0x2080, 0x73 };
+    const parents = [_]u32{ 0xc100, 0xc100, 0xd080, 0xd080 };
+    const sizes = [_]usize{ 152, 88, 36, 32 };
+    for (0..4) |i| {
+        const operation = objects.Operation{ .allocate = @enumFromInt(i) };
+        @memset(&payload, 0xa5);
+        const encoded = try objects.encode(&plan, operation, &payload);
+        try t.expectEqual(@as(u32, 103), encoded.function);
+        try t.expectEqual(sizes[i], encoded.bytes.len);
+        for ([_]u32{ 0xc100, parents[i], ids[i], classes[i], 0, @intCast(sizes[i] - 32), 0, 0 }, 0..) |value, j|
+            try t.expectEqual(value, get(encoded.bytes, j * 4));
+        try t.expectEqual(@as(u8, 0xa5), payload[sizes[i]]);
+        if (i == 0) {
+            try t.expectEqual(@as(u32, 0xc100), get(encoded.bytes, 32));
+            try t.expectEqual(@as(u32, 0xffffffff), get(encoded.bytes, 36));
+            try t.expectEqualStrings("R4OS display", encoded.bytes[40..52]);
+            // All name tail, alignment padding and the570.144 OS pointer zero.
+            for (encoded.bytes[52..152]) |byte| try t.expectEqual(@as(u8, 0), byte);
+        } else if (i == 1) {
+            try t.expectEqual(@as(u32, 0), get(encoded.bytes, 32));
+            try t.expectEqual(@as(u32, 0xc100), get(encoded.bytes, 36));
+            for (encoded.bytes[40..88]) |byte| try t.expectEqual(@as(u8, 0), byte);
+        }
+        try t.expectError(error.Bounds, objects.encode(&plan, operation, payload[0 .. sizes[i] - 1]));
+        var record = message.Record{ .shape = undefined, .queue_sequence = 0, .rpc = .{ .function = 103, .result = 0 }, .payload = encoded.bytes };
+        try t.expect((try objects.decode(&plan, operation, record)) == .ok);
+        for (0..sizes[i]) |count| {
+            record.payload = payload[0..count];
+            if (count == 32) try t.expect((try objects.decode(&plan, operation, record)) == .ok) else try t.expectError(error.Payload, objects.decode(&plan, operation, record));
+        }
+        for ([_]usize{ 0, 4, 8, 12, 20, 24, 28 }) |offset| {
+            _ = try objects.encode(&plan, operation, &payload);
+            put(&payload, offset, get(&payload, offset) ^ 1);
+            record.payload = payload[0..32];
+            try t.expectError(if (offset < 16) error.Unexpected else error.Payload, objects.decode(&plan, operation, record));
+        }
+        const free = objects.Operation{ .free = @enumFromInt(i) };
+        const freed = try objects.encode(&plan, free, &payload);
+        try t.expectEqual(@as(u32, 10), freed.function);
+        try t.expectEqual(@as(usize, 16), freed.bytes.len);
+        for ([_]u32{ 0xc100, 0, ids[i], 0 }, 0..) |value, j| try t.expectEqual(value, get(freed.bytes, j * 4));
+        record.rpc.function = 10;
+        for (0..18) |count| {
+            record.payload = payload[0..count];
+            if (count == 16) try t.expect((try objects.decode(&plan, free, record)) == .ok) else try t.expectError(error.Payload, objects.decode(&plan, free, record));
+        }
+    }
+    var bad_handles = plan.handles;
+    bad_handles.display = bad_handles.client;
+    try t.expectError(error.Handle, objects.Plan.init(7, bad_handles, 0, "x"));
+    bad_handles.display = 0;
+    try t.expectError(error.Handle, objects.Plan.init(7, bad_handles, 0, "x"));
+    try t.expectError(error.Handle, objects.Plan.init(0, plan.handles, 0, "x"));
+    const long_name: [100]u8 = @splat('a');
+    try t.expectError(error.Payload, objects.Plan.init(7, plan.handles, 0, &long_name));
+    try t.expectError(error.Payload, objects.Plan.init(7, plan.handles, 0, "a\x00b"));
+    const longest = try objects.Plan.init(7, plan.handles, 0, long_name[0..99]);
+    const max_name = try objects.encode(&longest, .{ .allocate = .client }, &payload);
+    try t.expectEqual(@as(u8, 0), max_name.bytes[139]);
+    for (max_name.bytes[140..152]) |byte| try t.expectEqual(@as(u8, 0), byte);
+
+    var session: transport.Session = undefined;
+    var owner = try startObjects(model, &session);
+    try t.expectError(error.State, owner.loan(deadline));
+    try t.expect((try owner.poll()) == null);
+    try model.replyRpc(&session, .{ .function = 0x1003 }, "allocation notification");
+    const notice = (try owner.poll()).?;
+    const before = model.count;
+    try t.expect(!notice.response);
+    try t.expectError(error.Pending, owner.poll());
+    try t.expectError(error.State, owner.beginDestroy(deadline));
+    var wrong = notice.ticket;
+    wrong.serial += 1;
+    try t.expectError(error.Stale, owner.completeNotification(wrong));
+    try t.expectEqual(before, model.count);
+    try owner.completeNotification(notice.ticket);
+    try objectReply(model, &owner, 0, false);
+    try t.expect((try owner.poll()) == null);
+    for (1..4) |i| try createOne(model, &owner, @enumFromInt(i));
+    var loan = try owner.loan(deadline);
+    try t.expectEqualDeep(display_object, loan.object);
+    try t.expectError(error.State, owner.poll());
+    var channel = try display_rpc.Channel.init(&loan.runtime, loan.object, deadline);
+    try t.expectError(error.State, owner.reclaim(&loan.runtime, deadline));
+    try t.expectEqual(transport.State.active, session.state);
+    try channel.begin(.supported, deadline);
+    try t.expect((try channel.poll(deadline)) == null);
+    try displayReply(model, &channel, 0, 1);
+    try channel.complete((try channel.poll(deadline)).?.ticket);
+    var returned = try channel.handoff(deadline);
+    // An old display owner must not stop the session after transferring it.
+    try t.expectError(error.State, channel.poll(deadline));
+    try t.expectEqual(transport.State.active, session.state);
+    try owner.reclaim(&returned, deadline);
+    try owner.beginDestroy(deadline);
+    for (0..4) |i| {
+        try t.expect((try owner.poll()) == null);
+        const kind: objects.Kind = @enumFromInt(3 - i);
+        try t.expectEqual(kind, owner.outstanding.?.free);
+        try t.expectEqual(objects.Slot.freeing, owner.slots[3 - i]);
+        try objectReply(model, &owner, 0, false);
+        try t.expect((try owner.poll()) == null);
+        try t.expectEqual(objects.Slot.absent, owner.slots[3 - i]);
+    }
+    try t.expectEqual(objects.State.objects_closed, owner.state);
+    const finished = try owner.finish(deadline);
+    try t.expectEqual(objects.State.finished, owner.state);
+    try t.expect(finished.session == &session and !finished.claimed);
+    try t.expectEqual(transport.State.active, session.state); // Not device quiescence.
+    try t.expectError(error.State, owner.finish(deadline));
+
+    // Every confirmed allocation rejection cleans only the live prefix in
+    // reverse order, using an explicit bounded cleanup phase, not a retry.
+    for (0..4) |failed_index| {
+        owner = try startObjects(model, &session);
+        for (0..failed_index) |i| try createOne(model, &owner, @enumFromInt(i));
+        try t.expect((try owner.poll()) == null);
+        try objectReply(model, &owner, 0x51, false);
+        try t.expect((try owner.poll()) == null);
+        try t.expectEqual(objects.State.rejected, owner.state);
+        try t.expectEqual(objects.Slot.absent, owner.slots[failed_index]);
+        model.now = deadline - 1;
+        try owner.beginDestroy(deadline + 100);
+        try t.expectEqual(@as(u64, deadline + 100), owner.deadline);
+        var freed_count: usize = 0;
+        while (owner.state == .destroying) {
+            try t.expect((try owner.poll()) == null);
+            if (owner.state == .objects_closed) break;
+            try t.expectEqual(@as(objects.Kind, @enumFromInt(failed_index - freed_count - 1)), owner.outstanding.?.free);
+            freed_count += 1;
+            try objectReply(model, &owner, 0, false);
+            try t.expect((try owner.poll()) == null);
+        }
+        try t.expectEqual(failed_index, freed_count);
+        try t.expectEqual(objects.State.objects_closed, owner.state);
+        _ = try owner.finish(deadline + 100);
+    }
+    // Failed free retains that object and every not-yet-freed ancestor.
+    for (0..4) |failed_index| {
+        owner = try startObjects(model, &session);
+        try createAll(model, &owner);
+        try owner.beginDestroy(deadline);
+        for (0..4 - failed_index) |i| {
+            try t.expect((try owner.poll()) == null);
+            try objectReply(model, &owner, if (3 - i == failed_index) 0x55 else 0, false);
+            if (3 - i == failed_index) try t.expectError(error.FirmwareResult, owner.poll()) else try t.expect((try owner.poll()) == null);
+        }
+        try t.expectEqual(objects.State.failed, owner.state);
+        try t.expectEqual(objects.Slot.uncertain, owner.slots[failed_index]);
+        for (owner.slots[0..failed_index]) |slot| try t.expectEqual(objects.Slot.live, slot);
+        const count = model.count;
+        try t.expectError(error.State, owner.poll());
+        try t.expectError(error.State, owner.beginDestroy(deadline + 100));
+        try t.expectEqual(count, model.count);
+    }
+    // Publication and ACK faults can occur after the pointer was visible;
+    // neither missing local sequence advancement nor an OK reply permits reuse.
+    for ([_]bool{ false, true }) |ack| for ([_]bool{ false, true }) |after| {
+        owner = try startObjects(model, &session);
+        if (ack) {
+            try t.expect((try owner.poll()) == null);
+            try objectReply(model, &owner, 0, false);
+        }
+        model.fault = model.count + 4;
+        model.after = after;
+        try t.expectError(error.Io, owner.poll());
+        try t.expectEqual(objects.State.failed, owner.state);
+        try t.expectEqual(objects.Slot.uncertain, owner.slots[0]);
+        try t.expect(owner.outstanding != null);
+        if (ack) try t.expect(session.pending != null);
+        const count = model.count;
+        try t.expectError(error.State, owner.poll());
+        try t.expectEqual(count, model.count);
+    };
+    owner = try startObjects(model, &session);
+    try t.expect((try owner.poll()) == null);
+    model.now = deadline;
+    try t.expectError(error.Deadline, owner.poll());
+    try t.expectEqual(objects.Slot.uncertain, owner.slots[0]);
+    owner = try startObjects(model, &session);
+    try t.expect((try owner.poll()) == null);
+    try model.replyRpc(&session, .{ .function = 0x1003 }, "deferred");
+    const deferred = (try owner.poll()).?;
+    model.epoch += 1;
+    try t.expectError(error.Stale, owner.borrowNotification(deferred.ticket));
+    try t.expectEqual(objects.State.failed, owner.state);
+    try t.expect(session.pending != null and owner.slots[0] == .uncertain);
+}
+
 test "GSP transport orders range publication, explicit acknowledgement and terminal ambiguous failures" {
     const model = try t.allocator.create(Model);
     defer t.allocator.destroy(model);
     try checkDisplayRpc(model);
+    try checkObjects(model);
     for (0..4) |flags| {
         var session = try model.start(@intCast(flags));
         // Device-only neighbour changes must survive CPU command publication.
