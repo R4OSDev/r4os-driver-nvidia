@@ -182,6 +182,12 @@ test "firmware CPU storage boot pack owns complete GSP lifetime and resynchroniz
             try t.expectEqual(@as(usize, 5), sync_count);
             try t.expectEqual(case == .bounce, report.pack_bounced);
             try t.expectEqualSlices(u8, backing[1].?, &device_pack);
+            try t.expect(wpr.matchesPlan(device_pack[storage.metadata_offset..][0..wpr.bytes], &owned.vram_plan.?));
+            if (case == .none) {
+                owned.vram_owner = 0x790010;
+                try t.expect(!owned.close() and owned.report != null and owned.vram_plan != null);
+                owned.vram_owner = 0;
+            }
         }
         try t.expectError(error.Busy, owned.stageAdmitted(&ctx, &sources, 1000));
         closing = true;

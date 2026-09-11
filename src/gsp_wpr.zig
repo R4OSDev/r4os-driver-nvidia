@@ -89,6 +89,23 @@ pub fn prepare(input: *const Input) Error!Prepared {
     return .{ .plan = plan, .boot_info = info, .unbound_template = output };
 }
 
+/// Compare the complete VRAM part of already staged first-boot metadata to a
+/// freshly admitted plan. This neither trusts nor changes firmware's verified
+/// marker, and it does not grant ownership or GPU execution.
+pub fn matchesPlan(data: []const u8, plan: *const layout.Plan) bool {
+    if (data.len != bytes) return false;
+    const fields = [_]u64{
+        plan.reserved.offset, plan.non_wpr_heap.offset, plan.non_wpr_heap.bytes,
+        plan.wpr.offset, plan.heap.offset, plan.heap.bytes, plan.firmware.offset,
+        plan.boot.offset, plan.frts.offset, plan.frts.bytes, plan.wpr.end(),
+        plan.fb_bytes, plan.vga.offset, plan.vga.bytes,
+    };
+    for (fields, 11..) |value, index| {
+        if (std.mem.readInt(u64, data[index * 8 ..][0..8], .little) != value) return false;
+    }
+    return true;
+}
+
 fn span(segment: radix.Segment) Error!void {
     if (segment.address == 0 or segment.address > radix.dma_mask or segment.bytes == 0 or
         segment.bytes - 1 > radix.dma_mask - segment.address) return error.Address;

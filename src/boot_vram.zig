@@ -8,11 +8,18 @@ const a = r4os.abi;
 const identity = @import("identity.zig");
 const display = @import("boot_display.zig");
 const probe = @import("fwsec_state_probe.zig");
+const state = @import("fwsec_state.zig");
 const pramin = @import("pramin.zig");
 pub const Report = struct { boot: display.Report, range: pramin.Range, sha256: [32]u8, window_original: u32, window_restored: bool, window_writes: u32 };
 const offsets = [_]u32{ 0, 0x1000, 0x625000, pramin.aperture };
 const lengths = [_]u32{ 4096, 4096, 4096, pramin.aperture_bytes };
 pub const Capture = struct {
+    context: ?r4os.r4dev.DriverContext = null,
+    snapshot: ?identity.Snapshot = null,
+    chip: ?identity.Chip = null,
+    observation: ?state.Raw = null,
+    borrower: usize = 0,
+    ready: bool = false,
     boot: display.Snapshot = .{},
     preflight: probe.Capture = .{},
     memory: ?r4os.driver_memory.Context = null,
@@ -38,6 +45,9 @@ pub const Capture = struct {
             bar.bytes < 0x821000 or bar.base > std.math.maxInt(u64) - bar.bytes) return error.Profile;
         self.self_address = @intFromPtr(self);
         errdefer |err| self.last_error = err;
+        self.context = ctx.*;
+        self.snapshot = snapshot.*;
+        self.chip = chip;
         self.clock = ctx.resources() orelse return error.Api;
         self.memory = ctx.memory() orelse return error.Api;
         const adapter = 0x01000000 | (@as(u32, snapshot.pci.bus) << 8) | (@as(u32, snapshot.pci.device) << 3) | snapshot.pci.function;
@@ -47,6 +57,7 @@ pub const Capture = struct {
         const raw = try self.preflight.read(ctx, snapshot, chip);
         if (!self.preflight.close()) return error.Cleanup;
         const range = try pramin.workspace(chip.id, &raw);
+        self.observation = raw;
         for (offsets, lengths, 0..) |offset, bytes, index| {
             const request: a.GfxMmioRequest = .{ .resource_base = bar.base, .resource_bytes = bar.bytes,
                 .byte_offset = offset, .byte_length = bytes, .cache_policy = a.gfx_buffer_cache_uncached };
@@ -83,8 +94,26 @@ pub const Capture = struct {
         const data: [*]const u8 = @ptrFromInt(self.map.cpu_address);
         var hash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(data[0..range.bytes], &hash, .{});
+        self.ready = true;
         return .{ .boot = boot, .range = range, .sha256 = hash, .window_original = self.operation.?.original.?,
             .window_restored = self.operation.?.restored, .window_writes = self.window_writes };
+    }
+
+    /// Fresh read-only admission while both snapshots and the common display
+    /// hold are still owned. A borrower freezes this observation until release.
+    pub fn reobserve(self: *Capture) !state.Raw {
+        if (self.self_address != @intFromPtr(self) or !self.ready or self.borrower != 0 or
+            self.boot.held_generation == 0 or self.map.lease.id == 0) return error.State;
+        const operation = if (self.operation) |*value| value else return error.State;
+        if (!operation.restored or operation.phase != .done or operation.failure != null) return error.State;
+        const raw = try self.preflight.readWithVga(&self.context.?, &self.snapshot.?, self.chip.?, &self.windows[2]);
+        if (!self.preflight.close()) return error.Cleanup;
+        const range = try pramin.workspace(self.chip.?.id, &raw);
+        if (range.address != operation.options.range.address or range.bytes != operation.options.range.bytes or
+            try raw.get(.vga) != operation.options.vga or try read32(self, 0) != operation.options.boot0 or
+            try read32(self, 4) != operation.options.boot1 or try read32(self, pramin.window_register) != operation.original.?) return error.Unstable;
+        self.observation = raw;
+        return raw;
     }
 
     fn cast(raw: *anyopaque) *Capture { return @ptrCast(@alignCast(raw)); }
@@ -159,7 +188,7 @@ pub const Capture = struct {
 
     pub fn close(self: *Capture) bool {
         if (self.self_address == 0) return true;
-        if (self.self_address != @intFromPtr(self)) return false;
+        if (self.self_address != @intFromPtr(self) or self.borrower != 0) return false;
         // Recovery needs all MMIO and snapshot leases. It runs before any
         // resource release; a failed callback retains the common display.
         if (!self.boot.close()) return false;

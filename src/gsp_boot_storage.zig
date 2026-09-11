@@ -10,6 +10,7 @@ const gsp = @import("gsp_dma.zig");
 const radix = @import("gsp_radix.zig");
 const wpr = @import("gsp_wpr.zig");
 const preflight = @import("fwsec_state.zig");
+const layout = @import("gsp_layout.zig");
 pub const signature_offset = boot.image.bytes;
 pub const metadata_offset = signature_offset + wpr.signature_bytes;
 pub const pack_bytes = metadata_offset + radix.page_bytes;
@@ -44,6 +45,8 @@ pub const Storage = struct {
     mapping: a.DmaMapping = .{},
     report: ?Report = null,
     execution_owner: usize = 0,
+    vram_plan: ?layout.Plan = null,
+    vram_owner: usize = 0,
 
     fn checkClock(self: *Storage) Error!u64 {
         const now = self.clock.?.nowNs();
@@ -67,7 +70,7 @@ pub const Storage = struct {
             .descriptor = sources.descriptor,
             .signature_bytes = sources.signature.len,
         };
-        _ = try wpr.prepare(&input);
+        const prepared = try wpr.prepare(&input);
         const boot_info = try boot.inspect(sources.descriptor, @intCast(sources.boot_image.len));
         if (!ctx.supportsDriverApi(19, @offsetOf(a.DriverApi, "dma_unpin_buffer") + @sizeOf(usize))) return error.Api;
         self.context = ctx.*;
@@ -136,12 +139,14 @@ pub const Storage = struct {
             .pack_bounced = map.flags & a.dma_mapping_flag_bounced != 0,
             .app_version = boot_info.app_version,
         };
+        self.vram_plan = prepared.plan;
         return self.report.?;
     }
 
     pub fn close(self: *Storage) bool {
-        if (self.execution_owner != 0 or self.image.execution_owner != 0) return false;
+        if (self.execution_owner != 0 or self.image.execution_owner != 0 or self.vram_owner != 0) return false;
         self.report = null;
+        self.vram_plan = null;
         const ctx = self.context orelse return self.allocation.handle == 0 and self.image.context == null;
         // Close the pack that points at GSP first. Each allocation retains its
         // exact mapping/pin/CPU lifetime; partial failure prevents later release.

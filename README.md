@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-Passive NVIDIA display driver for R4OS. Module 0.1.29; original R4OS code is
+Passive NVIDIA display driver for R4OS. Module 0.1.30; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -10,7 +10,34 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
-Current VGA workspace preservation (NVIDIA 0.1.29):
+Boot VRAM reservation and snapshot lifetime (NVIDIA 0.1.30):
+
+The existing boot-check now keeps its boot/VGA snapshots throughout firmware
+resource, DMA and queue preparation. A resident exclusive reservation binds
+seven exact target regions to a fresh first-boot layout and the actual staged
+WPR metadata. Changed framebuffer size, targets or metadata refuse admission.
+Full display epochs and nonwrapping reservation serials reject old bindings,
+including reuse of the same reservation during the same display hold.
+
+The fresh preflight borrows the existing VGA register window, avoiding an
+overlapping MMIO alias. Closing the capture or boot storage while borrowed
+fails. Cleanup first releases the unsubmitted DMA execution owner, then the
+VRAM reservation and storage, finally the CPU aperture and display snapshot.
+General VRAM allocation remains withheld: the old scanout GPU mapping and
+full recovery after firmware effects have not yet been implemented.
+
+51 existing owner cases pass in one targeted run, as does the module build.
+The existing lifecycle case checks the actual capture/reservation owners;
+the existing storage case checks real encoded/synchronized metadata. No new
+case count, gate or guest run. All 24 nonresident R4D resources remain pinned;
+the module has 380,928 resident bytes and 3,511 relocations.
+
+Default mode remains passive. OssiPC is offline per the user; NVIDIA 30 has
+not been installed or physically tested. Firmware execution, native scanout
+and HDMI audio remain open. Evidence: `vram_reservation_checkpoint` in
+`Docs/Drivers/GrafikFirmware07910.json`; archive `vram-reservation-20260911`.
+
+Earlier current VGA workspace preservation (NVIDIA 0.1.29):
 
 The existing opt-in boot-check now retains both the boot framebuffer and the
 current GA106 VGA workspace in real private BOs. Under the common display

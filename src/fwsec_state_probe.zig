@@ -10,8 +10,15 @@ pub const Capture = struct {
     memory: ?r4os.driver_memory.Context = null,
     windows: [state.pages.len]a.GfxMmioWindow = @splat(.{}),
     cleanup_needed: bool = false,
+    borrowed_vga: bool = false,
 
     pub fn read(self: *Capture, ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, chip: identity.Chip) Error!state.Raw {
+        return self.readWithVga(ctx, snapshot, chip, null);
+    }
+
+    /// The serialized caller retains this exact existing VGA window throughout
+    /// read and close. Never request a second physical MMIO alias from the kernel.
+    pub fn readWithVga(self: *Capture, ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, chip: identity.Chip, shared: ?*const a.GfxMmioWindow) Error!state.Raw {
         const bar = snapshot.bars[0];
         if (identity.decision(snapshot) != .identity_words_only or chip.id != 0x176 or
             bar.bytes < 0x821000 or bar.base > std.math.maxInt(u64) - bar.bytes) return error.UnmeasuredRange;
@@ -21,6 +28,13 @@ pub const Capture = struct {
         if (previous == 0 or previous == std.math.maxInt(u64)) return error.Clock;
         const deadline = std.math.add(u64, previous, std.time.ns_per_s) catch return error.Clock;
         self.memory = ctx.memory() orelse return error.Api;
+        if (shared) |window| {
+            if (window.version != 1 or window.size < @sizeOf(a.GfxMmioWindow) or
+                window.handle.id == 0 or window.handle.generation == 0 or window.cpu_address == 0 or window.cpu_address & 3 != 0 or
+                window.cpu_address > std.math.maxInt(u64) - 4096 or window.byte_length != 4096 or
+                window.physical_address != bar.base + 0x625000 or window.cache_policy != a.gfx_buffer_cache_uncached) return error.Mapping;
+            self.borrowed_vga = true;
+        }
         var first: state.Raw = .{};
         var second: state.Raw = .{};
         for ([_]*state.Raw{ &first, &second }, 0..) |raw, pass| {
@@ -32,13 +46,18 @@ pub const Capture = struct {
                 try checkClock(clock, &previous, deadline);
                 const window = &self.windows[page_index];
                 if (pass == 0) {
-                    const request: a.GfxMmioRequest = .{ .resource_base = bar.base, .resource_bytes = bar.bytes, .byte_offset = page, .byte_length = 4096, .cache_policy = a.gfx_buffer_cache_uncached };
-                    self.cleanup_needed = true;
-                    if (self.memory.?.mmioMap(&request, window) != a.gfx_buffer_result_ok) return error.Mapping;
-                    if (window.handle.id == 0 or window.cpu_address == 0 or window.cpu_address & 3 != 0 or
-                        window.cpu_address > std.math.maxInt(u64) - 4096 or window.byte_length != 4096 or
-                        window.physical_address != bar.base + page or window.cache_policy != a.gfx_buffer_cache_uncached) return error.Mapping;
+                    if (page == 0x625000 and self.borrowed_vga) {
+                        window.* = shared.?.*;
+                    } else {
+                        const request: a.GfxMmioRequest = .{ .resource_base = bar.base, .resource_bytes = bar.bytes, .byte_offset = page, .byte_length = 4096, .cache_policy = a.gfx_buffer_cache_uncached };
+                        self.cleanup_needed = true;
+                        if (self.memory.?.mmioMap(&request, window) != a.gfx_buffer_result_ok) return error.Mapping;
+                        if (window.handle.id == 0 or window.cpu_address == 0 or window.cpu_address & 3 != 0 or
+                            window.cpu_address > std.math.maxInt(u64) - 4096 or window.byte_length != 4096 or
+                            window.physical_address != bar.base + page or window.cache_policy != a.gfx_buffer_cache_uncached) return error.Mapping;
+                    }
                 } else if (window.handle.id == 0) return error.Unstable;
+                if (page == 0x625000 and self.borrowed_vga and !std.meta.eql(shared.?.*, window.*)) return error.Unstable;
                 const words: [*]const volatile u32 = @ptrFromInt(window.cpu_address);
                 for (state.addresses, 0..) |address, index| {
                     if (address & ~@as(u32, 0xfff) != page) continue;
@@ -61,6 +80,10 @@ pub const Capture = struct {
             while (remaining != 0) {
                 remaining -= 1;
                 const window = &self.windows[remaining];
+                if (state.pages[remaining] == 0x625000 and self.borrowed_vga) {
+                    window.* = .{};
+                    continue;
+                }
                 if (window.handle.id == 0) continue;
                 if (memory.mmioUnmap(&window.handle, 1) != a.gfx_buffer_result_ok) return false;
                 window.* = .{};

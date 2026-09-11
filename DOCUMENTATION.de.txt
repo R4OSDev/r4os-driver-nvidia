@@ -10,7 +10,42 @@ unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
 
-Aktuelle VGA-Speichersicherung (NVIDIA 0.1.29)
+Boot-VRAM-Reservierung und Snapshot-Lebensdauer (NVIDIA 0.1.30)
+-------------------------------------------------------------
+Der vorhandene Bootcheck behaelt Bootbild und VGA-Sicherung nun waehrend
+Firmware-, DMA- und Queuevorbereitung. Ein exklusiver residenter Besitzer
+bindet sieben konkrete Zielbereiche an den frisch geprueften Erststartplan
+und die wirklichen VRAM-Felder des vorbereiteten WPR-Metadatenpuffers.
+Geaenderte VRAM-Groesse, Zieladressen oder Metadaten verhindern die Bindung.
+Volle Displaygeneration und ueber Freigaben fortgefuehrte Reservierungsnummer
+weisen alte Bindungen auch innerhalb derselben Displaysperre zurueck.
+
+Der neue Preflight benutzt das bereits gehaltene VGA-Registerfenster mit.
+Er erzeugt keine vom Kernel verbotene ueberlappende MMIO-Abbildung und gibt
+das geliehene Fenster nicht frei. Bootpuffer und Bildsicherung verweigern
+Close solange sie geliehen sind. Abbau: zuerst nicht eingereichten DMA-Lauf,
+dann VRAM-Reservierung und Bootpuffer loesen, zuletzt CPU-Fenster verifizieren
+und Display freigeben. Ein behaltener Ausfuehrungsbesitzer sperrt den Abbau.
+
+Allgemeine VRAM-Allokation bleibt gesperrt, bis die echte GPU-Abbildung des
+alten Scanouts und dessen Recovery bekannt sind. Dieser Zwischenstand
+implementiert keinen allgemeinen GPU-Allokator, keine Seitentabellen und
+keine Wiederherstellung nach Firmwareeffekten. Der Falconlauf bleibt ungelinkt.
+
+Ein gezielter Lauf mit 51 vorhandenen Besitzerfaellen und der Modulbuild
+bestanden. Bestehender SDK-Lifecyclefall prueft echte Sicherungs-/Reservierungs-
+besitzer mit geaenderten Metadaten, alten Bindungen und Freigabeversuchen;
+bestehender Bootstoragefall prueft wirklich kodierte/synchronisierte Metadaten.
+Keine neue Fallzahl, kein Gate/Gastlauf. R4D: 24 unveraenderte nichtresidente
+Ressourcen, 380928 residente Bytes, 3511 Relocations. Lizenzen unveraendert.
+
+OssiPC laut User offline, kein Zugriff/Update/Reboot. NVIDIA 30 ist lokal
+gebaut; letzter echter Nachweis bleibt Kernel 150 / NVIDIA 28 passiv.
+Physische VRAM-/Fensterabnahme, Firmwarestart, GPU-Recovery, Scanout und HDMI
+bleiben offen. Beleg: vram_reservation_checkpoint; Archiv:
+ExFiles/Reference/GFX/Nvidia/0.79.10/vram-reservation-20260911.
+
+Historisch: Aktuelle VGA-Speichersicherung (NVIDIA 0.1.29)
 --------------------------------------------
 Der vorhandene optionale Bootcheck haelt nun Bootbild und aktuellen GA106-
 VGA-Arbeitsbereich in echten privaten BOs. Unter der gemeinsamen Displaysperre

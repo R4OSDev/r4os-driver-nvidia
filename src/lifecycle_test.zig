@@ -1017,6 +1017,66 @@ fn checkBootVramOwner() !void {
     try t.expectEqualSlices(u8, &expected, &report.sha256);
     try t.expectEqual(@as(u64, 0x10e0000), report.range.address);
     try t.expect(report.window_restored and report.window_writes == 2 and f.held and f.leases[1]);
+    // The existing host fixture supplies prepared boot metadata; actual DMA
+    // packing/synchronization remains covered by gsp_boot_storage_test.zig.
+    // Here the production reservation borrows the actual BO/display capture.
+    const boot_storage = @import("gsp_boot_storage.zig");
+    const wpr = @import("gsp_wpr.zig");
+    const reservation = @import("boot_vram_lease.zig");
+    const pack = try std.heap.page_allocator.alloc(u8, boot_storage.pack_bytes);
+    defer std.heap.page_allocator.free(pack);
+    @memset(pack, 0);
+    const desc_fields = [_]u32{ 5, 20480, 2176, 22656, 16, 0, 0, 0, 0, 2048, 2048, 4096, 6144, 10496, 1, 0, 0, 0, 0, 24576, 0 };
+    var descriptor: [84]u8 = undefined;
+    for (desc_fields, 0..) |value, index| std.mem.writeInt(u32, descriptor[index * 4 ..][0..4], value, .little);
+    const prepared = try wpr.prepare(&.{ .chip_id = chip.id, .raw = raw, .image_bytes = wpr.image_bytes,
+        .descriptor = &descriptor, .signature_bytes = wpr.signature_bytes });
+    @memcpy(pack[boot_storage.metadata_offset..][0..wpr.bytes], &prepared.unbound_template);
+    var backing: boot_storage.Storage = .{ .context = ctx, .vram_plan = prepared.plan,
+        .allocation = .{ .handle = 31, .cpu_address = @intFromPtr(pack.ptr), .byte_length = pack.len },
+        .pin = .{ .handle = 32 }, .mapping = .{ .handle = 33, .pin_handle = 32 },
+        .report = .{ .image = .{ .root_address = 0x200000000, .image_bytes = wpr.image_bytes,
+            .allocation_bytes = 63676416, .table_bytes = 135168, .mappings = 4, .segments = 4, .bounced = 0 },
+            .boot_address = 0x300000000, .signature_address = 0x300006000, .metadata_address = 0x300007000, .pack_bounced = false } };
+    var held: reservation.Lease = .{};
+    pack[boot_storage.metadata_offset + 19 * 8] ^= 1;
+    try t.expectError(error.MetadataChanged, held.acquire(&capture, &backing));
+    try t.expect(capture.borrower == 0 and backing.vram_owner == 0 and f.mapped[0x625]);
+    pack[boot_storage.metadata_offset + 19 * 8] ^= 1;
+    f.put(0x1183a4, (try raw.get(.fb_mb)) - 1024);
+    try t.expectError(error.PlanChanged, held.acquire(&capture, &backing));
+    try t.expect(capture.borrower == 0 and backing.vram_owner == 0);
+    f.put(0x1183a4, try raw.get(.fb_mb));
+    try held.acquire(&capture, &backing);
+    const frts = try held.binding(.frts);
+    try t.expect(held.validates(frts) and frts.range.bytes == 0x100000 and frts.range.offset > 0x100000000);
+    try t.expect(!capture.close() and !backing.close() and capture.ready and backing.report != null);
+    try t.expect(f.held and f.buffers[0] != null and f.buffers[1] != null and f.leases[0] and f.leases[1]);
+    try t.expectError(error.State, capture.reobserve());
+    var duplicate: reservation.Lease = .{};
+    try t.expectError(error.Owner, duplicate.acquire(&capture, &backing));
+    var moved = held;
+    try t.expect(!moved.validates(frts) and !moved.releaseBeforeSubmission());
+    var wrong = frts;
+    wrong.range.offset += 4096;
+    try t.expect(!held.validates(wrong));
+    pack[boot_storage.metadata_offset + 19 * 8] ^= 1;
+    try t.expectError(error.MetadataChanged, held.binding(.frts));
+    pack[boot_storage.metadata_offset + 19 * 8] ^= 1;
+    backing.execution_owner = 99;
+    try t.expect(!held.releaseBeforeSubmission() and !capture.close() and !backing.close());
+    backing.execution_owner = 0; // Undo the fixture's unsubmitted execution borrow.
+    capture.boot.held_generation += 1;
+    try t.expect(!held.validates(frts) and !held.releaseBeforeSubmission());
+    capture.boot.held_generation -= 1;
+    try t.expect(held.releaseBeforeSubmission() and held.releaseBeforeSubmission());
+    try held.acquire(&capture, &backing);
+    try t.expect(!held.validates(frts)); // Same display hold, new reservation serial.
+    try t.expect(held.validates(try held.binding(.frts)));
+    try t.expect(held.releaseBeforeSubmission());
+    held.serial = std.math.maxInt(u64);
+    try t.expectError(error.Exhausted, held.acquire(&capture, &backing));
+    try t.expect(capture.borrower == 0 and backing.vram_owner == 0 and f.mapped[0x625]);
     f.put(0x625f04, 0x10f08); // Unknown display change: retain every required owner.
     try t.expect(!capture.close());
     try t.expect(f.held and f.buffers[0] != null and f.buffers[1] != null and f.mapped[0x700] and f.leases[1]);

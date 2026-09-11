@@ -43,6 +43,7 @@ var init_storage: gsp_init_storage.Storage = .{};
 var run_memory: gsp_run_memory.Lease = .{};
 var booters: booter_storage.Pair = .{};
 var boot_vram: @import("boot_vram.zig").Capture = .{};
+var boot_vram_lease: @import("boot_vram_lease.zig").Lease = .{};
 // Bounded resident scratch: do not copy the maximum boot SG list to the stack.
 var init_excluded: [gsp_init.max_excluded]gsp_init.Span = undefined;
 var checking_boot = false;
@@ -162,7 +163,6 @@ pub export fn nvidia_init(api: *const a.DriverApi) callconv(.c) i32 {
 }
 
 pub export fn nvidia_shutdown() callconv(.c) i32 {
-    if (!boot_vram.close()) return -1;
     const api = driver_api orelse return 0;
     const ctx = r4os.r4dev.DriverContext.init(api);
     if (!wait_probe.shutdown(&ctx)) return -1;
@@ -172,7 +172,9 @@ pub export fn nvidia_shutdown() callconv(.c) i32 {
     if (!thread_probe.shutdown(&ctx)) return -1;
     if (!runtime_probe.shutdown(&ctx)) return -1;
     if (!closeBootInit()) return -1;
+    if (!boot_vram_lease.releaseBeforeSubmission()) return -1;
     if (!boot_storage.close()) return -1;
+    if (!boot_vram.close()) return -1;
     boot_inputs.close();
     if (!gsp_image.close()) return -1;
     if (!firmware_cpu.close()) return -1;
@@ -450,11 +452,6 @@ fn checkBoot(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Sna
     log("NVIDIA boot-vram: captured address={x} bytes={d} sha256={s} window-original={x:0>8} window-restored={} window-writes={d} firmware-execution=disabled", .{
         vram_copy.range.address, vram_copy.range.bytes, vram_hash, vram_copy.window_original, vram_copy.window_restored, vram_copy.window_writes,
     });
-    if (!boot_vram.close()) {
-        ctx.logError("NVIDIA boot-vram: cleanup=retained display-and-snapshot=held");
-        return false;
-    }
-    ctx.logInfo("NVIDIA boot-display: cleanup=OK writers=restored snapshot-references=0 aperture-recovery=verified firmware-recovery=unperformed");
     const inputs = boot_inputs.load(ctx, 30 * std.time.ns_per_s) catch |err| {
         log("NVIDIA boot-check: rejected phase=boot-resources reason={s} fallback=preserved", .{@errorName(err)});
         boot_inputs.close();
@@ -495,7 +492,15 @@ fn checkBoot(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Sna
     log("NVIDIA boot-check: staged image-bytes={d} image-mappings={d} image-segments={d} radix-root={x} pack-bytes={d} pack-bounced={} synchronized=yes submitted=no", .{
         report.image.image_bytes, report.image.mappings, report.image.segments, report.image.root_address, report.pack_bytes, report.pack_bounced,
     });
-    log("NVIDIA boot-check: boot-address={x} signature-address={x} metadata-address={x} metadata-bytes={d} verified=0 boot-count=0 vram-reserved=no vga-relocated=no", .{
+    boot_vram_lease.acquire(&boot_vram, &boot_storage) catch |err| {
+        log("NVIDIA boot-vram: reservation=rejected reason={s} submitted=no", .{@errorName(err)});
+        return false;
+    };
+    const frts = boot_vram_lease.binding(.frts) catch return false;
+    log("NVIDIA boot-vram: reservation=held epoch={d} serial={d} fb-bytes={d} frts-address={x} frts-bytes={d} metadata=matched general-allocation=withheld submitted=no", .{
+        frts.epoch, frts.serial, boot_vram_lease.plan.?.fb_bytes, frts.range.offset, frts.range.bytes,
+    });
+    log("NVIDIA boot-check: boot-address={x} signature-address={x} metadata-address={x} metadata-bytes={d} verified=0 boot-count=0 vram-reserved=boot-owner vga-relocated=no", .{
         report.boot_address, report.signature_address, report.metadata_address, report.metadata_bytes,
     });
     const fuses = security_fuses.readBooter(ctx, snapshot, chip) catch |err| {
@@ -528,12 +533,18 @@ fn checkBoot(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Sna
         return false;
     }
     ctx.logInfo("NVIDIA boot-init: cleanup=OK mappings=0 pins=0 cpu=0 submitted=no");
+    if (!boot_vram_lease.releaseBeforeSubmission()) return false;
     if (!boot_storage.close()) {
         ctx.logError("NVIDIA boot-check: cleanup=retained submitted=no");
         return false;
     }
     boot_inputs.close();
     if (!firmware_cpu.close()) return false;
+    if (!boot_vram.close()) {
+        ctx.logError("NVIDIA boot-vram: cleanup=retained display-and-snapshot=held");
+        return false;
+    }
+    ctx.logInfo("NVIDIA boot-display: cleanup=OK writers=restored snapshot-references=0 aperture-recovery=verified firmware-recovery=unperformed");
     boot_checked = true;
     ctx.logInfo("NVIDIA boot-check: OK mappings=0 pins=0 cpu=0 firmware-execution=disabled fallback=preserved");
     return true;
