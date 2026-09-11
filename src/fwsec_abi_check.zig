@@ -5,10 +5,12 @@ const wpr = @import("gsp_wpr.zig");
 const gsp_init = @import("gsp_init.zig");
 const message = @import("gsp_message.zig");
 const ring = @import("gsp_ring.zig");
+const boot_events = @import("gsp_boot_events.zig");
 extern fn r4nv_fwsec_abi_check([*]const u8, usize, c_uint, [*]const u8, usize, c_uint, [*]const u8, usize) c_int;
 extern fn r4nv_gsp_init_abi_check([*]const u8, usize) c_int;
 extern fn r4nv_gsp_message_abi_check([*]const u8, usize, c_uint) c_int;
 extern fn r4nv_gsp_ring_abi_check([*]const u32, usize, c_uint) c_int;
+extern fn r4nv_gsp_event_abi_fixture(c_uint, [*]u8, usize) usize;
 pub fn main() !void {
     // Heap backing belongs only to this host comparison, never to a target
     // driver or its bounded stack. All DMA addresses below are synthetic.
@@ -36,6 +38,37 @@ pub fn main() !void {
     for ([_]usize{ 0, 1, 7, 4016, 4017, message.max_payload_bytes }, 0..) |length, index| {
         const shape = try message.encode(.{ .chip_id = 0x176 }, std.math.maxInt(u32) - @as(u32, @intCast(index)), .{ .function = 0xdeadbeef, .sequence = 0x12345678 }, payload[0..length], message_output);
         if (r4nv_gsp_message_abi_check(message_output.ptr, shape.storage_bytes, @intCast(index)) != 0) return error.OriginalMessageMismatch;
+    }
+    // Decode real original-C event layouts through the production codec. C
+    // creates the bytes with its own generated types and original checksum.
+    for (0..6) |fixture| {
+        const length = r4nv_gsp_event_abi_fixture(@intCast(fixture), message_output.ptr, message_output.len);
+        if (length != 4096) return error.OriginalEventMismatch;
+        const record = try message.decode(.{ .chip_id = 0x176 }, message_output[0..length], @intCast(10 + fixture));
+        if (record.rpc.result_private != 0x76543210 or record.rpc.sequence != 0x700 + fixture) return error.OriginalEventMismatch;
+        const event = try boot_events.decode(record);
+        const same = switch (fixture) {
+            0 => event == .init_done,
+            1 => check: {
+                if (event != .cpu_sequencer) break :check false;
+                const seq = event.cpu_sequencer;
+                for (seq.saved, 0..) |value, index| if (value != 0x100 + index) break :check false;
+                break :check seq.capacity_words == 8 and std.mem.eql(u8, seq.commands, &.{ 0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55, 0xcc, 0xbb, 0xaa, 0x99 });
+            },
+            2 => event == .os_error and event.os_error.xid == 119 and event.os_error.runlist == 4 and
+                event.os_error.channel == 0xffffffff and event.os_error.previous_xid == 13 and
+                event.os_error.text.len == 256 and std.mem.allEqual(u8, event.os_error.text, 'X'),
+            3 => event == .libos_print and event.libos_print.engine == 0x1234 and std.mem.eql(u8, event.libos_print.bytes, &.{ 0, '%', 0xff, 0x1b, 'Z' }),
+            4 => event == .lockdown and event.lockdown,
+            else => check: {
+                if (event != .nocat) break :check false;
+                const n = event.nocat;
+                break :check n.flags == 3 and n.timestamp == 0x123456789abcdef0 and n.record_type == 7 and n.bugcheck == 0x79 and
+                    std.mem.eql(u8, n.source, "rm") and n.subsystem == 8 and n.error_code == 0xfedcba9876543210 and
+                    std.mem.eql(u8, n.engine, "gsp") and n.tdr_reason == 12 and std.mem.eql(u8, n.diagnostic, &.{ 0xde, 0xad, 0xbe, 0xef, 0x79 });
+            },
+        };
+        if (!same) return error.OriginalEventMismatch;
     }
     for (0..8) |fixture| {
         var command: [32]u8 = undefined;

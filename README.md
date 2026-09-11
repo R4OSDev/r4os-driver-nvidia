@@ -10,6 +10,33 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
+The host-qualified `gsp_boot_events.Boot` now processes the six pinned startup
+notification types over `gsp_transport.Session`. It admits exact fixed layouts
+and bounded inline/flexible payloads, preserving raw RPC status fields and
+binary log data. One absolute deadline covers connection and deferred handling.
+Each call receives at most one record. A matching ticket can be acknowledged
+only after the execution/logging owner actually handled it. Sequencer payload
+admission does not execute or authorize its opcodes. Unknown events, nonzero
+guest IDs, invalid payloads and failed INIT_DONE results stop the session.
+
+Lockdown restricts register access as soon as its notice is admitted; clearing
+it requires an unambiguous acknowledgement. INIT_DONE is accepted only after
+a zero result and completed acknowledgement. It is not a GPU health, scanout
+or quiescence proof. Failed/late acknowledgements retain dispatch and receipt;
+handlers must not be replayed. There is no new allocator, wait loop or reset.
+
+The existing owner step passes 45 cases with one added grouped boot-event case.
+Six fixtures built with complete original NVIDIA C types and the original
+checksum agree with the decoder, including inline 1208-byte NOCAT data and
+the one-byte lockdown flag. Both final checks pass. No new gate,
+guest run, hardware update or module build was needed: this core is not yet
+linked into NVIDIA.R4D0.1.25. Native launch/IRQ integration, sequencer execution,
+log handling and health checks remain open. The 181 complete source/notice
+references are in `gsp-boot-events-20260911`; executable linkage must add all
+codec/transport/event notices to the distributed license bundle.
+
+Earlier DMA-port checkpoint (module0.1.25):
+
 `gsp_init_storage.QueueLease` now binds the transport port to DriverApi34.
 One admitted execution owner borrows the staged 516-KB queue mapping with a
 nonwrapping lease epoch. Reads synchronize the exact range before copying;
@@ -26,7 +53,7 @@ Kernel 0.1.148 confirms these actual range acquisitions and complete cleanup.
 After two update boots the exact original passive configuration was restored.
 No GPU message, firmware start or new picture/sound acceptance occurred.
 
-The existing owner step passes 44 cases, including real Storage/SDK/Session
+At the DMA-port checkpoint, the owner step passed 44 cases, including real Storage/SDK/Session
 composition against direct and separate bounce-memory host models. The final
 module also passes the existing SMP4 passive fallback probe in 20.41 seconds.
 Lease identity is not yet a hardware reset generation. Real GSP traffic,
@@ -67,7 +94,7 @@ spans, including wraparound. Gathering accepts a complete validated message;
 scattering leaves the CPU queue shadow unchanged on admission failure.
 Neither operation publishes a cursor, sequence, acknowledgement or live link.
 
-The existing owner step now passes 42 cases. Eight fixtures match actual
+At the ring checkpoint, the owner step passed 42 cases. Eight fixtures match actual
 original msgq linking, slot lookup, submit and consume operations, including
 all four swap-flag combinations, RX offsets 32/64 and wraparound. This is host
 validation only. At the ring checkpoint, DriverApi33 synchronized entire mappings: live shared

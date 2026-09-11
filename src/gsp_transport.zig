@@ -76,6 +76,16 @@ pub const Session = struct {
         self.state = .failed;
         return err;
     }
+    /// A protocol owner may stop after a semantically invalid message. Keep
+    /// all receipts/backing intact; this does not stop or quiesce the GPU.
+    pub fn stop(self: *Session) void {
+        self.state = .failed;
+    }
+    /// Validate lifetime/time between I/O calls while a dispatch is deferred.
+    /// Does not touch a queue or renew any deadline.
+    pub fn guard(self: *Session, deadline: u64) Error!void {
+        try self.check(deadline);
+    }
     fn check(self: *Session, deadline: u64) Error!void {
         if (self.state == .failed) return error.State;
         if (self.port.generation(self.port.context) != self.epoch) return self.fail(error.Stale);

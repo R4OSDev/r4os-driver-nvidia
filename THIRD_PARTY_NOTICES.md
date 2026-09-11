@@ -1,5 +1,19 @@
 ﻿# Third-Party Notices
 
+The host-qualified `gsp_boot_events.zig` adapts the six boot-event layouts and
+selection from pinned g_rpc-structures.h (2008-2025), ctrl2080nvd.h (2004-2023),
+rpc_global_enums.h and kernel_gsp.c (2019-2024), NVIDIA CORPORATION & AFFILIATES.
+The source retains the full MIT permission/disclaimer and copyright lines;
+original R4OS admission, ownership and deadlines remain Apache-2.0. The
+181 complete original dependencies/sources/notices accompany the
+gsp-boot-events-20260911 archive with exact hashes and official source URLs.
+The optional existing ABI verifier creates six frames with original generated
+C types and checksum; it runs only on host memory. No boot-event code is linked
+into NVIDIA.R4D0.1.25, and its33543-byte boot notice remains unchanged. Future
+executable linkage must include all additional full codec/transport/event
+notices in the module and Distribution. There is no new firmware or RM linkage.
+
+
 Original R4OS driver, parser, adapter, test and inspector code is Apache-2.0.
 The attributed layout/metadata adaptations and selected original NVIDIA
 headers described below retain their MIT terms. No full NVIDIA RM/NVKMS host implementation, Linux driver or

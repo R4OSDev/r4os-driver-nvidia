@@ -1,5 +1,21 @@
 ﻿Original R4OS implementation for roadmap 0.79.9, 10.09.2026.
 Host/module scaffolding follows R4OS SDK and existing R4D owners.
+
+0.79.10 GSP boot events (host), 11.09.2026:
+gsp_boot_events.zig uses the six boot event IDs/selection and complete original
+layouts from g_rpc-structures.h, rpc_global_enums.h, ctrl2080nvd.h and kernel_gsp.c
+at RM570.144 commit8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f. NVIDIA copyright
+2008-2025,2004-2023,2019-2024 and the full MIT notice are retained; R4OS admission,
+ticket ownership and deadline policy are original Apache-2.0. Capacity bounds,
+strict supported-event admission and conservative acknowledgement handling are
+R4OS policies; original C consumer code is not executed or represented as a
+GPU test. The existing ABI verifier constructs six frames with genuine vendor
+types and original checksum; no shadow types, success stubs or GPU callbacks.
+181 full original files/notices and all compiled dependencies are archived in
+ExFiles/Reference/GFX/Nvidia/0.79.10/gsp-boot-events-20260911. The exact full
+3156-file source catalog was checked before the C build. Core/decoder changes
+are not linked into module0.1.25; its resources/notices remain unchanged.
+
 Firmware fixture bodies and signatures are synthetic. Selected measured
 table fields are explicit regression data, as described below.
 

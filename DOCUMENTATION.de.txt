@@ -9,7 +9,38 @@ Boardanschluesse. Die spaeteren PROM-Boots bestaetigen softwareseitig den
 unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
-DMA-Queue-Port und reale Headeraufnahme (NVIDIA0.1.25)
+
+GSP-Startmeldungen und ausdrueckliche Bearbeitung (Host)
+-----------------------------------------------------
+gsp_boot_events.Boot verarbeitet sechs Startmeldungstypen ueber den vorhandenen
+GSP-Transport: InitDone, CPU-Sequencer, OS-Fehler, Libos-Daten, Lockdown und
+NOCAT. Feste Strukturgroessen, flexible Datenlaengen und eingebettete Arrays
+werden begrenzt geprueft. RPC-Statusfelder und binaere Protokolldaten bleiben
+erhalten. NOCAT ist ein1208-Byte-Inline-Datensatz; Lockdown ein einzelnes Byte.
+Sequencer-Kapazitaet, uebertragene und benutzte Woerter bleiben getrennt;
+deren Zulassung fuehrt keine Opcodes aus und erlaubt keine Registerzugriffe.
+
+Eine feste absolute Frist umfasst Verbindung und aufgeschobene Bearbeitung.
+Pro Aufruf hoechstens eine Nachricht, ohne Allokation oder Pollschleife.
+Nur das passende Ticket darf nach tatsaechlicher Bearbeitung quittiert werden.
+Lockdown sperrt Registerzugriffe bereits beim Empfang; Entsperrung erst nach
+eindeutigem Ack. InitDone verlangt Status0 und erfolgreiches Ack. Unbekannte
+Meldungen, andere GFIDs, defekte Nutzdaten, Fehlerstatus oder Fristverlust
+beenden den Transport. Fehlerhaftes/spaetes Ack behaelt Meldung und Empfang;
+kein erneuter Handleraufruf. InitDone und Abbruch beweisen keine GPU-Ruhe.
+
+45/45 Faelle im bestehenden Besitzerstep bestanden; genau ein gruppierter
+Fall ergaenzt. Sechs echte originale C-Nachrichtentypen und Originalpruefsumme
+gegen den Decoder verglichen; beide abschliessenden Pruefungen bestanden.
+181 vollstaendige Originalquellen/Header/Lizenzdateien samt Herkunft gehasht.
+Kein neues Gate, Gastlauf, Hardwareupdate oder Modulbau. NVIDIA0.1.25 und sein
+Lizenzpaket unveraendert. Der neue Protokollkern ist noch nicht im R4D gelinkt;
+vor Einbindung muessen alle Codec-/Transport-/Event-MIT-Hinweise ins Paket.
+Nativer Start/IRQ, Sequencer-Ausfuehrung, Logbesitzer, Healthcheck sowie VRAM-/
+VGA-Recovery und echte Quieszenz bleiben offen. Keine Bild-/Tonabnahme.
+Archiv: ExFiles/Reference/GFX/Nvidia/0.79.10/gsp-boot-events-20260911.
+
+Historischer DMA-Queue-Port und reale Headeraufnahme (NVIDIA0.1.25)
 ----------------------------------------------------
 gsp_init_storage.QueueLease bindet den Transportport an DriverApi34. Erst
 nach echter Kernelzulassung des Mappings entsteht eine exklusive, niemals
@@ -45,8 +76,9 @@ unreferenzierten aelteren Backup mit dauerhaftem Vollvergleich; zusaetzlicher
 SHA-256-Rueckvergleich bestaetigt alle 29.418.864 Bytes. Beide Journalslots,
 Bootkonfiguration und FAT-Geschwisteridentitaeten wurden vorher geprueft.
 Journal und Backupinhalt blieben erhalten. Danach gelang der gebundene Batch.
-SYSUPD 0.1.16 ist mit der passiven Konfiguration installiert. Die dauerhafte
-FAT-Verzeichniserweiterung bleibt separat offen. Details: Deployment/SystemUpdate.txt.
+SYSUPD 0.1.16 ist mit der passiven Konfiguration installiert. Die damals offene
+FAT-Verzeichniserweiterung ist inzwischen mit Kernel0.1.149 umgesetzt und
+gezielt am Host, mit SMP4 und auf OssiPC belegt. Details: Deployment/SystemUpdate.txt.
 
 Historischer GSP-Transportbesitzer und geordnete Publikation (Host)
 ---------------------------------------------------

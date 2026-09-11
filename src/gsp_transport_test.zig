@@ -1,6 +1,7 @@
 const std = @import("std");
 const t = std.testing;
 const transport = @import("gsp_transport.zig");
+const boot_events = @import("gsp_boot_events.zig");
 const message = transport.message;
 const ring = transport.ring;
 const profile = message.Profile{ .chip_id = 0x176 };
@@ -79,8 +80,11 @@ const Model = struct {
         put(&self.peer[@intFromEnum(location.queue)], location.offset, value);
     }
     fn reply(self: *Model, session: *transport.Session, payload: []const u8) !void {
+        return self.replyRpc(session, .{ .function = 0xf0000790, .result = 0x87654321 }, payload);
+    }
+    fn replyRpc(self: *Model, session: *transport.Session, rpc: message.Rpc, payload: []const u8) !void {
         const link = session.link.?;
-        const shape = try message.encode(profile, session.rx_sequence, .{ .function = 0xf0000790, .result = 0x87654321 }, payload, &self.frame);
+        const shape = try message.encode(profile, session.rx_sequence, rpc, payload, &self.frame);
         const plan = try ring.scatter(profile, link.status.layout, get(&self.peer[1], 16), self.peerWord(link.status_read), session.rx_sequence, self.frame[0..shape.storage_bytes], &self.peer[1]);
         put(&self.peer[1], 16, plan.next_cursor);
     }
@@ -90,6 +94,184 @@ fn put(bytes: []u8, offset: usize, value: u32) void {
 }
 fn get(bytes: []const u8, offset: usize) u32 {
     return std.mem.readInt(u32, bytes[offset..][0..4], .little);
+}
+
+fn startBoot(model: *Model, session: *transport.Session) !boot_events.Boot {
+    model.reset(3);
+    session.* = try transport.Session.init(model.port(), profile, model.epoch, &model.tx, &model.rx);
+    var boot = try boot_events.Boot.init(session, deadline);
+    try t.expect((try boot.poll()) == null);
+    model.count = 0;
+    return boot;
+}
+fn badBootEvent(model: *Model, rpc: message.Rpc, payload: []const u8, expected: boot_events.Error) !void {
+    var session: transport.Session = undefined;
+    var boot = try startBoot(model, &session);
+    try model.replyRpc(&session, rpc, payload);
+    try t.expectError(expected, boot.poll());
+    try t.expectEqual(boot_events.State.failed, boot.state);
+    try t.expectEqual(transport.State.failed, session.state);
+    try t.expectEqual(expected, boot.failure.?.reason);
+    try t.expectEqualDeep(rpc, boot.failure.?.rpc.?);
+    try t.expectEqualDeep(session.pending.?, boot.failure.?.ticket.?);
+    try t.expectEqual(@as(u32, 0), model.peerWord(session.link.?.status_read));
+    const calls = model.count;
+    try t.expectError(error.State, boot.poll());
+    try t.expectError(error.State, session.send(deadline, .{ .function = 1 }, "retry"));
+    try t.expectEqual(calls, model.count);
+}
+
+test "GSP boot events require explicit handling, valid original payloads and an unextended deadline" {
+    const model = try t.allocator.create(Model);
+    defer t.allocator.destroy(model);
+    var session: transport.Session = undefined;
+    var boot = try startBoot(model, &session);
+    try model.replyRpc(&session, .{ .function = 0x101c }, &.{1});
+    var event = (try boot.poll()).?;
+    try t.expect(event.event == .lockdown and event.event.lockdown);
+    try t.expect(boot.in_lockdown); // Restrict registers BEFORE handling/ACK.
+    try t.expectEqual(boot_events.State.dispatching, boot.state);
+    var before = model.count;
+    try t.expectError(error.Pending, boot.poll());
+    var wrong = event.ticket;
+    wrong.serial += 1;
+    try t.expectError(error.Stale, boot.complete(wrong));
+    try t.expectError(error.Stale, boot.reject(wrong));
+    try t.expectEqual(before, model.count);
+    try boot.complete(event.ticket);
+    try t.expectEqual(@as(u32, 1), model.peerWord(session.link.?.status_read));
+    try t.expectError(error.Stale, boot.complete(event.ticket));
+    try model.replyRpc(&session, .{ .function = 0x101c }, &.{0});
+    event = (try boot.poll()).?;
+    try t.expect(boot.in_lockdown); // Release only after unambiguous ACK.
+    try boot.complete(event.ticket);
+    try t.expect(!boot.in_lockdown);
+    try model.replyRpc(&session, .{ .function = 0x1001, .result = 0, .result_private = 0x76543210 }, &.{ 0xff, 0xab, 0xcd, 0xef });
+    event = (try boot.poll()).?;
+    try t.expect(event.event == .init_done);
+    try t.expectEqual(boot_events.State.dispatching, boot.state);
+    try boot.complete(event.ticket);
+    try t.expectEqual(boot_events.State.init_done, boot.state);
+    try t.expectEqual(@as(u64, 3), boot.handled_events);
+    before = model.count;
+    try t.expectError(error.State, boot.poll());
+    try t.expectEqual(before, model.count);
+
+    for ([_]u32{ 79, 0x1000, 0x1021, 0xffffffff }) |function|
+        try badBootEvent(model, .{ .function = function }, "unknown", error.UnknownEvent);
+    try badBootEvent(model, .{ .function = 0x1001, .result = 0, .cpu_rm_gfid = 1 }, &.{ 0, 0, 0, 0 }, error.Guest);
+    for ([_]u32{ message.pending, 0x65, 0x12345678 }) |result|
+        try badBootEvent(model, .{ .function = 0x1001, .result = result, .result_private = 0x1122 }, &.{ 0, 0, 0, 0 }, error.FirmwareResult);
+    var bytes: [1212]u8 = @splat(0);
+    const Invalid = struct { function: u32, length: usize };
+    for ([_]Invalid{
+        .{ .function = 0x1001, .length = 3 },    .{ .function = 0x1001, .length = 5 },
+        .{ .function = 0x101c, .length = 0 },    .{ .function = 0x101c, .length = 2 },
+        .{ .function = 0x1006, .length = 271 },  .{ .function = 0x1006, .length = 273 },
+        .{ .function = 0x1020, .length = 1207 }, .{ .function = 0x1020, .length = 1209 },
+        .{ .function = 0x100c, .length = 7 },    .{ .function = 0x1002, .length = 39 },
+    }) |case| try badBootEvent(model, .{ .function = case.function, .result = 0 }, bytes[0..case.length], error.Payload);
+    try badBootEvent(model, .{ .function = 0x101c }, &.{2}, error.Payload);
+    put(&bytes, 176, 1025);
+    try badBootEvent(model, .{ .function = 0x1020 }, bytes[0..1208], error.Payload);
+    put(&bytes, 176, 0);
+    put(&bytes, 4, 0xffffffff);
+    try badBootEvent(model, .{ .function = 0x100c }, bytes[0..9], error.Payload);
+
+    // Capacity cannot authorize missing commands or wrap a byte count. These
+    // are transport-valid frames whose semantic payload must not reach MMIO.
+    for ([_][3]u32{ .{ 0, 0, 40 }, .{ 1, 1, 44 }, .{ 3, 2, 44 }, .{ 1, 0, 48 }, .{ 0xffffffff, 0, 40 }, .{ 2, 1, 45 } }) |case| {
+        put(&bytes, 0, case[0]);
+        put(&bytes, 4, case[1]);
+        try badBootEvent(model, .{ .function = 0x1002 }, bytes[0..case[2]], error.Payload);
+    }
+    boot = try startBoot(model, &session);
+    put(&bytes, 0, 2);
+    put(&bytes, 4, 1);
+    put(&bytes, 40, 0xfeed);
+    try model.replyRpc(&session, .{ .function = 0x1002 }, bytes[0..44]);
+    event = (try boot.poll()).?;
+    try t.expect(event.event == .cpu_sequencer);
+    try t.expectEqual(@as(usize, 4), event.event.cpu_sequencer.commands.len);
+    before = model.count;
+    // There is no real executor in this fixture; parsing must not ACK it.
+    try t.expectError(error.Handler, boot.reject(event.ticket));
+    try t.expectEqual(before, model.count);
+    try t.expect(boot.pending != null and session.pending != null);
+
+    // Largest binary log traverses the actual framing/ring transport. Embedded
+    // NUL/control bytes stay a bounded byte span for the logging owner.
+    const large = try t.allocator.alloc(u8, message.max_payload_bytes);
+    defer t.allocator.free(large);
+    @memset(large, 0x1b);
+    put(large, 0, 0x9999);
+    put(large, 4, @intCast(large.len - 8));
+    large[8] = 0;
+    boot = try startBoot(model, &session);
+    try model.replyRpc(&session, .{ .function = 0x100c }, large);
+    event = (try boot.poll()).?;
+    try t.expectEqualSlices(u8, large[8..], event.event.libos_print.bytes);
+    try boot.complete(event.ticket);
+    try t.expectEqual(@as(u32, 16), session.rx_read);
+    model.now = deadline;
+    try t.expectError(error.Deadline, boot.poll());
+    try t.expect(boot.failure.?.rpc == null and boot.failure.?.ticket == null);
+
+    // Delayed handler, lifetime change and ambiguous acknowledgements cannot
+    // report INIT_DONE or cause handler replay, even if the cursor was written.
+    for (0..4) |fault| {
+        boot = try startBoot(model, &session);
+        try model.replyRpc(&session, .{ .function = 0x1001, .result = 0 }, &.{ 0, 0, 0, 0 });
+        event = (try boot.poll()).?;
+        before = model.count;
+        const expected: boot_events.Error = switch (fault) {
+            0 => blk: {
+                model.now = deadline;
+                break :blk error.Deadline;
+            },
+            1 => blk: {
+                model.epoch += 1;
+                break :blk error.Stale;
+            },
+            2 => blk: {
+                model.fault = before + 1;
+                model.after = true;
+                break :blk error.Io;
+            },
+            else => blk: {
+                model.expire = before + 1;
+                break :blk error.Deadline;
+            },
+        };
+        try t.expectError(expected, boot.complete(event.ticket));
+        try t.expectEqual(boot_events.State.failed, boot.state);
+        try t.expectEqual(@as(u64, 0), boot.handled_events);
+        try t.expect(boot.pending != null and session.pending != null);
+        try t.expectEqual(@as(u32, if (fault >= 2) 1 else 0), model.peerWord(session.link.?.status_read));
+        before = model.count;
+        try t.expectError(error.State, boot.complete(event.ticket));
+        try t.expectEqual(before, model.count);
+    }
+    boot = try startBoot(model, &session);
+    try model.replyRpc(&session, .{ .function = 0x101c }, &.{1});
+    _ = (try boot.poll()).?;
+    model.now = deadline;
+    try t.expectError(error.Deadline, boot.poll()); // Pending doesn't hide TTL.
+    try t.expect(boot.in_lockdown);
+    try t.expectEqual(@as(u32, 0), model.peerWord(session.link.?.status_read));
+
+    // Readiness attempts keep the same absolute boot deadline.
+    model.reset(3);
+    session = try transport.Session.init(model.port(), profile, model.epoch, &model.tx, &model.rx);
+    boot = try boot_events.Boot.init(&session, deadline);
+    @memset(&model.peer[1], 0);
+    try t.expect((try boot.poll()) == null);
+    model.now = deadline - 1;
+    try t.expect((try boot.poll()) == null);
+    model.now = deadline;
+    before = model.count;
+    try t.expectError(error.Deadline, boot.poll());
+    try t.expectEqual(before, model.count);
 }
 
 test "GSP transport orders range publication, explicit acknowledgement and terminal ambiguous failures" {
