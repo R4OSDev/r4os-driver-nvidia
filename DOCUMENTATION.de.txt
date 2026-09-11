@@ -9,7 +9,46 @@ Boardanschluesse. Die spaeteren PROM-Boots bestaetigen softwareseitig den
 unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
-GSP-Transportbesitzer und geordnete Publikation (Host)
+DMA-Queue-Port und reale Headeraufnahme (NVIDIA0.1.25)
+----------------------------------------------------
+gsp_init_storage.QueueLease bindet den Transportport an DriverApi34. Erst
+nach echter Kernelzulassung des Mappings entsteht eine exklusive, niemals
+ueberlaufende Leihe. Bereichs-Reads synchronisieren vor dem Kopieren; Writes
+kopieren vor der Device-Synchronisierung. Grenzen und Aliase der gesamten
+Allokation werden vorher geprueft. Alte Leihen und fehlgeschlagene Zugriffe
+duerfen nicht weiter zugreifen. Der genaue Kernelstatus bleibt erhalten.
+
+Eine offene Leihe sperrt den Abbau aller sieben Init-Mappings samt Pins und
+Backing. Vor jeder kuenftigen GPU-Einreichung ist die Device-Sperre zu setzen;
+es gibt noch keinen produktiven Entsperraufruf. Freigabe ist bisher nur vor
+Einreichung erlaubt. Diese Leihgeneration ist keine Hardware-Resetgeneration.
+Storage und Leihe brauchen stabile Adressen unter einem Ausfuehrungsbesitzer;
+IRQ, dedizierte Tasks und Storage-Callbacks erhalten keinen Legacy-DMA-Zugang.
+
+Der echte Boot-Check liest je 32 Bytes Command-/Statusheader, prueft Geometrie
+und Nullstatus und schliesst Leihe, Init, Boot/Image und FWSEC der Reihe nach.
+OssiPC mit Kernel 0.1.148 bestaetigt den Port und vollstaendigen Rueckbau.
+Nach zwei Neustarts ist die urspruengliche passive CONFIG.R4S bytegleich
+wiederhergestellt. Bootfb 800x600, Generation 1/Reset 0/Owner 0, 14 Dienste ohne
+Fehler. Hisense laut User aus mit Strom; keine neue Bild-/Tonabnahme.
+
+44/44 Besitzerfaelle und der fertige Modulbau bestanden. Ein neuer gruppierter
+Fall in der vorhandenen Datei verbindet echten Storage, SDK und Transport
+mit direkten sowie getrennten Bounce-Hostmodellen. Die bestehende passive
+SMP4-Probe besteht in 20.41s. Kein neues Gate/Gastprofil. GPU-Start, reale RPC/
+IRQ, Resetgeneration, Quieszenz und VRAM-/VGA-Recovery bleiben offen.
+Archiv: ExFiles/Reference/GFX/Nvidia/0.79.10/gsp-dma-port-20260911.
+
+Das echte Update deckte ein volles FAT-Bootverzeichnis ohne Erweiterung auf.
+Vor jedem Payloadtausch blieb Batch 17 stehen. SYSUPD 0.1.16 archivierte einen
+unreferenzierten aelteren Backup mit dauerhaftem Vollvergleich; zusaetzlicher
+SHA-256-Rueckvergleich bestaetigt alle 29.418.864 Bytes. Beide Journalslots,
+Bootkonfiguration und FAT-Geschwisteridentitaeten wurden vorher geprueft.
+Journal und Backupinhalt blieben erhalten. Danach gelang der gebundene Batch.
+SYSUPD 0.1.16 ist mit der passiven Konfiguration installiert. Die dauerhafte
+FAT-Verzeichniserweiterung bleibt separat offen. Details: Deployment/SystemUpdate.txt.
+
+Historischer GSP-Transportbesitzer und geordnete Publikation (Host)
 ---------------------------------------------------
 gsp_transport.zig verwaltet einen GA106-Klartextlauf ueber einen expliziten
 synchronen Bereichs-I/O-Port. Ein Ausfuehrungsbesitzer leiht zwei64-KB-Puffer.
@@ -29,9 +68,9 @@ maximale Nachrichten am Ringende, volle Queues,14 Vorher-/Nachher-I/O-Fehler,
 spaeten Frist-/Generationsverlust, alte Acks und Headerbereitschaft:43/43
 Faelle bestanden. Kein neues Gate, Gastlauf, Modul- oder kompletter RM-Bau.
 
-Der Port ist derzeit ein Hostmodell. Reale DriverApi34-/Storage-Anbindung,
-DMA-Lebensdauer/Resetgeneration, RPC/IRQ und GPU-Start bleiben offen.
-NVIDIA0.1.24 bleibt unveraendert. Die vollstaendige MIT-Notice aus dem gepinnten
+Dieser historische Port war ein Hostmodell; die jetzige Storage-Anbindung
+steht oben. Hardware-Resetgeneration, RPC/IRQ und GPU-Start bleiben offen.
+Damals blieb NVIDIA0.1.24 unveraendert. Die vollstaendige MIT-Notice aus dem gepinnten
 message_queue_cpu.c steht im Quellcode und Referenzarchiv gsp-transport-20260911;
 vor spaeterer Einbindung muss das Lizenzbuendel alle neuen Notices enthalten.
 

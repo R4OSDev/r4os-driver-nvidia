@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-Passive NVIDIA display driver for R4OS. Module 0.1.24; original R4OS code is
+Passive NVIDIA display driver for R4OS. Module 0.1.25; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -9,6 +9,30 @@ This owner inventories NVIDIA display functions once through
 the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
+
+`gsp_init_storage.QueueLease` now binds the transport port to DriverApi34.
+One admitted execution owner borrows the staged 516-KB queue mapping with a
+nonwrapping lease epoch. Reads synchronize the exact range before copying;
+publication copies before device synchronization. Bounds and aliases of the
+entire allocation are rejected. Old leases and failed I/O cannot keep using
+the mapping. An outstanding lease blocks teardown of all seven init mappings,
+pins and backing. A latch must be set before any future GPU submission and
+currently has no production clear operation; errors do not prove quiescence.
+
+NVIDIA 0.1.25 boot-check reads only the two 32-byte queue headers through this
+port, validates initial geometry and the zero status header, then releases
+the lease and all dependent storage before returning to bootfb. OssiPC with
+Kernel 0.1.148 confirms these actual range acquisitions and complete cleanup.
+After two update boots the exact original passive configuration was restored.
+No GPU message, firmware start or new picture/sound acceptance occurred.
+
+The existing owner step passes 44 cases, including real Storage/SDK/Session
+composition against direct and separate bounce-memory host models. The final
+module also passes the existing SMP4 passive fallback probe in 20.41 seconds.
+Lease identity is not yet a hardware reset generation. Real GSP traffic,
+RPC/IRQ, native quiescence/release and VRAM/VGA recovery remain open.
+
+Earlier transport-core checkpoint (host model):
 
 The host-qualified `gsp_transport.zig` owns one cleartext GA106 queue session
 over an explicit synchronous range-I/O port. One execution owner borrows two
@@ -23,15 +47,16 @@ Impossible peer progress is refused. Errors after a possibly completed copy,
 cursor store or acknowledgement latch failure and prohibit retries. Pending
 receipts remain retained; no reset/free operation can invent device quiescence.
 Protocol u32 sequences wrap; generation-bound u64 receipt identities never do.
-The existing owner step passes 43 cases, including one grouped transport case
+At that checkpoint the owner step passed 43 cases, including one grouped transport case
 with all swap routes, maximum frames across ring end, full queues, fourteen
 before/after callback failures, late deadline/generation loss and stale acks.
 
-This port is currently a host model, not a DriverApi34/storage binding. Real
-DMA backing/epoch retention, RPC/IRQ dispatch and native bringup remain open.
-NVIDIA0.1.24 and its packaged licenses are unchanged. The source keeps the full
-MIT notice from the pinned message_queue_cpu.c; hardware linkage must carry
-all message/ring/transport notices into the distributed bundle.
+That checkpoint used a host port and kept NVIDIA0.1.24 unchanged. The current
+Storage/DriverApi34 binding is described above. The source retains the full
+MIT notice from the pinned message_queue_cpu.c. Executable codec/Session
+integration must include all message/ring/transport notices in the bundle.
+
+Earlier ring and message checkpoints (host qualification):
 
 The host-qualified `gsp_ring.zig` layer admits command/status geometry and
 computes swap routing using each side's own RX-header offset. A zero peer

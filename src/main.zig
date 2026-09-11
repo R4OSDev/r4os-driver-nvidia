@@ -38,6 +38,7 @@ var gsp_image: gsp_dma.Storage = .{};
 var boot_inputs: boot_resources.Inputs = .{};
 var boot_storage: gsp_boot_storage.Storage = .{};
 var init_storage: gsp_init_storage.Storage = .{};
+var init_queues: gsp_init_storage.QueueLease = .{};
 // Bounded resident scratch: do not copy the maximum boot SG list to the stack.
 var init_excluded: [gsp_init.max_excluded]gsp_init.Span = undefined;
 var checking_boot = false;
@@ -163,7 +164,7 @@ pub export fn nvidia_shutdown() callconv(.c) i32 {
     if (!semaphore_probe.shutdown(&ctx)) return -1;
     if (!thread_probe.shutdown(&ctx)) return -1;
     if (!runtime_probe.shutdown(&ctx)) return -1;
-    if (!init_storage.close()) return -1;
+    if (!closeBootInit()) return -1;
     if (!boot_storage.close()) return -1;
     boot_inputs.close();
     if (!gsp_image.close()) return -1;
@@ -469,7 +470,7 @@ fn checkBoot(ctx: *const r4os.r4dev.DriverContext, chip: identity.Chip, raw: fws
     if (!stageBootInit(ctx, chip.id)) return false;
     // No GPU submission occurred. On failure leave this owner and all borrowed
     // boot allocations for shutdown, which retries this same dependency order.
-    if (!init_storage.close()) {
+    if (!closeBootInit()) {
         ctx.logError("NVIDIA boot-init: cleanup=retained submitted=no");
         return false;
     }
@@ -504,7 +505,36 @@ fn stageBootInit(ctx: *const r4os.r4dev.DriverContext, chip_id: u16) bool {
         report.init.libos_address, report.init.rm_address, report.init.queues_address, report.init.queue_page_count, gsp_init.ring_slots, gsp_init.ring_capacity,
     });
     ctx.logInfo("NVIDIA boot-init: arguments=to-device logs=bidirectional queues=bidirectional status-header=zero native-writes=disabled");
+    init_queues = init_storage.borrowQueues() catch |err| {
+        log("NVIDIA boot-init: rejected phase=queue-port reason={s} status={d} submitted=no", .{ @errorName(err), init_storage.last_queue_status });
+        return false;
+    };
+    const port = init_queues.port();
+    const before = port.now_ns(port.context);
+    if (before == std.math.maxInt(u64) or before >= init_storage.deadline) return false;
+    var command: [32]u8 = undefined;
+    var status: [32]u8 = undefined;
+    port.read(port.context, .command, 0, &command) catch |err| {
+        log("NVIDIA boot-init: rejected phase=command-header reason={s} status={d} submitted=no", .{ @errorName(err), init_queues.last_status });
+        return false;
+    };
+    port.read(port.context, .status, 0, &status) catch |err| {
+        log("NVIDIA boot-init: rejected phase=status-header reason={s} status={d} submitted=no", .{ @errorName(err), init_queues.last_status });
+        return false;
+    };
+    const after = port.now_ns(port.context);
+    if (after < before or after >= init_storage.deadline) return false;
+    const header = @import("gsp_ring.zig").inspect(&command) catch return false;
+    if (header.write != 0 or header.layout.flags != 1 or header.layout.rx_offset != 32 or
+        header.layout.entries_offset != gsp_init.page_bytes or header.layout.slots != gsp_init.ring_slots or
+        !std.mem.allEqual(u8, &status, 0)) return false;
+    log("NVIDIA boot-init: queue-port=OK epoch={d} command-bytes=32 status-bytes=32 status=zero writes=0 lease=held submitted=no", .{init_queues.generation()});
     return true;
+}
+
+fn closeBootInit() bool {
+    if (!init_queues.releaseBeforeSubmission()) return false;
+    return init_storage.close();
 }
 
 const VbiosDiagnostic = struct {

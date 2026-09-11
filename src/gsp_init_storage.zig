@@ -8,8 +8,13 @@ const r4os = @import("r4os");
 const a = r4os.abi;
 const init = @import("gsp_init.zig");
 const radix = @import("gsp_radix.zig");
+const transport = @import("gsp_transport.zig");
+// Allocated only after a real legacy-DMA owner admission. This module's
+// init/shutdown/Driver Work execution owner serializes queue-lease creation;
+// dedicated tasks/IRQ/storage callbacks do not gain access through this API.
+var next_queue_epoch: u64 = 1;
 pub const max_mappings = 7;
-pub const Error = init.Error || @import("gsp_dma.zig").Error;
+pub const Error = init.Error || @import("gsp_dma.zig").Error || error{ QueueClosed, QueueRange, QueueAlias, EpochExhausted };
 const Piece = struct {
     pin: a.DmaPinnedBuffer = .{},
     mapping: a.DmaMapping = .{},
@@ -43,6 +48,9 @@ pub const Storage = struct {
     deadline: u64 = 0,
     last_clock: u64 = 0,
     report: ?Report = null,
+    queue_epoch: u64 = 0,
+    device_access: bool = false,
+    last_queue_status: i32 = 0,
 
     fn checkClock(self: *Storage) Error!void {
         const now = self.clock.?.nowNs();
@@ -137,7 +145,31 @@ pub const Storage = struct {
         return self.report.?;
     }
 
+    /// Exclusive borrowed port; caller keeps both Storage and QueueLease at
+    /// stable addresses until the transport stops using them. No allocation.
+    pub fn borrowQueues(self: *Storage) Error!QueueLease {
+        if (self.queue_epoch != 0 or self.device_access) return error.Busy;
+        if (self.report == null or self.piece_count != max_mappings or self.allocation.handle == 0) return error.QueueClosed;
+        const ctx = self.context orelse return error.QueueClosed;
+        if (!ctx.supportsDriverApi(34, @offsetOf(a.DriverApi, "dma_sync_range_for_cpu") + @sizeOf(usize)) or
+            ctx.api.dma_sync_range_for_device == null or ctx.api.dma_sync_range_for_cpu == null) return error.Api;
+        const mapping = &self.pieces[6].mapping;
+        if (mapping.handle == 0) return error.QueueClosed;
+        // Besides acquiring this CPU-owned header word, this checks actual
+        // Kernel owner/generation admission before allocating a local epoch.
+        self.last_queue_status = ctx.syncDmaRangeForCpu(mapping, init.command_offset, 4);
+        if (self.last_queue_status != 0) return error.Synchronization;
+        if (next_queue_epoch == std.math.maxInt(u64)) return error.EpochExhausted;
+        const epoch = next_queue_epoch;
+        next_queue_epoch += 1;
+        self.queue_epoch = epoch;
+        return .{ .owner = self, .epoch = epoch, .allocation = self.allocation.handle, .mapping = mapping.handle };
+    }
+
     pub fn close(self: *Storage) bool {
+        // Retain the whole dependency chain before touching report, maps,
+        // pins or CPU backing. A failed port call does not prove GPU silence.
+        if (self.queue_epoch != 0 or self.device_access) return false;
         self.report = null;
         const ctx = self.context orelse return self.allocation.handle == 0;
         var index = self.piece_count;
@@ -166,5 +198,85 @@ pub const Storage = struct {
         }
         self.* = .{};
         return true;
+    }
+};
+
+pub const QueueLease = struct {
+    owner: ?*Storage = null,
+    epoch: u64 = 0,
+    allocation: u64 = 0,
+    mapping: u64 = 0,
+    failed: bool = false,
+    last_status: i32 = 0,
+
+    pub fn generation(self: *const QueueLease) u64 {
+        const owner = self.owner orelse return 0;
+        if (self.epoch == 0 or owner.queue_epoch != self.epoch or owner.report == null or
+            owner.allocation.handle != self.allocation or owner.pieces[6].mapping.handle != self.mapping) return 0;
+        return self.epoch;
+    }
+    /// Call BEFORE any MMIO/firmware action can expose this backing to a GPU.
+    /// This latch intentionally has no clear operation yet: native quiescence
+    /// must be implemented and verified before enabling real GPU submission.
+    pub fn retainForDevice(self: *QueueLease) bool {
+        if (self.generation() == 0 or self.failed) return false;
+        self.owner.?.device_access = true;
+        return true;
+    }
+    pub fn releaseBeforeSubmission(self: *QueueLease) bool {
+        if (self.owner == null) return self.epoch == 0;
+        if (self.generation() == 0 or self.owner.?.device_access) return false;
+        self.owner.?.queue_epoch = 0;
+        self.* = .{};
+        return true;
+    }
+    pub fn port(self: *QueueLease) transport.Port {
+        return .{ .context = self, .generation = portGeneration, .now_ns = portClock, .read = portRead, .publish = portPublish };
+    }
+    fn from(context: *anyopaque) *QueueLease {
+        return @ptrCast(@alignCast(context));
+    }
+    fn portGeneration(context: *anyopaque) u64 {
+        return from(context).generation();
+    }
+    fn portClock(context: *anyopaque) u64 {
+        const self = from(context);
+        if (self.generation() == 0) return std.math.maxInt(u64);
+        return self.owner.?.clock.?.nowNs();
+    }
+    fn offsetFor(self: *QueueLease, queue: transport.ring.Queue, offset: usize, bytes: usize, buffer: []const u8) Error!usize {
+        if (self.generation() == 0 or self.failed) return error.QueueClosed;
+        if (bytes == 0 or bytes > transport.message.max_bytes or offset > init.queue_bytes or bytes > init.queue_bytes - offset) return error.QueueRange;
+        const owner = self.owner.?;
+        const address = @intFromPtr(buffer.ptr);
+        const base = owner.allocation.cpu_address;
+        if (address >= base) {
+            if (address - base < owner.allocation.byte_length) return error.QueueAlias;
+        } else if (base - address < bytes) return error.QueueAlias;
+        return @as(usize, if (queue == .command) init.command_offset else init.status_offset) + offset;
+    }
+    fn sync(self: *QueueLease, offset: usize, bytes: usize, cpu: bool) Error!void {
+        const owner = self.owner.?;
+        const ctx = owner.context.?;
+        const map = &owner.pieces[6].mapping;
+        self.last_status = if (cpu) ctx.syncDmaRangeForCpu(map, @intCast(offset), @intCast(bytes)) else ctx.syncDmaRangeForDevice(map, @intCast(offset), @intCast(bytes));
+        if (self.last_status != 0) {
+            self.failed = true;
+            return error.Synchronization;
+        }
+    }
+    fn portRead(context: *anyopaque, queue: transport.ring.Queue, offset: usize, output: []u8) Error!void {
+        const self = from(context);
+        const start = try self.offsetFor(queue, offset, output.len, output);
+        try self.sync(start, output.len, true);
+        const pointer: [*]const u8 = @ptrFromInt(self.owner.?.allocation.cpu_address + init.queues_offset + start);
+        @memcpy(output, pointer[0..output.len]);
+    }
+    fn portPublish(context: *anyopaque, queue: transport.ring.Queue, offset: usize, input: []const u8) Error!void {
+        const self = from(context);
+        const start = try self.offsetFor(queue, offset, input.len, input);
+        const pointer: [*]u8 = @ptrFromInt(self.owner.?.allocation.cpu_address + init.queues_offset + start);
+        @memcpy(pointer[0..input.len], input);
+        try self.sync(start, input.len, false);
     }
 };

@@ -14,6 +14,16 @@ their original licenses in the separate workspace reference archive.
 Fixture firmware bodies and signatures are synthetic; selected measured table
 metadata is regression data documented in PROVENANCE.txt.
 
+Module0.1.25 links the queue-header inspector from `src/gsp_ring.zig` in
+the explicit pre-submission boot-check. The complete pinned msgq.c/msgq_priv.h
+MIT notices (2018-2019 NVIDIA CORPORATION & AFFILIATES) already accompany
+the unchanged33,543-byte boot notice bundle and firmware lock (twelve inputs).
+The byte-identical notice is in the R4D and Distribution. The new QueueLease
+storage/SDK binding is original Apache-2.0 code. Original RM/msgq C remains
+host-only, and executable GSP codec/Session methods are not yet linked.
+The gsp-dma-port-20260911 archive retains four complete pinned sources/notices
+and links the earlier full original source set and generic DMA provider.
+
 The host-qualified `src/gsp_transport.zig` adapts ordered payload/cursor
 publication and protocol sequence advancement from the pinned NVIDIA570.144
 message_queue_cpu.c (2019-2024 NVIDIA CORPORATION & AFFILIATES). Its complete

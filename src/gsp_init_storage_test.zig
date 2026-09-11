@@ -5,6 +5,7 @@ const t = std.testing;
 const init = @import("gsp_init.zig");
 const radix = @import("gsp_radix.zig");
 const Storage = @import("gsp_init_storage.zig").Storage;
+const transport = @import("gsp_transport.zig");
 const Fault = enum { none, allocation, pin_last, map_last, pin_header, map_header, direction, overlap, external_overlap, address, sync_last, timeout, regression, unmap, unpin, release, bounce };
 var fault: Fault = .none;
 var backing: ?[]align(4096) u8 = null;
@@ -17,6 +18,8 @@ var close_calls: usize = 0;
 var queries: usize = 0;
 var closing = false;
 var clock: u64 = 100;
+var range_failure: i32 = 0;
+var range_calls: usize = 0;
 const offsets = [_]usize{ 0, 8192, 73728, 139264, 204800, 270336, 335872 };
 const lengths = [_]usize{ 8192, 65536, 65536, 65536, 65536, 65536, 528384 };
 fn address(index: usize) u64 {
@@ -132,7 +135,24 @@ fn unpin(pin_info: *a.DmaPinnedBuffer) callconv(.c) i32 {
     return 0;
 }
 
-test "firmware CPU storage GSP init owns bidirectional logs and queues with exact partial cleanup" {
+fn rangeSync(mapping: *const a.DmaMapping, offset: u32, bytes: u32, cpu: bool) i32 {
+    std.debug.assert(mapping.handle == 0x2006 and maps[6] and pins[6]);
+    std.debug.assert(bytes != 0 and bytes <= 65536 and offset <= init.queue_allocation_bytes - bytes);
+    range_calls += 1;
+    if (range_failure != 0) return range_failure;
+    if (fault == .bounce) {
+        const start = init.queues_offset + offset;
+        if (cpu) @memcpy(backing.?[start..][0..bytes], shadow[start..][0..bytes]) else @memcpy(shadow[start..][0..bytes], backing.?[start..][0..bytes]);
+    }
+    return 0;
+}
+fn rangeCpu(mapping: *const a.DmaMapping, offset: u32, bytes: u32) callconv(.c) i32 {
+    return rangeSync(mapping, offset, bytes, true);
+}
+fn rangeDevice(mapping: *const a.DmaMapping, offset: u32, bytes: u32) callconv(.c) i32 {
+    return rangeSync(mapping, offset, bytes, false);
+}
+fn apiTable() a.DriverApi {
     var table: a.DriverApi = undefined;
     table.magic = a.driver_magic;
     table.version = 34;
@@ -144,6 +164,129 @@ test "firmware CPU storage GSP init owns bidirectional logs and queues with exac
     table.dma_sync_for_device = sync;
     table.dma_unmap = unmap;
     table.dma_unpin_buffer = unpin;
+    table.dma_sync_range_for_device = rangeDevice;
+    table.dma_sync_range_for_cpu = rangeCpu;
+    return table;
+}
+
+test "firmware CPU storage GSP queue lease binds range I/O and retains all backing before device quiescence" {
+    var table = apiTable();
+    const ctx = r4os.r4dev.DriverContext.init(&table);
+    shadow = try t.allocator.alloc(u8, init.output_bytes);
+    defer t.allocator.free(shadow);
+    const tx = try t.allocator.create([65536]u8);
+    defer t.allocator.destroy(tx);
+    const rx = try t.allocator.create([65536]u8);
+    defer t.allocator.destroy(rx);
+    for ([_]Fault{ .none, .bounce }) |case| {
+        fault = case;
+        closing = false;
+        clock = 100;
+        pin_calls = 0;
+        sync_calls = 0;
+        close_calls = 0;
+        range_calls = 0;
+        range_failure = 0;
+        var storage: Storage = .{};
+        _ = try storage.stage(&ctx, 0x176, &.{}, 1000);
+        table.version = 33;
+        try t.expectError(error.Api, storage.borrowQueues());
+        table.version = 34;
+        table.size = 640;
+        try t.expectError(error.Api, storage.borrowQueues());
+        table.size = @sizeOf(a.DriverApi);
+        table.dma_sync_range_for_cpu = null;
+        try t.expectError(error.Api, storage.borrowQueues());
+        table.dma_sync_range_for_cpu = rangeCpu;
+        table.dma_sync_range_for_device = null;
+        try t.expectError(error.Api, storage.borrowQueues());
+        table.dma_sync_range_for_device = rangeDevice;
+        try t.expectEqual(@as(usize, 0), range_calls);
+        range_failure = -1; // Real provider admission failure publishes no lease.
+        try t.expectError(error.Synchronization, storage.borrowQueues());
+        try t.expectEqual(@as(i32, -1), storage.last_queue_status);
+        try t.expectEqual(@as(u64, 0), storage.queue_epoch);
+        range_failure = 0;
+        var lease = try storage.borrowQueues();
+        const first_epoch = lease.generation();
+        var old_copy = lease;
+        try t.expect(first_epoch != 0);
+        try t.expectError(error.Busy, storage.borrowQueues());
+        try t.expect(!storage.close());
+        try t.expect(storage.report != null and close_calls == 0 and any(&maps));
+        try t.expect(lease.releaseBeforeSubmission());
+        try t.expect(lease.releaseBeforeSubmission());
+        lease = try storage.borrowQueues();
+        try t.expect(lease.generation() != first_epoch);
+        try t.expectEqual(@as(u64, 0), old_copy.generation());
+        try t.expect(!old_copy.releaseBeforeSubmission());
+        const port = lease.port();
+        var bytes: [80]u8 = @splat(0x5a);
+        const calls = range_calls;
+        try t.expectError(error.QueueRange, port.read(port.context, .status, init.queue_bytes, bytes[0..1]));
+        try t.expectError(error.QueueRange, port.publish(port.context, .command, 0, bytes[0..0]));
+        try t.expectError(error.QueueRange, port.read(port.context, .command, std.math.maxInt(usize), &bytes));
+        try t.expectError(error.QueueAlias, port.read(port.context, .status, 0, backing.?[0..4]));
+        try t.expectError(error.QueueAlias, port.publish(port.context, .command, 0, backing.?[0..4]));
+        try t.expectEqual(calls, range_calls);
+        const map_handle = storage.pieces[6].mapping.handle;
+        storage.pieces[6].mapping.handle += 1;
+        try t.expectEqual(@as(u64, 0), port.generation(port.context));
+        try t.expectError(error.QueueClosed, port.read(port.context, .status, 0, &bytes));
+        storage.pieces[6].mapping.handle = map_handle;
+        const device = if (case == .bounce) shadow else backing.?;
+        const command = init.queues_offset + init.command_offset;
+        const status = init.queues_offset + init.status_offset;
+        // CPU-owned test model only: publish the peer header/data without any
+        // real GPU engine. The actual lease/SDK callback path performs every
+        // range translation, copy and acknowledgement below.
+        @memcpy(device[status..][0..32], device[command..][0..32]);
+        std.mem.writeInt(u32, device[status + 24 ..][0..4], 64, .little);
+        device[command + 36] = 0x83;
+        const page_table_first = std.mem.readInt(u64, device[init.queues_offset..][0..8], .little);
+        var session = try transport.Session.init(port, .{ .chip_id = 0x176 }, lease.generation(), tx, rx);
+        try session.connect(1000);
+        try session.send(1000, .{ .function = 79 }, "real range facade");
+        const command_record = try transport.message.decode(.{ .chip_id = 0x176 }, device[command + 4096 ..][0..4096], 0);
+        try t.expectEqualStrings("real range facade", command_record.payload);
+        try t.expectEqual(@as(u8, 0x83), device[command + 36]);
+        try t.expectEqual(page_table_first, std.mem.readInt(u64, device[init.queues_offset..][0..8], .little));
+        _ = try transport.message.encode(.{ .chip_id = 0x176 }, 0, .{ .function = 0xf0000790 }, "reply", device[status + 4096 ..][0..4096]);
+        std.mem.writeInt(u32, device[status + 16 ..][0..4], 1, .little);
+        const received = (try session.receive(1000)).?;
+        try t.expectEqualStrings("reply", received.record.payload);
+        try t.expectEqual(@as(u32, 0), std.mem.readInt(u32, device[command + 32 ..][0..4], .little));
+        try t.expect(!storage.close());
+        try session.acknowledge(1000, received.ticket);
+        try t.expectEqual(@as(u32, 1), std.mem.readInt(u32, device[command + 32 ..][0..4], .little));
+        try t.expectEqual(@as(u8, 0x83), device[command + 36]);
+        // Model-only latch test: there is intentionally no production clear
+        // API until actual native quiescence has been implemented/verified.
+        try t.expect(lease.retainForDevice());
+        try t.expect(!lease.releaseBeforeSubmission());
+        try t.expect(!storage.close());
+        try t.expect(storage.report != null and close_calls == 0 and any(&maps) and any(&pins));
+        storage.device_access = false; // Fixture only; no GPU ever submitted.
+        range_failure = -123;
+        @memset(&bytes, 0x5a);
+        try t.expectError(error.Synchronization, port.read(port.context, .status, 0, &bytes));
+        try t.expectEqual(@as(i32, -123), lease.last_status);
+        try t.expect(std.mem.allEqual(u8, &bytes, 0x5a));
+        try t.expect(!lease.retainForDevice());
+        try t.expectError(error.QueueClosed, port.publish(port.context, .command, 16, bytes[0..4]));
+        try t.expect(!storage.close());
+        range_failure = 0;
+        try t.expect(lease.releaseBeforeSubmission());
+        try t.expectEqual(@as(u64, 0), port.generation(port.context));
+        try t.expectError(error.QueueClosed, port.read(port.context, .status, 0, &bytes));
+        closing = true;
+        try t.expect(storage.close());
+        try t.expect(backing == null and !any(&maps) and !any(&pins));
+    }
+}
+
+test "firmware CPU storage GSP init owns bidirectional logs and queues with exact partial cleanup" {
+    var table = apiTable();
     const ctx = r4os.r4dev.DriverContext.init(&table);
     shadow = try t.allocator.alloc(u8, init.output_bytes);
     defer t.allocator.free(shadow);
