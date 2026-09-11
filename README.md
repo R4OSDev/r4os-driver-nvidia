@@ -10,31 +10,36 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
-Existing BAR1 mapping resolution (host qualified):
+Boot mapping preservation (NVIDIA 0.1.34):
 
-bar1_walk translates one contiguous part of a CPU physical BAR1 span to local
-VRAM. It handles physical mode and the pinned GA106 v2 directory format,
-including4KB/64KB/128KB/2MB/512MB leaves and high address bits. It returns the
-instance span and raw dependency path, with exact bounds and leaf clipping.
-Seven8/16-byte records at most are reread before publication; control words,
-epoch and absolute monotonic deadline must remain valid. Sparse/conflicting,
-foreign, protected, compressed and misaligned mappings refuse explicitly.
+The explicit boot-check now resolves the entire held boot surface through
+actual shared BAR0/PRAMIN access. The physical GA106 register addresses are
+0xb80f40 and 0xb80f50: the pinned TU102 HAL adds 0xb80000 to VREG offsets.
+The reader selects one aperture at a time and publishes at most 4 KB only
+after exact window restoration, identity, epoch and deadline checks. A
+failed selection retains the BAR0 child lease until bounded recovery succeeds.
 
-The generated NVIDIA HAL admits onlyv2 for this GA106 RM path. An initial
-legacy-v1 prototype was removed after that source review; the existing test
-now requires refusal before following its root. Final51 existing cases and
-module build pass. No new case/gate count or guest run. NVIDIA0.1.33 and its
-24resources remain byte-identical: this resolver is not yet linked from main.
-Fourteen complete pinned sources/notices are archived with hashes. Full MMU
-notices must be packaged before executable linkage.
+boot_mapping merges contiguous VRAM ranges and backs up every full dependency
+page, including the BAR1 instance. Entries must match the copied page; all
+pages and control words are reread before sealing the private CPU backup.
+Limits: 64 MB surface, 1024 ranges, 128 pages / 512 KB backup, five seconds.
+Physical BAR1 mode needs no table allocation. The GSP VRAM lease requires the
+retained mapping and rejects surface/table overlaps with its reserved targets.
+The lease holds this backup through FRTS preparation and unsubmitted cleanup.
 
-Next: bind the reader to shared BAR0 and held boot display, resolve the whole
-boot surface, preserve its table pages and reserve the actual VRAM ranges.
-The returned path is not a table backup, recovery or quiescence proof. Full
-device/scanout recovery and physical bootstrap/INIT_DONE/HDMI remain open.
-OssiPC offline/unmodified. Evidence: bar1_walk_checkpoint; bar1-walk-20260911.
+All 51 existing cases and the module build pass. The existing lifecycle case
+uses sparse host VRAM behind the actual SDK/volatile reader, with timeout,
+unknown-window recovery, full-page digest, collision and owner-lifetime checks.
+No added cases/gates or guest run. All 25 nonallocated resources are verified;
+complete additional MIT notices accompany the driver and Distribution.
+Nineteen complete pinned originals: bar1-reader-20260911. Evidence:
+bar1_reader_checkpoint in Docs/Drivers/GrafikFirmware07910.json.
 
-Current linked checkpoint: shared BAR0 ownership (NVIDIA 0.1.33):
+Full device/VGA/VRAM/scanout recovery, native firmware admission, INIT_DONE
+and HDMI remain open. The current callback restores only PRAMIN and pixels.
+OssiPC is offline and unchanged; no hardware acceptance is inferred here.
+
+Earlier shared BAR0 implementation (NVIDIA 0.1.33):
 
 The opt-in boot-check now keeps one full measured GA106 BAR0 UC mapping.
 Boot/VGA capture, repeated preflight and Booter fuse reads borrow this owner;

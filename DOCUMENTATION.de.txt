@@ -10,33 +10,39 @@ unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
 
-Vorhandene BAR1-Zuordnung aufloesen (Hostnachweis)
------------------------------------------------
-bar1_walk uebersetzt einen zusammenhaengenden Teil eines CPU-physischen
-BAR1-Bereichs in lokales VRAM. Direkter Modus und das zugelassene GA106-
-Tabellenformatv2 mit4KB/64KB/128KB/2MB/512MB-Seiten, hohen Adressbits und
-genauen Bereichsgrenzen. Instanzbereich und rohe Tabellenabhaengigkeiten
-werden mitgeliefert. Hoechstens sieben8/16-Byte-Eintraege werden vor Rueckgabe
-erneut gelesen; Steuerregister, Epoche und absolute monotone Frist gelten
-durchgaengig. Luecken, widerspruechliche, fremde, geschuetzte, komprimierte
-oder falsch ausgerichtete Zuordnungen werden abgewiesen.
+Boot-Zuordnung vollstaendig sichern (NVIDIA 0.1.34)
+-------------------------------------------------
+Der explizite Boot-Check loest die gesamte gehaltene Bootflaeche ueber den
+wirklichen gemeinsamen BAR0-/PRAMIN-Zugriff auf. Fuer die physische GA106
+liegen die Steuerregister bei 0xb80f40 und 0xb80f50: Die originale TU102-HAL
+addiert 0xb80000 auf die VREG-Adressen. Der Leser liefert hoechstens 4 KB
+nach gepruefter Fensterwiederherstellung, Identitaet, Epoche und Frist. Bei
+Fehlern bleibt seine BAR0-Leihe bis zur begrenzten Recovery erhalten.
 
-Die originale HAL-Auswahl laesst fuer diesen GA106-RM-Pfad nurv2 zu. Eine
-erstev1-Auswertung nach dieser Quellpruefung entfernt; vorhandener Test
-verlangt jetzt Ablehnung vor dem Folgen ihres Wurzelzeigers. Final51 bestehende
-Faelle und Modulbuild bestanden. Keine neue Fallzahl/Gates/Gastlaeufe.
-NVIDIA0.1.33 samt24Ressourcen bytegleich: Auswertung noch nicht aus main
-eingebunden.14vollstaendige gepinnte Quellen/Lizenztexte mit Hashes archiviert;
-vor Einbindung die vollstaendigen MMU-Hinweise paketieren.
+boot_mapping fasst zusammenhaengende VRAM-Bereiche zusammen und sichert
+jede vollstaendige Abhaengigkeitsseite einschliesslich der BAR1-Instanz.
+Die Eintraege muessen zur kopierten Seite passen; alle Seiten und Steuerwerte
+werden vor der unveraenderlichen CPU-Abbildung erneut verglichen. Grenzen:
+64 MB Bootflaeche, 1024 Bereiche, 128 Seiten / 512 KB Sicherung, fuenf Sekunden.
+Der direkte BAR1-Modus benoetigt keine Tabellensicherung. Die GSP-VRAM-Leihe
+verlangt diese gehaltene Zuordnung und weist Ueberschneidungen ihrer Ziele
+mit Bootflaeche oder Tabellen ab. Sie haelt die Sicherung bis nach FRTS- und
+unabgesendetem Ausfuehrungsabbau.
 
-Naechster Schritt: Leser an gemeinsamen BAR0 und gehaltenes Boot-Display
-binden, die ganze Bootflaeche aufloesen, Tabellenseiten sichern und wirkliche
-VRAM-Bereiche reservieren. Rueckgegebener Pfad ist keine Tabellensicherung,
-Recovery oder Quieszenz. Gesamt-Recovery und physischer Start/INIT_DONE/HDMI
-offen. OssiPC offline/unveraendert. Beleg: bar1_walk_checkpoint; Archiv:
-ExFiles/Reference/GFX/Nvidia/0.79.10/bar1-walk-20260911.
+51 bestehende Faelle und Modulbuild bestanden. Im vorhandenen Lebenszyklus-
+fall modelliert Host-VRAM die Apertur hinter echtem SDK-/volatile-Zugriff:
+Fristfehler, unbekanntes Fenster und Recovery, vollstaendiger Seitenhash,
+Bereichskollisionen und gehaltene Besitzer. Keine neue Fallzahl/Gates/Gastlaeufe.
+Alle 25 nicht residenten Ressourcen geprueft; zusaetzliche volle MIT-Hinweise
+im Treiber und der Distribution. 19 vollstaendige gepinnte Originaldateien
+im Archiv ExFiles/Reference/GFX/Nvidia/0.79.10/bar1-reader-20260911.
+Beleg: bar1_reader_checkpoint in Docs/Drivers/GrafikFirmware07910.json.
 
-Aktuell eingebundener Stand: Gemeinsamer BAR0-Besitz (NVIDIA 0.1.33)
+Gesamt-Recovery von Geraet/VGA/VRAM/Scanout, native Firmware-Zulassung,
+INIT_DONE und HDMI bleiben offen. Der vorhandene Callback stellt nur PRAMIN
+und Pixel wieder her. OssiPC offline/unveraendert; keine Hardwareabnahme.
+
+Vorheriger gemeinsamer BAR0-Besitz (NVIDIA 0.1.33)
 -------------------------------------
 Der optionale Boot-Check haelt jetzt ein vollstaendiges gemessenes GA106-
 BAR0-Mapping mit UC-Cachetyp. Boot-/VGA-Sicherung, erneute Zustandspruefung

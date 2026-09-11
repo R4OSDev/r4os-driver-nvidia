@@ -18,6 +18,7 @@ pub const Capture = struct {
     chip: ?identity.Chip = null,
     observation: ?state.Raw = null,
     borrower: usize = 0,
+    mapping_owner: usize = 0,
     ready: bool = false,
     boot: display.Snapshot = .{},
     preflight: probe.Capture = .{},
@@ -173,7 +174,7 @@ pub const Capture = struct {
 
     pub fn close(self: *Capture) bool {
         if (self.self_address == 0) return true;
-        if (self.self_address != @intFromPtr(self) or self.borrower != 0) return false;
+        if (self.self_address != @intFromPtr(self) or self.borrower != 0 or self.mapping_owner != 0) return false;
         if (!self.preflight.close()) return false;
         const own_borrow: usize = if (self.register_access.owner != null) 1 else 0;
         if (self.registers.borrowedCount() != own_borrow or

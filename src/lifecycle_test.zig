@@ -884,8 +884,8 @@ test "NVIDIA actual driver lifecycle rejects writes and retains failed mappings 
 // selection and partial device effects independently. This is no GPU proof.
 const BootVramFixture = struct {
     var registers: []u8 = &.{};
-    var buffers: [2]?[]u8 = .{ null, null };
-    var leases: [2]bool = .{ false, false };
+    var buffers: [3]?[]u8 = @splat(null);
+    var leases: [3]bool = @splat(false);
     var mapped: [0x1000]bool = @splat(false);
     var map_pages: [0x1000]usize = @splat(0);
     var maps: usize = 0;
@@ -910,7 +910,47 @@ const BootVramFixture = struct {
         return a.gfx_output_ok;
     }
     fn resourcesQuery(out: *a.DriverResourceApi) callconv(.c) i32 { out.* = .{ .now_ns = @intFromPtr(&now) }; return a.driver_resource_ok; }
-    fn now() callconv(.c) u64 { return 1000000; }
+    // Sparse host VRAM behind the actual volatile BAR0 reader. Clock guards
+    // emulate aperture remapping after a window write; no physical GPU claim.
+    var banked = false;
+    var bank_window: u32 = 0;
+    var clock: u64 = 1000000;
+    var delay_selected = false;
+    var vram_pages: [6][4096]u8 = undefined;
+    const addresses = [_]u64{ 0x100000, 0x201000, 0x302000, 0x403000, 0x504000, 0x605000 };
+    fn now() callconv(.c) u64 {
+        if (banked) {
+            const window = std.mem.readInt(u32, registers[0x1700..][0..4], .little);
+            if (window != bank_window) {
+                bank_window = window;
+                @memset(registers[0x700000..0x800000], 0x5d);
+                if ((window >> 24) & 3 == 0) {
+                    const base = @as(u64, window & 0xffffff) << 16;
+                    for (addresses, &vram_pages) |address, *page| {
+                        if (address >= base and address + 4096 <= base + 0x100000)
+                            @memcpy(registers[0x700000 + address - base ..][0..4096], page);
+                    }
+                    if (delay_selected) { clock += 6 * std.time.ns_per_s; delay_selected = false; }
+                }
+            }
+        }
+        return clock;
+    }
+    fn setupTables() void {
+        for (&vram_pages) |*page| @memset(page, 0);
+        std.mem.writeInt(u64, vram_pages[0][0x200..][0..8], addresses[1] | 0x400, .little);
+        std.mem.writeInt(u64, vram_pages[0][0x208..][0..8], 0xfffffff, .little);
+        for (1..4) |index| std.mem.writeInt(u64, vram_pages[index][0..8], (addresses[index + 1] >> 4) | 2, .little);
+        std.mem.writeInt(u64, vram_pages[4][8..16], (addresses[5] >> 4) | 2, .little);
+        for (0..4) |index| {
+            const vram: u64 = (if (index < 2) @as(u64, 0x2000000) else 0x4000000) + (index % 2) * 4096;
+            std.mem.writeInt(u64, vram_pages[5][index * 8 ..][0..8], (vram >> 12) << 8 | 1, .little);
+        }
+        put(@import("bar1_reader.zig").block_register, 0x80000100);
+        put(@import("bar1_reader.zig").bind_register, 0);
+        banked = true;
+        bank_window = 0;
+    }
     fn bootInfo(out: *a.GfxNativeBootInfo) callconv(.c) i32 { out.* = info(); return a.gfx_output_ok; }
     fn bootHold(input: *const a.GfxBootHoldRequest, out: *a.GfxNativeState) callconv(.c) i32 {
         std.debug.assert(!held and input.generation == 7 and input.reference.id == 1 and buffers[0] != null);
@@ -946,7 +986,7 @@ const BootVramFixture = struct {
     }
     fn bufferMap(input: *const a.GfxBufferHandle, access: u32, offset: u64, bytes: u64, out: *a.GfxBufferMap) callconv(.c) i32 {
         const index = input.id - 1;
-        std.debug.assert(index < 2 and buffers[index] != null and !leases[index] and offset == 0 and bytes == buffers[index].?.len);
+        std.debug.assert(index < buffers.len and buffers[index] != null and !leases[index] and offset == 0 and bytes == buffers[index].?.len);
         std.debug.assert(access == a.gfx_buffer_map_read or access == a.gfx_buffer_map_write);
         leases[index] = true;
         out.* = .{ .lease = .{ .id = 101 + index, .generation = 4 }, .cpu_address = @intFromPtr(buffers[index].?.ptr), .byte_length = bytes };
@@ -954,13 +994,13 @@ const BootVramFixture = struct {
     }
     fn bufferUnmap(input: *const a.GfxBufferHandle) callconv(.c) i32 {
         const index = input.id - 101;
-        std.debug.assert(index < 2 and leases[index]);
+        std.debug.assert(index < leases.len and leases[index]);
         leases[index] = false;
         return a.gfx_buffer_result_ok;
     }
     fn release(input: *const a.GfxBufferHandle) callconv(.c) i32 {
         const index = input.id - 1;
-        std.debug.assert(index < 2 and !leases[index] and !(index == 0 and held));
+        std.debug.assert(index < leases.len and !leases[index] and !(index == 0 and held));
         std.heap.page_allocator.free(buffers[index].?);
         buffers[index] = null;
         return a.gfx_buffer_result_ok;
@@ -1207,6 +1247,7 @@ fn checkBootVramOwner() !void {
     snapshot.pci = .{ .bus_kind = 2, .bus = 9, .vendor_id = 0x10de, .device_id = 0x2504, .class_code = 3 };
     snapshot.command = 2;
     snapshot.bars[0] = .{ .kind = .memory32, .base = 0xe0000000, .bytes = 0x1000000 };
+    snapshot.bars[1] = .{ .kind = .memory64, .base = 0xd0000000, .bytes = 0x10000000, .prefetchable = true };
     const chip = id.chip(0xb76000a1, 0).?;
     var capture: @import("boot_vram.zig").Capture = .{};
     defer _ = capture.close();
@@ -1240,6 +1281,38 @@ fn checkBootVramOwner() !void {
     try t.expect(fuse_capture.close() and capture.registers.borrowedCount() == 1 and f.unmaps == 0);
     _ = try capture.reobserve();
     try t.expect(f.maps == 1);
+    f.setupTables();
+    const reader = @import("bar1_reader.zig");
+    var io: reader.Reader = .{};
+    defer _ = io.close();
+    try io.open(&capture);
+    var output: [16]u8 = @splat(0xa5);
+    f.delay_selected = true;
+    try t.expectError(error.Deadline, io.read(f.addresses[0] + 0x200, &output));
+    try t.expect(io.pending and std.mem.allEqual(u8, &output, 0xa5));
+    try t.expect(!capture.close() and f.held and capture.registers.borrowedCount() == 2);
+    f.put(0x1700, 0xc0000040); // An unknown third-party window cannot be overwritten.
+    try t.expect(!io.close() and io.pending and !capture.close());
+    f.put(0x1700, io.selected);
+    try t.expect(io.close() and capture.registers.borrowedCount() == 1);
+    try t.expectEqual(@as(u32, 0xc2000079), std.mem.readInt(u32, f.registers[0x1700..][0..4], .little));
+    const mapping = @import("boot_mapping.zig");
+    var mapped_boot: mapping.Capture = .{};
+    defer _ = mapped_boot.close();
+    const mapped_report = try mapped_boot.capture(&capture);
+    try t.expect(mapped_report.bytes == 16384 and mapped_report.ranges == 2 and mapped_report.pages == 6 and mapped_report.format == .v2);
+    try t.expect(mapped_boot.ranges[0].address == 0x2000000 and mapped_boot.ranges[0].bytes == 8192);
+    try t.expect(mapped_boot.ranges[1].address == 0x4000000 and mapped_boot.ranges[1].bytes == 8192);
+    for (f.addresses, 0..) |address, index| try t.expectEqual(address, mapped_boot.pages[index]);
+    var table_hash = std.crypto.hash.sha2.Sha256.init(.{});
+    for (&f.vram_pages) |*page| table_hash.update(page);
+    var tables_digest: [32]u8 = undefined;
+    table_hash.final(&tables_digest);
+    try t.expectEqualSlices(u8, &tables_digest, &mapped_report.sha256);
+    try t.expect(mapped_boot.valid(&capture) and !capture.close() and f.buffers[2] != null and f.leases[2]);
+    try t.expect(capture.registers.borrowedCount() == 1 and f.maps == 1);
+    var moved_mapping = mapped_boot;
+    try t.expect(!moved_mapping.valid(&capture) and !moved_mapping.close());
     // The existing host fixture supplies prepared boot metadata; actual DMA
     // packing/synchronization remains covered by gsp_boot_storage_test.zig.
     // Here the production reservation borrows the actual BO/display capture.
@@ -1263,14 +1336,23 @@ fn checkBootVramOwner() !void {
             .boot_address = 0x300000000, .signature_address = 0x300006000, .metadata_address = 0x300007000, .pack_bounced = false } };
     var held: reservation.Lease = .{};
     pack[boot_storage.metadata_offset + 19 * 8] ^= 1;
-    try t.expectError(error.MetadataChanged, held.acquire(&capture, &backing));
+    try t.expectError(error.MetadataChanged, held.acquire(&capture, &backing, &mapped_boot));
     try t.expect(capture.borrower == 0 and backing.vram_owner == 0 and f.mapped[0x625]);
     pack[boot_storage.metadata_offset + 19 * 8] ^= 1;
     f.put(0x1183a4, (try raw.get(.fb_mb)) - 1024);
-    try t.expectError(error.PlanChanged, held.acquire(&capture, &backing));
+    try t.expectError(error.PlanChanged, held.acquire(&capture, &backing, &mapped_boot));
     try t.expect(capture.borrower == 0 and backing.vram_owner == 0);
     f.put(0x1183a4, try raw.get(.fb_mb));
-    try held.acquire(&capture, &backing);
+    const original_range = mapped_boot.ranges[0];
+    mapped_boot.ranges[0].address = prepared.plan.frts.offset;
+    try t.expectError(error.BootSurfaceCollision, held.acquire(&capture, &backing, &mapped_boot));
+    mapped_boot.ranges[0] = original_range;
+    const original_page = mapped_boot.pages[0];
+    mapped_boot.pages[0] = prepared.plan.metadata_reservation.offset;
+    try t.expectError(error.BootTableCollision, held.acquire(&capture, &backing, &mapped_boot));
+    mapped_boot.pages[0] = original_page;
+    try held.acquire(&capture, &backing, &mapped_boot);
+    try t.expect(!mapped_boot.close());
     const frts = try held.binding(.frts);
     try checkFrtsStorage(&ctx, &held);
     try t.expect(held.validates(frts) and frts.range.bytes == 0x100000 and frts.range.offset > 0x100000000);
@@ -1278,7 +1360,7 @@ fn checkBootVramOwner() !void {
     try t.expect(f.held and f.buffers[0] != null and f.buffers[1] != null and f.leases[0] and f.leases[1]);
     try t.expectError(error.State, capture.reobserve());
     var duplicate: reservation.Lease = .{};
-    try t.expectError(error.Owner, duplicate.acquire(&capture, &backing));
+    try t.expectError(error.Owner, duplicate.acquire(&capture, &backing, &mapped_boot));
     var moved = held;
     try t.expect(!moved.validates(frts) and !moved.releaseBeforeSubmission());
     var wrong = frts;
@@ -1294,13 +1376,27 @@ fn checkBootVramOwner() !void {
     try t.expect(!held.validates(frts) and !held.releaseBeforeSubmission());
     capture.boot.held_generation -= 1;
     try t.expect(held.releaseBeforeSubmission() and held.releaseBeforeSubmission());
-    try held.acquire(&capture, &backing);
+    try held.acquire(&capture, &backing, &mapped_boot);
     try t.expect(!held.validates(frts)); // Same display hold, new reservation serial.
     try t.expect(held.validates(try held.binding(.frts)));
     try t.expect(held.releaseBeforeSubmission());
     held.serial = std.math.maxInt(u64);
-    try t.expectError(error.Exhausted, held.acquire(&capture, &backing));
+    try t.expectError(error.Exhausted, held.acquire(&capture, &backing, &mapped_boot));
     try t.expect(capture.borrower == 0 and backing.vram_owner == 0 and f.mapped[0x625]);
+    try t.expect(mapped_boot.close() and f.buffers[2] == null and !f.leases[2]);
+    // Direct BAR1 mode needs no table BO and still covers the complete span.
+    f.put(reader.block_register, 0x4321);
+    const direct = try mapped_boot.capture(&capture);
+    try t.expect(direct.format == .physical and direct.pages == 0 and direct.ranges == 1 and direct.window_writes == 0);
+    try t.expect(mapped_boot.ranges[0].address == 0 and mapped_boot.ranges[0].bytes == 16384 and f.buffers[2] == null);
+    try t.expect(mapped_boot.close());
+    // A pending bind fails before any table read or window selection.
+    f.put(reader.bind_register, 1);
+    try t.expectError(error.BindPending, mapped_boot.capture(&capture));
+    try t.expect(!mapped_boot.ready and mapped_boot.io.window_writes == 0 and !capture.close());
+    try t.expect(mapped_boot.close());
+    f.put(reader.bind_register, 0);
+    f.banked = false;
     f.put(0x625f04, 0x10f08); // Unknown display change: retain every required owner.
     try t.expect(!capture.close());
     try t.expect(f.held and f.buffers[0] != null and f.buffers[1] != null and f.mapped[0x700] and f.leases[1]);

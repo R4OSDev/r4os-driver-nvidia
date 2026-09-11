@@ -1,7 +1,7 @@
 //! Exclusive first-boot VRAM reservation bound to the real display/VGA
 //! snapshots and the exact prepared GSP metadata. All framebuffer memory
-//! remains unavailable to general allocations during this boot reservation:
-//! the old scanout's GPU mapping has not yet been resolved. No GPU command,
+//! remains unavailable to general allocations during this boot reservation.
+//! The retained boot surface/table backup must avoid all GSP targets. No GPU command,
 //! VGA relocation, page table or post-submission recovery is provided here.
 const std = @import("std");
 const capture = @import("boot_vram.zig");
@@ -9,11 +9,13 @@ const storage = @import("gsp_boot_storage.zig");
 const layout = @import("gsp_layout.zig");
 const boot = @import("gsp_boot.zig");
 const wpr = @import("gsp_wpr.zig");
+const mapping = @import("boot_mapping.zig");
 pub const Target = enum { non_wpr_heap, metadata, heap, firmware, boot_image, frts, vga };
 pub const Binding = struct { owner: usize, epoch: u64, serial: u64, target: Target, range: layout.Range };
 pub const Lease = struct {
     self_address: usize = 0,
     display: ?*capture.Capture = null,
+    boot_mapping: ?*mapping.Capture = null,
     backing: ?*storage.Storage = null,
     epoch: u64 = 0,
     serial: u64 = 0,
@@ -27,7 +29,7 @@ pub const Lease = struct {
 
     /// Serialized native init/work owner. Reject every stale input before
     /// publishing either borrow; no fallible operation follows publication.
-    pub fn acquire(self: *Lease, display: *capture.Capture, backing: *storage.Storage) !void {
+    pub fn acquire(self: *Lease, display: *capture.Capture, backing: *storage.Storage, boot_mapping: *mapping.Capture) !void {
         if (self.self_address != 0) return error.Busy;
         if (self.serial == std.math.maxInt(u64)) return error.Exhausted;
         if (!display.ready or display.self_address != @intFromPtr(display) or display.borrower != 0 or
@@ -44,11 +46,12 @@ pub const Lease = struct {
         const raw = try display.reobserve();
         const plan = try layout.firstBoot(display.chip.?.id, &raw, report.image.image_bytes, boot.image.bytes);
         if (!std.meta.eql(staged, plan)) return error.PlanChanged;
+        try boot_mapping.admit(display, &plan);
         const data: [*]const u8 = @ptrFromInt(allocation.cpu_address);
         if (!wpr.matchesPlan(data[storage.metadata_offset..][0..wpr.bytes], &plan)) return error.MetadataChanged;
         const epoch = display.boot.held_generation;
         if (epoch == 0) return error.Owner;
-        self.* = .{ .self_address = @intFromPtr(self), .display = display, .backing = backing, .epoch = epoch, .serial = self.serial + 1, .plan = plan,
+        self.* = .{ .self_address = @intFromPtr(self), .display = display, .boot_mapping = boot_mapping, .backing = backing, .epoch = epoch, .serial = self.serial + 1, .plan = plan,
             .allocation = allocation.handle, .mapping = backing.mapping.handle, .pin = backing.pin.handle,
             .cpu_address = allocation.cpu_address, .metadata_address = report.metadata_address };
         display.borrower = self.self_address;
@@ -59,8 +62,9 @@ pub const Lease = struct {
         if (self.self_address == 0 or self.self_address != @intFromPtr(self) or self.epoch == 0) return false;
         const display = self.display orelse return false;
         const backing = self.backing orelse return false;
+        const boot_mapping = self.boot_mapping orelse return false;
         const report = backing.report orelse return false;
-        return display.self_address == @intFromPtr(display) and display.ready and display.borrower == self.self_address and
+        return boot_mapping.valid(display) and display.self_address == @intFromPtr(display) and display.ready and display.borrower == self.self_address and
             display.boot.held_generation == self.epoch and backing.vram_owner == self.self_address and
             backing.context != null and display.context != null and backing.context.?.api == display.context.?.api and
             backing.allocation.handle == self.allocation and backing.allocation.cpu_address == self.cpu_address and

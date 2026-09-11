@@ -43,6 +43,7 @@ var init_storage: gsp_init_storage.Storage = .{};
 var run_memory: gsp_run_memory.Lease = .{};
 var booters: booter_storage.Pair = .{};
 var boot_vram: @import("boot_vram.zig").Capture = .{};
+var boot_mapping: @import("boot_mapping.zig").Capture = .{};
 var boot_vram_lease: @import("boot_vram_lease.zig").Lease = .{};
 // Bounded resident scratch: do not copy the maximum boot SG list to the stack.
 var init_excluded: [gsp_init.max_excluded]gsp_init.Span = undefined;
@@ -178,6 +179,7 @@ pub export fn nvidia_shutdown() callconv(.c) i32 {
     if (boot_vram_lease.self_address != 0 and !fwsec_cpu.close()) return -1;
     if (!boot_vram_lease.releaseBeforeSubmission()) return -1;
     if (!boot_storage.close()) return -1;
+    if (!boot_mapping.close()) return -1;
     if (!boot_vram.close()) return -1;
     boot_inputs.close();
     if (!gsp_image.close()) return -1;
@@ -456,6 +458,15 @@ fn checkBoot(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Sna
     log("NVIDIA boot-vram: captured address={x} bytes={d} sha256={s} window-original={x:0>8} window-restored={} window-writes={d} firmware-execution=disabled", .{
         vram_copy.range.address, vram_copy.range.bytes, vram_hash, vram_copy.window_original, vram_copy.window_restored, vram_copy.window_writes,
     });
+    const mapping_copy = boot_mapping.capture(&boot_vram) catch |err| {
+        log("NVIDIA boot-mapping: rejected reason={s} status={d} firmware-execution=disabled", .{ @errorName(err), boot_mapping.last_status });
+        if (!boot_mapping.close()) ctx.logError("NVIDIA boot-mapping: cleanup=retained display-and-registers=held");
+        return false;
+    };
+    const mapping_hash = std.fmt.bytesToHex(mapping_copy.sha256, .lower);
+    log("NVIDIA boot-mapping: bytes={d} ranges={d} table-pages={d} format={s} tables-sha256={s} window-writes={d} restored=yes firmware-execution=disabled", .{
+        mapping_copy.bytes, mapping_copy.ranges, mapping_copy.pages, @tagName(mapping_copy.format), mapping_hash, mapping_copy.window_writes,
+    });
     const inputs = boot_inputs.load(ctx, 30 * std.time.ns_per_s) catch |err| {
         log("NVIDIA boot-check: rejected phase=boot-resources reason={s} fallback=preserved", .{@errorName(err)});
         boot_inputs.close();
@@ -496,7 +507,7 @@ fn checkBoot(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Sna
     log("NVIDIA boot-check: staged image-bytes={d} image-mappings={d} image-segments={d} radix-root={x} pack-bytes={d} pack-bounced={} synchronized=yes submitted=no", .{
         report.image.image_bytes, report.image.mappings, report.image.segments, report.image.root_address, report.pack_bytes, report.pack_bounced,
     });
-    boot_vram_lease.acquire(&boot_vram, &boot_storage) catch |err| {
+    boot_vram_lease.acquire(&boot_vram, &boot_storage, &boot_mapping) catch |err| {
         log("NVIDIA boot-vram: reservation=rejected reason={s} submitted=no", .{@errorName(err)});
         return false;
     };
@@ -568,6 +579,7 @@ fn checkBoot(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Sna
     }
     boot_inputs.close();
     if (!firmware_cpu.close()) return false;
+    if (!boot_mapping.close()) return false;
     if (!boot_vram.close()) {
         ctx.logError("NVIDIA boot-vram: cleanup=retained display-and-snapshot=held");
         return false;

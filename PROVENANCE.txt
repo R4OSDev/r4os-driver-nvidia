@@ -1,15 +1,17 @@
 ﻿Original R4OS implementation for roadmap 0.79.9, 10.09.2026.
 Host/module scaffolding follows R4OS SDK and existing R4D owners.
 
-Existing GA106 BAR1 mapping observation (host qualified, 2026-09-11):
-bar1_walk.zig adapts the pinned NVIDIA BAR1/RAMIN and GMMUv2 field/level
-definitions from dev_bus.h, dev_ram.h, dev_mmu.h and GP10x/GA10x format
-sources under MIT. Full original copyright lines and terms are preserved
-in the source. R4OS reader, bounds and lifetime policy is Apache-2.0. The
-generated GA106 HAL selects v2-only admission; no legacy-v1 path is enabled.
-Fourteen complete original sources/notices accompany bar1-walk-20260911.
-The resolver is unlinked; NVIDIA0.1.33 and24packaged resources are unchanged.
-Package full additional MMU notices before executable linkage.
+GA106 BAR1/GMMU mapping and physical-function reader (NVIDIA 0.1.34):
+bar1_walk.zig and bar1_reader.zig adapt the pinned NVIDIA MIT BAR1/RAMIN,
+GMMU v2 and physical-function VREG definitions. TU102 PF adds 0xb80000;
+BLOCK/BIND_STATUS are 0xb80f40/0xb80f50. Complete copyright and MIT terms
+remain in the sources. The existing GM107 PRAMIN notices also apply.
+Original R4OS bounds, reader, ownership and boot_mapping policy: Apache-2.0.
+Nineteen complete pinned originals accompany bar1-reader-20260911. Full
+source notices are packaged as NVIDIA-570.144-BAR1-LICENSE.txt in the
+nonallocated driver resource and Distribution legal directory/staging list.
+The resolver and reader are now linked into the explicit boot-check; all
+previous 24 resource payloads are unchanged. No firmware/scanout execution.
 
 Normal GA106 cold core stages (host qualified, 2026-09-11):
 gsp_core extends its existing MIT-attributed adaptation using normal bootstrap
