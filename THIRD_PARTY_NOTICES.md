@@ -1,5 +1,21 @@
 ﻿# Third-Party Notices
 
+GA106 HS Falcon execution (host qualified, 2026-09-11):
+falcon_hs.zig adapts kgspExecuteHsFalcon_GA102 and s_dmaTransfer_GA102 from
+kernel_gsp_falcon_ga102.c (NVIDIA 2021-2024), plus context-disable/CPU-start/
+halt semantics in kernel_falcon_tu102.c (NVIDIA 2017-2024), under their MIT
+license. GA102 published Falcon, second-page, FBIF, GSP and SEC2 headers and
+HAL dispatch/configuration establish register identities and engine mapping.
+The full MIT notice and original copyright lines are preserved in the
+adaptation. R4OS admission, cooperative phases, deadline/epoch/lifetime and
+SDK/MMIO binding are original Apache-2.0 interfaces. The complete pinned
+570.144 snapshot was checked; 34 HS register values match the original C
+macros. 210 complete original files/notices accompany falcon-hs-20260911.
+These routines are not linked into NVIDIA0.1.27; module bytes and packaged
+licenses remain identical. Before executable linkage, the additional full
+MIT notices must join the module/distribution notice bundle. Host hardware
+models are not GPU authentication or execution evidence.
+
 NVIDIA 0.1.27 packages fourteen unchanged GA102 Booter Load/Unload
 production artifacts from the original 570.144 bindata decoder export.
 Header/signature preparation in booter.zig adapts kernel_gsp_booter.c

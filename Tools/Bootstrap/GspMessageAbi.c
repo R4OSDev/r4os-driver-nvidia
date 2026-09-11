@@ -24,12 +24,53 @@
 #include "published/ampere/ga102/dev_gsp.h"
 #include "published/ampere/ga102/dev_gsp_addendum.h"
 #include "published/ampere/ga102/dev_sec_pri.h"
+#include "published/ampere/ga102/dev_sec_addendum.h"
+#include "published/ampere/ga102/dev_falcon_second_pri.h"
 #include "published/ampere/ga102/dev_falcon_v4.h"
 #include "published/ampere/ga102/dev_falcon_v4_addendum.h"
 #include "published/ampere/ga102/dev_fbif_v4.h"
 #include "published/ampere/ga102/dev_riscv_pri.h"
 #include "published/ampere/ga102/dev_gc6_island.h"
 #include "published/ampere/ga102/dev_gc6_island_addendum.h"
+
+int r4nv_falcon_hs_abi_check(const unsigned *actual, size_t count)
+{
+    const NvU32 expected[] = {
+        DRF_BASE(NV_PGSP), DRF_BASE(NV_PSEC),
+        NV_PGSP_FBIF_BASE - DRF_BASE(NV_PGSP),
+        NV_PSEC_FBIF_BASE - DRF_BASE(NV_PSEC),
+        NV_FALCON2_GSP_BASE - DRF_BASE(NV_PGSP),
+        NV_FALCON2_SEC_BASE - DRF_BASE(NV_PSEC),
+        NV_PFALCON_FBIF_CTL, NV_PFALCON_FBIF_TRANSCFG(0),
+        NV_PFALCON_FALCON_DMACTL, NV_PFALCON_FALCON_DMATRFBASE,
+        NV_PFALCON_FALCON_DMATRFBASE1, NV_PFALCON_FALCON_DMATRFMOFFS,
+        NV_PFALCON_FALCON_DMATRFFBOFFS, NV_PFALCON_FALCON_DMATRFCMD,
+        NV_PFALCON2_FALCON_BROM_PARAADDR(0), NV_PFALCON2_FALCON_BROM_ENGIDMASK,
+        NV_PFALCON2_FALCON_BROM_CURR_UCODE_ID, NV_PFALCON2_FALCON_MOD_SEL,
+        NV_PFALCON_FALCON_BOOTVEC, NV_PFALCON_FALCON_CPUCTL,
+        NV_PFALCON_FALCON_CPUCTL_ALIAS, NV_PFALCON_FALCON_MAILBOX0,
+        NV_PFALCON_FALCON_MAILBOX1,
+        DRF_DEF(_PFALCON, _FBIF_CTL, _ALLOW_PHYS_NO_CTX, _ALLOW),
+        DRF_SHIFTMASK(NV_PFALCON_FBIF_TRANSCFG_TARGET) |
+          DRF_SHIFTMASK(NV_PFALCON_FBIF_TRANSCFG_MEM_TYPE),
+        DRF_DEF(_PFALCON, _FBIF_TRANSCFG, _TARGET, _COHERENT_SYSMEM) |
+          DRF_DEF(_PFALCON, _FBIF_TRANSCFG, _MEM_TYPE, _PHYSICAL),
+        DRF_DEF(_PFALCON, _FALCON_DMATRFCMD, _FULL, _TRUE),
+        DRF_DEF(_PFALCON, _FALCON_DMATRFCMD, _IDLE, _TRUE),
+        DRF_DEF(_PFALCON, _FALCON_DMATRFCMD, _IMEM, _TRUE) |
+          DRF_NUM(_PFALCON, _FALCON_DMATRFCMD, _SEC, 1) |
+          DRF_DEF(_PFALCON, _FALCON_DMATRFCMD, _SIZE, _256B),
+        DRF_DEF(_PFALCON, _FALCON_DMATRFCMD, _IMEM, _FALSE) |
+          DRF_NUM(_PFALCON, _FALCON_DMATRFCMD, _SEC, 0) |
+          DRF_DEF(_PFALCON, _FALCON_DMATRFCMD, _SIZE, _256B),
+        DRF_DEF(_PFALCON2, _FALCON_MOD_SEL, _ALGO, _RSA3K),
+        DRF_DEF(_PFALCON, _FALCON_CPUCTL, _ALIAS_EN, _TRUE),
+        DRF_DEF(_PFALCON, _FALCON_CPUCTL, _STARTCPU, _TRUE),
+        DRF_DEF(_PFALCON, _FALCON_CPUCTL, _HALTED, _TRUE)
+    };
+    return count != sizeof(expected) / sizeof(expected[0]) ||
+           memcmp(actual, expected, sizeof(expected)) != 0;
+}
 
 int r4nv_gsp_core_abi_check(const unsigned *actual, size_t count)
 {

@@ -10,7 +10,36 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
-Production GA102 Booter Load/Unload preparation (NVIDIA 0.1.27):
+GA106 HS Falcon loader and MMIO binding (host qualified):
+
+`falcon_hs` implements the original GA102 HS upload/PKC/start/halt sequence
+for GSP FWSEC and SEC2 Booters. It waits for DMA queue space before changing
+bases and before each 256-byte transfer, then for IDLE after each complete
+IMEM/DMEM transfer. It programs RSA3K BROM parameters, the boot vector and
+optional mailboxes, selects the correct CPU start alias and returns raw
+mailboxes after halt. Halt alone proves neither authentication nor quiescence.
+
+One bounded phase per step shares a finite deadline and live epoch. Errors,
+attempted writes and last register values remain available; failed operations
+cannot replay. The native MMIO port retains DMA before effects, orders posted
+writes through BOOT0 and excludes sequencer access while HS is active. It
+rejects a short SEC2 second-register-page aperture before starting DMA. A
+required owner callback must bind the exact retained firmware, completed
+reset/Falcon selection, actual TCM limits and VRAM/VGA/display recovery.
+
+51 cases in the existing owner step pass, including one grouped HS case and
+the extended actual SDK/MMIO accessor case on host memory. 34 HS register
+values match the complete original NVIDIA C headers. The full 3,156-file
+source pin was verified; 210 complete originals/notices are archived under
+`falcon-hs-20260911`. No new gate or guest run. The module rebuild is byte
+identical to NVIDIA 0.1.27: these routines remain unlinked from `main.zig`.
+No update or hardware execution in this checkpoint. Native reset/TCM and
+recovery ownership, initial FRTS/Booter execution, result interpretation,
+IRQ/log/health service and proven post-submission quiescence remain open.
+Before executable linkage, extend the packaged full MIT notice bundle.
+Evidence: `falcon_hs_checkpoint` in `Docs/Drivers/GrafikFirmware07910.json`.
+
+Earlier production GA102 Booter Load/Unload preparation (NVIDIA 0.1.27):
 
 The loaded R4D now provides fourteen original production parts for both
 Booters, pinned to NVIDIA 570.144, with a separate 24,640-byte full notice

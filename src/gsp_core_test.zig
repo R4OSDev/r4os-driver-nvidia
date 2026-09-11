@@ -5,6 +5,7 @@ const t = std.testing;
 const core = @import("gsp_core.zig");
 const seq = @import("gsp_sequencer.zig");
 const native = @import("gsp_sequencer_port.zig");
+const hs = @import("falcon_hs.zig");
 const identity = @import("identity.zig");
 const r = core.reg;
 const b = core.bits;
@@ -120,6 +121,7 @@ const NativeRig = struct {
     wrong_flush: bool = false,
     fail_unmap: bool = false,
     wrong_map: bool = false,
+    hs_admissions: u32 = 0,
     fn cast(p: *anyopaque) *NativeRig {
         return @ptrCast(@alignCast(p));
     }
@@ -130,10 +132,18 @@ const NativeRig = struct {
         return rig.clock;
     }
     fn admit(_: *anyopaque, _: seq.Command) error{ Denied, Unsupported }!void {}
+    fn admitHs(p: *anyopaque, options: *const hs.Options) anyerror!void {
+        const self = cast(p);
+        try t.expect(options.epoch == self.epoch and options.engine == .gsp);
+        self.hs_admissions += 1;
+    }
     fn access(p: *anyopaque, kind: native.Access, address: u32) anyerror!void {
         const self = cast(p);
         self.accesses += 1;
         if (kind == .read and (address == r.cpuctl_alias or address == r.sec_cpuctl_alias)) return error.WriteOnly;
+        // Host register model only: completed DMA and the existing halted
+        // CPU word allow exercising actual MMIO wrappers without a real GPU.
+        if (self.hs_admissions != 0 and kind == .read and address == hs.reg.gsp + hs.reg.dma_command) self.words[address / 4] = hs.bits.idle;
         if (kind == .read and address == 0 and self.retains != 0) {
             self.flushes += 1;
             if (self.wrong_flush) self.words[0] = 0;
@@ -286,6 +296,54 @@ test "firmware CPU storage GA106 core sequencing and native MMIO ownership" {
     try t.expectEqual(@as(u32, 2), words[r.cpuctl_alias / 4]);
     try t.expect(fixture.retains == 1 and fixture.flushes == 1);
     try t.expect(!port.close() and fixture.unmaps == 0);
+    const hs_options: hs.Options = .{
+        .engine = .gsp,
+        .boot0 = boot0,
+        .epoch = fixture.epoch,
+        .deadline = 1000000,
+        .imem_capacity = 65536,
+        .dmem_capacity = 65536,
+        .mailboxes = .{ 0x79, null },
+        .plan = .{
+            .imem = .{ .base = 0x123456000, .destination = 0, .source_offset = 0, .bytes = 512, .command = hs.bits.imem_command },
+            .dmem = .{ .base = 0x123456200, .destination = 0, .source_offset = 0, .bytes = 512, .command = hs.bits.dmem_command },
+            .boot_vector = 0,
+            .signature_address = 16,
+            .engine_mask = 0x400,
+            .ucode_id = 9,
+        },
+    };
+    try t.expectError(error.Unsupported, port.beginHs(hs_options));
+    port.owner.?.admit_hs = NativeRig.admitHs;
+    var sec_options = hs_options;
+    sec_options.engine = .sec2;
+    sec_options.plan.ucode_id = 3;
+    sec_options.plan.engine_mask = 1;
+    sec_options.plan.imem.source_offset = 256;
+    sec_options.plan.boot_vector = 256;
+    sec_options.plan.dmem.base += 256;
+    // The old core-only aperture ends before SEC2's BROM page. No admission
+    // callback or preceding DMA write may run for that truncated mapping.
+    try t.expectError(error.Register, port.beginHs(sec_options));
+    try t.expectEqual(@as(u32, 0), fixture.hs_admissions);
+    try port.beginHs(hs_options);
+    try t.expectError(error.Busy, port.beginHs(hs_options));
+    try t.expectError(error.Busy, port.sequencer());
+    try t.expectError(error.Busy, io.read32(io.context, r.os));
+    try t.expectError(error.Busy, io.write32(io.context, r.os, 1));
+    try t.expectError(error.Denied, io.admit(io.context, .core_start));
+    var hs_result: ?hs.Result = null;
+    for (0..128) |_| {
+        hs_result = try port.stepHs();
+        if (hs_result != null) break;
+    }
+    try t.expect(hs_result != null and hs_result.?.blocks == 4 and hs_result.?.mailboxes[0].? == 0x79 and hs_result.?.mailboxes[1] == null);
+    try t.expectEqual(@as(u32, 1), fixture.hs_admissions);
+    try t.expectEqual(@as(u32, 16), words[(hs.reg.gsp + hs.reg.second_offset + hs.reg.signature) / 4]);
+    try t.expectEqual(@as(u32, 0x400), words[(hs.reg.gsp + hs.reg.second_offset + hs.reg.engine_mask) / 4]);
+    try t.expectEqual(@as(u32, 9), words[(hs.reg.gsp + hs.reg.second_offset + hs.reg.ucode) / 4]);
+    try t.expectEqual(@as(u32, 1), words[(hs.reg.gsp + hs.reg.second_offset + hs.reg.algorithm) / 4]);
+    try t.expect(fixture.retains == 1 and !port.close() and fixture.unmaps == 0);
     // An invalid flush comes AFTER the write: preserve the actual effect and
     // keep the MMIO/DMA owner alive. Subsequent callbacks cannot write again.
     fixture.wrong_flush = true;

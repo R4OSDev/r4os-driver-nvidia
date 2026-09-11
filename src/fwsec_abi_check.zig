@@ -8,6 +8,8 @@ const ring = @import("gsp_ring.zig");
 const boot_events = @import("gsp_boot_events.zig");
 const sequencer = @import("gsp_sequencer.zig");
 const core = @import("gsp_core.zig");
+const hs = @import("falcon_hs.zig");
+extern fn r4nv_falcon_hs_abi_check([*]const u32, usize) c_int;
 extern fn r4nv_gsp_core_abi_check([*]const u32, usize) c_int;
 extern fn r4nv_fwsec_abi_check([*]const u8, usize, c_uint, [*]const u8, usize, c_uint, [*]const u8, usize) c_int;
 extern fn r4nv_gsp_init_abi_check([*]const u8, usize) c_int;
@@ -26,6 +28,17 @@ pub fn main() !void {
         b.handoff_done, core.propagation_reads,
     };
     if (r4nv_gsp_core_abi_check(&core_values, core_values.len) != 0) return error.OriginalCoreMismatch;
+    const hr = hs.reg;
+    const hb = hs.bits;
+    const hs_values = [_]u32{
+        hr.gsp,               hr.sec2,              hr.fbif_offset, hr.fbif_offset, hr.second_offset, hr.second_offset,
+        hr.fbif_control,      hr.transcfg,          hr.dma_control, hr.dma_base,    hr.dma_base_high, hr.dma_destination,
+        hr.dma_source_offset, hr.dma_command,       hr.signature,   hr.engine_mask, hr.ucode,         hr.algorithm,
+        hr.boot_vector,       hr.cpu_control,       hr.cpu_alias,   hr.mailbox0,    hr.mailbox1,      hb.physical_no_context,
+        hb.transcfg_mask,     hb.coherent_physical, hb.full,        hb.idle,        hb.imem_command,  hb.dmem_command,
+        hb.rsa3k,             hb.cpu_alias,         hb.cpu_start,   hb.cpu_halted,
+    };
+    if (r4nv_falcon_hs_abi_check(&hs_values, hs_values.len) != 0) return error.OriginalHsMismatch;
     // Heap backing belongs only to this host comparison, never to a target
     // driver or its bounded stack. All DMA addresses below are synthetic.
     const init_output = try std.heap.page_allocator.alloc(u8, gsp_init.output_bytes);

@@ -10,7 +10,38 @@ unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
 
-Produktions-Booter Load/Unload (NVIDIA 0.1.27)
+GA106-HS-Falcon-Lader und MMIO-Bindung (Hostnachweis)
+--------------------------------------------------
+falcon_hs implementiert die originale GA102-HS-Folge fuer GSP-FWSEC und
+SEC2-Booter: DMA-Platz vor Basisregistern und jedem 256-Byte-Transfer pruefen;
+nach IMEM und DMEM jeweils IDLE abwarten. Danach BROM-Signaturadresse,
+Engine-Maske/Ucode/RSA3K, Bootvektor, optionale Mailboxen, CPU-Start ueber den
+passenden Alias und Halt-Warten. Mailboxwerte bleiben roh; Halt allein
+beweist weder Authentifizierung noch Quieszenz.
+
+Eine begrenzte Phase pro Schritt, feste Frist und lebende Epoche. Fehler,
+versuchte Effekte und letzter Registerwert bleiben erhalten; keine erneute
+Ausfuehrung nach Fehler. Der MMIO-Port haelt DMA vor Effekten, ordnet Writes
+ueber BOOT0 und sperrt Sequencerzugriffe waehrend des HS-Laufs. Eine zu kurze
+SEC2-BROM-Apertur wird vor vorhergehenden DMA-Writes abgewiesen. Der native
+Besitzer muss das exakte behaltene Firmwareabbild mit abgeschlossenem Reset,
+Falconauswahl, wirklichen TCM-Grenzen und VRAM/VGA/Display-Recovery verbinden.
+
+51 Faelle im vorhandenen Besitzerstep bestanden: ein gruppierter HS-Fall
+und die erweiterte echte SDK-/MMIO-Accessorpruefung auf Hostspeicher. 34
+Register-/Befehlswerte stimmen mit originalen NVIDIA-C-Headern ueberein.
+Alle 3156 Quelldateien gegen den Pin geprueft; 210 komplette Originale samt
+Lizenzen archiviert. Kein neues Gate/Gastlauf. Modulbuild bytegleich zu
+NVIDIA 0.1.27; diese Routinen bleiben aus main.zig ungelinkt. Kein Update
+oder Hardwarelauf in diesem Schritt. Letzter OssiPC-Nachweis bleibt die
+Booter-Vorbereitung, kein Firmwarestart. Native Reset-/TCM-/Recoverybesitzer,
+FRTS-Erststart/Booterausfuehrung und Ergebnisauswertung, IRQ/Log/Health sowie
+bewiesene Quieszenz bleiben offen. Vor ausfuehrbarer Einbindung die vollen
+zusaetzlichen MIT-Hinweise in das Distributionspaket aufnehmen.
+Archiv: ExFiles/Reference/GFX/Nvidia/0.79.10/falcon-hs-20260911.
+JSON: falcon_hs_checkpoint; 0.79.10 bleibt offen.
+
+Historisch: Produktions-Booter Load/Unload (NVIDIA 0.1.27)
 -------------------------------------------
 Vierzehn unveraenderte GA102-Produktionsdateien aus dem originalen NVIDIA-
 570.144-Decoderexport sind jetzt versionsgebundene R4D-Ressourcen. Dazu
