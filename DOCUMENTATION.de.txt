@@ -10,7 +10,43 @@ unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
 
-Display-Instanz und genutzte Flaechenkontexte (NVIDIA 0.1.37)
+Aktiver Farb- und Cursorzustand (NVIDIA 0.1.38)
+---------------------------------------------
+Die gehaltene Aufnahme erhaelt zusaetzlich 53 C67D-Woerter je vorhandenem
+Head und 79 C67E-Farbwoerter je Window: Hintergrund, Clamp, Procamp/Dither/
+Skalierung, Farbmatrizen, LUT-/Tone-Mapping-Steuerung und -Bindungen sowie
+Cursorformat, Groesse, Hotspot, Komposition und beide Kontext-/Offsetpaare.
+Core-Client und beide C67A-Cursorpositionen werden ebenfalls aufgenommen.
+Die Koordinaten folgen der vorzeichenbehafteten 16-Bit-Darstellung des
+Original-C6-HAL. Gelesen werden Armed-Spiegel, keine Cursor-UPDATE-/FREE-
+oder Submit-Ports.
+
+Farb-/Koordinatenwerte duerfen alle Bits setzen oder allgemeinen MMIO-
+Fehlermustern aehneln. Die expliziten Nutzdatenlesungen erhalten sie; die
+Pruefung von Identitaet/Topologie, Mapping/Besitzer/Epoche, einer Sekunde
+Frist und zwei ganzen gleichen Aufnahmen bleibt verbindlich. Maximal 2896
+Reads, im bestehenden Zwei-Head-/Zwei-Window-Fall 748. Erneute Zulassung und
+bisherige Apertur-/Pixel-Recovery vergleichen auch Farb-/Cursorzustand.
+
+Der vorhandene Lebenszyklusfall prueft volle 32-Bit-Nutzwerte, aktiven und
+deaktivierten Cursor, beide signierten Positionen/Bindungen, LUT-Metadaten,
+CSC-Aenderung zwischen Aufnahmen und gehaltene Recovery bei Cursorbewegung.
+Alle 51 Besitzerfaelle und Modulbuild beim ersten Aufruf bestanden; keine
+neuen Faelle/Gates/Gastlaeufe. Abschlussreview: drei Leerzeichen in leeren
+Lizenzkommentarzeilen bereinigt und Modul erneut gebaut; keine wiederholten
+Besitzertests. 28 Ressourcen geprueft, vorherige 27 unveraendert.
+Sechs volle Quellhinweise im neuen 7664-Byte-Farblizenztext; 31 vollstaendige
+gepinnt erhaltene Originale: ExFiles/Reference/GFX/Nvidia/0.79.10/display-color-20260911.
+Beleg: display_color_checkpoint in Docs/Drivers/GrafikFirmware07910.json.
+
+Externe LUT-/Cursorinhalte muessen noch aufgeloest und gesichert werden.
+Indizierte CSC-LUTs und Koeffizienten des Ausgangsskalierers sind aus dem
+zuletzt geschriebenen Methodenwort nicht vollstaendig wiederherstellbar;
+die Diagnose benennt diese Luecke. Native UEFI-/Geraete-Recovery, Firmware-
+start, Scanout und HDMI bleiben offen. OssiPC offline/unveraendert; keine
+neue physische oder sichtbare Abnahme.
+
+Vorherige Display-Instanz und genutzte Flaechenkontexte (NVIDIA 0.1.37)
 ----------------------------------------------------------
 Der ausdrueckliche Boot-Check sichert nun die gesamten 64 KB Display-Instanz
 ueber den vorhandenen gemeinsamen BAR0-/PRAMIN-Leser. Alle Seiten werden

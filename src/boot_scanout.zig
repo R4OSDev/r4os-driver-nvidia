@@ -167,6 +167,7 @@ const identity = @import("identity.zig");
 const state = @import("fwsec_state.zig");
 const bar0 = @import("bar0.zig");
 const display_context = @import("display_context.zig");
+const color = @import("color_state.zig");
 pub const max_heads = 8;
 pub const max_sors = 8;
 pub const max_windows = 8;
@@ -217,6 +218,7 @@ pub const WindowField = enum {
 };
 pub const Window = struct {
     client: u32 = 0,
+    color: color.Window = .{},
     core: [window_core_methods.len]u32 = @splat(0),
     words: [window_methods.len]u32 = @splat(0),
     pub fn get(self: *const Window, field: WindowField) u32 {
@@ -241,11 +243,12 @@ pub fn windowHead(window: *const Window) !?u3 {
     if (owner >= max_heads) return error.Routing;
     return @intCast(owner);
 }
-pub const max_read_count = 2 * (14 + max_sors + max_heads * (head_methods.len + 1) +
-    max_windows * (1 + window_core_methods.len + window_methods.len));
+pub const max_read_count = 2 * (16 + max_sors + max_heads * (head_methods.len + 1 + color.head_methods.len + color.cursor_methods.len) +
+    max_windows * (1 + window_core_methods.len + window_methods.len + color.window_methods.len));
 pub const Head = struct {
     words: [head_methods.len]u32 = @splat(0),
     hdmi: u32 = 0,
+    color: color.Head = .{},
     pub fn get(self: *const Head, field: Field) u32 {
         return self.words[@intFromEnum(field)];
     }
@@ -258,6 +261,7 @@ pub const Raw = struct {
     counts: u32 = 0,
     instance_control: u32 = 0,
     instance_address: u32 = 0,
+    core_client: u32 = 0,
     heads: [max_heads]Head = @splat(.{}),
     sors: [max_sors]u32 = @splat(0),
     windows: [max_windows]Window = @splat(.{}),
@@ -395,11 +399,14 @@ pub const Capture = struct {
         if (now >= self.deadline) return error.Deadline;
     }
     fn permitted(address: u32) bool {
+        if (address == display_context.client_register) return true;
         if (address == display_context.instance_control_register or address == display_context.instance_address_register) return true;
         if (address == 0 or address == 4 or address == capability_register or address == window_capability_register or address == count_register) return true;
         for (0..max_heads) |head| {
             const offset: u32 = @intCast(head * 0x400);
             for (head_methods) |method| if (address == armed_base + method + offset) return true;
+            for (color.head_methods) |method| if (address == armed_base + method + offset) return true;
+            for (color.cursor_methods) |method| if (address == color.cursor_armed_base + method + head * 0x1000) return true;
             if (address == 0x6165c0 + head * 0x800) return true;
         }
         for (0..max_sors) |sor| if (address == armed_base + 0x300 + sor * 0x20) return true;
@@ -407,10 +414,17 @@ pub const Capture = struct {
             if (address == display_context.client_register + (1 + window) * 16) return true;
             for (window_core_methods) |method| if (address == armed_base + method + window * 0x80) return true;
             for (window_methods) |method| if (address == window_armed_base + method + window * 0x1000) return true;
+            for (color.window_methods) |method| if (address == window_armed_base + method + window * 0x1000) return true;
         }
         return false;
     }
     fn read(self: *Capture, address: u32) !u32 {
+        return self.readValue(address, false);
+    }
+    fn readOpaque(self: *Capture, address: u32) !u32 {
+        return self.readValue(address, true);
+    }
+    fn readValue(self: *Capture, address: u32, raw_payload: bool) !u32 {
         if (!permitted(address)) return error.Register;
         try self.guard();
         const view = try self.access.view(address, 4);
@@ -420,7 +434,9 @@ pub const Capture = struct {
         asm volatile ("mfence" ::: .{ .memory = true });
         self.reads += 1;
         try self.guard();
-        if (!state.readable(value)) return error.Inaccessible;
+        // Color payloads legitimately use all 32 bits (e.g. OLUT norm is
+        // 0xffffffff). Identity/topology checks still bracket the whole pass.
+        if (!raw_payload and !state.readable(value)) return error.Inaccessible;
         return value;
     }
     fn observe(self: *Capture, out: *Raw, chip: identity.Chip) !void {
@@ -431,6 +447,7 @@ pub const Capture = struct {
         out.capabilities = try self.read(capability_register);
         out.instance_control = try self.read(display_context.instance_control_register);
         out.instance_address = try self.read(display_context.instance_address_register);
+        out.core_client = try self.read(display_context.client_register);
         out.window_mask = try self.read(window_capability_register);
         out.counts = try self.read(count_register);
         if (out.headCount() == 0 or out.headCount() > max_heads or out.sorCount() == 0 or out.sorCount() > max_sors or
@@ -445,6 +462,8 @@ pub const Capture = struct {
             const offset: u32 = @intCast(head * 0x400);
             for (head_methods, 0..) |method, index| out.heads[head].words[index] = try self.read(armed_base + method + offset);
             out.heads[head].hdmi = try self.read(0x6165c0 + @as(u32, @intCast(head)) * 0x800);
+            for (color.head_methods, 0..) |method, index| out.heads[head].color.words[index] = try self.readOpaque(armed_base + method + offset);
+            for (color.cursor_methods, 0..) |method, index| out.heads[head].color.cursor_points[index] = try self.readOpaque(color.cursor_armed_base + method + @as(u32, @intCast(head)) * 0x1000);
         };
         for (0..max_windows) |window| if (out.window_mask & (@as(u32, 1) << @intCast(window)) != 0) {
             const offset: u32 = @intCast(window);
@@ -455,11 +474,12 @@ pub const Capture = struct {
                 if (out.headMask() & (@as(u8, 1) << head) == 0) return error.Routing;
             }
             for (window_methods, 0..) |method, index| target.words[index] = try self.read(window_armed_base + method + offset * 0x1000);
+            for (color.window_methods, 0..) |method, index| target.color.words[index] = try self.readOpaque(window_armed_base + method + offset * 0x1000);
         };
         if (try self.read(0) != out.boot0 or try self.read(4) != out.boot1 or
             try self.read(capability_register) != out.capabilities or try self.read(window_capability_register) != out.window_mask or
             try self.read(count_register) != out.counts or try self.read(display_context.instance_control_register) != out.instance_control or
-            try self.read(display_context.instance_address_register) != out.instance_address) return error.Unstable;
+            try self.read(display_context.instance_address_register) != out.instance_address or try self.read(display_context.client_register) != out.core_client) return error.Unstable;
     }
     pub fn close(self: *Capture) bool {
         if (self.self_address == 0) return true;

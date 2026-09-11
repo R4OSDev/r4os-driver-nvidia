@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-Passive NVIDIA display driver for R4OS. Module 0.1.37; original R4OS code is
+Passive NVIDIA display driver for R4OS. Module 0.1.38; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -10,7 +10,41 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
-Display instance and used surface contexts (NVIDIA 0.1.37):
+Armed color and cursor state (NVIDIA 0.1.38):
+
+The held snapshot now retains 53 additional C67D words per fused head and
+79 C67E color words per window: background, clamp, procamp/dither/scaling,
+input/output color matrices, LUT and tone-map controls/bindings, plus cursor
+format, size, hotspot, composition and both context/offset pairs. The core
+client and both C67A cursor positions are captured too. Coordinates follow
+the original C6 HAL's signed 16-bit convention. These are armed mirrors;
+cursor UPDATE/FREE and submission ports are not used.
+
+Raw color/coordinate payloads may legitimately contain all-one bits or
+patterns resembling generic MMIO error sentinels. Explicit color reads
+preserve these values; identity/topology, mapping/owner/epoch, one-second
+deadline and two whole matching observations remain mandatory. Maximum
+2896 reads; the sparse two-head/two-window fixture uses 748. Admission and
+existing aperture/pixel recovery compare the color/cursor state as well.
+
+The existing lifecycle case covers full-width payloads, enabled/disabled
+cursor state, both signed eye positions and bindings, LUT metadata, a CSC
+change between passes and retained recovery after cursor movement. All 51
+owner cases and the module pass first invocation; no new case/gate/guest.
+Final source review removed three trailing spaces in license-comment blank
+lines and rebuilt the module; no repeated owner tests.
+All 28 resources verified, previous 27 unchanged. Six complete source
+notices are in the new 7664-byte color license. 31 full pinned originals:
+display-color-20260911; current evidence is display_color_checkpoint in
+Docs/Drivers/GrafikFirmware07910.json.
+
+External LUT/cursor payloads still need resolution and backup. Indexed
+CSC LUTs and output-scaler coefficient arrays cannot be recovered from
+their last-write method words; diagnostics explicitly disclose this gap.
+Native UEFI/device recovery, firmware start, scanout and HDMI remain open.
+OssiPC is offline and untouched; no new physical or visual acceptance.
+
+Previous display instance and used surface contexts (NVIDIA 0.1.37):
 
 The explicit boot-check now backs up all 64KB of display instance memory
 through the existing shared BAR0/PRAMIN reader, compares every page twice,

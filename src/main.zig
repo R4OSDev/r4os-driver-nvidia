@@ -445,7 +445,7 @@ fn inspectFwsecState(ctx: *const r4os.r4dev.DriverContext, snapshot: *const iden
 fn logBootScanout(raw: *const @import("boot_scanout.zig").Raw) void {
     const scanout = @import("boot_scanout.zig");
     const routed = scanout.routedHeads(raw);
-    log("NVIDIA boot-scanout: heads={x:0>2} sors={x:0>2} routed-heads={x:0>2} source=armed-mirror repeated=matched visible=unverified", .{ raw.headMask(), raw.sorMask(), routed });
+    log("NVIDIA boot-scanout: heads={x:0>2} sors={x:0>2} routed-heads={x:0>2} core-client={x} source=armed-mirror repeated=matched visible=unverified", .{ raw.headMask(), raw.sorMask(), routed, raw.core_client });
     log("NVIDIA boot-windows: count={d} mask={x:0>8} source=armed-mirror layout=unresolved", .{ raw.windowCount(), raw.window_mask });
     for (0..scanout.max_windows) |index| if (raw.window_mask & (@as(u32, 1) << @intCast(index)) != 0) {
         const display_window = &raw.windows[index];
@@ -465,6 +465,24 @@ fn logBootScanout(raw: *const @import("boot_scanout.zig").Raw) void {
                 });
             };
         } else log("NVIDIA boot-window: id={d} head=none raw-state=retained", .{index});
+    };
+    for (0..scanout.max_windows) |index| if (raw.window_mask & (@as(u32, 1) << @intCast(index)) != 0) {
+        const fields = &raw.windows[index].color;
+        log("NVIDIA boot-color-window: id={d} ilut-handle={x} ilut-control={x} tmo-handle={x} tmo-control={x} indexed-luts={x} indexed-data=unresolved", .{
+            index, fields.get(.ilut_dma), fields.get(.ilut_control), fields.get(.tmo_dma), fields.get(.tmo_control), fields.indexedLuts(),
+        });
+    };
+    for (0..scanout.max_heads) |index| if (raw.headMask() & (@as(u8, 1) << @intCast(index)) != 0) {
+        const fields = &raw.heads[index].color;
+        const left = fields.cursorPoint(0);
+        const right = fields.cursorPoint(1);
+        log("NVIDIA boot-cursor: head={d} enabled={} control={x} present={x} left={d},{d} right={d},{d} handles={x},{x} offsets={x},{x}", .{
+            index, fields.cursorEnabled(), fields.get(.cursor_control), fields.get(.cursor_present), left.x, left.y, right.x, right.y,
+            fields.get(.cursor_dma_left), fields.get(.cursor_dma_right), fields.get(.cursor_offset_left), fields.get(.cursor_offset_right),
+        });
+        log("NVIDIA boot-color-head: id={d} olut-handle={x} olut-control={x} olut-norm={x} csc-control={x},{x} payloads=unresolved", .{
+            index, fields.get(.olut_dma), fields.get(.olut_control), fields.get(.olut_norm), fields.get(.csc0_control), fields.get(.csc1_control),
+        });
     };
     for (0..scanout.max_sors) |sor| if (raw.sorMask() & (@as(u8, 1) << @intCast(sor)) != 0) {
         log("NVIDIA boot-sor: id={d} heads={x:0>2} protocol={s} control={x:0>8}", .{ sor, raw.sors[sor] & 0xff, @tagName(scanout.protocol(raw.sors[sor])), raw.sors[sor] });

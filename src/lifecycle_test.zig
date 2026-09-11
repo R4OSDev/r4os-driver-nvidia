@@ -927,7 +927,7 @@ const BootVramFixture = struct {
         if (scanout_mutate_at != 0) {
             scanout_guard_calls += 1;
             if (scanout_guard_calls == scanout_mutate_at) {
-                put(@import("boot_scanout.zig").window_armed_base + 7 * 0x1000 + 0x254, 0x87654321);
+                put(@import("boot_scanout.zig").window_armed_base + 7 * 0x1000 + 0x5cc, 0x87654321);
             }
         }
         if (clock_backwards) {
@@ -957,6 +957,33 @@ const BootVramFixture = struct {
     fn setupScanout() void {
         const scanout = @import("boot_scanout.zig");
         put(scanout.capability_register, 0x303);
+        put(0x610b2c, 0x333);
+        const color = @import("color_state.zig");
+        put(scanout.armed_base + 0x2284, 0xffffffff); // Valid raw OLUT norm, not a dead BAR.
+        put(scanout.armed_base + 0x2220, 0xbadf1234); // Arbitrary color bits may resemble an error sentinel.
+        put(scanout.armed_base + 0x229c, 1);
+        put(scanout.armed_base + 0x22cc, 0x1234);
+        put(scanout.armed_base + 0x2088, 0x701);
+        put(scanout.armed_base + 0x208c, 0x702);
+        put(scanout.armed_base + 0x2090, 0x20);
+        put(scanout.armed_base + 0x2094, 0x30);
+        put(scanout.armed_base + 0x209c, 0x800001cf);
+        put(scanout.armed_base + 0x209c + 0x400, 0xcf); // Disabled second cursor remains raw.
+        put(scanout.armed_base + 0x2280, (1029 << 8) | 9);
+        put(scanout.armed_base + 0x2288, 0x801);
+        put(scanout.armed_base + 0x228c, 0x400);
+        put(color.cursor_armed_base + 0x208, 0xfffeffff);
+        put(color.cursor_armed_base + 0x20c, 0x00040003);
+        put(scanout.window_armed_base + 0x440, (261 << 8) | 5);
+        put(scanout.window_armed_base + 0x444, 0x901);
+        put(scanout.window_armed_base + 0x448, 0x200);
+        put(scanout.window_armed_base + 0x500, (517 << 8) | 1);
+        put(scanout.window_armed_base + 0x528, 0x902);
+        put(scanout.window_armed_base + 0x52c, 0x500);
+        put(scanout.window_armed_base + 7 * 0x1000 + 0x4a0, 16);
+        put(scanout.window_armed_base + 7 * 0x1000 + 0x580, 16);
+        put(scanout.window_armed_base + 7 * 0x1000 + 0x5cc, 0x2222);
+        put(scanout.window_armed_base + 7 * 0x1000 + 0x5d0, 0xffffffff);
         put(0x610010, 9);
         put(0x610014, @intCast(display_address >> 16));
         put(scanout.window_capability_register, 0x81);
@@ -1326,7 +1353,17 @@ fn checkBootVramOwner() !void {
     const scanout = @import("boot_scanout.zig");
     const observed_scanout = capture.scanout_original.?;
     try t.expect(observed_scanout.windowCount() == 8 and observed_scanout.window_mask == 0x81);
+    const head_color = &observed_scanout.heads[0].color;
+    try t.expect(observed_scanout.core_client == 0x333 and head_color.cursorEnabled() and !observed_scanout.heads[1].color.cursorEnabled());
+    try t.expect(head_color.get(.olut_norm) == 0xffffffff and head_color.get(.desktop_ar) == 0xbadf1234);
+    try t.expect(head_color.get(.csc1_c23) == 0x1234 and head_color.get(.olut_dma) == 0x801 and head_color.get(.olut_offset) == 0x400);
+    try t.expect(head_color.get(.cursor_dma_left) == 0x701 and head_color.get(.cursor_dma_right) == 0x702);
+    try t.expect(head_color.get(.cursor_offset_left) == 0x20 and head_color.get(.cursor_offset_right) == 0x30);
+    try t.expect(head_color.cursorPoint(0).x == -1 and head_color.cursorPoint(0).y == -2);
+    try t.expect(head_color.cursorPoint(1).x == 3 and head_color.cursorPoint(1).y == 4);
+    try t.expect(observed_scanout.windows[0].color.get(.ilut_dma) == 0x901 and observed_scanout.windows[0].color.get(.tmo_dma) == 0x902);
     const last_window = &observed_scanout.windows[7];
+    try t.expect(last_window.color.indexedLuts() == 3 and last_window.color.get(.csc11_c23) == 0x2222 and last_window.color.get(.clamp_range) == 0xffffffff);
     try t.expect((try scanout.windowHead(last_window)).? == 1);
     for (0..3) |plane| for (0..2) |eye| {
         const binding = try last_window.binding(@intCast(plane), @intCast(eye));
@@ -1570,26 +1607,32 @@ fn checkBootVramOwner() !void {
     const unassigned_raw = try unassigned.readShared(&ctx, &snapshot, chip, &capture.registers,
         .{ .context = &capture, .epoch = capture.boot.held_generation, .generation = f.nativeGeneration });
     try t.expect(try scanout.windowHead(&unassigned_raw.windows[0]) == null);
-    try t.expect(unassigned.reads == 208 and unassigned.reads <= scanout.max_read_count);
+    try t.expect(unassigned.reads == 748 and unassigned.reads <= scanout.max_read_count);
     try t.expect(unassigned.close());
     f.put(scanout.armed_base + 0x1000, 0);
     const last_binding_address = scanout.window_armed_base + 7 * 0x1000 + 0x254;
-    // Change a plane at the boundary between the two complete observations.
+    // Change the last CSC coefficient at the boundary between complete observations.
     f.scanout_guard_calls = 0;
-    f.scanout_mutate_at = 210;
+    f.scanout_mutate_at = 750;
     var changing: scanout.Capture = .{};
     defer _ = changing.close();
     const changing_result = changing.readShared(&ctx, &snapshot, chip, &capture.registers,
         .{ .context = &capture, .epoch = capture.boot.held_generation, .generation = f.nativeGeneration });
     f.scanout_mutate_at = 0;
     try t.expectError(error.Unstable, changing_result);
-    try t.expect(changing.reads == 208 and capture.registers.borrowedCount() == 2);
+    try t.expect(changing.reads == 748 and capture.registers.borrowedCount() == 2);
     try t.expect(changing.close() and capture.registers.borrowedCount() == 1);
-    f.put(last_binding_address, 0x175);
+    f.put(scanout.window_armed_base + 7 * 0x1000 + 0x5cc, 0x2222);
     f.put(last_binding_address, 0x87654321);
     try t.expectError(error.ScanoutChanged, capture.reobserve());
     try t.expect(!capture.close() and f.held and f.leases[1] and f.mapped[0]);
     f.put(last_binding_address, 0x175);
+    _ = try capture.reobserve();
+    const cursor_point_address = @import("color_state.zig").cursor_armed_base + 0x208;
+    f.put(cursor_point_address, 0x00010002);
+    try t.expectError(error.ScanoutChanged, capture.reobserve());
+    try t.expect(!capture.close() and f.held and f.leases[1] and f.mapped[0]);
+    f.put(cursor_point_address, 0xfffeffff);
     _ = try capture.reobserve();
     f.put(scanout.armed_base + 0x300, 0x104); // Route cannot name a fused-off head.
     try t.expectError(error.Routing, capture.reobserve());

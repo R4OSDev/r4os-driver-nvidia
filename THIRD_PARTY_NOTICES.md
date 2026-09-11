@@ -1,6 +1,17 @@
 ﻿# Third-Party Notices
 
-GA106 display instance/context decoding (NVIDIA 0.1.37):
+GA106 color/cursor state definitions (NVIDIA 0.1.38):
+color_state follows the original MIT C67D/C67E/C67A method definitions,
+GA102 armed mirror definitions, NVKMS indexed-table semantics and C6 cursor
+HAL. Six complete original notices remain in code and in the new
+NVIDIA-DISPLAY-COLOR-LICENSE.txt (7664 bytes), identical in Distribution.
+31 complete pinned originals accompany display-color-20260911. The extra
+Nouveau headc57d file is reference-only evidence for full-width OLUT norm;
+its entire original notice remains in that file. Previous 27 module resource
+payloads are unchanged. Original R4OS observation/lifetime/validation stays
+Apache-2.0. Indexed tables and native display recovery are still incomplete.
+
+Earlier GA106 display instance/context decoding (NVIDIA 0.1.37):
 display_context adapts the pinned GA102 manual, RM v03 instance layout/hash
 and NVKMS format/surface layout definitions under their original MIT terms.
 Twelve additional complete per-source notices remain in the decoder and
