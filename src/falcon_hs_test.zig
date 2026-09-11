@@ -3,6 +3,7 @@ const t = std.testing;
 const hs = @import("falcon_hs.zig");
 const core = @import("gsp_core.zig");
 const run = @import("falcon_run.zig");
+const fwsec_result = @import("fwsec_result.zig");
 const r = hs.reg;
 const b = hs.bits;
 
@@ -35,6 +36,7 @@ const Model = struct {
     brom: u32 = 0,
     mailbox_writes: u32 = 0,
     started: bool = false,
+    halt_observed: bool = false,
     alias: bool = true,
     deny: bool = false,
     hold_full: bool = false,
@@ -84,7 +86,10 @@ const Model = struct {
                 self.last_status = b.idle;
                 break :blk b.idle;
             },
-            r.cpu_control => (if (self.alias) @as(u32, b.cpu_alias) else 0) | (if (self.started and !self.hold_halt) @as(u32, b.cpu_halted) else 0),
+            r.cpu_control => blk: {
+                if (self.started and !self.hold_halt) self.halt_observed = true;
+                break :blk (if (self.alias) @as(u32, b.cpu_alias) else 0) | (if (self.halt_observed) @as(u32, b.cpu_halted) else 0);
+            },
             r.mailbox0 => if (self.started) 0xffffffff else error.EarlyMailbox,
             r.mailbox1 => if (self.started) 0xbadf7777 else error.EarlyMailbox,
             else => error.UnexpectedRead,
@@ -286,6 +291,12 @@ const RunModel = struct {
     wrong_core: bool = false,
     lost_valid: bool = false,
     fail_reset: bool = false,
+    fwsec: ?fwsec_result.Command = null,
+    result_words: [3]u32 = @splat(0),
+    result_reads: u8 = 0,
+    expire_result: ?usize = null,
+    stale_result: ?usize = null,
+    fail_result: ?usize = null,
 
     fn cast(p: *anyopaque) *RunModel {
         return @ptrCast(@alignCast(p));
@@ -298,7 +309,7 @@ const RunModel = struct {
     }
     fn config(self: *const RunModel) run.Options {
         const c = self.dma.config;
-        return .{ .engine = c.engine, .boot0 = c.boot0, .epoch = c.epoch, .deadline = c.deadline, .plan = c.plan, .mailboxes = c.mailboxes };
+        return .{ .engine = c.engine, .boot0 = c.boot0, .epoch = c.epoch, .deadline = c.deadline, .plan = c.plan, .mailboxes = c.mailboxes, .fwsec = self.fwsec };
     }
     fn admit(p: *anyopaque, config_: *const run.Options) anyerror!void {
         const self = cast(p);
@@ -309,6 +320,19 @@ const RunModel = struct {
     fn read(p: *anyopaque, address: u32) anyerror!u32 {
         const self = cast(p);
         try t.expectEqual(@as(u32, 1), self.dma.admits);
+        if (self.fwsec) |command| {
+            const registers = if (command == .frts) fwsec_result.frts_registers else fwsec_result.sb_registers;
+            for (registers, 0..) |expected, index| {
+                if (address != expected) continue;
+                try t.expect(self.dma.started and self.dma.halt_observed and self.reset_complete);
+                try t.expectEqual(index, self.result_reads);
+                self.result_reads += 1;
+                if (self.expire_result == index) self.dma.clock = self.dma.config.deadline;
+                if (self.stale_result == index) self.dma.epoch += 1;
+                if (self.fail_result == index) return error.ReadResult;
+                return self.result_words[index];
+            }
+        }
         const offset = address - self.dma.base();
         return switch (offset) {
             0x3c0 => blk: {
@@ -367,6 +391,7 @@ const RunModel = struct {
 };
 
 fn checkCompleteRun() !void {
+    try checkFwsecResults();
     for ([_]hs.Engine{ .gsp, .sec2 }) |engine| {
         for ([_]bool{ false, true }) |riscv| {
             var model: RunModel = .{ .dma = .{ .config = options(engine) }, .riscv = riscv };
@@ -376,6 +401,7 @@ fn checkCompleteRun() !void {
             try t.expectEqual(@as(u32, 65536), operation.hs_operation.?.options.imem_capacity);
             try t.expectEqual(@as(u32, 65536), operation.hs_operation.?.options.dmem_capacity);
             try t.expectEqual(@as(u32, 0xffffffff), operation.result.?.mailboxes[0].?);
+            try t.expect(operation.result.?.fwsec == null and model.result_reads == 0);
             const writes = model.dma.writes;
             try t.expect(try operation.step(model.io()));
             model.dma.epoch += 1;
@@ -392,7 +418,7 @@ fn checkCompleteRun() !void {
     const Fault = enum { denied, size, unstable, unavailable, scrub, reset, core_select, lost_valid, posted, hs_posted };
     for (std.enums.values(Fault)) |fault| {
         var model: RunModel = .{ .dma = .{ .config = options(.sec2) } };
-        const expected = switch (fault) {
+        const expected: anyerror = switch (fault) {
             .denied => blk: {
                 model.dma.deny = true;
                 break :blk error.Denied;
@@ -454,4 +480,89 @@ fn checkCompleteRun() !void {
     model.dma.clock = model.dma.config.deadline;
     try t.expectError(error.Deadline, operation.step(model.io()));
     try t.expectEqual(@as(u32, 0), model.reset_edges);
+}
+
+fn resultModel(command: fwsec_result.Command) RunModel {
+    var model: RunModel = .{ .dma = .{ .config = options(.gsp) }, .fwsec = command };
+    model.dma.config.mailboxes = .{ null, null };
+    // Unrelated bits are deliberately set; HI is not an exclusive end.
+    model.result_words = switch (command) {
+        .frts => |offset| .{ 0x0000ffff, @as(u32, @intCast((offset + 0xff000) >> 12)) << 4 | 3, @as(u32, @intCast(offset >> 12)) << 4 | 9 },
+        .sb => .{ 0x31, 0x987654ff, 0xffff0000 },
+    };
+    return model;
+}
+
+fn checkFwsecResults() !void {
+    const commands = [_]fwsec_result.Command{ .{ .frts = 0x2ffee0000 }, .sb };
+    for (commands) |command| {
+        var model = resultModel(command);
+        var operation = try run.Operation.init(model.config());
+        for (0..192) |_| {
+            if (operation.phase == .fwsec_result) break;
+            try t.expect(!(try operation.step(model.io())));
+        }
+        try t.expect(operation.phase == .fwsec_result and model.result_reads == 0 and operation.result == null);
+        const writes = model.dma.writes;
+        for (0..3) |index| {
+            try t.expectEqual(index == 2, try operation.step(model.io()));
+            try t.expectEqual(index + 1, model.result_reads);
+            try t.expectEqual(index == 2, operation.result != null);
+        }
+        try t.expectEqualDeep(command, operation.result.?.fwsec.?.command);
+        try t.expectEqualSlices(u32, &model.result_words, &operation.result.?.fwsec.?.raw);
+        try t.expect(operation.result.?.mailboxes[0] == null and model.dma.mailbox_writes == 0);
+        try t.expect(try operation.step(model.io()));
+        try t.expectEqual(writes, model.dma.writes);
+        try t.expectEqual(@as(u8, 3), model.result_reads);
+        // Each original completion condition can independently fail. The
+        // failed raw word remains available and no later read is attempted.
+        const faults: [3]anyerror = if (command == .frts) .{ error.FrtsError, error.WprMissing, error.WprTarget } else .{ error.SbProtection, error.SbProgress, error.SbError };
+        const values: [3]u32 = if (command == .frts) .{ 0x12340001, 0xf, 0x2ffed009 } else .{ 0x30, 0x987654fe, 0xabcd0001 };
+        for (faults, values, 0..) |expected, value, index| {
+            model = resultModel(command);
+            model.result_words[index] = value;
+            operation = try run.Operation.init(model.config());
+            try t.expectError(expected, model.drive(&operation));
+            try t.expect(operation.result == null and operation.halt_result != null);
+            try t.expectEqual(index + 1, model.result_reads);
+            try t.expectEqual(value, operation.fwsec_check.?.raw[index]);
+            try t.expectEqual(expected, operation.fwsec_check.?.failure.?);
+            const read_count = model.result_reads;
+            const write_count = model.dma.writes;
+            try t.expectError(error.State, operation.step(model.io()));
+            try t.expect(model.result_reads == read_count and model.dma.writes == write_count);
+        }
+    }
+    // The final observation must still share the original clock/epoch. A
+    // register read itself may fail or consume the remainder of the deadline.
+    const Fault = enum { unavailable, inaccessible, clock, epoch, io };
+    for (std.meta.tags(Fault)) |fault| {
+        var model = resultModel(commands[0]);
+        const expected = switch (fault) {
+            .unavailable => blk: { model.result_words[2] = 0xffffffff; break :blk error.RegisterUnavailable; },
+            .inaccessible => blk: { model.result_words[2] = 0xbadf1234; break :blk error.RegisterUnavailable; },
+            .clock => blk: { model.expire_result = 2; break :blk error.Deadline; },
+            .epoch => blk: { model.stale_result = 2; break :blk error.Stale; },
+            .io => blk: { model.fail_result = 2; break :blk error.ReadResult; },
+        };
+        var operation = try run.Operation.init(model.config());
+        try t.expectError(expected, model.drive(&operation));
+        try t.expect(operation.result == null and operation.halt_result != null);
+        try t.expectEqual(expected, operation.failure.?);
+        try t.expectEqual(@as(u8, 3), model.result_reads);
+    }
+    var model = resultModel(commands[0]);
+    var invalid = model.config();
+    invalid.engine = .sec2;
+    try t.expectError(error.Options, run.Operation.init(invalid));
+    invalid = model.config(); invalid.mailboxes[0] = 0;
+    try t.expectError(error.Options, run.Operation.init(invalid));
+    for ([_]u64{ 0, 1, (@as(u64, 1) << 40) - 0x100000 + 4096 }) |offset| {
+        invalid = model.config(); invalid.fwsec = .{ .frts = offset };
+        try t.expectError(error.Address, run.Operation.init(invalid));
+    }
+    // Highest complete GA106 range remains representable without truncation.
+    invalid = model.config(); invalid.fwsec = .{ .frts = (@as(u64, 1) << 40) - 0x100000 };
+    _ = try run.Operation.init(invalid);
 }

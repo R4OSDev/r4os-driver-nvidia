@@ -333,18 +333,39 @@ test "firmware CPU storage GA106 core sequencing and native MMIO ownership" {
     try t.expectError(error.Busy, io.read32(io.context, r.os));
     try t.expectError(error.Busy, io.write32(io.context, r.os, 1));
     try t.expectError(error.Denied, io.admit(io.context, .core_start));
-    var hs_result: ?hs.Result = null;
+    var hs_result: ?firmware_run.Result = null;
     for (0..128) |_| {
         hs_result = try port.stepFirmware();
         if (hs_result != null) break;
     }
     try t.expect(hs_result != null and hs_result.?.blocks == 4 and hs_result.?.mailboxes[0].? == 0x79 and hs_result.?.mailboxes[1] == null);
+    try t.expect(hs_result.?.fwsec == null);
     try t.expectEqual(@as(u32, 1), fixture.hs_admissions);
     try t.expectEqual(@as(u32, 16), words[(hs.reg.gsp + hs.reg.second_offset + hs.reg.signature) / 4]);
     try t.expectEqual(@as(u32, 0x400), words[(hs.reg.gsp + hs.reg.second_offset + hs.reg.engine_mask) / 4]);
     try t.expectEqual(@as(u32, 9), words[(hs.reg.gsp + hs.reg.second_offset + hs.reg.ucode) / 4]);
     try t.expectEqual(@as(u32, 1), words[(hs.reg.gsp + hs.reg.second_offset + hs.reg.algorithm) / 4]);
     try t.expect(fixture.retains == 1 and !port.close() and fixture.unmaps == 0);
+    // Same actual SDK/MMIO port retains the run through post-halt FWSEC
+    // reads. Command results never mark the device quiescent or release it.
+    const result_check = @import("fwsec_result.zig");
+    for ([_]result_check.Command{ .{ .frts = 0x2ffee0000 }, .sb }) |command| {
+        var fwsec_options = hs_options;
+        fwsec_options.mailboxes = .{ null, null };
+        fwsec_options.fwsec = command;
+        const addresses = if (command == .frts) result_check.frts_registers else result_check.sb_registers;
+        const expected: [3]u32 = if (command == .frts) .{ 0x0000ffff, 0x2fffdff, 0x2ffee09 } else .{ 1, 0xabcdefFF, 0xffff0000 };
+        for (addresses, expected) |address, value| words[address / 4] = value;
+        try port.beginFirmware(fwsec_options);
+        hs_result = null;
+        for (0..128) |_| {
+            hs_result = try port.stepFirmware();
+            if (hs_result != null) break;
+        }
+        try t.expect(hs_result != null and hs_result.?.fwsec != null);
+        try t.expectEqualSlices(u32, &expected, &hs_result.?.fwsec.?.raw);
+        try t.expect(fixture.retains == 1 and !port.close() and fixture.unmaps == 0);
+    }
     // An invalid flush comes AFTER the write: preserve the actual effect and
     // keep the MMIO/DMA owner alive. Subsequent callbacks cannot write again.
     fixture.wrong_flush = true;

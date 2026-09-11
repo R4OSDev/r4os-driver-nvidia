@@ -10,7 +10,26 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
-FWSEC-FRTS preparation bound to retained VRAM (NVIDIA 0.1.31):
+FWSEC completion checks after the actual Falcon run (host qualified):
+
+The prepared native executor can now check command-specific FWSEC results
+after its own reset, measured TCM, upload/start/halt sequence. FRTS checks the
+scratch error, initialized WPR2 and exact low target address. SB checks read
+protection, GFW completion and its scratch error. Each step reads one register
+under the original epoch/deadline and MMIO policy; failures preserve raw data
+and cannot replay. Unrelated scratch bits are preserved. Result success does
+not release DMA/MMIO or establish GSP readiness or global GPU quiescence.
+
+The existing Falcon and SDK/MMIO groups cover both commands and their failure
+conditions; final 51-case owner run and module build pass. No new case/gate or
+guest run. Six complete pinned NVIDIA files/notices accompany the reference
+archive. Native execution and result checks remain unlinked; NVIDIA0.1.31 and
+its 24 resources are byte-identical. Package all additional execution notices
+before linkage. OssiPC is offline and untouched; actual firmware execution,
+full GPU recovery, Booter results and HDMI remain open.
+Evidence: `fwsec_result_checkpoint`; archive `fwsec-result-20260911`.
+
+Current linked FWSEC-FRTS preparation bound to retained VRAM (NVIDIA 0.1.31):
 
 The opt-in boot-check now closes its earlier SB CPU/DMA image and prepares
 a fresh immutable FRTS image from the retained VBIOS. Command 0x15 names the

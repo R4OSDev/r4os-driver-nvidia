@@ -1,5 +1,17 @@
 ﻿# Third-Party Notices
 
+FWSEC post-halt completion checks (host qualified, 2026-09-11):
+fwsec_result.zig adapts the command-specific result checks of
+kgspExecuteFwsec_TU102 in kernel_gsp_frts_tu102.c (NVIDIA2021-2023, MIT).
+The full original notice is preserved in the adaptation. Register facts use
+the original TU102 dev_bus.h (NVIDIA2003-2023) and dev_fb.h/dev_gc6_island.h/
+dev_gc6_island_addendum.h (NVIDIA2003-2022), all MIT. Six complete pinned
+originals, including COPYING, are archived under fwsec-result-20260911.
+R4OS step, epoch/deadline and lifetime composition are original Apache-2.0.
+These routines remain unlinked; NVIDIA0.1.31 and all resource/license bytes
+are unchanged. Before native execution linkage, include the additional
+complete core/HS/result notices in the module and distribution bundle.
+
 
 PRAMIN / VGA-workspace capture (NVIDIA 0.1.29, 2026-09-11):
 pramin.zig follows the GM107 BAR0 window semantics in kern_bus_gm107.c

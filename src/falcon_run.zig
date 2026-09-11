@@ -1,6 +1,6 @@
 //! One admitted GA106 firmware execution: engine reset, actual TCM observation,
 //! HS upload/start/halt. Caller owns exact retained memory and display recovery.
-//! Completion returns raw mailboxes, not authentication or GPU quiescence.
+//! Optional FWSEC checks run after halt. Completion is not GPU quiescence.
 // Original R4OS composition/lifetime: Apache-2.0. HWCFG capacity calculation
 // follows Nouveau nvkm_falcon_oneinit (nvkm/falcon/base.c), under MIT:
 // Copyright (c) 2016, NVIDIA CORPORATION. All rights reserved.
@@ -26,6 +26,7 @@ const std = @import("std");
 const core = @import("gsp_core.zig");
 const hs = @import("falcon_hs.zig");
 const load = @import("fwsec_load.zig");
+const security_result = @import("fwsec_result.zig");
 pub const hwcfg_offset = 0x108;
 pub const max_tcm_bytes = 0x1ff00;
 pub const Options = struct {
@@ -35,6 +36,9 @@ pub const Options = struct {
     deadline: u64,
     plan: load.Plan,
     mailboxes: [2]?u32 = .{ null, null },
+    // Owner admission must bind this command/target to the actual retained
+    // prepared image. Null keeps generic raw-mailbox/Booter interpretation.
+    fwsec: ?security_result.Command = null,
 
     fn upload(self: *const Options, hwcfg: u32) hs.Options {
         return .{ .engine = self.engine, .boot0 = self.boot0, .epoch = self.epoch, .deadline = self.deadline, .plan = self.plan, .mailboxes = self.mailboxes, .imem_capacity = (hwcfg & 0x1ff) << 8, .dmem_capacity = (hwcfg & 0x3fe00) >> 1 };
@@ -51,7 +55,8 @@ pub const Io = struct {
     read32: *const fn (*anyopaque, u32) anyerror!u32,
     write32: *const fn (*anyopaque, u32, u32) anyerror!void,
 };
-pub const Phase = enum { admission, reset, hwcfg, status, engine, core_select, stable_hwcfg, upload, complete };
+pub const Result = struct { mailboxes: [2]?u32, blocks: u32, fwsec: ?security_result.Report = null };
+pub const Phase = enum { admission, reset, hwcfg, status, engine, core_select, stable_hwcfg, upload, fwsec_result, complete };
 pub const Operation = struct {
     options: Options,
     reset: core.Operation,
@@ -63,23 +68,31 @@ pub const Operation = struct {
     last_value: ?u32 = null,
     hwcfg: u32 = 0,
     hwcfg2: u32 = 0,
-    result: ?hs.Result = null,
+    halt_result: ?hs.Result = null,
+    fwsec_check: ?security_result.Observer = null,
+    result: ?Result = null,
     failure: ?anyerror = null,
 
     pub fn init(options: Options) !Operation {
+        const fwsec_check = if (options.fwsec) |command| blk: {
+            if (options.engine != .gsp or options.mailboxes[0] != null or options.mailboxes[1] != null) return error.Options;
+            break :blk try security_result.Observer.init(command);
+        } else null;
         // Reject the whole malformed transfer before even resetting hardware.
         // Actual (possibly smaller) capacities are read after reset completes.
         var upload = options.upload(0x3ffff);
         upload.imem_capacity = max_tcm_bytes;
         upload.dmem_capacity = max_tcm_bytes;
         try hs.validate(&upload);
-        return .{ .options = options, .reset = try core.Operation.initReset(options.engine, options.epoch, options.deadline, options.boot0) };
+        return .{ .options = options, .fwsec_check = fwsec_check, .reset = try core.Operation.initReset(options.engine, options.epoch, options.deadline, options.boot0) };
     }
     pub fn base(self: *const Operation) u32 {
         return if (self.options.engine == .gsp) hs.reg.gsp else hs.reg.sec2;
     }
     fn guard(self: *Operation, io: Io) !void {
         if (self.failure != null or self.self_address != @intFromPtr(self)) return error.State;
+        if ((self.options.fwsec == null) != (self.fwsec_check == null)) return error.State;
+        if (self.fwsec_check) |check| if (!std.meta.eql(check.command, self.options.fwsec.?)) return error.State;
         if (io.generation(io.context) != self.options.epoch) return error.Stale;
         const now = io.now_ns(io.context);
         if (now == std.math.maxInt(u64) or now < self.last_clock) return error.Clock;
@@ -133,6 +146,7 @@ pub const Operation = struct {
         if (self.self_address != @intFromPtr(self)) return error.State;
         return self.advance(io) catch |err| {
             self.failure = err;
+            self.result = null;
             return err;
         };
     }
@@ -176,7 +190,27 @@ pub const Operation = struct {
                 var adapter: Adapter = .{ .operation = self, .io = io };
                 const operation = &self.hs_operation.?;
                 if (try operation.step(.{ .context = &adapter, .generation = generation, .now_ns = nowNs, .admit = admitUpload, .read32 = read32, .write32 = write32 })) {
-                    self.result = operation.result;
+                    self.halt_result = operation.result;
+                    if (self.fwsec_check != null) self.phase = .fwsec_result else {
+                        self.result = .{ .mailboxes = operation.result.mailboxes, .blocks = operation.result.blocks };
+                        self.phase = .complete;
+                    }
+                }
+            },
+            .fwsec_result => {
+                // One guarded, read-only observation per step, exclusively
+                // after this same operation completed reset/upload/start/halt.
+                const observer = &self.fwsec_check.?;
+                if (self.halt_result == null or self.hs_operation.?.phase != .complete or self.hs_operation.?.failure != null) return error.State;
+                self.last_address = observer.nextRegister() orelse return error.State;
+                self.last_value = null;
+                const value = try io.read32(io.context, self.last_address.?);
+                self.last_value = value;
+                try self.guard(io);
+                // Scratch words carry arbitrary unrelated bits: do not apply
+                // the engine-control register's stricter upper-half filter.
+                if (try observer.accept(value)) {
+                    self.result = .{ .mailboxes = self.halt_result.?.mailboxes, .blocks = self.halt_result.?.blocks, .fwsec = try observer.report() };
                     self.phase = .complete;
                 }
             },

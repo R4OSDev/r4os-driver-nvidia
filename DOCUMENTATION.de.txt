@@ -10,7 +10,29 @@ unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
 
-FWSEC-FRTS an gehaltenen VRAM binden (NVIDIA 0.1.31)
+FWSEC-Ergebnisse nach dem echten Falcon-Ablauf pruefen (Hostnachweis)
+------------------------------------------------------------------
+Der vorbereitete native Ausfuehrungspfad prueft FWSEC-Ergebnisse erst nach
+seinem eigenen Reset, gemessenen TCM und Upload/Start/Halt. FRTS verlangt
+fehlerfreien Scratchwert, initialisiertes WPR2 und die richtige Zieladresse.
+SB prueft Lesefreigabe, GFW-Fortschritt und seinen Scratchfehler. Ein Register
+pro Schritt unter derselben Epoche/Frist und MMIO-Zugriffspolitik; rohe Werte
+bleiben auch bei Fehlern erhalten, keine Wiederholung nach Fehler. Fremde
+Scratchbits bleiben erhalten. Erfolg beweist keine GSP-Bereitschaft oder
+globale GPU-Quieszenz und gibt weder DMA noch MMIO frei.
+
+Bestehende Falcon- und echte SDK/MMIO-Fallgruppen pruefen beide Befehle und
+die Fehlerbedingungen. Final 51 Besitzerfaelle und Modulbuild bestanden;
+keine neue Fallzahl, kein Gate/Gastlauf. Sechs komplette NVIDIA-Originale
+samt Lizenzen archiviert. Ausfuehrung und Ergebnispruefung bleiben ungelinkt;
+NVIDIA0.1.31 samt 24 Ressourcen ist bytegleich. Vor ausfuehrbarer Einbindung
+alle zusaetzlichen Core-/HS-/Ergebnishinweise in das Lizenzpaket aufnehmen.
+OssiPC offline/unveraendert, kein Zugriff/Update. Physischer Firmwarestart,
+vollstaendige GPU-Recovery, Booter-Ergebnisse und HDMI bleiben offen.
+Beleg: fwsec_result_checkpoint. Archiv:
+ExFiles/Reference/GFX/Nvidia/0.79.10/fwsec-result-20260911.
+
+Aktuell eingebunden: FWSEC-FRTS an gehaltenen VRAM binden (NVIDIA 0.1.31)
 -------------------------------------------------
 Der optionale Bootcheck schliesst zuerst sein bisheriges SB-Abbild samt DMA
 und bereitet aus dem gehaltenen VBIOS ein neues unveraenderliches FRTS-Abbild

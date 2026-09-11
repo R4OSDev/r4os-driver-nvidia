@@ -7,7 +7,6 @@ const a = r4os.abi;
 const identity = @import("identity.zig");
 const seq = @import("gsp_sequencer.zig");
 const core = @import("gsp_core.zig");
-const hs = @import("falcon_hs.zig");
 const firmware_run = @import("falcon_run.zig");
 pub const Access = enum { read, write };
 pub const Owner = struct {
@@ -27,7 +26,8 @@ pub const Owner = struct {
     // and handled log-reader suspension. No timeout or Falcon halt substitutes.
     quiesced: *const fn (*anyopaque) bool,
     log_polling: ?*const fn (*anyopaque, bool) anyerror!void = null,
-    // Bind exact firmware/DMA and VRAM/VGA/display recovery before reset.
+    // Bind exact firmware/DMA, optional FWSEC command/target and VRAM/VGA/
+    // display recovery before reset, including post-halt register reads.
     // The executor performs reset and measures TCM itself. Pure admission;
     // absent capability refuses the entire operation before device effects.
     admit_firmware: ?*const fn (*anyopaque, *const firmware_run.Options) anyerror!void = null,
@@ -102,10 +102,10 @@ pub const Port = struct {
         if (self.owner.?.admit_firmware == null) return error.Unsupported;
         self.firmware_operation = operation;
     }
-    /// Completion reports Falcon halt and raw mailboxes only. All DMA and
-    /// this mapping stay retained; the native caller must verify the specific
-    /// FWSEC/Booter result, recovery and device quiescence separately.
-    pub fn stepFirmware(self: *Port) !?hs.Result {
+    /// FWSEC completion includes command-specific post-halt register checks;
+    /// generic runs return raw mailboxes. All DMA and this mapping stay held.
+    /// Neither result establishes GSP readiness or device quiescence.
+    pub fn stepFirmware(self: *Port) !?firmware_run.Result {
         errdefer |err| self.failure = err;
         try self.guard();
         const operation = if (self.firmware_operation) |*op| op else return error.State;
