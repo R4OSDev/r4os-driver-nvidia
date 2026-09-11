@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.53; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.54; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -11,6 +11,33 @@ Starting with R4OS 0.79.9, `IMAGE_SCOPE=slim` includes the current module in
 Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
+
+Early GSP initialization messages (NVIDIA 0.1.54, 2026-09-12):
+
+RM consumes system information and registry settings before creating its GPU
+object. The start path now places those two asynchronous messages into the
+actual fresh command queue before FWSEC/Booter. The same Session carries its
+TX cursor/sequence through the firmware handshake; unrelated old CPU queue
+state remains rejected. Preloading synchronizes payloads before cursors and
+does not ring a doorbell or mark unexposed DMA as firmware-owned.
+
+The 928-byte SystemInfo uses the held PCI identity/apertures and console size,
+documented config mirror, 4-KB pages and the positive canonical end of R4OS's
+48-bit CPU VA layout. It does not advertise unavailable host services. The
+three pinned Nouveau boot registry settings are encoded with exact DWORD
+entries. A partial preload cannot be retried; pre-submit cleanup remains valid.
+
+One existing owner run passes 51/51 cases, including actual packets, partial
+DMA failure/cleanup, preserved counters and foreign-session rejection. One C
+comparison verifies 12 exact original declarations and 47 SystemInfo ABI fields;
+the module build and legal staging pass. No new group, guest or hardware run.
+Kernel152 is unchanged. Full source notices now occupy 41,158 bytes, preserving
+the previous 27,240 bytes as an exact prefix. Twenty-six complete pinned
+references and the evidence are in 0.79.10/gsp-preboot-20260912 under
+ExFiles/Reference/GFX/Nvidia. Actual firmware acceptance, post-init RM, IRQ,
+thermal verification and full GPU/UEFI restoration remain open.
+
+The entries below describe preceding checkpoints.
 
 Resident GSP runtime (NVIDIA 0.1.53, 2026-09-12):
 
@@ -39,8 +66,6 @@ ExFiles/Reference/GFX/Nvidia/0.79.10/gsp-runtime-20260912.
 Physical firmware start, IRQ wakeup/health, RM initialization, full GPU/UEFI
 restore and native video/audio remain open. OssiPC was not contacted or
 updated; its last verified state is Kernel150/NVIDIA50 passive.
-
-The entries below describe preceding checkpoints.
 
 Native GSP start wiring (NVIDIA 0.1.52 / Kernel 0.1.152, 2026-09-12):
 

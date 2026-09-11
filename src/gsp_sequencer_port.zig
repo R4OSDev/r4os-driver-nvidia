@@ -187,6 +187,8 @@ pub const Port = struct {
     phase: Phase = .boot,
     runtime_session: ?*transport.Session = null,
     runtime_sequence: ?*RuntimeSequencer = null,
+    preloaded_session: ?*transport.Session = null,
+    preloading: bool = false,
     recovery_owner: usize = 0,
     recovery_deadline: u64 = 0,
     recovery_last_clock: u64 = 0,
@@ -257,6 +259,20 @@ pub const Port = struct {
     fn boundTransport(self: *Port) transport.Port {
         return .{ .context = self, .generation = generation, .now_ns = nowNs, .read = queueRead, .publish = queuePublish, .notification = .{ .context = self, .generation = generation, .prepare = prepareCommand, .submit = notifyCommand } };
     }
+    /// Fill the fresh CPU queue before any firmware/MMIO effect. Exact native
+    /// mapping/run ownership remains checked for every range. This one-shot
+    /// scope omits ordinary publication retention because no GPU has received
+    /// these new DMA addresses; no notification register is touched.
+    pub fn preloadInit(self: *Port, session: *transport.Session, system: []const u8, registry: []const u8) !void {
+        if (self.phase != .boot or self.preloaded_session != null or self.preloading or self.effects_possible or self.retained) return error.State;
+        const memory = try self.queueMemory(self.run.deadline_ns);
+        if (memory.retained or !std.meta.eql(session.port, self.boundTransport()) or session.epoch != self.run.epoch) return error.Binding;
+        self.preloaded_session = session;
+        self.preloading = true;
+        defer self.preloading = false;
+        errdefer |err| self.recordFailure(err);
+        try session.preloadInit(self.run.deadline_ns, system, registry);
+    }
     fn runtimeValid(self: *Port) bool {
         if (self.phase != .runtime) return true;
         const session = self.runtime_session orelse return false;
@@ -270,6 +286,7 @@ pub const Port = struct {
         if (self.phase != .boot) return error.Phase;
         try self.guard();
         if (!std.meta.eql(boot.session.port, try self.transportPort()) or boot.session.epoch != self.run.epoch) return error.Binding;
+        if (self.preloaded_session) |session| if (boot.session != session) return error.Binding;
         if (boot.state != .init_done or boot.pending != null or boot.session.pending != null or boot.session.state != .active) return error.State;
         const admit_runtime = self.owner.?.admit_runtime orelse return error.Unsupported;
         errdefer |err| self.recordFailure(err);
@@ -306,9 +323,15 @@ pub const Port = struct {
         if (self.runtime_sequence) |execution| if (!execution.permitsAck(deadline, queue, offset, bytes)) return error.Busy;
         errdefer |err| self.recordFailure(err);
         const memory = try self.queueMemory(deadline);
-        // ACK publication can be the first effect too. It needs retention,
-        // but does not ring the command queue notification register.
-        try self.retainFor(.{ .request = deadline });
+        if (self.preloading) {
+            if (self.phase != .boot or self.effects_possible or self.retained or memory.retained or
+                self.preloaded_session == null or self.preloaded_session.?.state != .linking or queue != .command or
+                !((offset == 16 and bytes.len == 4) or offset >= transport.message.element_bytes)) return error.State;
+        } else {
+            // ACK publication can be the first effect too. It needs retention,
+            // but does not ring the command queue notification register.
+            try self.retainFor(.{ .request = deadline });
+        }
         const port = try memory.transportPort();
         try port.publish(port.context, deadline, queue, offset, bytes);
         try self.guardFor(.{ .request = deadline });

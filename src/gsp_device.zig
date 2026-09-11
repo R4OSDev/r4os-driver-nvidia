@@ -20,6 +20,7 @@ const events = @import("gsp_boot_events.zig");
 const sequencer = @import("gsp_sequencer.zig");
 const teardown = @import("gsp_teardown.zig");
 const runtime = @import("gsp_runtime.zig");
+const preboot = @import("gsp_preboot.zig");
 
 pub const Phase = enum { detached, frts, prepare, load, start, notifications, ready, recovering, failed };
 pub const Progress = enum { progress, idle, stopped };
@@ -92,6 +93,11 @@ pub const Device = struct {
         try self.port.openShared(ctx, &display.snapshot.?, original.boot0, original.boot1,
             .{ .epoch = self.epoch, .deadline_ns = deadline, .resume_args = inputs.resume_args },
             self.owner(), &display.registers);
+        var payloads: preboot.Payloads = .{};
+        try preboot.encode(&display.snapshot.?, display.original_boot.?.byte_length, &payloads);
+        self.session = try transport.Session.init(try self.port.transportPort(), .{ .chip_id = 0x176 }, self.epoch, &self.tx, &self.rx);
+        try self.port.preloadInit(&self.session.?, &payloads.system, &payloads.registry);
+        self.ctx.?.logInfo("NVIDIA gsp-start: preboot=system-info,registry rpc-sequence=0 queue-sequence=2 firmware-submitted=no");
         try self.beginFirmware(.frts, &inputs);
     }
 
@@ -178,7 +184,7 @@ pub const Device = struct {
             .start => if (try self.port.stepColdBoot()) {
                 self.phase = .notifications;
                 self.phase_deadline = self.deadline;
-                self.session = try transport.Session.init(try self.port.transportPort(), .{ .chip_id = 0x176 }, self.epoch, &self.tx, &self.rx);
+                if (self.session == null or self.port.preloaded_session != &self.session.? or self.session.?.tx_sequence != 2) return error.State;
                 self.boot = try events.Boot.init(&self.session.?, self.deadline);
                 self.logPhase();
             },

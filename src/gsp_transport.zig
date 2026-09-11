@@ -100,6 +100,8 @@ pub const Session = struct {
     rx_sequence: u32 = 0,
     next_ticket: u64 = 1,
     pending: ?Ticket = null,
+    preloaded: bool = false,
+    preload_layout: ?ring.Layout = null,
     // The sole RM namespace survives all Boot/Exchange/display handoffs.
     // Only the serialized graph owner mutates it; transport I/O never does.
     rm_names: @import("gsp_rm_names.zig").Ledger,
@@ -179,6 +181,39 @@ pub const Session = struct {
         try self.check(deadline);
     }
 
+    /// Exactly the two asynchronous early-RM messages, before firmware sees
+    /// this queue. The native caller must admit a fresh unsubmitted run and
+    /// a CPU-only publication scope. No peer header or doorbell is fabricated.
+    pub fn preloadInit(self: *Session, deadline: u64, system: []const u8, registry: []const u8) Error!void {
+        if (self.state != .linking or self.link != null or self.link_deadline != null or self.preloaded or
+            self.tx_write != 0 or self.tx_sequence != 0 or self.pending != null) return error.State;
+        if (system.len == 0 or registry.len == 0 or system.len > message.max_payload_bytes or registry.len > message.max_payload_bytes) return error.Length;
+        self.preloaded = true; // A partial publication cannot be repeated.
+        errdefer self.state = .failed;
+        var own: [ring.header_bytes]u8 = undefined;
+        var peer: [ring.header_bytes]u8 = undefined;
+        try self.read(deadline, .command, 0, &own);
+        const header = try ring.inspect(&own);
+        if (header.write != 0 or try self.readWord(deadline, .{ .queue = .command, .offset = header.layout.rx_offset }) != 0) return error.Stale;
+        try self.read(deadline, .status, 0, &peer);
+        if (!std.mem.allEqual(u8, &peer, 0)) return error.Stale;
+        self.preload_layout = header.layout;
+        for ([_][]const u8{ system, registry }, [_]u32{ 72, 73 }) |payload, function| {
+            // NOSEQ async RPCs carry RPC sequence0; outer queue sequences
+            // still advance and must survive the later firmware handshake.
+            const encoded = try message.encode(self.profile, self.tx_sequence, .{ .function = function }, payload, self.tx);
+            const plan = try ring.transmit(header.layout, self.tx_write, 0, encoded.elements);
+            var copied: usize = 0;
+            for (plan.spans[0..plan.span_count]) |span| {
+                try self.publish(deadline, .command, span.offset, self.tx[copied..][0..span.bytes]);
+                copied += span.bytes;
+            }
+            try self.publishWord(deadline, .{ .queue = .command, .offset = 16 }, plan.next_cursor);
+            self.tx_write = plan.next_cursor;
+            self.tx_sequence += 1;
+        }
+    }
+
     /// One readiness attempt, no spin/retry loop. Firmware may still be
     /// constructing its header; caller reschedules within one absolute limit.
     pub fn connect(self: *Session, deadline: u64) Error!void {
@@ -193,10 +228,16 @@ pub const Session = struct {
         const link = ring.inspectLink(&own, &peer) catch return error.NotReady;
         const tx_read = try self.readWord(limit, link.command_read);
         const rx_read = try self.readWord(limit, link.status_read);
-        // Sequence numbers begin at zero. A nonempty firmware TX ring is
-        // allowed (early notifications), but an old CPU session is not.
-        if (link.command.write != 0 or tx_read != 0 or rx_read != 0) return self.fail(error.Stale);
+        // Only this exact session may adopt its two preboot messages. Firmware
+        // may already have consumed some/all of them. Unknown old CPU cursors
+        // are still rejected, and RX/ACK always starts at zero.
+        if (self.preloaded) {
+            if (self.tx_sequence != 2 or self.preload_layout == null or
+                !std.meta.eql(link.command.layout, self.preload_layout.?) or
+                link.command.write != self.tx_write or tx_read > self.tx_write or rx_read != 0) return self.fail(error.Stale);
+        } else if (link.command.write != 0 or tx_read != 0 or rx_read != 0) return self.fail(error.Stale);
         self.link = link;
+        self.tx_peer_read = tx_read;
         self.rx_peer_write = link.status.write;
         self.state = .active;
     }

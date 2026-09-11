@@ -20,6 +20,7 @@ var closing = false;
 var clock: u64 = 100;
 var range_failure: i32 = 0;
 var range_calls: usize = 0;
+var range_failure_call: usize = 0;
 const LogFault = enum { none, producer, timeout, regression, io };
 var log_fault: LogFault = .none;
 const offsets = [_]usize{ 0, 8192, 73728, 139264, 204800, 270336, 335872 };
@@ -142,6 +143,7 @@ fn rangeSync(mapping: *const a.DmaMapping, offset: u32, bytes: u32, cpu: bool) i
     std.debug.assert(index >= 1 and index <= 6 and maps[index] and pins[index]);
     std.debug.assert(bytes != 0 and bytes <= 65536 and offset <= lengths[index] - bytes);
     range_calls += 1;
+    if (range_failure_call != 0 and range_calls == range_failure_call) return -31;
     if (range_failure != 0) return range_failure;
     const device = if (fault == .bounce) shadow else backing.?;
     if (index < 6) {
@@ -1384,6 +1386,10 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
     table.log_error = DeviceModel.log;
     var snapshot: identity.Snapshot = .{ .pci = .{ .vendor_id = 0x10de, .device_id = 0x2504, .class_code = 3 }, .command = 7 };
     snapshot.bars[0] = .{ .kind = .memory32, .base = 0xfb000000, .bytes = words.len * 4 };
+    snapshot.bars[1] = .{ .kind = .memory64, .base = 0xd0000000, .bytes = 0x10000000 };
+    snapshot.bars[2] = .{ .kind = .upper };
+    snapshot.bars[3] = .{ .kind = .memory64, .base = 0xe0000000, .bytes = 0x2000000 };
+    snapshot.bars[4] = .{ .kind = .upper };
     const chip = identity.chip(0xb76000a1, 0).?;
     capture.snapshot = snapshot;
     capture.chip = chip;
@@ -1413,7 +1419,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
     const command = init.queues_offset + init.command_offset;
     const status = init.queues_offset + init.status_offset;
     const header = backing.?[command..][0..32].*;
-    const Case = enum { success, old_api, frts_error, timeout, stolen_display, unknown_event,
+    const Case = enum { success, old_api, preboot_partial, frts_error, timeout, stolen_display, unknown_event,
         runtime_healthy, runtime_lockdown, runtime_unknown, runtime_unowned, runtime_sequence_timeout,
         runtime_log_failure, runtime_moving_log };
     for (std.enums.values(Case)) |case| {
@@ -1452,8 +1458,42 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
             try t.expect(target.self_address == 0 and !lease.retained and capture.firmware_owner == 0);
             capture.snapshot.?.command |= 4;
         }
+        if (case == .preboot_partial) {
+            // Own header/read cursor + absent peer, system data/cursor, then
+            // failure synchronizing registry data. No firmware sees this run.
+            range_failure_call = range_calls + 6;
+            try t.expectError(error.Io, target.open(ctx, capture, held, lease, &reader));
+            range_failure_call = 0;
+            try t.expect(target.session.?.state == .failed and target.session.?.tx_sequence == 1);
+            try t.expect(std.mem.readInt(u32, backing.?[command + 16 ..][0..4], .little) == 1);
+            try t.expect(!target.port.effects_possible and !lease.retained and capture.firmware_owner == 0);
+            try t.expect(target.closeBeforeSubmission() and reader.close());
+            // Retained host fixture mappings are still owned here. Reset only
+            // their injected failure before staging a different model case.
+            lease.failed = false;
+            lease.queue.failed = false;
+            continue;
+        }
         try target.open(ctx, capture, held, lease, &reader);
         try t.expect(target.phase == .frts and !target.port.effects_possible and capture.firmware_owner == 0);
+        const session = &target.session.?;
+        try t.expect(session.preloaded and session.tx_sequence == 2 and session.tx_write == 2);
+        try t.expect(std.mem.allEqual(u8, backing.?[status..][0..32], 0));
+        const before_repeat = range_calls;
+        try t.expectError(error.State, target.port.preloadInit(session, &.{1}, &.{1}));
+        try t.expect(range_calls == before_repeat and !lease.retained);
+        const system_message = try transport.message.decode(.{ .chip_id = 0x176 }, backing.?[command + 4096 ..][0..4096], 0);
+        const registry_message = try transport.message.decode(.{ .chip_id = 0x176 }, backing.?[command + 8192 ..][0..4096], 1);
+        try t.expect(system_message.rpc.function == 72 and system_message.rpc.sequence == 0 and system_message.payload.len == 928);
+        try t.expect(registry_message.rpc.function == 73 and registry_message.rpc.sequence == 0);
+        try t.expect(std.mem.readInt(u64, system_message.payload[0..8], .little) == snapshot.bars[0].base);
+        try t.expect(std.mem.readInt(u64, system_message.payload[8..16], .little) == snapshot.bars[1].base);
+        try t.expect(std.mem.readInt(u64, system_message.payload[16..24], .little) == snapshot.bars[3].base);
+        try t.expect(std.mem.readInt(u64, system_message.payload[64..72], .little) == 0x10000);
+        try t.expect(std.mem.readInt(u64, system_message.payload[72..80], .little) == 0x800000000000);
+        try t.expect(std.mem.readInt(u64, system_message.payload[920..928], .little) == 4096 and system_message.payload[896] == 1);
+        try t.expect(std.mem.readInt(u32, registry_message.payload[4..8], .little) == 3);
+        try t.expect(std.mem.indexOf(u8, registry_message.payload, "RMForcePcieConfigSave\x00") != null);
         const original_epoch = capture.boot.held_generation;
         var injected = false;
         var notified = false;
@@ -1471,6 +1511,9 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
                 if (!boot_lockdown) {
                     @memcpy(backing.?[status..][0..32], &header);
                     std.mem.writeInt(u32, backing.?[status + 24 ..][0..4], 64, .little);
+                    // The firmware can consume both async commands before
+                    // initializing its producer/header and emitting INIT_DONE.
+                    std.mem.writeInt(u32, backing.?[status + 64 ..][0..4], 2, .little);
                 }
                 if (case == .runtime_lockdown and !boot_lockdown) {
                     try nativeEvent(&target.session.?, 0x101c, &.{1});
@@ -1491,6 +1534,12 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         if (boot_success) {
             try t.expect(target.phase == .ready and target.handoff != null and target.frts_result != null and target.load_result != null);
             try t.expect(target.boot.?.handled_events == @as(u64, if (boot_lockdown) 2 else 1) and target.session.?.pending == null and target.port.phase == .runtime);
+            try t.expect(session.tx_sequence == 2 and session.tx_write == 2 and session.tx_peer_read == 2);
+            if (case == .success) {
+                var foreign = try transport.Session.init(session.port, session.profile, session.epoch, &target.tx, &target.rx);
+                try t.expectError(error.Stale, foreign.connect(target.deadline));
+                try t.expect(session.state == .active); // Cannot adopt an old nonempty CPU queue.
+            }
             if (exercise_runtime) try checkDeviceRuntime(target, words, held.plan.?.frts.offset, case);
         } else {
             try t.expect(target.phase == .failed and target.failure != null);

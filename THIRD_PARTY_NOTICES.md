@@ -1,5 +1,16 @@
 ﻿# Third-Party Notices
 
+Preboot initialization RPCs (NVIDIA0.1.54, 2026-09-12):
+SystemInfo/registry layouts and early queue ordering follow the pinned
+NVIDIA570.144 sources and Nouveau r570/r535. Eleven complete source
+notices are retained in gsp_preboot.zig and appended to the existing
+NVIDIA-GSP-RUNTIME-LICENSE.txt; its previous27,240 bytes remain an exact
+prefix in both module and Distribution. The no-header ABI/enumeration
+files use the pinned COPYING default MIT notice. Nouveau r570 keeps
+its original SPDX/copyright and the full original Linux MIT text.
+Twenty-six full originals and one exact C ABI comparison are archived
+under 0.79.10/gsp-preboot-20260912. R4OS binding/publication: Apache-2.0.
+
 Resident GSP runtime (NVIDIA 0.1.53, 2026-09-12):
 The previously prepared runtime exchange and typed events are now linked
 to the actual device worker. Their full original NVIDIA/Nouveau notices,
