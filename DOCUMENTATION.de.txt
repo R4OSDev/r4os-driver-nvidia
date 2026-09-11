@@ -10,7 +10,36 @@ unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
 
-GA106-HS-Falcon-Lader und MMIO-Bindung (Hostnachweis)
+Zusammenhaengender Falcon-Reset-/Firmwarelauf (Hostnachweis)
+---------------------------------------------------------
+falcon_run besitzt Engine-Reset, anschliessende TCM-Messung und HS-Upload in
+einer begrenzten Operation. Der gemeinsame Corecode verwendet jetzt auch
+die wirklichen SEC2-Resetregister. Nach Reset: HWCFG zweimal lesen,
+Scrubbing-/Reset-/Core-Zustand pruefen und das ganze Abbild gegen gemessene
+IMEM-/DMEM-Kapazitaeten validieren. Keine Kapazitaetszahlen oder erfolgreiche
+Reset-Rueckmeldung vom Aufrufer. Wie im Original gilt BCR.VALID nach einem
+geschriebenen Corewechsel; bereits ausgewaehlter Falcon braucht keinen neuen.
+
+Port.beginFirmware/stepFirmware ersetzen die direkte HS-Bindung. Reine
+Zulassung haelt exaktes Firmware-/DMA-Abbild sowie VRAM/VGA/Display-Recovery
+vor dem ersten Resetwrite; die zweite BCR-Registerseite muss vorher passen.
+Derselbe MMIO-Besitzer, feste Frist/Epoche und behaltene Fehlerzustand gelten
+fuer Reset, Messung und Upload. Kein Neustart nach Fehler oder Verschieben;
+rohe Mailboxen und Falcon-Halt beweisen keine Authentifizierung/Quieszenz.
+
+Vorhandene 51 Besitzerfaelle bestanden; HS- und SDK/MMIO-Fall erweitert,
+keine neue Testdatei, kein Gate/Gastlauf. Original-C-Vergleich: 39 Corewerte
+(neun weitere SEC2-/TCM-Werte) und 34 HS-Werte. 210 vollstaendige NVIDIA-
+Originale und die originale MIT-Nouveau-Kapazitaetsquelle aus Linux-Commit
+038d61fd642278bab63ee8ef722c50d10ab01e8f archiviert. NVIDIA 0.1.27 bleibt
+bytegleich; Ausfuehrung weiterhin ungelinkt, kein Hardwarelauf/Update.
+Native VRAM/VGA/Recoverybesitzer, FRTS/Erststart und Ergebnisauswertung,
+IRQ/Log/Health und bewiesene Quieszenz bleiben offen. Zusaetzliche volle
+MIT-Hinweise vor ausfuehrbarer Einbindung paketieren.
+Archiv: ExFiles/Reference/GFX/Nvidia/0.79.10/falcon-run-20260911.
+JSON: falcon_run_checkpoint; 0.79.10 bleibt offen.
+
+Historisch: GA106-HS-Falcon-Lader und MMIO-Bindung (Hostnachweis)
 --------------------------------------------------
 falcon_hs implementiert die originale GA102-HS-Folge fuer GSP-FWSEC und
 SEC2-Booter: DMA-Platz vor Basisregistern und jedem 256-Byte-Transfer pruefen;

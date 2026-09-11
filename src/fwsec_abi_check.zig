@@ -9,6 +9,7 @@ const boot_events = @import("gsp_boot_events.zig");
 const sequencer = @import("gsp_sequencer.zig");
 const core = @import("gsp_core.zig");
 const hs = @import("falcon_hs.zig");
+const firmware_run = @import("falcon_run.zig");
 extern fn r4nv_falcon_hs_abi_check([*]const u32, usize) c_int;
 extern fn r4nv_gsp_core_abi_check([*]const u32, usize) c_int;
 extern fn r4nv_fwsec_abi_check([*]const u8, usize, c_uint, [*]const u8, usize, c_uint, [*]const u8, usize) c_int;
@@ -21,11 +22,12 @@ pub fn main() !void {
     const r = core.reg;
     const b = core.bits;
     const core_values = [_]u32{
-        r.hwcfg2,       r.engine,               r.rm,          r.fbif,      r.dmactl,        r.cpuctl,     r.cpuctl_alias,
-        r.bcr,          r.riscv_cpuctl,         r.mailbox0,    r.mailbox1,  r.os,            r.sec_cpuctl, r.sec_cpuctl_alias,
-        r.sec_mailbox0, r.handoff,              b.reset_ready, b.scrubbing, b.riscv_enabled, b.reset,      b.allow_phys,
-        b.start,        b.alias,                b.halted,      b.bcr_riscv, b.bcr_valid,     b.bcr_boot,   b.active,
-        b.handoff_done, core.propagation_reads,
+        r.hwcfg2,       r.engine,               r.rm,                      r.fbif,                     r.dmactl,        r.cpuctl,     r.cpuctl_alias,
+        r.bcr,          r.riscv_cpuctl,         r.mailbox0,                r.mailbox1,                 r.os,            r.sec_cpuctl, r.sec_cpuctl_alias,
+        r.sec_mailbox0, r.handoff,              b.reset_ready,             b.scrubbing,                b.riscv_enabled, b.reset,      b.allow_phys,
+        b.start,        b.alias,                b.halted,                  b.bcr_riscv,                b.bcr_valid,     b.bcr_boot,   b.active,
+        b.handoff_done, core.propagation_reads, r.sec_hwcfg2,              r.sec_engine,               r.sec_rm,        r.sec_fbif,   r.sec_dmactl,
+        r.sec_bcr,      b.reset,                firmware_run.hwcfg_offset, firmware_run.max_tcm_bytes,
     };
     if (r4nv_gsp_core_abi_check(&core_values, core_values.len) != 0) return error.OriginalCoreMismatch;
     const hr = hs.reg;

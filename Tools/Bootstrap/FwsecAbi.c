@@ -213,7 +213,7 @@ int r4nv_fwsec_abi_check(const unsigned char *sb, size_t sb_len, unsigned sb_id,
          "\"gsp_message_byte_comparison\":true,\"gsp_message_fixtures\":6,"
          "\"gsp_boot_event_original_comparison\":true,\"gsp_boot_event_fixtures\":6,"
          "\"gsp_sequencer_original_comparison\":true,\"gsp_sequencer_opcodes\":9,"
-         "\"gsp_core_register_original_comparison\":true,\"gsp_core_register_values\":30,"
+         "\"gsp_core_register_original_comparison\":true,\"gsp_core_register_values\":39,"
          "\"falcon_hs_register_original_comparison\":true,\"falcon_hs_register_values\":34,"
          "\"gsp_message_outer_bytes\":48,\"gsp_rpc_header_bytes\":32,"
          "\"gsp_message_min_bytes\":80,\"gsp_message_max_bytes\":65536,"

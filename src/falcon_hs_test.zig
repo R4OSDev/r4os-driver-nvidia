@@ -1,6 +1,8 @@
 const std = @import("std");
 const t = std.testing;
 const hs = @import("falcon_hs.zig");
+const core = @import("gsp_core.zig");
+const run = @import("falcon_run.zig");
 const r = hs.reg;
 const b = hs.bits;
 
@@ -264,4 +266,192 @@ test "firmware CPU storage HS Falcon DMA honors queue ordering, PKC and irrevers
     model.clock = 1;
     try t.expectError(error.Clock, operation.step(model.io()));
     try t.expect(model.writes == 0);
+    try checkCompleteRun();
+}
+
+// One device model composes the actual reset and actual HS executors. The
+// reset cannot be replaced by a callback that merely reports completion.
+const RunModel = struct {
+    dma: Model,
+    reset_edges: u32 = 0,
+    propagation: u32 = 0,
+    reset_complete: bool = false,
+    sizes_read: u32 = 0,
+    hwcfg: u32 = 0x20100,
+    bcr: u32 = core.bits.bcr_riscv | core.bits.bcr_valid,
+    riscv: bool = true,
+    unstable: bool = false,
+    scrub_after_reset: bool = false,
+    reset_stuck: bool = false,
+    wrong_core: bool = false,
+    lost_valid: bool = false,
+    fail_reset: bool = false,
+
+    fn cast(p: *anyopaque) *RunModel {
+        return @ptrCast(@alignCast(p));
+    }
+    fn generation(p: *anyopaque) u64 {
+        return cast(p).dma.epoch;
+    }
+    fn now(p: *anyopaque) u64 {
+        return cast(p).dma.clock;
+    }
+    fn config(self: *const RunModel) run.Options {
+        const c = self.dma.config;
+        return .{ .engine = c.engine, .boot0 = c.boot0, .epoch = c.epoch, .deadline = c.deadline, .plan = c.plan, .mailboxes = c.mailboxes };
+    }
+    fn admit(p: *anyopaque, config_: *const run.Options) anyerror!void {
+        const self = cast(p);
+        try t.expectEqualDeep(self.config(), config_.*);
+        self.dma.admits += 1;
+        if (self.dma.deny) return error.Denied;
+    }
+    fn read(p: *anyopaque, address: u32) anyerror!u32 {
+        const self = cast(p);
+        try t.expectEqual(@as(u32, 1), self.dma.admits);
+        const offset = address - self.dma.base();
+        return switch (offset) {
+            0x3c0 => blk: {
+                self.propagation += 1;
+                break :blk 0x84 | @as(u32, if (self.reset_edges == 1 or (self.reset_complete and self.reset_stuck)) 1 else 0);
+            },
+            0xf4 => core.bits.reset_ready | (if (self.riscv) @as(u32, core.bits.riscv_enabled) else 0) |
+                (if (self.reset_complete and self.scrub_after_reset) @as(u32, core.bits.scrubbing) else 0),
+            0x1668 => if (self.reset_complete and self.wrong_core) core.bits.bcr_riscv | core.bits.bcr_valid else if (self.reset_complete and self.lost_valid) 0 else self.bcr,
+            run.hwcfg_offset => blk: {
+                try t.expect(self.reset_complete and self.reset_edges == 2 and self.propagation >= 10);
+                self.sizes_read += 1;
+                break :blk self.hwcfg ^ @as(u32, if (self.unstable and self.sizes_read == 2) 1 else 0);
+            },
+            else => try Model.read(&self.dma, address),
+        };
+    }
+    fn write(p: *anyopaque, address: u32, value: u32) anyerror!void {
+        const self = cast(p);
+        try t.expectEqual(@as(u32, 1), self.dma.admits);
+        switch (address - self.dma.base()) {
+            0x3c0 => {
+                if (self.reset_edges == 0) try t.expectEqual(@as(u32, 0x85), value) else {
+                    try t.expect(self.reset_edges == 1 and self.propagation >= 10);
+                    try t.expectEqual(@as(u32, 0x84), value);
+                }
+                self.reset_edges += 1;
+                self.propagation = 0;
+                if (self.fail_reset) return error.ResetPosted;
+            },
+            0x1668 => {
+                try t.expect(self.reset_edges == 2 and self.propagation == 10 and value == 0);
+                self.bcr = core.bits.bcr_valid;
+            },
+            0x84 => {
+                try t.expect(self.reset_edges == 2 and self.propagation == 10);
+                try t.expectEqual(self.dma.config.boot0, value);
+            },
+            else => {
+                if (address - self.dma.base() == r.dma_command) try t.expect(self.reset_complete and self.sizes_read == 2);
+                try Model.write(&self.dma, address, value);
+                if (address - self.dma.base() == r.dma_control) self.reset_complete = true;
+            },
+        }
+    }
+    fn io(self: *RunModel) run.Io {
+        return .{ .context = self, .generation = generation, .now_ns = now, .admit = admit, .read32 = read, .write32 = write };
+    }
+    fn drive(self: *RunModel, operation: *run.Operation) !void {
+        for (0..192) |_| {
+            if (try operation.step(self.io())) return;
+            self.dma.clock += 1;
+        }
+        return error.Bound;
+    }
+};
+
+fn checkCompleteRun() !void {
+    for ([_]hs.Engine{ .gsp, .sec2 }) |engine| {
+        for ([_]bool{ false, true }) |riscv| {
+            var model: RunModel = .{ .dma = .{ .config = options(engine) }, .riscv = riscv };
+            var operation = try run.Operation.init(model.config());
+            try model.drive(&operation);
+            try t.expect(model.reset_edges == 2 and model.sizes_read == 2 and model.dma.started);
+            try t.expectEqual(@as(u32, 65536), operation.hs_operation.?.options.imem_capacity);
+            try t.expectEqual(@as(u32, 65536), operation.hs_operation.?.options.dmem_capacity);
+            try t.expectEqual(@as(u32, 0xffffffff), operation.result.?.mailboxes[0].?);
+            const writes = model.dma.writes;
+            try t.expect(try operation.step(model.io()));
+            model.dma.epoch += 1;
+            try t.expectError(error.Stale, operation.step(model.io()));
+            try t.expectEqual(writes, model.dma.writes);
+        }
+    }
+    // Already-selected Falcon follows the original no-switch path even if
+    // BCR.VALID retains zero. VALID is required after an actual switch write.
+    var already: RunModel = .{ .dma = .{ .config = options(.sec2) }, .bcr = 0 };
+    var already_op = try run.Operation.init(already.config());
+    try already.drive(&already_op);
+    try t.expect(!already_op.reset.core_switch_written and already.dma.started);
+    const Fault = enum { denied, size, unstable, unavailable, scrub, reset, core_select, lost_valid, posted, hs_posted };
+    for (std.enums.values(Fault)) |fault| {
+        var model: RunModel = .{ .dma = .{ .config = options(.sec2) } };
+        const expected = switch (fault) {
+            .denied => blk: {
+                model.dma.deny = true;
+                break :blk error.Denied;
+            },
+            .size => blk: {
+                model.hwcfg = 0x300;
+                break :blk error.Capacity;
+            },
+            .unstable => blk: {
+                model.unstable = true;
+                break :blk error.Unstable;
+            },
+            .unavailable => blk: {
+                model.hwcfg = 0xbadf1234;
+                break :blk error.RegisterUnavailable;
+            },
+            .scrub => blk: {
+                model.scrub_after_reset = true;
+                break :blk error.EngineState;
+            },
+            .reset => blk: {
+                model.reset_stuck = true;
+                break :blk error.EngineState;
+            },
+            .core_select => blk: {
+                model.wrong_core = true;
+                break :blk error.EngineState;
+            },
+            .lost_valid => blk: {
+                model.lost_valid = true;
+                break :blk error.EngineState;
+            },
+            .posted => blk: {
+                model.fail_reset = true;
+                break :blk error.ResetPosted;
+            },
+            .hs_posted => blk: {
+                model.dma.fail_write = r.dma_command;
+                break :blk error.PostedFailure;
+            },
+        };
+        var operation = try run.Operation.init(model.config());
+        try t.expectError(expected, model.drive(&operation));
+        try t.expect(!model.dma.started);
+        if (fault == .denied) try t.expect(model.reset_edges == 0 and !operation.reset.write_attempted) else try t.expect(operation.reset.write_attempted);
+        const writes = model.dma.writes;
+        const edges = model.reset_edges;
+        try t.expectError(error.State, operation.step(model.io()));
+        try t.expect(model.dma.writes == writes and model.reset_edges == edges);
+    }
+    var model: RunModel = .{ .dma = .{ .config = options(.gsp) } };
+    var config = model.config();
+    config.plan.dmem.command |= 0x10000;
+    try t.expectError(error.Profile, run.Operation.init(config));
+    var operation = try run.Operation.init(model.config());
+    _ = try operation.step(model.io());
+    var moved = operation;
+    try t.expectError(error.State, moved.step(model.io()));
+    model.dma.clock = model.dma.config.deadline;
+    try t.expectError(error.Deadline, operation.step(model.io()));
+    try t.expectEqual(@as(u32, 0), model.reset_edges);
 }

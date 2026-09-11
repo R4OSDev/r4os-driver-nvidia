@@ -10,7 +10,38 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
-GA106 HS Falcon loader and MMIO binding (host qualified):
+Complete GA106 reset-to-firmware run (host qualified):
+
+`falcon_run` owns engine reset, fresh TCM observations and the HS upload as
+one bounded operation. The shared core implementation now selects SEC2's
+actual reset registers as well as GSP's. After reset, the executor reads
+HWCFG twice, checks scrub/reset/core state and validates the complete image
+against the measured IMEM/DMEM capacities. Caller-supplied capacity numbers
+and an external reset-success callback are no longer part of this entry.
+The original BCR behavior is preserved: VALID is checked after an actual
+core switch; an already-selected Falcon does not require a new switch.
+
+`Port.beginFirmware/stepFirmware` replace the earlier direct-HS binding.
+Pure admission must hold exact firmware/DMA and VRAM/VGA/display recovery
+before the first reset write. The second-page BCR aperture is checked up
+front. The same retained MMIO owner, epoch/deadline and failure state cover
+reset, observation and upload. Failed or moved operations cannot restart;
+raw mailboxes and Falcon halt remain distinct from firmware authentication
+and whole-device quiescence.
+
+The existing 51 owner cases pass, with the HS and SDK/MMIO cases extended;
+no additional test file, gate or guest variant. The original C comparison
+now covers 39 core values (nine added SEC2/TCM values) and 34 HS values.
+210 complete NVIDIA originals plus the MIT Nouveau capacity source at Linux
+commit 038d61fd642278bab63ee8ef722c50d10ab01e8f are archived in
+`falcon-run-20260911`. The module is still byte-identical to NVIDIA0.1.27;
+these executable paths remain unlinked. No hardware run/update occurred.
+Native VRAM/VGA/recovery ownership, FRTS/initial boot, result interpretation,
+IRQ/log/health service and demonstrated quiescence remain open. Additional
+full MIT notices must be packaged before executable linkage. Current evidence:
+`falcon_run_checkpoint` in `Docs/Drivers/GrafikFirmware07910.json`.
+
+Earlier GA106 HS Falcon loader and MMIO binding (host qualified):
 
 `falcon_hs` implements the original GA102 HS upload/PKC/start/halt sequence
 for GSP FWSEC and SEC2 Booters. It waits for DMA queue space before changing

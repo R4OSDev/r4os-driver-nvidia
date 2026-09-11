@@ -8,6 +8,7 @@ const identity = @import("identity.zig");
 const seq = @import("gsp_sequencer.zig");
 const core = @import("gsp_core.zig");
 const hs = @import("falcon_hs.zig");
+const firmware_run = @import("falcon_run.zig");
 pub const Access = enum { read, write };
 pub const Owner = struct {
     context: *anyopaque,
@@ -26,10 +27,10 @@ pub const Owner = struct {
     // and handled log-reader suspension. No timeout or Falcon halt substitutes.
     quiesced: *const fn (*anyopaque) bool,
     log_polling: ?*const fn (*anyopaque, bool) anyerror!void = null,
-    // Bind the exact HS firmware/DMA plan and measured TCM capacities to a
-    // completed reset/Falcon selection under this run's recovery owner.
-    // Pure admission; absent capability refuses the entire operation.
-    admit_hs: ?*const fn (*anyopaque, *const hs.Options) anyerror!void = null,
+    // Bind exact firmware/DMA and VRAM/VGA/display recovery before reset.
+    // The executor performs reset and measures TCM itself. Pure admission;
+    // absent capability refuses the entire operation before device effects.
+    admit_firmware: ?*const fn (*anyopaque, *const firmware_run.Options) anyerror!void = null,
 };
 pub const Run = struct { epoch: u64, deadline_ns: u64, resume_args: ?core.Resume = null };
 pub const Port = struct {
@@ -48,7 +49,7 @@ pub const Port = struct {
     failure: ?anyerror = null,
     memory_status: i32 = 0,
     operation: ?core.Operation = null,
-    hs_operation: ?hs.Operation = null,
+    firmware_operation: ?firmware_run.Operation = null,
     core_phase: u32 = 0,
 
     /// Stable address, serialized init/Driver Work owner; not an IRQ callback
@@ -84,41 +85,41 @@ pub const Port = struct {
     pub fn sequencer(self: *Port) !seq.Port {
         try self.guard();
         if (!self.ready) return error.State;
-        if (self.hs_operation != null) return error.Busy;
+        if (self.firmware_operation != null) return error.Busy;
         return .{ .context = self, .generation = generation, .now_ns = nowNs, .admit = admit, .read32 = sequenceRead, .write32 = sequenceWrite, .core_step = coreStep };
     }
-    pub fn beginHs(self: *Port, options: hs.Options) !void {
+    pub fn beginFirmware(self: *Port, options: firmware_run.Options) !void {
         try self.guard();
         if (!self.ready) return error.State;
-        if (self.operation != null or self.hs_operation != null) return error.Busy;
+        if (self.operation != null or self.firmware_operation != null) return error.Busy;
         if (options.epoch != self.run.epoch or options.boot0 != self.boot0 or options.deadline > self.run.deadline_ns or options.deadline <= self.last_clock) return error.Options;
-        const operation = try hs.Operation.init(options);
-        // BROM lives on the second register page, beyond SEC2's core page.
-        // Reject a short aperture before any of the preceding DMA writes.
-        if (!self.supports(.write, operation.base() + hs.reg.second_offset + hs.reg.signature)) return error.Register;
+        const operation = try firmware_run.Operation.init(options);
+        // BCR and BROM live on the second page. Admit the complete aperture
+        // before reset, including the possibly needed RISC-V/Falcon switch.
+        if (!self.supports(.write, operation.base() + 0x1668)) return error.Register;
         // Admission itself remains an explicit phase in the stable stored
         // operation, so failure is preserved before any register mutation.
-        if (self.owner.?.admit_hs == null) return error.Unsupported;
-        self.hs_operation = operation;
+        if (self.owner.?.admit_firmware == null) return error.Unsupported;
+        self.firmware_operation = operation;
     }
     /// Completion reports Falcon halt and raw mailboxes only. All DMA and
     /// this mapping stay retained; the native caller must verify the specific
     /// FWSEC/Booter result, recovery and device quiescence separately.
-    pub fn stepHs(self: *Port) !?hs.Result {
+    pub fn stepFirmware(self: *Port) !?hs.Result {
         errdefer |err| self.failure = err;
         try self.guard();
-        const operation = if (self.hs_operation) |*op| op else return error.State;
-        const done = try operation.step(.{ .context = self, .generation = generation, .now_ns = nowNs, .admit = admitHs, .read32 = read32, .write32 = write32 });
+        const operation = if (self.firmware_operation) |*op| op else return error.State;
+        const done = try operation.step(.{ .context = self, .generation = generation, .now_ns = nowNs, .admit = admitFirmware, .read32 = read32, .write32 = write32 });
         if (!done) return null;
-        const result = operation.result;
-        self.hs_operation = null;
+        const result = operation.result.?;
+        self.firmware_operation = null;
         return result;
     }
-    fn admitHs(p: *anyopaque, options: *const hs.Options) anyerror!void {
+    fn admitFirmware(p: *anyopaque, options: *const firmware_run.Options) anyerror!void {
         const self = cast(p);
         try self.guard();
         const owner = self.owner.?;
-        try (owner.admit_hs orelse return error.Unsupported)(owner.context, options);
+        try (owner.admit_firmware orelse return error.Unsupported)(owner.context, options);
         try self.guard();
     }
     fn cast(p: *anyopaque) *Port {
@@ -161,7 +162,7 @@ pub const Port = struct {
     fn admit(p: *anyopaque, command: seq.Command) error{ Denied, Unsupported }!void {
         const self = cast(p);
         self.guard() catch return error.Denied;
-        if (!self.ready or self.hs_operation != null) return error.Denied;
+        if (!self.ready or self.firmware_operation != null) return error.Denied;
         // Reject known aperture/identity/write-only errors in the pure pass,
         // including errors near the end of a stream after otherwise valid IO.
         const supported = switch (command) {
@@ -225,11 +226,11 @@ pub const Port = struct {
         return cast(p).write(offset, value);
     }
     fn sequenceRead(p: *anyopaque, offset: u32) anyerror!u32 {
-        if (cast(p).hs_operation != null) return error.Busy;
+        if (cast(p).firmware_operation != null) return error.Busy;
         return read32(p, offset);
     }
     fn sequenceWrite(p: *anyopaque, offset: u32, value: u32) anyerror!void {
-        if (cast(p).hs_operation != null) return error.Busy;
+        if (cast(p).firmware_operation != null) return error.Busy;
         return write32(p, offset, value);
     }
     fn logs(p: *anyopaque, enable: bool) anyerror!void {
@@ -244,7 +245,7 @@ pub const Port = struct {
         const self = cast(p);
         errdefer |err| self.failure = err;
         try self.guard();
-        if (self.hs_operation != null) return error.Busy;
+        if (self.firmware_operation != null) return error.Busy;
         if (deadline > self.run.deadline_ns or deadline <= self.last_clock) return error.Deadline;
         if (state.phase == 0) {
             if (self.operation != null) return error.Busy;

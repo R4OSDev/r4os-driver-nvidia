@@ -105,7 +105,16 @@ int r4nv_gsp_core_abi_check(const unsigned *actual, size_t count)
           DRF_DEF(_PRISCV_RISCV, _BCR_CTRL, _BRFETCH, _TRUE),
         DRF_DEF(_PRISCV_RISCV, _CPUCTL, _ACTIVE_STAT, _ACTIVE),
         DRF_DEF(_PGC6, _BSI_SECURE_SCRATCH_14, _BOOT_STAGE_3_HANDOFF, _VALUE_DONE),
-        FLCN_RESET_PROPAGATION_DELAY_COUNT
+        FLCN_RESET_PROPAGATION_DELAY_COUNT,
+        DRF_BASE(NV_PSEC) + NV_PFALCON_FALCON_HWCFG2,
+        NV_PSEC_FALCON_ENGINE,
+        DRF_BASE(NV_PSEC) + NV_PFALCON_FALCON_RM,
+        NV_PSEC_FBIF_BASE + NV_PFALCON_FBIF_CTL,
+        DRF_BASE(NV_PSEC) + NV_PFALCON_FALCON_DMACTL,
+        NV_FALCON2_SEC_BASE + NV_PRISCV_RISCV_BCR_CTRL,
+        DRF_DEF(_PSEC, _FALCON_ENGINE, _RESET, _TRUE),
+        NV_PFALCON_FALCON_HWCFG,
+        DRF_MASK(NV_PFALCON_FALCON_HWCFG_IMEM_SIZE) * FLCN_BLK_ALIGNMENT
     };
     return count != sizeof(expected) / sizeof(expected[0]) ||
            memcmp(actual, expected, sizeof(expected)) != 0;

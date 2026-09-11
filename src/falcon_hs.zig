@@ -31,7 +31,7 @@
 // DEALINGS IN THE SOFTWARE.
 const std = @import("std");
 const load = @import("fwsec_load.zig");
-pub const Engine = enum { gsp, sec2 };
+pub const Engine = @import("gsp_core.zig").Engine;
 pub const reg = struct {
     pub const gsp = 0x110000;
     pub const sec2 = 0x840000;

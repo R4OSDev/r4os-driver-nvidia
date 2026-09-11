@@ -6,6 +6,7 @@ const core = @import("gsp_core.zig");
 const seq = @import("gsp_sequencer.zig");
 const native = @import("gsp_sequencer_port.zig");
 const hs = @import("falcon_hs.zig");
+const firmware_run = @import("falcon_run.zig");
 const identity = @import("identity.zig");
 const r = core.reg;
 const b = core.bits;
@@ -132,7 +133,7 @@ const NativeRig = struct {
         return rig.clock;
     }
     fn admit(_: *anyopaque, _: seq.Command) error{ Denied, Unsupported }!void {}
-    fn admitHs(p: *anyopaque, options: *const hs.Options) anyerror!void {
+    fn admitFirmware(p: *anyopaque, options: *const firmware_run.Options) anyerror!void {
         const self = cast(p);
         try t.expect(options.epoch == self.epoch and options.engine == .gsp);
         self.hs_admissions += 1;
@@ -296,13 +297,13 @@ test "firmware CPU storage GA106 core sequencing and native MMIO ownership" {
     try t.expectEqual(@as(u32, 2), words[r.cpuctl_alias / 4]);
     try t.expect(fixture.retains == 1 and fixture.flushes == 1);
     try t.expect(!port.close() and fixture.unmaps == 0);
-    const hs_options: hs.Options = .{
+    words[(hs.reg.gsp + firmware_run.hwcfg_offset) / 4] = 0x20100;
+    words[r.hwcfg2 / 4] = b.reset_ready;
+    const hs_options: firmware_run.Options = .{
         .engine = .gsp,
         .boot0 = boot0,
         .epoch = fixture.epoch,
         .deadline = 1000000,
-        .imem_capacity = 65536,
-        .dmem_capacity = 65536,
         .mailboxes = .{ 0x79, null },
         .plan = .{
             .imem = .{ .base = 0x123456000, .destination = 0, .source_offset = 0, .bytes = 512, .command = hs.bits.imem_command },
@@ -313,8 +314,8 @@ test "firmware CPU storage GA106 core sequencing and native MMIO ownership" {
             .ucode_id = 9,
         },
     };
-    try t.expectError(error.Unsupported, port.beginHs(hs_options));
-    port.owner.?.admit_hs = NativeRig.admitHs;
+    try t.expectError(error.Unsupported, port.beginFirmware(hs_options));
+    port.owner.?.admit_firmware = NativeRig.admitFirmware;
     var sec_options = hs_options;
     sec_options.engine = .sec2;
     sec_options.plan.ucode_id = 3;
@@ -324,17 +325,17 @@ test "firmware CPU storage GA106 core sequencing and native MMIO ownership" {
     sec_options.plan.dmem.base += 256;
     // The old core-only aperture ends before SEC2's BROM page. No admission
     // callback or preceding DMA write may run for that truncated mapping.
-    try t.expectError(error.Register, port.beginHs(sec_options));
+    try t.expectError(error.Register, port.beginFirmware(sec_options));
     try t.expectEqual(@as(u32, 0), fixture.hs_admissions);
-    try port.beginHs(hs_options);
-    try t.expectError(error.Busy, port.beginHs(hs_options));
+    try port.beginFirmware(hs_options);
+    try t.expectError(error.Busy, port.beginFirmware(hs_options));
     try t.expectError(error.Busy, port.sequencer());
     try t.expectError(error.Busy, io.read32(io.context, r.os));
     try t.expectError(error.Busy, io.write32(io.context, r.os, 1));
     try t.expectError(error.Denied, io.admit(io.context, .core_start));
     var hs_result: ?hs.Result = null;
     for (0..128) |_| {
-        hs_result = try port.stepHs();
+        hs_result = try port.stepFirmware();
         if (hs_result != null) break;
     }
     try t.expect(hs_result != null and hs_result.?.blocks == 4 and hs_result.?.mailboxes[0].? == 0x79 and hs_result.?.mailboxes[1] == null);

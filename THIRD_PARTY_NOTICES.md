@@ -1,5 +1,24 @@
 ﻿# Third-Party Notices
 
+Complete GA106 Falcon reset/TCM/upload composition (host, 2026-09-11):
+falcon_run.zig composes the existing NVIDIA-derived core/HS executors with
+original Apache-2.0 R4OS lifetime/admission. Its HWCFG IMEM/DMEM calculation
+follows nvkm_falcon_oneinit in Nouveau nvkm/falcon/base.c (NVIDIA2016, MIT),
+verified byte-identical to the earlier reference and now independently tied
+to Linux commit 038d61fd642278bab63ee8ef722c50d10ab01e8f (v6.16). The full
+original file, copyright and MIT terms are retained; no Linux code is linked.
+https://raw.githubusercontent.com/torvalds/linux/038d61fd642278bab63ee8ef722c50d10ab01e8f/drivers/gpu/drm/nouveau/nvkm/falcon/base.c
+SEC2 reset follows ksec2ResetHw_TU102 (NVIDIA2021-2023, MIT) through the shared
+Falcon reset phases and explicitly selected GA102 SEC2 registers. Its full
+copyright/notice is retained in gsp_core.zig; original reset/configuration
+and generated dispatch remain in the 210-file NVIDIA reference set.
+https://raw.githubusercontent.com/NVIDIA/open-gpu-kernel-modules/8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f/src/nvidia/src/kernel/gpu/sec2/arch/turing/kernel_sec2_tu102.c
+39 core and34 HS values match original C macros. BCR VALID handling follows
+the original conditional switch, with regression coverage in existing tests.
+NVIDIA0.1.27 stays byte-identical; additional full MIT notices must join the
+packaged module/distribution license bundle before executable linkage.
+Archive falcon-run-20260911 has211 complete originals; no hardware execution.
+
 GA106 HS Falcon execution (host qualified, 2026-09-11):
 falcon_hs.zig adapts kgspExecuteHsFalcon_GA102 and s_dmaTransfer_GA102 from
 kernel_gsp_falcon_ga102.c (NVIDIA 2021-2024), plus context-disable/CPU-start/

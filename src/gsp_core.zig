@@ -1,4 +1,4 @@
-//! GA106 silicon implementation of the four RM570.144 sequencer core commands.
+//! GA106 RM570.144 sequencer core commands and SEC2 Falcon reset.
 //! One bounded phase per call. The caller retains the native device, firmware,
 //! DMA, display recovery and MMIO owners; completion is NOT GPU quiescence.
 // Adapted from NVIDIA kernel_falcon_{tu102,ga102}.c, kernel_gsp_{tu102,ga102}.c
@@ -9,6 +9,7 @@
 // Copyright (c) 2017-2021 NVIDIA CORPORATION & AFFILIATES
 // Copyright (c) 2003-2022 NVIDIA CORPORATION & AFFILIATES
 // Copyright (c) 2003-2024 NVIDIA CORPORATION & AFFILIATES
+// Copyright (c) 2021-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a
 // copy of this software and associated documentation files (the "Software"),
@@ -29,6 +30,7 @@
 // DEALINGS IN THE SOFTWARE.
 const std = @import("std");
 const seq = @import("gsp_sequencer.zig");
+pub const Engine = enum { gsp, sec2 };
 
 // Compared with the complete original C headers by the existing ABI verifier.
 pub const reg = struct {
@@ -47,6 +49,12 @@ pub const reg = struct {
     pub const sec_cpuctl = 0x840100;
     pub const sec_cpuctl_alias = 0x840130;
     pub const sec_mailbox0 = 0x840040;
+    pub const sec_hwcfg2 = 0x8400f4;
+    pub const sec_engine = 0x8403c0;
+    pub const sec_rm = 0x840084;
+    pub const sec_fbif = 0x840624;
+    pub const sec_dmactl = 0x84010c;
+    pub const sec_bcr = 0x841668;
     pub const handoff = 0x1180f8;
 };
 pub const bits = struct {
@@ -109,6 +117,7 @@ pub const Phase = enum {
 };
 pub const Operation = struct {
     opcode: seq.Opcode,
+    reset_engine: Engine = .gsp,
     epoch: u64,
     deadline: u64,
     boot0: u32,
@@ -120,6 +129,7 @@ pub const Operation = struct {
     last_address: ?u32 = null,
     last_value: ?u32 = null,
     write_attempted: bool = false,
+    core_switch_written: bool = false,
     logs_suspended: bool = false,
     failure: ?anyerror = null,
 
@@ -139,6 +149,27 @@ pub const Operation = struct {
         }
         return .{ .opcode = op, .epoch = epoch, .deadline = deadline, .boot0 = boot0, .resume_args = resume_args, .phase = phase };
     }
+    /// GA106 dispatch uses the same Falcon reset phases for both engines.
+    /// SEC2's hardware reset is ksec2ResetHw_TU102, with the same ten reads
+    /// per edge. Sequencer start/halt/resume retain their original targets.
+    pub fn initReset(engine: Engine, epoch: u64, deadline: u64, boot0: u32) !Operation {
+        var operation = try init(.core_reset, epoch, deadline, boot0, null);
+        operation.reset_engine = engine;
+        return operation;
+    }
+    fn register(self: *const Operation, address: u32) !u32 {
+        if (self.reset_engine == .gsp) return address;
+        if (self.opcode != .core_reset) return error.Opcode;
+        return switch (address) {
+            reg.hwcfg2 => reg.sec_hwcfg2,
+            reg.engine => reg.sec_engine,
+            reg.rm => reg.sec_rm,
+            reg.fbif => reg.sec_fbif,
+            reg.dmactl => reg.sec_dmactl,
+            reg.bcr => reg.sec_bcr,
+            else => error.Register,
+        };
+    }
     fn guard(self: *Operation, io: Io) !u64 {
         if (self.failure != null) return error.State;
         if (io.generation(io.context) != self.epoch) return error.Stale;
@@ -150,9 +181,9 @@ pub const Operation = struct {
     }
     fn read(self: *Operation, io: Io, address: u32) !u32 {
         _ = try self.guard(io);
-        self.last_address = address;
+        self.last_address = try self.register(address);
         self.last_value = null;
-        const value = try io.read32(io.context, address);
+        const value = try io.read32(io.context, self.last_address.?);
         self.last_value = value;
         _ = try self.guard(io);
         // These control/status registers cannot use PCI/PRIV read-error
@@ -162,10 +193,10 @@ pub const Operation = struct {
     }
     fn write(self: *Operation, io: Io, address: u32, value: u32) !void {
         _ = try self.guard(io);
-        self.last_address = address;
+        self.last_address = try self.register(address);
         self.last_value = value;
         self.write_attempted = true;
-        try io.write32(io.context, address, value);
+        try io.write32(io.context, self.last_address.?, value);
         _ = try self.guard(io);
     }
     fn startCpu(self: *Operation, io: Io, control: u32, alias: u32) !void {
@@ -241,6 +272,7 @@ pub const Operation = struct {
                 } else {
                     // Only after reset was released and scrubbing completed
                     // (bug 200586493). Preserve the vendor full-register write.
+                    self.core_switch_written = true;
                     try self.write(io, reg.bcr, 0);
                     self.phase = .wait_falcon;
                 }
