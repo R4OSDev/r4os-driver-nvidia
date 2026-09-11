@@ -20,7 +20,7 @@ var closing = false;
 var clock: u64 = 100;
 var range_failure: i32 = 0;
 var range_calls: usize = 0;
-const LogFault = enum { none, producer, timeout, regression };
+const LogFault = enum { none, producer, timeout, regression, io };
 var log_fault: LogFault = .none;
 const offsets = [_]usize{ 0, 8192, 73728, 139264, 204800, 270336, 335872 };
 const lengths = [_]usize{ 8192, 65536, 65536, 65536, 65536, 65536, 528384 };
@@ -146,11 +146,13 @@ fn rangeSync(mapping: *const a.DmaMapping, offset: u32, bytes: u32, cpu: bool) i
     const device = if (fault == .bounce) shadow else backing.?;
     if (index < 6) {
         std.debug.assert(cpu); // Log readers must never publish or acknowledge.
+        if (log_fault == .io) return -31;
         if (offset != 0) switch (log_fault) {
             .producer => { const put = device[offsets[index]..][0..8]; std.mem.writeInt(u64, put, std.mem.readInt(u64, put, .little) + 1, .little); },
             .timeout => clock = 1000,
             .regression => clock = 1,
             .none => {},
+            .io => unreachable,
         };
     }
     if (fault == .bounce) {
@@ -866,7 +868,7 @@ fn checkLogReader(memory: *@import("gsp_run_memory.zig").Lease) !void {
             fillRawLog(0, prior + 4);
             log_fault = injection;
             @memset(output, 0x5a);
-            const expected = switch (injection) { .producer => error.ProducerChanged, .timeout => error.Timeout, .regression => error.ClockRegression, .none => unreachable };
+            const expected = switch (injection) { .producer => error.ProducerChanged, .timeout => error.Timeout, .regression => error.ClockRegression, .none, .io => unreachable };
             try t.expectError(expected, reader.capture(0, 1000, output));
             try t.expect(reader.previous[0] == prior and !reader.busy and !memory.failed);
             try t.expect(std.mem.allEqual(u8, output, 0));
@@ -1411,8 +1413,12 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
     const command = init.queues_offset + init.command_offset;
     const status = init.queues_offset + init.status_offset;
     const header = backing.?[command..][0..32].*;
-    const Case = enum { success, old_api, frts_error, timeout, stolen_display, unknown_event };
+    const Case = enum { success, old_api, frts_error, timeout, stolen_display, unknown_event,
+        runtime_healthy, runtime_lockdown, runtime_unknown, runtime_unowned, runtime_sequence_timeout,
+        runtime_log_failure, runtime_moving_log };
     for (std.enums.values(Case)) |case| {
+        const exercise_runtime = @intFromEnum(case) >= @intFromEnum(Case.runtime_healthy);
+        const boot_success = case == .success or exercise_runtime;
         errdefer |err| std.debug.print("native device startup {s}: {s}\n", .{ @tagName(case), @errorName(err) });
         @memset(words, 0);
         words[0] = 0xb76000a1;
@@ -1427,6 +1433,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         clock = 100;
         @memset(backing.?[command..][0..init.queue_bytes], 0);
         @memset(backing.?[status..][0..init.queue_bytes], 0);
+        @memset(backing.?[init.logs_offset..][0 .. init.log_count * init.log_bytes], 0);
         @memcpy(backing.?[command..][0..32], &header);
         var reader: @import("gsp_logs.zig").Reader = .{};
         try reader.open(lease);
@@ -1450,6 +1457,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         const original_epoch = capture.boot.held_generation;
         var injected = false;
         var notified = false;
+        var boot_lockdown = false;
         var steps: usize = 0;
         while (target.phase != .ready and target.phase != .failed and steps < 12000) : (steps += 1) {
             clock += 1000;
@@ -1460,22 +1468,30 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
                 injected = true;
             }
             if (target.phase == .notifications and !notified) {
-                @memcpy(backing.?[status..][0..32], &header);
-                std.mem.writeInt(u32, backing.?[status + 24 ..][0..4], 64, .little);
-                try nativeEvent(&target.session.?, if (case == .unknown_event) 0xdead else 0x1001, &.{ 0, 0, 0, 0 });
-                notified = true;
+                if (!boot_lockdown) {
+                    @memcpy(backing.?[status..][0..32], &header);
+                    std.mem.writeInt(u32, backing.?[status + 24 ..][0..4], 64, .little);
+                }
+                if (case == .runtime_lockdown and !boot_lockdown) {
+                    try nativeEvent(&target.session.?, 0x101c, &.{1});
+                    boot_lockdown = true;
+                } else {
+                    try nativeEvent(&target.session.?, if (case == .unknown_event) 0xdead else 0x1001, &.{ 0, 0, 0, 0 });
+                    notified = true;
+                }
             }
             _ = target.step();
         }
-        if (steps == 12000 or (case == .success and target.phase != .ready)) {
+        if (steps == 12000 or (boot_success and target.phase != .ready)) {
             std.debug.print("device phase={s} error={?} recovery={?} fw={?} core={?}\n", .{ @tagName(target.phase), target.failure,
                 target.recovery_failure, if (target.port.firmware_operation) |op| op.failure else null,
                 if (target.port.operation) |op| op.failure else null });
         }
         try t.expect(steps < 12000 and target.port.effects_possible and lease.retained and capture.firmware_owner == @intFromPtr(target));
-        if (case == .success) {
+        if (boot_success) {
             try t.expect(target.phase == .ready and target.handoff != null and target.frts_result != null and target.load_result != null);
-            try t.expect(target.boot.?.handled_events == 1 and target.session.?.pending == null and target.port.phase == .runtime);
+            try t.expect(target.boot.?.handled_events == @as(u64, if (boot_lockdown) 2 else 1) and target.session.?.pending == null and target.port.phase == .runtime);
+            if (exercise_runtime) try checkDeviceRuntime(target, words, held.plan.?.frts.offset, case);
         } else {
             try t.expect(target.phase == .failed and target.failure != null);
             if (case == .stolen_display) try t.expect(target.recovery_failure != null) else
@@ -1495,11 +1511,13 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         target.port.recovery_owner = 0;
         target.port.phase = .boot;
         target.port.runtime_session = null;
+        target.port.runtime_sequence = null; // Dispose retained host-only fault metadata.
         try t.expect(target.port.close());
         try t.expect(reader.close());
     }
     @memset(backing.?[command..][0..init.queue_bytes], 0);
     @memset(backing.?[status..][0..init.queue_bytes], 0);
+    @memset(backing.?[init.logs_offset..][0 .. init.log_count * init.log_bytes], 0);
     @memcpy(backing.?[command..][0..32], &header);
     clock = 100;
     for ([_]u32{ 0, 4 }) |reg| try t.expect(driver.allowed(.read, reg) and !driver.allowed(.write, reg));
@@ -1508,4 +1526,122 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
     for ([_]u32{ core.reg.hwcfg2, core.reg.sec_hwcfg2, core.reg.riscv_cpuctl, core.reg.handoff,
         hs.reg.gsp + 0x108, hs.reg.sec2 + 0x108 }) |reg|
         try t.expect(driver.allowed(.read, reg) and !driver.allowed(.write, reg));
+}
+
+fn deviceSequence(target: *@import("gsp_device.zig").Device, words: []const u32) !void {
+    var payload: [128]u8 = @splat(0);
+    std.mem.writeInt(u32, payload[0..4], @intCast(words.len + 1), .little);
+    std.mem.writeInt(u32, payload[4..8], @intCast(words.len), .little);
+    for (words, 0..) |value, index| std.mem.writeInt(u32, payload[40 + index * 4 ..][0..4], value, .little);
+    try nativeEvent(&target.session.?, 0x1002, payload[0 .. 40 + words.len * 4]);
+}
+
+fn checkDeviceRuntime(target: *@import("gsp_device.zig").Device, words: []u32, frts: u64, scenario: anytype) !void {
+    const core = @import("gsp_core.zig");
+    const original_deadline = target.deadline;
+    const reader = target.reader.?;
+    try t.expect(target.running.self_address == @intFromPtr(&target.running) and target.handoff.?.claimed);
+    // Runtime idle uses a fresh finite observation deadline, never the old
+    // boot deadline and never an unbounded wait or a claimed heartbeat.
+    clock = original_deadline + 1;
+    try t.expect(target.step() == .idle and target.phase == .ready and target.failure == null);
+    try t.expect(target.running.channel.?.deadline == null and target.deadline == original_deadline);
+    try t.expect(target.running.snapshot.last_poll_ns == clock and target.running.snapshot.events == 0);
+    var fails = false;
+    switch (scenario) {
+        .runtime_unknown => {
+            try nativeEvent(&target.session.?, 0xdead, &.{});
+            _ = target.step();
+            fails = true;
+        },
+        .runtime_unowned => {
+            try nativeEvent(&target.session.?, 0x1007, &.{ 0, 0, 0, 0, 1, 0, 0, 0 });
+            _ = target.step();
+            try t.expect(target.running.failure != null and target.running.failure.? == error.Unsupported);
+            fails = true;
+        },
+        .runtime_sequence_timeout => {
+            try deviceSequence(target, &.{ 3, 100000 });
+            try t.expect(target.step() == .progress and target.running.sequence.self_address != 0);
+            clock = target.running.sequence.deadline;
+            _ = target.step();
+            fails = true;
+        },
+        .runtime_log_failure, .runtime_moving_log => {
+            const index = target.running.log_index;
+            const bytes = backing.?[init.logs_offset + index * init.log_bytes ..][0..init.log_bytes];
+            std.mem.writeInt(u64, bytes[0..8], 1, .little);
+            std.mem.writeInt(u64, bytes[8..16], 0x79797979, .little);
+            clock = target.running.next_log;
+            log_fault = if (scenario == .runtime_log_failure) .io else .producer;
+            const progress = target.step();
+            log_fault = .none;
+            if (scenario == .runtime_log_failure) {
+                fails = true;
+            } else {
+                try t.expect(progress == .idle and target.phase == .ready and target.running.snapshot.moving_logs == 1);
+                try t.expect(reader.previous[index] == 0 and target.running.snapshot.raw_words == 0 and !target.memory.?.failed);
+            }
+        },
+        .runtime_healthy, .runtime_lockdown => {
+            const io_owner = target.port.owner.?;
+            if (scenario == .runtime_lockdown) {
+                try t.expect(target.boot.?.in_lockdown and target.running.channel.?.in_lockdown);
+                try t.expectError(error.Lockdown, io_owner.access(io_owner.context, .write, core.reg.mailbox0));
+                try nativeEvent(&target.session.?, 0x101c, &.{0});
+                try t.expect(target.step() == .progress and !target.running.channel.?.in_lockdown);
+                try t.expect(target.boot.?.in_lockdown); // Old boot token cannot keep runtime locked.
+                try io_owner.access(io_owner.context, .write, core.reg.mailbox0);
+            }
+            var print: [15]u8 = @splat(0);
+            std.mem.writeInt(u32, print[4..8], 7, .little);
+            @memcpy(print[8..], "50%\r\nOK");
+            try nativeEvent(&target.session.?, 0x100c, &print);
+            try t.expect(target.step() == .progress and target.running.channel.?.pending == null);
+            var xid: [272]u8 = @splat(0);
+            std.mem.writeInt(u32, xid[0..4], 79, .little);
+            std.mem.writeInt(u32, xid[4..8], 3, .little);
+            std.mem.writeInt(u32, xid[8..12], 4, .little);
+            @memcpy(xid[12..16], "diag");
+            try nativeEvent(&target.session.?, 0x1006, &xid);
+            try t.expect(target.step() == .progress and target.running.snapshot.xid_count == 1 and target.running.snapshot.last_xid == 79);
+            const nocat: [1208]u8 = @splat(0);
+            try nativeEvent(&target.session.?, 0x1020, &nocat);
+            try t.expect(target.step() == .progress and target.running.snapshot.nocat_count == 1);
+            try deviceSequence(target, &.{ 0, core.reg.mailbox0, 0x7979, 4, core.reg.mailbox0, 0 });
+            try t.expect(target.step() == .progress and target.running.sequence.self_address != 0);
+            var count: usize = 0;
+            while (target.running.sequence.self_address != 0 and count < 16) : (count += 1) {
+                clock += 1000;
+                try t.expect(target.step() == .progress);
+            }
+            try t.expect(count < 16 and target.running.snapshot.sequencers == 1 and words[core.reg.mailbox0 / 4] == 0x7979);
+            try t.expect(target.session.?.pending == null and target.port.runtime_sequence == null);
+            for (0..init.log_count) |index| {
+                const bytes = backing.?[init.logs_offset + index * init.log_bytes ..][0..init.log_bytes];
+                std.mem.writeInt(u64, bytes[0..8], index + 1, .little);
+            }
+            for (0..init.log_count) |_| {
+                clock = target.running.next_log;
+                try t.expect(target.step() == .idle);
+            }
+            try t.expect(target.running.snapshot.raw_words == 15 and target.running.snapshot.lost_words == 0);
+            try t.expect(target.running.snapshot.events == @as(u64, if (scenario == .runtime_lockdown) 5 else 4));
+            try t.expect(target.running.snapshot.last_event_ns < target.running.snapshot.last_poll_ns);
+        },
+        else => unreachable,
+    }
+    if (fails) {
+        const receipt = target.session.?.pending;
+        var steps: usize = 0;
+        while (target.phase != .failed and steps < 12000) : (steps += 1) {
+            clock += 1000;
+            DeviceModel.tick(words, frts, false);
+            _ = target.step();
+        }
+        try t.expect(steps < 12000 and target.phase == .failed and target.running.failure != null and target.failure != null);
+        try t.expect(target.recovery.report != null and target.port.phase == .recovery and !reader.enabled);
+        try t.expect(std.meta.eql(receipt, target.session.?.pending) and target.memory.?.retained);
+        if (scenario != .runtime_log_failure) try t.expect(receipt != null);
+    } else try t.expect(target.phase == .ready and target.running.failure == null and target.memory.?.retained);
 }

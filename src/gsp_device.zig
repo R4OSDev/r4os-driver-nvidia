@@ -1,4 +1,4 @@
-//! Resident GA106 cold-start owner. All device access runs in serialized
+//! Resident GA106 startup/runtime owner. All device access runs in serialized
 //! DriverInit/DriverWork, with the actual boot hold and complete DMA lease.
 //! The first implementation retains the device through poweroff: successful
 //! firmware teardown does not yet prove UEFI restoration or global DMA stop.
@@ -19,8 +19,10 @@ const transport = @import("gsp_transport.zig");
 const events = @import("gsp_boot_events.zig");
 const sequencer = @import("gsp_sequencer.zig");
 const teardown = @import("gsp_teardown.zig");
+const runtime = @import("gsp_runtime.zig");
 
 pub const Phase = enum { detached, frts, prepare, load, start, notifications, ready, recovering, failed };
+pub const Progress = enum { progress, idle, stopped };
 pub const Device = struct {
     self_address: usize = 0,
     ctx: ?r4os.r4dev.DriverContext = null,
@@ -47,6 +49,7 @@ pub const Device = struct {
     sequence: ?sequencer.DispatchExecution = null,
     handoff: ?events.Handoff = null,
     recovery: teardown.Recovery = .{},
+    running: runtime.Owner = .{},
     tx: [transport.message.max_bytes]u8 = undefined,
     rx: [transport.message.max_bytes]u8 = undefined,
 
@@ -132,27 +135,29 @@ pub const Device = struct {
     /// At most one native phase step or one notification. A shared worker
     /// may call a bounded number of these; waits belong to its dedicated
     /// pacing task, never an IRQ or a long-running shared-work callback.
-    pub fn step(self: *Device) bool {
-        if (self.self_address == 0 or self.self_address != @intFromPtr(self)) return true;
-        if (self.stopped or self.phase == .ready or self.phase == .failed) return true;
-        self.advance() catch |err| {
+    pub fn step(self: *Device) Progress {
+        if (self.self_address == 0 or self.self_address != @intFromPtr(self)) return .stopped;
+        if (self.stopped or self.phase == .failed) return .stopped;
+        const progress = self.advance() catch |err| blk: {
             if (self.phase == .recovering) {
                 self.recovery_failure = err;
                 self.phase = .failed;
                 self.logFailure("teardown", err);
             } else self.fail(err);
+            break :blk true;
         };
-        return self.phase == .ready or self.phase == .failed;
+        return if (self.phase == .failed) .stopped else if (progress) .progress else .idle;
     }
-    fn advance(self: *Device) !void {
+    fn advance(self: *Device) !bool {
         if (self.phase == .recovering) {
             if (try self.recovery.step()) {
                 self.phase = .failed;
                 self.ctx.?.logWarn("NVIDIA gsp-start: teardown=complete memory=retained display=held poweroff-required=yes");
             }
-            return;
+            return true;
         }
         try self.checkLive(false);
+        if (self.phase == .ready) return try self.running.step() == .progress;
         if (try self.now() >= self.deadline) return error.Deadline;
         switch (self.phase) {
             .frts, .load => if (try self.port.stepFirmware()) |result| {
@@ -177,23 +182,24 @@ pub const Device = struct {
                 self.boot = try events.Boot.init(&self.session.?, self.deadline);
                 self.logPhase();
             },
-            .notifications => try self.poll(),
+            .notifications => return self.poll(),
             else => return error.State,
         }
+        return true;
     }
-    fn poll(self: *Device) !void {
+    fn poll(self: *Device) !bool {
         const boot = &self.boot.?;
         if (self.sequence) |*execution| {
             if (try execution.step() == .complete) self.sequence = null;
-            return;
+            return true;
         }
-        const dispatch = try boot.poll() orelse return;
+        const dispatch = try boot.poll() orelse return false;
         switch (dispatch.event) {
             .cpu_sequencer => {
                 self.sequence = try sequencer.DispatchExecution.init(boot, try self.port.sequencer(),
                     .{ .default_timeout_ns = std.time.ns_per_s, .poll_interval_ns = std.time.ns_per_ms,
                         .register_bytes = self.port.window.byte_length });
-                return;
+                return true;
             },
             .os_error, .nocat => {
                 self.logFailure("firmware-event", error.FirmwareError);
@@ -207,12 +213,14 @@ pub const Device = struct {
         if (boot.state == .init_done) {
             self.handoff = try self.port.handoffBoot(boot);
             self.phase = .ready;
-            self.ctx.?.logInfo("NVIDIA gsp-start: firmware-ready=INIT_DONE ack=complete rm=570.144 memory=retained display=held native-output=unavailable");
+            try self.running.open(&self.ctx.?, &self.port, &self.handoff.?, self.reader.?, self.deadline);
+            self.ctx.?.logInfo("NVIDIA gsp-start: firmware-ready=INIT_DONE ack=complete rm=570.144 runtime=polling memory=retained display=held native-output=unavailable");
         }
+        return true;
     }
     fn fail(self: *Device, err: anyerror) void {
         if (self.failure == null) { self.failure = err; self.failed_phase = self.phase; }
-        self.logFailure("startup", err);
+        self.logFailure(if (self.phase == .ready) "runtime" else "startup", err);
         if (!self.port.effects_possible or !self.memory.?.retained) { self.phase = .failed; return; }
         self.phase = .recovering;
         const current = self.now() catch |failure| { self.recovery_failure = failure; self.phase = .failed; return; };
@@ -311,7 +319,7 @@ pub const Device = struct {
     fn admit(raw: *anyopaque, command: sequencer.Command) error{ Denied, Unsupported }!void {
         const self = from(raw);
         self.checkLive(false) catch return error.Denied;
-        if (self.phase != .notifications or self.boot == null or self.boot.?.in_lockdown) return error.Denied;
+        if ((self.phase != .notifications and self.phase != .ready) or self.boot == null or self.inLockdown()) return error.Denied;
         const permitted = switch (command) {
             .write => |v| allowed(.write, v.address),
             .modify => |v| allowed(.read, v.address) and allowed(.write, v.address),
@@ -324,8 +332,12 @@ pub const Device = struct {
     fn access(raw: *anyopaque, kind: native.Access, address: u32) !void {
         const self = from(raw);
         try self.checkLive(false);
-        if (self.boot) |*boot| if (boot.in_lockdown) return error.Lockdown;
+        if (self.inLockdown()) return error.Lockdown;
         if (!allowed(kind, address)) return error.Register;
+    }
+    fn inLockdown(self: *Device) bool {
+        if (self.running.channel) |*channel| return channel.in_lockdown;
+        return if (self.boot) |*boot| boot.in_lockdown else false;
     }
     fn recoveryGeneration(raw: *anyopaque) u64 {
         const self = from(raw);

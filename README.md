@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.52; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.53; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -11,6 +11,36 @@ Starting with R4OS 0.79.9, `IMAGE_SCOPE=slim` includes the current module in
 Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
+
+Resident GSP runtime (NVIDIA 0.1.53, 2026-09-12):
+
+After INIT_DONE, the actual device worker keeps its runtime Exchange alive.
+Idle polls receive fresh deadlines; pending messages/sequencers retain their
+original bounds. Libos print, XID and NOCAT diagnostics, current lockdown and
+the native CPU sequencer are connected. Effects requiring actual RM/channel,
+display, IRQ or recovery owners remain unsupported and retain their receipt.
+XID logging does not itself initiate a GPU reset.
+
+An empty runtime queue paces the dedicated Task at about 100 Hz (at least one
+tick). Each Work callback retains the 64-step/2-ms bound. One raw Libos ring
+is sampled per second while idle, using resident scratch space; a moving
+producer is skipped. Poll/log counters are CPU observations, not a firmware
+heartbeat. Runtime errors use the existing one-shot retained teardown.
+
+All 51 existing host cases, the module build and legal staging pass. The
+existing complete-run case covers post-boot deadlines, lockdown/unlock,
+diagnostics, native sequencer execution/expiry, unknown/unowned messages,
+raw-log DMA failure and a moving producer. No new test group or guest run;
+Kernel152 and its previous SMP4 Task-to-Work evidence are unchanged. The
+27,240-byte complete source notices are embedded and staged byte-identically.
+Twenty-two complete pinned references accompany the source and evidence in
+ExFiles/Reference/GFX/Nvidia/0.79.10/gsp-runtime-20260912.
+
+Physical firmware start, IRQ wakeup/health, RM initialization, full GPU/UEFI
+restore and native video/audio remain open. OssiPC was not contacted or
+updated; its last verified state is Kernel150/NVIDIA50 passive.
+
+The entries below describe preceding checkpoints.
 
 Native GSP start wiring (NVIDIA 0.1.52 / Kernel 0.1.152, 2026-09-12):
 
@@ -38,8 +68,6 @@ The runner now avoids explicitly including/staging an already selected Slim
 driver. No new test group or physical firmware execution. OssiPC remains on
 Kernel150/NVIDIA50 passive, pending availability to power on after a required
 poweroff. Evidence: ExFiles/Reference/GFX/Nvidia/0.79.10/gsp-start-20260912.
-
-The entries below describe preceding checkpoints.
 
 One-shot firmware teardown (NVIDIA 0.1.51, 2026-09-11):
 

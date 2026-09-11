@@ -1,5 +1,16 @@
 ﻿# Third-Party Notices
 
+Resident GSP runtime (NVIDIA 0.1.53, 2026-09-12):
+The previously prepared runtime exchange and typed events are now linked
+to the actual device worker. Their full original NVIDIA/Nouveau notices,
+together with the existing boot/core/teardown adapter notices, are kept
+in NVIDIA-GSP-RUNTIME-LICENSE.txt and embedded/staged unchanged. Nine
+source preambles retain all copyright, permission and disclaimer text.
+Full pinned reference files and provenance: gsp-runtime-20260912 under
+ExFiles/Reference/GFX/Nvidia/0.79.10. No firmware binary or source pin
+changes. Original R4OS runtime scheduling/ownership: Apache-2.0.
+Older entries below describe their historical integration state.
+
 Firmware teardown (0.79.10, NVIDIA 0.1.51, 2026-09-11):
 Ordering follows the pinned MIT kgspTeardown_TU102; its complete original
 notice is retained in gsp_teardown.zig. Existing Falcon/Booter notices remain

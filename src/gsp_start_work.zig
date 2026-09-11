@@ -67,10 +67,14 @@ pub const Work = struct {
                 ctx.logError("NVIDIA gsp-start: pacing=failed reason=work-completion device=retained");
                 return -1;
             }
-            if (result != 0) return if (result > 0) 0 else result;
+            if (result == 1) return 0;
+            if (result < 0) return result;
             // Sleeping here releases the dedicated task's owner context.
             // No shared worker, MMIO callback or device lock spans this wait.
-            if (self.threads.?.sleepTicks(1) != 0) return 0;
+            // An empty runtime queue needs no tight spin. Active startup or
+            // sequencer steps keep the short cadence; IRQ wakeup is separate.
+            const ticks = if (result == 2 and self.device.?.phase == .ready) @max(ctx.timerFrequency() / 100, 1) else 1;
+            if (self.threads.?.sleepTicks(ticks) != 0) return 0;
         }
         return 0;
     }
@@ -104,7 +108,11 @@ pub const Work = struct {
         // already has its native phase's finite deadline and register limit.
         for (0..64) |_| {
             if (@atomicLoad(u32, &self.stopping, .acquire) != 0) return 1;
-            if (self.device.?.step()) return 1;
+            switch (self.device.?.step()) {
+                .stopped => return 1,
+                .idle => return 2,
+                .progress => {},
+            }
             const current = clock.nowNs();
             if (current == std.math.maxInt(u64) or current < started_at) return -1;
             if (current - started_at >= 2 * std.time.ns_per_ms) break;
