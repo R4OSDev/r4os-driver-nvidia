@@ -330,6 +330,19 @@ fn readVbios(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Sna
             if (connector.mux_mask) |value| @as(u16, value) else @as(u16, 256), connector.display_paths, connector.heads, connector.or_mask, connector.logical_bus_mask, connector.ccb_mask,
         });
     }
+    if (result.gpio_table) |*gpio| {
+        log("NVIDIA gpio-table: version={x} offset={x} bytes={d} entries={d} stride={d} external-offset={x} external=unresolved state=metadata-only", .{
+            gpio.version, gpio.offset, gpio.byte_length, gpio.count, gpio.entry_bytes, gpio.external_table_offset orelse 0,
+        });
+        for (&gpio.hpd, 0..) |*hpd, i| {
+            log("NVIDIA HPD-function: mask={x} function={d} status={s} matches={d} entry={d} pin={d} active-high={d} level=unread", .{
+                @as(u8, 1) << @as(u3, @intCast(i)), hpd.function, @tagName(hpd.status), hpd.matches,
+                if (hpd.entry_index) |value| @as(u16, value) else @as(u16, 256),
+                if (hpd.line) |value| @as(u16, value) else @as(u16, 256),
+                if (hpd.active_high) |value| @as(u8, @intFromBool(value)) else @as(u8, 2),
+            });
+        }
+    } else ctx.logInfo("NVIDIA gpio-table: absent live-HPD=unknown");
     if (!inspectFwsec(ctx, snapshot, chip, bytes[start.offset..][0..result.rom_bytes], &result)) return false;
     if (!board_rom.close()) return false;
     ctx.logInfo("NVIDIA vbios: cleanup=OK resources=0 PROM-writes=disabled fallback=preserved");

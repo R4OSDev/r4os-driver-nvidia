@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-Passive NVIDIA display driver for R4OS. Module 0.1.43; original R4OS code is
+Passive NVIDIA display driver for R4OS. Module 0.1.44; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -10,7 +10,38 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
-Physical connector wiring (NVIDIA 0.1.43, roadmap 0.79.12 preparation):
+Internal GPIO wiring (NVIDIA 0.1.44, roadmap 0.79.12 preparation):
+
+The existing VBIOS reader now snapshots optional GPIO 4.0/4.1 assignment
+tables, including all 255 possible records, with exact four/five-byte
+reads and disjoint ROM bounds. It matches the seven HPD function names
+against the complete internal table. Missing, ambiguous, invalid input
+and mapped metadata remain distinct; duplicates never choose the first
+entry. Input polarity requires opposite levels with both states input.
+Dedicated lock pins, reserved bits and invalid lock assignments cannot
+be presented as usable HPD inputs. Raw fields and unknown legacy fields
+remain available. Connector HPD masks refer to these same seven mappings.
+
+PROM diagnostics and inspect-vbios schema 4 expose the shared catalog.
+The external expander pointer remains explicitly unparsed. Six-bit pin
+numbers are firmware metadata, not admission to GA106's 32 GPIO lines.
+Nouveau also refuses an independent GA106 GPIO driver under GSP/RM;
+no live register access, GPIO initialization, interrupt ownership or
+firmware control is added. Actual connection state stays unknown.
+
+51 existing owner cases pass after fixing two typed-array literals in
+the new synthetic fixture. The module and existing inspector also pass;
+no added case/gate, guest or hardware run. The inspector checks seven
+synthetic pins with both polarities and connector A/G versus B masks.
+Fourteen full pinned originals accompany gpio-20260911 under
+ExFiles/Reference/GFX/Nvidia/0.79.12. The existing connector notice grows
+to 5105 bytes with both complete GPIO source notices; its prior
+2620 bytes are an exact prefix, and the other 29 resources are unchanged.
+Current evidence: gpio_topology_checkpoint in
+Docs/Drivers/GrafikFirmware07910.json. OssiPC remains offline/untouched;
+native firmware/recovery, external GPIO and real receiver acceptance open.
+
+Previous physical connector wiring (NVIDIA 0.1.43):
 
 The existing VBIOS reader now retains bounded physical connector and CCB
 catalogs. DP/TMDS alternatives share original path masks instead of implying

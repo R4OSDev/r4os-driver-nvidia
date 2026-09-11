@@ -1,5 +1,15 @@
 ﻿# Third-Party Notices
 
+Internal GPIO metadata (NVIDIA 0.1.44, roadmap 0.79.12):
+The decoder preserves complete original MIT notices from Nouveau bios/gpio.c
+(2012 Red Hat) and gpio/base.c (2011 Red Hat), both Ben Skeggs. They also
+extend the existing NVIDIA-CONNECTORS-LICENSE.txt to 5105 bytes in
+the R4D and Distribution. All earlier 2620 notice bytes remain an exact
+prefix. Fourteen full pinned originals accompany gpio-20260911; ga102.c
+register/ownership code remains reference-only. Original R4OS copy, bounds,
+matching and ambiguity policy is Apache-2.0. No live GPIO or firmware call.
+
+
 Connector/CCB metadata (NVIDIA 0.1.43, roadmap 0.79.12):
 The wiring decoder retains both complete Nouveau bios/i2c.c and conn.c
 MIT notices, also in NVIDIA-CONNECTORS-LICENSE.txt and Distribution.

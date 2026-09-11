@@ -1,5 +1,6 @@
 const std = @import("std");
 pub const topology = @import("vbios_topology.zig");
+pub const gpio = @import("vbios_gpio.zig");
 
 pub const max_rom_bytes = 1024 * 1024;
 pub const max_ports = 32;
@@ -47,6 +48,7 @@ pub const Result = struct {
     connector_version: u8 = 0,
     connector_count: u8 = 0,
     connectors: [topology.max_entries]topology.Connector = .{topology.Connector{}} ** topology.max_entries,
+    gpio_table: ?gpio.Catalog = null,
     port_count: u8 = 0,
     ports: [max_ports]Port = .{Port{}} ** max_ports,
 };
@@ -286,6 +288,11 @@ fn parseDcb(image: []const u8, ranges: *Ranges, result: *Result) Error!void {
         result.connector_count = value.count;
         for (0..value.count) |i| result.connectors[i] = try topology.connector(@intCast(i), value.records[i * value.stride ..][0..value.stride]);
     }
+    const gpio_offset = u16le(header, 0x0a);
+    if (gpio_offset != 0) {
+        result.gpio_table = try gpio.parse(image, gpio_offset);
+        try ranges.add(gpio_offset, result.gpio_table.?.byte_length);
+    }
     for (0..count) |index| {
         const entry = table[size + index * stride ..][0..8];
         const path = u32le(entry, 0);
@@ -335,8 +342,8 @@ fn parseDcb(image: []const u8, ranges: *Ranges, result: *Result) Error!void {
 
 const Ranges = struct {
     const Range = struct { start: usize = 0, end: usize = 0 };
-    // Header, DCB pointer, PCI, optional NPDE, BIT header/data and DCB/CCB/connector.
-    values: [9]Range = .{Range{}} ** 9,
+    // Header, DCB pointer, PCI, optional NPDE, BIT header/data and DCB/CCB/connector/GPIO.
+    values: [10]Range = .{Range{}} ** 10,
     count: usize = 0,
     fn add(self: *Ranges, start: usize, length: usize) Error!void {
         if (self.count == self.values.len) return error.Limit;

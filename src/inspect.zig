@@ -37,8 +37,12 @@ pub fn main(init: std.process.Init) !void {
             entries[index] = .{ .entry = entry.*, .descriptor_sha256 = &hashes[index][0], .image_sha256 = &hashes[index][1], .signatures_sha256 = if (entry.signatures.bytes == 0) null else &hashes[index][2] };
         }
     }
+    var gpio_entries: [vbios.gpio.max_entries]vbios.gpio.Entry = undefined;
+    if (result.gpio_table) |*gpio| for (0..gpio.count) |i| {
+        gpio_entries[i] = try gpio.entry(i);
+    };
     const report = .{
-        .schema = 3,
+        .schema = 4,
         .source = "supplied-file",
         .sha256 = digest_hex[0..],
         .hardware_verified = false,
@@ -65,6 +69,13 @@ pub fn main(init: std.process.Init) !void {
         .communications = result.communications[0..result.communication_count],
         .connector_version = result.connector_version,
         .connectors = result.connectors[0..result.connector_count],
+        .gpio = if (result.gpio_table) |*gpio| .{
+            .offset = gpio.offset, .version = gpio.version, .header_bytes = gpio.header_bytes,
+            .entry_bytes = gpio.entry_bytes, .byte_length = gpio.byte_length,
+            .external_table_offset = gpio.external_table_offset,
+            .external_table_resolved = false,
+            .entries = gpio_entries[0..gpio.count], .hpd = &gpio.hpd,
+        } else null,
         .topology_state = "VBIOS-wiring-only; live HPD, active routing and receiver data unknown",
         .ports = result.ports[0..result.port_count],
         .fwsec = .{

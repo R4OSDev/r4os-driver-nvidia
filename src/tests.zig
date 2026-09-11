@@ -275,6 +275,7 @@ test "modern BIT DCB CCB and connector extraction keeps raw facts and null ports
     try t.expectEqual(@as(?u8, 0x61), info.ports[0].connector_type);
     try t.expectEqual(@as(?u8, 0x46), info.ports[1].connector_type);
     try checkConnectorTopology(&rom, &info);
+    try checkGpioTopology(&rom);
     try t.expectEqualSlices(u8, &before, &rom);
     try t.expectError(error.Identity, vbios.parse(&rom, 0xbeef));
     try t.expectError(error.Limit, vbios.parse(rom[0..0], null));
@@ -366,6 +367,96 @@ fn checkConnectorTopology(rom: *const [1024]u8, info: *const vbios.Result) !void
     try t.expectError(error.Bounds, wiring.connector(16, &.{ 0x61, 0 }));
     try t.expectError(error.Bounds, wiring.connector(0, &.{0x61}));
     try t.expectError(error.Bounds, wiring.communication(0, &.{ 1, 2, 3 }));
+}
+
+fn checkGpioTopology(rom: *const [1024]u8) !void {
+    const gpio = vbios.gpio;
+    try t.expect((try vbios.parse(rom, null)).gpio_table == null);
+    var table: [6 + 7 * 5]u8 = .{0} ** (6 + 7 * 5);
+    @memcpy(table[0..4], &[_]u8{ 0x41, 6, 7, 5 });
+    for (gpio.hpd_functions, 0..) |function, i| {
+        put32(&table, 6 + i * 5, @as(u32, @intCast(i + 10)) | (@as(u32, function) << 8) | (@as(u32, @intCast(i + 1)) << 24));
+        table[6 + i * 5 + 4] = if (i & 1 == 0) 0xef else 0xbf;
+    }
+    const saved = try gpio.parse(&table, 0);
+    try t.expectEqual(@as(u16, table.len), saved.byte_length);
+    for (&saved.hpd, 0..) |*hpd, i| {
+        try t.expectEqual(gpio.Status.mapped, hpd.status);
+        try t.expectEqual(@as(u16, 1), hpd.matches);
+        try t.expectEqual(@as(?u8, @intCast(i + 10)), hpd.line);
+        try t.expectEqual(@as(?bool, i & 1 == 0), hpd.active_high);
+        const item = try saved.entry(i);
+        try t.expectEqual(@as(?u8, @intCast(i + 1)), item.input_select);
+        try t.expectEqual(@as(?u8, 15), item.lock_pin);
+    }
+    // The final record has exactly five bytes; no 32-bit read of byte4.
+    try t.expectEqual(@as(u8, 96), (try saved.entry(6)).function);
+    for (0..table.len) |len| try t.expectError(error.Bounds, gpio.parse(table[0..len], 0));
+    try t.expectError(error.Bounds, saved.entry(7));
+    var image = rom.*;
+    put16(&image, 0x10a, 0x220);
+    @memcpy(image[0x220..][0..table.len], &table);
+    checksum(&image, 1023);
+    const board = try vbios.parse(&image, 0x2504);
+    try t.expectEqualDeep(saved.hpd, board.gpio_table.?.hpd);
+    table[7] = 0xff;
+    try t.expectEqual(@as(u8, 7), (try saved.entry(0)).function);
+    table[7] = 7;
+    // External expanders remain explicitly unparsed, without dereferencing
+    // an external table pointer or pretending an internal miss proves absence.
+    put16(&table, 4, 0x1234);
+    const external = try gpio.parse(&table, 0);
+    try t.expectEqual(@as(?u16, 0x1234), external.external_table_offset);
+    try t.expectEqualDeep(saved.hpd, external.hpd);
+
+    var one: [11]u8 = .{ 0x41, 6, 1, 5, 0, 0, 63, 7, 0, 0, 0xef };
+    const high_pin = try gpio.parse(&one, 0);
+    try t.expectEqual(@as(?u8, 63), high_pin.hpd[0].line); // Metadata, not GA106 admission (32 lines).
+    for ([_]struct { word: u32, extra: u8 }{
+        .{ .word = 0x00000740, .extra = 0xef }, // Dedicated lock, no GPIO.
+        .{ .word = 0x40000701, .extra = 0xef }, // Reserved bit.
+        .{ .word = 0x00000701, .extra = 0xe0 }, // HPD cannot be a lock pin.
+        .{ .word = 0x00000701, .extra = 0xcf }, // OFF drives output.
+        .{ .word = 0x00000701, .extra = 0xff }, // Input levels indistinguishable.
+    }) |fault| {
+        put32(&one, 6, fault.word);one[10] = fault.extra;
+        const bad = try gpio.parse(&one, 0);
+        try t.expectEqual(gpio.Status.invalid_input, bad.hpd[0].status);
+        try t.expect(bad.hpd[0].line == null and bad.hpd[0].active_high == null);
+    }
+    put32(&one, 6, 0x0000ff01);one[10] = 0xef;
+    try t.expectEqual(gpio.Status.missing, (try gpio.parse(&one, 0)).hpd[0].status);
+    one[0] = 0x42;
+    try t.expectError(error.Version, gpio.parse(&one, 0));one[0] = 0x41;
+    one[3] = 8;
+    try t.expectError(error.Limit, gpio.parse(&one, 0));
+    var old: [10]u8 = .{ 0x40, 6, 1, 4, 0, 0, 0, 0, 0, 0 };
+    put32(&old, 6, 0xf000071f);
+    const legacy = try gpio.parse(&old, 0);
+    const legacy_entry = try legacy.entry(0);
+    try t.expectEqual(@as(?u8, 31), legacy.hpd[0].line);
+    try t.expectEqual(@as(?bool, true), legacy.hpd[0].active_high);
+    try t.expect(legacy_entry.extra == null and legacy_entry.input_select == null and legacy_entry.pwm);
+
+    // Accept the full count field, but never silently choose one duplicate.
+    var full: [6 + gpio.max_entries * 5]u8 = .{0} ** (6 + gpio.max_entries * 5);
+    @memcpy(full[0..4], &[_]u8{ 0x41, 6, 255, 5 });
+    for (0..gpio.max_entries) |i| {
+        put32(&full, 6 + i * 5, 0x701);full[6 + i * 5 + 4] = 0xef;
+    }
+    const duplicate = try gpio.parse(&full, 0);
+    try t.expectEqual(@as(u8, 255), duplicate.count);
+    try t.expectEqual(@as(u16, 255), duplicate.hpd[0].matches);
+    try t.expectEqual(gpio.Status.ambiguous, duplicate.hpd[0].status);
+    try t.expect(duplicate.hpd[0].entry_index == null and duplicate.hpd[0].line == null);
+    // GPIO and CCB may not claim the same ROM bytes, even when both headers
+    // independently fit their versions and bounds.
+    image = rom.*;
+    std.mem.copyBackwards(u8, image[0x18b..0x18f], image[0x18a..0x18e]);
+    image[0x183] = 5;put16(&image, 0x10a, 0x180);checksum(&image, 1023);
+    try t.expectError(error.Overlap, vbios.parse(&image, null));
+    put16(&image, 0x10a, 0xfffc);checksum(&image, 1023);
+    try t.expectError(error.Bounds, vbios.parse(&image, null));
 }
 
 const DiagnosticSink = struct {

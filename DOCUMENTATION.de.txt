@@ -10,7 +10,39 @@ unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
 
-Physische Anschlusszuordnung (NVIDIA 0.1.43; Vorbereitung 0.79.12)
+Interne GPIO-Zuordnung (NVIDIA 0.1.44; Vorbereitung 0.79.12)
+---------------------------------------------------------
+Der vorhandene VBIOS-Leser kopiert optionale GPIO-4.0/4.1-Tabellen mit bis
+zu allen 255 Eintraegen. Vier-/Fuenf-Byte-Eintraege werden exakt gelesen;
+auch der letzte Fuenf-Byte-Eintrag wird nicht ueberlesen. Der gesamte
+Tabellenbereich wird gegen andere belegte ROM-Strukturen abgegrenzt.
+Die sieben HPD-Funktionen A..G werden ueber alle internen Eintraege gesucht:
+fehlend, mehrdeutig, unbrauchbarer Eingang oder eindeutige Metadaten.
+Doppelte Funktionen waehlen nicht still den ersten Pin. Gueltige Eingangs-
+polaritaet verlangt zwei entgegengesetzte Pegel bei jeweils Input-Richtung.
+Dedizierte Lock-Pins, reservierte Bits und ungeeignete Lock-Zuordnungen
+bleiben als HPD-Eingang unbrauchbar. Rohdaten und Legacy-Unbekannte bleiben
+erhalten. Die Connector-Funktionsmasken nutzen dieselben sieben Zuordnungen.
+
+PROM-Diagnose und inspect-vbios Schema 4 zeigen diesen Katalog. Externe
+GPIO-Erweiterungen werden nur als noch nicht ausgewerteter Verweis erfasst.
+Die sechs Bit breiten Pinangaben sind keine Hardwarezulassung: GA106 bietet
+im referenzierten Treiber 32 Leitungen. Unter GSP/RM wird auch dort kein
+unabhaengiger GPIO-Treiber gestartet. Keine neuen MMIO-/Bus-/GPIO-Zugriffe,
+Initialisierungen, IRQ-Besitzer oder Firmwareaufrufe. Live-HPD bleibt offen.
+
+51 bestehende Besitzerfaelle nach Korrektur zweier typisierter Arrayliterale
+im neuen synthetischen Fixture bestanden; Modul und vorhandener Inspektor
+ebenfalls. Kein neuer Fall/Gate oder Gast-/Hardwarelauf. Geprueft sind alle
+HPD-Funktionen mit beiden Polaritaeten, volle 255 Eintraege/Duplikate,
+Legacy/Fehler/Bereichsgrenzen sowie synthetische Connector-Masken A/G und B.
+14 vollstaendige gepinnte Quellen unter ExFiles/Reference/GFX/Nvidia/
+0.79.12/gpio-20260911. Bestehende Connector-Lizenz nun 5105 Bytes,
+alte 2620 Bytes als exakter Praefix und weitere 29 Ressourcen unveraendert.
+Beleg gpio_topology_checkpoint in GrafikFirmware07910.json. OssiPC offline
+und unberuehrt; externe GPIOs, GSP/Recovery, echte Monitor-/Audioabnahme offen.
+
+Vorherige Anschlusszuordnung (NVIDIA 0.1.43)
 --------------------------------------------------------------
 Der bestehende VBIOS-Leser bewahrt nun die begrenzten Connector- und CCB-
 Tabellen. DP/TMDS-Alternativen derselben Buchse teilen sich die originalen
