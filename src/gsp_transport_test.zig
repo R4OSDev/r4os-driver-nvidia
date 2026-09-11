@@ -2,6 +2,7 @@ const std = @import("std");
 const t = std.testing;
 const transport = @import("gsp_transport.zig");
 const boot_events = @import("gsp_boot_events.zig");
+const sequencer = @import("gsp_sequencer.zig");
 const message = transport.message;
 const ring = transport.ring;
 const profile = message.Profile{ .chip_id = 0x176 };
@@ -97,12 +98,273 @@ fn get(bytes: []const u8, offset: usize) u32 {
 }
 
 fn startBoot(model: *Model, session: *transport.Session) !boot_events.Boot {
+    return startBootAt(model, session, deadline);
+}
+fn startBootAt(model: *Model, session: *transport.Session, end: u64) !boot_events.Boot {
     model.reset(3);
     session.* = try transport.Session.init(model.port(), profile, model.epoch, &model.tx, &model.rx);
-    var boot = try boot_events.Boot.init(session, deadline);
+    var boot = try boot_events.Boot.init(session, end);
     try t.expect((try boot.poll()) == null);
     model.count = 0;
     return boot;
+}
+
+const SequencerDevice = struct {
+    queue: *Model,
+    registers: [4]u32 = @splat(0),
+    admissions: usize = 0,
+    calls: usize = 0,
+    writes: usize = 0,
+    starts: usize = 0,
+    completions: usize = 0,
+    denied: ?sequencer.Opcode = null,
+    fault: usize = 0,
+    after: bool = false,
+    late: usize = 0,
+    epoch_change: usize = 0,
+    fn ptr(context: *anyopaque) *SequencerDevice {
+        return @ptrCast(@alignCast(context));
+    }
+    fn generation(context: *anyopaque) u64 {
+        return ptr(context).queue.epoch;
+    }
+    fn now(context: *anyopaque) u64 {
+        return ptr(context).queue.now;
+    }
+    fn admit(context: *anyopaque, command: sequencer.Command) error{ Denied, Unsupported }!void {
+        const self = ptr(context);
+        self.admissions += 1;
+        if (self.denied == std.meta.activeTag(command)) return error.Denied;
+    }
+    fn begin(self: *SequencerDevice) !void {
+        self.calls += 1;
+        if (self.calls == self.fault and !self.after) return error.RegisterBus;
+    }
+    fn finish(self: *SequencerDevice) !void {
+        if (self.calls == self.late) self.queue.now = 100000;
+        if (self.calls == self.epoch_change) self.queue.epoch += 1;
+        if (self.calls == self.fault and self.after) return error.RegisterBus;
+    }
+    fn read(context: *anyopaque, address: u32) !u32 {
+        const self = ptr(context);
+        try self.begin();
+        const value = self.registers[address / 4];
+        try self.finish();
+        return value;
+    }
+    fn write(context: *anyopaque, address: u32, value: u32) !void {
+        const self = ptr(context);
+        try self.begin();
+        self.writes += 1;
+        self.registers[address / 4] = value;
+        try self.finish();
+    }
+    fn core(context: *anyopaque, opcode: sequencer.Opcode, state: *sequencer.CoreState, end: u64, saved: *const [8]u32) !bool {
+        const self = ptr(context);
+        try t.expect(@intFromEnum(opcode) >= 5 and @intFromEnum(opcode) <= 8);
+        try t.expect(end <= 100000 and end > self.queue.now);
+        _ = saved;
+        try self.begin();
+        if (state.phase == 0) {
+            self.starts += 1;
+            state.phase = 1;
+            try self.finish();
+            return false;
+        }
+        try t.expectEqual(@as(u32, 1), state.phase);
+        self.completions += 1;
+        state.phase = 2;
+        try self.finish();
+        return true;
+    }
+    fn port(self: *SequencerDevice) sequencer.Port {
+        return .{ .context = self, .generation = generation, .now_ns = now, .admit = admit, .read32 = read, .write32 = write, .core_step = core };
+    }
+};
+fn sequencerPayload(output: []u8, words: []const u32) []const u8 {
+    const bytes = output[0 .. 40 + words.len * 4];
+    @memset(bytes, 0);
+    put(bytes, 0, @intCast(words.len + 1));
+    put(bytes, 4, @intCast(words.len));
+    for (0..8) |i| put(bytes, 8 + i * 4, @intCast(0xa0 + i));
+    for (words, 0..) |value, i| put(bytes, 40 + i * 4, value);
+    return bytes;
+}
+
+test "GSP sequencer admits the entire stream and finishes bounded effects before acknowledging its dispatch" {
+    const model = try t.allocator.create(Model);
+    defer t.allocator.destroy(model);
+    const limits = sequencer.Limits{ .register_bytes = 16, .default_timeout_ns = 20000, .poll_interval_ns = 1000 };
+    var session: transport.Session = undefined;
+    var boot = try startBootAt(model, &session, 100000);
+    var device = SequencerDevice{ .queue = model };
+    var payload: [256]u8 = undefined;
+    const program = [_]u32{
+        0, 0, 0xa500, // write
+        1, 0, 0xff, 0x10003, // modify; value includes bits outside mask
+        4, 0, 7, // save
+        2, 4, 0xff, 0x79, 5, 0x600d, // poll, five MICROseconds
+        3, 2, // delay, two microseconds
+        5, 6, 7, 8, // four distinct architecture operations
+    };
+    try model.replyRpc(&session, .{ .function = 0x1002 }, sequencerPayload(&payload, &program));
+    _ = (try boot.poll()).?;
+    var execution = try sequencer.DispatchExecution.init(&boot, device.port(), limits);
+    try t.expectEqual(@as(usize, 9), device.admissions);
+    try t.expectEqual(@as(usize, 0), device.calls);
+    try t.expect((try execution.step()) == .advanced);
+    try t.expectEqual(@as(u32, 0xa500), device.registers[0]);
+    try t.expect((try execution.step()) == .advanced);
+    try t.expectEqual(@as(u32, 0x1a503), device.registers[0]);
+    try t.expect((try execution.step()) == .advanced);
+    try t.expectEqual(@as(u32, 0x1a503), execution.runner.saved[7]);
+    try t.expectEqual(@as(u64, 1001), (try execution.step()).wait_until);
+    try t.expectEqual(@as(u64, 5001), execution.runner.phase_deadline.?);
+    model.now = 4000;
+    try t.expectEqual(@as(u64, 5000), (try execution.step()).wait_until);
+    device.registers[1] = 0x79;
+    model.now = 4001;
+    try t.expect((try execution.step()) == .advanced);
+    try t.expectEqual(@as(u64, 6001), (try execution.step()).wait_until);
+    const before_delay = device.calls;
+    model.now = 6000;
+    try t.expectEqual(@as(u64, 6001), (try execution.step()).wait_until);
+    try t.expectEqual(before_delay, device.calls);
+    model.now = 6001;
+    try t.expect((try execution.step()) == .advanced);
+    for (0..4) |i| {
+        try t.expect((try execution.step()) == .wait_until);
+        try t.expectEqual(@as(u32, 0), model.peerWord(session.link.?.status_read));
+        model.now += 1000;
+        const result = try execution.step();
+        try t.expect(if (i == 3) result == .complete else result == .advanced);
+    }
+    try t.expectEqual(@as(usize, 4), device.starts);
+    try t.expectEqual(@as(usize, 4), device.completions);
+    try t.expect(execution.acknowledged);
+    try t.expectEqual(@as(u32, 1), model.peerWord(session.link.?.status_read));
+    try t.expectEqual(boot_events.State.waiting, boot.state); // Still needs INIT_DONE.
+    const completed_calls = device.calls;
+    const completed_queue_calls = model.count;
+    try t.expect((try execution.step()) == .complete);
+    try t.expectEqual(completed_calls, device.calls);
+    try t.expectEqual(completed_queue_calls, model.count);
+
+    const Invalid = struct { words: []const u32, expected: sequencer.Error, deny: ?sequencer.Opcode = null, core: bool = true };
+    for ([_]Invalid{
+        .{ .words = &.{ 0, 0, 0x79, 99 }, .expected = error.Opcode },
+        .{ .words = &.{ 0, 0, 0x79, 0 }, .expected = error.Payload },
+        .{ .words = &.{ 0, 0, 0x79, 0, 16, 1 }, .expected = error.Register },
+        .{ .words = &.{ 0, 0, 0x79, 0, 2, 1 }, .expected = error.Register },
+        .{ .words = &.{ 0, 0, 0x79, 4, 4, 8 }, .expected = error.Slot },
+        .{ .words = &.{ 0, 0, 0x79, 2, 4, 1, 2, 3, 4 }, .expected = error.Payload },
+        .{ .words = &.{ 0, 0, 0x79, 8 }, .expected = error.Unsupported, .core = false },
+        .{ .words = &.{ 0, 0, 0x79, 6 }, .expected = error.Denied, .deny = .core_start },
+        .{ .words = &.{ 0, 0, 0x79, 3, 0xffffffff }, .expected = error.Deadline },
+        .{ .words = &.{ 0, 0, 0x79, 3, 50, 3, 50 }, .expected = error.Deadline },
+    }) |case| {
+        boot = try startBootAt(model, &session, 100000);
+        device = .{ .queue = model, .denied = case.deny };
+        try model.replyRpc(&session, .{ .function = 0x1002 }, sequencerPayload(&payload, case.words));
+        _ = (try boot.poll()).?;
+        var port = device.port();
+        if (!case.core) port.core_step = null;
+        try t.expectError(case.expected, sequencer.DispatchExecution.init(&boot, port, limits));
+        try t.expectEqual(@as(usize, 0), device.calls);
+        try t.expectEqual(@as(u32, 0), model.peerWord(session.link.?.status_read));
+        try t.expectEqual(boot_events.State.failed, boot.state);
+        try t.expect(session.pending != null);
+    }
+    // A poll's first local deadline cannot slide on subsequent worker calls.
+    // Prior writes remain accounted for; a timeout cannot trigger a replay.
+    boot = try startBootAt(model, &session, 100000);
+    device = .{ .queue = model };
+    try model.replyRpc(&session, .{ .function = 0x1002 }, sequencerPayload(&payload, &.{ 0, 0, 0x79, 2, 4, 0xff, 0x79, 3, 0xbeef }));
+    _ = (try boot.poll()).?;
+    execution = try sequencer.DispatchExecution.init(&boot, device.port(), limits);
+    _ = try execution.step();
+    _ = try execution.step();
+    model.now = 3000;
+    _ = try execution.step();
+    model.now = 3001;
+    try t.expectError(error.Timeout, execution.step());
+    try t.expectEqual(@as(u32, 0xbeef), execution.runner.failure.?.vendor_error);
+    try t.expectEqual(@as(usize, 3), execution.runner.failure.?.word_index);
+    try t.expectEqual(@as(u32, 0), execution.runner.failure.?.last_value.?);
+    var calls = device.calls;
+    try t.expectError(error.State, execution.step());
+    try t.expectEqual(calls, device.calls);
+    try t.expectEqual(@as(u32, 0x79), device.registers[0]);
+    try t.expectEqual(@as(u32, 0), model.peerWord(session.link.?.status_read));
+
+    // Hardware callback failure before/after an effect, global deadline and
+    // stale epoch all stop execution while the event remains unacknowledged.
+    for (0..4) |fault| {
+        boot = try startBootAt(model, &session, 100000);
+        device = .{ .queue = model };
+        try model.replyRpc(&session, .{ .function = 0x1002 }, sequencerPayload(&payload, &.{ 0, 0, 0x79, 0, 4, 0xaa }));
+        _ = (try boot.poll()).?;
+        execution = try sequencer.DispatchExecution.init(&boot, device.port(), limits);
+        const expected: sequencer.DispatchError = switch (fault) {
+            0, 1 => blk: {
+                device.fault = 1;
+                device.after = fault == 1;
+                break :blk error.Io;
+            },
+            2 => blk: {
+                device.late = 1;
+                break :blk error.Deadline;
+            },
+            else => blk: {
+                device.epoch_change = 1;
+                break :blk error.Stale;
+            },
+        };
+        try t.expectError(expected, execution.step());
+        try t.expectEqual(@as(u32, if (fault == 0) 0 else 0x79), device.registers[0]);
+        try t.expectEqual(@as(u32, 0), device.registers[1]);
+        try t.expectEqual(@as(u32, 0), model.peerWord(session.link.?.status_read));
+        calls = device.calls;
+        try t.expectError(error.State, execution.step());
+        try t.expectEqual(calls, device.calls);
+    }
+    // A partially started architecture operation is not restarted after an
+    // ambiguous callback, and an expired deferred event prevents any new I/O.
+    boot = try startBootAt(model, &session, 100000);
+    device = .{ .queue = model, .fault = 1, .after = true };
+    try model.replyRpc(&session, .{ .function = 0x1002 }, sequencerPayload(&payload, &.{8}));
+    _ = (try boot.poll()).?;
+    execution = try sequencer.DispatchExecution.init(&boot, device.port(), limits);
+    try t.expectError(error.Io, execution.step());
+    try t.expectEqual(@as(u32, 1), execution.runner.core.phase);
+    try t.expectEqual(@as(usize, 1), device.starts);
+    try t.expectEqual(error.RegisterBus, execution.runner.failure.?.callback_error.?);
+
+    boot = try startBootAt(model, &session, 100000);
+    device = .{ .queue = model };
+    try model.replyRpc(&session, .{ .function = 0x1002 }, sequencerPayload(&payload, &.{ 0, 0, 0x79 }));
+    _ = (try boot.poll()).?;
+    execution = try sequencer.DispatchExecution.init(&boot, device.port(), limits);
+    model.now = 100000;
+    try t.expectError(error.Deadline, execution.step());
+    try t.expectEqual(@as(usize, 0), device.calls);
+
+    // ACK can fail after all real port effects finished. Keep that completion
+    // and never repeat the write merely to get a second queue acknowledgement.
+    boot = try startBootAt(model, &session, 100000);
+    device = .{ .queue = model };
+    try model.replyRpc(&session, .{ .function = 0x1002 }, sequencerPayload(&payload, &.{ 0, 0, 0x79 }));
+    _ = (try boot.poll()).?;
+    execution = try sequencer.DispatchExecution.init(&boot, device.port(), limits);
+    model.fault = model.count + 1;
+    model.after = true;
+    try t.expectError(error.Io, execution.step());
+    try t.expectEqual(sequencer.State.complete, execution.runner.state);
+    try t.expect(!execution.acknowledged and execution.failed);
+    try t.expectEqual(@as(u32, 1), model.peerWord(session.link.?.status_read));
+    try t.expect(boot.pending != null and session.pending != null);
+    try t.expectError(error.State, execution.step());
+    try t.expectEqual(@as(usize, 1), device.writes);
 }
 fn badBootEvent(model: *Model, rpc: message.Rpc, payload: []const u8, expected: boot_events.Error) !void {
     var session: transport.Session = undefined;

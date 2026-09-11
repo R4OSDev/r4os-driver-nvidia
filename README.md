@@ -10,6 +10,39 @@ the kernel PCI inventory. It does not initialize engines or take over scanout.
 `IMAGE_SCOPE=none` keeps the module out of normal images. The boot framebuffer
 and any existing display owner remain in control.
 
+The host-qualified `gsp_sequencer.DispatchExecution` now holds a CPU-sequencer
+boot event through complete execution. It checks all nine opcode forms, operand
+extents, register alignment/aperture, save slots and mandatory delay totals
+before the first hardware access. A pure native-port admission callback must
+accept every instruction. Missing core support rejects the entire program.
+
+Each step performs one instruction, one poll sample or one architecture phase.
+Register modify keeps the original `(old & ~mask) | value` semantics. Polls and
+delays use microseconds: the actual NVIDIA timeoutSet ABI/multiplication takes
+precedence over an old MS header comment. Fixed phase deadlines stay within the
+boot deadline; wait_until returns scheduling work without sleeping or spinning.
+Core operations retain phase state and require actual completion by the native
+port. GA106 resume needs its SEC2/RISC-V/boot-argument path. It is not replaced
+by a generic core-start callback that reports success.
+
+Every deferred step revalidates the pending boot ticket. Only complete effects
+permit one queue acknowledgement. Ambiguous effects, expired/stale lifetimes
+or failed acknowledgements cannot replay the program. Word/opcode, vendor poll
+error, last register value and callback error remain available. No memory is
+freed and completion does not prove device quiescence. Native register ports
+must enforce the boot owner's lockdown restrictions and MMIO ordering.
+
+The existing owner step passes 46 cases, with one added grouped composition
+case. All nine opcode/operand forms match the complete original C types/macros
+in an 88-byte stream; the existing six event fixtures also pass. The archive
+`gsp-sequencer-20260911` contains 185 complete original files/notices. This is
+host qualification using register/core-phase models. Real MMIO, Falcon/SEC2
+handlers, native launch/IRQ, health and recovery remain open. NVIDIA0.1.25 and
+its packaged notices are unchanged; no guest run or hardware update occurred.
+Executable linkage must add all new full MIT notices to the package.
+
+Earlier boot-event checkpoint (host):
+
 The host-qualified `gsp_boot_events.Boot` now processes the six pinned startup
 notification types over `gsp_transport.Session`. It admits exact fixed layouts
 and bounded inline/flexible payloads, preserving raw RPC status fields and
@@ -25,7 +58,7 @@ a zero result and completed acknowledgement. It is not a GPU health, scanout
 or quiescence proof. Failed/late acknowledgements retain dispatch and receipt;
 handlers must not be replayed. There is no new allocator, wait loop or reset.
 
-The existing owner step passes 45 cases with one added grouped boot-event case.
+At the boot-event checkpoint the owner step passed 45 cases with one added group.
 Six fixtures built with complete original NVIDIA C types and the original
 checksum agree with the decoder, including inline 1208-byte NOCAT data and
 the one-byte lockdown flag. Both final checks pass. No new gate,

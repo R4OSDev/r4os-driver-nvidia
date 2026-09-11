@@ -18,6 +18,8 @@
 #include "gpu/gsp/message_queue.h"
 #include "gpu/gsp/message_queue_priv.h"
 #include "ctrl/ctrl2080/ctrl2080nvd.h"
+#include "rmgspseq.h"
+#include "gpu/gpu_timeout.h"
 
 _Static_assert(sizeof(rpc_message_header_v) == 32, "complete original RPC header");
 _Static_assert(sizeof(GSP_MSG_QUEUE_ELEMENT) == 80, "minimum message");
@@ -177,3 +179,45 @@ size_t r4nv_gsp_event_abi_fixture(unsigned fixture, unsigned char *output, size_
 }
 
 int r4nv_gsp_event_abi_complete(void) { return events_compared == 0x3f; }
+
+_Static_assert(sizeof(GSP_SEQ_BUF_OPCODE) == 4, "sequencer opcode word");
+_Static_assert(offsetof(GSP_SEQUENCER_BUFFER_CMD, payload) == 4, "immediate operands");
+_Static_assert(GSP_SEQ_BUF_REG_SAVE_SIZE == 8, "saved register slots");
+_Static_assert(GPU_TIMEOUT_DEFAULT == 0, "zero poll timeout inherits owner default");
+static int sequence_compared;
+size_t r4nv_gsp_sequence_abi_fixture(unsigned char *output, size_t capacity)
+{
+    if (capacity < 88) return 0;
+    size_t offset = 0;
+    static const GSP_SEQ_BUF_OPCODE opcodes[] = {
+        GSP_SEQ_BUF_OPCODE_REG_WRITE, GSP_SEQ_BUF_OPCODE_REG_MODIFY,
+        GSP_SEQ_BUF_OPCODE_REG_POLL, GSP_SEQ_BUF_OPCODE_DELAY_US,
+        GSP_SEQ_BUF_OPCODE_REG_STORE, GSP_SEQ_BUF_OPCODE_CORE_RESET,
+        GSP_SEQ_BUF_OPCODE_CORE_START, GSP_SEQ_BUF_OPCODE_CORE_WAIT_FOR_HALT,
+        GSP_SEQ_BUF_OPCODE_CORE_RESUME
+    };
+    for (unsigned i = 0; i < sizeof(opcodes) / sizeof(opcodes[0]); ++i) {
+        GSP_SEQUENCER_BUFFER_CMD cmd;
+        memset(&cmd, 0, sizeof(cmd));
+        cmd.opCode = opcodes[i];
+        switch (cmd.opCode) {
+        case GSP_SEQ_BUF_OPCODE_REG_WRITE:
+            cmd.payload.regWrite.addr = 0x1234; cmd.payload.regWrite.val = 0x5678; break;
+        case GSP_SEQ_BUF_OPCODE_REG_MODIFY:
+            cmd.payload.regModify.addr = 0x5678; cmd.payload.regModify.mask = 0xff00; cmd.payload.regModify.val = 0xf00f; break;
+        case GSP_SEQ_BUF_OPCODE_REG_POLL:
+            cmd.payload.regPoll.addr = 0x9010; cmd.payload.regPoll.mask = 0xfff;
+            cmd.payload.regPoll.val = 0x321; cmd.payload.regPoll.timeout = 7; cmd.payload.regPoll.error = 99; break;
+        case GSP_SEQ_BUF_OPCODE_DELAY_US: cmd.payload.delayUs.val = 13; break;
+        case GSP_SEQ_BUF_OPCODE_REG_STORE: cmd.payload.regStore.addr = 0x1100; cmd.payload.regStore.index = 7; break;
+        default: break;
+        }
+        const size_t bytes = sizeof(cmd.opCode) + GSP_SEQUENCER_PAYLOAD_SIZE_DWORDS(cmd.opCode) * sizeof(NvU32);
+        if (bytes > sizeof(cmd) || bytes > capacity - offset) return 0;
+        memcpy(output + offset, &cmd, bytes);
+        offset += bytes;
+    }
+    sequence_compared = offset == 88;
+    return offset;
+}
+int r4nv_gsp_sequence_abi_complete(void) { return sequence_compared; }

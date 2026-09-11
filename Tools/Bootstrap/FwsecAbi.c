@@ -24,6 +24,7 @@ static int init_compared;
 static unsigned rings_compared;
 extern int r4nv_gsp_message_abi_complete(void);
 extern int r4nv_gsp_event_abi_complete(void);
+extern int r4nv_gsp_sequence_abi_complete(void);
 
 static NvU64 init_id(const char *name)
 {
@@ -151,7 +152,7 @@ int r4nv_fwsec_abi_check(const unsigned char *sb, size_t sb_len, unsigned sb_id,
                         const unsigned char *frts, size_t frts_len, unsigned frts_id,
                         const unsigned char *wpr, size_t wpr_len)
 {
-    if (!init_compared || rings_compared != 0xff || !r4nv_gsp_message_abi_complete() || !r4nv_gsp_event_abi_complete()) return 4;
+    if (!init_compared || rings_compared != 0xff || !r4nv_gsp_message_abi_complete() || !r4nv_gsp_event_abi_complete() || !r4nv_gsp_sequence_abi_complete()) return 4;
     FWSECLIC_READ_VBIOS_DESC read;
     FWSECLIC_FRTS_CMD command;
     memset(&read, 0, sizeof(read));
@@ -211,6 +212,7 @@ int r4nv_fwsec_abi_check(const unsigned char *sb, size_t sb_len, unsigned sb_id,
          "\"original_msgq_create_executed_on_host\":true,\"status_queue_zero\":true,"
          "\"gsp_message_byte_comparison\":true,\"gsp_message_fixtures\":6,"
          "\"gsp_boot_event_original_comparison\":true,\"gsp_boot_event_fixtures\":6,"
+         "\"gsp_sequencer_original_comparison\":true,\"gsp_sequencer_opcodes\":9,"
          "\"gsp_message_outer_bytes\":48,\"gsp_rpc_header_bytes\":32,"
          "\"gsp_message_min_bytes\":80,\"gsp_message_max_bytes\":65536,"
          "\"original_gsp_checksum_executed_on_host\":true,"

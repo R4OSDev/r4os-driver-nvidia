@@ -1,6 +1,23 @@
 ﻿Original R4OS implementation for roadmap 0.79.9, 10.09.2026.
 Host/module scaffolding follows R4OS SDK and existing R4D owners.
 
+0.79.10 GSP sequencer execution (host), 11.09.2026:
+gsp_sequencer.zig adapts all nine opcode forms and register semantics from
+rmgspseq.h (NVIDIA 2019-2020) and kernel_gsp.c (2019-2024). Poll duration uses
+the actual gpuSetTimeout -> timeoutSet contract in gpu_timeout.h/gpu_timeout.c
+(1993-2023): timeoutUs*1000, zero inheriting the owner default. The header's
+older MS comment is not the executed behavior. Full MIT notices retained;
+R4OS whole-stream admission, cooperative steps and receipt ownership are
+original Apache-2.0. Sequencer CPU/core callbacks in tests model operations;
+they are not original NVIDIA HAL or real GPU execution. Nine command forms
+are independently built with original C types/macros for ABI comparison.
+The entire 3156-file source pin was verified before compilation; 185 full
+original dependencies and context sources/notices are retained in
+ExFiles/Reference/GFX/Nvidia/0.79.10/gsp-sequencer-20260911. No firmware bytes,
+module0.1.25 or its distributed notice changed. Native MMIO/Falcon/SEC2
+implementations, GSP execution and corresponding packaged notices remain open.
+
+
 0.79.10 GSP boot events (host), 11.09.2026:
 gsp_boot_events.zig uses the six boot event IDs/selection and complete original
 layouts from g_rpc-structures.h, rpc_global_enums.h, ctrl2080nvd.h and kernel_gsp.c

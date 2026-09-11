@@ -202,9 +202,7 @@ pub const Boot = struct {
     /// In particular, parsing a sequencer does not satisfy this contract. A
     /// failed/ambiguous ACK is terminal: never execute that handler again.
     pub fn complete(self: *Boot, ticket: transport.Ticket) Error!void {
-        try self.guard();
-        const dispatch = self.pending orelse return error.Stale;
-        if (!std.meta.eql(dispatch.ticket, ticket)) return error.Stale;
+        const dispatch = try self.borrow(ticket);
         if (self.handled_events == std.math.maxInt(u64)) return self.fail(error.Exhausted);
         self.session.acknowledge(self.deadline, ticket) catch |err| return self.fail(err);
         switch (dispatch.event) {
@@ -221,9 +219,16 @@ pub const Boot = struct {
     /// receipt and exact RPC fields. Neither failure nor INIT_DONE proves that
     /// the device is quiescent; DMA storage belongs to the execution owner.
     pub fn reject(self: *Boot, ticket: transport.Ticket) Error!void {
+        _ = try self.borrow(ticket);
+        return self.fail(error.Handler);
+    }
+
+    /// Revalidate an outstanding dispatch before each deferred hardware step.
+    /// No queue access, new receipt, acknowledgement or deadline extension.
+    pub fn borrow(self: *Boot, ticket: transport.Ticket) Error!Dispatch {
         try self.guard();
         const dispatch = self.pending orelse return error.Stale;
         if (!std.meta.eql(dispatch.ticket, ticket)) return error.Stale;
-        return self.fail(error.Handler);
+        return dispatch;
     }
 };

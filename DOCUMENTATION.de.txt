@@ -10,7 +10,41 @@ unveraenderten Fallback. Kein nativer NVIDIA-/HDMI-/Audiopfad wird durch
 diesen Stand als unterstuetzt ausgegeben.
 
 
-GSP-Startmeldungen und ausdrueckliche Bearbeitung (Host)
+GSP-CPU-Sequencer und Empfangsbindung (Host)
+------------------------------------------
+gsp_sequencer prueft den gesamten Befehlsstrom vor dem ersten Geraetezugriff:
+neun Opcodeformen, Operanden, ausgerichtete Register in der gemessenen Apertur,
+acht Saveslots und die Summe zwingender Delays. Ein reiner Zulassungsaufruf
+des nativen Ports muss jeden Befehl akzeptieren. Fehlende Core-Unterstuetzung
+weist bereits den Gesamtstrom ab, auch bei gueltigen vorangehenden Writes.
+
+Pro Arbeitsschritt ein Befehl, ein Poll-Sample oder eine Architekturphase.
+Modify folgt unveraendert (alt & ~Maske) | Wert. Poll und Delay verwenden
+Mikrosekunden: ausschlaggebend sind timeoutSet-ABI und Multiplikation im
+Originalcode; der alte MS-Kommentar im Sequencerheader ist widerspruechlich.
+Nulltimeout erbt den Besitzerdefault; feste Phasenfristen liegen immer innerhalb
+der Bootfrist. wait_until fordert Neuplanung an, ohne Schlaf-/Busy-Wait-Schleife.
+Core-Phasen bleiben erhalten; ihr nativer Besitzer muss den tatsaechlichen
+Abschluss bestaetigen. GA106-Resume braucht SEC2, RISC-V und behaltene Bootargs.
+
+DispatchExecution prueft vor jedem Schritt das gehaltene Boot-Ticket. Erst
+nach allen abgeschlossenen Effekten erfolgt ein Ack. Bei Fehler bleiben
+Befehlsposition, Opcode, Herstellerfehler, letzter Registerwert und Callback-
+Fehler erhalten. Ein fehlerhaftes Ack nach abgeschlossenen Effekten erlaubt
+keine erneute Ausfuehrung. Keine Freigabe und kein Quieszenznachweis; native
+Ports muessen Lockdown-Zustand, Registerrechte und MMIO-Ordnung umsetzen.
+
+46/46 Faelle im bestehenden Besitzerstep bestanden, ein gezielter gruppierter
+Fall ergaenzt. Neun Opcodes/Operanden gegen echte Original-C-Typen/Makros in
+einem 88-Byte-Strom verglichen; sechs bisherige Ereignisfixtures bestehen.
+185 vollstaendige Originalquellen/Header/Lizenzen samt Hashes archiviert.
+Register und Core-Phasen sind im Test Hostmodelle. Echte MMIO-/Falcon-/SEC2-
+Anbindung, nativer Start/IRQ, Healthcheck und VRAM-/VGA-Recovery bleiben offen.
+NVIDIA0.1.25/Lizenzpaket unveraendert; kein Gastlauf oder Hardwareupdate.
+Vor ausfuehrbarer Einbindung muessen die weiteren MIT-Hinweise ins Paket.
+Archiv: ExFiles/Reference/GFX/Nvidia/0.79.10/gsp-sequencer-20260911.
+
+Historischer GSP-Startmeldungen und ausdrueckliche Bearbeitung (Host)
 -----------------------------------------------------
 gsp_boot_events.Boot verarbeitet sechs Startmeldungstypen ueber den vorhandenen
 GSP-Transport: InitDone, CPU-Sequencer, OS-Fehler, Libos-Daten, Lockdown und

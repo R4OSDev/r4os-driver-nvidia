@@ -6,11 +6,13 @@ const gsp_init = @import("gsp_init.zig");
 const message = @import("gsp_message.zig");
 const ring = @import("gsp_ring.zig");
 const boot_events = @import("gsp_boot_events.zig");
+const sequencer = @import("gsp_sequencer.zig");
 extern fn r4nv_fwsec_abi_check([*]const u8, usize, c_uint, [*]const u8, usize, c_uint, [*]const u8, usize) c_int;
 extern fn r4nv_gsp_init_abi_check([*]const u8, usize) c_int;
 extern fn r4nv_gsp_message_abi_check([*]const u8, usize, c_uint) c_int;
 extern fn r4nv_gsp_ring_abi_check([*]const u32, usize, c_uint) c_int;
 extern fn r4nv_gsp_event_abi_fixture(c_uint, [*]u8, usize) usize;
+extern fn r4nv_gsp_sequence_abi_fixture([*]u8, usize) usize;
 pub fn main() !void {
     // Heap backing belongs only to this host comparison, never to a target
     // driver or its bounded stack. All DMA addresses below are synthetic.
@@ -70,6 +72,26 @@ pub fn main() !void {
         };
         if (!same) return error.OriginalEventMismatch;
     }
+    const sequence_bytes = r4nv_gsp_sequence_abi_fixture(message_output.ptr, message_output.len);
+    if (sequence_bytes != 88) return error.OriginalSequencerMismatch;
+    const expected_commands = [_]sequencer.Command{
+        .{ .write = .{ .address = 0x1234, .value = 0x5678 } },
+        .{ .modify = .{ .address = 0x5678, .mask = 0xff00, .value = 0xf00f } },
+        .{ .poll = .{ .address = 0x9010, .mask = 0xfff, .value = 0x321, .timeout_us = 7, .error_code = 99 } },
+        .{ .delay_us = 13 },
+        .{ .store = .{ .address = 0x1100, .index = 7 } },
+        .core_reset,
+        .core_start,
+        .core_halt,
+        .core_resume,
+    };
+    var position: usize = 0;
+    for (expected_commands) |expected| {
+        const instruction = try sequencer.decode(message_output[0..sequence_bytes], position);
+        if (!std.meta.eql(instruction.command, expected)) return error.OriginalSequencerMismatch;
+        position = instruction.next;
+    }
+    if (position != sequence_bytes) return error.OriginalSequencerMismatch;
     for (0..8) |fixture| {
         var command: [32]u8 = undefined;
         for ([_]u32{ 0, 262144, 4096, 63, 0, @intCast(fixture & 1), 32, 4096 }, 0..) |value, index|

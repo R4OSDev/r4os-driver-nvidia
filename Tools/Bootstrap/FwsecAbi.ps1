@@ -65,6 +65,7 @@ function Confirm-FwsecAbi([string]$Compiler,[string]$Source,[string]$Run,[string
     if($result -ne 0){throw 'Zig firmware command, memory or message bytes differ from original NVIDIA C structures'}
     $abi=Get-Content -Raw (Join-Path $Stage 'fwsec-abi.json')|ConvertFrom-Json
     if(!$abi.gsp_boot_event_original_comparison -or $abi.gsp_boot_event_fixtures -ne 6){throw 'GSP boot event comparison incomplete'}
+    if(!$abi.gsp_sequencer_original_comparison -or $abi.gsp_sequencer_opcodes -ne 9){throw 'GSP sequencer comparison incomplete'}
     if(!$abi.zig_c_byte_comparison -or !$abi.gsp_wpr_byte_comparison -or !$abi.gsp_init_byte_comparison -or !$abi.original_msgq_create_executed_on_host -or !$abi.gsp_message_byte_comparison -or $abi.gsp_message_fixtures -ne 6 -or !$abi.original_gsp_checksum_executed_on_host -or !$abi.gsp_ring_original_comparison -or $abi.gsp_ring_fixtures -ne 8 -or !$abi.original_msgq_link_submit_consume_executed_on_host -or $abi.gpu_executed){throw 'Firmware ABI result invalid'}
     return $abi
 }

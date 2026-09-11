@@ -1,5 +1,17 @@
 ﻿# Third-Party Notices
 
+The host-qualified `gsp_sequencer.zig` adapts opcode/operation semantics from
+rmgspseq.h (2019-2020), kernel_gsp.c (2019-2024) and the executed timeout
+contract in gpu_timeout.c (1993-2023), NVIDIA CORPORATION & AFFILIATES, from
+the same 570.144 pin. It retains the full MIT notice/copyright; original R4OS
+admission, scheduling, port and lifetime logic is Apache-2.0. The existing ABI
+verifier uses complete original command types/macros for all nine opcodes.
+The 185 full original dependencies/sources/notices are in gsp-sequencer-20260911.
+Interpreter/dispatch execution is not linked into NVIDIA.R4D0.1.25; no native
+MMIO/Falcon/SEC2 handler or original RM implementation is linked. The current
+notice resource remains unchanged and must gain every new full notice before
+executable linkage in the module and Distribution.
+
 The host-qualified `gsp_boot_events.zig` adapts the six boot-event layouts and
 selection from pinned g_rpc-structures.h (2008-2025), ctrl2080nvd.h (2004-2023),
 rpc_global_enums.h and kernel_gsp.c (2019-2024), NVIDIA CORPORATION & AFFILIATES.
