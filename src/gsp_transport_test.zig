@@ -1967,6 +1967,7 @@ fn topologyReply(model: *Model, probe: *topology.Discovery, status: u32, mask: u
     try model.replyRpc(probe.channel.exchange.session, .{ .function = 76, .result = 0 }, payload);
 }
 fn checkTopology(model: *Model) !void {
+    try checkPortMapping();
     // Validate semantic fields beyond the shared framing/length checks. All
     // four connector records survive; flags=NO keeps DDC partners but cannot
     // establish a physical socket. Unknown scalar values are retained.
@@ -2101,7 +2102,7 @@ fn checkTopology(model: *Model) !void {
                 if (case == .partial) try t.expect(first.connectors == null and first.rejections[0].?.control.? == 0x55) else try t.expect(first.connectors.?.present() and first.connectors.?.count == 2 and first.connectors.?.data[0].index == dynamic.connectors.?.data[0].index);
                 var rom: @import("vbios.zig").Result = .{};
                 rom.port_count = 1;
-                rom.ports[0] = .{ .index = 27, .kind = 2, .connector = 3, .heads = 5, .or_mask = 6, .i2c = 1, .aux = 2 };
+                rom.ports[0] = .{ .index = 27, .kind = 2, .connector = 3, .heads = 5, .output_mask = 6, .i2c = 1, .aux = 2 };
                 try t.expectEqual(@as(u8, 3), topology.relate(first, &rom).static.connector);
                 try t.expectEqual(@as(u32, 4), topology.relate(dynamic, &rom).dynamic);
                 rom.port_count = 0;
@@ -2122,6 +2123,82 @@ fn checkTopology(model: *Model) !void {
         try probe.release(deadline + 100);
         try t.expect(owner.state == .ready and session.state == .active);
     }
+}
+
+fn checkPortMapping() !void {
+    const rom = @import("tests.zig").portFixture();
+    var board = try @import("vbios.zig").parse(&rom, 0x2504);
+    var catalog: topology.Catalog = .{ .count = 1, .head_count = 1 };
+    catalog.heads[0].display_id = 0x100;
+    catalog.routes[0] = .{ .id = 0x100,
+        .resource = .{ .index = 0, .kind = 2, .protocol = 1, .dither_type = 0, .dither_algo = 0,
+            .location = 0, .root_port_id = 1, .dcb_index = 27, .vbios_address = 0, .lit_by_vbios = true, .dynamic = false },
+        .buses = .{ .communication = 0, .ddc = 37 },
+        .connectors = .{ .flags = 1, .ddc_partners = 0x100, .platform = 0, .count = 2,
+            .data = .{ .{ .index = 17, .kind = 0x61, .location = 4 }, .{ .index = 19, .kind = 0xffffffff, .location = 2 }, .{}, .{} } } };
+    const route = &catalog.routes[0];
+    topology.correlate(&catalog, &board);
+    const saved = route.*;
+    try t.expect(route.wiring.relation.static.index == 27 and route.wiring.active_heads.? == 1);
+    try t.expect(route.wiring.heads == .matched and route.wiring.encoder == .observed and route.wiring.protocol == .matched);
+    try t.expect(route.wiring.physical_status == .matched and route.wiring.physical.?.index == 17);
+    try t.expect(route.wiring.connector.?.index == 0 and route.wiring.communication.?.index == 0);
+    try t.expect(route.wiring.communication.?.i2c.? == 3 and route.buses.?.ddc == 37);
+    try t.expect(route.wiring.hpd[0].?.line.? == 3 and route.wiring.hpd[1] == null);
+    try t.expect(route.wiring.external_dongle[0].?.line.? == 1 and route.wiring.external_dongle[1] == null);
+    route.resource.?.index = 0xffffffff;
+    topology.correlate(&catalog, &board);
+    try t.expect(route.wiring.encoder == .unassigned);
+    board.ports[0].assignment = .encoder; // DCB4.0, not the repurposed 4.1 pad mask.
+    for ([_]u32{ 1, 4, 0xfffffffe }) |index| {
+        route.resource.?.index = index;
+        topology.correlate(&catalog, &board);
+        try t.expect(route.wiring.encoder == .mismatch);
+    }
+    board.ports[0].assignment = .pad_macro;
+    board.ports[0].virtual = true;
+    topology.correlate(&catalog, &board);
+    try t.expect(route.wiring.relation == .virtual and route.wiring.physical == null);
+    board.ports[0].virtual = false;
+    route.* = saved; route.resource.?.protocol = 8;
+    topology.correlate(&catalog, &board);
+    try t.expect(route.wiring.protocol == .mismatch);
+    route.resource.?.protocol = 0xffffffff;
+    topology.correlate(&catalog, &board);
+    try t.expect(route.wiring.protocol == .unavailable);
+    route.* = saved; route.resource.?.dynamic = true;
+    topology.correlate(&catalog, &board);
+    try t.expect(route.wiring.relation.dynamic == 1 and route.wiring.physical == null and route.wiring.hpd[0] == null);
+    route.* = saved; route.resource.?.dcb_index = 8;
+    topology.correlate(&catalog, &board);
+    try t.expect(route.wiring.relation == .missing and route.wiring.physical == null);
+    route.* = saved; route.connectors.?.data[1] = route.connectors.?.data[0];
+    topology.correlate(&catalog, &board);
+    try t.expect(route.wiring.physical_status == .ambiguous and route.wiring.physical == null);
+    route.* = saved; route.connectors.?.data[0].location = 5;
+    topology.correlate(&catalog, &board);
+    try t.expect(route.wiring.physical_status == .mismatch and route.wiring.physical == null);
+    route.* = saved; catalog.heads[0].display_id = null;
+    topology.correlate(&catalog, &board);
+    try t.expect(route.wiring.heads == .unavailable);
+    catalog.heads[0].display_id = 0;
+    topology.correlate(&catalog, &board);
+    try t.expect(route.wiring.heads == .unassigned);
+    catalog.heads[0].display_id = 0x100; board.ports[0].heads = 2;
+    topology.correlate(&catalog, &board);
+    try t.expect(route.wiring.heads == .mismatch);
+    board.ports[0].heads = 1;
+    // Same physical DCB socket with different RM IDs: discard the derived
+    // identity for every alias, including a third matching earlier record.
+    catalog.count = 3;
+    for (catalog.routes[0..3], 0..) |*item, i| {
+        item.* = saved; item.id = @as(u32, 1) << @as(u5, @intCast(i));
+        item.connectors.?.data[0].index = if (i == 1) 18 else 17;
+    }
+    topology.correlate(&catalog, &board);
+    for (catalog.routes[0..3]) |*item| try t.expect(item.wiring.physical_status == .ambiguous and item.wiring.physical == null);
+    topology.correlate(&catalog, null);
+    for (catalog.routes[0..3]) |*item| try t.expect(item.wiring.relation == .unavailable and item.wiring.physical == null);
 }
 
 fn checkDdcWire() !void {

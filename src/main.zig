@@ -325,9 +325,12 @@ fn readVbios(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Sna
         result.bit_offset,       result.dcb_offset,       result.dcb_version,      result.ccb_version,      result.port_count,       result.checksum_bytes,
     });
     for (result.ports[0..result.port_count]) |port| {
-        log("NVIDIA vbios port={d} type={x} heads={x} or={x} location={d} bus={d} ccb={d} connector={d} connector-type={d} i2c={d} aux={d} raw={x:0>8}/{x:0>8}", .{
-            port.index,                                                          port.kind,                                                port.heads,                                               port.or_mask,  port.location,   port.bus, port.ccb, port.connector,
+        log("NVIDIA vbios port={d} type={x} heads={x} output={x} location={d} bus={d} ccb={d} connector={d} connector-type={d} i2c={d} aux={d} raw={x:0>8}/{x:0>8}", .{
+            port.index,                                                          port.kind,                                                port.heads,                                               port.output_mask,  port.location,   port.bus, port.ccb, port.connector,
             if (port.connector_type) |value| @as(u16, value) else @as(u16, 256), if (port.i2c) |value| @as(u16, value) else @as(u16, 256), if (port.aux) |value| @as(u16, value) else @as(u16, 256), port.raw_path, port.raw_config,
+        });
+        log("NVIDIA vbios assignment: port={d} kind={s} mask={x} links={?} virtual={} state=wiring-only", .{
+            port.index, @tagName(port.assignment), port.output_mask, port.link_mask, port.virtual,
         });
     }
     log("NVIDIA topology: source=VBIOS connectors={d} ccb={d} live-HPD=unknown active-route=unknown receiver=unread", .{ result.connector_count, result.communication_count });
@@ -337,13 +340,13 @@ fn readVbios(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Sna
         });
     }
     for (result.connectors[0..result.connector_count]) |*connector| {
-        log("NVIDIA connector={d} bytes={d} type={x} location={d} raw={x:0>8} HPD-mask={x} DP-DVI-mask={x} mux-mask={d} paths={x} heads={x} or={x} buses={x} ccb={x}", .{
+        log("NVIDIA connector={d} bytes={d} type={x} location={d} raw={x:0>8} HPD-mask={x} DP-DVI-mask={x} mux-mask={d} paths={x} heads={x} encoders={x} pads={x} buses={x} ccb={x}", .{
             connector.index, connector.entry_bytes, connector.kind, connector.location, connector.raw, connector.hpd_mask, connector.dp_dvi_mask,
-            if (connector.mux_mask) |value| @as(u16, value) else @as(u16, 256), connector.display_paths, connector.heads, connector.or_mask, connector.logical_bus_mask, connector.ccb_mask,
+            if (connector.mux_mask) |value| @as(u16, value) else @as(u16, 256), connector.display_paths, connector.heads, connector.encoder_mask, connector.pad_mask, connector.logical_bus_mask, connector.ccb_mask,
         });
     }
     if (result.gpio_table) |*gpio| {
-        log("NVIDIA gpio-table: version={x} offset={x} bytes={d} entries={d} stride={d} external-offset={x} external=unresolved state=metadata-only", .{
+        log("NVIDIA gpio-table: version={x} offset={x} bytes={d} entries={d} stride={d} external-offset={x} state=metadata-only", .{
             gpio.version, gpio.offset, gpio.byte_length, gpio.count, gpio.entry_bytes, gpio.external_table_offset orelse 0,
         });
         for (&gpio.hpd, 0..) |*hpd, i| {
@@ -355,6 +358,19 @@ fn readVbios(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Sna
             });
         }
     } else ctx.logInfo("NVIDIA gpio-table: absent live-HPD=unknown");
+    if (result.external_gpio) |*external| {
+        log("NVIDIA xpio: master={x} slots={d} tables={d} entries={d} primary-ccb={?} secondary-ccb={?} state=metadata-only", .{
+            external.master.offset, external.master_count, external.table_count, external.entry_count, result.primary_ccb, result.secondary_ccb,
+        });
+        for (external.tables[0..external.table_count]) |*item| {
+            log("NVIDIA xpio-table: slot={d} type={x} address={x} flags={x} entries={d} ccb={?} pmgr-i2c={?} pmgr-aux={?} metadata-known={} pin-levels=unread", .{
+                item.index, item.kind, item.address, item.flags, item.count, item.ccb, item.i2c, item.aux, item.knownWiring(),
+            });
+            if (item.interrupt) |signal| log("NVIDIA xpio-interrupt: slot={d} function={d} status={s} pin={?} active-high={?} level=unread", .{
+                item.index, signal.function, @tagName(signal.status), signal.line, signal.active_high,
+            });
+        }
+    }
     if (!inspectFwsec(ctx, snapshot, chip, bytes[start.offset..][0..result.rom_bytes], &result)) return false;
     if (!board_rom.close()) return false;
     ctx.logInfo("NVIDIA vbios: cleanup=OK resources=0 PROM-writes=disabled fallback=preserved");
@@ -698,7 +714,7 @@ fn checkBoot(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Sna
     log("NVIDIA booters: resources=14 license=matched generation={d} reads={d} source=loaded-r4d gpu-authentication=unverified", .{ booters.generation, booters.reads });
     if (!stageBootInit(ctx, chip.id)) return false;
     if (starting_gsp) {
-        native_device.open(ctx, &boot_vram, &boot_vram_lease, &run_memory, &firmware_logs) catch |err| {
+        native_device.open(ctx, &boot_vram, &boot_vram_lease, &run_memory, &firmware_logs, source.board) catch |err| {
             log("NVIDIA gsp-start: rejected phase=owner reason={s} firmware-execution=disabled", .{@errorName(err)});
             return false;
         };

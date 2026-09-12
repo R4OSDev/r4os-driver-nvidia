@@ -1338,11 +1338,17 @@ const DeviceModel = struct {
     var receiver_logs: usize = 0;
     var ddc_logs: usize = 0;
     var aux_logs: usize = 0;
+    var wiring_logs: usize = 0;
+    var hpd_logs: usize = 0;
+    var xpio_logs: usize = 0;
     fn log(text: [*:0]const u8) callconv(.c) void {
         const line = std.mem.span(text);
         if (std.mem.startsWith(u8, line, "NVIDIA gsp-receiver:")) receiver_logs += 1;
         if (std.mem.startsWith(u8, line, "NVIDIA gsp-ddc:")) ddc_logs += 1;
         if (std.mem.startsWith(u8, line, "NVIDIA gsp-aux:")) aux_logs += 1;
+        if (std.mem.startsWith(u8, line, "NVIDIA gsp-wire:")) wiring_logs += 1;
+        if (std.mem.startsWith(u8, line, "NVIDIA gsp-hpd:")) hpd_logs += 1;
+        if (std.mem.startsWith(u8, line, "NVIDIA gsp-xpio:")) xpio_logs += 1;
     }
     fn tick(words: []u32, frts: u64, bad_frts: bool) void {
         const core = @import("gsp_core.zig");
@@ -1484,7 +1490,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         irq_intx, irq_register_error, irq_msi_uncertain, irq_cause, irq_wake_failure, irq_close_busy, irq_unregister_failure,
         rm_base_reject, rm_i2c_reject, rm_event_reject, rm_free_error, rm_timeout, rm_ack_failure, rm_foreign_event, rm_event_ack,
         outputs_empty, outputs_all, outputs_rejected, outputs_partial, outputs_missing, outputs_incomplete, outputs_bad_edid,
-        outputs_edid_rejected, outputs_ddc, outputs_ddc_bus_changed, outputs_aux, outputs_changed, outputs_final_changed, outputs_final_rejected, outputs_hpd, outputs_sequence, outputs_ack, outputs_timeout, catalog_rejected,
+        outputs_edid_rejected, outputs_ddc, outputs_ddc_bus_changed, outputs_aux, outputs_wiring, outputs_virtual, outputs_changed, outputs_final_changed, outputs_final_rejected, outputs_hpd, outputs_sequence, outputs_ack, outputs_timeout, catalog_rejected,
         runtime_healthy, runtime_lockdown, runtime_unknown, runtime_unowned, runtime_sequence_timeout,
         runtime_log_failure, runtime_moving_log };
     for (std.enums.values(Case)) |case| {
@@ -1518,11 +1524,11 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         capture.snapshot.?.interrupt_pin = 1;
         if (case == .old_api) {
             table.version = a.driver_api_thread_work_version - 1;
-            try t.expectError(error.Api, target.open(ctx, capture, held, lease, &reader));
+            try t.expectError(error.Api, target.open(ctx, capture, held, lease, &reader, null));
             try t.expect(target.self_address == 0 and !lease.retained and capture.firmware_owner == 0);
             table.version += 1;
             CatalogModel.legacy = true;
-            try t.expectError(error.Api, target.open(ctx, capture, held, lease, &reader));
+            try t.expectError(error.Api, target.open(ctx, capture, held, lease, &reader, null));
             try t.expect(!target.port.effects_possible and !CatalogModel.active and !lease.retained);
             CatalogModel.legacy = false;
             try t.expect(target.closeBeforeSubmission());
@@ -1531,7 +1537,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         }
         if (case == .success) {
             capture.snapshot.?.command &= ~@as(u16, 4);
-            try t.expectError(error.BusMasterDisabled, target.open(ctx, capture, held, lease, &reader));
+            try t.expectError(error.BusMasterDisabled, target.open(ctx, capture, held, lease, &reader, null));
             try t.expect(target.self_address == 0 and !lease.retained and capture.firmware_owner == 0);
             capture.snapshot.?.command |= 4;
         }
@@ -1539,7 +1545,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
             // Own header/read cursor + absent peer, system data/cursor, then
             // failure synchronizing registry data. No firmware sees this run.
             range_failure_call = range_calls + 6;
-            try t.expectError(error.Io, target.open(ctx, capture, held, lease, &reader));
+            try t.expectError(error.Io, target.open(ctx, capture, held, lease, &reader, null));
             range_failure_call = 0;
             try t.expect(target.session.?.state == .failed and target.session.?.tx_sequence == 1);
             try t.expect(std.mem.readInt(u32, backing.?[command + 16 ..][0..4], .little) == 1);
@@ -1551,7 +1557,17 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
             lease.queue.failed = false;
             continue;
         }
-        try target.open(ctx, capture, held, lease, &reader);
+        const board_rom = @import("tests.zig").portFixture();
+        var supplied_board = try @import("vbios.zig").parse(&board_rom, 0x2504);
+        if (case == .outputs_wiring) {
+            supplied_board.validated_device = 0xbeef;
+            try t.expectError(error.Binding, target.open(ctx, capture, held, lease, &reader, &supplied_board));
+            try t.expect(target.self_address == 0 and !CatalogModel.active);
+            supplied_board.validated_device = 0x2504;
+        }
+        if (case == .outputs_virtual) supplied_board.ports[0].virtual = true;
+        try target.open(ctx, capture, held, lease, &reader, if (case == .outputs_wiring or case == .outputs_virtual) &supplied_board else null);
+        supplied_board = .{}; // Device must own a complete copy beyond the caller's lifetime.
         try t.expect(target.phase == .frts and !target.port.effects_possible and capture.firmware_owner == 0);
         const session = &target.session.?;
         try t.expect(session.preloaded and session.tx_sequence == 2 and session.tx_write == 2);
@@ -2257,6 +2273,9 @@ fn checkDeviceOutputs(target: *@import("gsp_device.zig").Device, words: []u32, f
     DeviceModel.receiver_logs = 0;
     DeviceModel.ddc_logs = 0;
     DeviceModel.aux_logs = 0;
+    DeviceModel.wiring_logs = 0;
+    DeviceModel.hpd_logs = 0;
+    DeviceModel.xpio_logs = 0;
     const running = &target.running;
     const owner = &running.outputs;
     const session = &target.session.?;
@@ -2375,7 +2394,7 @@ fn checkDeviceOutputs(target: *@import("gsp_device.zig").Device, words: []u32, f
             .connectors => |id| {
                 outputWord(payload, 32, 1);
                 outputWord(payload, 36, 0x80000001);
-                outputWord(payload, 40, 2);
+                outputWord(payload, 40, if (scenario == .outputs_virtual) 1 else 2);
                 outputWord(payload, 44, 17);
                 outputWord(payload, 48, 0x61);
                 outputWord(payload, 52, 4);
@@ -2479,12 +2498,21 @@ fn checkDeviceOutputs(target: *@import("gsp_device.zig").Device, words: []u32, f
     try t.expect(CatalogModel.count == expected and target.catalog.published == (expected != 0));
     if (expected == 0) return;
     try t.expect(CatalogModel.first.connector_id == 1 and CatalogModel.last.connector_id == 0x80000000);
-    try t.expect(CatalogModel.first.connector_kind == 0); // Multiple physical records are ambiguous.
+    if (scenario == .outputs_wiring) {
+        const wire = &data.topology.routes[0].wiring;
+        try t.expect(wire.relation.static.index == 27 and wire.connector.?.index == 0 and wire.physical.?.index == 17);
+        try t.expect(wire.hpd[0].?.line.? == 3 and wire.external_dongle[0].?.table.? == 1);
+        try t.expect(CatalogModel.first.connector_kind == a.gfx_output_kind_hdmi);
+        try t.expect(DeviceModel.wiring_logs == 2 and DeviceModel.hpd_logs == 1 and DeviceModel.xpio_logs == 1);
+        try t.expect(target.board.?.validated_device.? == 0x2504 and target.running.outputs.board == &target.board.?);
+    } else try t.expect(CatalogModel.first.connector_kind == 0); // No invented identity for multiple records or a virtual path.
+    if (scenario == .outputs_virtual) try t.expect(data.topology.routes[0].wiring.relation == .virtual and DeviceModel.hpd_logs == 0 and DeviceModel.xpio_logs == 0);
     const first = &data.receivers[0];
     try t.expect(first.display_id == 1 and first.client == data.topology.client and first.epoch == target.epoch);
     try t.expect(data.topology.routes[0].resource.?.index == 0xffffffff and data.topology.routes[0].resource.?.dcb_index == 27);
     if (scenario == .outputs_partial) try t.expect(data.topology.routes[0].connectors == null and data.topology.routes[0].rejections[0].?.control.? == 0x55)
-    else try t.expect(data.topology.routes[0].connectors.?.data[0].index == 17 and data.topology.routes[0].connectors.?.data[1].kind == 0xffffffff);
+    else try t.expect(data.topology.routes[0].connectors.?.data[0].index == 17 and
+        (scenario == .outputs_virtual or data.topology.routes[0].connectors.?.data[1].kind == 0xffffffff));
     try t.expect(data.topology.routes[0].buses.?.communication == 0 and
         data.topology.routes[0].buses.?.ddc == @as(u32, if (scenario == .outputs_ddc) 3 else 37));
     if (scenario == .outputs_partial) try t.expect(data.topology.activeHeads(1) == null and data.topology.heads[1].rejected.?.control.? == 0x55)

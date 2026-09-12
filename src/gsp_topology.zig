@@ -108,6 +108,7 @@ pub const Route = struct {
     resource: ?display.Resource = null,
     buses: ?display.Buses = null,
     rejections: [3]?Rejection = @splat(null),
+    wiring: Wiring = .{},
 };
 pub const Head = struct { display_id: ?u32 = null, rejected: ?Rejection = null };
 pub const Catalog = struct {
@@ -142,7 +143,7 @@ pub const State = enum { supported, heads, active, connectors, resource, buses, 
 /// RM's explicit dcb_index selects the original DCB slot, never log2(id).
 /// Keep RM physical connector records alongside the DCB connector reference;
 /// do not assume these two index namespaces are numerically identical.
-pub const Relation = union(enum) { unavailable, dynamic: u32, missing, ambiguous, static: vbios.Port };
+pub const Relation = union(enum) { unavailable, dynamic: u32, missing, ambiguous, virtual: vbios.Port, static: vbios.Port };
 pub fn relate(route: *const Route, rom: *const vbios.Result) Relation {
     const resource = route.resource orelse return .unavailable;
     if (resource.dynamic) return .{ .dynamic = resource.root_port_id };
@@ -154,7 +155,102 @@ pub fn relate(route: *const Route, rom: *const vbios.Result) Relation {
         if (port != null) return .ambiguous;
         port = item;
     }
-    return if (port) |value| .{ .static = value } else .missing;
+    return if (port) |value| (if (value.virtual) .{ .virtual = value } else .{ .static = value }) else .missing;
+}
+
+pub const Match = enum { unavailable, unassigned, observed, matched, mismatch, ambiguous };
+pub const Wiring = struct {
+    relation: Relation = .unavailable,
+    active_heads: ?u32 = null,
+    heads: Match = .unavailable,
+    encoder: Match = .unavailable,
+    protocol: Match = .unavailable,
+    physical_status: Match = .unavailable,
+    physical: ?display.Connector = null,
+    connector: ?vbios.topology.Connector = null,
+    communication: ?vbios.topology.Communication = null,
+    hpd: [7]?vbios.gpio.Hpd = @splat(null),
+    external_dongle: [4]?vbios.xpio.Signal = @splat(null),
+};
+
+/// Pure correlation after the final RM topology receipt. Each identity
+/// remains in its own namespace: RM IDs/ports, DCB slots, connector slots,
+/// CCB indices and PMGR I2C/AUX controllers. No numeric bus-ID equality is
+/// assumed, and firmware routing observations grant no programming lease.
+pub fn correlate(catalog: *Catalog, rom: ?*const vbios.Result) void {
+    for (catalog.routes[0..catalog.count]) |*route| {
+        route.wiring = .{ .active_heads = catalog.activeHeads(route.id) };
+        const board = rom orelse continue;
+        const wiring = &route.wiring;
+        wiring.relation = relate(route, board);
+        if (wiring.relation != .static) continue;
+        const port = &wiring.relation.static;
+        const resource = &route.resource.?;
+        if (wiring.active_heads) |heads| {
+            wiring.heads = if (heads == 0) .unassigned else if (heads & ~@as(u32, port.heads) == 0) .matched else .mismatch;
+        }
+        wiring.encoder = if (resource.index == 0xffffffff) .unassigned else if (port.assignment == .pad_macro) .observed else
+            if (resource.index < 4 and port.output_mask & (@as(u8, 1) << @as(u3, @intCast(resource.index))) != 0) .matched else .mismatch;
+        wiring.protocol = protocolMatch(port, resource);
+        if (port.ccb < board.communication_count) wiring.communication = board.communications[port.ccb];
+        if (port.connector >= board.connector_count) continue;
+        const connector = &board.connectors[port.connector];
+        wiring.connector = connector.*;
+        // The documented type and relative location can correlate records,
+        // but the independent RM connector index must still be preserved.
+        if (route.connectors) |*physical| {
+            if (physical.present() and physical.count != 0) {
+                var matches: u32 = 0;
+                for (physical.data[0..physical.count]) |item| {
+                    if (item.kind != connector.kind or item.location != connector.location) continue;
+                    matches += 1;
+                    wiring.physical = item;
+                }
+                wiring.physical_status = if (matches == 1) .matched else if (matches == 0) .mismatch else .ambiguous;
+                if (matches != 1) wiring.physical = null;
+            }
+        }
+        for (0..7) |i| {
+            if (connector.hpd_mask & (@as(u8, 1) << @as(u3, @intCast(i))) == 0) continue;
+            wiring.hpd[i] = if (board.gpio_table) |*gpio| gpio.hpd[i] else .{ .function = vbios.gpio.hpd_functions[i] };
+        }
+        if (board.external_gpio) |*external| for (0..4) |i| {
+            if (connector.dp_dvi_mask & (@as(u8, 1) << @as(u3, @intCast(i))) == 0 or port.ccb == 0xf) continue;
+            wiring.external_dongle[i] = external.dongle(port.ccb, @intCast(i));
+        };
+    }
+    // Shared sockets can have several DCB paths. Conflicting aliases
+    // invalidate the derived identity, never the independent RM records.
+    for (catalog.routes[0..catalog.count], 0..) |*left, i| {
+        const a = left.wiring.physical orelse continue;
+        const ac = left.wiring.connector orelse continue;
+        for (catalog.routes[i + 1 .. catalog.count]) |*right| {
+            const b = right.wiring.physical orelse continue;
+            const bc = right.wiring.connector orelse continue;
+            if ((ac.index == bc.index and a.index != b.index) or
+                (a.index == b.index and (ac.index != bc.index or a.kind != b.kind or a.location != b.location))) {
+                left.wiring.physical_status = .ambiguous;
+                right.wiring.physical_status = .ambiguous;
+            }
+        }
+    }
+    for (catalog.routes[0..catalog.count]) |*route| if (route.wiring.physical_status != .matched) { route.wiring.physical = null; };
+}
+
+fn protocolMatch(port: *const vbios.Port, resource: *const display.Resource) Match {
+    if (resource.protocol == 0xffffffff or resource.kind == 0) return .unavailable;
+    if (port.location > 1 or resource.location > 1) return .unavailable;
+    if (port.location != resource.location) return .mismatch;
+    const matches = switch (port.kind) {
+        0 => resource.kind == 1 and resource.protocol == 0,
+        2 => if (port.location == 0) resource.kind == 2 and
+            (resource.protocol == 1 or resource.protocol == 2 or resource.protocol == 5)
+            else resource.kind == 3 and resource.protocol == 0,
+        3 => resource.kind == 2 and resource.protocol == 0,
+        6 => resource.kind == 2 and (resource.protocol == 8 or resource.protocol == 9),
+        else => return .unavailable,
+    };
+    return if (matches) .matched else .mismatch;
 }
 
 /// Catalog storage and graph remain exclusively borrowed until release.

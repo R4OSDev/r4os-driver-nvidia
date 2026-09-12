@@ -42,7 +42,7 @@ pub fn main(init: std.process.Init) !void {
         gpio_entries[i] = try gpio.entry(i);
     };
     const report = .{
-        .schema = 5,
+        .schema = 6,
         .source = "supplied-file",
         .sha256 = digest_hex[0..],
         .hardware_verified = false,
@@ -59,6 +59,7 @@ pub fn main(init: std.process.Init) !void {
         .checksum_bytes = result.checksum_bytes,
         .checksum_scope = "x86-initialization-only",
         .pci_device = result.pci_device,
+        .validated_device = result.validated_device,
         .vbios_version = result.vbios_version,
         .version_present = result.version_present,
         .bit_offset = result.bit_offset,
@@ -66,6 +67,8 @@ pub fn main(init: std.process.Init) !void {
         .dcb_offset = result.dcb_offset,
         .dcb_version = result.dcb_version,
         .ccb_version = result.ccb_version,
+        .primary_ccb = result.primary_ccb,
+        .secondary_ccb = result.secondary_ccb,
         .communications = result.communications[0..result.communication_count],
         .connector_version = result.connector_version,
         .connectors = result.connectors[0..result.connector_count],
@@ -73,8 +76,14 @@ pub fn main(init: std.process.Init) !void {
             .offset = gpio.offset, .version = gpio.version, .header_bytes = gpio.header_bytes,
             .entry_bytes = gpio.entry_bytes, .byte_length = gpio.byte_length,
             .external_table_offset = gpio.external_table_offset,
-            .external_table_resolved = false,
+            .external_table_resolved = result.external_gpio != null,
             .entries = gpio_entries[0..gpio.count], .hpd = &gpio.hpd,
+        } else null,
+        .external_gpio = if (result.external_gpio) |*external| .{
+            .master = external.master, .master_count = external.master_count,
+            .tables = external.tables[0..external.table_count],
+            .raw_entries = external.raw[0..external.entry_count],
+            .function_namespace = "type-specific; no internal HPD aliases; no expander access",
         } else null,
         .topology_state = "VBIOS-wiring-only; live HPD, active routing and receiver data unknown",
         .ports = result.ports[0..result.port_count],

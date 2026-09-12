@@ -616,3 +616,10 @@ state public-domain terms and credit Lasse Collin and Igor Pavlov, with the
 original MIT-noticed NVIDIA memory-hook headers. Its full original sources
 and notices remain in the verified scratch snapshot. XZ Utils is an external
 host prerequisite and is not redistributed by this driver repository.
+
+External GPIO and port correlation (NVIDIA 0.1.64):
+The fixed table layouts and assignment semantics follow the pinned NVIDIA
+DCB4.x document. Nouveau xpio.c is retained as an independent comparison;
+its complete MIT notice is also in vbios_xpio.zig and the identically
+embedded/staged NVIDIA-CONNECTORS-LICENSE.txt. Type-specific GPIO
+functions and DCB4.1 pad masks are never relabeled as HPD pins or SORs.

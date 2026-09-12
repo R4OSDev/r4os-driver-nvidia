@@ -54,6 +54,7 @@ pub const Device = struct {
     recovery: teardown.Recovery = .{},
     running: runtime.Owner = .{},
     catalog: @import("gsp_catalog.zig").Owner = .{},
+    board: ?@import("vbios.zig").Result = null,
     interrupts: irq.Owner = .{},
     irq_wake: ?irq.Wake = null,
     recovery_deadline: u64 = 0,
@@ -66,7 +67,8 @@ pub const Device = struct {
     /// caller must retain this address and use a kernel with terminal display
     /// shutdown and thread-to-work admission (DriverApi35 / Kernel0.1.152).
     pub fn open(self: *Device, ctx: *const r4os.r4dev.DriverContext, display: *capture.Capture,
-        reservation: *vram.Lease, backing: *memory.Lease, reader: *logs.Reader) !void
+        reservation: *vram.Lease, backing: *memory.Lease, reader: *logs.Reader,
+        board: ?*const @import("vbios.zig").Result) !void
     {
         if (self.self_address != 0) return error.Busy;
         if (ctx.apiVersion() < a.driver_api_thread_work_version) return error.Api;
@@ -76,6 +78,7 @@ pub const Device = struct {
             reservation.backing != backing.boot_storage or backing.api != ctx.api or
             reader.memory != backing or reader.generation() != backing.generation() or reader.busy) return error.Binding;
         if (display.snapshot.?.command & 4 == 0) return error.BusMasterDisabled;
+        if (board) |value| if (value.validated_device != display.snapshot.?.pci.device_id) return error.Binding;
         const inputs = try backing.inputs();
         const frts = inputs.frts orelse return error.Binding;
         if (!reservation.validates(frts) or inputs.fwsec_command != 0x15 or
@@ -94,6 +97,10 @@ pub const Device = struct {
         self.display_epoch = display.boot.held_generation;
         self.deadline = deadline;
         self.last_clock = opened_at;
+        if (board) |value| {
+            self.board = value.*;
+            self.running.outputs.board = &self.board.?;
+        }
         errdefer |err| { self.failure = err; self.failed_phase = self.phase; self.phase = .failed; }
         const pci = display.snapshot.?.pci;
         try self.catalog.open(ctx, 0x0100_0000 | (@as(u32, pci.bus) << 8) | (@as(u32, pci.device) << 3) | pci.function);

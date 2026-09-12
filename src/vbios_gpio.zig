@@ -100,8 +100,8 @@ pub const Catalog = struct {
     entry_bytes: u8 = 0,
     count: u8 = 0,
     byte_length: u16 = 0,
-    // External expander tables are not read/resolved by this internal table
-    // reader. A missing internal function is not proof it is absent there.
+    // The containing VBIOS reader resolves this via vbios_xpio. External
+    // function codes retain their own type-specific namespace.
     external_table_offset: ?u16 = null,
     raw: [max_entries][6]u8 = .{[_]u8{0} ** 6} ** max_entries,
     hpd: [7]Hpd = .{Hpd{}} ** 7,
@@ -110,6 +110,26 @@ pub const Catalog = struct {
         if (index >= self.count) return error.Bounds;
         if (self.entry_bytes > 6) return error.Limit;
         return decode(self.version, self.raw[index][0..self.entry_bytes]);
+    }
+
+    pub fn input(self: *const Catalog, function: u8) Error!Hpd {
+        var signal: Hpd = .{ .function = function };
+        for (0..self.count) |i| {
+            const item = try self.entry(i);
+            if (item.function != function) continue;
+            signal.matches += 1;
+            if (signal.matches > 1) {
+                signal.status = .ambiguous; signal.entry_index = null;
+                signal.line = null; signal.active_high = null;
+                continue;
+            }
+            signal.entry_index = @intCast(i);
+            if (item.inputPolarity()) |polarity| {
+                signal.status = .mapped; signal.line = item.line;
+                signal.active_high = polarity;
+            } else signal.status = .invalid_input;
+        }
+        return signal;
     }
 };
 
@@ -161,27 +181,7 @@ pub fn parse(image: []const u8, offset: u16) Error!Catalog {
         .external_table_offset = if (external == 0) null else external,
     };
     for (0..count) |i| @memcpy(result.raw[i][0..stride], bytes[@as(usize, size) + i * stride ..][0..stride]);
-    for (hpd_functions, &result.hpd) |function, *hpd| {
-        hpd.function = function;
-        for (0..count) |i| {
-            const item = try result.entry(i);
-            if (item.function != function) continue;
-            hpd.matches += 1;
-            if (hpd.matches != 1) {
-                hpd.status = .ambiguous;
-                hpd.entry_index = null;
-                hpd.line = null;
-                hpd.active_high = null;
-                continue;
-            }
-            hpd.entry_index = @intCast(i);
-            if (item.inputPolarity()) |polarity| {
-                hpd.status = .mapped;
-                hpd.line = item.line;
-                hpd.active_high = polarity;
-            } else hpd.status = .invalid_input;
-        }
-    }
+    for (hpd_functions, &result.hpd) |function, *hpd| hpd.* = try result.input(function);
     return result;
 }
 

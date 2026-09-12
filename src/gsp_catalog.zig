@@ -128,9 +128,12 @@ fn encode(output: *a.GfxReceiverInfo, route: *const topology.Route, capture: *co
 // ctrl0073specific.h. Neither a sink HDMI VSDB nor an SOR protocol proves
 // the physical socket type. Ambiguous/multiple records remain unknown.
 fn kind(route: *const topology.Route) u32 {
+    if (route.wiring.relation == .virtual) return 0;
     const connectors = route.connectors orelse return 0;
-    if (!connectors.present() or connectors.count != 1) return 0;
-    return switch (connectors.data[0].kind) {
+    if (!connectors.present()) return 0;
+    const physical = if (route.wiring.physical_status == .matched) route.wiring.physical.? else
+        if (route.wiring.physical_status == .unavailable and connectors.count == 1) connectors.data[0] else return 0;
+    return switch (physical.kind) {
         0x61, 0x63 => a.gfx_output_kind_hdmi,
         0x46, 0x48 => a.gfx_output_kind_displayport,
         0x47 => a.gfx_output_kind_edp,

@@ -1,6 +1,7 @@
 const std = @import("std");
 pub const topology = @import("vbios_topology.zig");
 pub const gpio = @import("vbios_gpio.zig");
+pub const xpio = @import("vbios_xpio.zig");
 
 pub const max_rom_bytes = 1024 * 1024;
 pub const max_ports = 32;
@@ -11,7 +12,10 @@ pub const Port = struct {
     ccb: u8 = 0xf,
     connector: u8 = 0xf,
     heads: u8 = 0,
-    or_mask: u8 = 0,
+    output_mask: u8 = 0,
+    assignment: enum { encoder, pad_macro } = .encoder,
+    link_mask: ?u8 = null,
+    virtual: bool = false,
     location: u8 = 0,
     bus: u8 = 0,
     i2c: ?u8 = null,
@@ -30,6 +34,7 @@ pub const Result = struct {
     pci_extension_offset: u32 = 0,
     pci_extension_bytes: u16 = 0,
     pci_device: u16 = 0,
+    validated_device: ?u16 = null,
     first_extension_offset: ?u32 = null,
     // RM adds this bias to Falcon table/descriptor pointers. It is NOT the
     // first extension's address: intervening EFI images shift the pointers.
@@ -43,12 +48,15 @@ pub const Result = struct {
     dcb_offset: u16 = 0,
     dcb_version: u8 = 0,
     ccb_version: u8 = 0,
+    primary_ccb: ?u8 = null,
+    secondary_ccb: ?u8 = null,
     communication_count: u8 = 0,
     communications: [topology.max_entries]topology.Communication = .{topology.Communication{}} ** topology.max_entries,
     connector_version: u8 = 0,
     connector_count: u8 = 0,
     connectors: [topology.max_entries]topology.Connector = .{topology.Connector{}} ** topology.max_entries,
     gpio_table: ?gpio.Catalog = null,
+    external_gpio: ?xpio.Catalog = null,
     port_count: u8 = 0,
     ports: [max_ports]Port = .{Port{}} ** max_ports,
 };
@@ -86,7 +94,7 @@ pub fn promStart(bytes: []const u8) Error!PromStart {
 /// are x86-relative; BIT 'p' uses the whole PCI ROM as in the pinned RM reader.
 pub fn parse(rom: []const u8, expected_device: ?u16) Error!Result {
     if (rom.len == 0 or rom.len > max_rom_bytes) return error.Limit;
-    var result: Result = .{};
+    var result: Result = .{ .validated_device = expected_device };
     var cursor: usize = 0;
     var selected: ?[]const u8 = null;
     while (true) {
@@ -279,6 +287,10 @@ fn parseDcb(image: []const u8, ranges: *Ranges, result: *Result) Error!void {
     if (ccb) |value| {
         if (value.version != 0x41) return error.Version;
         result.ccb_version = value.version;
+        const primary = image[@as(usize, ccb_offset) + 4];
+        const secondary = image[@as(usize, ccb_offset) + 5];
+        result.primary_ccb = if (primary < value.count) primary else null;
+        result.secondary_ccb = if (secondary < value.count) secondary else null;
         result.communication_count = value.count;
         for (0..value.count) |i| result.communications[i] = try topology.communication(@intCast(i), value.records[i * value.stride ..][0..value.stride]);
     }
@@ -292,6 +304,23 @@ fn parseDcb(image: []const u8, ranges: *Ranges, result: *Result) Error!void {
     if (gpio_offset != 0) {
         result.gpio_table = try gpio.parse(image, gpio_offset);
         try ranges.add(gpio_offset, result.gpio_table.?.byte_length);
+        if (result.gpio_table.?.external_table_offset) |external| {
+            result.external_gpio = try xpio.parse(image, external);
+            const catalog = &result.external_gpio.?;
+            try ranges.add(catalog.master.offset, catalog.master.bytes);
+            for (catalog.tables[0..catalog.table_count]) |*specific| {
+                try ranges.add(specific.range.offset, specific.range.bytes);
+                specific.ccb = if (specific.flags & 0x10 == 0) result.primary_ccb else result.secondary_ccb;
+                if (specific.ccb) |index| {
+                    specific.i2c = result.communications[index].i2c;
+                    specific.aux = result.communications[index].aux;
+                    specific.bus_known = result.communications[index].reserved_bits == 0;
+                }
+                // xInt=1 names internal Expansion1/function99, not a GPIO
+                // line number. Reserved interrupt selectors stay unknown.
+                if (specific.flags & 3 == 1) specific.interrupt = try result.gpio_table.?.input(99);
+            }
+        }
     }
     for (0..count) |index| {
         const entry = table[size + index * stride ..][0..8];
@@ -309,7 +338,10 @@ fn parseDcb(image: []const u8, ranges: *Ranges, result: *Result) Error!void {
             .heads = @truncate((path >> 8) & 0xf),
             .bus = @truncate((path >> 16) & 0xf),
             .location = @truncate((path >> 20) & 3),
-            .or_mask = @truncate((path >> 24) & 0xf),
+            .output_mask = @truncate((path >> 24) & 0xf),
+            .assignment = if (header[0] == 0x41 and (kind == 2 or kind == 3 or kind == 6)) .pad_macro else .encoder,
+            .link_mask = if (kind == 2 or kind == 3 or kind == 6) @intCast((config >> 4) & 3) else null,
+            .virtual = path & (1 << 28) != 0,
             .raw_path = path,
             .raw_config = config,
         };
@@ -331,7 +363,7 @@ fn parseDcb(image: []const u8, ranges: *Ranges, result: *Result) Error!void {
             port.connector_type = connector.kind;
             connector.display_paths |= @as(u32, 1) << @as(u5, @intCast(index));
             connector.heads |= port.heads;
-            connector.or_mask |= port.or_mask;
+            if (port.assignment == .pad_macro) connector.pad_mask |= port.output_mask else connector.encoder_mask |= port.output_mask;
             connector.logical_bus_mask |= @as(u16, 1) << @as(u4, @intCast(port.bus));
             if (port.ccb != 0xf) connector.ccb_mask |= @as(u16, 1) << @as(u4, @intCast(port.ccb));
         }
@@ -343,7 +375,7 @@ fn parseDcb(image: []const u8, ranges: *Ranges, result: *Result) Error!void {
 const Ranges = struct {
     const Range = struct { start: usize = 0, end: usize = 0 };
     // Header, DCB pointer, PCI, optional NPDE, BIT header/data and DCB/CCB/connector/GPIO.
-    values: [10]Range = .{Range{}} ** 10,
+    values: [11 + xpio.max_tables]Range = @splat(.{}),
     count: usize = 0,
     fn add(self: *Ranges, start: usize, length: usize) Error!void {
         if (self.count == self.values.len) return error.Limit;

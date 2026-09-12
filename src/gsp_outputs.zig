@@ -22,6 +22,7 @@ pub const Snapshot = struct {
 pub const Owner = struct {
     self_address: usize = 0,
     graph: ?*graph.Owner = null,
+    board: ?*const @import("vbios.zig").Result = null, // Resident Device-owned CPU copy.
     state: State = .detached,
     deadline: u64 = 0,
     invalidated: bool = false,
@@ -99,6 +100,7 @@ pub const Owner = struct {
                 if (probe.state != .complete and probe.state != .obsolete) return try probe.poll();
                 if (probe.state == .obsolete) self.invalidated = true else _ = try probe.borrow(self.deadline);
                 try probe.release(self.deadline);
+                if (!self.invalidated) topology.correlate(&self.data.topology, self.board);
                 self.state = if (self.invalidated) .obsolete else if (self.data.topology.count == 0) .complete else .receivers;
             },
             .receivers => {

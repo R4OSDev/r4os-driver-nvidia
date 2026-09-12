@@ -81,11 +81,12 @@ pub const Connector = struct {
     self_refresh: ?bool = null,
     lcd_id: ?u8 = null,
     reserved_bits: u32 = 0,
-    // Original DCB indices survive skipped records. Multiple paths can name
-    // one connector; head/SOR masks are candidates, not the active route.
+    // DCB4.1 DFP masks name fixed pad macros, not candidate SORs. Other
+    // paths keep the encoder mask. Neither describes the active RM route.
     display_paths: u32 = 0,
     heads: u8 = 0,
-    or_mask: u8 = 0,
+    encoder_mask: u8 = 0,
+    pad_mask: u8 = 0,
     logical_bus_mask: u16 = 0,
     ccb_mask: u16 = 0,
 };

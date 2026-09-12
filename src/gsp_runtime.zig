@@ -205,11 +205,29 @@ pub const Owner = struct {
                 if (self.outputs.data.coherent) {
                     const catalog = &self.outputs.data.topology;
                     self.log("NVIDIA gsp-heads: generation={d} count={?} observation=queried lease=no", .{self.output_generation, catalog.head_count});
-                    for (catalog.routes[0..catalog.count]) |*route|
+                    for (catalog.routes[0..catalog.count]) |*route| {
                         self.log("NVIDIA gsp-route: display={x} active-heads={?} or={?} dcb-slot={?} ddc-port={?} communication-port={?}",
                             .{route.id, catalog.activeHeads(route.id), if (route.resource) |resource| resource.index else null,
                                 if (route.resource) |resource| resource.dcb_index else null, if (route.buses) |buses| buses.ddc else null,
                                 if (route.buses) |buses| buses.communication else null});
+                        const wire = &route.wiring;
+                        self.log("NVIDIA gsp-wire: display={x} relation={s} physical={s} rm-connector={?} heads={s} encoder={s} protocol={s}",
+                            .{route.id, @tagName(wire.relation), @tagName(wire.physical_status),
+                                if (wire.physical) |physical| @as(?u32, physical.index) else null,
+                                @tagName(wire.heads), @tagName(wire.encoder), @tagName(wire.protocol)});
+                        if (wire.relation == .static) {
+                            const port = &wire.relation.static;
+                            self.log("NVIDIA gsp-bus: display={x} dcb={d} connector={d} ccb={d} pmgr-i2c={?} pmgr-aux={?} assignment={s} mask={x} links={?}",
+                                .{route.id, port.index, port.connector, port.ccb, port.i2c, port.aux, @tagName(port.assignment), port.output_mask, port.link_mask});
+                            for (&wire.hpd) |*signal| if (signal.*) |hpd|
+                                self.log("NVIDIA gsp-hpd: display={x} function={d} status={s} pin={?} active-high={?} level=unread",
+                                    .{route.id, hpd.function, @tagName(hpd.status), hpd.line, hpd.active_high});
+                            for (&wire.external_dongle, 0..) |*signal, bit| if (signal.*) |dongle|
+                                self.log("NVIDIA gsp-xpio: display={x} dp-dvi={d} status={s} table={?} pin={?} level=unread",
+                                    .{route.id, bit, @tagName(dongle.status), dongle.table, dongle.line});
+                        } else if (wire.relation == .dynamic)
+                            self.log("NVIDIA gsp-root: display={x} root={x} physical=not-inferred", .{route.id, wire.relation.dynamic});
+                    }
                 }
                 return .progress;
             }

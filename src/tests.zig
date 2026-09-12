@@ -276,6 +276,7 @@ test "modern BIT DCB CCB and connector extraction keeps raw facts and null ports
     try t.expectEqual(@as(?u8, 0x46), info.ports[1].connector_type);
     try checkConnectorTopology(&rom, &info);
     try checkGpioTopology(&rom);
+    try checkExternalTopology();
     try t.expectEqualSlices(u8, &before, &rom);
     try t.expectError(error.Identity, vbios.parse(&rom, 0xbeef));
     try t.expectError(error.Limit, vbios.parse(rom[0..0], null));
@@ -287,6 +288,99 @@ test "modern BIT DCB CCB and connector extraction keeps raw facts and null ports
     var sink: DiagnosticSink = .{ .rom = &rom };
     @import("vbios_diagnostic.zig").inspect(&rom, &sink);
     try t.expect(sink.records >= 7);
+}
+
+pub fn portFixture() [1024]u8 {
+    var rom = fixture();
+    put16(&rom, 0x36, 0x220);
+    @memcpy(rom[0x220..][0..23], rom[0x100..][0..23]);
+    rom[0x222] = 28;
+    @memset(rom[0x237..][0 .. 28 * 8], 0xff);
+    put32(&rom, 0x30f, 0x01000102); // DCB slot27, independently of RM ID.
+    put32(&rom, 0x313, 0);
+    put16(&rom, 0x22a, 0x330);
+    @memcpy(rom[0x330..][0..6], &[_]u8{ 0x41, 6, 1, 5, 0x50, 3 });
+    put32(&rom, 0x336, 0x00000703); rom[0x33a] = 0xef;
+    rom[0x184] = 0; rom[0x185] = 1;
+    rom[0x1c5] = 0x54; // Relative location4, internal HPD A, DP2DVI A.
+    @memcpy(rom[0x350..][0..10], &[_]u8{ 0x40, 4, 3, 2, 0, 0, 0x70, 3, 0x90, 3 });
+    @memcpy(rom[0x370..][0..7], &[_]u8{ 0x40, 7, 1, 4, 9, 0x40, 0 });
+    put32(&rom, 0x377, 0x70000101); // External type9 DP2DVI A input.
+    @memcpy(rom[0x390..][0..7], &[_]u8{ 0x40, 7, 1, 4, 7, 0x42, 0 });
+    put32(&rom, 0x397, 0x70000702); // Type7 function7 is not HPD A.
+    checksum(&rom, 1023);
+    return rom;
+}
+
+fn checkExternalTopology() !void {
+    var rom = portFixture();
+    const board = try vbios.parse(&rom, 0x2504);
+    try t.expect(board.port_count == 1 and board.ports[0].index == 27);
+    try t.expect(board.ports[0].assignment == .pad_macro and board.ports[0].output_mask == 1 and board.ports[0].link_mask.? == 0);
+    try t.expect(board.connectors[0].pad_mask == 1 and board.connectors[0].encoder_mask == 0);
+    var legacy = rom; legacy[0x220] = 0x40; checksum(&legacy, 1023);
+    const legacy_board = try vbios.parse(&legacy, null);
+    try t.expect(legacy_board.ports[0].assignment == .encoder and legacy_board.connectors[0].encoder_mask == 1 and legacy_board.connectors[0].pad_mask == 0);
+    legacy = rom; legacy[0x312] |= 0x10; checksum(&legacy, 1023);
+    try t.expect((try vbios.parse(&legacy, null)).ports[0].virtual);
+    try t.expect(board.primary_ccb.? == 0 and board.secondary_ccb.? == 1);
+    const external = &board.external_gpio.?;
+    try t.expect(external.master_count == 3 and external.table_count == 2 and external.entry_count == 2);
+    try t.expect(external.tables[0].index == 1 and external.tables[0].ccb.? == 0 and external.tables[0].i2c.? == 3);
+    try t.expect((try external.entry(0, 0)).function == 1 and (try external.entry(1, 0)).function == 7);
+    try t.expect(board.gpio_table.?.hpd[0].matches == 1 and board.gpio_table.?.hpd[0].line.? == 3);
+    const signal = external.dongle(0, 0);
+    try t.expect(signal.status == .mapped and signal.table.? == 1 and signal.line.? == 1 and signal.active_high.?);
+    try t.expect(external.dongle(1, 0).status == .missing and external.dongle(0, 1).status == .missing);
+    try t.expectError(error.Bounds, external.entry(2, 0));
+    try t.expectError(error.Bounds, external.entry(0, 1));
+    for (0..0x39b) |length| try t.expectError(error.Bounds, vbios.xpio.parse(rom[0..length], 0x350));
+    // Each level reads its own header; no inherited internal GPIO4.1 stride.
+    var malformed = rom;
+    malformed[0x350] = 0x41; checksum(&malformed, 1023);
+    try t.expectError(error.Version, vbios.parse(&malformed, null));
+    malformed = rom; malformed[0x373] = 5; checksum(&malformed, 1023);
+    try t.expectError(error.Limit, vbios.parse(&malformed, null));
+    malformed = rom; malformed[0x352] = 17; checksum(&malformed, 1023);
+    try t.expectError(error.Limit, vbios.parse(&malformed, null));
+    malformed = rom; put16(&malformed, 0x358, 0x370); checksum(&malformed, 1023);
+    try t.expectError(error.Overlap, vbios.parse(&malformed, null));
+    malformed = rom; put16(&malformed, 0x334, 0x1c0); checksum(&malformed, 1023);
+    try t.expectError(error.Limit, vbios.parse(&malformed, null));
+    malformed = rom; malformed[0x376] = 0x10; checksum(&malformed, 1023);
+    const secondary = try vbios.parse(&malformed, null);
+    try t.expect(secondary.external_gpio.?.tables[0].ccb.? == 1 and secondary.external_gpio.?.tables[0].aux.? == 2);
+    try t.expect(!secondary.external_gpio.?.tables[0].knownWiring()); // No PMGR I2C on secondary pad.
+    malformed = rom; malformed[0x184] = 0xff; checksum(&malformed, 1023);
+    try t.expect((try vbios.parse(&malformed, null)).external_gpio.?.tables[0].ccb == null);
+    for ([_]u8{ 1, 2, 4, 8, 0x20, 0x40, 0x80 }) |flag| {
+        var item = external.tables[0]; item.flags = flag;
+        try t.expectEqual(flag == 1, item.knownWiring());
+    }
+    for ([_]u8{ 0, 11, 0xff }) |kind| {
+        var retained = external.*; retained.tables[0].kind = kind;
+        try t.expect(retained.dongle(0, 0).status == .missing and !retained.tables[0].knownWiring());
+    }
+    malformed = rom; malformed[0x376] = 1; malformed[0x332] = 2;
+    put32(&malformed, 0x33b, 0x0000630a); malformed[0x33f] = 0xbf; checksum(&malformed, 1023);
+    const irq = (try vbios.parse(&malformed, null)).external_gpio.?.tables[0].interrupt.?;
+    try t.expect(irq.status == .mapped and irq.function == 99 and irq.line.? == 10 and !irq.active_high.?);
+    malformed[0x376] = 2; checksum(&malformed, 1023);
+    try t.expect((try vbios.parse(&malformed, null)).external_gpio.?.tables[0].interrupt == null);
+    var ambiguous = external.*;
+    ambiguous.tables[1].kind = 9; ambiguous.raw[1] = ambiguous.raw[0];
+    try t.expect(ambiguous.dongle(0, 0).status == .ambiguous and ambiguous.dongle(0, 0).line == null);
+    // Full u8 count is accepted for one table; a second cannot overflow
+    // the explicitly bounded total entry storage.
+    var large: [2200]u8 = @splat(0);
+    @memcpy(large[0..8], &[_]u8{ 0x40, 4, 2, 2, 16, 0, 0x30, 4 });
+    @memcpy(large[16..][0..7], &[_]u8{ 0x40, 7, 255, 4, 7, 0x40, 0 });
+    @memcpy(large[0x430..][0..7], &[_]u8{ 0x40, 7, 1, 4, 7, 0x42, 0 });
+    try t.expect((try vbios.xpio.parse(&large, 0)).entry_count == 256);
+    large[0x432] = 2;
+    try t.expectError(error.Limit, vbios.xpio.parse(&large, 0));
+    rom[0x377] = 0;
+    try t.expect((try external.entry(0, 0)).line == 1); // Independent retained copy.
 }
 
 fn checkConnectorTopology(rom: *const [1024]u8, info: *const vbios.Result) !void {
@@ -305,7 +399,7 @@ fn checkConnectorTopology(rom: *const [1024]u8, info: *const vbios.Result) !void
     const pair = try vbios.parse(&paired, 0x2504);
     try t.expectEqual(@as(u32, 3), pair.connectors[0].display_paths);
     try t.expectEqual(@as(u8, 3), pair.connectors[0].heads);
-    try t.expectEqual(@as(u8, 3), pair.connectors[0].or_mask);
+    try t.expectEqual(@as(u8, 3), pair.connectors[0].pad_mask);
     try t.expectEqual(@as(u16, 0x81), pair.connectors[0].logical_bus_mask);
     try t.expectEqual(@as(u16, 1), pair.connectors[0].ccb_mask);
     try t.expectEqual(@as(u32, 3), pair.communications[0].display_paths);
