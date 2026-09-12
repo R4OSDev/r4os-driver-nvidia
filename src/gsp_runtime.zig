@@ -126,7 +126,7 @@ pub const Owner = struct {
                 if (self.static_info != null) {
                     try self.post.accept(dispatch);
                     if (self.post.snapshot()) |info|
-                        self.log("NVIDIA gsp-postinit: gpcs={d} tpcs={d} intr-entries={d} gsp-stall={d} irq=unconfigured native-output=unavailable",
+                        self.log("NVIDIA gsp-postinit: gpcs={d} tpcs={d} intr-entries={d} gsp-stall={d} irq=awaiting-owner native-output=unavailable",
                             .{@popCount(info.gpc_mask), info.tpc_count, info.entry_count, info.entries[info.gsp_index.?].stall});
                     return .progress;
                 }

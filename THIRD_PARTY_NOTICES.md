@@ -1,5 +1,14 @@
 ﻿# Third-Party Notices
 
+GA106 GSP interrupts (NVIDIA 0.1.57, 2026-09-12):
+The bounded VFN/Falcon/MSI interrupt sequence follows NVIDIA 570.144
+register definitions and Nouveau GA106/r535 sources. Thirteen complete
+source notices are included in gsp_irq.zig and appended to the existing
+NVIDIA-GSP-RUNTIME-LICENSE.txt in both module and Distribution. The previous
+66,681 bytes remain unchanged. Full pinned references and 12 original
+register comparisons are archived under 0.79.10/gsp-irq-20260912.
+R4OS owner, semaphore binding and lifecycle code remain Apache-2.0.
+
 Internal RM post-init discovery (NVIDIA 0.1.56, 2026-09-12):
 The fixed GPC/TPC controls, interrupt table, RPC envelope and GA106 vector
 bounds follow NVIDIA 570.144 and Nouveau r570/r535. Eleven complete source

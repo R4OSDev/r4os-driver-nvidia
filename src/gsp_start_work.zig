@@ -8,6 +8,8 @@ pub const Work = struct {
     self_address: usize = 0,
     ctx: ?r4os.r4dev.DriverContext = null,
     threads: ?r4os.r4dev.DriverThreadContext = null,
+    semaphores: ?r4os.r4dev.DriverSemaphoreContext = null,
+    wake_semaphore: u64 = 0,
     device: ?*device.Device = null,
     task: u64 = 0,
     completion: u32 = 0,
@@ -17,10 +19,14 @@ pub const Work = struct {
         if (self.self_address != 0 or target.self_address != @intFromPtr(target)) return error.State;
         if (ctx.apiVersion() < a.driver_api_thread_work_version) return error.Api;
         const service = ctx.threads() orelse return error.Api;
+        const semaphores = ctx.semaphores() orelse return error.Api;
         self.self_address = @intFromPtr(self);
         self.ctx = ctx.*;
         self.threads = service;
+        self.semaphores = semaphores;
         self.device = target;
+        if (semaphores.create(0, 1, &self.wake_semaphore) != 0 or self.wake_semaphore == 0) return error.Semaphore;
+        target.irq_wake = .{ .context = self.self_address, .signal = wake };
         if (service.start(pace, self.self_address, 0, &self.task) != 0 or self.task == 0) return error.Task;
     }
     /// Serialized init/shutdown caller. Stop future native admission before
@@ -30,7 +36,8 @@ pub const Work = struct {
         if (self.self_address == 0) return true;
         if (self.self_address != @intFromPtr(self)) return false;
         @atomicStore(u32, &self.stopping, 1, .release);
-        self.device.?.stop();
+        if (!self.device.?.stop()) return false;
+        if (self.wake_semaphore != 0) _ = wake(self.self_address);
         if (self.task != 0) {
             const service = self.threads.?;
             if (service.stop(self.task) != 0) return false;
@@ -49,10 +56,22 @@ pub const Work = struct {
             }
             self.task = 0;
         }
+        if (self.wake_semaphore != 0) {
+            if (self.semaphores.?.destroy(self.wake_semaphore) != 0) return false;
+            self.wake_semaphore = 0;
+        }
+        self.device.?.irq_wake = null;
         self.* = .{};
         return true;
     }
     fn from(raw: usize) *Work { return @ptrFromInt(raw); }
+    fn wake(raw: usize) i32 {
+        const self = from(raw);
+        // Immutable while a callback can run. One resident permit coalesces
+        // interrupts; release is the existing IRQ-safe semaphore operation.
+        const result = self.semaphores.?.release(self.wake_semaphore);
+        return if (result == a.driver_semaphore_error_overflow) 0 else result;
+    }
     fn pace(raw: usize) callconv(.c) i32 {
         const self = from(raw);
         if (self.self_address != raw or self.ctx == null or self.threads == null) return -1;
@@ -71,10 +90,15 @@ pub const Work = struct {
             if (result < 0) return result;
             // Sleeping here releases the dedicated task's owner context.
             // No shared worker, MMIO callback or device lock spans this wait.
-            // An empty runtime queue needs no tight spin. Active startup or
-            // sequencer steps keep the short cadence; IRQ wakeup is separate.
+            // A GSP IRQ supplies a permit immediately; the finite timeout
+            // preserves startup, deadlines and log polling if no IRQ arrives.
             const ticks = if (result == 2 and self.device.?.phase == .ready) @max(ctx.timerFrequency() / 100, 1) else 1;
-            if (self.threads.?.sleepTicks(ticks) != 0) return 0;
+            const waited = self.semaphores.?.acquire(self.wake_semaphore, ticks);
+            if (waited != 0 and waited != a.driver_semaphore_error_timeout) {
+                if (@atomicLoad(u32, &self.stopping, .acquire) != 0 or waited == a.driver_semaphore_error_cancelled) return 0;
+                ctx.logError("NVIDIA gsp-start: pacing=failed reason=interrupt-wait device=retained");
+                return -1;
+            }
         }
         return 0;
     }

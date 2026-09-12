@@ -1375,7 +1375,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
     const core = @import("gsp_core.zig");
     const hs = @import("falcon_hs.zig");
     const identity = @import("identity.zig");
-    const words = try t.allocator.alignedAlloc(u32, comptime std.mem.Alignment.fromByteUnits(4096), 0x842000 / 4);
+    const words = try t.allocator.alignedAlloc(u32, comptime std.mem.Alignment.fromByteUnits(4096), 0xb82000 / 4);
     defer t.allocator.free(words);
     const target = try t.allocator.create(driver.Device);
     defer t.allocator.destroy(target);
@@ -1388,6 +1388,10 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
     table.log_info = DeviceModel.log;
     table.log_warn = DeviceModel.log;
     table.log_error = DeviceModel.log;
+    table.pci_enable_msi = IrqModel.enableMsi;
+    table.pci_disable_msi = IrqModel.disableMsi;
+    table.irq_register = IrqModel.register;
+    table.irq_unregister = IrqModel.unregister;
     var snapshot: identity.Snapshot = .{ .pci = .{ .vendor_id = 0x10de, .device_id = 0x2504, .class_code = 3 }, .command = 7 };
     snapshot.bars[0] = .{ .kind = .memory32, .base = 0xfb000000, .bytes = words.len * 4 };
     snapshot.bars[1] = .{ .kind = .memory64, .base = 0xd0000000, .bytes = 0x10000000 };
@@ -1426,6 +1430,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
     const Case = enum { success, old_api, preboot_partial, frts_error, timeout, stolen_display, unknown_event,
         static_bad_region, static_ack_failure, static_timeout,
         post_control_error, post_wrong_gpc, post_bad_vector, post_ack_failure, post_timeout,
+        irq_intx, irq_register_error, irq_msi_uncertain, irq_cause, irq_wake_failure, irq_close_busy, irq_unregister_failure,
         runtime_healthy, runtime_lockdown, runtime_unknown, runtime_unowned, runtime_sequence_timeout,
         runtime_log_failure, runtime_moving_log };
     for (std.enums.values(Case)) |case| {
@@ -1450,6 +1455,11 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         var reader: @import("gsp_logs.zig").Reader = .{};
         try reader.open(lease);
         target.* = .{};
+        IrqModel.reset();
+        target.irq_wake = .{ .context = @intFromPtr(target), .signal = IrqModel.wake };
+        capture.snapshot.?.caps.msi = if (case == .irq_intx) 0 else 0x68;
+        capture.snapshot.?.interrupt_line = 11;
+        capture.snapshot.?.interrupt_pin = 1;
         if (case == .old_api) {
             table.version = a.driver_api_thread_work_version - 1;
             try t.expectError(error.Api, target.open(ctx, capture, held, lease, &reader));
@@ -1548,6 +1558,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
             }
             try checkDeviceStatic(target, words, held.plan.?.frts.offset, case);
             if (target.phase == .ready) try checkDevicePostInit(target, words, held.plan.?.frts.offset, case);
+            if (target.phase == .ready) try checkDeviceIrq(target, words, held.plan.?.frts.offset, case);
             if (exercise_runtime) try checkDeviceRuntime(target, words, held.plan.?.frts.offset, case);
         } else {
             try t.expect(target.phase == .failed and target.failure != null);
@@ -1555,6 +1566,11 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
                 try t.expect(target.recovery.report != null and target.port.phase == .recovery and !reader.enabled);
         }
         try t.expect(!target.closeBeforeSubmission() and !capture.close() and !lease.releaseBeforeSubmission());
+        // Remove injected routing/retirement failures only for host disposal.
+        // Production retains the entire mapping graph on these failures.
+        IrqModel.unregister_result = 0;
+        target.interrupts.routing_uncertain = false;
+        try t.expect(target.interrupts.close());
         // Dispose host-only fixture effects. Production exposes no equivalent
         // release or replay operation; neither model success nor halt is proof.
         capture.boot.held_generation = original_epoch;
@@ -1790,6 +1806,161 @@ fn checkDevicePostInit(target: *@import("gsp_device.zig").Device, words: []u32, 
     }
     try t.expect(recovery_steps < 12000 and target.phase == .failed and target.recovery.report != null and target.memory.?.retained);
     try t.expect(std.meta.eql(receipt, session.pending) and post.snapshot() == null and !target.reader.?.enabled);
+}
+
+const IrqModel = struct {
+    var handler: ?a.IrqHandler = null;
+    var context: usize = 0;
+    var irq: u8 = 0;
+    var flags: u32 = 0;
+    var msi_result: i32 = 24;
+    var register_result: i32 = 0;
+    var unregister_result: i32 = 0;
+    var wake_result: i32 = 0;
+    var msi_enabled: bool = false;
+    var in_irq: bool = false;
+    var close_during_irq: bool = false;
+    var close_blocked: bool = false;
+    var wakes: usize = 0;
+    fn reset() void {
+        std.debug.assert(handler == null and !msi_enabled and !in_irq);
+        msi_result = 24; register_result = 0; unregister_result = 0;
+        wake_result = 0; close_during_irq = false; close_blocked = false; wakes = 0;
+    }
+    fn enableMsi(_: u8, _: u8, _: u8, _: u8) callconv(.c) i32 {
+        std.debug.assert(!in_irq and !msi_enabled);
+        if (msi_result >= 0) msi_enabled = true;
+        return msi_result;
+    }
+    fn disableMsi(_: u8, _: u8, _: u8, _: u8) callconv(.c) i32 {
+        std.debug.assert(!in_irq and handler == null and msi_enabled);
+        msi_enabled = false;
+        return 0;
+    }
+    fn register(line: u8, callback: a.IrqHandler, raw: usize, options: u32) callconv(.c) i32 {
+        std.debug.assert(!in_irq and handler == null);
+        if (register_result != 0) return register_result;
+        irq = line; handler = callback; context = raw; flags = options;
+        return 0;
+    }
+    fn unregister(line: u8, callback: a.IrqHandler, raw: usize) callconv(.c) i32 {
+        std.debug.assert(!in_irq and handler == callback and irq == line and context == raw);
+        const owner: *@import("gsp_irq.zig").Owner = @ptrFromInt(raw);
+        std.debug.assert(@atomicLoad(u32, &owner.gate, .acquire) == 0 and owner.lease.valid());
+        if (unregister_result != 0) return unregister_result;
+        handler = null;
+        return 0;
+    }
+    fn wake(raw: usize) i32 {
+        std.debug.assert(in_irq);
+        wakes += 1;
+        const target: *@import("gsp_device.zig").Device = @ptrFromInt(raw);
+        if (close_during_irq) {
+            // Deterministically stop while the actual callback is pinned.
+            // It must retain its lease/registration and defer unarm to close.
+            close_blocked = !target.interrupts.close();
+            std.debug.assert(target.interrupts.registered and target.interrupts.lease.valid());
+        }
+        return wake_result;
+    }
+    fn dispatch(line: u8) u32 {
+        in_irq = true;
+        defer in_irq = false;
+        return handler.?(line, context);
+    }
+};
+
+fn checkDeviceIrq(target: *@import("gsp_device.zig").Device, words: []u32, frts: u64, scenario: anytype) !void {
+    const irqs = @import("gsp_irq.zig");
+    const endpoint = &target.interrupts;
+    var checkpoint: u8 = 0;
+    errdefer |err| std.debug.print("GSP IRQ model checkpoint={d} error={s} phase={s} device={?} irq={d}/{d} gate={d} registered={} calls={d} events={d}\n",
+        .{ checkpoint, @errorName(err), @tagName(target.phase), target.failure, endpoint.irq, endpoint.last_status,
+            endpoint.gate, endpoint.registered, range_calls, target.running.snapshot.events });
+    const before_open = range_calls;
+    if (scenario == .irq_register_error) IrqModel.register_result = -5;
+    if (scenario == .irq_msi_uncertain) IrqModel.msi_result = -4;
+    try t.expect(target.step() == .progress);
+    try t.expect(range_calls == before_open);
+    const install_failed = scenario == .irq_register_error or scenario == .irq_msi_uncertain;
+    if (!install_failed) {
+        checkpoint = 1;
+        try t.expect(endpoint.registered and endpoint.lease.valid() and endpoint.bit == 512 and endpoint.leaf == 6 and endpoint.subtree == 8);
+        try t.expect(IrqModel.flags == @as(u32, if (scenario == .irq_intx) a.irq_flag_shared | a.irq_flag_level_low else a.irq_flag_msi));
+        try t.expect(IrqModel.irq == @as(u8, if (scenario == .irq_intx) 11 else 24));
+        try t.expect(words[irqs.reg.rearm / 4] == 8 and words[(irqs.reg.allow + 24) / 4] == 512);
+        for (0..8) |leaf| try t.expect(words[irqs.reg.block / 4 + leaf] == 0xffffffff);
+        checkpoint = 2;
+        // A foreign/shared interrupt cannot consume the GSP queue.
+        const sequence = target.session.?.tx_sequence;
+        const events = target.running.snapshot.events;
+        try t.expect(IrqModel.dispatch(IrqModel.irq + 1) == 0);
+        words[irqs.reg.top / 4] = 0;
+        try t.expect(IrqModel.dispatch(IrqModel.irq) == 0 and IrqModel.wakes == 0);
+        var print: [11]u8 = @splat(0);
+        std.mem.writeInt(u32, print[4..8], 3, .little);
+        @memcpy(print[8..], "IRQ");
+        try nativeEvent(&target.session.?, 0x100c, &print);
+        const calls = range_calls;
+        const pending = target.session.?.pending;
+        checkpoint = 3;
+        words[irqs.reg.top / 4] = 8;
+        words[(irqs.reg.leaf + 24) / 4] = 512;
+        words[irqs.reg.mask / 4] = 0xff;
+        words[irqs.reg.status / 4] = if (scenario == .irq_cause or scenario == .irq_unregister_failure) 0x42 else 0x40;
+        words[irqs.reg.rearm / 4] = 0;
+        if (scenario == .irq_wake_failure) IrqModel.wake_result = -1;
+        IrqModel.close_during_irq = scenario == .irq_close_busy;
+        try t.expect(IrqModel.dispatch(IrqModel.irq) == a.irq_result_handled);
+        checkpoint = 4;
+        try t.expect(IrqModel.wakes == 1 and endpoint.interrupts == 1 and endpoint.messages == 1);
+        try t.expect(range_calls == calls and target.session.?.tx_sequence == sequence and target.running.snapshot.events == events);
+        try t.expect(std.meta.eql(pending, target.session.?.pending));
+        try t.expect(words[irqs.reg.retrigger / 4] == 1 and words[(irqs.reg.leaf + 24) / 4] == 512);
+        if (scenario == .irq_close_busy) {
+            checkpoint = 5;
+            try t.expect(IrqModel.close_blocked and endpoint.gate == 0 and words[irqs.reg.rearm / 4] == 0);
+            try t.expect(endpoint.registered and endpoint.lease.valid());
+            try t.expect(target.stop() and endpoint.closed and IrqModel.handler == null and !IrqModel.msi_enabled);
+            const closed_writes = words[irqs.reg.block / 4 + 6];
+            try t.expect(target.stop() and words[irqs.reg.block / 4 + 6] == closed_writes);
+            return;
+        }
+        const fatal = scenario == .irq_cause or scenario == .irq_unregister_failure or scenario == .irq_wake_failure;
+        if (fatal) {
+            checkpoint = 6;
+            try t.expect(endpoint.failed() and endpoint.gate == 0 and words[irqs.reg.rearm / 4] == 0);
+            if (scenario != .irq_wake_failure) try t.expect(endpoint.last_raw == 0x42 and words[irqs.reg.mask_clear / 4] == 2 and words[irqs.reg.clear / 4] == 2);
+            if (scenario == .irq_unregister_failure) IrqModel.unregister_result = -5;
+            try t.expect(target.step() == .progress and target.failure.? == error.Interrupt);
+        } else {
+            checkpoint = 7;
+            try t.expect(!endpoint.failed() and words[irqs.reg.clear / 4] == 0x40 and words[irqs.reg.rearm / 4] == 8);
+            try t.expect(target.step() == .progress and target.running.snapshot.events == events + 1);
+            try t.expect(target.session.?.pending == null and target.phase == .ready);
+            return;
+        }
+    }
+    checkpoint = 8;
+    try t.expect(target.phase == .recovering and !target.recovery_started);
+    _ = target.step();
+    const retained_irq = scenario == .irq_msi_uncertain or scenario == .irq_unregister_failure;
+    if (retained_irq) {
+        try t.expect(!target.recovery_started and endpoint.lease.valid() and target.memory.?.retained);
+        try t.expect(target.port.phase == .runtime); // No reset before retirement.
+        clock = target.recovery_deadline;
+        _ = target.step();
+        try t.expect(target.phase == .failed and target.recovery_failure.? == error.IrqRetirement and target.recovery.report == null);
+    } else {
+        var steps: usize = 0;
+        while (target.phase != .failed and steps < 12000) : (steps += 1) {
+            clock += 1000;
+            DeviceModel.tick(words, frts, false);
+            _ = target.step();
+        }
+        try t.expect(steps < 12000 and target.recovery.report != null and endpoint.closed and !endpoint.registered and !endpoint.msi);
+    }
+    try t.expect(target.memory.?.retained and target.display.?.firmware_owner == @intFromPtr(target));
 }
 
 fn checkDeviceRuntime(target: *@import("gsp_device.zig").Device, words: []u32, frts: u64, scenario: anytype) !void {

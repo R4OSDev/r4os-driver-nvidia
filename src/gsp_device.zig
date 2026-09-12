@@ -21,6 +21,7 @@ const sequencer = @import("gsp_sequencer.zig");
 const teardown = @import("gsp_teardown.zig");
 const runtime = @import("gsp_runtime.zig");
 const preboot = @import("gsp_preboot.zig");
+const irq = @import("gsp_irq.zig");
 
 pub const Phase = enum { detached, frts, prepare, load, start, notifications, ready, recovering, failed };
 pub const Progress = enum { progress, idle, stopped };
@@ -51,6 +52,10 @@ pub const Device = struct {
     handoff: ?events.Handoff = null,
     recovery: teardown.Recovery = .{},
     running: runtime.Owner = .{},
+    interrupts: irq.Owner = .{},
+    irq_wake: ?irq.Wake = null,
+    recovery_deadline: u64 = 0,
+    recovery_started: bool = false,
     tx: [transport.message.max_bytes]u8 = undefined,
     rx: [transport.message.max_bytes]u8 = undefined,
 
@@ -156,6 +161,13 @@ pub const Device = struct {
     }
     fn advance(self: *Device) !bool {
         if (self.phase == .recovering) {
+            if (!self.recovery_started) {
+                if (try self.now() >= self.recovery_deadline) return error.IrqRetirement;
+                if (!self.interrupts.close()) return true;
+                try self.recovery.open(&self.port, self.reader.?, self.recovery_deadline);
+                self.recovery_started = true;
+                return true;
+            }
             if (try self.recovery.step()) {
                 self.phase = .failed;
                 self.ctx.?.logWarn("NVIDIA gsp-start: teardown=complete memory=retained display=held poweroff-required=yes");
@@ -163,7 +175,21 @@ pub const Device = struct {
             return true;
         }
         try self.checkLive(false);
-        if (self.phase == .ready) return try self.running.step() == .progress;
+        if (self.phase == .ready) {
+            if (self.interrupts.failed()) return error.Interrupt;
+            if (self.running.post.snapshot()) |inventory| {
+                if (self.interrupts.self_address == 0) {
+                    if (try self.now() >= self.deadline) return error.Deadline;
+                    if (!self.inLockdown() and self.running.sequence.self_address == 0) {
+                        try self.interrupts.open(&self.ctx.?, &self.display.?.registers, &self.display.?.snapshot.?,
+                            self.display.?.chip.?, inventory, self.irq_wake orelse return error.IrqWake, self.port.boot0);
+                        self.ctx.?.logInfo("NVIDIA gsp-irq: configured=yes source=GSP wake=semaphore worker=serialized native-output=unavailable");
+                        return true;
+                    }
+                }
+            }
+            return try self.running.step() == .progress;
+        }
         if (try self.now() >= self.deadline) return error.Deadline;
         switch (self.phase) {
             .frts, .load => if (try self.port.stepFirmware()) |result| {
@@ -227,17 +253,28 @@ pub const Device = struct {
     fn fail(self: *Device, err: anyerror) void {
         if (self.failure == null) { self.failure = err; self.failed_phase = self.phase; }
         self.logFailure(if (self.phase == .ready) "runtime" else "startup", err);
+        if (self.interrupts.self_address != 0) {
+            var bytes: [220]u8 = undefined;
+            const endpoint = &self.interrupts;
+            const line = std.fmt.bufPrintZ(&bytes, "NVIDIA gsp-irq: failed irq={d} status={d} fault={d} raw={x} mask={x} received={d} messages={d}",
+                .{ endpoint.irq, endpoint.last_status, @atomicLoad(u32, &endpoint.fault, .acquire),
+                    @atomicLoad(u32, &endpoint.last_raw, .acquire), @atomicLoad(u32, &endpoint.last_mask, .acquire),
+                    @atomicLoad(u64, &endpoint.interrupts, .acquire), @atomicLoad(u64, &endpoint.messages, .acquire) }) catch null;
+            if (line) |text| self.ctx.?.logError(text);
+        }
         if (!self.port.effects_possible or !self.memory.?.retained) { self.phase = .failed; return; }
         self.phase = .recovering;
         const current = self.now() catch |failure| { self.recovery_failure = failure; self.phase = .failed; return; };
         const limit = std.math.add(u64, current, 10 * std.time.ns_per_s) catch { self.phase = .failed; return; };
-        self.recovery.open(&self.port, self.reader.?, limit) catch |failure| {
-            self.recovery_failure = failure;
-            self.phase = .failed;
-            self.logFailure("teardown-admission", failure);
-        };
+        self.recovery_deadline = limit;
+        // The next short worker slice retires IRQ delivery first. No reset
+        // races a live callback; failure retains the entire GPU dependency graph.
     }
-    pub fn stop(self: *Device) void { self.stopped = true; }
+    pub fn stop(self: *Device) bool {
+        if (!self.interrupts.close()) return false;
+        self.stopped = true;
+        return true;
+    }
     pub fn closeBeforeSubmission(self: *Device) bool {
         if (self.self_address == 0) return true;
         if (self.self_address != @intFromPtr(self) or self.port.effects_possible or
@@ -371,7 +408,8 @@ pub const Device = struct {
     fn admitRecovery(raw: *anyopaque, port: *const native.Port) !void {
         const self = from(raw);
         if (port != &self.port or self.phase != .recovering or self.failure == null or self.reader.?.busy or
-            self.reader.?.enabled or self.display.?.firmware_owner != self.self_address) return error.State;
+            self.reader.?.enabled or self.display.?.firmware_owner != self.self_address or
+            (self.interrupts.self_address != 0 and !self.interrupts.closed)) return error.State;
         try self.checkLive(true);
     }
     fn recoveryAccess(raw: *anyopaque, kind: native.Access, address: u32) !void {

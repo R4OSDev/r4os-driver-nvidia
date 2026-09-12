@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.56; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.57; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -11,6 +11,37 @@ Starting with R4OS 0.79.9, `IMAGE_SCOPE=slim` includes the current module in
 Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
+
+GSP interrupt endpoint (NVIDIA 0.1.57, 2026-09-12):
+
+After RM discovery, the actual driver installs the returned GSP stall vector
+using the existing MSI/IRQ interfaces. A valid shared INTx route is the fallback
+when MSI is unavailable. The endpoint borrows the complete existing BAR0 map;
+only the GSP vector and its VFN subtree are enabled. Immutable MMIO metadata
+and an atomic admission gate keep the short IRQ handler independent of task
+locks, queue/DMA operations, allocation and logging.
+
+The handler acknowledges VFN/Falcon status and wakes the existing pacing task
+through a semaphore with one coalesced permit. That task still submits exactly
+one bounded, serialized Work slice at a time. Finite timeout polling remains
+for startup, deadlines and logs. Unknown causes preserve raw diagnostics and
+stop rearming. Reset waits for handler retirement, IRQ removal and owned MSI
+disable; ambiguous routing or failed retirement retains the entire GPU graph.
+
+All 51 existing host tests pass after correcting the complete-run model's BAR
+size; the initial and diagnostic failures are retained in the evidence. The
+real registered handler is exercised over RAM, including receipt/worker
+separation, MSI/INTx and failure/close paths. Twelve original register checks,
+module build and exact legal staging pass. No new test group, guest or hardware
+run. Physical IRQ delivery and the semaphore wake path on OssiPC remain open.
+
+Kernel 152 / DriverApi 35 are unchanged. OssiPC was last verified with
+Kernel150/NVIDIA50 passive. Sixteen complete upstream files, thirteen source
+notices and the unchanged kernel/SDK dependencies are archived under
+ExFiles/Reference/GFX/Nvidia/0.79.10/gsp-irq-20260912. Firmware health, host RM
+objects, full GPU/UEFI restore and native video/audio remain necessary work.
+
+The entries below describe preceding checkpoints.
 
 Internal RM discovery (NVIDIA 0.1.56, 2026-09-12):
 
@@ -35,8 +66,6 @@ run. Kernel 152 and the last physical Kernel150/NVIDIA50 state are unchanged.
 Twenty-eight complete pinned references, full licenses and publication evidence
 are in ExFiles/Reference/GFX/Nvidia/0.79.10/gsp-postinit-20260912. IRQ service,
 firmware health, host RM objects, complete restore and native output remain open.
-
-The entries below describe preceding checkpoints.
 
 Post-init static configuration (NVIDIA 0.1.55, 2026-09-12):
 
