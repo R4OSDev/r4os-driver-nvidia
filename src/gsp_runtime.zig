@@ -44,6 +44,10 @@ const display = @import("gsp_display_rpc.zig");
 const subscriptions = @import("gsp_event_objects.zig");
 const outputs = @import("gsp_outputs.zig");
 const inventory = @import("gsp_memory_inventory.zig");
+pub const buffer_mapping = @import("gsp_buffer_mapping.zig");
+pub const BufferHandle = struct { epoch: u64, serial: u64, slot: u16 };
+pub const BufferStatus = struct { state: buffer_mapping.State, info: ?buffer_mapping.Info, rejected: ?u32, host_rejected: ?buffer_mapping.Error };
+const BufferSlot = struct { owner: ?*buffer_mapping.Owner = null, allocation: r4os.abi.DriverHeapAllocation = .{}, serial: u64 = 0 };
 pub const Progress = enum { idle, progress };
 pub const Snapshot = struct {
     polls: u64 = 0,
@@ -91,6 +95,11 @@ pub const Owner = struct {
     output_refresh: bool = false,
     output_generation: u64 = 0,
     output_next_ns: u64 = 0,
+    buffers: [256]BufferSlot = @splat(.{}),
+    buffer_active: ?u16 = null,
+    buffer_serial: u64 = 0,
+    graph_closing: bool = false,
+    close_deadline: u64 = 0,
     words: [logs.output_bytes]u8 = undefined,
 
     pub fn open(self: *Owner, ctx: *const r4os.r4dev.DriverContext, device: *native.Port,
@@ -168,6 +177,7 @@ pub const Owner = struct {
         }
     }
     pub fn activeChannel(self: *Owner) ?*exchange.Exchange {
+        if (self.buffer_active) |index| if (self.buffers[index].owner) |owner| return &owner.exchange;
         if (self.outputs.channel()) |channel| return &channel.exchange;
         if (self.graph) |*graph| if (graph.channel()) |channel| return channel;
         return if (self.channel) |*channel| channel else null;
@@ -208,6 +218,92 @@ pub const Owner = struct {
             owner.backing.epoch != self.epoch or !std.meta.eql(owner.binding.space, space.*)) return null;
         return owner.info();
     }
+    /// Called by the serialized native engine worker after queue.take. The
+    /// common queue authenticates the full job/driver generation and supplies
+    /// the reference; diagnostic buffer IDs are never imported here.
+    pub fn mapQueuedBuffer(self: *Owner, fence: *const r4os.abi.GfxFence, which: u32, deadline: u64) !BufferHandle {
+        _ = try self.now();
+        if (self.graph_closing or self.buffer_active != null or self.sequence.self_address != 0 or self.outputs.active()) return error.Busy;
+        const space = (self.nativeAddressSpace() orelse return error.State).*;
+        if (self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
+        try self.channel.?.guard(deadline);
+        const serial = try std.math.add(u64, self.buffer_serial, 1);
+        const index: u16 = blk: {
+            for (&self.buffers, 0..) |*slot, i| if (slot.allocation.handle == 0) break :blk @intCast(i);
+            return error.Exhausted;
+        };
+        const heap = self.ctx.?.heap() orelse return error.Api;
+        const memory = self.ctx.?.memory() orelse return error.Api;
+        const queue = self.ctx.?.graphicsQueue() orelse return error.Api;
+        const slot = &self.buffers[index];
+        const result = heap.allocate(@sizeOf(buffer_mapping.Owner), @alignOf(buffer_mapping.Owner), &slot.allocation);
+        const allocation = slot.allocation;
+        if (result != r4os.abi.driver_heap_ok and allocation.handle == 0) return error.Memory;
+        if (allocation.version != 1 or allocation.size < @sizeOf(r4os.abi.DriverHeapAllocation) or allocation.handle == 0 or
+            allocation.cpu_address == 0 or allocation.cpu_address % @alignOf(buffer_mapping.Owner) != 0 or allocation.reserved != 0 or
+            allocation.byte_length < @sizeOf(buffer_mapping.Owner) or allocation.alignment < @alignOf(buffer_mapping.Owner) or
+            allocation.cpu_address > std.math.maxInt(u64) - allocation.byte_length) {
+            self.stop(error.Descriptor);
+            return error.Descriptor;
+        }
+        errdefer {
+            if (heap.release(allocation.handle) == r4os.abi.driver_heap_ok) slot.* = .{} else self.stop(error.Retained);
+        }
+        if (result != r4os.abi.driver_heap_ok) return error.Memory;
+        var source: r4os.abi.GfxBufferReference = .{};
+        if (queue.retainResource(fence, which, &source) != r4os.abi.gfx_buffer_result_ok) return error.Resource;
+        errdefer if (memory.bufferRelease(&source.reference) != r4os.abi.gfx_buffer_result_ok) self.stop(error.Retained);
+        var token = try self.channel.?.handoff(deadline);
+        const value = buffer_mapping.Owner.init(&token, &self.ctx.?, self.adapter_id, space, self.graph.?.reservation, source, deadline) catch |err| {
+            self.channel = exchange.Exchange.init(&token, deadline) catch |restore| {
+                self.stop(restore);
+                return restore;
+            };
+            return err;
+        };
+        const owner: *buffer_mapping.Owner = @ptrFromInt(allocation.cpu_address);
+        owner.* = value;
+        slot.owner = owner;
+        slot.serial = serial;
+        self.buffer_serial = serial;
+        self.buffer_active = index;
+        return .{ .epoch = self.epoch, .serial = serial, .slot = index };
+    }
+    fn findBuffer(self: *Owner, handle: BufferHandle) !*buffer_mapping.Owner {
+        _ = try self.now();
+        if (handle.epoch != self.epoch or handle.slot >= self.buffers.len or handle.serial == 0 or
+            self.buffers[handle.slot].serial != handle.serial) return error.Stale;
+        return self.buffers[handle.slot].owner orelse return error.Stale;
+    }
+    pub fn bufferStatus(self: *Owner, handle: BufferHandle) !BufferStatus {
+        const owner = try self.findBuffer(handle);
+        return .{ .state = owner.state, .info = owner.info(), .rejected = owner.rejected, .host_rejected = owner.host_rejected };
+    }
+    pub fn retireBuffer(self: *Owner, handle: BufferHandle, deadline: u64, quiesced: bool) !void {
+        const owner = try self.findBuffer(handle);
+        if (!quiesced or self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or
+            self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
+        if (owner.state != .handed_off) return error.State;
+        var token = try self.channel.?.handoff(deadline);
+        owner.beginDestroy(&token, deadline, quiesced) catch |err| {
+            self.channel = exchange.Exchange.init(&token, deadline) catch |restore| {
+                self.stop(restore);
+                return restore;
+            };
+            return err;
+        };
+        self.buffer_active = handle.slot;
+    }
+    /// Requires all engine users independently quiesced. Each child mapping
+    /// is drained before graph.beginDestroy may send any parent/event free.
+    pub fn beginDestroyGraph(self: *Owner, deadline: u64, quiesced: bool) !void {
+        _ = try self.now();
+        if (!quiesced or self.graph_closing or self.buffer_active != null or self.outputs.active() or
+            self.sequence.self_address != 0 or self.nativeObject() == null or self.channel.?.phase != .idle) return error.Busy;
+        try self.channel.?.guard(deadline);
+        self.graph_closing = true;
+        self.close_deadline = deadline;
+    }
     pub fn takeDisplayChanges(self: *Owner) !subscriptions.Changes {
         const current = try self.now();
         if (self.nativeObject() == null) return error.State;
@@ -225,6 +321,37 @@ pub const Owner = struct {
                 self.snapshot.events +|= 1;
                 self.snapshot.last_event_ns = current;
             }
+            return .progress;
+        }
+        if (self.buffer_active) |index| {
+            const slot = &self.buffers[index];
+            const owner = slot.owner orelse return error.State;
+            if (owner.state == .ready or owner.state == .closed) {
+                var token = try owner.handoff(owner.deadline);
+                self.channel = try exchange.Exchange.init(&token, owner.deadline);
+                if (owner.state == .finished) {
+                    const heap = self.ctx.?.heap() orelse return error.Api;
+                    if (heap.release(slot.allocation.handle) != r4os.abi.driver_heap_ok) return error.Retained;
+                    slot.* = .{};
+                }
+                self.buffer_active = null;
+                return .progress;
+            }
+            if (try owner.poll()) |dispatch| {
+                try self.notification(&owner.exchange, dispatch, current);
+                return .progress;
+            }
+            return if (owner.exchange.phase == .waiting) .idle else .progress;
+        }
+        if (self.graph_closing and self.graph.?.state == .loaned) {
+            try channel.guard(self.close_deadline);
+            for (&self.buffers, 0..) |*slot, index| if (slot.owner != null) {
+                try self.retireBuffer(.{ .epoch = self.epoch, .serial = slot.serial, .slot = @intCast(index) }, self.close_deadline, true);
+                return .progress;
+            };
+            var token = try channel.handoff(self.close_deadline);
+            try self.graph.?.reclaim(&token, self.close_deadline);
+            try self.graph.?.beginDestroy(self.close_deadline);
             return .progress;
         }
         if (self.outputs.active()) {
@@ -334,7 +461,7 @@ pub const Owner = struct {
                 .closed => {
                     var token = try graph.finish(graph.deadline);
                     self.channel = try exchange.Exchange.init(&token, graph.deadline);
-                    return error.RmRejected; // Object frees do not stop GPU DMA.
+                    return if (self.graph_closing) error.RmClosed else error.RmRejected; // Object frees do not stop GPU DMA.
                 },
                 .base_creating, .i2c_creating, .vaspace_creating, .control_creating, .events_creating, .events_destroying, .control_destroying, .vaspace_destroying, .i2c_destroying, .base_destroying => {
                     if (try graph.poll()) |dispatch| {

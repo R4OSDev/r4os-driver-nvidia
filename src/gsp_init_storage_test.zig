@@ -1522,6 +1522,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         control_allocation, control_cache, control_alias, control_sync, control_register_reject, control_virtual_reject, control_map_reject,
         control_short, control_bounds, control_map_address, control_ack, control_timeout, control_unmap, control_free, control_dma_unmap, control_release, control_gpu_acquire, control_gpu_release,
         memory_caps_reject, memory_caps_none, memory_caps_rpc, memory_caps_short, memory_caps_wrong, memory_caps_ack, memory_caps_timeout,
+        mapping_success, mapping_reject, mapping_offset, mapping_ack, mapping_timeout, mapping_release, mapping_segment, mapping_gpu,
         outputs_empty, outputs_all, outputs_rejected, outputs_partial, outputs_missing, outputs_incomplete, outputs_bad_edid,
         outputs_edid_rejected, outputs_ddc, outputs_ddc_bus_changed, outputs_aux, outputs_wiring, outputs_virtual, outputs_changed, outputs_final_changed, outputs_final_rejected, outputs_hpd, outputs_sequence, outputs_ack, outputs_timeout, catalog_rejected,
         runtime_healthy, runtime_lockdown, runtime_unknown, runtime_unowned, runtime_sequence_timeout,
@@ -1671,6 +1672,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
             if (target.phase == .ready) try checkDevicePostInit(target, words, held.plan.?.frts.offset, case);
             if (target.phase == .ready) try checkDeviceIrq(target, words, held.plan.?.frts.offset, case);
             if (target.phase == .ready and !target.stopped) try checkDeviceRm(target, words, held.plan.?.frts.offset, case);
+            if (target.phase == .ready and std.mem.startsWith(u8, @tagName(case), "mapping_")) try checkDeviceMappings(target, table, @tagName(case));
             if (target.phase == .ready and !target.stopped) try checkDeviceOutputs(target, words, held.plan.?.frts.offset, case);
             if (exercise_runtime) try checkDeviceRuntime(target, words, held.plan.?.frts.offset, case);
         } else {
@@ -2564,6 +2566,167 @@ fn outputEdidFull(bytes: *[4096]u8) void {
     bytes[127] -%= 30;
     for (2..32) |index| { bytes[index * 128] = 0x99; bytes[index * 128 + 127] = 0 -% @as(u8, 0x99); }
 }
+fn checkDeviceMappings(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, scenario: []const u8) !void {
+    const model = @import("gsp_buffer_test_model.zig").Model;
+    const runtime = @import("gsp_runtime.zig");
+    const ex = @import("gsp_exchange.zig");
+    const running = &target.running;
+    const session = &target.session.?;
+    const deadline = clock + 5 * std.time.ns_per_s;
+    const command = init.queues_offset + init.command_offset;
+    const status = init.queues_offset + init.status_offset;
+    const transmitted = try t.allocator.alloc(u8, 65536);
+    defer t.allocator.free(transmitted);
+    model.install(table, scenario);
+    defer model.dispose(table);
+    var handles: [2]runtime.BufferHandle = undefined;
+    var interleaved = false;
+    var registers: usize = 0;
+    var maps_done: usize = 0;
+    var unmaps: usize = 0;
+    var freeing = false;
+    var count: usize = 0;
+    errdefer |err| std.debug.print("native BO {s}: {s} phase={s} failure={?} active={?} registers={d} maps={d} unmaps={d} refs={any}\n",
+        .{scenario, @errorName(err), @tagName(target.phase), target.failure, running.buffer_active, registers, maps_done, unmaps, model.refs});
+    while (count < 2 and target.phase == .ready) : (count += 1) {
+        handles[count] = try running.mapQueuedBuffer(&model.fence, @intCast(count), deadline);
+        try t.expectError(error.Busy, running.mapQueuedBuffer(&model.fence, 0, deadline));
+        var steps: usize = 0;
+        while (target.phase == .ready and running.buffer_active != null and steps < 700) : (steps += 1) {
+            const segment_count = model.segments;
+            _ = target.step();
+            try t.expect(model.segments - segment_count <= 64);
+            if (target.phase != .ready or running.buffer_active == null) break;
+            const owner = running.buffers[running.buffer_active.?].owner.?;
+            const channel = &owner.exchange;
+            if (channel.phase != .waiting) continue;
+            try t.expect(running.nativeAddressSpace() == null and running.nativeControlBuffer() == null and owner.info() == null);
+            const operation = owner.operation.?;
+            const element_count: usize = (channel.request.len + 80 + 4095) / 4096;
+            const first = (session.tx_write + 63 - @as(u32, @intCast(element_count))) % 63;
+            for (0..element_count) |element| {
+                const cursor = (first + element) % 63;
+                @memcpy(transmitted[element * 4096 ..][0..4096], backing.?[command + 4096 + cursor * 4096 ..][0..4096]);
+            }
+            const request = try transport.message.decode(session.profile, transmitted[0 .. element_count * 4096], session.tx_sequence - 1);
+            try t.expectEqualSlices(u8, channel.request, request.payload);
+            const phase = channel.phase;
+            channel.phase = .prepared;
+            try target.port.owner.?.admit_command.?(target.port.owner.?.context, &target.port, deadline);
+            var moved = owner.*;
+            try t.expect(!moved.matches(channel, deadline));
+            try t.expectError(error.Stale, moved.poll());
+            const original_request = channel.request;
+            channel.request = request.payload;
+            try t.expectError(error.Binding, target.port.owner.?.admit_command.?(target.port.owner.?.context, &target.port, deadline));
+            channel.request = original_request;
+            channel.phase = phase;
+            std.mem.writeInt(u32, backing.?[status + 64 ..][0..4], session.tx_write, .little);
+            var response: [160]u8 = @splat(0);
+            const payload = request.payload;
+            const response_bytes: usize = if (operation == .register) 0 else payload.len;
+            if (response_bytes != 0) @memcpy(response[0..response_bytes], payload);
+            const part_offset = @as(u64, owner.operation_part) * @import("gsp_buffer_wire.zig").max_registration_pages * 4096;
+            if (operation == .register) {
+                registers += 1;
+                try t.expect(payload.len == 56 + std.mem.readInt(u32, payload[40..44], .little) * 8);
+                for (0..(payload.len - 56) / 8) |page| try t.expect(std.mem.readInt(u64, payload[56 + page * 8 ..][0..8], .little) == model.page(count, part_offset + page * 4096) >> 12);
+            } else if (operation == .allocate) {
+                try t.expect(std.mem.readInt(u64, payload[96..104], .little) == model.rounded[count]);
+                std.mem.writeInt(u64, response[112..120], model.address(count), .little);
+                std.mem.writeInt(u64, response[120..128], model.rounded[count] - 1, .little);
+            } else if (operation == .map) {
+                try t.expect(std.mem.readInt(u64, payload[40..48], .little) == part_offset);
+                std.mem.writeInt(u64, response[40..48], model.address(count) + part_offset + @as(u64, if (model.is("mapping_offset")) 4096 else 0), .little);
+                maps_done += 1;
+                if (model.is("mapping_reject") and owner.operation_part == 1) std.mem.writeInt(u32, response[48..52], 0x57, .little);
+                if (!interleaved) {
+                    const held_deadline = channel.deadline;
+                    var print: [9]u8 = @splat(0); print[4] = 1; print[8] = 'B';
+                    try nativeEvent(session, 0x100c, &print);
+                    _ = target.step();
+                    try t.expect(channel.phase == .waiting and channel.deadline == held_deadline and owner.operation.? == operation and owner.info() == null);
+                    interleaved = true;
+                }
+            } else if (operation == .unmap) {
+                try t.expect(std.mem.readInt(u64, payload[24..32], .little) == model.address(count) + part_offset);
+                unmaps += 1;
+            }
+            if (operation == .map and model.is("mapping_timeout")) clock = deadline else {
+                try nativeReply(session, request.rpc.function, 0, response[0..response_bytes]);
+                if (operation == .map and model.is("mapping_ack")) range_failure_call = range_calls + 4;
+            }
+            _ = target.step(); range_failure_call = 0;
+        }
+        try t.expect(steps < 700);
+        if (target.phase != .ready) break;
+        const result = try running.bufferStatus(handles[count]);
+        try t.expect(result.state == .handed_off);
+        if (result.info) |info| {
+            try t.expect(info.address == model.address(count) and info.logical_bytes == model.rounded[count] - 5 and info.mapped_bytes == model.rounded[count]);
+            try t.expect(info.parts == @as(u16, if (count == 0) 3 else 1));
+            try t.expect(model.refs[count] and model.dma[count].lease.id != 0 and model.gpu[count].lease.id != 0);
+            try t.expectError(error.Busy, running.retireBuffer(handles[count], deadline, false));
+            // The parent guard must reject before transmitting even its first
+            // event free. Restore the exact loan and keep both children live.
+            var token = try running.channel.?.handoff(deadline);
+            try running.graph.?.reclaim(&token, deadline);
+            const sent = session.tx_sequence;
+            try t.expectError(error.Retained, running.graph.?.beginDestroy(deadline));
+            try t.expect(session.tx_sequence == sent);
+            var loan = try running.graph.?.loan(deadline);
+            running.channel = try ex.Exchange.init(&loan.runtime, deadline);
+        } else {
+            try t.expect(model.is("mapping_reject") or model.is("mapping_segment") or model.is("mapping_gpu"));
+            try t.expect(!model.refs[count] and model.releases == 1 and (result.rejected != null or result.host_rejected != null));
+            break;
+        }
+        if (model.is("mapping_release")) break;
+    }
+    if (target.phase == .ready) {
+        try t.expectError(error.Busy, running.beginDestroyGraph(deadline, false));
+        try running.beginDestroyGraph(deadline, true);
+        var steps: usize = 0;
+        while (target.phase == .ready and steps < 120) : (steps += 1) {
+            _ = target.step();
+            if (target.phase != .ready) break;
+            const channel = running.activeChannel().?;
+            if (channel.phase != .waiting) continue;
+            var response: [160]u8 = @splat(0);
+            @memcpy(response[0..channel.request.len], channel.request);
+            if (running.buffer_active) |index| {
+                const owner = running.buffers[index].owner.?;
+                try t.expect(!freeing);
+                if (owner.operation.? == .unmap) {
+                    const offset = @as(u64, owner.operation_part) * @import("gsp_buffer_wire.zig").max_registration_pages * 4096;
+                    const selected: usize = if (owner.logical_bytes > 4096) 0 else 1;
+                    try t.expect(std.mem.readInt(u64, response[24..32], .little) == model.address(selected) + offset);
+                    unmaps += 1;
+                }
+            } else {
+                freeing = true;
+                try t.expect(!model.refs[0] and !model.refs[1] and running.buffer_active == null);
+                try t.expectError(error.Stale, running.bufferStatus(handles[0]));
+            }
+            std.mem.writeInt(u32, backing.?[status + 64 ..][0..4], session.tx_write, .little);
+            try nativeReply(session, channel.function, 0, response[0..channel.request.len]);
+            _ = target.step();
+        }
+        try t.expect(steps < 120);
+        if (!model.is("mapping_release")) {
+            try t.expect(freeing and running.graph.?.state == .finished and !ControlModel.active);
+            try t.expectError(error.Stale, session.rm_names.validate(running.graph.?.reservation));
+            if (model.is("mapping_success")) try t.expect(registers == 4 and maps_done == 4 and unmaps == 4 and model.releases == 2 and model.segments == 20481);
+        }
+    }
+    try t.expect(target.phase == .recovering and running.failure != null and running.nativeObject() == null);
+    if (model.is("mapping_offset") or model.is("mapping_ack") or model.is("mapping_timeout") or model.is("mapping_release")) {
+        try t.expect(model.refs[0] and model.dma[0].lease.id != 0 and model.releases == 0);
+        try t.expectError(error.Retained, session.rm_names.retire(running.graph.?.reservation));
+        if (!model.is("mapping_release")) try t.expect(!freeing and unmaps == 0);
+    }
+}
+
 fn checkDeviceOutputs(target: *@import("gsp_device.zig").Device, words: []u32, frts: u64, scenario: anytype) !void {
     const rpc = @import("gsp_display_rpc.zig");
     const ddc_case = scenario == .outputs_ddc or scenario == .outputs_ddc_bus_changed;

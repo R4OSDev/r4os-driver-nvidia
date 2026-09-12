@@ -192,6 +192,11 @@ pub const bytes: usize = 3 * 4096;
 pub const pages: usize = bytes / 4096;
 pub const register_bytes = 56 + pages * 8;
 pub const max_request_bytes: usize = 160;
+pub const max_registration_pages = (exchange.message.max_payload_bytes - 56) / 8;
+// Each memory-list object covers one bounded part of the shared virtual
+// allocation. RM receives a relative virtual offset, then returns an absolute
+// GPU VA. A large BO consumes more objects, never a copied staging buffer.
+pub const Part = struct { total_bytes: u64 = bytes, offset: u64 = 0, byte_length: u64 = bytes };
 pub const Operation = enum { register, allocate, map, unmap, free_virtual, free_memory };
 pub const Binding = struct { space: space.Info, memory: u32, virtual: u32 };
 pub const Encoded = struct { function: u32, bytes: []const u8 };
@@ -214,13 +219,20 @@ fn long(in: []const u8, at: usize) u64 {
     return std.mem.readInt(u64, in[at..][0..8], .little);
 }
 pub fn validate(binding: Binding) Error!void {
+    return validatePart(binding, .{});
+}
+pub fn validatePart(binding: Binding, part: Part) Error!void {
     const info = binding.space;
     if (info.epoch == 0 or info.client == 0 or info.device == 0 or info.handle == 0 or
         binding.memory == 0 or binding.virtual == 0 or binding.memory == binding.virtual) return error.Handle;
     for ([_]u32{ info.client, info.device, info.handle }) |name|
         if (binding.memory == name or binding.virtual == name) return error.Handle;
-    if (info.base == 0 or (info.base | info.bytes) & 4095 != 0 or info.bytes < bytes or
+    if (info.base == 0 or (info.base | info.bytes) & 4095 != 0 or info.bytes < 4096 or
         info.base >= @as(u64, 1) << 49 or info.bytes > (@as(u64, 1) << 49) - info.base) return error.Bounds;
+    if (part.total_bytes == 0 or part.byte_length == 0 or
+        (part.total_bytes | part.offset | part.byte_length) & 4095 != 0 or
+        part.total_bytes > info.bytes or part.byte_length > part.total_bytes or
+        part.offset > part.total_bytes - part.byte_length or part.byte_length / 4096 > max_registration_pages) return error.Bounds;
 }
 pub fn function(operation: Operation) u32 {
     return switch (operation) {
@@ -232,8 +244,11 @@ pub fn function(operation: Operation) u32 {
     };
 }
 pub fn length(operation: Operation) usize {
+    return partLength(operation, .{});
+}
+pub fn partLength(operation: Operation, part: Part) usize {
     return switch (operation) {
-        .register => register_bytes,
+        .register => 56 + @as(usize, @intCast(part.byte_length / 4096)) * 8,
         .allocate => 160,
         .map => 56,
         .unmap => 40,
@@ -241,16 +256,26 @@ pub fn length(operation: Operation) usize {
     };
 }
 pub fn encode(binding: Binding, operation: Operation, page_addresses: *const [pages]u64, address: u64, out: []u8) Error!Encoded {
-    try validate(binding);
-    const size = length(operation);
+    // Preserve the private-control contract's explicit distinct-page check.
+    // General lists come from the common BO owner and may legitimately alias
+    // other objects; the codec does not invent new allocation ownership.
+    if (operation == .register) for (page_addresses, 0..) |page, i| {
+        for (page_addresses[0..i]) |prior| if (prior == page) return error.Bounds;
+    };
+    return encodePart(binding, .{}, operation, page_addresses, address, out);
+}
+pub fn encodePart(binding: Binding, part: Part, operation: Operation, page_addresses: []const u64, address: u64, out: []u8) Error!Encoded {
+    try validatePart(binding, part);
+    const size = partLength(operation, part);
     if (out.len < size) return error.Bounds;
+    const page_count: u32 = @intCast(part.byte_length / 4096);
     if (operation == .register) {
-        for (page_addresses, 0..) |page, i| {
+        if (page_addresses.len != page_count) return error.Bounds;
+        for (page_addresses) |page| {
             if (page == 0 or page & 4095 != 0 or page >= @as(u64, 1) << 47) return error.Bounds;
-            for (page_addresses[0..i]) |prior| if (prior == page) return error.Bounds;
         }
     }
-    if (operation == .unmap) try addressValid(binding, address);
+    if (operation == .map or operation == .unmap) try addressValidPart(binding, part, address);
     const dst = out[0..size];
     @memset(dst, 0);
     put(dst, 0, binding.space.client);
@@ -260,9 +285,9 @@ pub fn encode(binding: Binding, operation: Operation, page_addresses: *const [pa
             put(dst, 8, binding.memory);
             put(dst, 12, 0x81);
             put(dst, 16, registration_flags);
-            wide(dst, 32, bytes);
-            put(dst, 40, pages);
-            put(dst, 48, pages << 16); // idr=0, reserved=0, 16-bit count.
+            wide(dst, 32, part.byte_length);
+            put(dst, 40, page_count);
+            put(dst, 48, page_count << 16); // idr=0, reserved=0, 16-bit count.
             for (page_addresses, 0..) |page, i| wide(dst, 56 + 8 * i, page >> 12);
         },
         .allocate => {
@@ -275,7 +300,7 @@ pub fn encode(binding: Binding, operation: Operation, page_addresses: *const [pa
             put(p, 8, allocation_flags);
             put(p, 24, attributes);
             put(p, 28, attributes2);
-            wide(p, 64, bytes);
+            wide(p, 64, part.total_bytes);
             wide(p, 72, 4096);
             put(p, 108, binding.space.handle);
         },
@@ -284,19 +309,29 @@ pub fn encode(binding: Binding, operation: Operation, page_addresses: *const [pa
             put(dst, 8, binding.virtual);
             put(dst, 12, binding.memory);
             if (operation == .map) {
-                wide(dst, 24, bytes);
+                wide(dst, 24, part.byte_length);
                 put(dst, 32, map_flags);
-            } else wide(dst, 24, address);
+                wide(dst, 40, part.offset); // NVOS46 non-CTXDMA relative offset.
+            } else wide(dst, 24, address + part.offset);
         },
         .free_virtual, .free_memory => put(dst, 8, if (operation == .free_virtual) binding.virtual else binding.memory),
     }
     return .{ .function = function(operation), .bytes = dst };
 }
 pub fn addressValid(binding: Binding, address: u64) Error!void {
+    return addressValidPart(binding, .{}, address);
+}
+pub fn addressValidPart(binding: Binding, part: Part, address: u64) Error!void {
+    try validatePart(binding, part);
     const s = binding.space;
-    if (address < s.base or address & 4095 != 0 or address - s.base > s.bytes - bytes) return error.Bounds;
+    if (address < s.base or address & 4095 != 0 or address - s.base > s.bytes - part.total_bytes) return error.Bounds;
 }
 pub fn decode(binding: Binding, operation: Operation, request: []const u8, record: exchange.message.Record, address: u64) Error!Reply {
+    return decodePart(binding, .{}, operation, request, record, address);
+}
+pub fn decodePart(binding: Binding, part: Part, operation: Operation, request: []const u8, record: exchange.message.Record, address: u64) Error!Reply {
+    try validatePart(binding, part);
+    if (request.len != partLength(operation, part)) return error.Payload;
     if (record.rpc.function != function(operation) or record.rpc.cpu_rm_gfid != 0) return error.Unexpected;
     if (record.rpc.result == exchange.message.pending) return error.Payload;
     // Registration has no secondary status or output. The pinned RPC caller
@@ -334,9 +369,9 @@ pub fn decode(binding: Binding, operation: Operation, request: []const u8, recor
             if (i >= 80 and i < 96) continue; // Returned VA and byte limit.
             if (value != request[32 + i]) return error.Payload;
         }
-        if (long(p, 88) != bytes - 1) return error.Bounds;
+        if (long(p, 88) != part.total_bytes - 1) return error.Bounds;
         const returned = long(p, 80);
-        try addressValid(binding, returned);
+        try addressValidPart(binding, part, returned);
         return .{ .ok = returned };
     }
     for (data, 0..) |value, i| {
@@ -344,6 +379,9 @@ pub fn decode(binding: Binding, operation: Operation, request: []const u8, recor
         if (operation == .map and i >= 40 and i < 48) continue;
         if (value != request[i]) return error.Payload;
     }
-    if (operation == .map and long(data, 40) != address) return error.Bounds;
+    if (operation == .map) {
+        try addressValidPart(binding, part, address);
+        if (long(data, 40) != address + part.offset) return error.Bounds;
+    }
     return .{ .ok = address };
 }

@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.69; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.70; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -11,6 +11,24 @@ Starting with R4OS 0.79.9, `IMAGE_SCOPE=slim` includes the current module in
 Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
+
+General queued-system-BO mappings (NVIDIA 0.1.70 / Kernel 0.1.156):
+The actual runtime maps queue-retained source/target references through
+its exact RM exchange and notifier. Large BOs use bounded 8175-page memory
+objects in one full virtual allocation; payload pages are never CPU-mapped
+or copied. Mapping offsets are relative, returned/unmap addresses absolute.
+Only allocated residency padding is allowed beyond the logical BO extent.
+Page-list work is sliced and its scratch is released after creation. Up to
+256 generation/serial-bound owners retain confirmed mappings independently.
+Engine quiescence precedes child unmap/free; parent teardown drains every
+child first and independently rejects a live child before transmitting free.
+Known rejection unwinds the confirmed prefix; uncertain effects retain it.
+All 51 existing groups, original-C pairs and builds pass. The existing SMP4
+queue case proves 4091 logical bytes versus 4096 residency bytes, including
+producer exit. Physical work remains in OssiGPU.txt. No native execution
+backend is registered: VRAM/instance allocation, channels, engine consumers
+and visibility patterns remain open. Evidence: GrafikSpeicher07911.json /
+native_buffer_checkpoint. The following checkpoints describe earlier stages.
 
 Memory capability query (NVIDIA 0.1.69, roadmap 0.79.11):
 The actual RM control-buffer owner queries FB_GET_CAPS_V2 before creating

@@ -1701,6 +1701,32 @@ fn checkRmGraph(model: *Model) !void {
         std.mem.writeInt(u64, response[72..80], std.math.maxInt(u64) - 4095, .little);
         try t.expectError(error.Bounds, vaspace.decodeInfo(&plan, &response));
     }
+    {
+        const wire = @import("gsp_buffer_wire.zig");
+        const golden = @embedFile("fixtures/buffer-part-570.144.bin");
+        const binding: wire.Binding = .{ .space = .{ .epoch = 7, .client = 0xc1d00000, .device = 0x10000000,
+            .handle = 0x10000006, .base = 0x200000, .bytes = 0x100000000, .big_page_bytes = 65536 }, .memory = 0x10000007, .virtual = 0x10000008 };
+        const part: wire.Part = .{ .total_bytes = 80 * 1024 * 1024, .offset = 8175 * 4096, .byte_length = 12288 };
+        const pages = [_]u64{0x100000000,0x300000000,0x100004000};
+        var request: [160]u8 = undefined;
+        var address: u64 = 0;
+        var offset: usize = 0;
+        for (std.enums.values(wire.Operation)) |operation| {
+            const encoded = try wire.encodePart(binding, part, operation, &pages, address, &request);
+            const size = wire.partLength(operation, part);
+            try t.expectEqualSlices(u8, golden[offset..][0..size], encoded.bytes);
+            const reply = try wire.decodePart(binding, part, operation, encoded.bytes,
+                .{ .shape = .{ .message_bytes = size + 80, .checksum_bytes = size + 80, .storage_bytes = 4096, .elements = 1 },
+                    .queue_sequence = 0, .rpc = .{ .function = encoded.function, .result = 0 }, .payload = golden[offset+size..][0..size] }, address);
+            try t.expect(reply == .ok);
+            if (operation == .allocate) address = reply.ok;
+            offset += size * 2;
+        }
+        try t.expect(offset == golden.len and address == 0x600000 and wire.max_registration_pages == 8175);
+        try t.expectError(error.Bounds, wire.validatePart(binding, .{ .total_bytes = 4096, .offset = 4096, .byte_length = 4096 }));
+        try t.expectError(error.Bounds, wire.validatePart(binding, .{ .total_bytes = 80 * 1024 * 1024, .byte_length = 8176 * 4096 }));
+        try t.expectError(error.Bounds, wire.encodePart(binding, part, .map, &.{}, 0, &request));
+    }
     // Bounded bookkeeping capacity is separate from consumed wire IDs.
     var ledger = try rm_names.Ledger.init(7);
     var leases: [rm_names.max_clients]rm_names.Lease = undefined;
@@ -1711,6 +1737,22 @@ fn checkRmGraph(model: *Model) !void {
         try t.expectError(error.Bounds, lease.object(5));
     }
     const next_client = ledger.next_client;
+    const child = try ledger.reserveChildren(leases[2], 4);
+    try t.expect(ledger.next_client == next_client and child.parent.client == leases[2].client);
+    try t.expectError(error.Retained, ledger.requireNoChildren(leases[2]));
+    try t.expectError(error.Retained, ledger.retire(leases[2]));
+    try t.expectError(error.Bounds, child.object(4));
+    var forged_child = child;
+    forged_child.object_count += 1;
+    try t.expectError(error.Stale, ledger.retireChildren(forged_child));
+    try ledger.retireChildren(child);
+    try ledger.requireNoChildren(leases[2]);
+    const child_next = try ledger.reserveChildren(leases[2], 2);
+    try t.expect(child_next.slot == child.slot and child_next.first_object > child.first_object);
+    try t.expectError(error.Stale, ledger.validateChildren(child));
+    try ledger.retainChildren(child_next);
+    try t.expectError(error.Retained, ledger.retireChildren(child_next));
+    try t.expectError(error.Retained, ledger.requireNoChildren(leases[2]));
     const next_object = ledger.next_object;
     try t.expectError(error.Exhausted, ledger.reserve(5));
     try t.expect(next_client == ledger.next_client and next_object == ledger.next_object);

@@ -115,11 +115,26 @@ pub const Lease = struct {
     }
 };
 const Entry = struct { lease: ?Lease = null, retained: bool = false };
+pub const max_child_ranges = 256;
+pub const Children = struct {
+    parent: Lease,
+    slot: u16,
+    first_object: u32,
+    object_count: u16,
+
+    pub fn object(self: Children, index: u16) Error!u32 {
+        if (index >= self.object_count or self.first_object < object_first or
+            self.first_object >= object_end or index >= object_end - self.first_object) return error.Bounds;
+        return self.first_object + index;
+    }
+};
+const ChildEntry = struct { lease: ?Children = null, retained: bool = false };
 pub const Ledger = struct {
     epoch: u64,
     next_client: u32 = 0,
     next_object: u32 = object_first,
     entries: [max_clients]Entry = @splat(.{}),
+    children: [max_child_ranges]ChildEntry = @splat(.{}),
 
     pub fn init(epoch: u64) error{Stale}!Ledger {
         if (epoch == 0) return error.Stale;
@@ -153,13 +168,54 @@ pub const Ledger = struct {
     /// Called only by an owner which has not submitted anything or has ACKed
     /// every RM child/root free. The counters are deliberately not rewound.
     pub fn retire(self: *Ledger, lease: Lease) Error!void {
-        const selected = try self.lookup(lease);
-        if (selected.retained) return error.Retained;
-        selected.* = .{};
+        try self.requireNoChildren(lease);
+        (try self.lookup(lease)).* = .{};
+    }
+    /// Required before transmitting parent destruction, not just retiring its
+    /// bookkeeping after RM has already recursively freed live children.
+    pub fn requireNoChildren(self: *Ledger, lease: Lease) Error!void {
+        try self.validate(lease);
+        for (&self.children) |child| if (child.lease) |held| {
+            if (std.meta.eql(held.parent, lease)) return error.Retained;
+        };
     }
     /// An uncertain graph stays in the ledger until the whole device run is
     /// discarded after independent quiescence. There is no unretain method.
     pub fn retain(self: *Ledger, lease: Lease) Error!void {
         (try self.lookup(lease)).retained = true;
+    }
+    /// Dynamic objects belong to the existing client. Its immutable parent
+    /// lease never changes size, and child retirement never recycles names.
+    pub fn reserveChildren(self: *Ledger, parent: Lease, count: u16) Error!Children {
+        try self.validate(parent);
+        if (count == 0) return error.Bounds;
+        if (self.next_object < object_first or self.next_object >= object_end or count > object_end - self.next_object) return error.Exhausted;
+        for (&self.children, 0..) |*entry, slot| {
+            if (entry.lease != null) continue;
+            const value: Children = .{ .parent = parent, .slot = @intCast(slot), .first_object = self.next_object, .object_count = count };
+            entry.* = .{ .lease = value };
+            self.next_object += count;
+            return value;
+        }
+        return error.Exhausted;
+    }
+    fn lookupChildren(self: *Ledger, lease: Children) Error!*ChildEntry {
+        _ = try self.lookup(lease.parent);
+        if (lease.slot >= self.children.len) return error.Stale;
+        const selected = &self.children[lease.slot];
+        if (!std.meta.eql(selected.lease orelse return error.Stale, lease)) return error.Stale;
+        return selected;
+    }
+    pub fn validateChildren(self: *Ledger, lease: Children) Error!void {
+        try self.validate(lease.parent);
+        if ((try self.lookupChildren(lease)).retained) return error.Retained;
+    }
+    pub fn retireChildren(self: *Ledger, lease: Children) Error!void {
+        try self.validateChildren(lease);
+        (try self.lookupChildren(lease)).* = .{};
+    }
+    pub fn retainChildren(self: *Ledger, lease: Children) Error!void {
+        (try self.lookupChildren(lease)).retained = true;
+        try self.retain(lease.parent);
     }
 };

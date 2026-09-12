@@ -268,6 +268,7 @@ pub const Owner = struct {
     pub fn beginDestroy(self: *Owner, deadline: u64) Error!void {
         if (self.state != .ready and self.state != .rejected) return error.State;
         try self.stable();
+        try self.session().rm_names.requireNoChildren(self.reservation);
         if (self.subscriptions) |*owner| {
             owner.beginDestroy(deadline) catch |err| return self.fail(err);
             self.state = .events_destroying;
