@@ -1368,6 +1368,48 @@ const DeviceModel = struct {
     }
 };
 
+const CatalogModel = struct {
+    var active: bool = false;
+    var legacy: bool = false;
+    var reject: bool = false;
+    var serial: u64 = 0;
+    var sequence: u64 = 0;
+    var count: u32 = 0;
+    var invalidations: usize = 0;
+    var first: a.GfxReceiverInfo = .{};
+    var last: a.GfxReceiverInfo = .{};
+    fn query(output: *a.GfxDriverOutputApi) callconv(.c) i32 {
+        output.* = if (legacy) .{ .size = 24 } else .{ .register_source = @intFromPtr(&register),
+            .replace_receivers = @intFromPtr(&replace), .close_source = @intFromPtr(&close) };
+        return a.gfx_output_ok;
+    }
+    fn register(adapter: u32, output: *a.GfxReceiverSource) callconv(.c) i32 {
+        std.debug.assert(!active and adapter == 0x01000000);
+        serial += 1; active = true; count = 0; sequence = 0; invalidations = 0;
+        output.* = .{ .adapter_id = adapter, .generation = serial };
+        return a.gfx_output_ok;
+    }
+    fn replace(input: *const a.GfxReceiverUpdate) callconv(.c) i32 {
+        std.debug.assert(active and input.source.generation == serial and input.sequence > sequence and
+            input.count <= 32 and (input.count == 0) == (input.receivers == 0));
+        if (reject) return a.gfx_output_error_capacity;
+        if (input.count == 0 and count != 0) invalidations += 1;
+        sequence = input.sequence; count = input.count;
+        if (count != 0) {
+            const records: [*]const a.GfxReceiverInfo = @ptrFromInt(input.receivers);
+            first = records[0]; last = records[count - 1];
+            std.debug.assert(first.connector_id != 0 and last.connector_id != 0);
+        }
+        return a.gfx_output_ok;
+    }
+    fn close(input: *const a.GfxReceiverSource) callconv(.c) i32 {
+        if (!active and input.generation == serial) return a.gfx_output_error_stale;
+        std.debug.assert(active and input.generation == serial);
+        active = false; count = 0;
+        return a.gfx_output_ok;
+    }
+};
+
 fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r4os.r4dev.DriverContext,
     table: *a.DriverApi, capture: *@import("boot_vram.zig").Capture, held: *@import("boot_vram_lease.zig").Lease) !void
 {
@@ -1385,6 +1427,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
     defer table.* = saved_table;
     table.version = a.driver_api_thread_work_version;
     table.gfx_memory_query = QueueNative.query;
+    table.gfx_output_query = CatalogModel.query;
     table.log_info = DeviceModel.log;
     table.log_warn = DeviceModel.log;
     table.log_error = DeviceModel.log;
@@ -1433,7 +1476,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         irq_intx, irq_register_error, irq_msi_uncertain, irq_cause, irq_wake_failure, irq_close_busy, irq_unregister_failure,
         rm_base_reject, rm_event_reject, rm_free_error, rm_timeout, rm_ack_failure, rm_foreign_event, rm_event_ack,
         outputs_empty, outputs_all, outputs_rejected, outputs_partial, outputs_missing, outputs_incomplete, outputs_bad_edid,
-        outputs_edid_rejected, outputs_changed, outputs_final_changed, outputs_final_rejected, outputs_hpd, outputs_sequence, outputs_ack, outputs_timeout,
+        outputs_edid_rejected, outputs_changed, outputs_final_changed, outputs_final_rejected, outputs_hpd, outputs_sequence, outputs_ack, outputs_timeout, catalog_rejected,
         runtime_healthy, runtime_lockdown, runtime_unknown, runtime_unowned, runtime_sequence_timeout,
         runtime_log_failure, runtime_moving_log };
     for (std.enums.values(Case)) |case| {
@@ -1458,6 +1501,8 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         var reader: @import("gsp_logs.zig").Reader = .{};
         try reader.open(lease);
         target.* = .{};
+        try t.expect(!CatalogModel.active);
+        CatalogModel.reject = case == .catalog_rejected;
         IrqModel.reset();
         target.irq_wake = .{ .context = @intFromPtr(target), .signal = IrqModel.wake };
         capture.snapshot.?.caps.msi = if (case == .irq_intx) 0 else 0x68;
@@ -1468,6 +1513,11 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
             try t.expectError(error.Api, target.open(ctx, capture, held, lease, &reader));
             try t.expect(target.self_address == 0 and !lease.retained and capture.firmware_owner == 0);
             table.version += 1;
+            CatalogModel.legacy = true;
+            try t.expectError(error.Api, target.open(ctx, capture, held, lease, &reader));
+            try t.expect(!target.port.effects_possible and !CatalogModel.active and !lease.retained);
+            CatalogModel.legacy = false;
+            try t.expect(target.closeBeforeSubmission());
             try t.expect(reader.close());
             continue;
         }
@@ -1570,7 +1620,13 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
             if (case == .stolen_display) try t.expect(target.recovery_failure != null) else
                 try t.expect(target.recovery.report != null and target.port.phase == .recovery and !reader.enabled);
         }
+        if (case == .outputs_hpd) {
+            // Generic kernel stop has already revoked the metadata source.
+            CatalogModel.active = false; CatalogModel.count = 0;
+            try t.expect(target.catalog.close() and target.catalog.last_status == a.gfx_output_error_stale and lease.retained);
+        }
         try t.expect(!target.closeBeforeSubmission() and !capture.close() and !lease.releaseBeforeSubmission());
+        try t.expect(!CatalogModel.active and CatalogModel.count == 0 and lease.retained);
         // Remove injected routing/retirement failures only for host disposal.
         // Production retains the entire mapping graph on these failures.
         IrqModel.unregister_result = 0;
@@ -2206,6 +2262,7 @@ fn checkDeviceOutputs(target: *@import("gsp_device.zig").Device, words: []u32, f
                 try devicePost(target, true, false); // Invalidate an already published generation.
                 _ = target.step();
                 try t.expect(running.nativeOutputs() == null);
+                try t.expect(CatalogModel.count == 0 and CatalogModel.invalidations == 1);
             }
             try t.expect(running.output_refresh);
             const sent = session.tx_sequence;
@@ -2329,7 +2386,8 @@ fn checkDeviceOutputs(target: *@import("gsp_device.zig").Device, words: []u32, f
     }
     try t.expect(steps < 1200);
     if (target.phase != .ready) {
-        try t.expect(scenario == .outputs_ack or scenario == .outputs_timeout);
+        try t.expect(scenario == .outputs_ack or scenario == .outputs_timeout or scenario == .catalog_rejected);
+        try t.expect(!CatalogModel.active and CatalogModel.count == 0);
         try t.expect(target.phase == .recovering and running.nativeOutputs() == null and running.nativeObject() == null);
         try t.expectError(error.Retained, session.rm_names.retire(running.graph.?.reservation));
         const pending = session.pending;
@@ -2356,7 +2414,10 @@ fn checkDeviceOutputs(target: *@import("gsp_device.zig").Device, words: []u32, f
     try t.expect(data.count == expected and data.topology.count == expected and data.coherent);
     try t.expect(data.topology.epoch == target.epoch and data.topology.client == running.graph.?.reservation.client);
     if (scenario == .outputs_rejected) try t.expect(data.topology.rejected.?.control.? == 0x55);
+    try t.expect(CatalogModel.count == expected and target.catalog.published == (expected != 0));
     if (expected == 0) return;
+    try t.expect(CatalogModel.first.connector_id == 1 and CatalogModel.last.connector_id == 0x80000000);
+    try t.expect(CatalogModel.first.connector_kind == 0); // Multiple physical records are ambiguous.
     const first = &data.receivers[0];
     try t.expect(first.display_id == 1 and first.client == data.topology.client and first.epoch == target.epoch);
     try t.expect(data.topology.routes[0].resource.?.index == 0xffffffff and data.topology.routes[0].resource.?.dcb_index == 27);
@@ -2376,6 +2437,16 @@ fn checkDeviceOutputs(target: *@import("gsp_device.zig").Device, words: []u32, f
         };
         try t.expect(first.status == expected_status and first.connected.?);
         if (first.status == .valid_edid) try t.expect(first.report.hdmi and first.report.mode_count != 0 and first.report.audio_count != 0);
+        const published = &CatalogModel.first;
+        try t.expect(published.flags & a.gfx_output_flag_connected != 0 and CatalogModel.last.edid_bytes == 0 and CatalogModel.last.mode_count == 0);
+        switch (first.status) {
+            .valid_edid => try t.expect(published.mode_count > 0 and published.edid_bytes == first.edid_bytes),
+            .edid_missing => try t.expect(published.flags & a.gfx_output_flag_edid_missing != 0 and published.mode_count == 0),
+            .edid_rejected => try t.expect(published.flags & a.gfx_output_flag_query_failed != 0 and published.mode_count == 0),
+            .invalid_edid => try t.expect(published.flags & a.gfx_output_flag_edid_invalid != 0 and published.mode_count == 0),
+            .incomplete_edid => try t.expect(published.flags & a.gfx_output_flag_receiver_incomplete != 0),
+            else => return error.UnexpectedReceiver,
+        }
         try t.expect(data.receivers[1].display_id == 0x80000000 and data.receivers[1].status == .disconnected);
         try t.expect(data.receivers[1].report.audio_count == 0 and data.receivers[1].edid_bytes == 0);
     }

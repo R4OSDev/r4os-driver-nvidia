@@ -1,5 +1,12 @@
 ﻿# Third-Party Notices
 
+Receiver publication (NVIDIA 0.1.60, 2026-09-12):
+The connector-type mapping reuses the pinned 570.144 ctrl0073specific.h
+definitions, with its complete MIT notice in gsp_catalog.zig and the already
+embedded NVIDIA-GSP-RUNTIME-LICENSE.txt. No new upstream code, firmware or
+license resource was imported. The R4GFX timing conversion is original R4OS
+Apache-2.0 code; the common parser and its existing notices are unchanged.
+
 Native topology and EDID acquisition (NVIDIA 0.1.59, 2026-09-12):
 The fixed display controls and existing shared R4GFX parser now run on
 the actual runtime queue. Six complete NVIDIA/Nouveau source notices and

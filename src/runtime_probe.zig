@@ -15,6 +15,7 @@ var closing_pointer: ?*anyopaque = null;
 var prepared = false;
 var previous_epoch: u64 = 0;
 var previous_handle: u64 = 0;
+var receiver_records: [2]a.GfxReceiverInfo = @splat(.{});
 
 pub fn start(ctx: *const r4os.r4dev.DriverContext) bool {
     if (api != null or !provider.available() or !clock_provider.available()) return false;
@@ -41,6 +42,7 @@ pub fn start(ctx: *const r4os.r4dev.DriverContext) bool {
     if (heap.stats(&after) != 0 or after.allocations != 0 or after.bytes != 0 or after.pending_creates != 0 or after.pending_releases != 0 or provider.releaseFailures() != 0) return false;
     ctx.logInfo("NVIDIA runtime-check: memory=OK init=64 worker=64 alignment=16 content=verified live=0");
     ctx.logInfo("NVIDIA runtime-check: clock=OK init=64 worker=64 monotonic-ns=verified");
+    ctx.logInfo("NVIDIA runtime-check: receivers=OK contexts=init,worker publish=atomic stale=rejected sources=closed hardware-writes=none");
     ctx.logInfo("NVIDIA runtime-check: native-c=OK adapters=21 contexts=init,worker providers=driver-api link=actual");
     ctx.logInfo("NVIDIA runtime-check: native-format=OK adapters=9 contexts=init,worker integers=64 truncation=reported invalid=rejected log=driver-owner");
 
@@ -113,6 +115,7 @@ fn exercise(seed: u8) bool {
         return false;
     }
     if (!exerciseClock(&ctx)) return false;
+    if (!exerciseReceivers(&ctx, seed)) return false;
     var pointers: [64]?*anyopaque = .{null} ** 64;
     defer for (&pointers) |*pointer| {
         provider.r4nv_heap_free(pointer.*);
@@ -135,6 +138,28 @@ fn exercise(seed: u8) bool {
         pointers[index] = null;
     }
     return true;
+}
+
+// Reuse the explicit CPU-only diagnostic to exercise the actual R4D bridge
+// on a machine without an NVIDIA GPU. These named synthetic sources never
+// claim a monitor timing, EDID, execution queue or hardware capability.
+fn exerciseReceivers(ctx: *const r4os.r4dev.DriverContext, seed: u8) bool {
+    if (seed < 1 or seed > receiver_records.len) return false;
+    const outputs = ctx.graphicsOutputs() orelse return false;
+    if (!outputs.supportsReceivers()) return false;
+    var source: a.GfxReceiverSource = .{};
+    if (outputs.registerSource(0xffff7900 + @as(u32, seed), &source) != a.gfx_output_ok) return false;
+    var closed = false;
+    defer if (!closed) { _ = outputs.closeSource(&source); };
+    const record = &receiver_records[seed - 1];
+    record.* = .{ .connector_id = 1, .flags = a.gfx_output_flag_connected | a.gfx_output_flag_edid_missing };
+    var update: a.GfxReceiverUpdate = .{ .source = source, .sequence = 1, .count = 1, .receivers = @intFromPtr(record) };
+    if (outputs.replaceReceivers(&update) != a.gfx_output_ok or outputs.replaceReceivers(&update) != a.gfx_output_error_stale) return false;
+    update.sequence = 2; update.count = 0; update.receivers = 0;
+    if (outputs.replaceReceivers(&update) != a.gfx_output_ok or outputs.closeSource(&source) != a.gfx_output_ok) return false;
+    closed = true;
+    update.sequence = 3;
+    return outputs.replaceReceivers(&update) == a.gfx_output_error_stale;
 }
 
 fn exerciseClock(ctx: *const r4os.r4dev.DriverContext) bool {

@@ -6,8 +6,13 @@ pub fn build(b: *std.Build) void {
     const libraries_build = b.lazyImport(@This(), "r4os_libraries") orelse return;
     const libraries = b.dependencyFromBuildZig(libraries_build, .{});
     const receiver_parser_path = libraries.namedLazyPath("r4gfx_edid");
-    const module = sdk.addR4MFWithOptions(b.path("module.R4MF"), .{ .zig_module_roots = &.{receiver_parser_path} });
+    const receiver_bridge_path = libraries.namedLazyPath("r4gfx_outputs");
+    const module = sdk.addR4MFWithOptions(b.path("module.R4MF"), .{ .zig_module_roots = &.{ receiver_parser_path, receiver_bridge_path } });
     const receiver_parser = b.createModule(.{ .root_source_file = receiver_parser_path, .target = b.graph.host, .optimize = .ReleaseSafe });
+    const host_sdk = sdk.createR4osModule(b.graph.host, .ReleaseSafe);
+    const receiver_bridge = b.createModule(.{ .root_source_file = receiver_bridge_path, .target = b.graph.host, .optimize = .ReleaseSafe });
+    receiver_bridge.addImport("r4os", host_sdk);
+    receiver_bridge.addImport("r4gfx_edid", receiver_parser);
     const headers = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-File" });
     headers.addFileArg(b.path("Tools/VerifyNativeHeaders.ps1"));
     headers.addArg("-HeaderRoot");
@@ -48,8 +53,9 @@ pub fn build(b: *std.Build) void {
     unit.root_module.addImport("r4gfx_edid", receiver_parser);
     unit_step.dependOn(&b.addRunArtifact(unit).step);
     const lifecycle = b.createModule(.{ .root_source_file = b.path("src/lifecycle_test.zig"), .target = b.graph.host, .optimize = .ReleaseSafe });
-    lifecycle.addImport("r4os", sdk.createR4osModule(b.graph.host, .ReleaseSafe));
+    lifecycle.addImport("r4os", host_sdk);
     lifecycle.addImport("r4gfx_edid", receiver_parser);
+    lifecycle.addImport("r4gfx_outputs", receiver_bridge);
     // Host lifecycle tests link the same C companions through the canonical
     // parser. They do not supply replacements for their private Zig providers.
     const manifest = sdk_build.build_api.module_manifest.parse(b.allocator, "module.R4MF", @embedFile("module.R4MF")) catch @panic("Invalid NVIDIA manifest");
@@ -76,8 +82,9 @@ pub fn build(b: *std.Build) void {
     format_test.step.dependOn(&headers.step);
     unit_step.dependOn(&b.addRunArtifact(format_test).step);
     const storage = b.createModule(.{ .root_source_file = b.path("src/firmware_storage_test.zig"), .target = b.graph.host, .optimize = .ReleaseSafe });
-    storage.addImport("r4os", sdk.createR4osModule(b.graph.host, .ReleaseSafe));
+    storage.addImport("r4os", host_sdk);
     storage.addImport("r4gfx_edid", receiver_parser);
+    storage.addImport("r4gfx_outputs", receiver_bridge);
     // Existing owner step exercises the complete Booter resource/heap/DMA
     // path with the same pinned bytes as the module, never a fake hash bypass.
     const fixture_files = b.addWriteFiles();

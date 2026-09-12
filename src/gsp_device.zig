@@ -53,6 +53,7 @@ pub const Device = struct {
     handoff: ?events.Handoff = null,
     recovery: teardown.Recovery = .{},
     running: runtime.Owner = .{},
+    catalog: @import("gsp_catalog.zig").Owner = .{},
     interrupts: irq.Owner = .{},
     irq_wake: ?irq.Wake = null,
     recovery_deadline: u64 = 0,
@@ -94,6 +95,9 @@ pub const Device = struct {
         self.deadline = deadline;
         self.last_clock = opened_at;
         errdefer |err| { self.failure = err; self.failed_phase = self.phase; self.phase = .failed; }
+        const pci = display.snapshot.?.pci;
+        try self.catalog.open(ctx, 0x0100_0000 | (@as(u32, pci.bus) << 8) | (@as(u32, pci.device) << 3) | pci.function);
+        errdefer _ = self.catalog.close();
         try self.checkLive(false);
         const original = display.operation.?.options;
         try self.port.openShared(ctx, &display.snapshot.?, original.boot0, original.boot1,
@@ -149,7 +153,7 @@ pub const Device = struct {
     /// pacing task, never an IRQ or a long-running shared-work callback.
     pub fn step(self: *Device) Progress {
         if (self.self_address == 0 or self.self_address != @intFromPtr(self)) return .stopped;
-        if (self.stopped or self.phase == .failed) return .stopped;
+        if (self.stopped or self.phase == .failed) { _ = self.catalog.close(); return .stopped; }
         const progress = self.advance() catch |err| blk: {
             if (self.phase == .recovering) {
                 self.recovery_failure = err;
@@ -190,7 +194,22 @@ pub const Device = struct {
                     }
                 }
             }
-            return try self.running.step() == .progress;
+            const progress = try self.running.step() == .progress;
+            if (self.running.outputs.invalidated) try self.catalog.invalidate();
+            if (self.running.nativeOutputs()) |snapshot| {
+                // A rejected discovery supplies no authoritative generation.
+                if (snapshot.topology.rejected == null and snapshot.final_rejection == null) {
+                    const before = self.catalog.sequence;
+                    try self.catalog.publish(snapshot);
+                    if (before != self.catalog.sequence) {
+                        var bytes: [180]u8 = undefined;
+                        const line = try std.fmt.bufPrintZ(&bytes, "NVIDIA gsp-catalog: generation={d} receivers={d} source=receiver-only modeset=no",
+                            .{ snapshot.generation, snapshot.count });
+                        self.ctx.?.logInfo(line);
+                    }
+                } else try self.catalog.invalidate();
+            }
+            return progress;
         }
         if (try self.now() >= self.deadline) return error.Deadline;
         switch (self.phase) {
@@ -254,6 +273,8 @@ pub const Device = struct {
     }
     fn fail(self: *Device, err: anyerror) void {
         if (self.failure == null) { self.failure = err; self.failed_phase = self.phase; }
+        self.running.stop(err);
+        if (!self.catalog.close()) self.ctx.?.logError("NVIDIA gsp-catalog: metadata close failed; cleanup retry required");
         self.logFailure(if (self.phase == .ready) "runtime" else "startup", err);
         if (self.interrupts.self_address != 0) {
             var bytes: [220]u8 = undefined;
@@ -273,12 +294,15 @@ pub const Device = struct {
         // races a live callback; failure retains the entire GPU dependency graph.
     }
     pub fn stop(self: *Device) bool {
+        if (!self.catalog.close()) return false;
+        self.running.stop(error.Stopped);
         if (!self.interrupts.close()) return false;
         self.stopped = true;
         return true;
     }
     pub fn closeBeforeSubmission(self: *Device) bool {
         if (self.self_address == 0) return true;
+        if (!self.catalog.close()) return false;
         if (self.self_address != @intFromPtr(self) or self.port.effects_possible or
             self.memory.?.retained or self.display.?.firmware_owner != 0) return false;
         if (!self.port.close()) return false;

@@ -1,16 +1,28 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.59; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.60; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
-subsystem 1458:4074, VBIOS 94.06.2f.00.d6. Preparation for 0.79.10 continues.
+subsystem 1458:4074, VBIOS 94.06.2f.00.d6. The 0.79.10 software stage is complete; physical native qualification remains separate.
 The default path inventories NVIDIA display functions once through
 the kernel PCI inventory. Explicit diagnostic/start modes are described below.
 Starting with R4OS 0.79.9, `IMAGE_SCOPE=slim` includes the current module in
 Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
+
+Receiver catalog publication (NVIDIA 0.1.60 / Kernel 0.1.153, 2026-09-12):
+
+A coherent native generation now replaces all receiver records atomically in
+R4DRAW. The optional 48-byte driver output table registers an owner-bound
+metadata source without an execution queue. Source limits/routing stay zero;
+receiver timings never authorize a modeset. HPD, failure and stop invalidate
+published and borrowed data even while GPU backing remains retained.
+DISPLAYD /RECEIVERS reads this same catalog and parser without hardware work.
+The default stays passive; gsp-start requires the new table before submission.
+Software evidence and remaining transport work: Docs/Drivers/GrafikEmpfaenger07912.txt.
+Physical follow-up: ExFiles/Reports/OssiGPU.txt, section 0.79.12.
 
 Native topology and receiver acquisition (NVIDIA 0.1.59, 2026-09-12):
 
@@ -25,8 +37,8 @@ complete generation. Interleaved events invalidate all candidates. HPD/DP
 also invalidates already returned data and coalesces a later refresh, with
 at least one second between acquisitions. CPU sequencer/lockdown use the
 display-semantic bridges; ambiguous failures retain receipts and GPU backing.
-The snapshot is currently private to the driver; platform catalog publication,
-physical DDC/AUX, native scanout and HDMI audio remain unfinished.
+The original private snapshot is now published by the 0.1.60 bridge above.
+Extended DDC/AUX transport, native scanout and HDMI audio remain unfinished.
 
 Both targeted host runs pass 51/51 existing tests; both module builds pass.
 The final run followed an additional cross-receiver/final-mask consistency

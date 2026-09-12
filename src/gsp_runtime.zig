@@ -127,26 +127,33 @@ pub const Owner = struct {
     pub fn step(self: *Owner) !Progress {
         if (self.self_address == 0 or self.self_address != @intFromPtr(self) or self.failure != null) return error.State;
         return self.advance() catch |err| {
-            self.failure = err;
-            if (self.activeChannel()) |channel| {
-                self.protocol_failure = channel.fail(error.Handler);
-                // A failed token transition can leave only handed-off views.
-                // They cannot ACK or poison another owner; stop the one retained
-                // session explicitly while the outer device retains its DMA.
-                channel.session.stop();
-                if (channel.last_rpc) |rpc| self.log("NVIDIA gsp-runtime: failed={s} last-rpc={x} sequence={d} result={x} receipt={s}",
-                    .{@errorName(err), rpc.function, rpc.sequence, rpc.result, if (channel.session.pending != null) @as([]const u8, "retained") else "none"});
-                if (self.post.self_address != 0 and self.post.state != .complete)
-                    self.log("NVIDIA gsp-postinit: failed={s} command={x} status={x} replies={d}",
-                        .{@errorName(err), @intFromEnum(self.post.command), self.post.last_status orelse exchange.message.pending, self.post.replies});
-            }
-            if (self.graph) |*graph| {
-                if (graph.state != .finished) graph.base.exchange.session.rm_names.retain(graph.reservation) catch {};
-                self.log("NVIDIA gsp-rm: failed={s} state={s} client={x} rejection={?}",
-                    .{@errorName(err), @tagName(graph.state), graph.reservation.client, self.rm_rejection});
-            }
+            self.stop(err);
             return err;
         };
+    }
+    /// Logical shutdown invalidates every borrowed inventory and retains the
+    /// existing RM/session resources. It is not physical GPU quiescence.
+    pub fn stop(self: *Owner, err: anyerror) void {
+        if (self.self_address == 0 or self.self_address != @intFromPtr(self) or self.failure != null) return;
+        self.outputs.invalidate() catch {};
+        self.failure = err;
+        if (self.activeChannel()) |channel| {
+            self.protocol_failure = channel.fail(error.Handler);
+            // A failed token transition can leave only handed-off views.
+            // They cannot ACK or poison another owner; stop the one retained
+            // session explicitly while the outer device retains its DMA.
+            channel.session.stop();
+            if (channel.last_rpc) |rpc| self.log("NVIDIA gsp-runtime: failed={s} last-rpc={x} sequence={d} result={x} receipt={s}",
+                .{@errorName(err), rpc.function, rpc.sequence, rpc.result, if (channel.session.pending != null) @as([]const u8, "retained") else "none"});
+            if (self.post.self_address != 0 and self.post.state != .complete)
+                self.log("NVIDIA gsp-postinit: failed={s} command={x} status={x} replies={d}",
+                    .{@errorName(err), @intFromEnum(self.post.command), self.post.last_status orelse exchange.message.pending, self.post.replies});
+        }
+        if (self.graph) |*graph| {
+            if (graph.state != .finished) graph.base.exchange.session.rm_names.retain(graph.reservation) catch {};
+            self.log("NVIDIA gsp-rm: failed={s} state={s} client={x} rejection={?}",
+                .{@errorName(err), @tagName(graph.state), graph.reservation.client, self.rm_rejection});
+        }
     }
     pub fn activeChannel(self: *Owner) ?*exchange.Exchange {
         if (self.outputs.channel()) |channel| return &channel.exchange;
