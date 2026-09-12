@@ -1539,6 +1539,8 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         context_display_success, context_display_timeout, context_display_fault, context_display_cursor, context_display_notifier, context_display_map,
         context_display_image, context_display_image_timeout, context_display_image_fault, context_display_image_lost,
         context_display_present, context_display_present_timeout, context_display_present_fault,
+        context_display_present_initial_timeout, context_display_present_initial_fault, context_display_present_initial_release,
+        context_display_present_initial_acquire, context_display_present_initial_retry,
         display_root_success, display_root_classes, display_root_reject, display_root_static, display_root_preserve, display_root_free,
         display_root_ack, display_root_timeout, display_root_wrong,
         display_dma_success, display_dma_instance_ack, display_dma_instance_reject, display_dma_oom, display_dma_segment, display_dma_unmap,
@@ -3275,6 +3277,7 @@ fn checkDeviceDisplayImage(target: *@import("gsp_device.zig").Device, table: *a.
     const source_index = table_owner.storage[2].info().?.reference.buffer.id - 801;
     try t.expect(native_model.slots[source_index].live and native_model.slots[source_index].imported and
         !native_model.slots[source_index].reference and native_model.slots[source_index].gpu.lease.id != 0);
+    if (present_case and !try checkInitialPresentation(target, table, fifo_handle, root, core_handle, window_handle, dma, deadline, scenario)) return;
     const endpoint = target.port.owner.?;
     const admit = endpoint.admit_display_push.?;
     for (1..4) |point| {
@@ -3339,7 +3342,8 @@ fn checkDeviceDisplayImage(target: *@import("gsp_device.zig").Device, table: *a.
             core_owner.ring.completed == point and std.meta.eql(active_image.image, image) and active_image.head == 1 and
             active_image.core_point == point and active_image.window_point == point and window_note.result.?.timestamp == (@as(u64, 7) << 32) + 100 + point);
     }
-    if (present_case) { try checkDevicePresentation(target, table, fifo_handle, root, window_handle, dma, deadline, scenario); return; }
+    if (std.mem.startsWith(u8, scenario, "context_display_present_initial_")) { _ = target.stop(); return; }
+    if (present_case) { try checkDevicePresentation(target, fifo_handle, window_handle, dma, scenario); return; }
     try running.retireDisplayChannel(window_handle, deadline); try pumpDisplayChannel(target, window_handle, deadline);
     try running.retireDisplayChannel(core_handle, deadline); try pumpDisplayChannel(target, core_handle, deadline);
     try t.expect(model.released == 2 and model.slots[0].active and model.slots[1].active and
@@ -3347,9 +3351,127 @@ fn checkDeviceDisplayImage(target: *@import("gsp_device.zig").Device, table: *a.
     _ = target.stop();
     try t.expect(table_owner.failed and model.released == 2 and native_model.slots[source_index].live);
 }
-fn checkDevicePresentation(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, handle: @import("gsp_runtime.zig").ChannelHandle,
-    root: @import("gsp_runtime.zig").DisplayEngineHandle, window_handle: @import("gsp_runtime.zig").DisplayChannelHandle,
-    dma: u32, deadline: u64, scenario: []const u8) !void
+fn checkInitialPresentation(target: *@import("gsp_device.zig").Device, table: *a.DriverApi,
+    handle: @import("gsp_runtime.zig").ChannelHandle, root: @import("gsp_runtime.zig").DisplayEngineHandle,
+    core_handle: @import("gsp_runtime.zig").DisplayChannelHandle, window_handle: @import("gsp_runtime.zig").DisplayChannelHandle,
+    dma: u32, deadline: u64, scenario: []const u8) !bool
+{
+    const model = @import("gsp_copy_test_model.zig").Model;
+    const native_model = @import("gsp_vram_test_model.zig").Model;
+    const running = &target.running;
+    const native_source = running.display_resources_slot.owner.?.publishedStorage(window_handle.slot, dma).?.info().?;
+    const source_index = native_source.reference.buffer.id - 801;
+    const fifo = running.fifos[handle.slot].owner.?;
+    errdefer |err| std.debug.print("initial {s}: {s} phase={s} failure={?} pending={} submitted={} read={} point={d}\n", .{
+        scenario,@errorName(err),@tagName(target.phase),target.failure,running.initial_image != null,
+        if(running.initial_image)|work|work.operation.submitted else false,model.initial_read.lease.id != 0,running.presentation.?.initial_point });
+    model.installPresentation(table, source_index, 65, 20);
+    target.irq_wake = .{ .context = @intFromPtr(target), .signal = model.wakePresentation };
+    const binding = try running.registerDisplayPresentation(handle, root, window_handle, dma, model.shadowReference(), deadline);
+    try t.expect(std.meta.eql(binding, model.binding) and running.presentation.?.surface.valid());
+    try t.expectError(error.Busy, running.registerDisplayPresentation(handle, root, window_handle, dma, model.shadowReference(), deadline));
+    model.closeShadow(); // The driver must import its own alias, not the closed creator.
+    for (&model.host[0], 0..) |*byte, i| byte.* = @truncate(i * 17 + 23);
+    try t.expectError(error.Busy, running.commitDisplayImage(core_handle, window_handle, dma, 1, deadline));
+    const first_point = fifo.ring.issued;
+    if (native_model.is("context_display_present_initial_retry")) {
+        try running.uploadInitialImage(clock + 1); clock += 1; _ = target.step();
+        const status = try running.initialImageStatus();
+        try t.expect(!status.pending and status.completed == 0 and status.failure != null and status.failure.? == error.Timeout and model.initial_read.lease.id == 0 and fifo.ring.issued == first_point);
+    }
+    model.reject_initial_read = native_model.is("context_display_present_initial_acquire");
+    const before_put_timeout = native_model.is("context_display_present_initial_retry");
+    try running.uploadInitialImage(if (before_put_timeout) clock + 1 else deadline);
+    try t.expectError(error.Busy, running.uploadInitialImage(deadline));
+    var steps: usize = 0;
+    while (target.phase == .ready and running.initial_image != null and model.initial_read.lease.id == 0 and steps < 100) : (steps += 1) {
+        _ = target.step();
+        if (target.phase == .ready and running.buffer_active != null) try replyCopyMapping(target);
+    }
+    try t.expect(target.phase == .ready and steps < 100 and fifo.ring.issued == first_point);
+    if (before_put_timeout) {
+        try t.expect(model.initial_read.lease.id != 0);
+        clock += 1; _ = target.step();
+        const cancelled = try running.initialImageStatus();
+        try t.expect(!cancelled.pending and cancelled.completed == 0 and cancelled.failure != null and cancelled.failure.? == error.Timeout and
+            model.initial_read.lease.id == 0 and model.dma[0].lease.id != 0 and fifo.ring.issued == first_point);
+        const prior_tx = target.session.?.tx_sequence;
+        try running.uploadInitialImage(deadline); _ = target.step();
+        try t.expect(model.initial_read.lease.id != 0 and target.session.?.tx_sequence == prior_tx);
+    }
+    if (model.reject_initial_read) {
+        const status = try running.initialImageStatus();
+        try t.expect(!status.pending and status.completed == 0 and status.failure != null and status.failure.? == error.Memory and model.initial_read.lease.id == 0 and model.dma[0].lease.id != 0);
+        model.reject_initial_read = false;
+        const prior_tx = target.session.?.tx_sequence;
+        try running.uploadInitialImage(deadline); _ = target.step();
+        try t.expect(model.initial_read.lease.id != 0 and target.session.?.tx_sequence == prior_tx);
+    }
+    try t.expect(model.initial_read.lease.id != 0 and !model.active and !model.queued and model.completed == 0);
+    const operation = &running.initial_image.?.operation;
+    const transfer = try running.initialImageTransfer();
+    try t.expect(transfer.source == model.address(0) and transfer.target == native_source.address and transfer.bytes == 260 and
+        transfer.rows.?.count == 20 and transfer.rows.?.source_pitch == 260 and transfer.rows.?.target_pitch == 512);
+    try t.expectError(error.State, operation.complete(std.math.maxInt(u32)));
+    try t.expectError(error.Busy, running.commitDisplayImage(core_handle, window_handle, dma, 1, deadline));
+    try t.expectError(error.Busy, running.retireBuffer(running.initial_image.?.mapping.?, deadline, true));
+    const endpoint = target.port.owner.?; const gate = endpoint.admit_copy.?;
+    operation.ticket = try fifo.prepareCopy(transfer);
+    try gate(endpoint.context, &target.port, fifo, operation.ticket.?, deadline);
+    operation.gpu.byte_length -= 1;
+    try t.expectError(error.Binding, gate(endpoint.context, &target.port, fifo, operation.ticket.?, deadline)); operation.gpu.byte_length += 1;
+    try t.expectError(error.Binding, gate(endpoint.context, &target.port, fifo, operation.ticket.?, deadline + 1));
+    const saved_source = operation.source_stamp.?;
+    operation.source_stamp.?.buffer.id += 1;
+    try t.expectError(error.Binding, gate(endpoint.context, &target.port, fifo, operation.ticket.?, deadline)); operation.source_stamp = saved_source;
+    const wire = @import("gsp_copy_wire.zig");
+    const pitch: *u32 = @ptrFromInt(fifo.ring.cpu.cpu_address + wire.push_offset + (fifo.ring.issued % wire.capacity) * wire.slot_bytes + 7 * 4);
+    pitch.* ^= 4;
+    try t.expectError(error.Binding, gate(endpoint.context, &target.port, fifo, operation.ticket.?, deadline)); pitch.* ^= 4;
+    var moved = operation.*; try t.expect(!moved.valid());
+    fifo.ring.pending = null; operation.ticket = null; // CPU-only test preparation; no PUT.
+    _ = target.step();
+    try t.expect(target.phase == .ready and operation.submitted and fifo.ring.issued == first_point + 1);
+    const raw: [*]const u8 = @ptrFromInt(target.port.window.cpu_address);
+    try model.fetch(fifo, raw[0..@intCast(target.port.window.byte_length)]); _ = target.step();
+    try t.expect((try running.initialImageStatus()).completed == 0 and model.initial_read.lease.id != 0);
+    try model.execute(); _ = target.step();
+    try t.expect((try running.initialImageStatus()).completed == 0 and model.initial_read.lease.id != 0);
+    for (model.vram_data, 0..) |byte, i| {
+        const row = i / 512; const column = i % 512;
+        try t.expectEqual(if (row < 20 and column < 260) model.host[0][row * 260 + column] else @as(u8, 0xcc), byte);
+    }
+    if (native_model.is("context_display_present_initial_timeout")) clock = deadline else {
+        try model.signal();
+        if (native_model.is("context_display_present_initial_fault")) {
+            var rc_payload = @embedFile("fixtures/fault-570.144.bin")[32..80].*;
+            outputWord(&rc_payload, 0, try @import("gsp_context.zig").wire.nvEngine(fifo.config.rm_engine));
+            std.mem.writeInt(u64, rc_payload[28..36], transfer.target + 19 * 512 + 259, .little);
+            try nativeEvent(&target.session.?, 0x1004, &rc_payload);
+        }
+    }
+    model.reject_initial_release = native_model.is("context_display_present_initial_release");
+    _ = target.step();
+    if (native_model.is("context_display_present_initial_timeout") or native_model.is("context_display_present_initial_fault") or model.reject_initial_release) {
+        try t.expect(target.phase == .recovering and running.initial_image != null and model.initial_read.lease.id != 0 and
+            running.presentation.?.initial_point == 0 and model.completed == 0 and !model.active and model.lost and
+            running.display_work == null and running.display_images[3] == null and native_model.slots[source_index].gpu.lease.id != 0);
+        if (native_model.is("context_display_present_initial_fault")) {
+            const record = running.faults.first_fatal.?;
+            try t.expect(record.source == .rc and record.acknowledged and record.target_address_match and
+                record.active_fence.timeline == 0 and record.copy_point == first_point + 1 and fifo.ring.completed == first_point);
+        }
+        return false;
+    }
+    const status = try running.initialImageStatus();
+    try t.expect(target.phase == .ready and !status.pending and status.completed == first_point + 1 and status.failure == null and
+        model.initial_read.lease.id == 0 and model.gpu[0].lease.id == 0 and model.dma[0].byte_length == 5200 and model.completed == 0 and
+        running.copy_completed == 0 and running.display_work == null and running.display_images[3] == null);
+    try t.expectError(error.Busy, running.uploadInitialImage(deadline));
+    return true;
+}
+fn checkDevicePresentation(target: *@import("gsp_device.zig").Device, handle: @import("gsp_runtime.zig").ChannelHandle,
+    window_handle: @import("gsp_runtime.zig").DisplayChannelHandle, dma: u32, scenario: []const u8) !void
 {
     const model = @import("gsp_copy_test_model.zig").Model;
     const native_model = @import("gsp_vram_test_model.zig").Model;
@@ -3362,12 +3484,7 @@ fn checkDevicePresentation(target: *@import("gsp_device.zig").Device, table: *a.
     errdefer |err| std.debug.print("present {s}/{s}: {s} phase={s} fail={?} pending={} job={} submitted={} completed={d}\n", .{
         scenario,checkpoint,@errorName(err),@tagName(target.phase),target.failure,if(running.presentation)|p|p.pending else false,
         running.copy_job != null,if(running.copy_job)|j|j.submitted else false,model.completed});
-    model.installPresentation(table, source_index, 65, 20);
-    target.irq_wake = .{ .context = @intFromPtr(target), .signal = model.wakePresentation };
-    const binding = try running.registerDisplayPresentation(handle, root, window_handle, dma, model.shadowReference(), deadline);
-    try t.expect(std.meta.eql(binding, model.binding) and running.presentation.?.surface.valid());
-    try t.expectError(error.Busy, running.registerDisplayPresentation(handle, root, window_handle, dma, model.shadowReference(), deadline));
-    model.closeShadow(); // Only the imported presentation reference remains.
+    try t.expect(running.presentation.?.initial_point != 0 and model.initial_read.lease.id == 0);
     const raw: [*]const u8 = @ptrFromInt(target.port.window.cpu_address);
     for (&model.host[0], 0..) |*byte, i| byte.* = @truncate(i * 37 + 11);
     for (0..2) |frame| {
@@ -3388,7 +3505,8 @@ fn checkDevicePresentation(target: *@import("gsp_device.zig").Device, table: *a.
         while (target.phase == .ready and (running.copy_job == null or !running.copy_job.?.submitted) and steps < 100) : (steps += 1) {
             if (frame == 0 and !admission_checked and running.copy_job != null and running.buffer_active == null) {
                 const job = &running.copy_job.?;
-                if (job.mappings[0]) |mapping| if ((try running.bufferStatus(mapping)).info) |source| {
+                for (&running.buffers) |*slot| if (slot.owner) |mapping| if (mapping.info()) |source| {
+                    if (!std.meta.eql(source.buffer, job.job.source_buffer)) continue;
                     job.addresses[0] = .{ .address = source.address, .bytes = source.logical_bytes };
                     job.transfer = try running.copyTransfer();
                     job.ticket = try fifo.prepareCopy(job.transfer.?);
@@ -3408,6 +3526,7 @@ fn checkDevicePresentation(target: *@import("gsp_device.zig").Device, table: *a.
                     try gate(io.context, &target.port, fifo, job.ticket.?, job.deadline);
                     fifo.ring.pending = null; job.ticket = null; job.transfer = null; // CPU-only preparation, before PUT.
                     admission_checked = true;
+                    break;
                 };
             }
             _ = target.step();
@@ -3427,7 +3546,7 @@ fn checkDevicePresentation(target: *@import("gsp_device.zig").Device, table: *a.
             }
         }
         try t.expect(steps < 100 and target.phase == .ready and running.copy_job.?.presentation and running.copy_job.?.submitted);
-        if (frame == 0) try t.expect(admission_checked) else
+        if (frame == 0) try t.expect(admission_checked and target.session.?.tx_sequence == prior_tx) else
             try t.expect(output_replies == 1 and target.session.?.tx_sequence == prior_tx + output_replies);
         const transfer = running.copy_job.?.transfer.?;
         checkpoint = "transfer";
@@ -3459,7 +3578,7 @@ fn checkDevicePresentation(target: *@import("gsp_device.zig").Device, table: *a.
         _ = target.step();
         if (!native_model.is("context_display_present")) {
             try t.expect(target.phase == .recovering and model.lost and model.active and model.completed == 0 and
-                running.copy_job != null and model.gpu[0].lease.id != 0 and model.dma[0].lease.id != 0 and
+                running.copy_job != null and model.dma[0].lease.id != 0 and
                 native_model.slots[source_index].gpu.lease.id != 0 and native_model.slots[source_index].imported and
                 running.presentation.?.surface.shadow.reference.id != 0);
             if (native_model.is("context_display_present_fault")) {
@@ -3483,7 +3602,7 @@ fn checkDevicePresentation(target: *@import("gsp_device.zig").Device, table: *a.
     _ = target.step();
     _ = target.stop();
     try t.expect(model.lost and model.unregisters == 1 and native_model.slots[source_index].imported and
-        model.gpu[0].lease.id != 0 and running.presentation.?.surface.shadow.reference.id != 0);
+        model.dma[0].lease.id != 0 and running.presentation.?.surface.shadow.reference.id != 0);
 }
 fn checkDeviceDisplaySubmissions(target: *@import("gsp_device.zig").Device, handle: @import("gsp_runtime.zig").DisplayChannelHandle, deadline: u64, scenario: []const u8) !void {
     const model = @import("gsp_display_test_model.zig").Model;

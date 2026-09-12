@@ -55,8 +55,10 @@ pub const Owner = struct {
     failure: ?Error = null,
     protocol_failure: ?exchange.Error = null,
 
-    /// On success this owner adopts the exact driver reference. On error the
-    /// caller still owns it. No CPU payload mapping, allocation or copy occurs.
+    /// Adopt either a queue mapping alias or the driver's own normal import.
+    /// A normal import leases only logical bytes; its last partial segment
+    /// still identifies the retained backing page for RM address translation.
+    /// No access to page padding is granted. On error the caller owns the ref.
     pub fn init(token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext, adapter: u32, space: vaspace.Info,
         parent: names.Lease, source: a.GfxBufferReference, deadline: u64) Error!Owner
     {
@@ -64,7 +66,7 @@ pub const Owner = struct {
             adapter == 0 or space.epoch != token.session.epoch or parent.epoch != space.epoch or parent.client != space.client) return error.Stale;
         try token.session.guard(deadline);
         if (source.version != 1 or source.size < @sizeOf(a.GfxBufferReference) or source.reserved0 != 0 or
-            source.flags != a.gfx_buffer_reference_mapping_only or !handleValid(source.reference) or !handleValid(source.buffer)) return error.Descriptor;
+            (source.flags != 0 and source.flags != a.gfx_buffer_reference_mapping_only) or !handleValid(source.reference) or !handleValid(source.buffer)) return error.Descriptor;
         const memory = ctx.memory() orelse return error.Api;
         const heap = ctx.heap() orelse return error.Api;
         var descriptor: a.GfxBufferDescriptor = .{};
@@ -99,7 +101,8 @@ pub const Owner = struct {
     pub fn info(self: *const Owner) ?Info {
         self.stable() catch return null;
         if (self.self_address != @intFromPtr(self) or (self.state != .ready and self.state != .handed_off) or
-            self.exchange.session.state != .active or self.mapped != self.parts or !self.allocated or self.gpu.lease.id == 0) return null;
+            self.exchange.session.state != .active or self.mapped != self.parts or !self.allocated or self.dma.lease.id == 0 or
+            (self.source.flags == a.gfx_buffer_reference_mapping_only and self.gpu.lease.id == 0)) return null;
         return .{ .epoch = self.space.epoch, .buffer = self.source.buffer, .virtual = self.reservation.object(self.parts) catch return null,
             .address = self.address, .logical_bytes = self.logical_bytes, .mapped_bytes = self.mapped_bytes, .parts = self.parts };
     }
@@ -129,7 +132,7 @@ pub const Owner = struct {
             value.cpu_address & 7 != 0 or value.byte_length < scratch_bytes or value.alignment < 8 or value.reserved != 0 or
             value.cpu_address > std.math.maxInt(u64) - value.byte_length) return error.Descriptor;
         if (allocated != a.driver_heap_ok) return error.Memory;
-        const acquired = self.memory.deviceAcquire(&self.source.reference, &.{ .byte_length = self.mapped_bytes, .adapter_id = self.adapter,
+        const acquired = self.memory.deviceAcquire(&self.source.reference, &.{ .byte_length = self.leaseBytes(), .adapter_id = self.adapter,
             .device_generation = self.space.epoch, .access = 4, .dma_mask = dma_mask }, &self.dma);
         self.dma_stamp = self.dma;
         if (acquired != a.gfx_buffer_result_ok and self.dma.lease.id == 0) return error.Map;
@@ -139,9 +142,12 @@ pub const Owner = struct {
     }
     fn deviceValid(self: *const Owner, value: a.GfxDeviceLease, access: u32, address: u64) bool {
         return value.version == 1 and value.size >= @sizeOf(a.GfxDeviceLease) and handleValid(value.lease) and
-            value.byte_offset == 0 and value.byte_length == self.mapped_bytes and value.gpu_virtual_address == address and
+            value.byte_offset == 0 and value.byte_length == self.leaseBytes() and value.gpu_virtual_address == address and
             value.device_generation == self.space.epoch and value.adapter_id == self.adapter and value.driver_owner != 0 and
             value.access == access and value.address_space == @as(u32, if (access == 3) 1 else 0);
+    }
+    fn leaseBytes(self: *const Owner) u64 {
+        return if (self.source.flags == a.gfx_buffer_reference_mapping_only) self.mapped_bytes else self.logical_bytes;
     }
     fn gather(self: *Owner, index: u16) Error!bool {
         const extent = self.part(index);
@@ -149,11 +155,13 @@ pub const Owner = struct {
         const end = @min(count, self.loaded_pages + page_batch);
         while (self.loaded_pages < end) : (self.loaded_pages += 1) {
             const offset = extent.offset + self.loaded_pages * 4096;
+            if (offset >= self.leaseBytes()) return error.Bounds;
+            const bytes = @min(@as(u64, 4096), self.leaseBytes() - offset);
             var segment: a.GfxDmaSegment = .{};
             if (self.memory.deviceSegment(&self.dma, offset, &segment) != a.gfx_buffer_result_ok) return error.Map;
             if (segment.version != 1 or segment.size < @sizeOf(a.GfxDmaSegment) or segment.dma_address == 0 or
                 segment.dma_address & 4095 != 0 or segment.dma_address > dma_mask - 4095 or
-                segment.byte_length != 4096 or segment.next_offset != offset + 4096) return error.Descriptor;
+                segment.byte_length != bytes or segment.next_offset != offset + bytes) return error.Descriptor;
             self.pages()[self.loaded_pages] = segment.dma_address;
         }
         return self.loaded_pages == count;
@@ -245,7 +253,12 @@ pub const Owner = struct {
         return null;
     }
     fn retainGpu(self: *Owner) Error!void {
-        const acquired = self.memory.deviceAcquire(&self.source.reference, &.{ .byte_length = self.mapped_bytes, .gpu_virtual_address = self.address,
+        // A normal BO import does not grant page padding, and the common
+        // virtual-mapping descriptor requires whole pages. Its exact-length
+        // DMA backing lease already retains every mapped page until RM unmap.
+        // Execution is separately leased by Initial or the common queue.
+        if (self.source.flags == 0) return;
+        const acquired = self.memory.deviceAcquire(&self.source.reference, &.{ .byte_length = self.leaseBytes(), .gpu_virtual_address = self.address,
             .adapter_id = self.adapter, .device_generation = self.space.epoch, .access = 3, .address_space = 1 }, &self.gpu);
         self.gpu_stamp = self.gpu;
         if (acquired != a.gfx_buffer_result_ok and self.gpu.lease.id == 0) return error.Map;

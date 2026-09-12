@@ -25,6 +25,9 @@ pub const Model = struct {
     pub var lost = false;
     pub var unregisters: usize = 0;
     pub var presentation_wakes: usize = 0;
+    pub var initial_read: a.GfxDeviceLease = .{};
+    pub var reject_initial_read = false;
+    pub var reject_initial_release = false;
     pub var reject_resource = false;
     pub var native_index: usize = 0;
     var app_reference = false;
@@ -43,6 +46,7 @@ pub const Model = struct {
         references = @splat(.{}); dma = @splat(.{}); gpu = @splat(.{}); queued = false; active = false;
         completed = 0; result = 0; lost = false; unregisters = 0; reject_resource = false; native_index = index; fetched = false; executed = false; signaled = false;
         present_mode = false; shadow_live = false; registration = null; decoded_count = 0; presentation_wakes = 0;
+        initial_read = .{}; reject_initial_read = false; reject_initial_release = false;
         app_reference = true; native.slots[index].imported = true; // Separate app alias, independent of the allocator's producer reference.
         for (0..2) |i| { @memset(&host[i], 0xa5); @memset(&gpu_data[i], 0x5a); }
         @memset(&vram_data, 0xcc);
@@ -148,10 +152,12 @@ pub const Model = struct {
         return a.gfx_buffer_result_ok;
     }
     fn importBuffer(input: *const a.GfxBufferHandle, out: *a.GfxBufferReference) callconv(.c) i32 {
-        if (!present_mode or !std.meta.eql(input.*, shadowReference())) {
+        const own = if (select(input.*)) |index| references[index].active and !references[index].mapping_only and
+            std.meta.eql(references[index].buffer, sys(0)) else false;
+        if (!present_mode or (!std.meta.eql(input.*, shadowReference()) and !own)) {
             const call: *const fn (*const a.GfxBufferHandle, *a.GfxBufferReference) callconv(.c) i32 = @ptrFromInt(original.buffer_import); return call(input, out);
         }
-        std.debug.assert(shadow_live);
+        std.debug.assert(shadow_live or own);
         for (&references, 0..) |*entry, i| if (!entry.active) {
             entry.* = .{ .active = true, .buffer = sys(0), .mapping_only = false };
             out.* = .{ .reference = ref(i), .buffer = entry.buffer }; return a.gfx_buffer_result_ok;
@@ -165,7 +171,19 @@ pub const Model = struct {
     }
     fn acquire(input: *const a.GfxBufferHandle, request: *const a.GfxDeviceRequest, out: *a.GfxDeviceLease) callconv(.c) i32 {
         const index = select(input.*).?; const entry = references[index]; const i = system(entry.buffer).?;
-        const mapped_bytes = if (present_mode) (shadow_descriptor.byte_length + 4095) & ~@as(u64, 4095) else length;
+        if (request.access == 0) {
+            std.debug.assert(present_mode and entry.active and !entry.mapping_only and i == 0 and initial_read.lease.id == 0 and
+                !active and !queued and request.byte_offset == 0 and request.byte_length == shadow_descriptor.byte_length and
+                dma[0].lease.id != 0 and request.gpu_virtual_address == address(0) and request.address_space == 1);
+            if (reject_initial_read) return a.gfx_buffer_error_busy;
+            out.* = .{ .lease = .{ .id = 1799, .generation = 991 }, .byte_length = request.byte_length,
+                .gpu_virtual_address = request.gpu_virtual_address, .device_generation = request.device_generation, .adapter_id = request.adapter_id,
+                .driver_owner = 7, .access = 0, .address_space = 1, .dma_mask = request.dma_mask };
+            initial_read = out.*; gpu_data[0] = host[0]; fetched = false; executed = false; signaled = false;
+            return a.gfx_buffer_result_ok;
+        }
+        const mapped_bytes = if (present_mode)
+            (if (entry.mapping_only) (shadow_descriptor.byte_length + 4095) & ~@as(u64, 4095) else shadow_descriptor.byte_length) else length;
         std.debug.assert(entry.active and request.byte_offset == 0 and request.byte_length == mapped_bytes);
         const virtual = request.access == 3;
         if (virtual) std.debug.assert(dma[i].lease.id != 0 and gpu[i].lease.id == 0 and request.gpu_virtual_address == address(i) and request.address_space == 1)
@@ -179,10 +197,16 @@ pub const Model = struct {
     fn segment(input: *const a.GfxDeviceLease, offset: u64, out: *a.GfxDmaSegment) callconv(.c) i32 {
         const i = (input.lease.id - 1701) / 2;
         std.debug.assert(std.meta.eql(input.*, dma[i]) and offset < input.byte_length and offset & 4095 == 0);
-        out.* = .{ .dma_address = 0x6000000000 + @as(u64, i) * 0x100000 + offset * 2, .byte_length = 4096, .next_offset = offset + 4096 };
+        const bytes = @min(@as(u64, 4096), input.byte_length - offset);
+        out.* = .{ .dma_address = 0x6000000000 + @as(u64, i) * 0x100000 + offset * 2, .byte_length = bytes, .next_offset = offset + bytes };
         return a.gfx_buffer_result_ok;
     }
     fn releaseDevice(input: *const a.GfxDeviceLease, quiesced: u32) callconv(.c) i32 {
+        if (input.access == 0) {
+            std.debug.assert(std.meta.eql(input.*, initial_read) and quiesced == 1 and !active and (!fetched or signaled));
+            if (reject_initial_release) return a.gfx_buffer_error_busy;
+            initial_read = .{}; return a.gfx_buffer_result_ok;
+        }
         const i = (input.lease.id - 1701) / 2; std.debug.assert(quiesced == 1 and !active);
         if (input.access == 3) { std.debug.assert(std.meta.eql(input.*, gpu[i])); gpu[i] = .{}; }
         else { std.debug.assert(gpu[i].lease.id == 0 and std.meta.eql(input.*, dma[i])); dma[i] = .{}; }
@@ -193,7 +217,8 @@ pub const Model = struct {
     fn data(address_value: u64, bytes: usize) ![]u8 {
         for (0..2) |i| if (address_value >= address(i) and address_value - address(i) < length) {
             const offset: usize = @intCast(address_value - address(i));
-            if (bytes > length - offset or gpu[i].lease.id == 0) return error.GpuAddress;
+            if (bytes > length - offset or (gpu[i].lease.id == 0 and
+                !(present_mode and i == 0 and dma[0].lease.id != 0 and (active or initial_read.lease.id != 0)))) return error.GpuAddress;
             return gpu_data[i][offset..][0..bytes];
         };
         const base = native.address(native_index);
@@ -201,7 +226,7 @@ pub const Model = struct {
         const offset: usize = @intCast(address_value - base); return vram_data[offset..][0..bytes];
     }
     pub fn fetch(owner: *@import("gsp_fifo.zig").Owner, mmio: []const u8) !void {
-        try t.expect(active and !fetched and owner.ring.pending == null);
+        try t.expect((active or initial_read.lease.id != 0) and !fetched and owner.ring.pending == null);
         try t.expect(word(mmio, 0xbb0090) == owner.work_submit_token.?);
         // The device observes commands only at the published doorbell boundary.
         command_view = fifo.slots[0].data;
@@ -231,7 +256,7 @@ pub const Model = struct {
         fetched = true;
     }
     pub fn execute() !void {
-        try t.expect(active and fetched and !executed);
+        try t.expect((active or initial_read.lease.id != 0) and fetched and !executed);
         if (present_mode) {
             for (0..decoded[10]) |y| {
                 const source = try data(operand(decoded[3], decoded[4]) + y * decoded[7], decoded[9]);
@@ -246,7 +271,7 @@ pub const Model = struct {
         executed = true;
     }
     pub fn signal() !void {
-        try t.expect(active and executed and !signaled);
+        try t.expect((active or initial_read.lease.id != 0) and executed and !signaled);
         // SYS-scope release makes preceding CE data visible before the point.
         host[0] = gpu_data[0]; host[1] = gpu_data[1];
         std.mem.writeInt(u32, fifo.slots[0].data[8704..8708], decoded[if (present_mode) @as(usize, 16) else 14], .little);

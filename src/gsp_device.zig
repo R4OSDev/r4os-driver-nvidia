@@ -476,13 +476,19 @@ pub const Device = struct {
             const root = if (self.running.display_engine_owner) |*value| value else return error.Binding;
             const graph = if (self.running.graph) |*value| value else return error.Binding;
             const staging = if (graph.control_buffer) |*value| value else return error.Binding;
-            if (self.running.copy_job != null or root.channels_started or root.info() == null or !root.instance_bound or
+            if (self.running.copy_job != null or self.running.initial_image != null or root.channels_started or root.info() == null or !root.instance_bound or
                 !resources.valid() or !std.meta.eql(resources.binding.?, root.binding) or resources.instance != &root.instance_storage or
                 work.operation.table != &resources.table or work.operation.source != staging or work.operation.target != &root.instance_storage or
                 !work.operation.matches(ticket, deadline) or fifo.config.context.vaspace != staging.binding.space.handle) return error.Binding;
             if (!fifo.ring.matchesTransfer(ticket, fifo.config.copy_class, work.operation.transfer() catch return error.Binding)) return error.Binding;
             for (&self.running.display_channels) |*entry| if (entry.* != null) return error.Binding;
             break :blk work.channel_handle;
+        } else if (self.running.initial_image) |*work| blk: {
+            const entry = if (self.running.presentation) |*value| value else return error.Binding;
+            if (self.running.copy_job != null or !work.operation.matches(ticket, deadline)) return error.Binding;
+            const transfer = self.running.initialImageTransfer() catch return error.Binding;
+            if (!fifo.ring.matchesTransfer(ticket, fifo.config.copy_class, transfer)) return error.Binding;
+            break :blk entry.channel_handle;
         } else blk: {
             const work = if (self.running.copy_job) |*value| value else return error.Binding;
             if (work.submitted or work.ticket == null or !std.meta.eql(work.ticket.?, ticket) or !std.meta.eql(work.job, work.job_stamp) or
@@ -506,7 +512,7 @@ pub const Device = struct {
             self.running.self_address != @intFromPtr(&self.running) or self.running.failure != null or self.running.sequence.self_address != 0 or
             self.running.fifo_active != null or self.running.context_active != null or self.running.native_active != null or self.running.buffer_active != null or
             self.running.outputs.active() or self.running.graph_closing or self.running.display_engine_active or self.running.display_channel_active != null or
-            self.running.copy_job != null or self.running.display_upload_job != null) return error.State;
+            self.running.copy_job != null or self.running.display_upload_job != null or self.running.initial_image != null) return error.State;
         const work = if (self.running.display_work) |*value| value else return error.Binding;
         const resources = self.running.display_resources_slot.owner orelse return error.Binding;
         const root = if (self.running.display_engine_owner) |*value| value else return error.Binding;
@@ -523,6 +529,11 @@ pub const Device = struct {
             part.config.initialize == channel.ring.initialized) return error.Binding;
         if (work.window) |*window_part| {
             const route = work.core.config.route orelse return error.Binding;
+            if (self.running.presentation) |*entry| {
+                const status = self.running.initialImageStatus() catch return error.Binding;
+                if (status.pending or status.completed == 0 or !std.meta.eql(entry.window, window_part.handle) or
+                    !std.meta.eql(entry.surface.scanout, window_part.config.scanout)) return error.Binding;
+            }
             if (route.window >= 8 or route.head >= root_info.hardware.heads or window_part.handle.slot != 1 + route.window or
                 work.core.config.kind != .core or window_part.config.kind != .window or
                 !std.meta.eql(window_part.config.route, work.core.config.route) or
