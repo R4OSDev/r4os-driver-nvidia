@@ -1532,6 +1532,8 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         context_fifo_success, context_fifo_allocate, context_fifo_bind, context_fifo_token, context_fifo_enable,
         context_fifo_changed, context_fifo_ack, context_fifo_timeout, context_fifo_disable, context_fifo_free, context_fifo_dma,
         context_copy_success, context_copy_class, context_copy_allocate, context_copy_changed, context_copy_timeout, context_copy_completion,
+        context_copy_rc, context_copy_rc_unmatched, context_copy_mmu, context_copy_xid, context_copy_fault_ack, context_copy_irq,
+        context_copy_capacity, context_copy_oom, context_copy_invalid, context_copy_lost_idle, context_copy_fastpath,
         outputs_empty, outputs_all, outputs_rejected, outputs_partial, outputs_missing, outputs_incomplete, outputs_bad_edid,
         outputs_edid_rejected, outputs_ddc, outputs_ddc_bus_changed, outputs_aux, outputs_wiring, outputs_virtual, outputs_changed, outputs_final_changed, outputs_final_rejected, outputs_hpd, outputs_sequence, outputs_ack, outputs_timeout, catalog_rejected,
         runtime_healthy, runtime_lockdown, runtime_unknown, runtime_unowned, runtime_sequence_timeout,
@@ -2831,7 +2833,26 @@ fn checkDeviceCopies(target: *@import("gsp_device.zig").Device, table: *a.Driver
         for (&model.host[0], 0..) |*v, i| v.* = @truncate(i * 37 + 11);
         const raw: [*]const u8 = @ptrFromInt(target.port.window.cpu_address);
         const mmio = raw[0..@intCast(target.port.window.byte_length)];
-        const repeats: usize = if (vram_model.is("context_copy_success")) 514 else 1;
+        const capacity = vram_model.is("context_copy_capacity");
+        if (capacity) {
+            model.reject_resource = true; model.enqueue(false);
+            const prior = session.tx_sequence;
+            try t.expect(try running.beginCopyWork(handle, model.binding, deadline));
+            try t.expect(running.copy_job == null and !model.active and !model.lost and model.result == a.gfx_queue_result_failed and
+                model.heldReferences() == 0 and fifo_owner.ring.issued == 0 and session.tx_sequence == prior);
+            const record = &running.faults.records[(running.faults.serial - 1) % 16];
+            try t.expect(record.kind == .resource and !record.fatal and running.failure == null);
+            model.reject_resource = false; model.enqueue(false);
+            var changed = model.binding; changed.reset_generation += 1;
+            try t.expectError(error.Stale, running.beginCopyWork(handle, changed, deadline));
+            try t.expect(model.queued and !model.active); // The stale owner never takes the queued successor.
+            try t.expect(try running.beginCopyWork(handle, model.binding, clock + 1));
+            clock += 1; _ = target.step();
+            try t.expect(running.copy_job == null and running.failure == null and !model.lost and model.result == a.gfx_queue_result_failed and
+                model.heldReferences() == 0 and fifo_owner.ring.issued == 0 and session.tx_sequence == prior);
+            try running.releaseNativeBuffer(data_handle);
+        }
+        const repeats: usize = if (capacity) 0 else if (vram_model.is("context_copy_success")) 514 else 1;
         for (0..repeats) |iteration| {
             const readback = iteration % 2 == 1;
             model.enqueue(readback);
@@ -2858,6 +2879,7 @@ fn checkDeviceCopies(target: *@import("gsp_device.zig").Device, table: *a.Driver
             _ = target.step();
             try t.expect(model.completed == iteration and model.heldReferences() == held);
             if (iteration == 1) try t.expect(std.mem.allEqual(u8, model.host[1][71..][0..4091], 0xa5));
+            if (try checkCopyFault(target, fifo_owner, handle, deadline, scenario, held)) return;
             if (vram_model.is("context_copy_timeout") or vram_model.is("context_copy_completion")) {
                 if (vram_model.is("context_copy_timeout")) clock = deadline
                 else std.mem.writeInt(u32, fifo_model.slots[0].data[8704..8708], fifo_owner.ring.issued + 1, .little);
@@ -2865,21 +2887,39 @@ fn checkDeviceCopies(target: *@import("gsp_device.zig").Device, table: *a.Driver
                 try t.expect(target.phase == .recovering and running.copy_job != null and model.active and model.heldReferences() == held and
                     fifo_model.slots[0].active and fifo_model.slots[0].cpu and vram_model.slots[model.native_index].live);
                 try t.expect(target.failure.? == if (vram_model.is("context_copy_timeout")) error.Timeout else error.Completion);
+                try t.expect(model.lost and model.result == a.gfx_queue_result_device_lost and model.unregisters == 1 and
+                    running.quarantine_result.? == a.gfx_queue_error_busy);
                 return;
             }
             try model.signal(); _ = target.step();
             try t.expect(running.copy_job == null and model.completed == iteration + 1 and model.result == a.gfx_queue_result_complete and fifo_owner.ring.idle());
+            if (vram_model.is("context_copy_lost_idle")) {
+                var xid: [272]u8 = @splat(0); outputWord(&xid, 0, 79);
+                try nativeEvent(session, 0x1006, &xid); _ = target.step();
+                try t.expect(target.phase == .recovering and model.lost and model.unregisters == 1 and running.quarantine_result.? == a.gfx_queue_ok and
+                    running.copy_job == null and model.completed == 1 and fifo_model.slots[0].active);
+                return;
+            }
             if (readback) try t.expectEqualSlices(u8, model.host[0][33..][0..4091], model.host[1][71..][0..4091])
             else try t.expectEqualSlices(u8, model.host[0][33..][0..4091], model.vram_data[129..][0..4091]);
         }
-        try t.expect(fifo_owner.ring.put == 2 and fifo_owner.ring.issued == 514 and running.copy_completed == 514);
+        if (!capacity) try t.expect(fifo_owner.ring.put == 2 and fifo_owner.ring.issued == 514 and running.copy_completed == 514);
         // Bounds are rejected before a GPU put or doorbell can advance.
-        model.enqueue(false); model.job.byte_length = 9000;
-        const old_put = fifo_owner.ring.put;
-        try t.expect(try running.beginCopyWork(handle, model.binding, deadline)); _ = target.step();
-        try t.expect(running.copy_job == null and model.result == a.gfx_queue_result_failed and fifo_owner.ring.put == old_put);
+        if (!capacity) {
+            model.enqueue(false); model.job.byte_length = 9000;
+            const old_put = fifo_owner.ring.put;
+            try t.expect(try running.beginCopyWork(handle, model.binding, deadline)); _ = target.step();
+            try t.expect(running.copy_job == null and model.result == a.gfx_queue_result_failed and fifo_owner.ring.put == old_put);
+        }
         model.closeApp();
-    } else try t.expect((vram_model.is("context_copy_class") or vram_model.is("context_copy_allocate")) and fifo_owner.ring.self_address == 0);
+    } else {
+        try t.expect((vram_model.is("context_copy_class") or vram_model.is("context_copy_allocate") or vram_model.is("context_copy_oom") or
+            vram_model.is("context_copy_invalid")) and fifo_owner.ring.self_address == 0);
+        const record = &running.faults.records[(running.faults.serial - 1) % 16];
+        if (vram_model.is("context_copy_oom") or vram_model.is("context_copy_invalid"))
+            try t.expect(record.source == .rm and !record.fatal and record.operation == .channel and record.rm_handle == fifo_owner.config.handle and
+                record.kind == if (vram_model.is("context_copy_oom")) @as(@import("gsp_faults.zig").Kind, .resource) else .invalid_channel);
+    }
     @import("gsp_buffer_test_model.zig").Model.closeHeapAdmission(table);
     try running.beginDestroyGraph(deadline, true);
     var steps: usize = 0;
@@ -2898,6 +2938,67 @@ fn checkDeviceCopies(target: *@import("gsp_device.zig").Device, table: *a.Driver
     for (&running.fifos) |*slot| try t.expect(slot.owner == null);
     for (&running.buffers) |*slot| try t.expect(slot.owner == null);
     if (vram_model.is("context_copy_success")) try t.expect(model.heldReferences() == 0);
+}
+fn checkCopyFault(target: *@import("gsp_device.zig").Device, fifo_owner: *@import("gsp_fifo.zig").Owner,
+    handle: @import("gsp_runtime.zig").ChannelHandle, deadline: u64, scenario: []const u8, held: usize) !bool
+{
+    const cases = [_][]const u8{ "context_copy_rc", "context_copy_rc_unmatched", "context_copy_mmu", "context_copy_xid",
+        "context_copy_fault_ack", "context_copy_irq", "context_copy_fastpath" };
+    var matched = false; for (cases) |name| if (std.mem.eql(u8, scenario, name)) { matched = true; };
+    if (!matched) return false;
+    const model = @import("gsp_copy_test_model.zig").Model;
+    const native_model = @import("gsp_vram_test_model.zig").Model;
+    const fifo_model = @import("gsp_fifo_test_model.zig").Model;
+    const running = &target.running; const session = &target.session.?;
+    const rc = native_model.is("context_copy_rc");
+    const irq = native_model.is("context_copy_irq");
+    const mmu = native_model.is("context_copy_mmu");
+    const xid = native_model.is("context_copy_xid");
+    const ack_failure = native_model.is("context_copy_fault_ack");
+    const unmatched = native_model.is("context_copy_rc_unmatched");
+    const fastpath = native_model.is("context_copy_fastpath");
+    const golden = @embedFile("fixtures/fault-570.144.bin");
+    const prior_tx = session.tx_sequence;
+    const prior_irqs = target.interrupts.interrupts;
+    if (rc) try model.signal(); // Error and valid semaphore are simultaneously observable.
+    if (irq) {
+        const irqs = @import("gsp_irq.zig"); const words: [*]u32 = @ptrFromInt(target.port.window.cpu_address);
+        words[irqs.reg.top / 4] = 8; words[(irqs.reg.leaf + 24) / 4] = 512;
+        words[irqs.reg.mask / 4] = 0xff; words[irqs.reg.status / 4] = 0x42;
+        const before = range_calls;
+        try t.expect(IrqModel.dispatch(IrqModel.irq) == a.irq_result_handled and range_calls == before and running.faults.first_fatal == null);
+    } else if (mmu) try nativeEvent(session, 0x1005, &.{}) else if (xid) {
+        const payload = golden[80..352].*;
+        try nativeEvent(session, 0x1006, &payload);
+    } else {
+        var payload = golden[32..80].*;
+        outputWord(&payload, 0, if (unmatched) 0x777 else try @import("gsp_context.zig").wire.nvEngine(fifo_owner.config.rm_engine));
+        if (fastpath) outputWord(&payload, 16, 141);
+        try nativeEvent(session, 0x1004, &payload);
+        if (ack_failure) range_failure_call = range_calls + 4;
+    }
+    _ = target.step(); range_failure_call = 0;
+    try t.expect(target.phase == .recovering and running.copy_job != null and model.active and model.lost and model.completed == 0 and
+        model.heldReferences() == held and fifo_model.slots[0].active and fifo_model.slots[0].cpu and native_model.slots[model.native_index].live);
+    try t.expect(model.result == a.gfx_queue_result_device_lost and model.unregisters == 1 and running.quarantine_result.? == a.gfx_queue_error_busy);
+    const record = &running.faults.first_fatal.?;
+    try t.expect(record.epoch == running.epoch and record.active_fence.point == model.job.fence.point and record.copy_point == 1 and
+        record.acknowledged == (!irq and !ack_failure) and (session.pending != null) == ack_failure and session.tx_sequence == prior_tx);
+    if (irq) try t.expect(record.source == .irq and record.irq_raw == 0x42 and record.irq_mask == 0xff and record.irq_received == prior_irqs + 1)
+    else if (mmu) try t.expect(record.source == .mmu_queue and record.kind == .mmu and record.fault_address == null)
+    else if (xid) try t.expect(record.source == .xid and record.kind == .device and record.hardware_channel == null)
+    else try t.expect(record.source == .rc and record.hardware_channel.? == 0xabc and record.source_address_match and !record.target_address_match and
+        record.candidate_channels == @as(u16, if (unmatched) 0 else 1) and record.candidate_rm_handle == @as(u32, if (unmatched) 0 else fifo_owner.config.handle));
+    // Late semaphore writes and a caller's quiesced=true cannot revive/free
+    // this epoch or let a successor binding consume the retained job.
+    if (!rc) try model.signal();
+    var successor = model.binding; successor.reset_generation += 1;
+    try t.expectError(error.State, running.beginCopyWork(handle, successor, deadline));
+    try t.expectError(error.State, running.retireExecutionChannel(handle, deadline, true));
+    try t.expectError(error.State, running.beginDestroyGraph(deadline, true));
+    try t.expectError(error.State, running.step()); running.stop(error.Stopped);
+    try t.expect(model.unregisters == 1 and model.heldReferences() == held and model.active and fifo_owner.ring.completed == 0);
+    return true;
 }
 fn replyDeviceFifo(target: *@import("gsp_device.zig").Device, counts: *FifoCounts, scenario: []const u8) !void {
     const model = @import("gsp_vram_test_model.zig").Model;
@@ -2958,6 +3059,8 @@ fn replyDeviceFifo(target: *@import("gsp_device.zig").Device, counts: *FifoCount
             outputWord(&response, if (op == .allocate) 16 else 12, 0x57);
         if (op == .allocate and model.is("context_fifo_changed")) response[56] ^= 1;
         if (op == .allocate_copy and model.is("context_copy_allocate")) outputWord(&response, 16, 0x57);
+        if (op == .allocate_copy and model.is("context_copy_oom")) outputWord(&response, 16, 0x51);
+        if (op == .allocate_copy and model.is("context_copy_invalid")) outputWord(&response, 16, 0x21);
         if (op == .allocate_copy and model.is("context_copy_changed")) response[36] ^= 1;
         if (op == .bind and !counts.event) {
             var print: [9]u8 = @splat(0); print[4] = 1; print[8] = 'F';
@@ -3780,12 +3883,12 @@ fn checkDeviceRuntime(target: *@import("gsp_device.zig").Device, words: []u32, f
             try nativeEvent(&target.session.?, 0x100c, &print);
             try t.expect(target.step() == .progress and target.running.channel.?.pending == null);
             var xid: [272]u8 = @splat(0);
-            std.mem.writeInt(u32, xid[0..4], 79, .little);
+            std.mem.writeInt(u32, xid[0..4], 23, .little);
             std.mem.writeInt(u32, xid[4..8], 3, .little);
             std.mem.writeInt(u32, xid[8..12], 4, .little);
             @memcpy(xid[12..16], "diag");
             try nativeEvent(&target.session.?, 0x1006, &xid);
-            try t.expect(target.step() == .progress and target.running.snapshot.xid_count == 1 and target.running.snapshot.last_xid == 79);
+            try t.expect(target.step() == .progress and target.running.snapshot.xid_count == 1 and target.running.snapshot.last_xid == 23);
             const nocat: [1208]u8 = @splat(0);
             try nativeEvent(&target.session.?, 0x1020, &nocat);
             try t.expect(target.step() == .progress and target.running.snapshot.nocat_count == 1);

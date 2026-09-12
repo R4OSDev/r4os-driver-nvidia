@@ -1202,6 +1202,26 @@ const EventSink = struct {
     }
 };
 fn checkRuntimeEvents(model: *Model) !void {
+    const diagnostics = @import("gsp_faults.zig");
+    const golden = @embedFile("fixtures/fault-570.144.bin");
+    try t.expect(golden.len == 352);
+    for ([_]u32{31,141,79,0x21,0x1a,0x51,4,28}, 0..) |expected, i|
+        try t.expectEqual(expected, std.mem.readInt(u32, golden[i * 4..][0..4], .little));
+    const scope: runtime_events.Scope = .{ .epoch = 7, .deadline = 9000,
+        .ticket = .{ .epoch = 7, .serial = 1, .sequence = 3, .cursor = 0, .next = 1 } };
+    const original_rc = diagnostics.event(scope, try runtimeEvent(model, 0x1004, golden[32..80]), 1234).?;
+    try t.expect(original_rc.kind == .mmu and original_rc.hardware_channel == 0xabc and original_rc.nv_engine == 0x34 and
+        original_rc.fault_address == 0x80000021 and original_rc.callback_needed and original_rc.fatal);
+    const original_xid = diagnostics.event(scope, try runtimeEvent(model, 0x1006, golden[80..352]), 1234).?;
+    try t.expect(original_xid.kind == .device and original_xid.hardware_channel == null and original_xid.runlist == null);
+    var journal: diagnostics.Journal = .{};
+    _ = try journal.append(original_rc);
+    for (0..20) |_| _ = try journal.append(.{ .source = .xid, .kind = .information });
+    var wrong = scope; wrong.ticket.serial += 1; journal.acknowledge(wrong);
+    try t.expect(journal.pending and journal.first_fatal.?.serial == 1 and !journal.first_fatal.?.acknowledged and journal.dropped == 5);
+    journal.acknowledge(scope);
+    try t.expect(journal.first_fatal.?.acknowledged and journal.first_fatal.?.fault_address == 0x80000021);
+    try t.expect(diagnostics.rmKind(0x21) == .invalid_channel and diagnostics.rmKind(0x1a) == .resource and diagnostics.rmKind(0x51) == .resource);
     var post: [40]u8 = undefined;
     var event = try runtimeEvent(model, 0x1003, postPayload(&post));
     const p = event.post_event;

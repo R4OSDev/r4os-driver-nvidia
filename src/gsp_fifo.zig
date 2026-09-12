@@ -291,6 +291,7 @@ pub const Owner = struct {
     request: [wire.max_bytes]u8 = undefined,
     deadline: u64 = 0,
     rejected: ?u32 = null,
+    last_status: ?u32 = null,
     host_rejected: ?anyerror = null,
     failure: ?anyerror = null,
     protocol_failure: ?exchange.Error = null,
@@ -417,6 +418,7 @@ pub const Owner = struct {
         if (!dispatch.response) return dispatch;
         const op = self.operation.?;
         const reply = try wire.decode(self.config, op, rpc.request, dispatch.record);
+        self.last_status = if (reply == .rejected) reply.rejected else 0;
         try rpc.complete(dispatch.ticket);
         if (reply == .rejected) {
             if (self.state != .creating) return error.FirmwareResult;

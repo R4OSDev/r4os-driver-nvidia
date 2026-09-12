@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.76; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.77; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -11,6 +11,20 @@ Starting with R4OS 0.79.9, `IMAGE_SCOPE=slim` includes the current module in
 Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
+
+Fault diagnosis and quarantine (NVIDIA 0.1.77):
+Roadmap 0.79.11 is software complete, including its combined targeted
+memory/channel acceptance. A bounded worker journal separates hardware
+CHID from RM handles/cid and opaque tokens, preserves the first fatal
+cause and ACK state, and correlates candidate channels and active jobs.
+Queued faults take priority over CE completion. The common queue receives
+device-lost without a quiescence claim; active resources remain retained.
+Known pre-submission OOM rejections unwind safely. Existing 51 groups,
+original C fault vectors and the module build pass. Physical qualification
+remains open in OssiGPU.txt; passive bootfb remains the default.
+Evidence: GrafikSpeicher07911.json / fault_checkpoint.
+
+Earlier checkpoint entries below describe their respective implementation state.
 
 Native CE submission and completion (NVIDIA 0.1.76):
 The internal worker discovers and allocates C7B5/C6B5 under its FIFO, uses
@@ -24,8 +38,6 @@ original C class vectors and the module build pass.0.79.11 T1-T5 are software
 complete; T6 fault handling and combined acceptance remain open. The passive
 default and unqualified product engine/render/display capabilities remain.
 Evidence: GrafikSpeicher07911.json / copy_checkpoint.
-
-Earlier checkpoint entries below describe their respective implementation state.
 
 Per-channel GPFIFO ownership (NVIDIA 0.1.75):
 The runtime creates C56F under its confirmed group/context share, with a

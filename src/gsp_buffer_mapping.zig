@@ -50,6 +50,7 @@ pub const Owner = struct {
     small_request: [wire.max_request_bytes]u8 = undefined,
     deadline: u64,
     rejected: ?u32 = null,
+    last_status: ?u32 = null,
     host_rejected: ?Error = null,
     failure: ?Error = null,
     protocol_failure: ?exchange.Error = null,
@@ -217,6 +218,7 @@ pub const Owner = struct {
         const operation = self.operation.?;
         const reply = try wire.decodePart(try self.binding(self.operation_part), self.part(self.operation_part), operation,
             self.request()[0..self.request_bytes], dispatch.record, self.address);
+        self.last_status = if (reply == .rejected) reply.rejected else 0;
         try self.exchange.complete(dispatch.ticket);
         if (reply == .rejected) {
             if (self.state != .creating) return error.FirmwareResult;

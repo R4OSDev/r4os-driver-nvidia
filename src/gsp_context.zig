@@ -333,6 +333,7 @@ pub const Owner = struct {
     request: [wire.max_bytes]u8 = undefined,
     operation: ?wire.Operation = null,
     rejected: ?u32 = null,
+    last_status: ?u32 = null,
     unavailable: ?Unavailable = null,
     failure: ?Error = null,
     protocol_failure: ?exchange.Error = null,
@@ -448,6 +449,7 @@ pub const Owner = struct {
         const more = op == .engines and reply == .ok and reply.ok[8] != 0;
         const value: u32 = if (reply == .ok and op == .method_size) wire.word(reply.ok, 0)
             else if (reply == .ok and op == .share) wire.word(reply.ok, 8) else 0;
+        self.last_status = if (reply == .rejected) reply.rejected else 0;
         try self.exchange.complete(dispatch.ticket);
         if (reply == .rejected) {
             if (self.state != .creating) return error.FirmwareResult;

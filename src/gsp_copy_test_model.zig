@@ -22,6 +22,9 @@ pub const Model = struct {
     pub var active = false;
     pub var completed: usize = 0;
     pub var result: u32 = 0;
+    pub var lost = false;
+    pub var unregisters: usize = 0;
+    pub var reject_resource = false;
     pub var native_index: usize = 0;
     var app_reference = false;
     var decoded: [17]u32 = undefined;
@@ -32,7 +35,7 @@ pub const Model = struct {
         std.debug.assert(table.gfx_memory_query.?(&original) == a.gfx_buffer_result_ok);
         table.gfx_memory_query = memory; table.gfx_queue_query = queue;
         references = @splat(.{}); dma = @splat(.{}); gpu = @splat(.{}); queued = false; active = false;
-        completed = 0; result = 0; native_index = index; fetched = false; executed = false; signaled = false;
+        completed = 0; result = 0; lost = false; unregisters = 0; reject_resource = false; native_index = index; fetched = false; executed = false; signaled = false;
         app_reference = true; native.slots[index].imported = true; // Separate app alias, independent of the allocator's producer reference.
         for (0..2) |i| { @memset(&host[i], 0xa5); @memset(&gpu_data[i], 0x5a); }
         @memset(&vram_data, 0xcc);
@@ -48,7 +51,7 @@ pub const Model = struct {
         return false;
     }
     pub fn enqueue(readback: bool) void {
-        std.debug.assert(!active and !queued);
+        std.debug.assert(!active and !queued and !lost);
         const point = completed + 1;
         job = .{ .fence = .{ .slot = 1, .adapter_id = binding.adapter_id, .timeline = 19, .point = point,
                 .device_generation = binding.device_generation, .reset_generation = binding.reset_generation },
@@ -58,9 +61,17 @@ pub const Model = struct {
             .source_offset = if (readback) 129 else 33, .target_offset = if (readback) 71 else 129, .byte_length = 4091 };
         queued = true; fetched = false; executed = false; signaled = false;
     }
-    fn queue(out: *a.GfxDriverQueueApi) callconv(.c) i32 { out.* = .{ .take = @intFromPtr(&take), .retain_resource = @intFromPtr(&retain), .complete = @intFromPtr(&complete) }; return a.gfx_queue_ok; }
+    fn queue(out: *a.GfxDriverQueueApi) callconv(.c) i32 { out.* = .{ .unregister_backend = @intFromPtr(&unregister), .take = @intFromPtr(&take), .retain_resource = @intFromPtr(&retain), .complete = @intFromPtr(&complete) }; return a.gfx_queue_ok; }
+    fn unregister(input: *const a.GfxBackendBinding, quiesced: u32) callconv(.c) i32 {
+        std.debug.assert(std.meta.eql(input.*, binding) and quiesced == 0 and !lost);
+        lost = true; unregisters += 1; queued = false;
+        if (active) result = a.gfx_queue_result_device_lost;
+        // Logical terminal result does not acknowledge the running GPU access.
+        return if (active) a.gfx_queue_error_busy else a.gfx_queue_ok;
+    }
     fn take(input: *const a.GfxBackendBinding, out: *a.GfxDriverJob) callconv(.c) i32 {
         std.debug.assert(std.meta.eql(input.*, binding));
+        if (lost) return a.gfx_queue_error_busy;
         if (!queued or active) return a.gfx_queue_error_busy;
         queued = false; active = true; out.* = job;
         // Common queue acquisition is after the app's CPU store boundary.
@@ -70,6 +81,7 @@ pub const Model = struct {
     }
     fn retain(input: *const a.GfxFence, which: u32, out: *a.GfxBufferReference) callconv(.c) i32 {
         if (!active or !std.meta.eql(input.*, job.fence) or which >= 2) return a.gfx_queue_error_invalid;
+        if (reject_resource and which == 1) return a.gfx_queue_error_capacity;
         for (&references, 0..) |*entry, i| if (!entry.active) {
             entry.* = .{ .active = true, .buffer = if (which == 0) job.source_buffer else job.target_buffer };
             out.* = .{ .reference = ref(i), .buffer = entry.buffer, .flags = a.gfx_buffer_reference_mapping_only }; return a.gfx_queue_ok;
@@ -77,7 +89,8 @@ pub const Model = struct {
         return a.gfx_queue_error_capacity;
     }
     fn complete(input: *const a.GfxFence, status: u32, quiesced: u32) callconv(.c) i32 {
-        std.debug.assert(active and std.meta.eql(input.*, job.fence) and quiesced == 1);
+        std.debug.assert(active and !lost and std.meta.eql(input.*, job.fence) and quiesced == 1);
+        std.debug.assert(status == a.gfx_queue_result_complete or status == a.gfx_queue_result_failed);
         if (status == a.gfx_queue_result_complete) std.debug.assert(signaled and executed);
         active = false; result = status; completed += 1; native.slots[native_index].imported = heldNative(); return a.gfx_queue_ok;
     }

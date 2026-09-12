@@ -282,6 +282,7 @@ pub const Device = struct {
     }
     fn fail(self: *Device, err: anyerror) void {
         if (self.failure == null) { self.failure = err; self.failed_phase = self.phase; }
+        self.running.reportIrq(&self.interrupts); // Worker-side snapshot; no allocation or BO mutation in the IRQ.
         self.running.stop(err);
         if (!self.catalog.close()) self.ctx.?.logError("NVIDIA gsp-catalog: metadata close failed; cleanup retry required");
         self.logFailure(if (self.phase == .ready) "runtime" else "startup", err);

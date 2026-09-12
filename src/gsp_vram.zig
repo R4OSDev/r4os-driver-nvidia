@@ -45,6 +45,7 @@ pub const Owner = struct {
     request_bytes: usize = 0,
     deadline: u64,
     rejected: ?u32 = null,
+    last_status: ?u32 = null,
     host_rejected: ?i32 = null,
     failure: ?Error = null,
     protocol_failure: ?exchange.Error = null,
@@ -191,6 +192,7 @@ pub const Owner = struct {
         if (op == .allocate_memory and reply == .ok) if (self.storage_policy) |policy| {
             if (reply.ok == 0 or reply.ok > policy.physical_bytes or self.bytes > policy.physical_bytes - reply.ok) return error.Bounds;
         };
+        self.last_status = if (reply == .rejected) reply.rejected else 0;
         try self.exchange.complete(dispatch.ticket);
         if (reply == .rejected) {
             if (self.state != .creating) return error.FirmwareResult;

@@ -697,3 +697,10 @@ remain in src/gsp_memory_caps.zig and the runtime license, whose unchanged
 full text. Six raw C request/reply pairs and source identities are recorded
 in src/fixtures/memory-caps-570.144.json; detailed workspace evidence is under
 ExFiles/Reference/GFX/Nvidia/0.79.11/memory-caps-20260912.
+
+NVIDIA 0.1.77 fault diagnosis: the pinned NVIDIA570.144 error/status macros,
+RC/XID declarations and CPU-RM channel lookup/notification semantics are
+archived under ExFiles/Reference/GFX/Nvidia/0.79.11/fault-diagnosis-20260912.
+All original notices are retained in NVIDIA-GSP-RUNTIME-LICENSE.txt and the
+distribution copy. R4OS journal, candidate correlation and quarantine policy
+remain original Apache-2.0 code. No private GSP CHID/token encoding is inferred.
