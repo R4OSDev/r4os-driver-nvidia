@@ -54,6 +54,7 @@ pub const Device = struct {
     recovery: teardown.Recovery = .{},
     running: runtime.Owner = .{},
     catalog: @import("gsp_catalog.zig").Owner = .{},
+    native_output: @import("gsp_native_output.zig").Owner = .{},
     board: ?@import("vbios.zig").Result = null,
     interrupts: irq.Owner = .{},
     irq_wake: ?irq.Wake = null,
@@ -218,7 +219,8 @@ pub const Device = struct {
                     }
                 } else try self.catalog.invalidate();
             }
-            return progress;
+            const output_progress = try self.native_output.step();
+            return progress or output_progress;
         }
         if (try self.now() >= self.deadline) return error.Deadline;
         switch (self.phase) {
@@ -284,6 +286,7 @@ pub const Device = struct {
         if (self.failure == null) { self.failure = err; self.failed_phase = self.phase; }
         self.running.reportIrq(&self.interrupts); // Worker-side snapshot; no allocation or BO mutation in the IRQ.
         self.running.stop(err);
+        self.native_output.quarantine(err);
         if (!self.catalog.close()) self.ctx.?.logError("NVIDIA gsp-catalog: metadata close failed; cleanup retry required");
         self.logFailure(if (self.phase == .ready) "runtime" else "startup", err);
         if (self.interrupts.self_address != 0) {
@@ -304,6 +307,7 @@ pub const Device = struct {
         // races a live callback; failure retains the entire GPU dependency graph.
     }
     pub fn stop(self: *Device) bool {
+        self.native_output.quarantine(error.Stopped);
         if (!self.catalog.close()) return false;
         self.running.stop(error.Stopped);
         if (!self.interrupts.close()) return false;
@@ -336,8 +340,9 @@ pub const Device = struct {
         if (backing.queue.epoch != self.epoch or inputs.frts == null or !reservation.validates(inputs.frts.?)) return error.Stale;
         const original = display.original_boot orelse return error.Binding;
         var current: a.GfxNativeBootInfo = .{};
-        if (display.boot.display.?.bootInfo(&current) != a.gfx_output_ok or current.state != a.display_state_preparing or
-            current.generation != original.generation or current.physical_address != original.physical_address or
+        if (display.boot.display.?.bootInfo(&current) != a.gfx_output_ok or
+            !((current.state == a.display_state_preparing and current.generation == original.generation) or self.native_output.ownsNative(current)) or
+            current.physical_address != original.physical_address or
             current.byte_length != original.byte_length or current.width != original.width or
             current.height != original.height or current.pitch != original.pitch or current.format != original.format) return error.Display;
     }

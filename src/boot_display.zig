@@ -15,6 +15,8 @@ pub const Snapshot = struct {
     held_generation: u64 = 0,
     last_status: i32 = 0,
     recovery_required: bool = false,
+    native_adopted: bool = false,
+    native_generation: u64 = 0,
 
     pub fn capture(self: *Snapshot, ctx: *const r4os.r4dev.DriverContext, adapter: u32) Error!Report {
         return self.captureGuarded(ctx, adapter, .{ .context = 0, .callback = refuseRecovery });
@@ -65,10 +67,34 @@ pub const Snapshot = struct {
             state.outcome != a.gfx_output_outcome_validated) return error.Hold;
     }
 
+    pub fn adoptNative(self: *Snapshot, state: a.GfxNativeState) Error!void {
+        if (self.native_adopted or !self.recovery_required or self.held_generation == 0 or
+            state.version != 1 or state.size < @sizeOf(a.GfxNativeState) or state.reserved0 != 0 or
+            state.generation != self.held_generation or state.state != a.display_state_preparing or
+            state.outcome != a.gfx_output_outcome_validated or state.retained != 1) return error.Hold;
+        self.native_adopted = true;
+        self.native_generation = state.generation;
+    }
+
     // The actual descriptor remains in this resident owner on every failed
     // cleanup. Shutdown retries this same order through the cached tables.
     pub fn close(self: *Snapshot) bool {
         const memory = self.memory orelse return self.reference.reference.id == 0 and self.held_generation == 0;
+        if (self.native_adopted) {
+            const display = self.display orelse return false;
+            var state: a.GfxNativeState = .{};
+            self.last_status = display.transition(self.native_generation, 2, &state);
+            if (self.last_status == a.gfx_output_ok and state.version == 1 and state.size >= @sizeOf(a.GfxNativeState) and
+                state.reserved0 == 0 and state.retained == 1 and state.generation > self.native_generation and
+                state.outcome == a.gfx_output_outcome_lost and
+                (state.state == a.display_state_unavailable or state.state == a.display_state_recovering)) self.native_generation = state.generation;
+            if (self.last_status != a.gfx_output_ok or state.version != 1 or state.size < @sizeOf(a.GfxNativeState) or
+                state.reserved0 != 0 or state.state != a.display_state_bootfb or state.retained != 0 or
+                state.outcome != a.gfx_output_outcome_applied) return false;
+            self.native_adopted = false;
+            self.native_generation = 0;
+            self.held_generation = 0;
+        }
         if (self.read.lease.id != 0) {
             self.last_status = memory.bufferUnmap(&self.read.lease);
             if (self.last_status != a.gfx_buffer_result_ok) return false;

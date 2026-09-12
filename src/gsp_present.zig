@@ -92,8 +92,8 @@ pub const Owner = struct {
     }
 };
 
-/// Initial pixels are supplied by the common held-native commit before its
-/// R4D callback. This real GPU-read lease excludes later CPU writers until
+/// Initial pixels come from the product owner's immutable boot capture;
+/// common commit uses that same capture. This GPU-read lease excludes CPU writers until
 /// the CE's SYS semaphore confirms the copy. Mapping residency is separate.
 pub const Initial = struct {
     self_address: usize = 0,

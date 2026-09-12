@@ -1545,6 +1545,8 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         context_display_present, context_display_present_timeout, context_display_present_fault,
         context_display_present_initial_timeout, context_display_present_initial_fault, context_display_present_initial_release,
         context_display_present_initial_acquire, context_display_present_initial_retry,
+        context_native_unknown, context_native_connected, context_native_prepare_reject,
+        context_native_receipt, context_native_timeout, context_native_link_reject, context_native_stale,
         display_root_success, display_root_classes, display_root_reject, display_root_static, display_root_preserve, display_root_free,
         display_root_ack, display_root_timeout, display_root_wrong,
         display_dma_success, display_dma_instance_ack, display_dma_instance_reject, display_dma_oom, display_dma_segment, display_dma_unmap,
@@ -2953,7 +2955,298 @@ fn pumpDisplayChannel(target: *@import("gsp_device.zig").Device, handle: @import
     }
     try t.expect(steps < 100);
 }
+// The existing native-device model supplies actual RPC/MMIO/BO edges to the
+// product orchestrator. Only this common-owner boundary is modeled here;
+// its real kernel implementation is exercised by EXAMPLE's held-native probe.
+const NativeCommon = struct {
+    var target: *@import("gsp_device.zig").Device = undefined;
+    var pixels: [5440]u8 = undefined;
+    var registration: a.GfxNativeRegistration = .{};
+    var publication: a.GfxOutputPublication = .{};
+    var prepares: usize = 0;
+    var commits: usize = 0;
+    var restores: usize = 0;
+    var published = false;
+    var scenario: []const u8 = "";
+    fn is(name: []const u8) bool { return std.mem.eql(u8, scenario, name); }
+    fn outputs(out: *a.GfxDriverOutputApi) callconv(.c) i32 {
+        _ = CatalogModel.query(out);
+        out.publish = @intFromPtr(&publish); out.withdraw = @intFromPtr(&withdraw);
+        return a.gfx_output_ok;
+    }
+    fn display(out: *a.GfxDriverDisplayApi) callconv(.c) i32 {
+        out.* = .{ .boot_info = @intFromPtr(&DeviceModel.bootInfo), .prepare_held = @intFromPtr(&prepare), .transition = @intFromPtr(&transition) };
+        return a.gfx_output_ok;
+    }
+    fn publish(input: *const a.GfxOutputPublication, out: *a.GfxOutputId) callconv(.c) i32 {
+        std.debug.assert(!published and input.info.identity.connector_id == 4 and input.info.mode_count == 1 and
+            input.info.limits.flags == 0 and input.modes[0].flags & a.gfx_output_mode_geometry_only != 0 and
+            std.meta.eql(input.backend, @import("gsp_copy_test_model.zig").Model.binding));
+        publication = input.*; published = true;
+        out.* = input.info.identity; out.connection_generation = 15;
+        return a.gfx_output_ok;
+    }
+    fn withdraw(input: *const a.GfxOutputId) callconv(.c) i32 {
+        std.debug.assert(published and input.connector_id == 4 and input.connection_generation == 15);
+        published = false; return a.gfx_output_ok;
+    }
+    fn prepare(input: *const a.GfxNativeRegistration, generation: u64, out: *a.GfxNativeState) callconv(.c) i32 {
+        std.debug.assert(published and prepares == 0 and generation == target.display_epoch and
+            std.meta.eql(input.reference, target.native_output.shadow.reference) and !@import("gsp_copy_test_model.zig").Model.shadow_cpu and
+            target.running.display_images[target.native_output.mode.?.window] == null);
+        prepares += 1;
+        if (is("context_native_prepare_reject")) return a.gfx_output_error_busy;
+        registration = input.*;
+        out.* = .{ .generation = generation, .state = a.display_state_preparing, .outcome = a.gfx_output_outcome_validated, .retained = 1 };
+        return a.gfx_output_ok;
+    }
+    fn transition(generation: u64, operation: u32, out: *a.GfxNativeState) callconv(.c) i32 {
+        std.debug.assert(registration.context != 0);
+        var boot = target.display.?.original_boot.?; boot.generation = generation;
+        if (operation == 2) {
+            std.debug.assert(generation == DeviceModel.boot_info.generation);
+            DeviceModel.boot_info.generation += 1; DeviceModel.boot_info.state = a.display_state_recovering;
+            boot.generation = DeviceModel.boot_info.generation; boot.state = a.display_state_recovering;
+            restores += 1;
+            const callback: *const fn (u64, u64, *const a.GfxNativeBootInfo) callconv(.c) i32 = @ptrFromInt(registration.restore_callback);
+            std.debug.assert(callback(registration.context, boot.generation, &boot) == 0);
+            DeviceModel.boot_info.state = a.display_state_unavailable;
+            out.* = .{ .generation = boot.generation, .state = a.display_state_unavailable, .outcome = a.gfx_output_outcome_lost, .retained = 1 };
+            return a.gfx_output_ok;
+        }
+        std.debug.assert(operation == 0 and generation == target.display_epoch and commits == 0 and target.running.initial_image == null and target.running.display_work == null);
+        const copy = @import("gsp_copy_test_model.zig").Model;
+        const image = target.running.display_images[target.native_output.mode.?.window].?.image;
+        for (0..20) |y| std.debug.assert(std.mem.eql(u8, copy.vram_data[y * image.pitch..][0..260], pixels[y * 272..][0..260]));
+        // Model the actual common commit's second copy from the same sealed
+        // RAM image, including CPU lease release before invoking the driver.
+        var cpu_map: a.GfxBufferMap = .{};
+        const memory = target.ctx.?.memory().?;
+        std.debug.assert(memory.bufferMap(&registration.reference, 1, 0, 5200, &cpu_map) == a.gfx_buffer_result_ok);
+        const bytes: [*]u8 = @ptrFromInt(cpu_map.cpu_address);
+        for (0..20) |y| @memcpy(bytes[y * 260..][0..260], pixels[y * 272..][0..260]);
+        std.debug.assert(memory.bufferUnmap(&cpu_map.lease) == a.gfx_buffer_result_ok);
+        const callback: *const fn (u64, u64, *const a.GfxNativeBootInfo) callconv(.c) i32 = @ptrFromInt(registration.commit_callback);
+        const result = callback(registration.context, generation, &boot);
+        std.debug.assert(result == 1 and !copy.shadow_cpu);
+        commits += 1;
+        DeviceModel.boot_info.state = a.display_state_software_native; DeviceModel.boot_info.generation = generation;
+        out.* = .{ .generation = generation + @as(u64, @intFromBool(is("context_native_receipt"))),
+            .state = a.display_state_software_native, .outcome = a.gfx_output_outcome_applied, .retained = 1 };
+        return a.gfx_output_ok;
+    }
+};
+fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, scenario: []const u8) !void {
+    const native = @import("gsp_vram_test_model.zig").Model;
+    const fifo = @import("gsp_fifo_test_model.zig").Model;
+    const display = @import("gsp_display_test_model.zig").Model;
+    const copy = @import("gsp_copy_test_model.zig").Model;
+    const vectors = @import("gsp_display_commands_test.zig");
+    const run = &target.running;
+    const captured = target.display.?;
+    const original_boot = captured.original_boot;
+    const original_scanout = captured.scanout_original;
+    const original_read = captured.boot.read;
+    const original_display = captured.boot.display;
+    const original_memory = captured.boot.memory;
+    const original_info = DeviceModel.boot_info;
+    const saved_table = table.*;
+    native.install(table, scenario);
+    defer { native.dispose(table); table.* = saved_table; }
+    fifo.install(table, scenario);
+    const raw: [*]u32 = @ptrFromInt(target.port.window.cpu_address);
+    display.install(table, scenario, raw[0..@intCast(target.port.window.byte_length / 4)]);
+    copy.installProduct(table, 3);
+    target.irq_wake = .{ .context = @intFromPtr(target), .signal = copy.wakePresentation };
+    NativeCommon.target = target; NativeCommon.scenario = scenario;
+    NativeCommon.prepares = 0; NativeCommon.commits = 0; NativeCommon.restores = 0; NativeCommon.published = false; NativeCommon.registration = .{};
+    for (&NativeCommon.pixels, 0..) |*byte, i| byte.* = @truncate(i * 17 + 23);
+    table.gfx_output_query = NativeCommon.outputs; table.gfx_display_query = NativeCommon.display;
+    captured.boot.display = target.ctx.?.graphicsDisplay();
+    captured.boot.memory = target.ctx.?.memory();
+    DeviceModel.boot_info.width = 65; DeviceModel.boot_info.height = 20;
+    DeviceModel.boot_info.pitch = 272; DeviceModel.boot_info.byte_length = NativeCommon.pixels.len;
+    DeviceModel.boot_info.format = a.gfx_buffer_format_xrgb8888;
+    captured.original_boot = DeviceModel.boot_info;
+    captured.boot.read = .{ .lease = .{ .id = 2991, .generation = 1 }, .cpu_address = @intFromPtr(&NativeCommon.pixels), .byte_length = NativeCommon.pixels.len };
+    var scanout = vectors.bootFixture(65, 20);
+    scanout.instance_control = original_scanout.?.instance_control; scanout.instance_address = original_scanout.?.instance_address;
+    for (&scanout.windows) |*entry| entry.core[0] = 15;
+    captured.scanout_original = scanout;
+    defer {
+        captured.original_boot = original_boot; captured.scanout_original = original_scanout;
+        captured.boot.read = original_read; captured.boot.display = original_display; captured.boot.memory = original_memory;
+        captured.boot.native_adopted = false; captured.boot.native_generation = 0;
+        DeviceModel.boot_info = original_info;
+    }
+    run.outputs.self_address = @intFromPtr(&run.outputs); run.outputs.state = .returned; run.outputs.graph = &run.graph.?;
+    vectors.outputFixture(&run.outputs.data, run.epoch, run.graph.?.reservation.client);
+    run.output_generation = run.outputs.data.generation; run.output_refresh = false;
+    run.output_next_ns = clock + std.time.ns_per_s; run.outputs.invalidated = false;
+    if (NativeCommon.is("context_native_connected")) run.outputs.data.receivers[0].connected = true;
+    try target.native_output.request(&target.ctx.?, run, captured);
+    var counts: FifoCounts = .{};
+    var steps: usize = 0;
+    var initial_fetched = false;
+    var table_fetched = false;
+    var checkpoint: []const u8 = "takeover";
+    errdefer _ = target.stop();
+    errdefer |err| std.debug.print("native product {s}: {s} check={s} step={d} device={s} failure={?} phase={s} failed-phase={?} status={d}\n",
+        .{ scenario, @errorName(err), checkpoint, steps, @tagName(target.phase), target.failure, @tagName(target.native_output.phase),
+            target.native_output.failed_phase, target.native_output.last_status });
+    while (target.phase == .ready and target.native_output.phase != .active and steps < 1200) : (steps += 1) {
+        clock += 1000;
+        _ = target.step();
+        if (target.phase != .ready) break;
+        if (run.fifo_active != null) { try replyDeviceFifo(target, &counts, scenario); continue; }
+        if (run.buffer_active != null) { try replyCopyMapping(target); continue; }
+        const rpc = run.activeChannel();
+        if (rpc != null and rpc.?.phase == .waiting) { try replyNativeProduct(target); continue; }
+        if (run.display_upload_job) |*upload| if (upload.operation.phase == .submitted) {
+            const channel = run.fifos[target.native_output.copy.?.slot].owner.?;
+            const wire = @import("gsp_copy_wire.zig");
+            // The real encoder has published the CE packet and unchanged RAMHT
+            // bytes. Hardware GET and SYS semaphore are separate observations.
+            try t.expectEqualSlices(u8, &run.display_resources_slot.owner.?.table.image,
+                ControlModel.data[0..@import("gsp_display_table.zig").image_bytes]);
+            const get: *u32 = @ptrFromInt(channel.ring.cpu.cpu_address + wire.userd_offset + 0x88);
+            const completion: *u32 = @ptrFromInt(channel.ring.cpu.cpu_address + wire.completion_offset);
+            if (!table_fetched) { get.* = channel.ring.put; table_fetched = true; } else completion.* = channel.ring.issued;
+        };
+        if (run.initial_image) |*initial| if (initial.operation.submitted) {
+            const channel = run.fifos[target.native_output.copy.?.slot].owner.?;
+            if (!initial_fetched) {
+                try copy.fetch(channel, @as([*]const u8, @ptrCast(raw))[0..@intCast(target.port.window.byte_length)]);
+                try copy.execute(); initial_fetched = true;
+            } else if (NativeCommon.is("context_native_timeout")) clock = initial.deadline else try copy.signal();
+        };
+        if (run.display_work) |*work| {
+            const push = @import("gsp_display_push.zig");
+            if (work.position) |position| if (position.phase == .submitted) {
+                const user = try push.userBase(.immediate, target.native_output.mode.?.window);
+                display.words[(user + 4) / 4] = display.words[user / 4];
+            };
+            if (work.core.phase == .submitted) {
+                const user = try push.userBase(.core, 0);
+                display.words[(user + 4) / 4] = display.words[user / 4];
+                const note: *u32 = @ptrFromInt(run.display_resources_slot.owner.?.publishedNotifier(0).?.cpu.cpu_address);
+                note.* = 2 << 30;
+            }
+            if (work.window) |window| if (window.phase == .submitted) {
+                const user = try push.userBase(.window, target.native_output.mode.?.window);
+                display.words[(user + 4) / 4] = display.words[user / 4];
+                const note = run.display_resources_slot.owner.?.publishedNotifier(1 + target.native_output.mode.?.window).?;
+                const words: [*]u32 = @ptrFromInt(note.cpu.cpu_address);
+                words[note.offset / 4 + 2] = 101; words[note.offset / 4 + 3] = 7; words[note.offset / 4] = 1 << 30;
+            };
+        }
+        if (NativeCommon.is("context_native_stale") and target.native_output.phase == .image_upload) run.outputs.data.generation += 1;
+    }
+    try t.expect(steps < 1200 and copy.shadow_creates == 1 and !copy.shadow_cpu and NativeCommon.prepares == 1);
+    const success = NativeCommon.is("context_native_unknown") or NativeCommon.is("context_native_connected");
+    if (success) {
+        try t.expect(target.phase == .ready and target.native_output.phase == .active and NativeCommon.commits == 1 and captured.boot.native_adopted);
+        try t.expect(target.native_output.ownsNative(DeviceModel.boot_info));
+        var stale = DeviceModel.boot_info; stale.generation += 1;
+        try t.expect(!target.native_output.ownsNative(stale));
+        const flags = NativeCommon.publication.info.flags;
+        try t.expect((flags & a.gfx_output_flag_connected != 0) == NativeCommon.is("context_native_connected"));
+        try t.expect((flags & a.gfx_output_flag_connection_unknown != 0) == NativeCommon.is("context_native_unknown"));
+        try t.expect(NativeCommon.publication.info.limits.flags == 0 and NativeCommon.publication.info.mode_count == 1);
+        try t.expect(target.step() != .stopped and target.failure == null);
+        // The actual common queue consumer now drives the already adopted
+        // image; there is no second product-specific per-frame copy path.
+        checkpoint = "present";
+        try copy.enqueuePresent(2, 3, 4, 2);
+        initial_fetched = false;
+        for (0..80) |_| {
+            clock += 1000;
+            _ = target.step();
+            if (run.buffer_active != null) try replyCopyMapping(target);
+            if (run.copy_job) |*job| if (job.submitted) {
+                const channel = run.fifos[target.native_output.copy.?.slot].owner.?;
+                if (!initial_fetched) {
+                    try copy.fetch(channel, @as([*]const u8, @ptrCast(raw))[0..@intCast(target.port.window.byte_length)]);
+                    try copy.execute(); initial_fetched = true;
+                } else try copy.signal();
+            };
+            if (copy.completed == 1) break;
+        }
+        try t.expect(copy.completed == 1 and copy.result == a.gfx_queue_result_complete and target.failure == null);
+        checkpoint = "restore";
+        const read = captured.boot.read;
+        try t.expect(!captured.boot.close() and NativeCommon.restores == 1 and std.meta.eql(read, captured.boot.read));
+        try t.expect(!captured.boot.close() and NativeCommon.restores == 2 and std.meta.eql(read, captured.boot.read));
+        try t.expect(captured.boot.native_adopted and target.native_output.restore_requested);
+    } else {
+        try t.expect(target.phase != .ready and target.native_output.failure != null and !NativeCommon.published);
+        try t.expect(NativeCommon.commits == @as(usize, if (NativeCommon.is("context_native_receipt")) 1 else 0));
+        try t.expect(target.memory.?.retained and native.released == 0 and copy.heldReferences() != 0);
+        try t.expect(!target.native_output.ownsNative(DeviceModel.boot_info));
+    }
+    checkpoint = "stop";
+    _ = target.stop();
+    try t.expect(native.released == 0 and display.released == 0 and !NativeCommon.published);
+}
+fn replyNativeProduct(target: *@import("gsp_device.zig").Device) !void {
+    const run = &target.running;
+    const rpc = run.activeChannel().?;
+    const session = &target.session.?;
+    const native = @import("gsp_vram_test_model.zig").Model;
+    const dm = @import("gsp_display_test_model.zig").Model;
+    var response: [4096]u8 = @splat(0);
+    @memcpy(response[0..rpc.request.len], rpc.request);
+    const cursor = (session.tx_write + 62) % 63;
+    const record = try transport.message.decode(session.profile, backing.?[init.queues_offset + init.command_offset + 4096 + cursor * 4096..][0..4096], session.tx_sequence - 1);
+    try t.expectEqualSlices(u8, rpc.request, record.payload);
+    if (run.context_active) |index| {
+        const owner = run.contexts[index].owner.?;
+        const op = owner.operation.?;
+        const vector: usize = switch (op) { .classes => 0, .engines => if (owner.base == 0) 1 else 2, .method_size => 3, .group => 4, .share => 5, .free_share => 6, .free_group => 7 };
+        const bytes = @import("gsp_context_test.zig").response(vector);
+        const header: usize = if (rpc.function == 76) 24 else if (rpc.function == 103) 32 else 16;
+        @memcpy(response[header..rpc.request.len], bytes[header..]);
+    } else if (run.native_active) |index| {
+        const owner = run.native_buffers[index].owner.?;
+        const slot = owner.reservation.buffer.id - 801;
+        switch (owner.operation.?) {
+            .allocate_memory, .allocate_virtual => {
+                std.mem.writeInt(u64, response[112..120], if (owner.operation.? == .allocate_memory) owner.storage_policy.?.physical_bytes / 2 + slot * 65536 else native.address(slot), .little);
+                std.mem.writeInt(u64, response[120..128], owner.bytes - 1, .little);
+            },
+            .map => std.mem.writeInt(u64, response[40..48], native.address(slot), .little),
+            else => return error.Unexpected,
+        }
+    } else if (run.display_engine_active) {
+        const op = run.display_engine_owner.?.operation.?;
+        if (op != .instance) {
+            const bytes = @import("gsp_display_engine_test.zig").response(op);
+            const header: usize = if (rpc.function == 103) 32 else 24;
+            @memcpy(response[header..rpc.request.len], bytes[header..]);
+        }
+        if (op == .classes) { outputWord(&response, 24, 4); outputWord(&response, 32, 0xc67d); outputWord(&response, 36, 0xc67e); outputWord(&response, 40, 0xc67b); }
+        if (op == .static_info) outputWord(&response, 28, 8); // Only real modeled window 3, never an assumed index.
+    } else if (run.display_channel_active) |index| {
+        const owner = &run.display_channels[index].?;
+        const wire = @import("gsp_display_channel_wire.zig");
+        if (owner.operation.? == .allocate) {
+            @memcpy(response[48..56], @import("gsp_display_channel_test.zig").response(owner.config.kind, .allocate)[48..56]);
+            const slot = &dm.slots[(owner.config.physical - dm.address(0)) / 0x100000];
+            slot.hardware = true; slot.control = try wire.controlRegister(owner.config.kind, owner.config.index); slot.state = try wire.statusRegister(owner.config.kind, owner.config.index);
+            dm.words[slot.control / 4] = 0x13; dm.words[slot.state / 4] = if (owner.config.kind == .core) 11 << 16 else 4 << 16;
+        }
+    } else if (run.display_work) |*work| {
+        const link = &work.link.?;
+        const bytes = try @import("gsp_hdmi_link_test.zig").reference(link.operation, link.plan);
+        @memcpy(response[24..rpc.request.len], bytes[24..]);
+        if (link.operation == .gcp and NativeCommon.is("context_native_link_reject")) outputWord(&response, 12, 0x57);
+    } else return error.Unexpected;
+    std.mem.writeInt(u32, backing.?[init.queues_offset + init.status_offset + 64..][0..4], session.tx_write, .little);
+    try nativeReply(session, rpc.function, 0, response[0..rpc.request.len]);
+}
+
 fn checkDeviceContexts(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, scenario: []const u8) !void {
+    if (std.mem.startsWith(u8, scenario, "context_native_")) return checkNativeProduct(target, table, scenario);
     const model = @import("gsp_vram_test_model.zig").Model;
     const runtime = @import("gsp_runtime.zig");
     const vectors = @import("gsp_context_test.zig");

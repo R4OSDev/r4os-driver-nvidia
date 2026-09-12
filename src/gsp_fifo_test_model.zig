@@ -38,7 +38,10 @@ pub const Model = struct {
         std.debug.assert(slots[i].active); out.* = slots[i].descriptor; return a.gfx_buffer_result_ok;
     }
     fn map(input: *const a.GfxBufferHandle, access: u32, offset: u64, length: u64, out: *a.GfxBufferMap) callconv(.c) i32 {
-        const i = select(input.*).?; const slot = &slots[i];
+        const i = select(input.*) orelse {
+            const call: *const fn (*const a.GfxBufferHandle, u32, u64, u64, *a.GfxBufferMap) callconv(.c) i32 = @ptrFromInt(original.buffer_map);
+            return call(input, access, offset, length, out);
+        }; const slot = &slots[i];
         std.debug.assert(slot.active and !slot.cpu and access == 1 and offset == 0 and length == bytes);
         if (slot.dma.lease.id != 0) std.debug.assert(slot.gpu.lease.id != 0 and slot.synced);
         slot.cpu = true; out.* = .{ .lease = cpuRef(i), .cpu_address = @intFromPtr(&slot.data), .byte_length = length, .cache_policy = a.gfx_buffer_cache_write_back };
@@ -50,7 +53,8 @@ pub const Model = struct {
             if (slot.dma.lease.id == 0) slot.synced = std.mem.allEqual(u8, &slot.data, 0);
             return a.gfx_buffer_result_ok;
         };
-        unreachable;
+        const call: *const fn (*const a.GfxBufferHandle) callconv(.c) i32 = @ptrFromInt(original.buffer_unmap);
+        return call(input);
     }
     fn acquire(input: *const a.GfxBufferHandle, request: *const a.GfxDeviceRequest, out: *a.GfxDeviceLease) callconv(.c) i32 {
         const i = select(input.*) orelse { const call: *const fn (*const a.GfxBufferHandle, *const a.GfxDeviceRequest, *a.GfxDeviceLease) callconv(.c) i32 = @ptrFromInt(original.device_acquire); return call(input, request, out); };
@@ -65,6 +69,10 @@ pub const Model = struct {
         return a.gfx_buffer_result_ok;
     }
     fn segment(input: *const a.GfxDeviceLease, offset: u64, out: *a.GfxDmaSegment) callconv(.c) i32 {
+        if (input.lease.id < 941 or input.lease.id > 944) {
+            const call: *const fn (*const a.GfxDeviceLease, u64, *a.GfxDmaSegment) callconv(.c) i32 = @ptrFromInt(original.device_segment);
+            return call(input, offset, out);
+        }
         const i = (input.lease.id - 941) / 2; const slot = &slots[i];
         std.debug.assert(slot.active and std.meta.eql(input.*, slot.dma) and offset & 4095 == 0 and offset < bytes);
         out.* = .{ .dma_address = 0x8000000000 + @as(u64, i) * 0x100000 + offset * 2, .byte_length = 4096, .next_offset = offset + 4096 }; return a.gfx_buffer_result_ok;

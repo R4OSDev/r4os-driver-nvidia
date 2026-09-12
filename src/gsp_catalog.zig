@@ -89,7 +89,7 @@ pub const Owner = struct {
     }
 };
 
-fn encode(output: *a.GfxReceiverInfo, route: *const topology.Route, capture: *const receiver.Capture) !void {
+pub fn encode(output: *a.GfxReceiverInfo, route: *const topology.Route, capture: *const receiver.Capture) !void {
     if (route.id == 0 or capture.status == .pending or capture.edid_bytes > capture.bytes.len) return error.State;
     output.* = .{ .connector_id = route.id, .connector_kind = kind(route) };
     output.flags = if (capture.connected) |connected| (if (connected) a.gfx_output_flag_connected else 0) else a.gfx_output_flag_connection_unknown;
@@ -102,6 +102,13 @@ fn encode(output: *a.GfxReceiverInfo, route: *const topology.Route, capture: *co
         .unsupported_data => output.flags |= a.gfx_output_flag_edid_invalid | a.gfx_output_flag_receiver_incomplete,
         .incomplete_edid => output.flags |= a.gfx_output_flag_receiver_incomplete,
         .valid_edid, .disconnected => {},
+    }
+    if (capture.connected != true) {
+        // Missing presence is not evidence of an attached receiver with a
+        // missing/invalid EDID. Common receiver metadata carries no modes or
+        // EDID in that state, independently of a retained source boot route.
+        output.flags &= ~(a.gfx_output_flag_edid_missing | a.gfx_output_flag_edid_invalid);
+        return;
     }
     // A malformed partial block is never padded into a fictional valid EDID.
     // Keep only complete diagnostic blocks and report the incomplete tail.

@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.87; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.88; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -12,25 +12,31 @@ Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
 
-Native display preparation (NVIDIA 0.1.87):
-The Device runtime owns RGB buffers, RAMHT, initial CE upload and Present.
-Boot adoption couples the saved timing/position with WIMM/Window/Core.
-The same transaction now acknowledges actual HDMI sink caps, saved HDMI/DVI
-transport and HDMI audio mute before channel submission. After both notifiers
-and final WIMM GET, it sends SDR AVI, needed legacy VSI or its disable,
-HDR disable and clear-AVMUTE GCP. Only the final ACK publishes the image.
-DVI uses two controls and no HDMI packets; image-only commits keep the receipt.
+Native boot output (NVIDIA 0.1.88):
+Explicit `OPTION NVIDIA mode=native` now drives resource allocation and the
+common handoff from the serialized Device worker: actual CE engine/context,
+display masks, private VRAM/RAMHT, Core/Window/WIMM, SYSTEM shadow, output
+publication, prepare_held, initial CE upload and HDMI boot-mode commit.
+The shadow and common commit use the same immutable pre-firmware RAM image.
+The callback validates prior CE/notifier/HDMI completion without waiting
+for its own worker. A matching software-native receipt enables the existing
+common Present queue: CPU rendering in RAM and native VRAM scanout.
 
-SCDC/scrambling facts require complete current EDID. Rational TMDS bounds
-preserve 1000/1001 clocks. Wrong requests/generations and ambiguous failures
-retain dependencies; even a fault after final ACK prevents image publication.
-This prepares video output; HDMI audio playback has its own later work.
+Receiver refresh cannot overwrite the owner's promoted native port.
+Unknown presence permits only authenticated held boot geometry, without
+inventing EDID or a connected sink. HDMI/DVI and SCDC limits remain bound
+to the saved mode and complete current receiver facts.
 
-Existing51 NVIDIA and7 R4GFX tests, original-header C vectors and module build
-pass. Product prepare_held/transition wiring, atomic mode changes, confirmation
-and recovery remain open in0.79.13. These internal APIs are not automatically
-invoked; passive bootfb remains the default. Evidence: GrafikScanout07913.json;
-physical checks: OssiGPU.txt.
+Prepare rejection, timeout, stale route and bad receipts withdraw metadata
+and retain reachable resources. Native close follows actual recovery
+generations; physical restoration is still unimplemented and refuses to
+acknowledge quiescence. Passive bootfb remains the default.
+
+Existing 51 NVIDIA groups, 52 Kernel display groups, all three artifact
+builds and targeted EXAMPLE 0.1.15 SMP4 integration pass. Model results do
+not prove physical NVIDIA execution or a visible image. Atomic mode changes,
+pattern/confirmation, timer rollback, diagnostics and restoration remain
+open in 0.79.13. Evidence: GrafikScanout07913.json; physical checks: OssiGPU.txt.
 
 Fault diagnosis and quarantine (NVIDIA 0.1.77):
 Roadmap 0.79.11 is software complete, including its combined targeted

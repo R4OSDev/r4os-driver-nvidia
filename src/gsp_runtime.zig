@@ -807,8 +807,9 @@ pub const Owner = struct {
             resources.publishedStorage(entry.window.slot, value.dma) == entry.surface.target;
     }
     fn copyBusy(self: *const Owner) bool { return self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.initial_image != null; }
-    /// Called after the common native commit populated and unmapped its CPU
-    /// shadow. This private operation does not invent a common queue fence.
+    /// Called after the product owner populated and unmapped its CPU shadow
+    /// from the same immutable capture used by common commit. This private
+    /// operation does not invent a common queue fence.
     pub fn uploadInitialImage(self: *Owner, deadline: u64) !void {
         _ = try self.now();
         if (!self.presentationPrepared()) return error.State;

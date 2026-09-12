@@ -54,6 +54,7 @@ var boot_vram_lease: @import("boot_vram_lease.zig").Lease = .{};
 var init_excluded: [gsp_init.max_excluded]gsp_init.Span = undefined;
 var checking_boot = false;
 var starting_gsp = false;
+var starting_native = false;
 var boot_checked = false;
 var checking_runtime = false;
 var board_rom: vbios_probe.Capture = .{};
@@ -78,7 +79,8 @@ pub export fn nvidia_init(api: *const a.DriverApi) callconv(.c) i32 {
     rm_log.bind(&ctx);
     const mode = std.mem.span(ctx.getOption("NVIDIA", "mode"));
     const check_firmware = std.ascii.eqlIgnoreCase(mode, "firmware-check");
-    starting_gsp = std.ascii.eqlIgnoreCase(mode, "gsp-start");
+    starting_native = std.ascii.eqlIgnoreCase(mode, "native");
+    starting_gsp = starting_native or std.ascii.eqlIgnoreCase(mode, "gsp-start");
     checking_boot = starting_gsp or std.ascii.eqlIgnoreCase(mode, "boot-check");
     boot_checked = false;
     checking_runtime = std.ascii.eqlIgnoreCase(mode, "runtime-check");
@@ -174,7 +176,8 @@ pub export fn nvidia_init(api: *const a.DriverApi) callconv(.c) i32 {
         return -11;
     }
     if (starting_gsp) {
-        ctx.logInfo("NVIDIA bind: gsp-start=scheduled firmware=570.144 display=held native-output=unavailable");
+        ctx.logInfo(if (starting_native) "NVIDIA bind: gsp-start=scheduled firmware=570.144 display=held native-output=requested" else
+            "NVIDIA bind: gsp-start=scheduled firmware=570.144 display=held native-output=unavailable");
     } else if (checking_boot) {
         log("NVIDIA bind: passive devices={d} resources=0 boot-snapshots=checked firmware-execution=disabled fallback=preserved", .{count});
     } else log("NVIDIA bind: passive devices={d} resources=0 native-writes=disabled fallback=preserved", .{count});
@@ -716,6 +719,10 @@ fn checkBoot(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Sna
     if (starting_gsp) {
         native_device.open(ctx, &boot_vram, &boot_vram_lease, &run_memory, &firmware_logs, source.board) catch |err| {
             log("NVIDIA gsp-start: rejected phase=owner reason={s} firmware-execution=disabled", .{@errorName(err)});
+            return false;
+        };
+        if (starting_native) native_device.native_output.request(ctx, &native_device.running, &boot_vram) catch |err| {
+            log("NVIDIA native-output: rejected phase=owner reason={s} firmware-execution=disabled", .{@errorName(err)});
             return false;
         };
         native_work.start(ctx, &native_device) catch |err| {
