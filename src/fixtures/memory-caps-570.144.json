@@ -1,0 +1,83 @@
+{
+  "source_commit": "8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f",
+  "references": [
+    {
+      "path": "Nvidia/OpenKernelModules-570.144/src/common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080fb.h",
+      "bytes": 12622,
+      "sha256": "a99f8b06230d4175e1f96389e767e615e434e3c6cab7b85989353222ec076ada"
+    },
+    {
+      "path": "Nvidia/OpenKernelModules-570.144/src/nvidia/src/kernel/gpu/mem_mgr/mem_mgr_ctrl.c",
+      "bytes": 28968,
+      "sha256": "dc1340f80fc3aabad006d7354ad39899853a1103bc1af2120be489066b122107"
+    },
+    {
+      "path": "Nvidia/OpenKernelModules-570.144/src/nvidia-modeset/kapi/src/nvkms-kapi.c",
+      "bytes": 128589,
+      "sha256": "6a4b72ce4dd6ae31998cf8ecf5997991b82f21b232c913b99f54d127e9f4b000"
+    },
+    {
+      "path": "Nvidia/OpenKernelModules-570.144/src/nvidia/generated/g_rpc-structures.h",
+      "bytes": 385592,
+      "sha256": "9f9edb3008a17bc506881f59083bbb416931f61b65b6392b123a6415e0622e70"
+    },
+    {
+      "path": "Nvidia/OpenKernelModules-570.144/src/nvidia/generated/g_device_nvoc.c",
+      "bytes": 93937,
+      "sha256": "b5f49424da0b3eeea4a5a4907e1db2354a7c129e76bfa9223dfbeffe9dfe0a92"
+    },
+    {
+      "path": "Nvidia/OpenKernelModules-570.144/src/nvidia/interface/rmapi/src/g_finn_rm_api.c",
+      "bytes": 302558,
+      "sha256": "fb46236d16725bc557e82f5e7f435212e151b74a0d1f17008363921692bc38f4"
+    },
+    {
+      "path": "Nvidia/OpenKernelModules-570.144/src/nvidia/src/kernel/vgpu/rpc.c",
+      "bytes": 393775,
+      "sha256": "d9a8432f764b3fef42e039d03b58e93eeb3b32915954b564039e3ee981cae2fd"
+    },
+    {
+      "path": "Nvidia/OpenKernelModules-570.144/src/common/sdk/nvidia/inc/nvtypes.h",
+      "bytes": 25775,
+      "sha256": "3fd5e2c20b1432421a214b12e52778f48f7914b87645d4736cf55324d25c9d3c"
+    },
+    {
+      "path": "Nvidia/OpenKernelModules-570.144/src/common/sdk/nvidia/inc/cpuopsys.h",
+      "bytes": 11619,
+      "sha256": "92114293c250b87a0c78d1bbfe52c3c132eba1c03ceef110a0e8b0ba6a80aca1"
+    },
+    {
+      "path": "Nvidia/OpenKernelModules-570.144/src/common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080base.h",
+      "bytes": 3272,
+      "sha256": "81f7cbb2fe0abd9b311f6758c6f1c3ecd81fe6b2158e63764bc96f291db3b5b8"
+    },
+    {
+      "path": "Nvidia/OpenKernelModules-570.144/src/common/sdk/nvidia/inc/ctrl/ctrlxxxx.h",
+      "bytes": 2537,
+      "sha256": "3c34cab9ddee358b3480a96795ec5068eae1c3f2328921a8d0a83d0d3f751db7"
+    },
+    {
+      "path": "Nvidia/OpenKernelModules-570.144/src/nvidia/inc/kernel/rmapi/control.h",
+      "bytes": 16037,
+      "sha256": "270a59d28493e98bcbb45ee3a7d850d140da19c0928f63cc2bfa317bea746998"
+    },
+    {
+      "path": "Nvidia/OpenKernelModules-570.144/src/nvidia/inc/kernel/rmapi/rmapi.h",
+      "bytes": 20909,
+      "sha256": "3bbf53dc27472ce8640bb1be50c37d8ffda1baf72b33c76098c77be49a12d8f5"
+    }
+  ],
+  "hardware_contact": false,
+  "license": {
+    "previous_bytes": 137137,
+    "bytes": 141047,
+    "previous_sha256": "002adf8a0480ab002d13d3bf2568be8fe2ae9988d09bb72b7d40c6cd892c58c9",
+    "sha256": "8124d8b9a0dae6c3bab3d4679e68731c45f4a7887d69d1a823ce554ca5bf4470"
+  },
+  "fixture": {
+    "path": "src/fixtures/memory-caps-570.144.bin",
+    "bytes": 324,
+    "pairs": 6,
+    "sha256": "82cca0e3154d942b970588290c0897d9641bbf48a01bb973eb683de5007a8631"
+  }
+}

@@ -1611,6 +1611,51 @@ fn graphDestroy(model: *Model, owner: *rm_graph.Owner) !boot_events.Handoff {
 }
 fn checkRmGraph(model: *Model) !void {
     {
+        const caps = @import("gsp_memory_caps.zig");
+        const golden = @embedFile("fixtures/memory-caps-570.144.bin");
+        const binding: caps.Binding = .{ .epoch = 7, .client = 0xc1d00000, .device = 0x10000000 };
+        var encoded: [caps.bytes]u8 = undefined;
+        for (0..6) |index| {
+            const pair = golden[index * 2 * caps.bytes ..][0 .. 2 * caps.bytes];
+            try t.expectEqualSlices(u8, pair[0..caps.bytes], try caps.encode(binding, &encoded));
+            var record: message.Record = .{ .shape = .{ .message_bytes = caps.bytes + 80, .checksum_bytes = caps.bytes + 80, .storage_bytes = 4096, .elements = 1 },
+                .queue_sequence = 0, .rpc = .{ .function = caps.function, .result = 0 }, .payload = pair[caps.bytes..] };
+            const reply = try caps.decode(binding, record);
+            if (index == 5) try t.expect(reply == .rejected and reply.rejected == 0x51) else {
+                try t.expect(reply == .ok and std.meta.eql(reply.ok.binding, binding));
+                try t.expectEqualSlices(u8, pair[caps.bytes + 24..], &reply.ok.raw);
+                const info = reply.ok;
+                try t.expect(info.renderSystem() == (index == 0 or index == 4) and info.scanoutSystem() == info.renderSystem());
+                try t.expect(info.gpuCachedSystem() == info.renderSystem() and info.blocklinear() == (index != 1));
+                try t.expect(info.gobBytes() == @as(u16, if (index == 0 or index == 2 or index == 4) 512 else 0));
+                try t.expect(info.genericPageKind() == @as(u8, if (index == 0 or index == 4) 6 else 0xfe));
+                try t.expect(info.vidmemCleared() == (index == 0 or index == 4) and info.partialUnmap() == info.vidmemCleared());
+            }
+            record.payload = pair[caps.bytes..][0..26];
+            try t.expectError(error.Payload, caps.decode(binding, record));
+            record.payload = pair[caps.bytes..];
+            record.rpc.result = message.pending;
+            try t.expectError(error.Payload, caps.decode(binding, record));
+            record.rpc.result = 5;
+            try t.expectError(error.FirmwareResult, caps.decode(binding, record));
+        }
+        for (0..caps.bytes) |size| try t.expectError(error.Bounds, caps.encode(binding, encoded[0..size]));
+        var record: message.Record = .{ .shape = .{ .message_bytes = caps.bytes + 80, .checksum_bytes = caps.bytes + 80, .storage_bytes = 4096, .elements = 1 },
+            .queue_sequence = 0, .rpc = .{ .function = caps.function, .result = 0 }, .payload = &encoded };
+        for ([_]usize{0,4,8,16,20}) |offset| {
+            @memcpy(&encoded, golden[caps.bytes..][0..caps.bytes]);
+            encoded[offset] ^= 1;
+            try t.expectError(error.Unexpected, caps.decode(binding, record));
+        }
+        @memcpy(&encoded, golden[caps.bytes..][0..caps.bytes]);
+        record.rpc.function += 1;
+        try t.expectError(error.Unexpected, caps.decode(binding, record));
+        record.rpc.function = caps.function;
+        record.rpc.cpu_rm_gfid = 1;
+        try t.expectError(error.Unexpected, caps.decode(binding, record));
+        try t.expectError(error.Handle, caps.encode(.{ .epoch = 0, .client = binding.client, .device = binding.device }, &encoded));
+    }
+    {
         const wire = @import("gsp_buffer_wire.zig");
         const golden = @embedFile("fixtures/control-buffer-570.144.bin");
         const binding = wire.Binding{ .space = .{ .epoch = 7, .client = 0xc1d00000, .device = 0x10000000,

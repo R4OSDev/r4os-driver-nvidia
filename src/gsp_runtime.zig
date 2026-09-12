@@ -163,7 +163,7 @@ pub const Owner = struct {
                 .{@errorName(err), @tagName(graph.state), graph.reservation.client, self.rm_rejection});
             if (graph.control_buffer) |*owner|
                 self.log("NVIDIA gsp-control: failed={s} operation={s} reply={?} registered={} allocated={} mapped={} retained={}",
-                    .{@errorName(err), if (owner.operation) |operation| @tagName(operation) else "none", owner.last_status,
+                    .{@errorName(err), if (owner.caps_active) "memory-caps" else if (owner.operation) |operation| @tagName(operation) else "none", owner.last_status,
                         owner.registered, owner.allocated, owner.mapped, owner.backing.retained});
         }
     }
@@ -194,6 +194,12 @@ pub const Owner = struct {
         const owner = if (self.graph.?.address_space) |*value| value else return null;
         if (owner.self_address != @intFromPtr(owner) or owner.state != .handed_off or owner.exchange.session.state != .active) return null;
         return if (owner.info) |*info| info else null;
+    }
+    pub fn nativeMemoryCapabilities(self: *Owner) ?@import("gsp_memory_caps.zig").Info {
+        const space = self.nativeAddressSpace() orelse return null;
+        const owner = if (self.graph.?.control_buffer) |*value| value else return null;
+        if (owner.adapter != self.adapter_id or !std.meta.eql(owner.binding.space, space.*)) return null;
+        return owner.memoryCapabilities();
     }
     pub fn nativeControlBuffer(self: *Owner) ?@import("gsp_control_buffer.zig").Info {
         const space = self.nativeAddressSpace() orelse return null;
@@ -297,6 +303,10 @@ pub const Owner = struct {
                         self.log("NVIDIA gsp-vaspace: handle={x} base={x} bytes={x} big-page={d} page-tables=RM app-mappings=none",
                             .{info.handle, info.base, info.bytes, info.big_page_bytes})
                     else self.log("NVIDIA gsp-vaspace: unavailable rm={?} receiver-inventory=available", .{graph.address_space.?.rejected});
+                    if (self.nativeMemoryCapabilities()) |caps|
+                        self.log("NVIDIA gsp-memory-caps: raw={x},{x},{x} system-render={} system-scanout={} gpu-cache={} blocklinear={} gob-bytes={d} generic-kind={x} engines=unqualified",
+                            .{caps.raw[0], caps.raw[1], caps.raw[2], caps.renderSystem(), caps.scanoutSystem(), caps.gpuCachedSystem(), caps.blocklinear(), caps.gobBytes(), caps.genericPageKind()})
+                    else self.log("NVIDIA gsp-memory-caps: unavailable native-layouts=unqualified", .{});
                     if (self.nativeControlBuffer()) |info|
                         self.log("NVIDIA gsp-control: memory={x} virtual={x} gpu-va={x} bytes={d} backing=BO pages=system-linear gpu-cache=disabled channels=none",
                             .{info.memory, info.virtual, info.address, info.bytes})

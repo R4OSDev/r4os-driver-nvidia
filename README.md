@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.68; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.69; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -11,6 +11,19 @@ Starting with R4OS 0.79.9, `IMAGE_SCOPE=slim` includes the current module in
 Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
+
+Memory capability query (NVIDIA 0.1.69, roadmap 0.79.11):
+The actual RM control-buffer owner queries FB_GET_CAPS_V2 before creating
+its BO. This is a raw 27-byte RPC, with support published only after ACK.
+Generation-bound facts cover system render/scanout/GPU caching, blocklinear,
+explicit 512-byte GOBs and NVKMS generic page-kind selection. They do not
+qualify surface layouts or engines. A valid empty table keeps the raw pitch
+control buffer usable with GPU caching disabled; CPU WB is a separate rule.
+An ACKed rejection preserves receivers without allocating a control BO;
+uncertain replies or ACK failures retain the session and its parents.
+All 51 existing groups, six original-C wire pairs (324 bytes) and the build
+pass. No additional guest or gate. Evidence: GrafikSpeicher07911.json /
+memory_caps_checkpoint; physical validation remains in OssiGPU.txt.
 
 Private GPU control buffer (NVIDIA 0.1.68, roadmap 0.79.11):
 The actual native graph uses the common BO service from ordinary Driver Work

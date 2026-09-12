@@ -649,3 +649,11 @@ Only trailing whitespace in appended notices is normalized. The driver
 resource and Distribution overlay are byte-identical; full originals and
 the original-C fixture remain in0.79.11/buffer-map-20260912. Original R4OS
 storage, graph and lifecycle code remains Apache-2.0.
+
+NVIDIA 0.1.69 adds the pinned 570.144 framebuffer capability definitions and
+their memory-manager/NVKMS interpretation. Complete original MIT notices
+remain in src/gsp_memory_caps.zig and the runtime license, whose unchanged
+137137-byte prefix is extended to 141047 bytes. Distribution ships the same
+full text. Six raw C request/reply pairs and source identities are recorded
+in src/fixtures/memory-caps-570.144.json; detailed workspace evidence is under
+ExFiles/Reference/GFX/Nvidia/0.79.11/memory-caps-20260912.

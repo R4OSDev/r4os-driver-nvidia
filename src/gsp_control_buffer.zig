@@ -5,6 +5,7 @@ const r4os = @import("r4os");
 const exchange = @import("gsp_exchange.zig");
 const boot = @import("gsp_boot_events.zig");
 const storage = @import("gsp_control_storage.zig");
+pub const memory_caps = @import("gsp_memory_caps.zig");
 pub const wire = @import("gsp_buffer_wire.zig");
 pub const Error = wire.Error || storage.Error || error{Retained};
 pub const State = enum { creating, unwinding, ready, handed_off, destroying, closed, finished, failed };
@@ -27,6 +28,9 @@ pub const Owner = struct {
     protocol_failure: ?exchange.Error = null,
     last_status: ?u32 = null,
     operation: ?wire.Operation = null,
+    caps: ?memory_caps.Info = null,
+    caps_checked: bool = false,
+    caps_active: bool = false,
     request: [wire.max_request_bytes]u8 = undefined,
     deadline: u64,
 
@@ -48,7 +52,46 @@ pub const Owner = struct {
     pub fn info(self: *const Owner) ?Info {
         if (self.self_address != @intFromPtr(self) or (self.state != .ready and self.state != .handed_off) or
             !self.mapped or !self.backing.gpuReady(self.address) or !self.backing.retained or self.exchange.session.state != .active) return null;
+        _ = self.memoryCapabilities() orelse return null;
         return .{ .epoch = self.binding.space.epoch, .memory = self.binding.memory, .virtual = self.binding.virtual, .address = self.address, .bytes = wire.bytes };
+    }
+    pub fn memoryCapabilities(self: *const Owner) ?memory_caps.Info {
+        if (self.self_address != @intFromPtr(self) or (self.state != .ready and self.state != .handed_off) or
+            !self.caps_checked or self.caps_active or self.exchange.session.state != .active or
+            self.binding.space.epoch != self.exchange.session.epoch) return null;
+        const caps = self.caps orelse return null;
+        return if (std.meta.eql(caps.binding, self.capsBinding())) caps else null;
+    }
+    fn capsBinding(self: *const Owner) memory_caps.Binding {
+        return .{ .epoch = self.binding.space.epoch, .client = self.binding.space.client, .device = self.binding.space.device };
+    }
+    fn pollCapabilities(self: *Owner) Error!?exchange.Dispatch {
+        if (!self.caps_active) {
+            const request = try memory_caps.encode(self.capsBinding(), &self.request);
+            try self.exchange.begin(memory_caps.function, request, self.deadline);
+            self.caps_active = true;
+        }
+        const dispatch = (try self.exchange.poll(self.deadline)) orelse return null;
+        if (!dispatch.response) return dispatch;
+        const reply = try memory_caps.decode(self.capsBinding(), dispatch.record);
+        self.last_status = if (reply == .rejected) reply.rejected else 0;
+        // No support is published, and no BO is created, before this ACK.
+        try self.exchange.complete(dispatch.ticket);
+        self.caps_active = false;
+        self.caps_checked = true;
+        switch (reply) {
+            .rejected => |status| {
+                self.rejected = status;
+                self.state = .unwinding;
+            },
+            .ok => |caps| {
+                self.caps = caps;
+                // The private raw control range uses pitch layout with GPU
+                // caching disabled. No render/scanout/cached-GPU bit is
+                // required; CPU WB visibility is a separate BO contract.
+            },
+        }
+        return null;
     }
     pub fn poll(self: *Owner) Error!?exchange.Dispatch {
         try self.stable();
@@ -63,6 +106,7 @@ pub const Owner = struct {
         try self.exchange.guard(self.deadline);
         if (self.backing.prepared and !self.backing.valid()) return error.Stale;
         if (self.exchange.pending != null) return error.Pending;
+        if (self.state == .creating and !self.caps_checked) return self.pollCapabilities();
         if (self.operation == null) {
             if (self.state == .creating and !self.backing.prepared) {
                 self.backing.prepare(&self.ctx, self.adapter, self.binding.space.epoch) catch |err| {
@@ -138,12 +182,15 @@ pub const Owner = struct {
         self.state = .destroying;
     }
     pub fn matches(self: *const Owner, current: *const exchange.Exchange, deadline: u64) bool {
-        const operation = self.operation orelse return false;
         if (self.self_address != @intFromPtr(self) or self.failure != null or
             (self.state != .creating and self.state != .unwinding and self.state != .destroying)) return false;
-        return current == &self.exchange and current.phase == .prepared and current.pending == null and
+        const common = current == &self.exchange and current.phase == .prepared and current.pending == null and
             current.deadline == deadline and self.deadline == deadline and current.session.epoch == self.binding.space.epoch and
-            current.request.ptr == self.request[0..].ptr and current.request.len == wire.length(operation) and
+            current.request.ptr == self.request[0..].ptr;
+        if (self.caps_active) return common and self.state == .creating and !self.caps_checked and self.operation == null and
+            current.function == memory_caps.function and current.request.len == memory_caps.bytes;
+        const operation = self.operation orelse return false;
+        return common and current.request.len == wire.length(operation) and
             current.function == wire.function(operation) and self.backing.retained;
     }
 };

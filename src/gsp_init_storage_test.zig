@@ -1521,6 +1521,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         rm_vaspace_reject, rm_vaspace_short, rm_vaspace_bounds, rm_vaspace_ack, rm_vaspace_timeout, rm_vaspace_free,
         control_allocation, control_cache, control_alias, control_sync, control_register_reject, control_virtual_reject, control_map_reject,
         control_short, control_bounds, control_map_address, control_ack, control_timeout, control_unmap, control_free, control_dma_unmap, control_release, control_gpu_acquire, control_gpu_release,
+        memory_caps_reject, memory_caps_none, memory_caps_rpc, memory_caps_short, memory_caps_wrong, memory_caps_ack, memory_caps_timeout,
         outputs_empty, outputs_all, outputs_rejected, outputs_partial, outputs_missing, outputs_incomplete, outputs_bad_edid,
         outputs_edid_rejected, outputs_ddc, outputs_ddc_bus_changed, outputs_aux, outputs_wiring, outputs_virtual, outputs_changed, outputs_final_changed, outputs_final_rejected, outputs_hpd, outputs_sequence, outputs_ack, outputs_timeout, catalog_rejected,
         runtime_healthy, runtime_lockdown, runtime_unknown, runtime_unowned, runtime_sequence_timeout,
@@ -2198,6 +2199,7 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
     var cleanups: usize = 0;
     var buffer_requests: usize = 0;
     var buffer_frees: usize = 0;
+    var caps_requests: usize = 0;
     var steps: usize = 0;
     errdefer if (running.graph) |*value| if (value.control_buffer) |*control| {
         std.debug.print("control BO failure: host={?} failure={?} ready={} active={} cpu={} dma={} gpu={} synced={} releases={d} requests={d} frees={d} adapter={x}/{x} epoch={d}/{d}\n", .{
@@ -2230,6 +2232,32 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
         try t.expect(std.mem.readInt(u32, payload[0..4], .little) == graph.reservation.client);
         if (graph.state == .control_creating or graph.state == .control_destroying) {
             const control = &graph.control_buffer.?;
+            if (control.caps_active) {
+                const caps_wire = @import("gsp_memory_caps.zig");
+                try t.expect(function == caps_wire.function and payload.len == caps_wire.bytes and caps_requests == 0);
+                try t.expect(std.mem.readInt(u32, payload[4..8], .little) == graph.base.plan.handles.device and
+                    std.mem.readInt(u32, payload[8..12], .little) == caps_wire.command and std.mem.allEqual(u8, payload[24..], 0));
+                try t.expect(!ControlModel.active and !control.caps_checked and control.caps == null and !control.backing.retained);
+                try t.expect(running.nativeControlBuffer() == null and running.nativeMemoryCapabilities() == null);
+                const phase = channel.phase;
+                channel.phase = .prepared;
+                try target.port.owner.?.admit_command.?(target.port.owner.?.context, &target.port, deadline);
+                var copy = control.*;
+                try t.expect(!copy.matches(channel, deadline));
+                try t.expectError(error.Stale, copy.poll());
+                channel.phase = phase;
+                caps_requests += 1;
+                response[24..27].* = if (scenario == .memory_caps_none) .{0,0,0} else .{0x0f,0x81,0x12};
+                if (scenario == .memory_caps_reject) std.mem.writeInt(u32, response[12..16], 0x51, .little);
+                if (scenario == .memory_caps_wrong) response[4] ^= 1;
+                if (scenario == .memory_caps_timeout) clock = deadline else {
+                    try nativeReply(session, function, if (scenario == .memory_caps_rpc) 0x52 else 0,
+                        response[0..if (scenario == .memory_caps_short) @as(usize, 26) else caps_wire.bytes]);
+                    if (scenario == .memory_caps_ack) range_failure_call = range_calls + 4;
+                }
+                _ = target.step();range_failure_call = 0;
+                continue;
+            }
             const operation = control.operation.?;
             try t.expect(control.backing.retained and !control.backing.close());
             try t.expect(ControlModel.active and !ControlModel.cpu_mapped and ControlModel.mapped and ControlModel.synced);
@@ -2400,10 +2428,11 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
         const object = running.nativeObject() orelse return error.MissingRmObjects;
         try t.expect(creates == 10 and requests == 10 and cleanups == 0 and graph.state == .loaned);
         try t.expect(object.client == graph.reservation.client and object.display == graph.base.plan.handles.display);
-        try t.expect(session.tx_sequence == original_sequence + 10 + buffer_requests + buffer_frees and running.activeChannel() == &running.channel.?);
+        try t.expect(session.tx_sequence == original_sequence + 10 + caps_requests + buffer_requests + buffer_frees and running.activeChannel() == &running.channel.?);
         try t.expect(DeviceModel.vaspace_logs == vaspace_logs + 1);
         if (scenario == .rm_vaspace_reject) {
             try t.expect(running.nativeAddressSpace() == null and graph.address_space.?.rejected.? == 0x51);
+            try t.expect(running.nativeMemoryCapabilities() == null and caps_requests == 0);
         } else {
             const address_space = running.nativeAddressSpace() orelse return error.MissingAddressSpace;
             try t.expect(address_space.epoch == session.epoch and address_space.client == graph.reservation.client);
@@ -2411,6 +2440,14 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
             try t.expect(address_space.bytes == 0x100000000 and address_space.big_page_bytes == 65536);
             if (running.nativeControlBuffer()) |info| {
                 try t.expect(info.address == 0x600000 and info.bytes == 12288 and info.epoch == session.epoch and buffer_requests == 3);
+                const caps = running.nativeMemoryCapabilities() orelse return error.MissingCapabilities;
+                try t.expect(caps_requests == 1 and caps.binding.epoch == session.epoch and caps.binding.device == graph.base.plan.handles.device);
+                const present = scenario != .memory_caps_none;
+                try t.expect(caps.renderSystem() == present and caps.scanoutSystem() == present and caps.gpuCachedSystem() == present and caps.blocklinear() == present);
+                try t.expect(caps.gobBytes() == @as(u16, if (present) 512 else 0) and caps.genericPageKind() == @as(u8, if (present) 6 else 0xfe));
+                graph.control_buffer.?.caps.?.binding.epoch += 1;
+                try t.expect(running.nativeMemoryCapabilities() == null and running.nativeControlBuffer() == null);
+                graph.control_buffer.?.caps.?.binding.epoch -= 1;
                 try t.expect(ControlModel.active and ControlModel.synced and ControlModel.releases == 0);
                 try t.expect(!graph.control_buffer.?.backing.close());
                 const backing_owner = &graph.control_buffer.?.backing;
@@ -2424,8 +2461,9 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
                 graph.address_space.?.info.?.handle -= 1;
                 try t.expect(running.nativeControlBuffer() != null);
             } else {
-                try t.expect(ControlModel.releases == 1 and !ControlModel.active and !ControlModel.cpu_mapped and !ControlModel.mapped);
+                try t.expect(ControlModel.releases == @as(usize, if (scenario == .memory_caps_reject) 0 else 1) and !ControlModel.active and !ControlModel.cpu_mapped and !ControlModel.mapped);
                 try t.expect(graph.control_buffer.?.rejected != null or graph.control_buffer.?.host_rejected != null);
+                if (scenario == .memory_caps_reject) try t.expect(caps_requests == 1 and buffer_requests == 0 and buffer_frees == 0 and running.nativeMemoryCapabilities() == null);
             }
         }
         if (scenario == .rm_i2c_reject) try t.expect(object.i2c == 0 and !graph.i2c.?.live and graph.i2c.?.rejected.? == 0x56)
@@ -2450,6 +2488,12 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
     try t.expect(running.nativeObject() == null and running.failure != null and target.phase == .recovering);
     try t.expect(running.nativeAddressSpace() == null);
     try t.expect(running.nativeControlBuffer() == null);
+    try t.expect(running.nativeMemoryCapabilities() == null);
+    if (std.mem.startsWith(u8, @tagName(scenario), "memory_caps_")) {
+        const control = &graph.control_buffer.?;
+        try t.expect(!ControlModel.active and !control.caps_checked and control.caps == null and !control.backing.retained);
+        try t.expect(caps_requests == 1 and buffer_requests == 0 and buffer_frees == 0);
+    }
     if (std.mem.startsWith(u8, @tagName(scenario), "control_")) {
         const control = &graph.control_buffer.?;
         try t.expect(ControlModel.active and control.info() == null);
