@@ -69,6 +69,7 @@ pub const Owner = struct {
     ordinary: ?events.Dispatch = null,
     sequence: native.RuntimeSequencer = .{},
     epoch: u64 = 0,
+    adapter_id: u32 = 0,
     last_clock: u64 = 0,
     next_log: u64 = 0,
     log_index: usize = 0,
@@ -96,6 +97,7 @@ pub const Owner = struct {
         handoff: *boot.Handoff, reader: *logs.Reader, reservation: *const @import("boot_vram_lease.zig").Lease, deadline: u64) !void
     {
         if (self.self_address != 0) return error.Busy;
+        if (self.adapter_id == 0) return error.Binding;
         if (device.phase != .runtime or device.runtime_session != handoff.session or
             reader.memory == null or device.owner == null or device.owner.?.queue_memory != reader.memory or
             reader.generation() != handoff.session.epoch or !reader.enabled or reader.busy or
@@ -196,7 +198,8 @@ pub const Owner = struct {
     pub fn nativeControlBuffer(self: *Owner) ?@import("gsp_control_buffer.zig").Info {
         const space = self.nativeAddressSpace() orelse return null;
         const owner = if (self.graph.?.control_buffer) |*value| value else return null;
-        if (!std.meta.eql(owner.binding.space, space.*)) return null;
+        if (owner.adapter != self.adapter_id or owner.backing.adapter != self.adapter_id or
+            owner.backing.epoch != self.epoch or !std.meta.eql(owner.binding.space, space.*)) return null;
         return owner.info();
     }
     pub fn takeDisplayChanges(self: *Owner) !subscriptions.Changes {
@@ -295,7 +298,7 @@ pub const Owner = struct {
                             .{info.handle, info.base, info.bytes, info.big_page_bytes})
                     else self.log("NVIDIA gsp-vaspace: unavailable rm={?} receiver-inventory=available", .{graph.address_space.?.rejected});
                     if (self.nativeControlBuffer()) |info|
-                        self.log("NVIDIA gsp-control: memory={x} virtual={x} gpu-va={x} bytes={d} pages=system-linear gpu-cache=disabled channels=none",
+                        self.log("NVIDIA gsp-control: memory={x} virtual={x} gpu-va={x} bytes={d} backing=BO pages=system-linear gpu-cache=disabled channels=none",
                             .{info.memory, info.virtual, info.address, info.bytes})
                     else if (graph.control_buffer) |*owner|
                         self.log("NVIDIA gsp-control: unavailable rm={?} host={s} receiver-inventory=available",
@@ -374,6 +377,7 @@ pub const Owner = struct {
             // name. This is not a fabricated R4OS program or host pointer.
             self.graph = try rm.Owner.init(&token, std.math.maxInt(u32), "", end);
             self.graph.?.control_context = self.ctx;
+            self.graph.?.control_adapter = self.adapter_id;
             self.log("NVIDIA gsp-rm: creating client={x} deadline-ns={d}", .{self.graph.?.reservation.client, end});
             return .progress;
         }

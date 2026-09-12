@@ -1454,8 +1454,8 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
     const saved_table = table.*;
     defer table.* = saved_table;
     table.version = a.driver_api_thread_work_version;
-    ControlModel.install(table);
     table.gfx_memory_query = QueueNative.query;
+    ControlModel.install(table);
     table.gfx_output_query = CatalogModel.query;
     table.log_info = DeviceModel.log;
     table.log_warn = DeviceModel.log;
@@ -1519,8 +1519,8 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         irq_intx, irq_register_error, irq_msi_uncertain, irq_cause, irq_wake_failure, irq_close_busy, irq_unregister_failure,
         rm_base_reject, rm_i2c_reject, rm_event_reject, rm_free_error, rm_timeout, rm_ack_failure, rm_foreign_event, rm_event_ack,
         rm_vaspace_reject, rm_vaspace_short, rm_vaspace_bounds, rm_vaspace_ack, rm_vaspace_timeout, rm_vaspace_free,
-        control_allocation, control_bounce, control_alias, control_sync, control_register_reject, control_virtual_reject, control_map_reject,
-        control_short, control_bounds, control_map_address, control_ack, control_timeout, control_unmap, control_free, control_dma_unmap, control_release,
+        control_allocation, control_cache, control_alias, control_sync, control_register_reject, control_virtual_reject, control_map_reject,
+        control_short, control_bounds, control_map_address, control_ack, control_timeout, control_unmap, control_free, control_dma_unmap, control_release, control_gpu_acquire, control_gpu_release,
         outputs_empty, outputs_all, outputs_rejected, outputs_partial, outputs_missing, outputs_incomplete, outputs_bad_edid,
         outputs_edid_rejected, outputs_ddc, outputs_ddc_bus_changed, outputs_aux, outputs_wiring, outputs_virtual, outputs_changed, outputs_final_changed, outputs_final_rejected, outputs_hpd, outputs_sequence, outputs_ack, outputs_timeout, catalog_rejected,
         runtime_healthy, runtime_lockdown, runtime_unknown, runtime_unowned, runtime_sequence_timeout,
@@ -2199,6 +2199,12 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
     var buffer_requests: usize = 0;
     var buffer_frees: usize = 0;
     var steps: usize = 0;
+    errdefer if (running.graph) |*value| if (value.control_buffer) |*control| {
+        std.debug.print("control BO failure: host={?} failure={?} ready={} active={} cpu={} dma={} gpu={} synced={} releases={d} requests={d} frees={d} adapter={x}/{x} epoch={d}/{d}\n", .{
+            control.host_rejected, control.failure, control.backing.prepared, ControlModel.active, ControlModel.cpu_mapped,
+            ControlModel.mapped, ControlModel.gpu_mapped, ControlModel.synced, ControlModel.releases, buffer_requests, buffer_frees,
+            control.backing.adapter, running.adapter_id, control.backing.epoch, running.epoch });
+    };
     errdefer |err| std.debug.print("actual RM graph scenario={s} error={s} phase={s} failure={?} graph={s} requests={d} creates={d} frees={d}\n",
         .{@tagName(scenario), @errorName(err), @tagName(target.phase), target.failure,
             if (running.graph) |*graph| @tagName(graph.state) else "none", requests, creates, cleanups});
@@ -2226,7 +2232,7 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
             const control = &graph.control_buffer.?;
             const operation = control.operation.?;
             try t.expect(control.backing.retained and !control.backing.close());
-            try t.expect(ControlModel.active and ControlModel.pinned and ControlModel.mapped and ControlModel.synced);
+            try t.expect(ControlModel.active and !ControlModel.cpu_mapped and ControlModel.mapped and ControlModel.synced);
             try t.expect(running.nativeControlBuffer() == null);
             const phase = channel.phase;
             channel.phase = .prepared;
@@ -2362,7 +2368,7 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
             if (scenario == .rm_base_reject and creates == 1) result = 0x55;
             if (scenario == .rm_i2c_reject and creates == 4) result = 0x56;
             if ((scenario == .rm_event_reject or scenario == .rm_free_error or scenario == .rm_vaspace_free or
-                scenario == .control_unmap or scenario == .control_free or scenario == .control_dma_unmap or scenario == .control_release) and creates == 7) result = 0x55;
+                scenario == .control_unmap or scenario == .control_free or scenario == .control_dma_unmap or scenario == .control_release or scenario == .control_gpu_release) and creates == 7) result = 0x55;
             if (scenario == .rm_vaspace_reject and allocating_vaspace) result = 0x51;
             creates += 1;
         }
@@ -2418,7 +2424,7 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
                 graph.address_space.?.info.?.handle -= 1;
                 try t.expect(running.nativeControlBuffer() != null);
             } else {
-                try t.expect(ControlModel.releases == 1 and !ControlModel.active and !ControlModel.pinned and !ControlModel.mapped);
+                try t.expect(ControlModel.releases == 1 and !ControlModel.active and !ControlModel.cpu_mapped and !ControlModel.mapped);
                 try t.expect(graph.control_buffer.?.rejected != null or graph.control_buffer.?.host_rejected != null);
             }
         }
@@ -2448,11 +2454,11 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
         const control = &graph.control_buffer.?;
         try t.expect(ControlModel.active and control.info() == null);
         try t.expectError(error.Retained, session.rm_names.retire(graph.reservation));
-        if (scenario == .control_dma_unmap or scenario == .control_release) {
+        if (scenario == .control_dma_unmap or scenario == .control_release or scenario == .control_gpu_release) {
             try t.expect(buffer_frees == 3 and !control.mapped and !control.allocated and !control.registered);
         } else {
             try t.expect(control.backing.retained and !control.backing.close());
-            try t.expect(ControlModel.pinned and ControlModel.mapped);
+            try t.expect(!ControlModel.cpu_mapped and ControlModel.mapped);
         }
     }
     if (scenario == .rm_base_reject or scenario == .rm_event_reject) {

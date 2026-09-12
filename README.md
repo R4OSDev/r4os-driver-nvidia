@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.67; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.68; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -12,17 +12,20 @@ Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
 
-Private GPU control buffer (NVIDIA 0.1.67, roadmap 0.79.11):
-The actual native graph stages three zeroed resident system pages through
-DriverHeap/DMA, registers them with RM and maps a validated private GPU VA.
-RM owns page tables;4K pages, cache snoop, GPU cache disabled and immediate
-TLB invalidation are requested. Reverse teardown acknowledges unmap and
-both object frees before releasing DMA/pin/heap, then the parent VASpace.
-Rejected allocations preserve receivers; uncertain effects retain pages.
-All51 existing groups, six original-C wire pairs and the module build pass.
-No channel uses this12-KB buffer yet. App BO integration from Driver Work,
-general VRAM resources, channels and GPU execution remain software work.
-Evidence: Docs/Drivers/GrafikSpeicher07911.json/control_buffer_checkpoint.
+Private GPU control buffer (NVIDIA 0.1.68, roadmap 0.79.11):
+The actual native graph uses the common BO service from ordinary Driver Work
+(Kernel 0.1.154). One 12-KB system BO supplies CPU zeroing and direct DMA pages;
+confirmed RM map plus ACK precedes its separate GPU residency lease. No
+private heap copy or legacy DMA pin is used. The PCI adapter and GSP epoch
+bind both leases. RM unmap/object frees precede GPU/DMA residency release,
+CPU-map remnants, BO reference and collection. Failed admission unwinds the
+confirmed prefix; uncertain effects or failed cleanup retain ownership.
+All 51 existing NVIDIA groups and the build pass. The common kernel path has
+52/52 display-step checks and actual SMP4 Work/closed-owner acceptance.
+No execution channel uses this buffer yet; general app GPU resources, VRAM
+placement and engines remain software work. The pinned 570.144 wire codec
+and 736-byte original-C fixture are unchanged. Evidence:
+Docs/Drivers/GrafikSpeicher07911.json / bo_work_checkpoint.
 
 RM-owned address space (NVIDIA 0.1.66, roadmap 0.79.11):
 The actual graph creates a private FERMI_VASPACE_A child through its one

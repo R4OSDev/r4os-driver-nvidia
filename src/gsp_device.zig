@@ -103,7 +103,9 @@ pub const Device = struct {
         }
         errdefer |err| { self.failure = err; self.failed_phase = self.phase; self.phase = .failed; }
         const pci = display.snapshot.?.pci;
-        try self.catalog.open(ctx, 0x0100_0000 | (@as(u32, pci.bus) << 8) | (@as(u32, pci.device) << 3) | pci.function);
+        const adapter = 0x0100_0000 | (@as(u32, pci.bus) << 8) | (@as(u32, pci.device) << 3) | pci.function;
+        self.running.adapter_id = adapter;
+        try self.catalog.open(ctx, adapter);
         errdefer _ = self.catalog.close();
         try self.checkLive(false);
         const original = display.operation.?.options;

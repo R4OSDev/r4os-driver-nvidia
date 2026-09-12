@@ -13,6 +13,7 @@ pub const Owner = struct {
     self_address: usize = 0,
     exchange: exchange.Exchange,
     ctx: r4os.r4dev.DriverContext,
+    adapter: u32,
     binding: wire.Binding,
     backing: storage.Storage = .{},
     state: State = .creating,
@@ -29,10 +30,10 @@ pub const Owner = struct {
     request: [wire.max_request_bytes]u8 = undefined,
     deadline: u64,
 
-    pub fn init(token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext, binding: wire.Binding, deadline: u64) Error!Owner {
+    pub fn init(token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext, adapter: u32, binding: wire.Binding, deadline: u64) Error!Owner {
         try wire.validate(binding);
-        if (token.session.epoch != binding.space.epoch) return error.Stale;
-        return .{ .ctx = ctx.*, .binding = binding, .deadline = deadline, .exchange = try exchange.Exchange.init(token, deadline) };
+        if (adapter == 0 or token.session.epoch != binding.space.epoch) return error.Stale;
+        return .{ .ctx = ctx.*, .adapter = adapter, .binding = binding, .deadline = deadline, .exchange = try exchange.Exchange.init(token, deadline) };
     }
     fn stable(self: *const Owner) Error!void {
         if ((self.self_address != 0 and self.self_address != @intFromPtr(self)) or
@@ -46,7 +47,7 @@ pub const Owner = struct {
     }
     pub fn info(self: *const Owner) ?Info {
         if (self.self_address != @intFromPtr(self) or (self.state != .ready and self.state != .handed_off) or
-            !self.mapped or !self.backing.valid() or !self.backing.retained or self.exchange.session.state != .active) return null;
+            !self.mapped or !self.backing.gpuReady(self.address) or !self.backing.retained or self.exchange.session.state != .active) return null;
         return .{ .epoch = self.binding.space.epoch, .memory = self.binding.memory, .virtual = self.binding.virtual, .address = self.address, .bytes = wire.bytes };
     }
     pub fn poll(self: *Owner) Error!?exchange.Dispatch {
@@ -64,7 +65,7 @@ pub const Owner = struct {
         if (self.exchange.pending != null) return error.Pending;
         if (self.operation == null) {
             if (self.state == .creating and !self.backing.prepared) {
-                self.backing.prepare(&self.ctx) catch |err| {
+                self.backing.prepare(&self.ctx, self.adapter, self.binding.space.epoch) catch |err| {
                     self.host_rejected = err;
                     self.state = .unwinding;
                     return null;
@@ -105,6 +106,12 @@ pub const Owner = struct {
             .map => {
                 self.mapped = true;
                 self.state = .ready;
+                self.backing.retainGpu(self.address) catch |err| {
+                    // RM reached the map, but common residency admission
+                    // failed. Confirm reverse RPC teardown before BO free.
+                    self.host_rejected = err;
+                    self.state = .unwinding;
+                };
             },
             .unmap => self.mapped = false,
             .free_virtual => {

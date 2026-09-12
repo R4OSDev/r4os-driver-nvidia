@@ -20,6 +20,7 @@ pub const Owner = struct {
     i2c: ?i2c_object.Owner = null,
     address_space: ?vaspace.Owner = null,
     control_context: ?@import("r4os").r4dev.DriverContext = null,
+    control_adapter: u32 = 0,
     control_buffer: ?control.Owner = null,
     state: State = .base_creating,
     self_address: usize = 0,
@@ -155,7 +156,7 @@ pub const Owner = struct {
                 if (self.address_space.?.state == .ready) {
                     var token = self.address_space.?.handoff(self.deadline) catch |err| return self.fail(err);
                     if (self.control_context != null and self.address_space.?.info != null) {
-                        self.control_buffer = control.Owner.init(&token, &self.control_context.?, .{ .space = self.address_space.?.info.?,
+                        self.control_buffer = control.Owner.init(&token, &self.control_context.?, self.control_adapter, .{ .space = self.address_space.?.info.?,
                             .memory = try self.reservation.object(7), .virtual = try self.reservation.object(8) }, self.deadline) catch |err| return self.fail(err);
                         self.state = .control_creating;
                     } else try self.beginEvents(&token);
