@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.71; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.72; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -11,6 +11,19 @@ Starting with R4OS 0.79.9, `IMAGE_SCOPE=slim` includes the current module in
 Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
+
+Native surface storage (NVIDIA 0.1.72 / Kernel 0.1.158):
+The runtime plans linear or capability-qualified blocklinear XRGB/ARGB/R8/
+NV12/P010 storage, reserves its common BO and allocates/maps RM-owned VRAM.
+Byte pitches, padded plane extents and canonical uncompressed modifiers
+survive publication and import. Scanout storage requests PRIMARY/contiguous
+placement; offscreen requests IMAGE/NO_SCANOUT. Changed successful layout
+or scanout-contiguity replies retain ownership. Common opaque descriptors
+remain CPU-inaccessible; ABI sizes and the default linear path are preserved.
+Existing51 NVIDIA groups,52 Kernel groups, pinned C vectors, builds and one
+focused SMP4 API run pass. Engine consumers/channels remain open; this
+storage interface registers no rendering or modesetting backend.
+Evidence: GrafikSpeicher07911.json / surface_layout_checkpoint.
 
 Native driver-owned VRAM (NVIDIA 0.1.71 / Kernel 0.1.157):
 The runtime reserves a common BO, allocates RM-owned local memory and a

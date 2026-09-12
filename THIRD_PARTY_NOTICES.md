@@ -1,5 +1,18 @@
 ﻿# Third-Party Notices
 
+Native surface storage (NVIDIA 0.1.72, 2026-09-12):
+Pitch/GOB geometry, automatic block height, uncompressed NVIDIA modifiers
+and RM allocation attributes follow the pinned 570.144 MIT sources.
+Complete notices remain in gsp_surface_layout.zig and the byte-identical
+embedded/staged runtime notice. Original C height policy, alignment macro,
+modifier macro and RM structures supply 16 geometry vectors and eight
+allocation request/response pairs. The pinned headsurface pitch helper
+passes granule-1 to a granule-based NV_ALIGN_UP; the fixture records this
+discrepancy and uses the documented GOB dimensions with the original macro.
+Original sources and the comparison are archived under
+0.79.11/surface-layout-20260912. R4OS planning/ownership remains Apache-2.0.
+
+
 AUX acquisition (NVIDIA 0.1.63, 2026-09-12):
 The fixed AUX ABI, copyout-on-error contract and EDID transaction workflow
 follow pinned NVIDIA 570.144, Nouveau and drm_dp_helper.c from Linux 7.2.4.

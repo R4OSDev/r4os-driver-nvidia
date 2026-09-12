@@ -8,9 +8,10 @@ const exchange = @import("gsp_exchange.zig");
 const names = @import("gsp_rm_names.zig");
 const vaspace = @import("gsp_vaspace.zig");
 pub const wire = @import("gsp_vram_wire.zig");
-pub const Error = wire.Error || names.Error || error{ Api, Descriptor, Memory, Busy, Retained };
+pub const surface = @import("gsp_surface_layout.zig");
+pub const Error = wire.Error || names.Error || surface.Error || error{ Api, Descriptor, Memory, Busy, Retained };
 pub const State = enum { creating, unwinding, ready, handed_off, destroying, closed, finished, failed };
-pub const Info = struct { reference: a.GfxBufferReference, address: u64, logical_bytes: u64, allocation_bytes: u64, epoch: u64 };
+pub const Info = struct { reference: a.GfxBufferReference, address: u64, logical_bytes: u64, allocation_bytes: u64, epoch: u64, surface: surface.Plan };
 pub const Owner = struct {
     self_address: usize = 0,
     exchange: exchange.Exchange,
@@ -21,6 +22,7 @@ pub const Owner = struct {
     adapter: u32,
     logical_bytes: u64,
     bytes: u64,
+    layout: surface.Plan,
     state: State = .creating,
     reservation: a.GfxOwnedBufferReservation = .{},
     reservation_stamp: a.GfxOwnedBufferReservation = .{},
@@ -46,20 +48,24 @@ pub const Owner = struct {
     pub fn init(token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext, adapter: u32, space: vaspace.Info,
         parent: names.Lease, logical_bytes: u64, deadline: u64) Error!Owner
     {
+        return initPlanned(token, ctx, adapter, space, parent, try surface.raw(adapter, space, logical_bytes), deadline);
+    }
+    pub fn initPlanned(token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext, adapter: u32, space: vaspace.Info,
+        parent: names.Lease, plan: surface.Plan, deadline: u64) Error!Owner
+    {
         if (token.claimed or token.session.state != .active or token.session.pending != null or adapter == 0 or
             space.epoch != token.session.epoch or parent.epoch != space.epoch or parent.client != space.client) return error.Stale;
         try token.session.guard(deadline);
         const memory = ctx.memory() orelse return error.Api;
         if (memory.table.size < 152 or memory.table.buffer_reserve == 0 or memory.table.buffer_commit == 0 or
             memory.table.buffer_abort == 0 or memory.table.buffer_take_release == 0 or memory.table.buffer_finish_release == 0) return error.Api;
-        if (logical_bytes == 0) return error.Bounds;
-        const bytes = (std.math.add(u64, logical_bytes, wire.alignment - 1) catch return error.Bounds) & ~(wire.alignment - 1);
-        if (bytes > space.bytes) return error.Bounds;
+        try plan.validate(adapter, space);
         const children = try token.session.rm_names.reserveChildren(parent, 2);
         errdefer token.session.rm_names.retireChildren(children) catch {};
         const binding: wire.Binding = .{ .space = space, .memory = try children.object(0), .virtual = try children.object(1) };
         return .{ .exchange = try exchange.Exchange.init(token, deadline), .memory = memory, .names = children,
-            .binding = binding, .adapter = adapter, .logical_bytes = logical_bytes, .bytes = bytes, .deadline = deadline };
+            .binding = binding, .adapter = adapter, .logical_bytes = plan.descriptor.byte_length,
+            .bytes = plan.allocation_bytes, .layout = plan, .deadline = deadline };
     }
     fn stable(self: *const Owner) Error!void {
         if ((self.self_address != 0 and self.self_address != @intFromPtr(self)) or self.binding.space.epoch != self.exchange.session.epoch or
@@ -76,12 +82,11 @@ pub const Owner = struct {
         self.stable() catch return null;
         if (self.self_address != @intFromPtr(self) or !self.committed or !self.reference_live or self.closing or !self.mapped or
             self.exchange.session.state != .active or (self.state != .ready and self.state != .handed_off)) return null;
-        return .{ .reference = self.reference, .address = self.address, .logical_bytes = self.logical_bytes, .allocation_bytes = self.bytes, .epoch = self.binding.space.epoch };
+        return .{ .reference = self.reference, .address = self.address, .logical_bytes = self.logical_bytes,
+            .allocation_bytes = self.bytes, .epoch = self.binding.space.epoch, .surface = self.layout };
     }
     fn reserve(self: *Owner) Error!void {
-        const result = self.memory.bufferReserve(&.{ .byte_length = self.logical_bytes, .alignment = wire.alignment, .usage = 12,
-            .location = a.gfx_buffer_location_device_local, .adapter_id = self.adapter, .device_generation = self.binding.space.epoch },
-            self.binding.memory, &self.reservation);
+        const result = self.memory.bufferReserve(&self.layout.descriptor, self.binding.memory, &self.reservation);
         self.reservation_stamp = self.reservation;
         if (result != a.gfx_buffer_result_ok and self.reservation.buffer.id == 0) {
             self.host_rejected = result; self.state = .unwinding; return;
@@ -133,7 +138,7 @@ pub const Owner = struct {
                 self.state = if (self.state == .unwinding) .ready else .closed;
                 return null;
             };
-            const encoded = try wire.encode(self.binding, self.bytes, op, self.address, &self.request);
+            const encoded = try wire.encodeLayout(self.binding, self.bytes, .{ .blocklinear = self.layout.blocklinear(), .scanout = self.layout.scanout() }, op, self.address, &self.request);
             try self.exchange.begin(encoded.function, encoded.bytes, self.deadline);
             self.operation = op; self.request_bytes = encoded.bytes.len;
         }

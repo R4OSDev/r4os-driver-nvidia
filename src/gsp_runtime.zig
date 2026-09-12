@@ -305,6 +305,15 @@ pub const Owner = struct {
     /// borrowed driver reference only after RM allocation/map ACKs and common
     /// commit. Consumers import that reference through the common API.
     pub fn allocateNativeBuffer(self: *Owner, bytes: u64, deadline: u64) !BufferHandle {
+        const space = (self.nativeAddressSpace() orelse return error.State).*;
+        return self.allocateNativePlan(try vram.surface.raw(self.adapter_id, space, bytes), deadline);
+    }
+    pub fn allocateNativeSurface(self: *Owner, request: vram.surface.Request, deadline: u64) !BufferHandle {
+        const space = (self.nativeAddressSpace() orelse return error.State).*;
+        const caps = self.nativeMemoryCapabilities() orelse return error.State;
+        return self.allocateNativePlan(try vram.surface.create(self.adapter_id, space, caps, request), deadline);
+    }
+    fn allocateNativePlan(self: *Owner, plan: vram.surface.Plan, deadline: u64) !BufferHandle {
         _ = try self.now();
         if (self.graph_closing or self.native_active != null or self.buffer_active != null or self.sequence.self_address != 0 or self.outputs.active()) return error.Busy;
         const space = (self.nativeAddressSpace() orelse return error.State).*;
@@ -330,7 +339,7 @@ pub const Owner = struct {
         errdefer if (heap.release(allocation.handle) == r4os.abi.driver_heap_ok) { slot.* = .{}; } else self.stop(error.Retained);
         if (result != r4os.abi.driver_heap_ok) return error.Memory;
         var token = try self.channel.?.handoff(deadline);
-        const value = vram.Owner.init(&token, &self.ctx.?, self.adapter_id, space, self.graph.?.reservation, bytes, deadline) catch |err| {
+        const value = vram.Owner.initPlanned(&token, &self.ctx.?, self.adapter_id, space, self.graph.?.reservation, plan, deadline) catch |err| {
             self.channel = exchange.Exchange.init(&token, deadline) catch |restore| { self.stop(restore); return restore; };
             return err;
         };

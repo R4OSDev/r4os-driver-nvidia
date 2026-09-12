@@ -1524,6 +1524,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         memory_caps_reject, memory_caps_none, memory_caps_rpc, memory_caps_short, memory_caps_wrong, memory_caps_ack, memory_caps_timeout,
         mapping_success, mapping_reject, mapping_offset, mapping_ack, mapping_timeout, mapping_release, mapping_segment, mapping_gpu,
         vram_success, vram_budget, vram_physical_reject, vram_virtual_reject, vram_map_reject, vram_commit, vram_size, vram_ack, vram_timeout, vram_free, vram_finish,
+        vram_surface_linear, vram_surface_tiled, vram_surface_changed, vram_surface_contiguity,
         outputs_empty, outputs_all, outputs_rejected, outputs_partial, outputs_missing, outputs_incomplete, outputs_bad_edid,
         outputs_edid_rejected, outputs_ddc, outputs_ddc_bus_changed, outputs_aux, outputs_wiring, outputs_virtual, outputs_changed, outputs_final_changed, outputs_final_rejected, outputs_hpd, outputs_sequence, outputs_ack, outputs_timeout, catalog_rejected,
         runtime_healthy, runtime_lockdown, runtime_unknown, runtime_unowned, runtime_sequence_timeout,
@@ -2581,13 +2582,23 @@ fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverAp
     var handles: [2]runtime.BufferHandle = undefined;
     var messages: usize = 0;
     var interleaved = false;
-    const full = 64 * 1024 * 1024;
-    const total: usize = if (model.is("vram_success")) 2 else 1;
+    const surface = runtime.vram.surface;
+    const surfaces = std.mem.startsWith(u8, scenario, "vram_surface_");
+    const success = model.is("vram_success") or model.is("vram_surface_linear") or model.is("vram_surface_tiled");
+    const layout: surface.Layout = if (model.is("vram_surface_linear")) .linear else .blocklinear;
+    const requests = [_]surface.Request{
+        if (model.is("vram_surface_contiguity")) .{ .width = 1920, .height = 1080, .usage = 44, .layout = layout }
+            else .{ .width = 1919, .height = 1079, .format = .nv12, .usage = 28, .layout = layout },
+        .{ .width = 1920, .height = 1080, .format = .argb8888, .usage = 44, .layout = layout },
+    };
+    const full: u64 = if (surfaces) (try surface.create(running.adapter_id, running.nativeAddressSpace().?.*, running.nativeMemoryCapabilities().?, requests[0])).allocation_bytes else 64 * 1024 * 1024;
+    const total: usize = if (success) 2 else 1;
     errdefer |err| std.debug.print("native VRAM {s}: {s} phase={s} failure={?} active={?} messages={d} charge={d}\n",
         .{scenario, @errorName(err), @tagName(target.phase), target.failure, running.native_active, messages, model.charged});
     for (0..total) |index| {
-        const bytes: u64 = if (index == 0) full - 5 else 4091;
-        handles[index] = try running.allocateNativeBuffer(bytes, deadline);
+        const plan = if (surfaces) try surface.create(running.adapter_id, running.nativeAddressSpace().?.*, running.nativeMemoryCapabilities().?, requests[index]) else null;
+        const bytes: u64 = if (plan) |p| p.descriptor.byte_length else if (index == 0) full - 5 else 4091;
+        handles[index] = if (surfaces) try running.allocateNativeSurface(requests[index], deadline) else try running.allocateNativeBuffer(bytes, deadline);
         var forged = handles[index]; forged.serial += 1;
         try t.expectError(error.Stale, running.nativeBufferStatus(forged));
         var steps: usize = 0;
@@ -2620,6 +2631,17 @@ fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverAp
                 std.mem.writeInt(u64, response[120..128], owner.bytes - 1, .little);
                 if ((op == .allocate_memory and model.is("vram_physical_reject")) or (op == .allocate_virtual and model.is("vram_virtual_reject"))) outputWord(&response, 16, 0x57);
                 if (op == .allocate_memory and model.is("vram_size")) std.mem.writeInt(u64, response[96..104], owner.bytes + 65536, .little);
+                if (surfaces) {
+                    const attr = std.mem.readInt(u32, response[56..60], .little);
+                    try t.expect(((attr >> 16) & 3) == @as(u32, if (layout == .blocklinear) 2 else 0));
+                    try t.expect(std.meta.eql(model.slots[index].descriptor, plan.?.descriptor));
+                    if (op == .allocate_memory and requests[index].usage & 32 != 0) {
+                        try t.expect(std.mem.readInt(u32, response[36..40], .little) == 8 and ((attr >> 27) & 3) == 2);
+                        try t.expect(std.mem.readInt(u32, response[40..44], .little) & 0x1000 == 0);
+                    }
+                    if (op == .allocate_memory and model.is("vram_surface_changed")) response[58] ^= 2;
+                    if (op == .allocate_memory and model.is("vram_surface_contiguity")) response[59] ^= 0x18;
+                }
             } else if (op == .map) {
                 try t.expect(std.mem.readInt(u32, response[32..36], .little) == 0x100 and model.slots[index].live and !model.slots[index].published);
                 std.mem.writeInt(u64, response[40..48], model.address(index), .little);
@@ -2643,7 +2665,8 @@ fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverAp
         const result = try running.nativeBufferStatus(handles[index]);
         try t.expect(result.state == .handed_off);
         if (result.info) |info| {
-            try t.expect(info.address == model.address(index) and info.logical_bytes == bytes and info.allocation_bytes == @as(u64, if (index == 0) full else 65536));
+            try t.expect(info.address == model.address(index) and info.logical_bytes == bytes and info.allocation_bytes == @as(u64, if (plan) |p| p.allocation_bytes else if (index == 0) full else 65536));
+            if (plan) |p| try t.expect(std.meta.eql(info.surface, p));
             try t.expect(model.slots[index].published and model.slots[index].reference);
             var loan = try running.channel.?.handoff(deadline);
             try running.graph.?.reclaim(&loan, deadline);
@@ -2661,14 +2684,14 @@ fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverAp
         }
     }
     if (target.phase == .ready) {
-        if (model.is("vram_success")) model.slots[0].imported = true;
-        if (model.is("vram_success")) @import("gsp_buffer_test_model.zig").Model.closeHeapAdmission(table);
+        if (success) model.slots[0].imported = true;
+        if (success) @import("gsp_buffer_test_model.zig").Model.closeHeapAdmission(table);
         try t.expectError(error.Busy, running.beginDestroyGraph(deadline, false));
         try running.beginDestroyGraph(deadline, true);
         var steps: usize = 0;
         while (target.phase == .ready and steps < 160) : (steps += 1) {
             _ = target.step();
-            if (model.is("vram_success") and model.released == 1 and model.slots[0].imported) {
+            if (success and model.released == 1 and model.slots[0].imported) {
                 try t.expect(model.charged == full and model.slots[0].live and !model.slots[0].claimed and !model.slots[0].reference);
                 model.slots[0].imported = false;
             }
@@ -2690,14 +2713,14 @@ fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverAp
         }
         try t.expect(steps < 160);
     }
-    const uncertain = model.is("vram_size") or model.is("vram_ack") or model.is("vram_timeout") or model.is("vram_free") or model.is("vram_finish");
+    const uncertain = model.is("vram_size") or model.is("vram_ack") or model.is("vram_timeout") or model.is("vram_free") or model.is("vram_finish") or model.is("vram_surface_changed") or model.is("vram_surface_contiguity");
     try t.expect(target.phase == .recovering and target.failure != null);
     if (uncertain) {
         try t.expect(model.charged == full and model.slots[0].live and running.native_buffers[0].owner != null);
         try t.expect(running.native_buffers[0].owner.?.namespace_live);
     } else {
         try t.expect(target.failure.? == error.RmClosed and model.charged == 0);
-        if (model.is("vram_success")) try t.expect(model.released == 2 and model.aborted == 0);
+        if (success) try t.expect(model.released == 2 and model.aborted == 0);
     }
 }
 

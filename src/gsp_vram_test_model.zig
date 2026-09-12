@@ -4,7 +4,7 @@ const std = @import("std");
 const a = @import("r4os").abi;
 const heap_model = @import("gsp_buffer_test_model.zig").Model;
 pub const Model = struct {
-    const Slot = struct { reservation: a.GfxOwnedBufferReservation = .{}, live: bool = false, published: bool = false, reference: bool = false, imported: bool = false, claimed: bool = false };
+    const Slot = struct { reservation: a.GfxOwnedBufferReservation = .{}, descriptor: a.GfxBufferDescriptor = .{}, live: bool = false, published: bool = false, reference: bool = false, imported: bool = false, claimed: bool = false };
     pub var slots: [2]Slot = @splat(.{});
     pub var charged: u64 = 0;
     pub var released: u32 = 0;
@@ -27,14 +27,14 @@ pub const Model = struct {
         return a.gfx_buffer_result_ok;
     }
     fn reserve(d: *const a.GfxBufferDescriptor, cookie: u64, out: *a.GfxOwnedBufferReservation) callconv(.c) i32 {
-        std.debug.assert(d.location == 1 and d.adapter_id == 0x01000000 and d.device_generation != 0 and d.driver_owner == 0 and d.usage == 12 and d.alignment == 65536);
+        std.debug.assert(d.location == 1 and d.adapter_id == 0x01000000 and d.device_generation != 0 and d.driver_owner == 0 and d.usage & 3 == 0 and d.alignment == 65536);
         if (is("vram_budget")) return a.gfx_buffer_error_budget;
         for (&slots, 0..) |*slot, i| if (!slot.live) {
             const bytes = (d.byte_length + 65535) & ~@as(u64, 65535);
             out.* = .{ .buffer = .{ .id = @intCast(801+i), .generation = 601 }, .reference = .{ .id = @intCast(811+i), .generation = 701 },
                 .allocation_bytes = bytes, .cookie = cookie, .device_generation = d.device_generation, .driver_generation = 0x200000003,
                 .adapter_id = d.adapter_id, .driver_owner = 7 };
-            slot.* = .{ .reservation = out.*, .live = true }; charged += bytes;
+            slot.* = .{ .reservation = out.*, .descriptor = d.*, .live = true }; charged += bytes;
             return a.gfx_buffer_result_ok;
         };
         return a.gfx_buffer_error_capacity;

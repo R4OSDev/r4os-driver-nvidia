@@ -1,0 +1,15 @@
+{
+  "source_pin": "NVIDIA 570.144 / 8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f",
+  "vector": {
+    "path": "Temp/gfx-surface-layout-20260912/surface-rm-570.144.bin",
+    "bytes": 2560,
+    "sha256": "805cba6b8567f876af3101bad15db0b0aafda317f8b2001c347c7a71858ab7d7"
+  },
+  "generator": {
+    "path": "Temp/gfx-surface-layout-20260912/Surface-ABI.c",
+    "bytes": 13191,
+    "sha256": "07464d43e8d48274d65dacf4b3dda54c0f46538dbc032bf0f1af2c0d3e3c7328"
+  },
+  "scope": "Original height-selection function, modifier/alignment macros and RM C structs; documented 64x8 GOB geometry; no physical hardware execution",
+  "reference_discrepancy": "GetLog2GobsPerBlock passes alignment masks to NV_ALIGN_UP, whose pinned nvmisc.h definition takes granules. The fixture retains the original macro and passes actual GOB dimensions."
+}
