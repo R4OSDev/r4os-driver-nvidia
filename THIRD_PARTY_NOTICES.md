@@ -1,5 +1,18 @@
 ﻿# Third-Party Notices
 
+Display RAMHT and physical DMA contexts (NVIDIA 0.1.80, 2026-09-12):
+The GA106 table layout, hash and GV100 descriptors follow the pinned
+Nouveau Linux7.2.4 MIT sources (ramht.c, usergv100.c, gv100.c, cl0002.h,
+device/base.c, r535/disp.c and ga102.c). Full originals/notices and the
+original-C fixture are archived under0.79.13/display-table-20260912.
+The fixture uses verbatim original hash/search/update/insert/bind functions
+and flags statements with host allocation/I/O stubs. Those C functions
+are not linked into the driver; the attributed Zig layout is derived MIT
+material. Original resource ownership/upload integration is Apache-2.0.
+All previous runtime-license bytes remain unchanged; full added notices
+are embedded and distributed identically. Only added trailing whitespace
+is normalized.
+
 Native display channels (NVIDIA 0.1.79, 2026-09-12):
 Instance/channel layouts and lifetime follow NVIDIA 570.144 MIT headers/RM,
 Nouveau r535/r570 and the pinned GA102 OpenGpuDoc register manual.

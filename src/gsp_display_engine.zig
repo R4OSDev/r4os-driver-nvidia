@@ -323,6 +323,7 @@ pub const Owner = struct {
     instance_bound: bool = false,
     instance_possible: bool = false,
     children: [9]u32 = @splat(0),
+    channels_started: bool = false, // Table replacement needs physical display quiescence from this point.
     live: bool = false,
     allocation_possible: bool = false,
     preserve: bool = false,

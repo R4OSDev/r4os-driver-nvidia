@@ -48,6 +48,10 @@ pub const DisplayEngineStatus = struct { state: display_engine.State, info: ?dis
 pub const display_channel = @import("gsp_display_channel.zig");
 pub const DisplayChannelHandle = struct { epoch: u64, handle: u32, slot: u8 };
 pub const DisplayChannelStatus = struct { state: display_channel.State, info: ?display_channel.Info, rejected: ?u32, host_rejected: ?anyerror };
+pub const display_resources = @import("gsp_display_resources.zig");
+pub const display_upload = @import("gsp_display_upload.zig");
+const DisplayResourcesSlot = struct { owner: ?*display_resources.Owner = null, allocation: r4os.abi.DriverHeapAllocation = .{}, heap: ?r4os.r4dev.DriverHeapContext = null };
+pub const DisplayTableStatus = struct { entries: u32, revision: u64, published_revision: u64, uploading: bool };
 const subscriptions = @import("gsp_event_objects.zig");
 const outputs = @import("gsp_outputs.zig");
 const inventory = @import("gsp_memory_inventory.zig");
@@ -127,6 +131,8 @@ pub const Owner = struct {
     display_engine_active: bool = false,
     display_channels: [9]?display_channel.Owner = @splat(null),
     display_channel_active: ?u8 = null,
+    display_resources_slot: DisplayResourcesSlot = .{},
+    display_upload_job: ?struct { operation: display_upload.Upload = .{}, channel_handle: ChannelHandle } = null,
     rm_rejection: ?u32 = null,
     outputs: outputs.Owner = .{},
     output_refresh: bool = false,
@@ -204,6 +210,8 @@ pub const Owner = struct {
             self.recordFault(diagnostics.host(.teardown, err, true)) catch {};
         self.outputs.invalidate() catch {};
         self.memory_inventory.invalidate();
+        if (self.display_upload_job) |*work| work.operation.quarantine(err);
+        if (self.display_resources_slot.owner) |owner| owner.quarantine();
         self.failure = err;
         // unregister(false) terminalizes the common queue as device-lost but
         // retains reachable jobs. complete(device_lost, false) is not that API.
@@ -240,6 +248,8 @@ pub const Owner = struct {
         for (&self.display_channels) |*slot| if (slot.*) |*owner| self.log("NVIDIA gsp-display-channel: failed={s} handle={x} class={x} index={d} rm-live={} possible={} control={x} state={x} storage-held={}",
             .{@errorName(err),owner.config.handle,display_channel.wire.class(owner.config.kind),owner.config.index,owner.live,owner.allocation_possible,
                 owner.last_control,owner.last_state,owner.backing.retained});
+        if (self.display_resources_slot.owner) |owner| self.log("NVIDIA gsp-display-table: failed={s} entries={d} revision={d} published={d} upload-held={} storage=retained",
+            .{@errorName(err),owner.table.count,owner.table.revision,owner.table.uploaded_revision,self.display_upload_job != null});
     }
     fn recordFault(self: *Owner, value: diagnostics.Record) !void {
         var record = value;
@@ -267,6 +277,14 @@ pub const Owner = struct {
                 const matches = va >= base and va - base < work.job.byte_length;
                 if (i == 0) record.source_address_match = matches else record.target_address_match = matches;
             };
+        }
+        if (self.display_upload_job) |*work| {
+            if (work.operation.ticket) |ticket| record.copy_point = ticket.point;
+            if (record.fault_address) |va| {
+                if (work.operation.source_stamp) |src| record.source_address_match = va >= src.address and va - src.address < display_resources.layout.image_bytes;
+                if (work.operation.target_stamp) |dst| record.target_address_match = va >= dst.address and va - dst.address < display_resources.layout.image_bytes;
+            }
+            // This private transfer has no common-queue fence to fabricate.
         }
         const kept = try self.faults.append(record);
         self.log("NVIDIA gsp-fault: serial={d} epoch={d} source={s} kind={s} operation={s} object={x} code={x} fatal={}",
@@ -313,6 +331,7 @@ pub const Owner = struct {
     }
     pub fn nativeObject(self: *Owner) ?display.Object {
         if (self.self_address != @intFromPtr(self) or self.failure != null or self.graph == null or
+            self.display_upload_job != null or
             self.graph.?.self_address != @intFromPtr(&self.graph.?) or self.graph.?.state != .loaned or
             self.display_object == null or self.channel == null or self.activeChannel() != &self.channel.? or
             self.channel.?.session.state != .active) return null;
@@ -351,7 +370,7 @@ pub const Owner = struct {
     /// No display instance replacement, DMA channel or native handoff yet.
     pub fn createDisplayEngine(self: *Owner, deadline: u64) !DisplayEngineHandle {
         _ = try self.now();
-        if (self.display_engine_owner != null or self.graph_closing or self.copy_job != null or self.sequence.self_address != 0) return error.Busy;
+        if (self.display_engine_owner != null or self.graph_closing or self.copyBusy() or self.sequence.self_address != 0) return error.Busy;
         _ = self.nativeObject() orelse return error.State;
         const internal = self.static_info orelse return error.State;
         const held = self.reservation orelse return error.State;
@@ -379,7 +398,7 @@ pub const Owner = struct {
     }
     pub fn retireDisplayEngine(self: *Owner, handle: DisplayEngineHandle, deadline: u64) !void {
         const owner = try self.findDisplayEngine(handle);
-        if (self.display_engine_active or self.copy_job != null or self.sequence.self_address != 0 or self.nativeObject() == null or
+        if (self.display_engine_active or self.copyBusy() or self.sequence.self_address != 0 or self.nativeObject() == null or
             self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         try self.channel.?.guard(deadline);
         var token = try self.channel.?.handoff(deadline);
@@ -390,7 +409,7 @@ pub const Owner = struct {
     }
     pub fn attachDisplayInstance(self: *Owner, handle: DisplayEngineHandle, source: BufferHandle, deadline: u64) !void {
         const owner = try self.findDisplayEngine(handle);
-        if (self.display_engine_active or self.copy_job != null or self.sequence.self_address != 0 or self.nativeObject() == null or
+        if (self.display_engine_active or self.copyBusy() or self.sequence.self_address != 0 or self.nativeObject() == null or
             self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         const backing = try self.findNativeBuffer(source);
         if (backing.adapter != self.adapter_id) return error.Stale;
@@ -405,7 +424,7 @@ pub const Owner = struct {
     }
     pub fn createDisplayChannel(self: *Owner, handle: DisplayEngineHandle, kind: display_channel.wire.Kind, index: u32, deadline: u64) !DisplayChannelHandle {
         const parent = try self.findDisplayEngine(handle);
-        if (self.copy_job != null or self.sequence.self_address != 0 or self.graph_closing or self.nativeObject() == null or
+        if (self.copyBusy() or self.sequence.self_address != 0 or self.graph_closing or self.nativeObject() == null or
             self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         const slot = try display_channel.wire.slot(kind, index);
         if (self.display_channels[slot] != null) return error.Busy;
@@ -418,6 +437,7 @@ pub const Owner = struct {
         const owner = display_channel.Owner.init(&token, self.ctx.?, self.adapter_id, parent, kind, index, deadline) catch |err| {
             self.channel = exchange.Exchange.init(&token, deadline) catch |restore| { self.stop(restore); return restore; }; return err;
         };
+        parent.channels_started = true;
         self.display_channels[slot] = owner; self.display_channel_active = @intCast(slot);
         return .{ .epoch = self.epoch, .handle = owner.config.handle, .slot = @intCast(slot) };
     }
@@ -434,7 +454,7 @@ pub const Owner = struct {
     }
     pub fn retireDisplayChannel(self: *Owner, handle: DisplayChannelHandle, deadline: u64) !void {
         const owner = try self.findDisplayChannel(handle);
-        if (self.copy_job != null or self.sequence.self_address != 0 or self.nativeObject() == null or self.channel.?.phase != .idle or
+        if (self.copyBusy() or self.sequence.self_address != 0 or self.nativeObject() == null or self.channel.?.phase != .idle or
             self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         try self.channel.?.guard(deadline);
         var token = try self.channel.?.handoff(deadline);
@@ -443,6 +463,78 @@ pub const Owner = struct {
         };
         self.display_channel_active = handle.slot;
     }
+    /// Populate the retained instance before display channels can fetch it.
+    /// Live-table replacement needs a later independent display-quiescence
+    /// protocol; an idle RM exchange or a CE completion alone is insufficient.
+    pub fn bindDisplayStorage(self: *Owner, handle: DisplayEngineHandle, kind: display_channel.wire.Kind, index: u32, source: BufferHandle) !u32 {
+        const parent = try self.idleDisplayTable(handle);
+        const config = parent.info() orelse return error.State;
+        const slot = try display_channel.wire.slot(kind, index);
+        if ((kind == .core and !config.core) or (kind == .window and (!config.window or config.hardware.windows & (@as(u32, 1) << @intCast(index)) == 0))) return error.Unsupported;
+        const storage = try self.findNativeBuffer(source);
+        const owner = try self.ensureDisplayResources(parent);
+        return owner.bindNative(@intCast(slot), storage) catch |err| {
+            if (err == error.Descriptor or err == error.Retained) self.stop(err);
+            return err;
+        };
+    }
+    fn idleDisplayTable(self: *Owner, handle: DisplayEngineHandle) !*display_engine.Owner {
+        const parent = try self.findDisplayEngine(handle);
+        if (self.copyBusy() or self.graph_closing or self.sequence.self_address != 0 or self.nativeObject() == null or
+            self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
+        const config = parent.info() orelse return error.State;
+        if (!config.instance_bound) return error.State;
+        if (parent.channels_started) return error.Busy;
+        // Also reject a channel whose allocation may be visible but has no
+        // confirmed Info yet, and conservatively hold after channel Free.
+        for (&self.display_channels) |*entry| if (entry.* != null) return error.Busy;
+        for (parent.children) |child| if (child != 0) return error.Busy;
+        return parent;
+    }
+    fn ensureDisplayResources(self: *Owner, parent: *display_engine.Owner) !*display_resources.Owner {
+        const slot = &self.display_resources_slot;
+        if (slot.owner) |owner| {
+            if (!owner.valid() or !std.meta.eql(owner.binding.?, parent.binding) or owner.instance != &parent.instance_storage) return error.Stale;
+            return owner;
+        }
+        if (slot.allocation.handle != 0) return error.Retained;
+        const heap = self.ctx.?.heap() orelse return error.Api; slot.heap = heap;
+        const result = heap.allocate(@sizeOf(display_resources.Owner), @alignOf(display_resources.Owner), &slot.allocation);
+        const allocation = slot.allocation;
+        if (result != r4os.abi.driver_heap_ok and allocation.handle == 0) return error.Memory;
+        if (allocation.version != 1 or allocation.size < @sizeOf(r4os.abi.DriverHeapAllocation) or allocation.handle == 0 or
+            allocation.cpu_address == 0 or allocation.cpu_address % @alignOf(display_resources.Owner) != 0 or allocation.reserved != 0 or
+            allocation.byte_length < @sizeOf(display_resources.Owner) or allocation.alignment < @alignOf(display_resources.Owner) or
+            allocation.cpu_address > std.math.maxInt(u64) - allocation.byte_length) { self.stop(error.Descriptor); return error.Descriptor; }
+        errdefer if (heap.release(allocation.handle) == r4os.abi.driver_heap_ok) { slot.* = .{}; } else self.stop(error.Retained);
+        if (result != r4os.abi.driver_heap_ok) return error.Memory;
+        const owner: *display_resources.Owner = @ptrFromInt(allocation.cpu_address); owner.* = .{};
+        try owner.open(self.channel.?.session, parent.binding, self.graph.?.reservation, &parent.instance_storage);
+        slot.owner = owner; return owner;
+    }
+    pub fn displayTableStatus(self: *Owner, handle: DisplayEngineHandle) !DisplayTableStatus {
+        const parent = try self.findDisplayEngine(handle);
+        const owner = self.display_resources_slot.owner orelse return error.State;
+        if (parent.info() == null or !owner.valid() or !std.meta.eql(owner.binding.?, parent.binding) or owner.instance != &parent.instance_storage) return error.Stale;
+        return .{ .entries = owner.table.count, .revision = owner.table.revision, .published_revision = owner.table.uploaded_revision, .uploading = owner.table.uploading };
+    }
+    pub fn uploadDisplayTable(self: *Owner, root: DisplayEngineHandle, handle: ChannelHandle, deadline: u64) !void {
+        const parent = try self.idleDisplayTable(root);
+        const owner = self.display_resources_slot.owner orelse return error.State;
+        if (!owner.valid() or !std.meta.eql(owner.binding.?, parent.binding) or owner.instance != &parent.instance_storage) return error.Stale;
+        const fifo = try self.findChannel(handle);
+        const config = fifo.info() orelse return error.State;
+        if (!config.config.system_userd or !fifo.ring.idle()) return error.Busy;
+        const staging = if (self.graph.?.control_buffer) |*value| value else return error.State;
+        if (staging.binding.space.handle != fifo.config.context.vaspace or staging.binding.space.client != parent.binding.client) return error.Stale;
+        try self.channel.?.guard(deadline);
+        self.display_upload_job = .{ .channel_handle = handle };
+        self.display_upload_job.?.operation.open(&owner.table, staging, &parent.instance_storage, deadline) catch |err| {
+            if (self.display_upload_job.?.operation.failure != null) self.stop(err) else self.display_upload_job = null;
+            return err;
+        };
+    }
+    fn copyBusy(self: *const Owner) bool { return self.copy_job != null or self.display_upload_job != null; }
     /// Discover the engine and create its RM group/share in this VA space.
     /// Channel children retain the context separately before using it.
     pub fn createExecutionContext(self: *Owner, rm_engine: u32, deadline: u64) !ContextHandle {
@@ -499,13 +591,13 @@ pub const Owner = struct {
         try (try self.findContext(handle)).releaseChild(child, quiesced);
     }
     pub fn attachContextMethods(self: *Owner, context: ContextHandle, runqueue: u8, buffer: BufferHandle) !void {
-        if (self.graph_closing or self.fifo_active != null or self.context_active != null or self.native_active != null or self.display_engine_active or self.display_channel_active != null) return error.Busy;
+        if (self.copyBusy() or self.graph_closing or self.fifo_active != null or self.context_active != null or self.native_active != null or self.display_engine_active or self.display_channel_active != null) return error.Busy;
         const owner = try self.findContext(context);
         try owner.attachMethods(runqueue, try self.findNativeBuffer(buffer));
     }
     pub fn retireExecutionContext(self: *Owner, handle: ContextHandle, deadline: u64) !void {
         const owner = try self.findContext(handle);
-        if (self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or
+        if (self.copyBusy() or self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or
             self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         if (owner.held()) return error.Retained;
         var token = try self.channel.?.handoff(deadline);
@@ -585,7 +677,7 @@ pub const Owner = struct {
     }
     pub fn retireExecutionChannel(self: *Owner, handle: ChannelHandle, deadline: u64, quiesced: bool) !void {
         const owner = try self.findChannel(handle);
-        if (self.copy_job) |*work| if (std.meta.eql(work.channel_handle, handle)) return error.Busy;
+        if (self.copyBusy()) return error.Busy;
         if (self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or
             self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         var token = try self.channel.?.handoff(deadline);
@@ -604,7 +696,7 @@ pub const Owner = struct {
     pub fn beginCopyWork(self: *Owner, handle: ChannelHandle, binding: r4os.abi.GfxBackendBinding, deadline: u64) !bool {
         const fifo = try self.findChannel(handle);
         const value = fifo.info() orelse return error.State;
-        if (!value.config.system_userd or !fifo.ring.idle() or self.copy_job != null or self.graph_closing or self.display_engine_active or self.display_channel_active != null or
+        if (!value.config.system_userd or !fifo.ring.idle() or self.copyBusy() or self.graph_closing or self.display_engine_active or self.display_channel_active != null or
             self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or
             self.outputs.active() or self.sequence.self_address != 0 or self.channel.?.phase != .idle or self.channel.?.in_lockdown) return error.Busy;
         try self.channel.?.guard(deadline);
@@ -726,6 +818,31 @@ pub const Owner = struct {
         try self.device.?.submitCopy(fifo, work.ticket.?, work.deadline);
         work.submitted = true; return true;
     }
+    fn advanceDisplayUpload(self: *Owner, current: u64) !bool {
+        const work = if (self.display_upload_job) |*value| value else return false;
+        const resources = self.display_resources_slot.owner orelse return error.State;
+        const parent = if (self.display_engine_owner) |*value| value else return error.State;
+        if (self.copy_job != null or parent.channels_started or !resources.valid() or !work.operation.valid() or
+            work.operation.table != &resources.table or work.operation.target != &parent.instance_storage) return error.Stale;
+        const fifo = try self.findChannel(work.channel_handle);
+        if (work.operation.phase == .submitted) {
+            const point = try fifo.ring.poll();
+            if (point >= work.operation.ticket.?.point) {
+                try work.operation.complete(point); self.display_upload_job = null; return true;
+            }
+            if (current >= work.operation.deadline) return error.Timeout;
+            return false;
+        }
+        if (current >= work.operation.deadline) {
+            try work.operation.cancel(); self.display_upload_job = null;
+            try self.recordFault(diagnostics.host(.submit, error.Timeout, false)); return true;
+        }
+        if (self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return false;
+        const transfer = try work.operation.transfer();
+        work.operation.ticket = try fifo.prepareCopy(transfer);
+        try self.device.?.submitCopy(fifo, work.operation.ticket.?, work.operation.deadline);
+        try work.operation.submitted(work.operation.ticket.?); return true;
+    }
     /// Called by the serialized native engine worker after queue.take. The
     /// common queue authenticates the full job/driver generation and supplies
     /// the reference; diagnostic buffer IDs are never imported here.
@@ -793,7 +910,7 @@ pub const Owner = struct {
     }
     pub fn retireBuffer(self: *Owner, handle: BufferHandle, deadline: u64, quiesced: bool) !void {
         const owner = try self.findBuffer(handle);
-        if (self.copy_job != null) return error.Busy;
+        if (self.copyBusy()) return error.Busy;
         if (!quiesced or self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or
             self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         if (owner.state != .handed_off) return error.State;
@@ -919,7 +1036,7 @@ pub const Owner = struct {
     /// is drained before graph.beginDestroy may send any parent/event free.
     pub fn beginDestroyGraph(self: *Owner, deadline: u64, quiesced: bool) !void {
         _ = try self.now();
-        if (self.copy_job != null or self.display_engine_owner != null) return error.Busy;
+        if (self.copyBusy() or self.display_engine_owner != null) return error.Busy;
         if (!quiesced or self.graph_closing or self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or
             self.sequence.self_address != 0 or self.nativeObject() == null or self.channel.?.phase != .idle) return error.Busy;
         try self.channel.?.guard(deadline);
@@ -1063,12 +1180,13 @@ pub const Owner = struct {
         }
         // Drain an already observable GSP fault before publishing CE success.
         // Active RPC owners above already receive before sending their work.
-        if (self.copy_job != null and channel.phase == .idle) {
+        if (self.copyBusy() and channel.phase == .idle) {
             const end = channel.deadline orelse try std.math.add(u64, current, std.time.ns_per_s);
             if (try channel.poll(end)) |dispatch| {
                 try self.notification(channel, dispatch, current); return .progress;
             }
         }
+        if (try self.advanceDisplayUpload(current)) return .progress;
         if (try self.advanceCopy(current)) return .progress;
         if (self.nativeObject() != null and try self.collectNativeBuffer(if (self.graph_closing) self.close_deadline else try std.math.add(u64, current, 5 * std.time.ns_per_s))) return .progress;
         if (self.graph_closing and self.graph.?.state == .loaned) graph_close: {
@@ -1259,7 +1377,7 @@ pub const Owner = struct {
             return .progress;
         }
         if (!self.graph_closing and self.graph != null and self.graph.?.state == .loaned and channel.phase == .idle and !channel.in_lockdown and
-            self.copy_job == null and (self.outputs.state == .detached or (self.output_refresh and current >= self.output_next_ns))) {
+            !self.copyBusy() and (self.outputs.state == .detached or (self.output_refresh and current >= self.output_next_ns))) {
             const end = try std.math.add(u64, current, 10 * std.time.ns_per_s);
             self.output_generation = try std.math.add(u64, self.output_generation, 1);
             var token = try channel.handoff(end);

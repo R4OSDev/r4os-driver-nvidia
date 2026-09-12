@@ -1534,6 +1534,8 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         context_copy_success, context_copy_class, context_copy_allocate, context_copy_changed, context_copy_timeout, context_copy_completion,
         context_copy_rc, context_copy_rc_unmatched, context_copy_mmu, context_copy_xid, context_copy_fault_ack, context_copy_irq,
         context_copy_capacity, context_copy_oom, context_copy_invalid, context_copy_lost_idle, context_copy_fastpath,
+        context_upload_success, context_upload_timeout, context_upload_fault, context_upload_sync,
+        context_upload_release, context_upload_acquire, context_upload_retry,
         display_root_success, display_root_classes, display_root_reject, display_root_static, display_root_preserve, display_root_free,
         display_root_ack, display_root_timeout, display_root_wrong,
         display_dma_success, display_dma_instance_ack, display_dma_instance_reject, display_dma_oom, display_dma_segment, display_dma_unmap,
@@ -2740,17 +2742,9 @@ fn checkDeviceDisplayEngine(target: *@import("gsp_device.zig").Device, scenario:
         prior = handle;
     }
 }
-fn checkDeviceDisplayChannels(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, words: []u32, scenario: []const u8) !void {
-    const runtime = @import("gsp_runtime.zig");
-    const native_model = @import("gsp_vram_test_model.zig").Model;
-    const model = @import("gsp_display_test_model.zig").Model;
+fn createTestDisplayRoot(target: *@import("gsp_device.zig").Device, deadline: u64) !@import("gsp_runtime.zig").DisplayEngineHandle {
     const root_vectors = @import("gsp_display_engine_test.zig");
     const running = &target.running; const session = &target.session.?;
-    const deadline = clock + 5 * std.time.ns_per_s;
-    native_model.install(table, scenario); defer native_model.dispose(table);
-    model.install(table, scenario, words);
-    errdefer |err| std.debug.print("display DMA {s}: {s} phase={s} failure={?} root-active={} channel-active={?}\n",
-        .{scenario,@errorName(err),@tagName(target.phase),target.failure,running.display_engine_active,running.display_channel_active});
     const root_handle = try running.createDisplayEngine(deadline);
     var steps: usize = 0;
     while (running.display_engine_active and steps < 60) : (steps += 1) {
@@ -2767,10 +2761,23 @@ fn checkDeviceDisplayChannels(target: *@import("gsp_device.zig").Device, table: 
         try nativeReply(session, rpc.function, 0, response[0..rpc.request.len]); _ = target.step();
     }
     try t.expect(steps < 60 and !running.display_engine_active);
+    return root_handle;
+}
+fn checkDeviceDisplayChannels(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, words: []u32, scenario: []const u8) !void {
+    const runtime = @import("gsp_runtime.zig");
+    const native_model = @import("gsp_vram_test_model.zig").Model;
+    const model = @import("gsp_display_test_model.zig").Model;
+    const running = &target.running; const session = &target.session.?;
+    const deadline = clock + 5 * std.time.ns_per_s;
+    native_model.install(table, scenario); defer native_model.dispose(table);
+    model.install(table, scenario, words);
+    errdefer |err| std.debug.print("display DMA {s}: {s} phase={s} failure={?} root-active={} channel-active={?}\n",
+        .{scenario,@errorName(err),@tagName(target.phase),target.failure,running.display_engine_active,running.display_channel_active});
+    const root_handle = try createTestDisplayRoot(target, deadline);
     try t.expectError(error.State, running.createDisplayChannel(root_handle, .core, 0, deadline));
     const instance = try allocateContextStorage(target, 65536, deadline);
     try running.attachDisplayInstance(root_handle, instance, deadline);
-    steps = 0;
+    var steps: usize = 0;
     while (running.display_engine_active and target.phase == .ready and steps < 60) : (steps += 1) {
         _ = target.step(); if (!running.display_engine_active or target.phase != .ready) break;
         const root_owner = &running.display_engine_owner.?; const rpc = &root_owner.exchange;
@@ -2939,7 +2946,7 @@ fn checkDeviceContexts(target: *@import("gsp_device.zig").Device, table: *a.Driv
     const command = init.queues_offset + init.command_offset;
     const status = init.queues_offset + init.status_offset;
     model.install(table, scenario); defer model.dispose(table);
-    const copy_case = std.mem.startsWith(u8, scenario, "context_copy");
+    const copy_case = std.mem.startsWith(u8, scenario, "context_copy") or std.mem.startsWith(u8, scenario, "context_upload");
     const fifo = std.mem.startsWith(u8, scenario, "context_fifo") or copy_case;
     const methods = std.mem.startsWith(u8, scenario, "context_methods") or fifo;
     const success = model.is("context_success") or model.is("context_methods");
@@ -3097,6 +3104,114 @@ fn checkDeviceContexts(target: *@import("gsp_device.zig").Device, table: *a.Driv
         } else try t.expect(model.released == 1 and model.charged == 0 and !model.slots[0].live);
     }
 }
+fn checkDeviceDisplayUpload(target: *@import("gsp_device.zig").Device, handle: @import("gsp_runtime.zig").ChannelHandle, deadline: u64, scenario: []const u8) !void {
+    const runtime = @import("gsp_runtime.zig");
+    const model = @import("gsp_vram_test_model.zig").Model;
+    const wire = @import("gsp_copy_wire.zig");
+    const running = &target.running; const session = &target.session.?;
+    const fifo = running.fifos[handle.slot].owner.?;
+    errdefer |err| std.debug.print("display upload {s}: {s} phase={s} failure={?} held={} issued={d} completed={d} reading={} cpu={}\n",
+        .{scenario,@errorName(err),@tagName(target.phase),target.failure,running.display_upload_job != null,fifo.ring.issued,fifo.ring.completed,ControlModel.reading,ControlModel.cpu_mapped});
+    const root = try createTestDisplayRoot(target, deadline);
+    const instance = try allocateContextStorage(target, 65536, deadline);
+    try running.attachDisplayInstance(root, instance, deadline);
+    var steps: usize = 0;
+    while (running.display_engine_active and steps < 30) : (steps += 1) {
+        _ = target.step(); try t.expect(target.phase == .ready);
+        if (!running.display_engine_active) break;
+        const rpc = &running.display_engine_owner.?.exchange;
+        if (rpc.phase != .waiting) continue;
+        try t.expect(running.display_engine_owner.?.operation.? == .instance);
+        var response: [48]u8 = undefined; @memcpy(&response, rpc.request);
+        std.mem.writeInt(u32, backing.?[init.queues_offset + init.status_offset + 64..][0..4], session.tx_write, .little);
+        try nativeReply(session, rpc.function, 0, &response); _ = target.step();
+    }
+    try t.expect(steps < 30 and running.display_engine_owner.?.instance_bound);
+    try running.releaseNativeBuffer(instance);
+    const data = try allocateContextStorage(target, 65536, deadline);
+    const data_index = (try running.nativeBufferStatus(data)).info.?.reference.buffer.id - 801;
+    try t.expectError(error.Unsupported, running.bindDisplayStorage(root, .window, 2, data));
+    const dma = try running.bindDisplayStorage(root, .window, 3, data);
+    try running.releaseNativeBuffer(data);
+    const table_owner = running.display_resources_slot.owner.?;
+    try t.expect(table_owner.valid() and table_owner.table.count == 1 and !table_owner.table.published(4, dma) and
+        model.slots[data_index].imported and model.slots[data_index].gpu.lease.id != 0 and !model.slots[data_index].reference);
+    var forged = root; forged.epoch += 1; try t.expectError(error.Stale, running.displayTableStatus(forged));
+    const first_deadline = if (model.is("context_upload_retry")) clock + 1 else deadline;
+    if (model.is("context_upload_sync")) {
+        try t.expectError(error.Retained, running.uploadDisplayTable(root, handle, first_deadline)); _ = target.step();
+        try t.expect(target.phase == .recovering and table_owner.failed and ControlModel.cpu_mapped and !ControlModel.reading and fifo.ring.issued == 0);
+        return;
+    }
+    if (model.is("context_upload_acquire")) {
+        try t.expectError(error.Memory, running.uploadDisplayTable(root, handle, first_deadline));
+        try t.expect(running.failure == null and running.display_upload_job == null and !table_owner.table.uploading and
+            !ControlModel.reading and !ControlModel.cpu_mapped and fifo.ring.issued == 0);
+        ControlModel.scenario = "context_upload_recovered";
+    }
+    try running.uploadDisplayTable(root, handle, first_deadline);
+    if (model.is("context_upload_retry")) {
+        clock = first_deadline; _ = target.step();
+        try t.expect(target.phase == .ready and running.display_upload_job == null and !ControlModel.reading and fifo.ring.issued == 0 and !table_owner.table.uploading);
+        try running.uploadDisplayTable(root, handle, deadline);
+    }
+    try t.expect(ControlModel.reading and !ControlModel.cpu_mapped and running.copy_job == null and
+        (try running.displayTableStatus(root)).published_revision == 0);
+    try t.expectEqualSlices(u8, &table_owner.table.image, ControlModel.data[0..runtime.display_resources.layout.image_bytes]);
+    try t.expectError(error.Busy, running.bindDisplayStorage(root, .core, 0, data));
+    try t.expectError(error.Busy, running.createDisplayChannel(root, .core, 0, deadline));
+    try t.expectError(error.Busy, running.retireExecutionChannel(handle, deadline, true));
+    try t.expectError(error.Busy, running.beginCopyWork(handle, .{}, deadline));
+    const gate = target.port.owner.?.admit_copy.?;
+    const work = &running.display_upload_job.?.operation;
+    // A private, unsubmitted preparation lets the real Device gate reject
+    // mutated owners/leases/bytes without touching hardware or a queue job.
+    work.ticket = try fifo.prepareCopy(try work.transfer());
+    try gate(target.port.owner.?.context, &target.port, fifo, work.ticket.?, deadline);
+    try t.expectError(error.Binding, gate(target.port.owner.?.context, &target.port, fifo, work.ticket.?, deadline + 1));
+    work.gpu.byte_length -= 1;
+    try t.expectError(error.Binding, gate(target.port.owner.?.context, &target.port, fifo, work.ticket.?, deadline)); work.gpu.byte_length += 1;
+    table_owner.table.image[0] ^= 1;
+    try t.expectError(error.Binding, gate(target.port.owner.?.context, &target.port, fifo, work.ticket.?, deadline)); table_owner.table.image[0] ^= 1;
+    const original_source = work.source; work.source = &fifo.commands.?;
+    try t.expectError(error.Binding, gate(target.port.owner.?.context, &target.port, fifo, work.ticket.?, deadline)); work.source = original_source;
+    const operand: *u32 = @ptrFromInt(fifo.ring.cpu.cpu_address + wire.push_offset + 8);
+    operand.* ^= 1;
+    try t.expectError(error.Binding, gate(target.port.owner.?.context, &target.port, fifo, work.ticket.?, deadline)); operand.* ^= 1;
+    var moved = work.*; try t.expect(!moved.valid());
+    try t.expect(fifo.ring.issued == 0 and !fifo.ring.published);
+    fifo.ring.pending = null; work.ticket = null; // Test-only rollback of CPU-only preparation, before PUT.
+    const completion: *u32 = @ptrFromInt(fifo.ring.cpu.cpu_address + wire.completion_offset);
+    const get: *u32 = @ptrFromInt(fifo.ring.cpu.cpu_address + wire.userd_offset + 0x88);
+    _ = target.step();
+    try t.expect(target.phase == .ready and work.phase == .submitted and fifo.ring.issued == 1 and ControlModel.reading);
+    get.* = fifo.ring.put; _ = target.step();
+    try t.expect(work.phase == .submitted and table_owner.table.uploaded_revision == 0 and fifo.ring.completed == 0 and ControlModel.reading);
+    if (model.is("context_upload_timeout")) clock = deadline else {
+        // Synthetic hardware completion only after checking the actual CE
+        // commands and source bytes. This is not a physical GPU claim.
+        completion.* = fifo.ring.issued;
+        if (model.is("context_upload_fault")) try nativeEvent(session, 0x10ff, &.{});
+    }
+    _ = target.step();
+    if (model.is("context_upload_timeout") or model.is("context_upload_fault") or model.is("context_upload_release")) {
+        try t.expect(target.phase == .recovering and table_owner.failed and table_owner.table.uploaded_revision == 0 and
+            ControlModel.reading and running.display_upload_job != null and model.slots[data_index].imported);
+        if (model.is("context_upload_fault")) try t.expect(fifo.ring.completed == 0);
+        return;
+    }
+    try t.expect(target.phase == .ready and running.display_upload_job == null and !ControlModel.reading and !ControlModel.cpu_mapped and
+        table_owner.table.published(4, dma) and (try running.displayTableStatus(root)).published_revision == 1 and running.copy_completed == 0);
+    try t.expectError(error.Busy, running.uploadDisplayTable(root, handle, deadline));
+    try t.expectError(error.Busy, running.beginDestroyGraph(deadline, true));
+    try t.expectError(error.Retained, running.retireDisplayEngine(root, deadline));
+    // Creation seals the initial table, even before a later channel ACK.
+    _ = try running.createDisplayChannel(root, .core, 0, deadline);
+    try t.expect(running.display_engine_owner.?.channels_started);
+    try t.expectError(error.Busy, running.bindDisplayStorage(root, .core, 0, data));
+    _ = target.stop();
+    try t.expect(table_owner.failed and model.slots[data_index].imported and ControlModel.active and ControlModel.releases == 0);
+}
 const FifoCounts = struct { allocations: usize = 0, frees: usize = 0, enables: usize = 0, disables: usize = 0, event: bool = false };
 fn replyCopyMapping(target: *@import("gsp_device.zig").Device) !void {
     const running = &target.running; const session = &target.session.?;
@@ -3139,6 +3254,7 @@ fn checkDeviceCopies(target: *@import("gsp_device.zig").Device, table: *a.Driver
     }
     if (fifo_owner.info()) |value| {
         try t.expect(value.config.copy_class == 0xc7b5 and value.config.system_userd and value.config.userd == fifo_owner.commands.?.backing.pages[2]);
+        if (std.mem.startsWith(u8, scenario, "context_upload")) { try checkDeviceDisplayUpload(target, handle, deadline, scenario); return; }
         const data_handle = try allocateContextBuffer(target, 8191, deadline, false);
         const data_info = (try running.nativeBufferStatus(data_handle)).info.?;
         model.install(table, data_info.reference.buffer.id - 801);

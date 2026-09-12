@@ -175,6 +175,17 @@ pub const Ring = struct {
     pub fn matches(self: *const Ring, ticket: Ticket) bool {
         return self.valid() and self.pending != null and std.meta.eql(self.pending.?, ticket) and !self.published;
     }
+    /// Check the actual private command bytes, including release destination.
+    /// A matching ticket alone does not authenticate the transfer operands.
+    pub fn matchesTransfer(self: *const Ring, ticket: Ticket, class: u32, transfer: wire.Transfer) bool {
+        if (!self.matches(ticket)) return false;
+        const push = wire.push_offset + (self.issued % wire.capacity) * wire.slot_bytes;
+        const expected = wire.encode(class, transfer, self.address + wire.completion_offset, ticket.point) catch return false;
+        const gp = wire.entry(self.address + push) catch return false;
+        fence();
+        for (expected, 0..) |value, i| if (self.word(push + i * 4).* != value) return false;
+        return self.word(self.put * 8).* == gp[0] and self.word(self.put * 8 + 4).* == gp[1];
+    }
     pub fn publish(self: *Ring, ticket: Ticket) Error!void {
         if (!self.matches(ticket)) return error.Stale;
         // Private producer accepts SYS memory only: no CPU BAR1 writes belong

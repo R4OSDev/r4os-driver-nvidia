@@ -1,0 +1,20 @@
+{
+  "generator": {
+    "bytes": 3623,
+    "sha256": "f41be5105f2a5e13007ff05752e3880c44efb6b8ceebbf9a33b954f44b793887",
+    "path": "Temp/gfx-display-table-20260912/Original-Table.c"
+  },
+  "vectors": {
+    "bytes": 12296,
+    "sha256": "89475b5841074b68d968aedb4a6e728251eca692cdd463185644b651cd7ca29f",
+    "path": "Repositories/Drivers/NVIDIA/src/fixtures/display-table-nouveau.bin"
+  },
+  "original_functions": {
+    "bytes": 5686,
+    "sha256": "f0945181032cbb18224c377a37b6cfb137ad2227f6b66acb4770e137fbd7218e",
+    "path": "Temp/gfx-display-table-20260912/Original-Functions.h"
+  },
+  "scope": "64 original-C RAMHT entries and physical DMA contexts; software verification only.",
+  "archive": "ExFiles/Reference/GFX/Nvidia/0.79.13/display-table-20260912",
+  "linux": "7.2.4"
+}

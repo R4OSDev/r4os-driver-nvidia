@@ -465,11 +465,27 @@ pub const Device = struct {
             self.running.self_address != @intFromPtr(&self.running) or self.running.failure != null or self.running.sequence.self_address != 0 or
             self.running.fifo_active != null or self.running.context_active != null or self.running.native_active != null or self.running.buffer_active != null or
             self.running.outputs.active() or self.running.graph_closing or self.running.display_engine_active or self.running.display_channel_active != null) return error.State;
-        const work = if (self.running.copy_job) |*value| value else return error.Binding;
-        if (work.submitted or work.ticket == null or !std.meta.eql(work.ticket.?, ticket) or !std.meta.eql(work.job, work.job_stamp) or
-            work.deadline != deadline or work.channel_handle.epoch != self.epoch or work.channel_handle.slot >= self.running.fifos.len) return error.Binding;
-        const slot = &self.running.fifos[work.channel_handle.slot];
-        if (slot.owner != fifo or slot.serial != work.channel_handle.serial or !fifo.matchesCopy(ticket)) return error.Binding;
+        const channel_handle = if (self.running.display_upload_job) |*work| blk: {
+            const resources = self.running.display_resources_slot.owner orelse return error.Binding;
+            const root = if (self.running.display_engine_owner) |*value| value else return error.Binding;
+            const graph = if (self.running.graph) |*value| value else return error.Binding;
+            const staging = if (graph.control_buffer) |*value| value else return error.Binding;
+            if (self.running.copy_job != null or root.channels_started or root.info() == null or !root.instance_bound or
+                !resources.valid() or !std.meta.eql(resources.binding.?, root.binding) or resources.instance != &root.instance_storage or
+                work.operation.table != &resources.table or work.operation.source != staging or work.operation.target != &root.instance_storage or
+                !work.operation.matches(ticket, deadline) or fifo.config.context.vaspace != staging.binding.space.handle) return error.Binding;
+            if (!fifo.ring.matchesTransfer(ticket, fifo.config.copy_class, work.operation.transfer() catch return error.Binding)) return error.Binding;
+            for (&self.running.display_channels) |*entry| if (entry.* != null) return error.Binding;
+            break :blk work.channel_handle;
+        } else blk: {
+            const work = if (self.running.copy_job) |*value| value else return error.Binding;
+            if (work.submitted or work.ticket == null or !std.meta.eql(work.ticket.?, ticket) or !std.meta.eql(work.job, work.job_stamp) or
+                work.deadline != deadline) return error.Binding;
+            break :blk work.channel_handle;
+        };
+        if (channel_handle.epoch != self.epoch or channel_handle.slot >= self.running.fifos.len) return error.Binding;
+        const slot = &self.running.fifos[channel_handle.slot];
+        if (slot.owner != fifo or slot.serial != channel_handle.serial or !fifo.matchesCopy(ticket)) return error.Binding;
         const rpc = self.running.activeChannel() orelse return error.State;
         if (rpc.session != &self.session.? or port.runtime_session != rpc.session or rpc.session.pending != null or
             rpc.phase != .idle or rpc.pending != null or rpc.in_lockdown or ticket.epoch != self.epoch) return error.Binding;
