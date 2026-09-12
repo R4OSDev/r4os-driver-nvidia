@@ -1,3 +1,27 @@
+// DDC/I2C reference notices: unchanged NVIDIA 570.144 attribution.
+// Nvidia570.144/src/common/sdk/nvidia/inc/nvstatuscodes.h
+// /*
+//  * SPDX-FileCopyrightText: Copyright (c) 2014-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//  * SPDX-License-Identifier: MIT
+//  *
+//  * Permission is hereby granted, free of charge, to any person obtaining a
+//  * copy of this software and associated documentation files (the "Software"),
+//  * to deal in the Software without restriction, including without limitation
+//  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//  * and/or sell copies of the Software, and to permit persons to whom the
+//  * Software is furnished to do so, subject to the following conditions:
+//  *
+//  * The above copyright notice and this permission notice shall be included in
+//  * all copies or substantial portions of the Software.
+//  *
+//  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+//  * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+//  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+//  * DEALINGS IN THE SOFTWARE.
+//  */
 // Query prerequisites and limits: NVIDIA570.144 (MIT); display sequence
 // also informed by Nouveau (MIT). R4OS capture ownership: Apache-2.0.
 // Nvidia570.144/src/common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073system.h
@@ -72,13 +96,14 @@
 //! semantics belong to the shared R4GFX parser; no duplicate driver parser.
 //! Caller-owned capture storage stays off the worker stack and is readable
 //! only after the full query/validation/drain sequence completes. No modeset,
-//! power inference, cached boot EDID substitution or automatic retry.
+//! power inference or cached boot EDID substitution. Only an explicit DDC
+//! read rejection can retry, within three attempts and the original deadline.
 const std = @import("std");
 const graph = @import("gsp_rm_graph.zig");
 const display = @import("gsp_display_rpc.zig");
 pub const edid = @import("r4gfx_edid");
 pub const Error = graph.Error;
-pub const State = enum { supported, connected, edid, verify, drain, complete, obsolete, failed, released };
+pub const State = enum { supported, connected, edid, buses, ports, ddc, ddc_verify, bus_verify, verify, drain, complete, obsolete, failed, released };
 pub const Status = enum { pending, not_supported, disconnected, edid_missing, edid_rejected, invalid_edid, unsupported_data, incomplete_edid, valid_edid, query_rejected };
 pub const Capture = struct {
     epoch: u64 = 0,
@@ -94,8 +119,14 @@ pub const Capture = struct {
     rejected_command: ?display.Command = null,
     parse_error: ?edid.Error = null,
     edid_bytes: usize = 0,
-    bytes: [display.max_edid_bytes]u8 = @splat(0),
+    bytes: [edid.max_blocks * 128]u8 = @splat(0),
     report: edid.Report = .{},
+    source: enum { rm_raw, ddc } = .rm_raw,
+    buses: ?display.Buses = null,
+    port_info: ?u8 = null,
+    ddc_retries: u16 = 0,
+    ddc_rpc_status: ?u32 = null,
+    ddc_control_status: ?u32 = null,
 };
 pub const Refresh = struct {
     owner: *graph.Owner,
@@ -107,6 +138,10 @@ pub const Refresh = struct {
     self_address: usize = 0,
     invalidated: bool = false,
     failure: ?Error = null,
+    block: u8 = 0,
+    blocks: u8 = 1,
+    attempts: u8 = 0,
+    retry_at_ns: u64 = 0,
 
     /// Storage and graph remain exclusively borrowed until release. Moving
     /// this value is allowed only before its first poll; never copy it live.
@@ -147,8 +182,29 @@ pub const Refresh = struct {
             .supported => .supported,
             .connected, .verify => .{ .connected = self.capture.display_id },
             .edid => .{ .edid = self.capture.display_id },
+            .buses, .bus_verify => .{ .buses = self.capture.display_id },
+            .ports => .ports,
+            .ddc, .ddc_verify => .{ .ddc = .{ .display_id = self.capture.display_id,
+                .port = @intCast(self.capture.buses.?.ddc - 1), .block = if (self.state == .ddc_verify) 0 else self.block } },
             else => error.State,
         };
+    }
+    fn parseCapture(self: *Refresh) void {
+        self.capture.report = .{};
+        self.capture.parse_error = null;
+        if (self.capture.edid_bytes == 0) { self.capture.status = .edid_missing; return; }
+        edid.parse(self.capture.bytes[0..self.capture.edid_bytes], &self.capture.report) catch |err| {
+            self.capture.parse_error = err;
+            self.capture.status = if (err == error.TooLarge or err == error.Capacity) .unsupported_data else .invalid_edid;
+            return;
+        };
+        self.capture.status = if (self.capture.report.complete()) .valid_edid else .incomplete_edid;
+    }
+    fn fallback(self: *Refresh) void {
+        self.state = if (self.capture.status != .valid_edid and self.channel.object.i2c != 0 and self.capture.supported_ddc) .buses else .verify;
+    }
+    pub fn waiting(self: *const Refresh) bool {
+        return self.retry_at_ns > self.channel.exchange.session.last_clock;
     }
     pub fn matches(self: *Refresh, current: *const @import("gsp_exchange.zig").Exchange, deadline: u64) bool {
         if (self.self_address != @intFromPtr(self) or self.failure != null or self.deadline != deadline) return false;
@@ -161,11 +217,37 @@ pub const Refresh = struct {
             return;
         }
         if (reply == .rpc_error or reply == .control_error) {
+            if (self.state == .ddc or self.state == .ddc_verify) {
+                if (reply == .rpc_error) self.capture.ddc_rpc_status = reply.rpc_error else self.capture.ddc_control_status = reply.control_error;
+                // Only complete, ACKable RM results can retry. No copyout,
+                // transport timeout, malformed reply or uncertain ACK retries.
+                if (reply == .control_error and (reply.control_error == 3 or reply.control_error == 0x14 or
+                    reply.control_error == 0x65 or reply.control_error == 0x66) and self.attempts < 2) {
+                    self.attempts += 1;
+                    self.capture.ddc_retries += 1;
+                    self.retry_at_ns = std.math.add(u64, self.channel.exchange.session.last_clock, std.time.ns_per_ms) catch return error.Clock;
+                    return;
+                }
+                self.attempts = 0;
+                self.retry_at_ns = 0;
+                if (self.state == .ddc_verify) self.invalidated = true else {
+                    self.parseCapture();
+                    if (self.capture.edid_bytes == 0) self.capture.status = .edid_rejected;
+                    self.state = if (self.capture.edid_bytes != 0) .ddc_verify else .verify;
+                }
+                return;
+            }
+            if (self.state == .buses or self.state == .ports or self.state == .bus_verify) {
+                if (reply == .rpc_error) self.capture.ddc_rpc_status = reply.rpc_error else self.capture.ddc_control_status = reply.control_error;
+                if (self.state == .bus_verify) self.invalidated = true;
+                self.state = .verify;
+                return;
+            }
             if (reply == .rpc_error) self.capture.rpc_status = reply.rpc_error else self.capture.control_status = reply.control_error;
             self.capture.rejected_command = std.meta.activeTag(try self.query());
             if (self.state == .edid) {
                 self.capture.status = .edid_rejected;
-                self.state = .verify;
+                self.fallback();
             } else {
                 self.capture.status = .query_rejected;
                 self.capture.connected = null;
@@ -197,17 +279,55 @@ pub const Refresh = struct {
                 if (reply != .edid) return error.Unexpected;
                 @memcpy(self.capture.bytes[0..reply.edid.len], reply.edid);
                 self.capture.edid_bytes = reply.edid.len;
-                self.state = .verify;
-                if (reply.edid.len == 0) {
-                    self.capture.status = .edid_missing;
+                self.parseCapture();
+                self.fallback();
+            },
+            .buses => {
+                if (reply != .buses) return error.Unexpected;
+                self.capture.buses = reply.buses;
+                // NONE/dynamic and unknown RM IDs never become guessed bus
+                // indices. NV402C has exactly sixteen zero-based ports.
+                self.state = if (reply.buses.ddc > 0 and reply.buses.ddc <= 16) .ports else .verify;
+            },
+            .ports => {
+                if (reply != .ports) return error.Unexpected;
+                const info = reply.ports[self.capture.buses.?.ddc - 1];
+                self.capture.port_info = info;
+                if (info & 5 != 5) { self.state = .verify; return; }
+                self.capture.source = .ddc;
+                self.capture.edid_bytes = 0;
+                self.capture.report = .{};
+                self.capture.parse_error = null;
+                self.capture.rpc_status = null;
+                self.capture.control_status = null;
+                self.capture.rejected_command = null;
+                self.capture.status = .pending;
+                @memset(&self.capture.bytes, 0);
+                self.state = .ddc;
+            },
+            .ddc, .ddc_verify => {
+                if (reply != .ddc) return error.Unexpected;
+                self.attempts = 0;
+                self.retry_at_ns = 0;
+                if (self.state == .ddc_verify) {
+                    if (!std.mem.eql(u8, self.capture.bytes[0..128], &reply.ddc)) self.invalidated = true;
+                    self.state = .bus_verify;
                     return;
                 }
-                edid.parse(self.capture.bytes[0..reply.edid.len], &self.capture.report) catch |err| {
-                    self.capture.parse_error = err;
-                    self.capture.status = if (err == error.TooLarge or err == error.Capacity) .unsupported_data else .invalid_edid;
-                    return;
-                };
-                self.capture.status = if (self.capture.report.complete()) .valid_edid else .incomplete_edid;
+                @memcpy(self.capture.bytes[@as(usize, self.block) * 128 ..][0..128], &reply.ddc);
+                self.capture.edid_bytes += 128;
+                if (self.block == 0) {
+                    self.parseCapture(); // The shared parser admits the base before its count is used.
+                    if (self.capture.parse_error != null) { self.state = .verify; return; }
+                    self.blocks = @intCast(@min(@as(u16, self.capture.bytes[126]) + 1, edid.max_blocks));
+                }
+                self.block += 1;
+                if (self.block == self.blocks) { self.parseCapture(); self.state = .ddc_verify; }
+            },
+            .bus_verify => {
+                if (reply != .buses) return error.Unexpected;
+                if (!std.meta.eql(self.capture.buses.?, reply.buses)) self.invalidated = true;
+                self.state = .verify;
             },
             .verify => {
                 if (reply != .connected) return error.Unexpected;
@@ -229,7 +349,7 @@ pub const Refresh = struct {
             self.state = .obsolete;
             return null;
         }
-        if (self.channel.exchange.phase == .idle and self.state != .drain) {
+        if (self.channel.exchange.phase == .idle and self.state != .drain and !self.waiting()) {
             self.channel.begin(try self.query(), self.deadline) catch |err| return self.fail(err);
         }
         const pending = self.channel.poll(self.deadline) catch |err| {

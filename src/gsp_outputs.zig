@@ -108,6 +108,10 @@ pub const Owner = struct {
                     if (refresh.channel.supported) |supported| {
                         if (!std.meta.eql(supported, self.data.topology.supported.?)) self.invalidated = true;
                     }
+                    if (refresh.capture.buses) |buses| {
+                        if (self.data.topology.routes[self.data.count].buses) |observed|
+                            if (!std.meta.eql(buses, observed)) { self.invalidated = true; };
+                    }
                     try refresh.release(self.deadline);
                     if (self.invalidated) {
                         self.state = .obsolete;

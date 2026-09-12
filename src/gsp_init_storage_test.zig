@@ -1474,9 +1474,9 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         static_bad_region, static_ack_failure, static_timeout,
         post_control_error, post_wrong_gpc, post_bad_vector, post_ack_failure, post_timeout,
         irq_intx, irq_register_error, irq_msi_uncertain, irq_cause, irq_wake_failure, irq_close_busy, irq_unregister_failure,
-        rm_base_reject, rm_event_reject, rm_free_error, rm_timeout, rm_ack_failure, rm_foreign_event, rm_event_ack,
+        rm_base_reject, rm_i2c_reject, rm_event_reject, rm_free_error, rm_timeout, rm_ack_failure, rm_foreign_event, rm_event_ack,
         outputs_empty, outputs_all, outputs_rejected, outputs_partial, outputs_missing, outputs_incomplete, outputs_bad_edid,
-        outputs_edid_rejected, outputs_changed, outputs_final_changed, outputs_final_rejected, outputs_hpd, outputs_sequence, outputs_ack, outputs_timeout, catalog_rejected,
+        outputs_edid_rejected, outputs_ddc, outputs_ddc_bus_changed, outputs_changed, outputs_final_changed, outputs_final_rejected, outputs_hpd, outputs_sequence, outputs_ack, outputs_timeout, catalog_rejected,
         runtime_healthy, runtime_lockdown, runtime_unknown, runtime_unowned, runtime_sequence_timeout,
         runtime_log_failure, runtime_moving_log };
     for (std.enums.values(Case)) |case| {
@@ -2075,7 +2075,7 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
         const payload = request.payload;
         std.mem.writeInt(u32, backing.?[status + 64 ..][0..4], session.tx_write, .little);
         try t.expect(std.mem.readInt(u32, payload[0..4], .little) == graph.reservation.client);
-        const destroying = graph.state == .events_destroying or graph.state == .base_destroying;
+        const destroying = graph.state == .events_destroying or graph.state == .i2c_destroying or graph.state == .base_destroying;
         var length = payload.len;
         var result: u32 = 0;
         if (destroying) {
@@ -2083,7 +2083,7 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
                 try t.expect(cleanups == 0 and function == 10 and std.mem.readInt(u32, payload[8..12], .little) == graph.reservation.client);
             } else {
                 const expected = [_]u32{ graph.subscriptions.?.plan.handles.hotplug,
-                    graph.subscriptions.?.plan.handles.hotplug, graph.base.plan.handles.display,
+                    graph.subscriptions.?.plan.handles.hotplug, graph.base.plan.handles.i2c, graph.base.plan.handles.display,
                     graph.base.plan.handles.subdevice, graph.base.plan.handles.device, graph.reservation.client };
                 try t.expect(cleanups < expected.len);
                 if (cleanups == 0) {
@@ -2094,8 +2094,8 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
             if (scenario == .rm_free_error) result = 0x66;
             cleanups += 1;
         } else {
-            const expected_functions = [_]u32{ 103, 103, 103, 103, 103, 76, 103, 76 };
-            const expected_classes = [_]u32{ 0, 0x80, 0x2080, 0x73, 0x7e, 0, 0x7e, 0 };
+            const expected_functions = [_]u32{ 103, 103, 103, 103, 103, 103, 76, 103, 76 };
+            const expected_classes = [_]u32{ 0, 0x80, 0x2080, 0x73, 0x402c, 0x7e, 0, 0x7e, 0 };
             try t.expect(creates < expected_functions.len and function == expected_functions[creates]);
             if (function == 103) try t.expect(std.mem.readInt(u32, payload[12..16], .little) == expected_classes[creates]);
             if (creates == 0) {
@@ -2138,14 +2138,15 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
                 try nativeEvent(session, 0x101c, &.{0});
                 try t.expect(target.step() == .progress and !channel.in_lockdown and channel.deadline == deadline);
             }
-            if (creates == 7) {
+            if (creates == 8) {
                 try devicePost(target, false, scenario == .rm_foreign_event);
                 _ = target.step();
                 if (scenario == .rm_foreign_event) break;
                 try t.expect(channel.phase == .waiting and channel.deadline == deadline and graph.subscriptions.?.changes.serial == 1);
             }
             if (scenario == .rm_base_reject and creates == 1) result = 0x55;
-            if ((scenario == .rm_event_reject or scenario == .rm_free_error) and creates == 5) result = 0x55;
+            if (scenario == .rm_i2c_reject and creates == 4) result = 0x56;
+            if ((scenario == .rm_event_reject or scenario == .rm_free_error) and creates == 6) result = 0x55;
             creates += 1;
         }
         // Responses may be the original fixed allocation result only.
@@ -2159,7 +2160,7 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
             clock = deadline;
         } else {
             try nativeEvent(session, function, response[0..length]);
-            if (scenario == .rm_ack_failure and creates == 8) range_failure_call = range_calls + 4;
+            if (scenario == .rm_ack_failure and creates == 9) range_failure_call = range_calls + 4;
         }
         _ = target.step();
         range_failure_call = 0;
@@ -2169,9 +2170,11 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
     if (target.phase == .ready) {
         const graph = &running.graph.?;
         const object = running.nativeObject() orelse return error.MissingRmObjects;
-        try t.expect(creates == 8 and requests == 8 and cleanups == 0 and graph.state == .loaned);
+        try t.expect(creates == 9 and requests == 9 and cleanups == 0 and graph.state == .loaned);
         try t.expect(object.client == graph.reservation.client and object.display == graph.base.plan.handles.display);
-        try t.expect(session.tx_sequence == original_sequence + 8 and running.activeChannel() == &running.channel.?);
+        try t.expect(session.tx_sequence == original_sequence + 9 and running.activeChannel() == &running.channel.?);
+        if (scenario == .rm_i2c_reject) try t.expect(object.i2c == 0 and !graph.i2c.?.live and graph.i2c.?.rejected.? == 0x56)
+        else try t.expect(object.i2c == graph.base.plan.handles.i2c and graph.i2c.?.live);
         try t.expect(session.pending == null and graph.base.exchange.phase == .handed_off and graph.subscriptions.?.exchange.phase == .handed_off);
         const first = try running.takeDisplayChanges();
         try t.expect(first.serial == 1 and first.plug == 0x80000005 and first.unplug == 0x80000004 and first.dp_irq == 0);
@@ -2192,7 +2195,7 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
     try t.expect(running.nativeObject() == null and running.failure != null and target.phase == .recovering);
     if (scenario == .rm_base_reject or scenario == .rm_event_reject) {
         try t.expect(running.failure.? == error.RmRejected and running.rm_rejection.? == 0x55 and graph.state == .finished);
-        try t.expect(cleanups == @as(usize, if (scenario == .rm_base_reject) 1 else 6));
+        try t.expect(cleanups == @as(usize, if (scenario == .rm_base_reject) 1 else 7));
         try t.expectError(error.Stale, session.rm_names.validate(graph.reservation));
     } else {
         try t.expectError(error.Retained, session.rm_names.retire(graph.reservation));
@@ -2235,6 +2238,7 @@ fn outputEdid(bytes: []u8, incomplete: bool, corrupt: bool) void {
 }
 fn checkDeviceOutputs(target: *@import("gsp_device.zig").Device, words: []u32, frts: u64, scenario: anytype) !void {
     const rpc = @import("gsp_display_rpc.zig");
+    const ddc_case = scenario == .outputs_ddc or scenario == .outputs_ddc_bus_changed;
     const running = &target.running;
     const owner = &running.outputs;
     const session = &target.session.?;
@@ -2282,9 +2286,10 @@ fn checkDeviceOutputs(target: *@import("gsp_device.zig").Device, words: []u32, f
         const request = try transport.message.decode(session.profile,
             backing.?[command + 4096 + @as(usize, cursor) * 4096 ..][0..4096], session.tx_sequence - 1);
         try t.expect(request.rpc.function == 76 and std.mem.readInt(u32, request.payload[0..4], .little) == running.graph.?.reservation.client);
-        try t.expect(std.mem.readInt(u32, request.payload[4..8], .little) == running.graph.?.base.plan.handles.display);
+        try t.expect(std.mem.readInt(u32, request.payload[4..8], .little) ==
+            (if (query == .ports or query == .ddc) running.graph.?.base.plan.handles.i2c else running.graph.?.base.plan.handles.display));
         try t.expect(std.mem.readInt(u32, request.payload[8..12], .little) == @intFromEnum(std.meta.activeTag(query)));
-        try t.expect(std.mem.readInt(u32, request.payload[20..24], .little) == 0 and channel == running.activeChannel());
+        try t.expect(std.mem.readInt(u32, request.payload[20..24], .little) == @as(u32, if (query == .ddc) 2 else 0) and channel == running.activeChannel());
         var response: [rpc.max_request_bytes]u8 = @splat(0);
         const payload = response[0..request.payload.len];
         @memcpy(payload, request.payload);
@@ -2370,14 +2375,28 @@ fn checkDeviceOutputs(target: *@import("gsp_device.zig").Device, words: []u32, f
             },
             .buses => {
                 outputWord(payload, 32, 0);
-                outputWord(payload, 36, 37);
+                outputWord(payload, 36, if (ddc_case) (if (scenario == .outputs_ddc_bus_changed and owner.state == .receivers) @as(u32, 4) else 3) else 37);
             },
             .connected => |id| outputWord(payload, 32, if (id == 1 and scenario != .outputs_all) 1 else 0),
             .edid => {
                 try t.expect(std.mem.readInt(u32, payload[36..40], .little) == 2); // RAW; no cached boot EDID.
                 outputWord(payload, 32, if (scenario == .outputs_missing) 0 else 256);
-                outputEdid(payload[40..296], scenario == .outputs_incomplete, scenario == .outputs_bad_edid);
+                outputEdid(payload[40..296], scenario == .outputs_incomplete or ddc_case, scenario == .outputs_bad_edid);
                 if (scenario == .outputs_edid_rejected) outputWord(payload, 12, 0x55);
+            },
+            .ports => {
+                try t.expect(ddc_case);
+                payload[26] = 7;
+                payload[27] = 7;
+            },
+            .ddc => |ddc| {
+                try t.expect(ddc_case and ddc.port == @as(u8, if (scenario == .outputs_ddc_bus_changed) 3 else 2) and ddc.display_id == 1);
+                var blob: [4096]u8 = @splat(0);
+                outputEdid(blob[0..256], false, false);
+                blob[126] = 31;
+                blob[127] -%= 30;
+                for (2..32) |index| { blob[index * 128] = 0x99; blob[index * 128 + 127] = 0 -% @as(u8, 0x99); }
+                _ = try rpc.ddc_wire.encode(.{ .port = ddc.port, .block = ddc.block }, blob[@as(usize, ddc.block) * 128 ..][0..128], payload[24..]);
             },
         }
         if (scenario == .outputs_timeout and requests == 0) clock = deadline else {
@@ -2409,8 +2428,9 @@ fn checkDeviceOutputs(target: *@import("gsp_device.zig").Device, words: []u32, f
     }
     try t.expect(session.tx_sequence == initial_sequence + requests and session.pending == null and running.graph.?.state == .loaned);
     try t.expect(owner.state == .returned and running.output_generation == @as(u64, if (scenario == .outputs_hpd) 3 else 1));
-    if (scenario == .outputs_changed or scenario == .outputs_final_changed or scenario == .outputs_final_rejected or scenario == .outputs_sequence) {
+    if (scenario == .outputs_changed or scenario == .outputs_ddc_bus_changed or scenario == .outputs_final_changed or scenario == .outputs_final_rejected or scenario == .outputs_sequence) {
         try t.expect(!owner.data.coherent and running.nativeOutputs() == null);
+        if (scenario == .outputs_ddc_bus_changed) try t.expect(CatalogModel.count == 0);
         if (scenario == .outputs_final_rejected) try t.expect(owner.data.final_rejection.?.control.? == 0x66);
         return;
     }
@@ -2428,7 +2448,8 @@ fn checkDeviceOutputs(target: *@import("gsp_device.zig").Device, words: []u32, f
     try t.expect(data.topology.routes[0].resource.?.index == 0xffffffff and data.topology.routes[0].resource.?.dcb_index == 27);
     if (scenario == .outputs_partial) try t.expect(data.topology.routes[0].connectors == null and data.topology.routes[0].rejections[0].?.control.? == 0x55)
     else try t.expect(data.topology.routes[0].connectors.?.data[0].index == 17 and data.topology.routes[0].connectors.?.data[1].kind == 0xffffffff);
-    try t.expect(data.topology.routes[0].buses.?.communication == 0 and data.topology.routes[0].buses.?.ddc == 37);
+    try t.expect(data.topology.routes[0].buses.?.communication == 0 and
+        data.topology.routes[0].buses.?.ddc == @as(u32, if (scenario == .outputs_ddc) 3 else 37));
     if (scenario == .outputs_partial) try t.expect(data.topology.activeHeads(1) == null and data.topology.heads[1].rejected.?.control.? == 0x55)
     else try t.expect(data.topology.activeHeads(1).? == 1 and data.topology.activeHeads(0x80000000).? == 8);
     if (scenario == .outputs_all) {
@@ -2444,6 +2465,7 @@ fn checkDeviceOutputs(target: *@import("gsp_device.zig").Device, words: []u32, f
         };
         try t.expect(first.status == expected_status and first.connected.?);
         if (first.status == .valid_edid) try t.expect(first.report.hdmi and first.report.mode_count != 0 and first.report.audio_count != 0);
+        if (scenario == .outputs_ddc) try t.expect(first.source == .ddc and first.edid_bytes == 4096 and first.report.declared_extensions == 31 and first.report.complete());
         const published = &CatalogModel.first;
         try t.expect(published.flags & a.gfx_output_flag_connected != 0 and CatalogModel.last.edid_bytes == 0 and CatalogModel.last.mode_count == 0);
         switch (first.status) {

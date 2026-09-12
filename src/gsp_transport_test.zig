@@ -679,7 +679,7 @@ fn displayReply(model: *Model, channel: *display_rpc.Channel, status: u32, value
                 byte.* = @truncate(i);
             };
         },
-        .heads, .active, .connectors, .resource, .buses => unreachable, // Dedicated bounded topology fixture below.
+        .heads, .active, .connectors, .resource, .buses, .ports, .ddc => unreachable, // Dedicated bounded topology/DDC fixtures below.
     }
     // The RPC sequence and private result deliberately do not echo the request.
     try model.replyRpc(channel.exchange.session, .{ .function = 76, .result = 0, .result_private = 0x19283746, .sequence = 0xdeadbeef }, encoded);
@@ -1563,19 +1563,35 @@ fn graphOperation(model: *Model, owner: *rm_graph.Owner, status: u32) !void {
             if (owner.subscriptions.?.outstanding == null) return;
             try eventReply(model, &owner.subscriptions.?, status);
         },
+        .i2c_creating, .i2c_destroying => {
+            const child = &owner.i2c.?;
+            if (child.outstanding == null) return;
+            var reply: [32]u8 = undefined;
+            const encoded = try objects.encode(&child.plan, child.outstanding.?, &reply);
+            put(&reply, if (encoded.function == 103) 16 else 12, status);
+            try model.replyRpc(child.exchange.session, .{ .function = encoded.function, .result = 0 }, encoded.bytes);
+        },
         .closed => return,
         else => return error.InvalidGraphProgress,
     }
     try t.expect((try owner.poll()) == null);
 }
 fn graphCreate(model: *Model, owner: *rm_graph.Owner) !void {
-    for (0..9) |_| try graphOperation(model, owner, 0);
+    for (0..13) |_| {
+        if (owner.state == .ready) break;
+        try graphOperation(model, owner, 0);
+    }
     try t.expect(owner.state == .ready and owner.base.state == .loaned and owner.subscriptions.?.state == .ready);
+    try t.expect(owner.i2c.?.live and owner.i2c.?.state == .handed_off);
 }
 fn graphDestroy(model: *Model, owner: *rm_graph.Owner) !boot_events.Handoff {
     try owner.beginDestroy(deadline);
-    for (0..9) |_| try graphOperation(model, owner, 0);
+    for (0..13) |_| {
+        if (owner.state == .closed) break;
+        try graphOperation(model, owner, 0);
+    }
     try t.expect(owner.state == .closed and owner.base.state == .objects_closed);
+    try t.expect(!owner.i2c.?.live and owner.i2c.?.state == .finished);
     return owner.finish(deadline);
 }
 fn checkRmGraph(model: *Model) !void {
@@ -1815,6 +1831,14 @@ fn checkReceiver(model: *Model) !void {
                     try refresh.release(deadline);
                     try t.expect(owner.state == .ready);
                     continue;
+                }
+                if (refresh.state == .buses) {
+                    try t.expect((try refresh.poll()) == null);
+                    var bytes: [40]u8 = undefined;
+                    const payload = try display_rpc.encode(refresh.channel.object, refresh.channel.request.?, &bytes);
+                    put(&bytes, 36, 37); // An unknown RM ID cannot be truncated to an I2C index.
+                    try model.replyRpc(&session, .{ .function = 76, .result = 0 }, payload);
+                    try t.expect((try refresh.poll()) == null);
                 }
                 try t.expect(refresh.state == .verify);
                 try t.expect((try refresh.poll()) == null);
@@ -2092,15 +2116,227 @@ fn checkTopology(model: *Model) !void {
     }
 }
 
+fn checkDdcWire() !void {
+    const wire = display_rpc.ddc_wire;
+    // Original 570.144 SerializeDown/DeserializeDown/SerializeUp/DeserializeUp,
+    // compiled unchanged with NVRM. This fixture is independent of our codec.
+    const golden = @embedFile("fixtures/ddc-finn-570.144.bin");
+    const blocks = [_]u8{ 0, 1, 2, 15, 16, 31 };
+    var encoded: [201]u8 = @splat(0xa5);
+    var output: [128]u8 = @splat(0xa5);
+    for (blocks, 0..) |block, i| {
+        const request = wire.Request{ .port = 2, .block = block };
+        const expected = golden[i * 400 ..][0..400];
+        try t.expectEqualSlices(u8, expected[0..200], try wire.encode(request, null, &encoded));
+        try t.expect(encoded[200] == 0xa5);
+        try wire.decode(request, expected[200..400], &output);
+        for (output, 0..) |value, index| try t.expectEqual(@as(u8, @truncate(index * 37 + block)), value);
+        try t.expectEqualSlices(u8, expected[200..400], try wire.encode(request, &output, &encoded));
+        for (0..200) |size| try t.expectError(error.Bounds, wire.encode(request, null, encoded[0..size]));
+        @memset(&output, 0xa5);
+        for (0..200) |size| try t.expectError(error.Payload, wire.decode(request, expected[200..][0..size], &output));
+        try t.expectError(error.Payload, wire.decode(request, &encoded, &output));
+        // Every field-presence bit (including the last data element), fixed
+        // echo/header and padding is checked before mutating the output.
+        const data_start = 402;
+        for ([_]usize{ 0, 64, 128, 192, 256, 265, 298, 315, 348, 349, 350, 359, 368, 401, data_start, data_start + 127 * 9, 1599 }) |bit| {
+            @memcpy(encoded[0..200], expected[200..400]);
+            encoded[bit / 8] ^= @as(u8, 1) << @as(u3, @intCast(bit % 8));
+            try t.expectError(error.Payload, wire.decode(request, encoded[0..200], &output));
+            try t.expect(std.mem.allEqual(u8, &output, 0xa5));
+        }
+    }
+    for ([_]wire.Request{ .{ .port = 16, .block = 0 }, .{ .port = 255, .block = 0 }, .{ .port = 0, .block = 32 } }) |request|
+        try t.expectError(error.Query, wire.encode(request, null, &encoded));
+}
+
+fn checkI2cGraph(model: *Model) !void {
+    const Case = enum { rejected, alloc_ack, alloc_rpc, free_reject, free_ack };
+    for (std.enums.values(Case)) |case| {
+        var session: transport.Session = undefined;
+        var boot = try startBoot(model, &session);
+        try model.replyRpc(&session, .{ .function = 0x1001, .result = 0 }, &.{ 0, 0, 0, 0 });
+        try boot.complete((try boot.poll()).?.ticket);
+        var token = try boot.handoff(deadline);
+        var owner = try rm_graph.Owner.init(&token, 1, "I2C child", deadline);
+        if (case == .free_reject or case == .free_ack) {
+            try graphCreate(model, &owner);
+            try owner.beginDestroy(deadline);
+            for (0..8) |_| {
+                model.count = 0;
+                if (owner.state == .i2c_destroying) break;
+                try graphOperation(model, &owner, 0);
+            }
+            try t.expect(owner.state == .i2c_destroying and owner.i2c.?.live and owner.base.state == .loaned);
+        } else {
+            for (0..4) |_| try graphOperation(model, &owner, 0);
+            try t.expect((try owner.poll()) == null and owner.state == .i2c_creating);
+        }
+        model.count = 0;
+        try t.expect((try owner.poll()) == null);
+        var response: [32]u8 = undefined;
+        const child = &owner.i2c.?;
+        const encoded = try objects.encode(&child.plan, child.outstanding.?, &response);
+        if (encoded.function == 103) try t.expect(get(&response, 4) == owner.base.plan.handles.subdevice and get(&response, 12) == 0x402c and get(&response, 20) == 0);
+        put(&response, if (encoded.function == 103) 16 else 12, if (case == .rejected or case == .free_reject) 0x55 else 0);
+        try model.replyRpc(&session, .{ .function = encoded.function, .result = if (case == .alloc_rpc) 0x66 else 0 }, encoded.bytes);
+        if (case == .alloc_ack or case == .free_ack) { model.fault = model.count + 4; model.after = true; }
+        if (case == .rejected) {
+            try t.expect((try owner.poll()) == null and !child.live and child.rejected.? == 0x55);
+            for (0..7) |_| {
+                model.count = 0;
+                if (owner.state == .ready) break;
+                try graphOperation(model, &owner, 0);
+            }
+            var loan = try owner.loan(deadline);
+            try t.expect(loan.object.i2c == 0);
+            var returned = try @import("gsp_exchange.zig").Exchange.init(&loan.runtime, deadline);
+            var handoff = try returned.handoff(deadline);
+            try owner.reclaim(&handoff, deadline);
+            model.count = 0;
+            _ = try graphDestroy(model, &owner);
+            try t.expect(session.state == .active and owner.state == .finished);
+        } else {
+            try t.expectError(if (case == .alloc_ack or case == .free_ack) error.Io else error.FirmwareResult, owner.poll());
+            try t.expect(owner.state == .failed and session.state == .failed and owner.base.state == .loaned);
+            for (owner.base.slots) |slot| try t.expect(slot == .live);
+            try t.expectError(error.Retained, session.rm_names.retire(owner.reservation));
+            const calls = model.count;
+            try t.expectError(error.State, owner.poll());
+            try t.expectError(error.State, owner.finish(deadline));
+            try t.expect(model.count == calls);
+        }
+    }
+}
+
+fn checkDdcReceiver(model: *Model) !void {
+    const capture = try t.allocator.create(receiver.Capture);
+    defer t.allocator.destroy(capture);
+    const end = 20 * std.time.ns_per_ms;
+    const Case = enum { full, bounded, dvi, bad_base, bad_extension, no_ddc_port, rejected_ports, prefix_error,
+        retry, exhausted, changed_base, changed_bus, hpd, ack, expired };
+    for (std.enums.values(Case)) |case| {
+        var session: transport.Session = undefined;
+        var boot = try startBoot(model, &session);
+        try model.replyRpc(&session, .{ .function = 0x1001, .result = 0 }, &.{ 0, 0, 0, 0 });
+        try boot.complete((try boot.poll()).?.ticket);
+        var token = try boot.handoff(deadline);
+        var parent = try rm_graph.Owner.init(&token, 1, "DDC", deadline);
+        try graphCreate(model, &parent);
+        var refresh = try receiver.Refresh.init(&parent, 1, capture, end);
+        var blob: [4096]u8 = undefined;
+        receiverFixture(&blob);
+        if (case == .dvi) receiverFixture(blob[0..128]);
+        if (case == .bounded) { blob[126] = 32; receiverChecksum(blob[0..128]); }
+        if (case == .bad_base) blob[0] = 1;
+        if (case == .bad_extension) blob[255] ^= 1;
+        var reads: usize = 0;
+        var steps: usize = 0;
+        errdefer |err| std.debug.print("DDC case={s} error={s} state={s} bytes={d} reads={d}\n", .{@tagName(case), @errorName(err), @tagName(refresh.state), capture.edid_bytes, reads});
+        while (refresh.state != .complete and refresh.state != .obsolete and steps < 90) : (steps += 1) {
+            model.count = 0;
+            if (refresh.waiting()) {
+                const sent = session.tx_sequence;
+                try t.expect((try refresh.poll()) == null and session.tx_sequence == sent);
+                model.now = refresh.retry_at_ns;
+            }
+            try t.expect((try refresh.poll()) == null);
+            if (refresh.channel.exchange.phase != .waiting) continue;
+            const query = refresh.channel.request.?;
+            try t.expect(refresh.matches(&refresh.channel.exchange, end) == false); // Already submitted.
+            model.peerPut(session.link.?.command_read, get(&model.peer[0], 16));
+            var bytes: [display_rpc.max_request_bytes]u8 = undefined;
+            const payload = try display_rpc.encode(refresh.channel.object, query, &bytes);
+            switch (query) {
+                .supported => { put(&bytes, 28, 1); put(&bytes, 32, 1); },
+                .connected => put(&bytes, 32, 1),
+                .edid => {
+                    const raw_size: usize = if (case == .full or case == .bounded) 2048 else 0;
+                    put(&bytes, 32, @intCast(raw_size));
+                    @memcpy(bytes[40..][0..raw_size], blob[0..raw_size]);
+                },
+                .buses => put(&bytes, 36, if (case == .changed_bus and refresh.state == .bus_verify) 4 else 3),
+                .ports => {
+                    bytes[26] = if (case == .no_ddc_port) 1 else 7;
+                    if (case == .rejected_ports) put(&bytes, 12, 0x55);
+                },
+                .ddc => |request| {
+                    try t.expect(request.port == 2 and request.display_id == 1 and request.block < 32);
+                    try t.expect(get(&bytes, 4) == parent.base.plan.handles.i2c and get(&bytes, 20) == 2);
+                    var block = blob[@as(usize, request.block) * 128 ..][0..128].*;
+                    if (case == .changed_base and refresh.state == .ddc_verify) { block[9] ^= 1; receiverChecksum(&block); }
+                    _ = try display_rpc.ddc_wire.encode(.{ .port = request.port, .block = request.block }, &block, bytes[24..]);
+                    if ((case == .retry and reads < 2) or case == .exhausted) {
+                        put(&bytes, 12, if (reads % 2 == 0) 3 else 0x14);
+                        @memset(bytes[24..payload.len], 0xee); // Error output is forbidden, including retry data.
+                    }
+                    if (case == .prefix_error and request.block == 16) put(&bytes, 12, 0x1f);
+                    if (case == .hpd and reads == 0) {
+                        var post: [40]u8 = undefined;
+                        const notice = registeredPost(&post, .hotplug, true);
+                        put(&post, 0, parent.reservation.client);
+                        put(&post, 4, try parent.reservation.object(3));
+                        try model.replyRpc(&session, .{ .function = 0x1003, .result = 0 }, notice);
+                        _ = (try refresh.poll()).?;
+                        var delivery = try runtime_events.Dispatch.initDisplay(&refresh.channel, try parent.eventSink());
+                        try delivery.step();
+                    }
+                    reads += 1;
+                },
+                else => return error.UnexpectedDdc,
+            }
+            try model.replyRpc(&session, .{ .function = 76, .result = 0 }, payload);
+            if (query == .ddc and (case == .ack or case == .expired)) {
+                if (case == .ack) { model.fault = model.count + 4; model.after = true; } else model.now = end;
+                try t.expectError(if (case == .ack) error.Io else error.Deadline, refresh.poll());
+                try t.expect(session.state == .failed and refresh.state == .failed and parent.state == .loaned);
+                try t.expectError(error.State, refresh.release(end + 1));
+                break;
+            }
+            try t.expect((try refresh.poll()) == null);
+            if (refresh.channel.exchange.phase == .idle and refresh.channel.supported != null and refresh.state == .connected)
+                try t.expectError(error.Query, refresh.channel.begin(.{ .ddc = .{ .display_id = 1, .port = 2, .block = 0 } }, end));
+        }
+        try t.expect(steps < 90);
+        if (case == .ack or case == .expired) continue;
+        if (case == .changed_base or case == .changed_bus or case == .hpd) {
+            try t.expect(refresh.state == .obsolete);
+            try t.expectError(error.State, refresh.borrow(end));
+        } else {
+            const result = try refresh.borrow(end);
+            const expected: receiver.Status = switch (case) {
+                .bounded, .bad_extension, .prefix_error => .incomplete_edid,
+                .no_ddc_port, .rejected_ports => .edid_missing,
+                .bad_base => .invalid_edid,
+                .exhausted => .edid_rejected,
+                else => .valid_edid,
+            };
+            try t.expectEqual(expected, result.status);
+            if (case == .full or case == .bounded or case == .retry) try t.expect(result.edid_bytes == 4096 and result.source == .ddc);
+            if (case == .full) try t.expectEqualSlices(u8, &blob, result.bytes[0..4096]);
+            if (case == .dvi) try t.expect(result.edid_bytes == 128 and result.report.audio_count == 0 and !result.report.hdmi);
+            if (case == .retry or case == .exhausted) try t.expect(result.ddc_retries == 2);
+            if (case == .exhausted) try t.expect(reads == 3 and result.edid_bytes == 0);
+            if (case == .prefix_error) try t.expect(result.edid_bytes == 2048 and result.ddc_control_status.? == 0x1f);
+            if (case == .no_ddc_port or case == .rejected_ports) try t.expect(reads == 0);
+        }
+        try refresh.release(end);
+        try t.expect(parent.state == .ready and session.state == .active);
+    }
+}
+
 test "GSP transport orders range publication, explicit acknowledgement and terminal ambiguous failures" {
     const model = try t.allocator.create(Model);
     defer t.allocator.destroy(model);
+    try checkDdcWire();
     try checkDisplayRpc(model);
     try checkObjects(model);
     try checkRuntimeEvents(model);
     try checkEventObjects(model);
     try checkRmGraph(model);
+    try checkI2cGraph(model);
     try checkReceiver(model);
+    try checkDdcReceiver(model);
     try checkTopology(model);
     for (0..4) |flags| {
         var session = try model.start(@intCast(flags));

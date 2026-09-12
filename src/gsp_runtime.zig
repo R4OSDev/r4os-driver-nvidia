@@ -221,10 +221,12 @@ pub const Owner = struct {
             }
             if (self.outputs.data.count != before) {
                 const capture = &self.outputs.data.receivers[before];
-                self.log("NVIDIA gsp-receiver: candidate generation={d} display={x} status={s} edid={d} modes={d} audio={d} warnings={x} rpc={?} rm={?}",
+                self.log("NVIDIA gsp-receiver: candidate generation={d} display={x} status={s} edid={d} modes={d} audio={d} warnings={x} rpc={?} rm={?} source={s} ddc-retries={d} ddc-rpc={?} ddc-rm={?}",
                     .{self.output_generation, capture.display_id, @tagName(capture.status), capture.edid_bytes,
-                        capture.report.mode_count, capture.report.audio_count, capture.report.warnings, capture.rpc_status, capture.control_status});
+                        capture.report.mode_count, capture.report.audio_count, capture.report.warnings, capture.rpc_status, capture.control_status,
+                        @tagName(capture.source), capture.ddc_retries, capture.ddc_rpc_status, capture.ddc_control_status});
             }
+            if (self.outputs.refresh) |*refresh| if (refresh.waiting()) return .idle;
             return if ((self.activeChannel() orelse return error.State).phase == .waiting) .idle else .progress;
         }
         if (self.graph) |*graph| {
@@ -258,7 +260,7 @@ pub const Owner = struct {
                     self.channel = try exchange.Exchange.init(&token, graph.deadline);
                     return error.RmRejected; // Object frees do not stop GPU DMA.
                 },
-                .base_creating, .events_creating, .events_destroying, .base_destroying => {
+                .base_creating, .i2c_creating, .events_creating, .events_destroying, .i2c_destroying, .base_destroying => {
                     if (try graph.poll()) |dispatch| {
                         try self.notification(self.activeChannel() orelse return error.State, dispatch, current);
                         return .progress;

@@ -1,3 +1,50 @@
+// DDC/I2C reference notices: unchanged NVIDIA 570.144 attribution.
+// Nvidia570.144/src/common/sdk/nvidia/inc/class/cl402c.h
+// /*
+//  * SPDX-FileCopyrightText: Copyright (c) 2010-2010 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//  * SPDX-License-Identifier: MIT
+//  *
+//  * Permission is hereby granted, free of charge, to any person obtaining a
+//  * copy of this software and associated documentation files (the "Software"),
+//  * to deal in the Software without restriction, including without limitation
+//  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//  * and/or sell copies of the Software, and to permit persons to whom the
+//  * Software is furnished to do so, subject to the following conditions:
+//  *
+//  * The above copyright notice and this permission notice shall be included in
+//  * all copies or substantial portions of the Software.
+//  *
+//  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+//  * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+//  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+//  * DEALINGS IN THE SOFTWARE.
+//  */
+// Nvidia570.144/src/nvidia/src/kernel/rmapi/resource_list.h
+// /*
+//  * SPDX-FileCopyrightText: Copyright (c) 2016-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//  * SPDX-License-Identifier: MIT
+//  *
+//  * Permission is hereby granted, free of charge, to any person obtaining a
+//  * copy of this software and associated documentation files (the "Software"),
+//  * to deal in the Software without restriction, including without limitation
+//  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//  * and/or sell copies of the Software, and to permit persons to whom the
+//  * Software is furnished to do so, subject to the following conditions:
+//  *
+//  * The above copyright notice and this permission notice shall be included in
+//  * all copies or substantial portions of the Software.
+//  *
+//  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+//  * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+//  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+//  * DEALINGS IN THE SOFTWARE.
+//  */
 // RM layouts/classes: NVIDIA570.144 (MIT). Hierarchy and RPC allocation/free
 // flow also informed by Nouveau r535 (MIT). Original R4OS bounded ledger,
 // exchange ownership and retention policy: Apache-2.0. Full notices follow.
@@ -147,9 +194,9 @@ const boot = @import("gsp_boot_events.zig");
 const display = @import("gsp_display_rpc.zig");
 const message = exchange.message;
 pub const Error = exchange.Error;
-pub const Kind = enum(u2) { client, device, subdevice, display };
+pub const Kind = enum(u3) { client, device, subdevice, display, i2c };
 pub const Operation = union(enum) { allocate: Kind, free: Kind };
-pub const Handles = struct { client: u32, device: u32, subdevice: u32, display: u32 };
+pub const Handles = struct { client: u32, device: u32, subdevice: u32, display: u32, i2c: u32 = 0 };
 pub const max_request_bytes = 152;
 pub const Response = union(enum) { ok: void, rm_error: u32, rpc_error: u32 };
 pub const Encoded = struct { function: u32, bytes: []const u8 };
@@ -168,6 +215,7 @@ pub const Plan = struct {
             if (value == 0) return error.Handle;
             for (all[0..i]) |previous| if (previous == value) return error.Handle;
         }
+        if (handles.i2c != 0) for (all) |value| if (value == handles.i2c) return error.Handle;
         if (name.len >= 100 or std.mem.indexOfScalar(u8, name, 0) != null) return error.Payload;
         var result = Plan{ .epoch = epoch, .handles = handles, .process_id = process_id, .process_name = @splat(0) };
         @memcpy(result.process_name[0..name.len], name);
@@ -184,6 +232,7 @@ pub const Plan = struct {
             .device => self.handles.device,
             .subdevice => self.handles.subdevice,
             .display => self.handles.display,
+            .i2c => self.handles.i2c,
         };
     }
     pub fn parent(self: *const Plan, kind: Kind) u32 {
@@ -192,6 +241,7 @@ pub const Plan = struct {
         return switch (kind) {
             .client, .device => self.handles.client,
             .subdevice, .display => self.handles.device,
+            .i2c => self.handles.subdevice,
         };
     }
 };
@@ -207,6 +257,7 @@ pub fn class(kind: Kind) u32 {
         .device => 0x80,
         .subdevice => 0x2080,
         .display => 0x73,
+        .i2c => 0x402c,
     };
 }
 pub fn paramsSize(kind: Kind) usize {
@@ -216,11 +267,13 @@ pub fn paramsSize(kind: Kind) usize {
         .client => 120,
         .device => 56,
         .subdevice => 4,
-        .display => 0,
+        .display, .i2c => 0,
     };
 }
 pub fn encode(plan: *const Plan, operation: Operation, output: []u8) Error!Encoded {
     try plan.validate();
+    const target = switch (operation) { .allocate, .free => |kind| kind };
+    if (plan.handle(target) == 0) return error.Handle;
     const size: usize = switch (operation) {
         .allocate => |kind| 32 + paramsSize(kind),
         .free => 16,
@@ -249,7 +302,7 @@ pub fn encode(plan: *const Plan, operation: Operation, output: []u8) Error!Encod
                     // VA policy override or address-space allocation request.
                     put(params, 4, plan.handles.client);
                 },
-                .subdevice, .display => {},
+                .subdevice, .display, .i2c => {},
             }
             return .{ .function = 103, .bytes = bytes };
         },

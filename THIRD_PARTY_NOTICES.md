@@ -1,5 +1,15 @@
 ﻿# Third-Party Notices
 
+DDC block acquisition (NVIDIA 0.1.62, 2026-09-12):
+The bounded FINN EDID codec, NV40_I2C graph child, port and retry contracts
+use the pinned 570.144 sources. Complete source notices are retained in
+the affected Zig files and appended to NVIDIA-GSP-RUNTIME-LICENSE.txt,
+embedded and staged identically. Full originals and COPYING accompany
+0.79.12/ddc-20260912. The host-only oracle compiles the unchanged original
+g_finn_rm_api.c with NVRM and libc memory hooks; no NVIDIA serializer code
+is newly linked into the module. Its 2400-byte fixture records six original
+request/response pairs. R4OS ownership and acquisition remain Apache-2.0.
+
 Receiver publication (NVIDIA 0.1.60, 2026-09-12):
 The connector-type mapping reuses the pinned 570.144 ctrl0073specific.h
 definitions, with its complete MIT notice in gsp_catalog.zig and the already

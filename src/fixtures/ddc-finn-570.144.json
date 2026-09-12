@@ -1,0 +1,18 @@
+{
+  "source_commit": "8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f",
+  "fixture_bytes": 2400,
+  "fixture_sha256": "216c241809cad1e7b73f164be8b974b8dc62414654038fb0c090310671638d3b",
+  "port": 2,
+  "blocks": [
+    0,
+    1,
+    2,
+    15,
+    16,
+    31
+  ],
+  "layout": "Each pair is 200-byte SerializeDown followed by 200-byte SerializeUp. Upward data byte j = (j*37+block) modulo 256.",
+  "generator": "Finn-Reference.c, compiled with unchanged full g_finn_rm_api.c and NVRM",
+  "reference_archive": "ExFiles/Reference/GFX/Nvidia/0.79.12/ddc-20260912",
+  "license": "Original NVIDIA MIT; full attribution in gsp_ddc_wire.zig and Licenses/NVIDIA-GSP-RUNTIME-LICENSE.txt"
+}

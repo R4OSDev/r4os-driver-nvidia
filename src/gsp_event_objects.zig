@@ -213,6 +213,7 @@ pub const Plan = struct {
         const names = [_]u32{ base.handles.client, base.handles.device, base.handles.subdevice, base.handles.display, handles.hotplug, handles.dp_irq };
         for (names, 0..) |name, i| {
             if (name == 0) return error.Handle;
+            if (base.handles.i2c != 0 and name == base.handles.i2c) return error.Handle;
             for (names[0..i]) |previous| if (name == previous) return error.Handle;
         }
         return .{ .base = base, .handles = handles };

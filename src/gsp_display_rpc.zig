@@ -1,3 +1,73 @@
+// DDC/I2C reference notices: unchanged NVIDIA 570.144 attribution.
+// Nvidia570.144/src/common/sdk/nvidia/inc/ctrl/ctrl402c.h
+// /*
+//  * SPDX-FileCopyrightText: Copyright (c) 2010-2020 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//  * SPDX-License-Identifier: MIT
+//  *
+//  * Permission is hereby granted, free of charge, to any person obtaining a
+//  * copy of this software and associated documentation files (the "Software"),
+//  * to deal in the Software without restriction, including without limitation
+//  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//  * and/or sell copies of the Software, and to permit persons to whom the
+//  * Software is furnished to do so, subject to the following conditions:
+//  *
+//  * The above copyright notice and this permission notice shall be included in
+//  * all copies or substantial portions of the Software.
+//  *
+//  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+//  * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+//  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+//  * DEALINGS IN THE SOFTWARE.
+//  */
+// Nvidia570.144/src/nvidia/inc/kernel/rmapi/rmapi.h
+// /*
+//  * SPDX-FileCopyrightText: Copyright (c) 2018-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//  * SPDX-License-Identifier: MIT
+//  *
+//  * Permission is hereby granted, free of charge, to any person obtaining a
+//  * copy of this software and associated documentation files (the "Software"),
+//  * to deal in the Software without restriction, including without limitation
+//  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//  * and/or sell copies of the Software, and to permit persons to whom the
+//  * Software is furnished to do so, subject to the following conditions:
+//  *
+//  * The above copyright notice and this permission notice shall be included in
+//  * all copies or substantial portions of the Software.
+//  *
+//  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+//  * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+//  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+//  * DEALINGS IN THE SOFTWARE.
+//  */
+// Nvidia570.144/src/nvidia/src/kernel/vgpu/rpc.c
+// /*
+//  * SPDX-FileCopyrightText: Copyright (c) 2008-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//  * SPDX-License-Identifier: MIT
+//  *
+//  * Permission is hereby granted, free of charge, to any person obtaining a
+//  * copy of this software and associated documentation files (the "Software"),
+//  * to deal in the Software without restriction, including without limitation
+//  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//  * and/or sell copies of the Software, and to permit persons to whom the
+//  * Software is furnished to do so, subject to the following conditions:
+//  *
+//  * The above copyright notice and this permission notice shall be included in
+//  * all copies or substantial portions of the Software.
+//  *
+//  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+//  * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+//  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+//  * DEALINGS IN THE SOFTWARE.
+//  */
 // RM wire ABI and query fields: NVIDIA 570.144 (MIT).
 // Notification/request separation also informed by Nouveau r535 (MIT).
 // Original R4OS bounded state/ownership/generation policy: Apache-2.0.
@@ -93,7 +163,7 @@
 //  * OTHER DEALINGS IN THE SOFTWARE.
 //  */
 //! Bounded RM display controls over one post-boot GSP queue owner.
-//! Fixed flat NV0073 queries only; no object allocation, FINN serialization,
+//! Fixed NV0073/402C reads only, including one bounded FINN EDID operation; no object allocation,
 //! continuation records, register access, callback execution or DMA release.
 //! The native caller must supply an actually allocated, retained RM object.
 const std = @import("std");
@@ -101,15 +171,17 @@ const boot_events = @import("gsp_boot_events.zig");
 const exchange = @import("gsp_exchange.zig");
 const transport = exchange.transport;
 const message = transport.message;
+pub const ddc_wire = @import("gsp_ddc_wire.zig");
 pub const Error = boot_events.Error || error{ Handle, Query, Unexpected, Obsolete, Bounds };
 pub const function: u32 = 76;
 pub const header_bytes = 24;
 pub const max_edid_bytes = 2048;
 pub const max_request_bytes = header_bytes + 16 + max_edid_bytes;
 pub const max_heads = 32;
-pub const Command = enum(u32) { heads = 0x730102, active = 0x73010c, supported = 0x730107, connected = 0x730108, edid = 0x730245, connectors = 0x730250, resource = 0x73028b, buses = 0x730211 };
-pub const Query = union(Command) { heads: void, active: u32, supported: void, connected: u32, edid: u32, connectors: u32, resource: u32, buses: u32 };
-pub const Object = struct { epoch: u64, client: u32, display: u32 };
+pub const Command = enum(u32) { heads = 0x730102, active = 0x73010c, supported = 0x730107, connected = 0x730108, edid = 0x730245, connectors = 0x730250, resource = 0x73028b, buses = 0x730211, ports = 0x402c0101, ddc = ddc_wire.command };
+pub const Ddc = struct { display_id: u32, port: u8, block: u8 };
+pub const Query = union(Command) { heads: void, active: u32, supported: void, connected: u32, edid: u32, connectors: u32, resource: u32, buses: u32, ports: void, ddc: Ddc };
+pub const Object = struct { epoch: u64, client: u32, display: u32, i2c: u32 = 0 };
 pub const Supported = struct { displays: u32, ddc: u32 };
 pub const Connector = struct { index: u32 = 0, kind: u32 = 0, location: u32 = 0 };
 pub const Connectors = struct {
@@ -146,6 +218,8 @@ pub const Reply = union(enum) {
     connectors: Connectors,
     resource: Resource,
     buses: Buses,
+    ports: [16]u8,
+    ddc: [ddc_wire.block_bytes]u8,
     // Raw, bounded bytes only. An empty blob is not an EDID; the receiver
     // parser must validate the header, all advertised blocks and checksums.
     edid: []const u8,
@@ -176,19 +250,26 @@ fn paramsSize(query: Query) usize {
         .connectors => 72,
         .resource => 56,
         .buses => 16,
+        .ports => 16,
+        .ddc => ddc_wire.bytes,
     };
 }
 fn oneBit(mask: u32) bool {
     return mask != 0 and mask & (mask - 1) == 0;
 }
 
-/// Encode only these pointer-free, fixed-size vendor structures. RPC flags
-/// remain NONE: neither serialized data nor copyout-on-error is requested.
+fn target(object: Object, query: Query) u32 {
+    return if (query == .ports or query == .ddc) object.i2c else object.display;
+}
+fn flags(query: Query) u32 { return if (query == .ddc) ddc_wire.rpc_flags else 0; }
+/// Encode only the fixed allowlist. The DDC read alone uses FINN serialization;
+/// no request permits copyout-on-error or sends CPU pointers to firmware.
 /// Output-only fields and the complete EDID array start at zero.
 pub fn encode(object: Object, query: Query, output: []u8) Error![]const u8 {
-    if (object.epoch == 0 or object.client == 0 or object.display == 0) return error.Handle;
+    if (object.epoch == 0 or object.client == 0 or object.display == 0 or target(object, query) == 0) return error.Handle;
     switch (query) {
-        .supported, .heads => {},
+        .supported, .heads, .ports => {},
+        .ddc => |request| if (!oneBit(request.display_id) or request.port >= 16 or request.block >= ddc_wire.max_blocks) return error.Query,
         .active => |head| if (head >= max_heads) return error.Query,
         .connected => |mask| if (mask == 0) return error.Query,
         .edid, .connectors, .resource, .buses => |id| if (!oneBit(id)) return error.Query,
@@ -198,14 +279,16 @@ pub fn encode(object: Object, query: Query, output: []u8) Error![]const u8 {
     const bytes = output[0 .. header_bytes + size];
     @memset(bytes, 0);
     put(bytes, 0, object.client);
-    put(bytes, 4, object.display);
+    put(bytes, 4, target(object, query));
     put(bytes, 8, @intFromEnum(std.meta.activeTag(query)));
     put(bytes, 16, @intCast(size));
+    put(bytes, 20, flags(query));
     // subDeviceInstance=0, default CONNECT_STATE (not cached), EDID RAW
     // with COPY_CACHE=NO and DISPMUX=DEFAULT. Display IDs are RM masks,
     // never VBIOS physical connector indices or GPIO numbers.
     switch (query) {
-        .supported, .heads => {},
+        .supported, .heads, .ports => {},
+        .ddc => |request| { _ = try ddc_wire.encode(.{ .port = request.port, .block = request.block }, null, bytes[header_bytes..]); },
         .active => |head| put(bytes, header_bytes + 4, head),
         .connected => |mask| put(bytes, header_bytes + 8, mask),
         .connectors, .resource, .buses => |id| put(bytes, header_bytes + 4, id),
@@ -228,15 +311,22 @@ pub fn decode(object: Object, query: Query, record: message.Record) Error!Reply 
     const bytes = record.payload;
     const size = paramsSize(query);
     if (bytes.len != header_bytes + size) return error.Payload;
-    if (word(bytes, 0) != object.client or word(bytes, 4) != object.display or
+    if (word(bytes, 0) != object.client or word(bytes, 4) != target(object, query) or
         word(bytes, 8) != @intFromEnum(std.meta.activeTag(query))) return error.Unexpected;
-    if (word(bytes, 16) != size or word(bytes, 20) != 0) return error.Payload;
+    if (word(bytes, 16) != size or word(bytes, 20) != flags(query)) return error.Payload;
     const status = word(bytes, 12);
     // NONE disallows using even retry-time/output bytes on a control error.
     if (status != 0) return .{ .control_error = status };
     const params = bytes[header_bytes..];
+    if (query == .ports) return .{ .ports = params[0..16].* };
+    if (query == .ddc) {
+        var block: [ddc_wire.block_bytes]u8 = undefined;
+        try ddc_wire.decode(.{ .port = query.ddc.port, .block = query.ddc.block }, params, &block);
+        return .{ .ddc = block };
+    }
     if (word(params, 0) != 0) return error.Unexpected;
     return switch (query) {
+        .ports, .ddc => unreachable,
         .heads => blk: {
             if (word(params, 4) != 0 or word(params, 8) > max_heads) return error.Payload;
             break :blk .{ .heads = word(params, 8) };
@@ -291,6 +381,8 @@ pub const Channel = struct {
     request_revision: u64 = 0,
     supported: ?Supported = null,
     heads: ?u32 = null,
+    ports: ?[16]u8 = null,
+    ddc_bus: ?struct { display_id: u32, port: u32 } = null,
     connected: u32 = 0,
     pending: ?Dispatch = null,
 
@@ -304,12 +396,16 @@ pub const Channel = struct {
     fn fail(self: *Channel, reason: Error) Error {
         self.connected = 0;
         self.heads = null;
+        self.ports = null;
+        self.ddc_bus = null;
         return self.exchange.fail(reason);
     }
     pub fn invalidate(self: *Channel) Error!void {
         try self.exchange.invalidate();
         self.connected = 0;
         self.heads = null;
+        self.ports = null;
+        self.ddc_bus = null;
     }
     pub fn begin(self: *Channel, query: Query, deadline: u64) Error!void {
         if (self.exchange.phase != .idle) return error.State;
@@ -317,6 +413,15 @@ pub const Channel = struct {
         self.exchange.guard(@min(self.exchange.deadline orelse deadline, deadline)) catch |err| return self.fail(err);
         switch (query) {
             .supported => {},
+            .ports => if (self.supported == null or self.object.i2c == 0) return error.Query,
+            .ddc => |request| {
+                const available = self.supported orelse return error.Query;
+                const bus = self.ddc_bus orelse return error.Query;
+                const ports = self.ports orelse return error.Query;
+                if (self.object.i2c == 0 or !oneBit(request.display_id) or request.display_id & self.connected == 0 or
+                    request.display_id & available.ddc == 0 or request.port >= 16 or request.block >= ddc_wire.max_blocks or
+                    bus.display_id != request.display_id or bus.port != @as(u32, request.port) + 1 or ports[request.port] & 5 != 5) return error.Query;
+            },
             .heads => if (self.supported == null) return error.Query,
             .active => |head| {
                 const count = self.heads orelse return error.Query;
@@ -337,6 +442,8 @@ pub const Channel = struct {
         self.request = query;
         self.request_revision = self.exchange.revision;
         if (query == .connected) self.connected &= ~query.connected;
+        if (query == .buses) self.ddc_bus = null;
+        if (query == .ports) self.ports = null;
     }
     /// Pure native notifier admission for this exact encoded display query.
     pub fn matches(self: *const Channel, current: *const exchange.Exchange, query: Query, deadline: u64) bool {
@@ -364,6 +471,8 @@ pub const Channel = struct {
         if (self.exchange.revision != old_revision) {
             self.connected = 0;
             self.heads = null;
+            self.ports = null;
+            self.ddc_bus = null;
         }
         var dispatch = Dispatch{ .ticket = received.ticket, .rpc = received.record.rpc, .value = undefined };
         if (received.response) {
@@ -400,8 +509,12 @@ pub const Channel = struct {
                         self.supported = value;
                         self.connected = 0;
                         self.heads = null;
+                        self.ports = null;
+                        self.ddc_bus = null;
                     },
                     .heads => |value| self.heads = value,
+                    .ports => |value| self.ports = value,
+                    .buses => |value| self.ddc_bus = .{ .display_id = self.request.?.buses, .port = value.ddc },
                     .connected => |mask| self.connected = (self.connected & ~self.request.?.connected) | mask,
                     else => {},
                 }
@@ -421,6 +534,8 @@ pub const Channel = struct {
         self.connected = 0;
         self.supported = null;
         self.heads = null;
+        self.ports = null;
+        self.ddc_bus = null;
         return runtime;
     }
 };
