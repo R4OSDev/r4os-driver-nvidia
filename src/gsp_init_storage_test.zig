@@ -228,9 +228,9 @@ const QueueNative = struct {
                 try t.expect(self.memory.retained and self.retains == 1);
                 const record = try transport.message.decode(.{ .chip_id = 0x176 }, backing.?[command + 4096 ..][0..4096], 0);
                 try t.expectEqualStrings("native queue fixture", record.payload);
-                // After commandAdmission, during writeFor's last access:
+                // After commandAdmission, during the last queue-only admission:
                 // the native run lasts longer than this individual request.
-                if (self.case == .late_write and self.queue_accesses == 5) clock = 500;
+                if (self.case == .late_write and self.queue_accesses == 4) clock = 500;
             }
         }
         if (kind == .read and address_value == 0 and self.words[0x110c00 / 4] == 0) {
@@ -247,8 +247,12 @@ const QueueNative = struct {
     fn quiesced(p: *anyopaque) bool {
         return from(p).quiet;
     }
+    fn admitCommand(p: *anyopaque, port: *const native.Port, deadline: u64) !void {
+        try t.expect(port.owner.?.context == p and deadline > clock);
+        try access(p, .write, native.command_queue_head);
+    }
     fn owner(self: *QueueNative) native.Owner {
-        return .{ .context = self, .generation = generation, .admit = admit, .access = access, .retain = retain, .quiesced = quiesced, .queue_memory = self.memory, .admit_runtime = if (self.case == .runtime_missing) null else admitRuntime, .log_polling = if (self.case == .runtime_seq_resume) logPolling else null };
+        return .{ .context = self, .generation = generation, .admit = admit, .access = access, .retain = retain, .quiesced = quiesced, .queue_memory = self.memory, .admit_runtime = if (self.case == .runtime_missing) null else admitRuntime, .admit_command = admitCommand, .log_polling = if (self.case == .runtime_seq_resume) logPolling else null };
     }
     fn recoveryGeneration(p: *anyopaque) u64 { return from(p).recovery_epoch; }
     fn recoveryAdmit(p: *anyopaque, port: *const native.Port) !void {
@@ -1420,11 +1424,12 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
     const status = init.queues_offset + init.status_offset;
     const header = backing.?[command..][0..32].*;
     const Case = enum { success, old_api, preboot_partial, frts_error, timeout, stolen_display, unknown_event,
+        static_bad_region, static_ack_failure, static_timeout,
         runtime_healthy, runtime_lockdown, runtime_unknown, runtime_unowned, runtime_sequence_timeout,
         runtime_log_failure, runtime_moving_log };
     for (std.enums.values(Case)) |case| {
         const exercise_runtime = @intFromEnum(case) >= @intFromEnum(Case.runtime_healthy);
-        const boot_success = case == .success or exercise_runtime;
+        const boot_success = case == .success or @intFromEnum(case) >= @intFromEnum(Case.static_bad_region);
         errdefer |err| std.debug.print("native device startup {s}: {s}\n", .{ @tagName(case), @errorName(err) });
         @memset(words, 0);
         words[0] = 0xb76000a1;
@@ -1540,6 +1545,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
                 try t.expectError(error.Stale, foreign.connect(target.deadline));
                 try t.expect(session.state == .active); // Cannot adopt an old nonempty CPU queue.
             }
+            try checkDeviceStatic(target, words, held.plan.?.frts.offset, case);
             if (exercise_runtime) try checkDeviceRuntime(target, words, held.plan.?.frts.offset, case);
         } else {
             try t.expect(target.phase == .failed and target.failure != null);
@@ -1585,17 +1591,108 @@ fn deviceSequence(target: *@import("gsp_device.zig").Device, words: []const u32)
     try nativeEvent(&target.session.?, 0x1002, payload[0 .. 40 + words.len * 4]);
 }
 
+fn checkDeviceStatic(target: *@import("gsp_device.zig").Device, words: []u32, frts: u64, scenario: anytype) !void {
+    const static = @import("gsp_static.zig");
+    const native = @import("gsp_sequencer_port.zig");
+    const channel = &target.running.channel.?;
+    const session = &target.session.?;
+    const owner = target.port.owner.?;
+    const deadline = channel.deadline.?;
+    const command = init.queues_offset + init.command_offset;
+    const status = init.queues_offset + init.status_offset;
+    const physical = target.vram.?.plan.?.fb_bytes;
+    try t.expect(target.running.static_info == null and channel.phase == .prepared);
+    // A firmware CPU command cannot acquire the queue notifier's authority.
+    if (!channel.in_lockdown) {
+        try t.expectError(error.Register, owner.access(owner.context, .write, native.command_queue_head));
+        try t.expectError(error.Unsupported, owner.admit(owner.context, .{ .write = .{ .address = native.command_queue_head, .value = 0 } }));
+    } else {
+        try t.expectError(error.Lockdown, owner.admit_command.?(owner.context, &target.port, deadline));
+        try t.expect(target.step() == .idle and session.tx_sequence == 2);
+        try nativeEvent(session, 0x101c, &.{0});
+        try t.expect(target.step() == .progress and !channel.in_lockdown);
+    }
+    var print: [9]u8 = @splat(0);
+    print[4] = 1; // Libos payload length, excluding its8-byte prefix.
+    print[8] = 'S';
+    try nativeEvent(session, 0x100c, &print);
+    try t.expect(target.step() == .progress and channel.deadline == deadline and session.tx_sequence == 2);
+    words[native.command_queue_head / 4] = 0x79797979;
+    _ = target.step();
+    try t.expect(target.phase == .ready and channel.phase == .waiting and session.tx_sequence == 3 and session.tx_write == 3);
+    try t.expect(words[native.command_queue_head / 4] == 0 and channel.deadline == deadline);
+    const request = try transport.message.decode(session.profile, backing.?[command + 3 * 4096 ..][0..4096], 2);
+    try t.expect(request.rpc.function == static.function and request.rpc.sequence == 2);
+    try t.expect(request.payload.len == static.payload_bytes and std.mem.allEqual(u8, request.payload, 0));
+    std.mem.writeInt(u32, backing.?[status + 64 ..][0..4], 3, .little); // Firmware consumes TX.
+    words[native.command_queue_head / 4] = 0x79797979;
+    var response: [static.payload_bytes]u8 = @splat(0);
+    std.mem.writeInt(u32, response[344..348], 2, .little);
+    std.mem.writeInt(u64, response[360..368], physical / 2 - 1, .little);
+    response[380] = 1; response[381] = 1;
+    std.mem.writeInt(u64, response[400..408], physical / 2, .little);
+    std.mem.writeInt(u64, response[408..416], physical - 1, .little);
+    std.mem.writeInt(u64, response[416..424], 4096, .little);
+    response[430] = 1;
+    std.mem.writeInt(u64, response[1224..1232], physical, .little);
+    std.mem.writeInt(u64, response[1536..1544], physical - 65536, .little);
+    std.mem.writeInt(u64, response[1544..1552], physical - 131072, .little);
+    for ([_]u32{0xcaf00001, 0xcaf00002, 0xcaf00003}, 0..) |value, index|
+        std.mem.writeInt(u32, response[1600 + index * 4 ..][0..4], value, .little);
+    if (scenario == .static_timeout) {
+        // A notification while waiting neither republishes nor extends RPC.
+        clock = deadline - 1;
+        try nativeEvent(session, 0x100c, &print);
+        try t.expect(target.step() == .progress and channel.deadline == deadline and session.tx_sequence == 3);
+        clock = deadline;
+    } else {
+        if (scenario == .static_bad_region) std.mem.writeInt(u64, response[400..408], 0, .little);
+        try nativeEvent(session, static.function, &response);
+        // Three receive range reads, then the one response ACK write.
+        if (scenario == .static_ack_failure) range_failure_call = range_calls + 4;
+    }
+    _ = target.step();
+    range_failure_call = 0;
+    const failed = scenario == .static_timeout or scenario == .static_bad_region or scenario == .static_ack_failure;
+    try t.expect(words[native.command_queue_head / 4] == 0x79797979 and session.tx_sequence == 3);
+    if (!failed) {
+        const info = target.running.static_info orelse return error.MissingStaticInfo;
+        try t.expect(channel.phase == .idle and channel.deadline == null and session.pending == null);
+        try t.expect(info.client == 0xcaf00001 and info.device == 0xcaf00002 and info.subdevice == 0xcaf00003);
+        try t.expect(info.fb_bytes == physical and info.region_count == 2 and info.regions[1].protected and info.regions[1].reserved == 4096);
+        try t.expect(info.regions[0].iso and info.regions[0].compressed and info.regions[0].bytes == physical / 2);
+        // Snapshot survives reuse of the borrowed DMA receive buffer.
+        @memset(&target.rx, 0xa5);
+        try t.expect(target.running.static_info.?.client == info.client);
+        return;
+    }
+    try t.expect(target.running.static_info == null and target.running.failure != null);
+    try t.expectEqual(if (scenario == .static_timeout) error.Deadline else if (scenario == .static_bad_region) error.Region else error.Io,
+        target.running.failure.?);
+    const receipt = session.pending;
+    try t.expect((receipt != null) == (scenario != .static_timeout));
+    var steps: usize = 0;
+    while (target.phase != .failed and steps < 12000) : (steps += 1) {
+        clock += 1000;
+        DeviceModel.tick(words, frts, false);
+        _ = target.step();
+    }
+    try t.expect(steps < 12000 and target.phase == .failed and target.memory.?.retained and target.recovery.report != null);
+    try t.expect(std.meta.eql(receipt, session.pending) and target.port.phase == .recovery and !target.reader.?.enabled);
+}
+
 fn checkDeviceRuntime(target: *@import("gsp_device.zig").Device, words: []u32, frts: u64, scenario: anytype) !void {
     const core = @import("gsp_core.zig");
     const original_deadline = target.deadline;
     const reader = target.reader.?;
+    const initial_events = target.running.snapshot.events;
     try t.expect(target.running.self_address == @intFromPtr(&target.running) and target.handoff.?.claimed);
     // Runtime idle uses a fresh finite observation deadline, never the old
     // boot deadline and never an unbounded wait or a claimed heartbeat.
     clock = original_deadline + 1;
     try t.expect(target.step() == .idle and target.phase == .ready and target.failure == null);
     try t.expect(target.running.channel.?.deadline == null and target.deadline == original_deadline);
-    try t.expect(target.running.snapshot.last_poll_ns == clock and target.running.snapshot.events == 0);
+    try t.expect(target.running.snapshot.last_poll_ns == clock and target.running.snapshot.events == initial_events);
     var fails = false;
     switch (scenario) {
         .runtime_unknown => {
@@ -1635,6 +1732,8 @@ fn checkDeviceRuntime(target: *@import("gsp_device.zig").Device, words: []u32, f
         .runtime_healthy, .runtime_lockdown => {
             const io_owner = target.port.owner.?;
             if (scenario == .runtime_lockdown) {
+                try nativeEvent(&target.session.?, 0x101c, &.{1});
+                try t.expect(target.step() == .progress);
                 try t.expect(target.boot.?.in_lockdown and target.running.channel.?.in_lockdown);
                 try t.expectError(error.Lockdown, io_owner.access(io_owner.context, .write, core.reg.mailbox0));
                 try nativeEvent(&target.session.?, 0x101c, &.{0});
@@ -1675,7 +1774,7 @@ fn checkDeviceRuntime(target: *@import("gsp_device.zig").Device, words: []u32, f
                 try t.expect(target.step() == .idle);
             }
             try t.expect(target.running.snapshot.raw_words == 15 and target.running.snapshot.lost_words == 0);
-            try t.expect(target.running.snapshot.events == @as(u64, if (scenario == .runtime_lockdown) 5 else 4));
+            try t.expect(target.running.snapshot.events == initial_events + @as(u64, if (scenario == .runtime_lockdown) 6 else 4));
             try t.expect(target.running.snapshot.last_event_ns < target.running.snapshot.last_poll_ns);
         },
         else => unreachable,

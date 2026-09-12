@@ -220,7 +220,7 @@ pub const Device = struct {
             self.handoff = try self.port.handoffBoot(boot);
             self.phase = .ready;
             try self.running.open(&self.ctx.?, &self.port, &self.handoff.?, self.reader.?, self.deadline);
-            self.ctx.?.logInfo("NVIDIA gsp-start: firmware-ready=INIT_DONE ack=complete rm=570.144 runtime=polling memory=retained display=held native-output=unavailable");
+            self.ctx.?.logInfo("NVIDIA gsp-start: firmware-ready=INIT_DONE ack=complete rm-static=awaiting runtime=polling memory=retained display=held native-output=unavailable");
         }
         return true;
     }
@@ -272,7 +272,8 @@ pub const Device = struct {
         return .{ .context = self, .generation = generation, .admit = admit, .access = access,
             .retain = retain, .quiesced = quiesced, .log_polling = polling,
             .admit_firmware = admitFirmware, .admit_cold = admitCold, .queue_memory = self.memory,
-            .admit_runtime = admitRuntime, .recovery = .{ .generation = recoveryGeneration, .admit = admitRecovery, .access = recoveryAccess } };
+            .admit_runtime = admitRuntime, .admit_command = admitCommand,
+            .recovery = .{ .generation = recoveryGeneration, .admit = admitRecovery, .access = recoveryAccess } };
     }
     fn generation(raw: *anyopaque) u64 {
         const self = from(raw);
@@ -334,6 +335,20 @@ pub const Device = struct {
             .delay_us, .core_reset, .core_start, .core_halt, .core_resume => true,
         };
         if (!permitted) return error.Unsupported;
+    }
+    fn admitCommand(raw: *anyopaque, port: *const native.Port, deadline: u64) !void {
+        const self = from(raw);
+        try self.checkLive(false);
+        if (self.phase != .ready or port != &self.port or port.phase != .runtime or self.session == null or
+            self.running.self_address != @intFromPtr(&self.running) or self.running.failure != null or
+            self.running.static_info != null or self.running.sequence.self_address != 0) return error.State;
+        const channel = if (self.running.channel) |*value| value else return error.State;
+        if (channel.session != &self.session.? or port.runtime_session != channel.session or
+            channel.phase != .prepared or channel.pending != null or channel.session.pending != null or
+            channel.function != @import("gsp_static.zig").function or channel.deadline != deadline or
+            channel.request.ptr != self.running.static_request[0..].ptr or channel.request.len != self.running.static_request.len)
+            return error.Binding;
+        if (channel.in_lockdown) return error.Lockdown;
     }
     fn access(raw: *anyopaque, kind: native.Access, address: u32) !void {
         const self = from(raw);

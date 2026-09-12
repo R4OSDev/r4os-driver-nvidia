@@ -9,6 +9,7 @@ const exchange = @import("gsp_exchange.zig");
 const events = @import("gsp_runtime_events.zig");
 const logs = @import("gsp_logs.zig");
 const init = @import("gsp_init.zig");
+const static = @import("gsp_static.zig");
 pub const Progress = enum { idle, progress };
 pub const Snapshot = struct {
     polls: u64 = 0,
@@ -38,6 +39,9 @@ pub const Owner = struct {
     snapshot: Snapshot = .{},
     failure: ?anyerror = null,
     protocol_failure: ?exchange.Error = null,
+    static_request: [static.payload_bytes]u8 = @splat(0),
+    static_info: ?static.Info = null,
+    physical_bytes: u64 = 0,
     words: [logs.output_bytes]u8 = undefined,
 
     pub fn open(self: *Owner, ctx: *const r4os.r4dev.DriverContext, device: *native.Port,
@@ -56,6 +60,12 @@ pub const Owner = struct {
         self.channel = try exchange.Exchange.init(handoff, deadline);
         const opened_at = try self.now();
         self.next_log = opened_at +| std.time.ns_per_s;
+        self.physical_bytes = (device.owner.?.queue_memory.?.boot_storage.?.vram_plan orelse return error.Binding).fb_bytes;
+        // Nouveau's bare-metal570 path queries this directly after INIT_DONE;
+        // no vGPU guest-version handshake is needed. One fixed request budget
+        // also covers interleaved notifications and lockdown; never retry TX.
+        try self.channel.?.begin(static.function, &self.static_request,
+            @min(deadline, try std.math.add(u64, opened_at, 5 * std.time.ns_per_s)));
     }
     fn now(self: *Owner) !u64 {
         if (self.self_address == 0 or self.self_address != @intFromPtr(self) or self.failure != null) return error.State;
@@ -96,9 +106,17 @@ pub const Owner = struct {
         }
         // A fresh idle observation gets a new bound. Pending messages and
         // sequencer phases keep their original deadline across rescheduling.
-        const deadline = std.math.add(u64, current, std.time.ns_per_s) catch return error.Clock;
+        const deadline = channel.deadline orelse (std.math.add(u64, current, std.time.ns_per_s) catch return error.Clock);
         if (try channel.poll(deadline)) |dispatch| {
-            if (dispatch.response) return error.Unexpected;
+            if (dispatch.response) {
+                if (self.static_info != null or channel.function != static.function) return error.Unexpected;
+                const info = try static.decode(dispatch.record, self.physical_bytes);
+                try channel.complete(dispatch.ticket);
+                self.static_info = info; // Publish no observation before a successful ACK.
+                self.log("NVIDIA gsp-static: client={x} device={x} subdevice={x} fb-bytes={d} regions={d} bar1-pdb={x} bar2-pdb={x}",
+                    .{info.client, info.device, info.subdevice, info.fb_bytes, info.region_count, info.bar1_pdb, info.bar2_pdb});
+                return .progress;
+            }
             if (dispatch.record.rpc.function == @intFromEnum(boot.Kind.cpu_sequencer)) {
                 try self.sequence.begin(self.device.?, channel, .{
                     .default_timeout_ns = std.time.ns_per_s,

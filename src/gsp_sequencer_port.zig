@@ -158,6 +158,9 @@ pub const Owner = struct {
     // before leaving boot. The Boot passed here already handled/ACKed INIT_DONE.
     // No callback or timer may manufacture firmware readiness from elapsed time.
     admit_runtime: ?*const fn (*anyopaque, *const events.Boot) anyerror!void = null,
+    // Only the bound queue sender may ring queue0. This admission is separate
+    // from CPU-sequencer register access and runs before TX and before MMIO.
+    admit_command: ?*const fn (*anyopaque, *const Port, u64) anyerror!void = null,
     recovery: ?RecoveryOwner = null,
 };
 pub const Run = struct { epoch: u64, deadline_ns: u64, resume_args: ?core.Resume = null };
@@ -340,7 +343,10 @@ pub const Port = struct {
         if (self.runtime_sequence != null) return error.Busy;
         _ = try self.queueMemory(deadline);
         const scope: Scope = .{ .request = deadline };
-        try self.accessFor(scope, .write, command_queue_head);
+        if (!self.supports(.write, command_queue_head)) return error.Register;
+        const owner = self.owner.?;
+        try (owner.admit_command orelse return error.Unsupported)(owner.context, self, deadline);
+        try self.guardFor(scope);
         try self.accessFor(scope, .read, 0); // Required BOOT0 flush, admitted before TX.
     }
     fn prepareCommand(p: *anyopaque, deadline: u64) anyerror!void {
@@ -357,9 +363,13 @@ pub const Port = struct {
         errdefer |err| self.recordFailure(err);
         try self.commandAdmission(deadline);
         if (!self.retained) return error.State;
-        // writeFor() fences prior DMA/cursor publication, performs the exact
-        // 32-bit zero write, then flushes PCI posted writes through BOOT0.
-        try self.writeFor(.{ .request = deadline }, command_queue_head, 0);
+        // Re-admit immediately before the only permitted queue0 write. Do not
+        // admit this register through the generic CPU-sequencer access path.
+        try self.commandAdmission(deadline);
+        fence();
+        self.pointer(command_queue_head).* = 0;
+        fence();
+        if (try self.readFor(.{ .request = deadline }, 0) != self.boot0) return error.IdentityChanged;
     }
     pub fn beginFirmware(self: *Port, options: firmware_run.Options) !void {
         try self.guard();

@@ -1,5 +1,14 @@
 ﻿# Third-Party Notices
 
+Post-init static configuration (NVIDIA0.1.55, 2026-09-12):
+The fixed570.144 GET_GSP_STATIC_INFO layout, FB region semantics and
+bare-metal ordering follow NVIDIA and Nouveau r570/r535. Nine complete
+source notices are retained in gsp_static.zig and appended to the existing
+NVIDIA-GSP-RUNTIME-LICENSE.txt; its previous41,158 bytes remain an exact
+prefix in both module and Distribution. Twenty-eight complete originals
+and an independent C comparison of63 ABI fields are archived under
+0.79.10/gsp-static-20260912. R4OS lifetime/validation: Apache-2.0.
+
 Preboot initialization RPCs (NVIDIA0.1.54, 2026-09-12):
 SystemInfo/registry layouts and early queue ordering follow the pinned
 NVIDIA570.144 sources and Nouveau r570/r535. Eleven complete source

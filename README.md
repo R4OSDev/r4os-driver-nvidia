@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.54; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.55; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -11,6 +11,29 @@ Starting with R4OS 0.79.9, `IMAGE_SCOPE=slim` includes the current module in
 Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
+
+Post-init static configuration (NVIDIA 0.1.55, 2026-09-12):
+
+After the real INIT_DONE handoff, the resident runtime sends GET_GSP_STATIC_INFO
+through its native queue. Its queue0 notification has separate sender admission;
+CPU-sequencer register access gains no doorbell permission. Interleaved events
+and lockdown retain the request's fixed deadline. A checked, successfully ACKed
+reply publishes copied firmware-owned RM handles, bounded FB regions, BAR page
+directory addresses and engine capabilities. It does not release boot VRAM or
+allocate/free RM objects. The default remains passive.
+
+All51 existing host groups pass. The added complete-run cases cover wire bytes,
+notification isolation, reply lifetime, overlapping regions, failed ACK and
+missing response. The first run rejected a malformed new model print packet;
+its length was corrected without changing the production decoder. One C ABI
+comparison verifies63 fields; module build and exact legal staging pass. No
+new group, guest or hardware run. Kernel152 is unchanged; OssiPC was last
+verified with Kernel150/NVIDIA50 passive. The28 complete pinned originals and
+receipts are archived in ExFiles/Reference/GFX/Nvidia/0.79.10/gsp-static-20260912.
+Real firmware acceptance, subsequent RM controls/objects, IRQ/health, thermals,
+full GPU/UEFI restoration and native video/audio remain open.
+
+The entries below describe preceding checkpoints.
 
 Early GSP initialization messages (NVIDIA 0.1.54, 2026-09-12):
 
@@ -36,8 +59,6 @@ the previous 27,240 bytes as an exact prefix. Twenty-six complete pinned
 references and the evidence are in 0.79.10/gsp-preboot-20260912 under
 ExFiles/Reference/GFX/Nvidia. Actual firmware acceptance, post-init RM, IRQ,
 thermal verification and full GPU/UEFI restoration remain open.
-
-The entries below describe preceding checkpoints.
 
 Resident GSP runtime (NVIDIA 0.1.53, 2026-09-12):
 
