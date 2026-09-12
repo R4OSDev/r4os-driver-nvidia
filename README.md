@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.84; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.85; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -12,22 +12,21 @@ Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
 
-Native display preparation (NVIDIA 0.1.84):
-The Device runtime owns RGB scanout storage, RAMHT, paired Window/Core
-submission and common Present copies. Initial upload now maps the real
-imported CPU shadow, holds an explicit GPU read and uses one full-image
-2D CE packet. Normal imports retain exact logical backing, including the
-last partial page; queued mapping-only aliases keep their prior contract.
+Native display preparation (NVIDIA 0.1.85):
+The Device runtime owns RGB scanout storage, RAMHT, paired Window/Core,
+initial CE upload and common Present copies. An initial SYS semaphore
+completion permits activation; later frames reuse the real source mapping.
 
-Only SYS semaphore completion releases the initial read and permits image
-activation. Core FINISHED plus Window BEGUN confirms the internal image;
-old notifier records require FINISHED before reuse. Later rectangles reuse
-the initial source mapping. Pre-PUT cancellation can retry; uncertain GPU
-effects or failed release keep storage. Faults win over concurrent success.
+The boot-signal planner now binds the saved progressive RGB8 TMDS timing
+to an actual coherent RM route and held Device generation. Coupled commit
+sets Head raster/viewports/min-frame-idle, exact clock including 1000/1001,
+displayId, identity colour state and SOR. Old cursor/LUT DMA handles are
+disabled. Device admission and paired completion revalidate the plan.
+An off receiver without EDID supplies no invented replacement mode.
 
-The existing 51 tests and module build pass. No new gates or unchanged
-guest reruns. Product prepare_held/transition wiring, boot-mode adoption,
-head/output state, atomic commit and rollback remain open in 0.79.13.
+All 51 existing tests, the independent 512-byte original-header C vector and
+the module build pass. Product prepare_held/transition wiring, WIMM position,
+complete link state, atomic mode changes and rollback remain open in 0.79.13.
 These internal APIs are not automatically invoked; passive bootfb remains
 default. Evidence: GrafikScanout07913.json; physical checks: OssiGPU.txt.
 

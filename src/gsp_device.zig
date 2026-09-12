@@ -529,6 +529,13 @@ pub const Device = struct {
             part.config.initialize == channel.ring.initialized) return error.Binding;
         if (work.window) |*window_part| {
             const route = work.core.config.route orelse return error.Binding;
+            if (work.boot_mode) |plan| {
+                const expected = self.running.bootDisplayPlan(.{ .epoch = self.epoch, .root = root.binding.root }, route.window) catch return error.Binding;
+                if (!std.meta.eql(plan, expected) or !std.meta.eql(work.core.config.signal, @as(?runtime.boot_mode.Signal, expected.signal)) or
+                    plan.head != route.head or window_part.config.scanout == null or window_part.config.scanout.?.width != plan.width or
+                    window_part.config.scanout.?.height != plan.height) return error.Binding;
+            } else if (work.core.config.signal != null) return error.Binding;
+            if (window_part.config.signal != null) return error.Binding;
             if (self.running.presentation) |*entry| {
                 const status = self.running.initialImageStatus() catch return error.Binding;
                 if (status.pending or status.completed == 0 or !std.meta.eql(entry.window, window_part.handle) or
@@ -541,7 +548,7 @@ pub const Device = struct {
             if (part.config.kind == .core) {
                 if (window_part.phase != .submitted and window_part.phase != .complete) return error.Binding;
             } else if (work.core.phase != .prepare) return error.Binding;
-        } else if (part.config.route != null or part.config.scanout != null or part.config.kind != .core) return error.Binding;
+        } else if (part.config.route != null or part.config.scanout != null or part.config.signal != null or work.boot_mode != null or part.config.kind != .core) return error.Binding;
         if (access_kind == .publish) {
             if (part.phase != .prepare or part.ticket == null or !channel.ring.matches(part.ticket.?, part.config)) return error.Binding;
             if (part.ticket.?.kind == .frame and (part.notifier.phase != .armed or part.notifier.point != part.ticket.?.point or

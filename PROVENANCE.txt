@@ -800,3 +800,13 @@ kernel-open/nvidia-modeset/nvidia-modeset-linux.c. The unsupported floating,
 writeback and pointer-extension cases follow an explicit bounded port policy;
 this is not a claim of full Linux printk compatibility. Original primary
 references and their complete notices remain in the reference archive.
+
+Boot Head/SOR programming (NVIDIA 0.1.85, 2026-09-12):
+The C67D raster, clock, output and colour fields follow the pinned MIT
+NVIDIA 570.144 class header and nvkms-evo3.c, with Nouveau headc57d,
+headc37d and sorc37d as reference. Full originals/notices and the independent
+C/DRF generator are archived under 0.79.13/boot-mode-20260912. Existing full
+MIT notices remain in the affected sources and the unchanged 352032-byte
+runtime/distribution license. The new boot-mode source retains the full
+C67D notice. Original R4OS policy and ownership code is Apache-2.0;
+no reference C implementation is linked into the driver.

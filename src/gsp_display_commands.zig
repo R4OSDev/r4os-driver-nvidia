@@ -239,6 +239,7 @@ const std = @import("std");
 pub const image = @import("gsp_display_image.zig");
 pub const Error = image.Error || error{Bounds, Handle};
 pub const Kind = @import("gsp_display_channel_wire.zig").Kind;
+pub const boot_mode = @import("gsp_boot_mode.zig");
 pub const Route = struct { window: u32, head: u32 };
 pub const Config = struct {
     notifier: u32, windows: u32, initialize: bool,
@@ -246,8 +247,9 @@ pub const Config = struct {
     notifier_offset: u16 = 0,
     route: ?Route = null,
     scanout: ?image.Image = null,
+    signal: ?boot_mode.Signal = null,
 };
-pub const max_words: usize = 96;
+pub const max_words: usize = 192;
 pub const Program = struct {
     words: [max_words]u32 = @splat(0),
     count: u16 = 0,
@@ -279,6 +281,46 @@ pub fn core(config: Config) Error!Program {
         try out.method(0x1000 + route.window * 0x80, &.{route.head});
         interlocks = @as(u32, 1) << @intCast(route.window);
     }
+    if (config.signal) |signal| {
+        const route = config.route orelse return error.Descriptor;
+        boot_mode.validate(signal, route.head) catch return error.Descriptor;
+        // Other boot windows must not retain old image/LUT handles in the
+        // replaced instance. This transaction establishes one opaque primary.
+        for (0..8) |i| if (i != route.window and config.windows & (@as(u32, 1) << @intCast(i)) != 0)
+            try out.method(0x1000 + @as(u32, @intCast(i)) * 0x80, &.{15});
+        const base = route.head * 0x400;
+        // Preserve the exact Hz + 1000/1001 encoding and raster coordinates.
+        // Clock configuration transfers programming to RM, without hopping.
+        try out.method(base + 0x2008, &.{0});
+        try out.method(base + 0x200c, &.{signal.clock});
+        try out.method(base + 0x201c, &.{0});
+        try out.method(base + 0x2020, &.{ signal.display_id, 0 });
+        try out.method(base + 0x2028, &.{signal.clock});
+        try out.method(base + 0x2030, &.{0x1000}); // No cursor/LUT; two taps, no upscale.
+        // Use individual raster writes, matching NVIDIA's EvoSetRasterParams3.
+        try out.method(base + 0x2064, &.{signal.total});
+        try out.method(base + 0x2068, &.{signal.sync_end});
+        try out.method(base + 0x206c, &.{signal.blank_end});
+        try out.method(base + 0x2070, &.{signal.blank_start});
+        try out.method(base + 0x2074, &.{0}); // No second interlaced blanking interval.
+        try out.method(base + 0x2218, &.{signal.min_frame_idle});
+        try out.method(base + 0x2048, &.{ 0, signal.viewport });
+        try out.method(base + 0x2058, &.{ signal.viewport, 0 });
+        try out.method(base + 0x2014, &.{0x11});
+        try out.method(base + 0x2078, &.{ 0, 0, signal.hdmi });
+        // Establish RGB8 and identity colour state. Never replay captured
+        // cursor or OLUT DMA handles into the new instance's namespace.
+        try out.method(base + 0x209c, &.{0xcf});
+        try out.method(base + 0x2088, &.{ 0, 0 });
+        try out.method(base + 0x2288, &.{0});
+        try out.method(base + 0x2240, &.{0});
+        try out.method(base + 0x229c, &.{0});
+        try out.method(base + 0x2238, &.{ 0x0fff0000, 0x0fff0000 });
+        try out.method(base + 0x2220, &.{ 0xff, 0 });
+        try out.method(base + 0x2018, &.{0});
+        try out.method(base + 0x2000, &.{ 0, 0xfc000040 | signal.polarity });
+        try out.method(0x300 + signal.sor * 0x20, &.{signal.sor_control});
+    }
     // A private16-byte notifier at offset0; no interrupt callback is needed.
     // Its completion establishes method execution, not visible scanout.
     try out.method(0x20c, &.{0x1000});
@@ -288,7 +330,7 @@ pub fn core(config: Config) Error!Program {
     return out;
 }
 pub fn window(config: Config) Error!Program {
-    if (config.kind != .window or config.notifier == 0 or config.notifier_offset > 16 or config.notifier_offset & 15 != 0) return error.Descriptor;
+    if (config.kind != .window or config.notifier == 0 or config.notifier_offset > 16 or config.notifier_offset & 15 != 0 or config.signal != null) return error.Descriptor;
     const value = config.scanout orelse return error.Descriptor;
     const route = config.route orelse return error.Descriptor;
     try image.validate(value);

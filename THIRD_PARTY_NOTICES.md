@@ -1,5 +1,15 @@
 ﻿# Third-Party Notices
 
+Boot Head/SOR programming (NVIDIA 0.1.85, 2026-09-12):
+The C67D raster, clock, output and colour fields follow the pinned MIT
+NVIDIA 570.144 class header and nvkms-evo3.c, with Nouveau headc57d,
+headc37d and sorc37d as reference. Full originals/notices and the independent
+C/DRF generator are archived under 0.79.13/boot-mode-20260912. Existing full
+MIT notices remain in the affected sources and the unchanged 352032-byte
+runtime/distribution license. The new boot-mode source retains the full
+C67D notice. Original R4OS policy and ownership code is Apache-2.0;
+no reference C implementation is linked into the driver.
+
 Pitch-aware Present copies (NVIDIA 0.1.83, 2026-09-12):
 The C6B5/C7B5 multiline methods and C56F GPFIFO layout follow the pinned
 MIT NVIDIA 570.144 definitions. Their full notices are already included

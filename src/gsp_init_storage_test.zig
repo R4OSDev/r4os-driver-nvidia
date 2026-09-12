@@ -3267,6 +3267,36 @@ fn checkDeviceDisplayImage(target: *@import("gsp_device.zig").Device, table: *a.
     const core_user = try push.userBase(.core, 0);
     const window_user = try push.userBase(.window, 3);
     const image = table_owner.publishedImage(4, dma).?;
+    const mode_case = !present_case or native_model.is("context_display_present");
+    const saved_boot_info = DeviceModel.boot_info;
+    const saved_original_boot = target.display.?.original_boot;
+    const saved_scanout = target.display.?.scanout_original;
+    defer {
+        DeviceModel.boot_info = saved_boot_info;
+        target.display.?.original_boot = saved_original_boot;
+        target.display.?.scanout_original = saved_scanout;
+    }
+    if (mode_case) {
+        const vectors = @import("gsp_display_commands_test.zig");
+        var observed = vectors.bootFixture(image.width, image.height);
+        // This fixture's original instance was inactive; keep its actual
+        // captured dependency contract while supplying a modeled signal.
+        observed.instance_control = saved_scanout.?.instance_control;
+        observed.instance_address = saved_scanout.?.instance_address;
+        for (&observed.windows) |*entry| entry.core[0] = 15;
+        target.display.?.scanout_original = observed;
+        DeviceModel.boot_info.width = image.width; DeviceModel.boot_info.height = image.height;
+        DeviceModel.boot_info.pitch = image.width * 4; DeviceModel.boot_info.byte_length = @as(u64, image.width) * 4 * image.height;
+        DeviceModel.boot_info.format = a.gfx_buffer_format_xrgb8888;
+        target.display.?.original_boot = DeviceModel.boot_info;
+        running.outputs.self_address = @intFromPtr(&running.outputs); running.outputs.state = .returned;
+        running.outputs.graph = &running.graph.?;
+        vectors.outputFixture(&running.outputs.data, running.epoch, running.graph.?.reservation.client);
+        target.display.?.scanout_original.?.heads[1].words[1] = 8;
+        try t.expectError(error.Unsupported, running.commitBootDisplayImage(core_handle, window_handle, dma, deadline));
+        try t.expect(running.display_work == null and core_owner.ring.issued == 0 and window_owner.ring.issued == 0);
+        target.display.?.scanout_original.?.heads[1].words[1] = 0;
+    }
     if (present_case) try t.expect(image.width == 65 and image.height == 20 and image.pitch == 512 and image.bytes >= 512 * 20)
     else try t.expect(image.width == 641 and image.height == 480 and image.pitch == 2816 and image.bytes >= 2816 * 480);
     try t.expect(table_owner.publishedImage(1, dma) == null and try running.displayImageStatus(root, 3) == null);
@@ -3289,7 +3319,8 @@ fn checkDeviceDisplayImage(target: *@import("gsp_device.zig").Device, table: *a.
             try t.expect(running.display_work == null and window_owner.ring.issued == 2);
             window_words[0] = 2 << 30;
         }
-        try running.commitDisplayImage(core_handle, window_handle, dma, 1, deadline);
+        if (mode_case and point == 1) try running.commitBootDisplayImage(core_handle, window_handle, dma, deadline)
+        else try running.commitDisplayImage(core_handle, window_handle, dma, 1, deadline);
         const window_part = &running.display_work.?.window.?;
         try t.expect(window_part.config.notifier_offset == if (point == 2) @as(u16, 16) else 0);
         try t.expectError(error.Busy, running.commitDisplayCore(core_handle, deadline));
@@ -3297,6 +3328,18 @@ fn checkDeviceDisplayImage(target: *@import("gsp_device.zig").Device, table: *a.
         try t.expectError(error.Binding, admit(endpoint.context, &target.port, core_owner, deadline, .read));
         try admit(endpoint.context, &target.port, window_owner, deadline, .read);
         if (point == 1) {
+            if (mode_case) {
+                const planned = &running.display_work.?.boot_mode.?;
+                try t.expect(planned.epoch == target.epoch and planned.held_generation == target.display_epoch and planned.head == 1 and planned.window == 3);
+                running.display_work.?.core.config.signal.?.clock ^= 1;
+                try t.expectError(error.Binding, admit(endpoint.context, &target.port, window_owner, deadline, .read));
+                running.display_work.?.core.config.signal.?.clock ^= 1;
+                planned.output_generation += 1;
+                try t.expectError(error.Binding, admit(endpoint.context, &target.port, window_owner, deadline, .read)); planned.output_generation -= 1;
+                running.outputs.data.generation += 1;
+                try t.expectError(error.Binding, admit(endpoint.context, &target.port, window_owner, deadline, .read)); running.outputs.data.generation -= 1;
+                try admit(endpoint.context, &target.port, window_owner, deadline, .read);
+            }
             window_part.config.scanout.?.pitch += 64;
             try t.expectError(error.Binding, admit(endpoint.context, &target.port, window_owner, deadline, .read));
             window_part.config.scanout.?.pitch -= 64;
@@ -3338,6 +3381,8 @@ fn checkDeviceDisplayImage(target: *@import("gsp_device.zig").Device, table: *a.
             return;
         }
         const active_image = (try running.displayImageStatus(root, 3)).?;
+        if (mode_case) try t.expect(active_image.boot_mode != null and active_image.boot_mode.?.signal.clock == (0x80000000 | 148500000) and
+            active_image.boot_mode.?.output_generation == 7 and active_image.boot_mode.?.held_generation == target.display_epoch);
         try t.expect(target.phase == .ready and running.display_work == null and window_owner.ring.completed == point and
             core_owner.ring.completed == point and std.meta.eql(active_image.image, image) and active_image.head == 1 and
             active_image.core_point == point and active_image.window_point == point and window_note.result.?.timestamp == (@as(u64, 7) << 32) + 100 + point);

@@ -59,8 +59,9 @@ pub const DisplaySubmission = struct {
     phase: enum { prepare, rewind, submitted, complete } = .prepare,
     ticket: ?display_channel.push.Ticket = null,
 };
-pub const DisplayWork = struct { core: DisplaySubmission, window: ?DisplaySubmission = null, deadline: u64 };
-pub const ActiveDisplayImage = struct { image: display_resources.image.Image, head: u32, core_point: u64, window_point: u64 };
+pub const boot_mode = @import("gsp_boot_mode.zig");
+pub const DisplayWork = struct { core: DisplaySubmission, window: ?DisplaySubmission = null, deadline: u64, boot_mode: ?boot_mode.Plan = null };
+pub const ActiveDisplayImage = struct { image: display_resources.image.Image, head: u32, core_point: u64, window_point: u64, boot_mode: ?boot_mode.Plan = null };
 const subscriptions = @import("gsp_event_objects.zig");
 const outputs = @import("gsp_outputs.zig");
 const inventory = @import("gsp_memory_inventory.zig");
@@ -620,6 +621,43 @@ pub const Owner = struct {
         return .{ .handle = handle, .notifier = note,
             .config = .{ .notifier = note.handle, .windows = root.hardware.windows, .initialize = !owner.ring.initialized } };
     }
+    /// Derive the candidate again from the actual retained Device capture and
+    /// current coherent RM catalog; callers cannot submit arbitrary timings.
+    pub fn bootDisplayPlan(self: *Owner, root_handle: DisplayEngineHandle, window: u32) !boot_mode.Plan {
+        const root = try self.findDisplayEngine(root_handle);
+        const info = root.info() orelse return error.State;
+        const held = self.reservation orelse return error.State;
+        _ = try held.binding(.metadata);
+        const saved = held.display orelse return error.Stale;
+        if (saved.original_boot == null or saved.scanout_original == null or saved.boot.held_generation == 0 or
+            saved.chip == null or saved.chip.?.id != 0x176) return error.Stale;
+        const plan = try boot_mode.capture(&saved.scanout_original.?, &saved.original_boot.?, window);
+        if (!info.core or !info.window or plan.head >= info.hardware.heads or
+            info.hardware.windows & (@as(u32, 1) << @intCast(window)) == 0) return error.Unsupported;
+        // nativeObject deliberately excludes an outstanding display commit.
+        // The submission gate must nevertheless revalidate its saved catalog
+        // while that exact work owns the otherwise idle canonical RM channel.
+        if (self.graph == null or self.graph.?.state != .loaned or self.display_object == null or self.channel == null or
+            self.activeChannel() != &self.channel.? or self.channel.?.session.state != .active or self.failure != null) return error.Busy;
+        const snapshot = self.outputs.snapshot() orelse return error.Busy;
+        return boot_mode.bind(plan, snapshot, self.epoch, saved.boot.held_generation);
+    }
+    /// The same Window/Core transaction now carries the exact boot signal.
+    /// Completion still needs both actual notifiers. WIMM position and common
+    /// native adoption are independent prerequisites of the product caller.
+    pub fn commitBootDisplayImage(self: *Owner, core_handle: DisplayChannelHandle, window_handle: DisplayChannelHandle, image_handle: u32, deadline: u64) !void {
+        const core = try self.findDisplayChannel(core_handle);
+        const window = try self.findDisplayChannel(window_handle);
+        if (core.parent != window.parent or window.config.kind != .window) return error.Stale;
+        const root: DisplayEngineHandle = .{ .epoch = self.epoch, .root = core.parent.binding.root };
+        const plan = try self.bootDisplayPlan(root, window.config.index);
+        const resources = self.display_resources_slot.owner orelse return error.State;
+        const image = resources.publishedImage(window_handle.slot, image_handle) orelse return error.State;
+        if (image.width != plan.width or image.height != plan.height) return error.Descriptor;
+        try self.commitDisplayImage(core_handle, window_handle, image_handle, plan.head, deadline);
+        self.display_work.?.core.config.signal = plan.signal;
+        self.display_work.?.boot_mode = plan;
+    }
     pub fn commitDisplayImage(self: *Owner, core_handle: DisplayChannelHandle, window_handle: DisplayChannelHandle, image_handle: u32, head: u32, deadline: u64) !void {
         if (self.presentation) |entry| {
             if (!self.presentationPrepared() or !std.meta.eql(entry.window, window_handle) or entry.surface.scanout.?.dma != image_handle)
@@ -1175,8 +1213,17 @@ pub const Owner = struct {
         if (work.core.phase != .complete) return progressed;
         if (work.window) |window| {
             const route = window.config.route.?;
+            var mode = work.boot_mode;
+            if (mode) |plan| {
+                const core = try self.findDisplayChannel(work.core.handle);
+                const expected = try self.bootDisplayPlan(.{ .epoch = self.epoch, .root = core.parent.binding.root }, route.window);
+                if (!std.meta.eql(plan, expected) or !std.meta.eql(work.core.config.signal, @as(?boot_mode.Signal, expected.signal))) return error.Stale;
+            } else if (self.display_images[route.window]) |prior| {
+                if (prior.head == route.head and prior.image.width == window.config.scanout.?.width and prior.image.height == window.config.scanout.?.height)
+                    mode = prior.boot_mode;
+            }
             self.display_images[route.window] = .{ .image = window.config.scanout.?, .head = route.head,
-                .core_point = work.core.ticket.?.point, .window_point = window.ticket.?.point };
+                .core_point = work.core.ticket.?.point, .window_point = window.ticket.?.point, .boot_mode = mode };
         }
         self.display_work = null; return true;
     }
