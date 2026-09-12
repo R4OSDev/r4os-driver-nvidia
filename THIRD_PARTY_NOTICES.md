@@ -1,5 +1,14 @@
 ﻿# Third-Party Notices
 
+Internal RM post-init discovery (NVIDIA 0.1.56, 2026-09-12):
+The fixed GPC/TPC controls, interrupt table, RPC envelope and GA106 vector
+bounds follow NVIDIA 570.144 and Nouveau r570/r535. Eleven complete source
+notices are retained in gsp_postinit.zig and appended to the existing
+NVIDIA-GSP-RUNTIME-LICENSE.txt. Its previous 52,693 bytes remain an exact
+prefix in both module and Distribution. Twenty-eight complete originals
+and a C comparison of 18 ABI fields are archived under
+0.79.10/gsp-postinit-20260912. R4OS lifetime/validation: Apache-2.0.
+
 Post-init static configuration (NVIDIA0.1.55, 2026-09-12):
 The fixed570.144 GET_GSP_STATIC_INFO layout, FB region semantics and
 bare-metal ordering follow NVIDIA and Nouveau r570/r535. Nine complete

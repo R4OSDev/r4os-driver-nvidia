@@ -10,6 +10,7 @@ const events = @import("gsp_runtime_events.zig");
 const logs = @import("gsp_logs.zig");
 const init = @import("gsp_init.zig");
 const static = @import("gsp_static.zig");
+const postinit = @import("gsp_postinit.zig");
 pub const Progress = enum { idle, progress };
 pub const Snapshot = struct {
     polls: u64 = 0,
@@ -42,6 +43,8 @@ pub const Owner = struct {
     static_request: [static.payload_bytes]u8 = @splat(0),
     static_info: ?static.Info = null,
     physical_bytes: u64 = 0,
+    startup_deadline: u64 = 0,
+    post: postinit.Owner = .{},
     words: [logs.output_bytes]u8 = undefined,
 
     pub fn open(self: *Owner, ctx: *const r4os.r4dev.DriverContext, device: *native.Port,
@@ -56,6 +59,7 @@ pub const Owner = struct {
         self.device = device;
         self.reader = reader;
         self.epoch = handoff.session.epoch;
+        self.startup_deadline = deadline;
         errdefer |err| self.failure = err;
         self.channel = try exchange.Exchange.init(handoff, deadline);
         const opened_at = try self.now();
@@ -86,6 +90,9 @@ pub const Owner = struct {
                 self.protocol_failure = channel.fail(error.Handler);
                 if (channel.last_rpc) |rpc| self.log("NVIDIA gsp-runtime: failed={s} last-rpc={x} sequence={d} result={x} receipt={s}",
                     .{@errorName(err), rpc.function, rpc.sequence, rpc.result, if (channel.session.pending != null) @as([]const u8, "retained") else "none"});
+                if (self.post.self_address != 0 and self.post.state != .complete)
+                    self.log("NVIDIA gsp-postinit: failed={s} command={x} status={x} replies={d}",
+                        .{@errorName(err), @intFromEnum(self.post.command), self.post.last_status orelse exchange.message.pending, self.post.replies});
             }
             return err;
         };
@@ -104,12 +111,26 @@ pub const Owner = struct {
             }
             return .progress;
         }
+        if (self.static_info != null and self.post.state != .complete and channel.phase == .idle) {
+            if (self.post.self_address == 0) try self.post.open(channel, &self.static_info.?);
+            const end = @min(self.startup_deadline, try std.math.add(u64, current, 5 * std.time.ns_per_s));
+            try self.post.prepare(end);
+            self.log("NVIDIA gsp-postinit: command={x} gpc={d} deadline-ns={d}", .{@intFromEnum(self.post.command), self.post.gpc, end});
+            return .progress;
+        }
         // A fresh idle observation gets a new bound. Pending messages and
         // sequencer phases keep their original deadline across rescheduling.
         const deadline = channel.deadline orelse (std.math.add(u64, current, std.time.ns_per_s) catch return error.Clock);
         if (try channel.poll(deadline)) |dispatch| {
             if (dispatch.response) {
-                if (self.static_info != null or channel.function != static.function) return error.Unexpected;
+                if (self.static_info != null) {
+                    try self.post.accept(dispatch);
+                    if (self.post.snapshot()) |info|
+                        self.log("NVIDIA gsp-postinit: gpcs={d} tpcs={d} intr-entries={d} gsp-stall={d} irq=unconfigured native-output=unavailable",
+                            .{@popCount(info.gpc_mask), info.tpc_count, info.entry_count, info.entries[info.gsp_index.?].stall});
+                    return .progress;
+                }
+                if (channel.function != static.function) return error.Unexpected;
                 const info = try static.decode(dispatch.record, self.physical_bytes);
                 try channel.complete(dispatch.ticket);
                 self.static_info = info; // Publish no observation before a successful ACK.

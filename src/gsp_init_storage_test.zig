@@ -1425,6 +1425,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
     const header = backing.?[command..][0..32].*;
     const Case = enum { success, old_api, preboot_partial, frts_error, timeout, stolen_display, unknown_event,
         static_bad_region, static_ack_failure, static_timeout,
+        post_control_error, post_wrong_gpc, post_bad_vector, post_ack_failure, post_timeout,
         runtime_healthy, runtime_lockdown, runtime_unknown, runtime_unowned, runtime_sequence_timeout,
         runtime_log_failure, runtime_moving_log };
     for (std.enums.values(Case)) |case| {
@@ -1546,6 +1547,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
                 try t.expect(session.state == .active); // Cannot adopt an old nonempty CPU queue.
             }
             try checkDeviceStatic(target, words, held.plan.?.frts.offset, case);
+            if (target.phase == .ready) try checkDevicePostInit(target, words, held.plan.?.frts.offset, case);
             if (exercise_runtime) try checkDeviceRuntime(target, words, held.plan.?.frts.offset, case);
         } else {
             try t.expect(target.phase == .failed and target.failure != null);
@@ -1681,11 +1683,121 @@ fn checkDeviceStatic(target: *@import("gsp_device.zig").Device, words: []u32, fr
     try t.expect(std.meta.eql(receipt, session.pending) and target.port.phase == .recovery and !target.reader.?.enabled);
 }
 
+fn checkDevicePostInit(target: *@import("gsp_device.zig").Device, words: []u32, frts: u64, scenario: anytype) !void {
+    const postinit = @import("gsp_postinit.zig");
+    const post = &target.running.post;
+    const channel = &target.running.channel.?;
+    const session = &target.session.?;
+    const command = init.queues_offset + init.command_offset;
+    const status = init.queues_offset + init.status_offset;
+    const queue_head = @import("gsp_sequencer_port.zig").command_queue_head;
+    const initial_sequence = session.tx_sequence;
+    var replies: usize = 0;
+    var steps: usize = 0;
+    while (target.phase == .ready and post.snapshot() == null and steps < 40) : (steps += 1) {
+        _ = target.step();
+        if (channel.phase != .waiting) continue;
+        try t.expect(post.snapshot() == null and post.armed);
+        const deadline = channel.deadline.?;
+        const size: usize = if (replies == 0) 4 else if (replies < 3) 8 else postinit.table_bytes;
+        const expected: u32 = if (replies == 0) 0x20800137 else if (replies < 3) 0x20800138 else 0x20800a5c;
+        const cursor = (session.tx_write + 62) % 63;
+        const request = try transport.message.decode(session.profile,
+            backing.?[command + 4096 + @as(usize, cursor) * 4096 ..][0..4096], session.tx_sequence - 1);
+        const wire = request.payload;
+        try t.expect(request.rpc.function == 76 and request.rpc.sequence == session.tx_sequence - 1);
+        try t.expect(wire.len == 24 + size and std.mem.readInt(u32, wire[0..4], .little) == 0xcaf00001);
+        try t.expect(std.mem.readInt(u32, wire[4..8], .little) == 0xcaf00003);
+        try t.expect(std.mem.readInt(u32, wire[8..12], .little) == expected);
+        try t.expect(std.mem.readInt(u32, wire[16..20], .little) == size and std.mem.readInt(u32, wire[20..24], .little) == 0);
+        if (replies == 1 or replies == 2) {
+            try t.expect(std.mem.readInt(u32, wire[24..28], .little) == @as(u32, if (replies == 1) 0 else 31));
+            try t.expect(std.mem.allEqual(u8, wire[28..], 0));
+        } else try t.expect(std.mem.allEqual(u8, wire[24..], 0));
+        std.mem.writeInt(u32, backing.?[status + 64 ..][0..4], session.tx_write, .little);
+        words[queue_head / 4] = 0x56565656;
+        if (replies == 0) {
+            // Run the actual native CPU sequencer while this control waits.
+            // Its ACK cannot steal the request, ring queue0 or renew its bound.
+            try deviceSequence(target, &.{ 3, 1 });
+            try t.expect(target.step() == .progress);
+            var sequence_steps: usize = 0;
+            while (target.running.sequence.self_address != 0 and sequence_steps < 10) : (sequence_steps += 1) {
+                clock += 1000;
+                try t.expect(target.step() == .progress);
+            }
+            try t.expect(sequence_steps < 10 and channel.phase == .waiting and channel.deadline == deadline);
+            try t.expect(session.tx_sequence == initial_sequence + 1 and words[queue_head / 4] == 0x56565656);
+        }
+        var response: [24 + postinit.table_bytes]u8 = @splat(0);
+        @memcpy(response[0..wire.len], wire);
+        if (replies == 0) {
+            std.mem.writeInt(u32, response[24..28], 0x80000001, .little);
+        } else if (replies < 3) {
+            std.mem.writeInt(u32, response[28..32], if (replies == 1) 0x80000001 else 0x35, .little);
+        } else {
+            std.mem.writeInt(u32, response[24..28], 3, .little);
+            for ([_]u16{50, 2, 60000}, 0..) |engine, index| {
+                const at = 28 + index * 16;
+                std.mem.writeInt(u16, response[at..][0..2], engine, .little);
+                std.mem.writeInt(u32, response[at + 4 ..][0..4], @as(u32, 1) << @intCast(index), .little);
+                std.mem.writeInt(u32, response[at + 8 ..][0..4], if (index == 0) 201 else if (index == 1) 150 else 0xffffffff, .little);
+                std.mem.writeInt(u32, response[at + 12 ..][0..4], if (index == 1) 42 else 0xffffffff, .little);
+            }
+            @memset(response[24 + 2052 ..][0..14], 255);
+            response[24 + 2054] = 2; response[24 + 2055] = 3;
+        }
+        if (scenario == .post_control_error and replies == 0) std.mem.writeInt(u32, response[12..16], 0x55, .little);
+        if (scenario == .post_wrong_gpc and replies == 1) std.mem.writeInt(u32, response[24..28], 1, .little);
+        if (scenario == .post_bad_vector and replies == 3) std.mem.writeInt(u32, response[36..40], 256, .little);
+        if (scenario == .post_timeout and replies == 0) {
+            clock = deadline;
+        } else {
+            try nativeEvent(session, 76, response[0..wire.len]);
+            if (scenario == .post_ack_failure and replies == 3) range_failure_call = range_calls + 4;
+        }
+        _ = target.step();
+        range_failure_call = 0;
+        try t.expect(words[queue_head / 4] == 0x56565656);
+        replies += 1;
+    }
+    try t.expect(steps < 40);
+    const failed = scenario == .post_control_error or scenario == .post_wrong_gpc or scenario == .post_bad_vector or
+        scenario == .post_ack_failure or scenario == .post_timeout;
+    if (!failed) {
+        const info = post.snapshot() orelse return error.MissingPostInit;
+        try t.expect(replies == 4 and post.replies == 4 and channel.phase == .idle and !post.armed);
+        try t.expect(info.gpc_mask == 0x80000001 and info.tpc_masks[0] == 0x80000001 and info.tpc_masks[31] == 0x35 and info.tpc_count == 6);
+        try t.expect(info.entry_count == 3 and info.gsp_index.? == 0 and info.entries[0].stall == 201 and info.entries[0].nonstall == 0xffffffff);
+        try t.expect(info.display_index.? == 1 and info.entries[1].nonstall == 42 and info.entries[2].engine == 60000);
+        try t.expect(info.subtrees[0].first == 255 and info.subtrees[1].first == 2 and info.subtrees[1].last == 3);
+        try t.expect(session.tx_sequence == initial_sequence + 4);
+        @memset(&target.rx, 0xa5);
+        try t.expect(post.snapshot().?.entries[0].stall == 201);
+        return;
+    }
+    const failure = target.running.failure orelse return error.MissingPostFailure;
+    try t.expectEqual(if (scenario == .post_control_error) error.Control else if (scenario == .post_wrong_gpc) error.Unexpected else
+        if (scenario == .post_bad_vector) error.Vector else if (scenario == .post_ack_failure) error.Io else error.Deadline, failure);
+    if (scenario == .post_control_error) try t.expect(post.last_status.? == 0x55);
+    const receipt = session.pending;
+    try t.expect(post.snapshot() == null and (receipt != null) == (scenario != .post_timeout));
+    var recovery_steps: usize = 0;
+    while (target.phase != .failed and recovery_steps < 12000) : (recovery_steps += 1) {
+        clock += 1000;
+        DeviceModel.tick(words, frts, false);
+        _ = target.step();
+    }
+    try t.expect(recovery_steps < 12000 and target.phase == .failed and target.recovery.report != null and target.memory.?.retained);
+    try t.expect(std.meta.eql(receipt, session.pending) and post.snapshot() == null and !target.reader.?.enabled);
+}
+
 fn checkDeviceRuntime(target: *@import("gsp_device.zig").Device, words: []u32, frts: u64, scenario: anytype) !void {
     const core = @import("gsp_core.zig");
     const original_deadline = target.deadline;
     const reader = target.reader.?;
     const initial_events = target.running.snapshot.events;
+    const initial_sequencers = target.running.snapshot.sequencers;
     try t.expect(target.running.self_address == @intFromPtr(&target.running) and target.handoff.?.claimed);
     // Runtime idle uses a fresh finite observation deadline, never the old
     // boot deadline and never an unbounded wait or a claimed heartbeat.
@@ -1763,7 +1875,7 @@ fn checkDeviceRuntime(target: *@import("gsp_device.zig").Device, words: []u32, f
                 clock += 1000;
                 try t.expect(target.step() == .progress);
             }
-            try t.expect(count < 16 and target.running.snapshot.sequencers == 1 and words[core.reg.mailbox0 / 4] == 0x7979);
+            try t.expect(count < 16 and target.running.snapshot.sequencers == initial_sequencers + 1 and words[core.reg.mailbox0 / 4] == 0x7979);
             try t.expect(target.session.?.pending == null and target.port.runtime_sequence == null);
             for (0..init.log_count) |index| {
                 const bytes = backing.?[init.logs_offset + index * init.log_bytes ..][0..init.log_bytes];

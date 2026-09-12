@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.55; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.56; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -12,6 +12,32 @@ Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
 
+Internal RM discovery (NVIDIA 0.1.56, 2026-09-12):
+
+After static-info acceptance, the actual runtime queries enabled GPCs, the TPC
+mask of each enabled GPC, then the kernel interrupt table through the borrowed
+firmware RM client/subdevice. Sparse masks keep their real IDs. The fixed flat
+controls share the retained queue and native notifier; interleaved diagnostics,
+lockdown and CPU-sequencer requests keep the original deadline. Each control
+has at most 5 seconds within the original 30-second startup budget.
+
+The resident inventory includes up to 128 interrupt entries and seven subtree
+ranges. Unknown engines and absent vectors remain explicit; GA106 vector
+bounds and the required unique GSP stall vector are checked. No partial table
+is exposed before the final ACK. These queries do not register IRQs, program
+VFN masks, enable engines, change clocks or release the held boot resources.
+
+One existing host run passes 51/51 groups, including sparse high-bit masks,
+actual control packets, native sequencer dispatch while waiting, RM/selector/
+vector errors, failed ACK and timeout. Original C ABI comparison (18 fields),
+module build and exact legal staging pass. No new test group, guest or hardware
+run. Kernel 152 and the last physical Kernel150/NVIDIA50 state are unchanged.
+Twenty-eight complete pinned references, full licenses and publication evidence
+are in ExFiles/Reference/GFX/Nvidia/0.79.10/gsp-postinit-20260912. IRQ service,
+firmware health, host RM objects, complete restore and native output remain open.
+
+The entries below describe preceding checkpoints.
+
 Post-init static configuration (NVIDIA 0.1.55, 2026-09-12):
 
 After the real INIT_DONE handoff, the resident runtime sends GET_GSP_STATIC_INFO
@@ -22,18 +48,16 @@ reply publishes copied firmware-owned RM handles, bounded FB regions, BAR page
 directory addresses and engine capabilities. It does not release boot VRAM or
 allocate/free RM objects. The default remains passive.
 
-All51 existing host groups pass. The added complete-run cases cover wire bytes,
+All 51 existing host groups pass. The added complete-run cases cover wire bytes,
 notification isolation, reply lifetime, overlapping regions, failed ACK and
 missing response. The first run rejected a malformed new model print packet;
 its length was corrected without changing the production decoder. One C ABI
-comparison verifies63 fields; module build and exact legal staging pass. No
+comparison verifies 63 fields; module build and exact legal staging pass. No
 new group, guest or hardware run. Kernel152 is unchanged; OssiPC was last
-verified with Kernel150/NVIDIA50 passive. The28 complete pinned originals and
+verified with Kernel150/NVIDIA50 passive. The 28 complete pinned originals and
 receipts are archived in ExFiles/Reference/GFX/Nvidia/0.79.10/gsp-static-20260912.
 Real firmware acceptance, subsequent RM controls/objects, IRQ/health, thermals,
 full GPU/UEFI restoration and native video/audio remain open.
-
-The entries below describe preceding checkpoints.
 
 Early GSP initialization messages (NVIDIA 0.1.54, 2026-09-12):
 

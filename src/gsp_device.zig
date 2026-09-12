@@ -341,14 +341,16 @@ pub const Device = struct {
         try self.checkLive(false);
         if (self.phase != .ready or port != &self.port or port.phase != .runtime or self.session == null or
             self.running.self_address != @intFromPtr(&self.running) or self.running.failure != null or
-            self.running.static_info != null or self.running.sequence.self_address != 0) return error.State;
+            self.running.sequence.self_address != 0) return error.State;
         const channel = if (self.running.channel) |*value| value else return error.State;
         if (channel.session != &self.session.? or port.runtime_session != channel.session or
             channel.phase != .prepared or channel.pending != null or channel.session.pending != null or
-            channel.function != @import("gsp_static.zig").function or channel.deadline != deadline or
-            channel.request.ptr != self.running.static_request[0..].ptr or channel.request.len != self.running.static_request.len)
-            return error.Binding;
+            channel.deadline != deadline) return error.Binding;
         if (channel.in_lockdown) return error.Lockdown;
+        if (self.running.static_info == null) {
+            if (channel.function != @import("gsp_static.zig").function or
+                channel.request.ptr != self.running.static_request[0..].ptr or channel.request.len != self.running.static_request.len) return error.Binding;
+        } else if (!self.running.post.matches(channel, deadline)) return error.Binding;
     }
     fn access(raw: *anyopaque, kind: native.Access, address: u32) !void {
         const self = from(raw);
