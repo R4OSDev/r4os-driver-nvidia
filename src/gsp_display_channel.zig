@@ -81,8 +81,9 @@ const exchange = @import("gsp_exchange.zig");
 const names = @import("gsp_rm_names.zig");
 const engine = @import("gsp_display_engine.zig");
 const storage = @import("gsp_display_storage.zig");
+pub const push = @import("gsp_display_push.zig");
 pub const wire = @import("gsp_display_channel_wire.zig");
-pub const Error = wire.Error || names.Error || storage.Error;
+pub const Error = wire.Error || names.Error || storage.Error || push.Error;
 pub const State = enum { creating, unwinding, ready, handed_off, destroying, closed, finished, failed };
 pub const Info = struct { config: wire.Config, rm_allocated: bool };
 pub const Owner = struct {
@@ -97,6 +98,7 @@ pub const Owner = struct {
     ctx: r4os.r4dev.DriverContext,
     adapter: u32,
     backing: storage.Storage = .{},
+    ring: push.Ring = .{},
     state: State = .creating,
     pushbuffer: bool = false,
     live: bool = false,
@@ -179,6 +181,7 @@ pub const Owner = struct {
                 self.state = .ready; return null;
             } else if (self.live) .free else {
                 if (self.retirementPending()) return null;
+                if (!self.ring.close(self.hardware_retired)) return error.Retained;
                 self.backing.retained = false;
                 if (!self.backing.close()) return error.Retained;
                 if (self.namespace_live) {

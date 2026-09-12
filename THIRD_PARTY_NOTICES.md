@@ -1,5 +1,17 @@
 ﻿# Third-Party Notices
 
+Core display submission and notifiers (NVIDIA 0.1.81, 2026-09-12):
+The GA106 method/PUT/GET/notifier protocol follows pinned MIT NVIDIA
+570.144 C67D definitions, nvkms-rm.c and nvkms-dma.c, plus Nouveau Linux
+7.2.4 corec57d/corec37d, display-ring and r535 user mappings and C37B/507C
+class/DRF headers. Twelve full originals/notices and the independent C
+header fixture are archived under 0.79.13/display-submit-20260912.
+Derived portions in gsp_display_commands/push/notifier.zig retain their
+full applicable MIT notices. Original ownership/Device integration is
+Apache-2.0. Prior runtime-license bytes are unchanged; full added notices
+are embedded and distributed identically. No reference C implementation
+is linked into the module.
+
 Display RAMHT and physical DMA contexts (NVIDIA 0.1.80, 2026-09-12):
 The GA106 table layout, hash and GV100 descriptors follow the pinned
 Nouveau Linux 7.2.4 MIT sources (ramht.c, usergv100.c, gv100.c, cl0002.h,

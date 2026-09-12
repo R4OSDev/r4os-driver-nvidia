@@ -1536,6 +1536,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         context_copy_capacity, context_copy_oom, context_copy_invalid, context_copy_lost_idle, context_copy_fastpath,
         context_upload_success, context_upload_timeout, context_upload_fault, context_upload_sync,
         context_upload_release, context_upload_acquire, context_upload_retry,
+        context_display_success, context_display_timeout, context_display_fault, context_display_cursor, context_display_notifier, context_display_map,
         display_root_success, display_root_classes, display_root_reject, display_root_static, display_root_preserve, display_root_free,
         display_root_ack, display_root_timeout, display_root_wrong,
         display_dma_success, display_dma_instance_ack, display_dma_instance_reject, display_dma_oom, display_dma_segment, display_dma_unmap,
@@ -2946,7 +2947,7 @@ fn checkDeviceContexts(target: *@import("gsp_device.zig").Device, table: *a.Driv
     const command = init.queues_offset + init.command_offset;
     const status = init.queues_offset + init.status_offset;
     model.install(table, scenario); defer model.dispose(table);
-    const copy_case = std.mem.startsWith(u8, scenario, "context_copy") or std.mem.startsWith(u8, scenario, "context_upload");
+    const copy_case = std.mem.startsWith(u8, scenario, "context_copy") or std.mem.startsWith(u8, scenario, "context_upload") or std.mem.startsWith(u8, scenario, "context_display");
     const fifo = std.mem.startsWith(u8, scenario, "context_fifo") or copy_case;
     const methods = std.mem.startsWith(u8, scenario, "context_methods") or fifo;
     const success = model.is("context_success") or model.is("context_methods");
@@ -3104,7 +3105,7 @@ fn checkDeviceContexts(target: *@import("gsp_device.zig").Device, table: *a.Driv
         } else try t.expect(model.released == 1 and model.charged == 0 and !model.slots[0].live);
     }
 }
-fn checkDeviceDisplayUpload(target: *@import("gsp_device.zig").Device, handle: @import("gsp_runtime.zig").ChannelHandle, deadline: u64, scenario: []const u8) !void {
+fn checkDeviceDisplayUpload(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, handle: @import("gsp_runtime.zig").ChannelHandle, deadline: u64, scenario: []const u8) !void {
     const runtime = @import("gsp_runtime.zig");
     const model = @import("gsp_vram_test_model.zig").Model;
     const wire = @import("gsp_copy_wire.zig");
@@ -3128,13 +3129,24 @@ fn checkDeviceDisplayUpload(target: *@import("gsp_device.zig").Device, handle: @
     }
     try t.expect(steps < 30 and running.display_engine_owner.?.instance_bound);
     try running.releaseNativeBuffer(instance);
+    const display_case = std.mem.startsWith(u8, scenario, "context_display");
+    if (display_case) {
+        const words: [*]u32 = @ptrFromInt(target.port.window.cpu_address);
+        @import("gsp_display_test_model.zig").Model.install(table, scenario, words[0..@intCast(target.port.window.byte_length / 4)]);
+        if (model.is("context_display_map")) {
+            try t.expectError(error.Retained, running.createDisplayNotifier(root, .core, 0)); _ = target.step();
+            try t.expect(target.phase == .recovering and running.display_resources_slot.owner.?.notifiers[0].failed); return;
+        }
+        _ = try running.createDisplayNotifier(root, .core, 0);
+        try t.expectError(error.Busy, running.createDisplayNotifier(root, .core, 0));
+    }
     const data = try allocateContextStorage(target, 65536, deadline);
     const data_index = (try running.nativeBufferStatus(data)).info.?.reference.buffer.id - 801;
     try t.expectError(error.Unsupported, running.bindDisplayStorage(root, .window, 2, data));
     const dma = try running.bindDisplayStorage(root, .window, 3, data);
     try running.releaseNativeBuffer(data);
     const table_owner = running.display_resources_slot.owner.?;
-    try t.expect(table_owner.valid() and table_owner.table.count == 1 and !table_owner.table.published(4, dma) and
+    try t.expect(table_owner.valid() and table_owner.table.count == @as(u32, if (display_case) 2 else 1) and !table_owner.table.published(4, dma) and
         model.slots[data_index].imported and model.slots[data_index].gpu.lease.id != 0 and !model.slots[data_index].reference);
     var forged = root; forged.epoch += 1; try t.expectError(error.Stale, running.displayTableStatus(forged));
     const first_deadline = if (model.is("context_upload_retry")) clock + 1 else deadline;
@@ -3201,16 +3213,108 @@ fn checkDeviceDisplayUpload(target: *@import("gsp_device.zig").Device, handle: @
         return;
     }
     try t.expect(target.phase == .ready and running.display_upload_job == null and !ControlModel.reading and !ControlModel.cpu_mapped and
-        table_owner.table.published(4, dma) and (try running.displayTableStatus(root)).published_revision == 1 and running.copy_completed == 0);
+        table_owner.table.published(4, dma) and (try running.displayTableStatus(root)).published_revision == @as(u32, if (display_case) 2 else 1) and running.copy_completed == 0);
     try t.expectError(error.Busy, running.uploadDisplayTable(root, handle, deadline));
     try t.expectError(error.Busy, running.beginDestroyGraph(deadline, true));
     try t.expectError(error.Retained, running.retireDisplayEngine(root, deadline));
     // Creation seals the initial table, even before a later channel ACK.
-    _ = try running.createDisplayChannel(root, .core, 0, deadline);
+    const core_handle = try running.createDisplayChannel(root, .core, 0, deadline);
     try t.expect(running.display_engine_owner.?.channels_started);
     try t.expectError(error.Busy, running.bindDisplayStorage(root, .core, 0, data));
+    if (display_case) { try checkDeviceDisplaySubmissions(target, core_handle, deadline, scenario); return; }
     _ = target.stop();
     try t.expect(table_owner.failed and model.slots[data_index].imported and ControlModel.active and ControlModel.releases == 0);
+}
+fn checkDeviceDisplaySubmissions(target: *@import("gsp_device.zig").Device, handle: @import("gsp_runtime.zig").DisplayChannelHandle, deadline: u64, scenario: []const u8) !void {
+    const model = @import("gsp_display_test_model.zig").Model;
+    const push = @import("gsp_display_push.zig");
+    const running = &target.running;
+    errdefer |err| std.debug.print("display submission {s}: {s} phase={s} failure={?} work={?}\n", .{scenario,@errorName(err),@tagName(target.phase),target.failure,if(running.display_work)|work|work.phase else null});
+    try pumpDisplayChannel(target, handle, deadline);
+    try t.expect(target.phase == .ready and (try running.displayChannelStatus(handle)).info != null);
+    const channel_owner = &running.display_channels[0].?;
+    const table_owner = running.display_resources_slot.owner.?;
+    const note = table_owner.publishedNotifier(0).?;
+    const user = try push.userBase(.core, 0);
+    const note_words: [*]u32 = @ptrFromInt(note.cpu.cpu_address);
+    try t.expect(note.valid() and note.phase == .ready and model.slots[0].active and model.slots[1].active);
+    try running.commitDisplayCore(handle, deadline);
+    try t.expectError(error.Busy, running.commitDisplayCore(handle, deadline));
+    try t.expectError(error.Busy, running.retireDisplayChannel(handle, deadline));
+    const endpoint = target.port.owner.?;
+    const admit = endpoint.admit_display_push.?;
+    try admit(endpoint.context, &target.port, channel_owner, deadline, .read);
+    try t.expectError(error.Binding, admit(endpoint.context, &target.port, channel_owner, deadline + 1, .read));
+    var copied = channel_owner.*;
+    try t.expectError(error.Binding, admit(endpoint.context, &target.port, &copied, deadline, .read));
+    // Exercise the actual write admission before the worker publishes PUT.
+    // Roll back only this test's CPU-only preparation, never submitted work.
+    const first = &running.display_work.?;
+    first.ticket = try channel_owner.ring.prepare(0, first.config);
+    try note.arm(first.ticket.?.point, deadline);
+    try admit(endpoint.context, &target.port, channel_owner, deadline, .publish);
+    const first_word: *u32 = @ptrFromInt(channel_owner.ring.cpu.cpu_address);
+    first_word.* ^= 1;
+    try t.expectError(error.Binding, admit(endpoint.context, &target.port, channel_owner, deadline, .publish)); first_word.* ^= 1;
+    note.handle ^= 1;
+    try t.expectError(error.Binding, admit(endpoint.context, &target.port, channel_owner, deadline, .publish)); note.handle ^= 1;
+    try t.expect(model.words[user / 4] == 0 and channel_owner.ring.issued == 0);
+    channel_owner.ring.pending = null; channel_owner.ring.program = null; first.ticket = null;
+    note.phase = .ready; note.point = 0; note.deadline = 0;
+    if (model.is("context_display_cursor")) model.words[(user + 4) / 4] = 0xffffffff;
+    _ = target.step();
+    if (!model.is("context_display_cursor")) {
+        try t.expect(target.phase == .ready and running.display_work.?.phase == .submitted and channel_owner.ring.issued == 1 and
+            model.words[user / 4] == channel_owner.ring.put * 4 and note.phase == .submitted);
+        model.words[(user + 4) / 4] = model.words[user / 4];
+        note_words[0] = 1 << 30; _ = target.step(); // GET and BEGUN are not completion.
+        try t.expect(target.phase == .ready and channel_owner.ring.completed == 0 and running.display_work != null);
+        if (model.is("context_display_timeout")) clock = deadline else {
+            note_words[2] = 0x12345678; note_words[3] = 9;
+            note_words[0] = if (model.is("context_display_notifier")) 3 << 30 else 2 << 30;
+            if (model.is("context_display_fault")) try nativeEvent(&target.session.?, 0x10ff, &.{});
+        }
+        _ = target.step();
+    }
+    if (!model.is("context_display_success")) {
+        try t.expect(target.phase == .recovering and running.display_work != null and channel_owner.ring.completed == 0 and
+            table_owner.failed and note.failed and note.backing.retained and channel_owner.backing.retained and
+            model.slots[0].active and model.slots[0].cpu and model.slots[1].active and model.slots[1].cpu and model.released == 0);
+        return;
+    }
+    try t.expect(target.phase == .ready and running.display_work == null and channel_owner.ring.completed == 1 and
+        channel_owner.ring.initialized and note.result.?.timestamp == 0x912345678);
+    var wraps: u32 = 0;
+    // One bounded 128-update host sequence crosses the real 4-KB ring end.
+    // Synthetic GPU GET/notifier writes happen only after actual submission.
+    for (2..129) |point| {
+        try running.commitDisplayCore(handle, deadline);
+        const prior_first = first_word.*;
+        _ = target.step(); try t.expect(target.phase == .ready);
+        if (running.display_work.?.phase == .rewind) {
+            wraps += 1;
+            try t.expect(model.words[user / 4] == 0 and model.words[(user + 4) / 4] != 0 and first_word.* == prior_first);
+            _ = target.step();
+            try t.expect(running.display_work.?.phase == .rewind and first_word.* == prior_first and channel_owner.ring.issued == point - 1);
+            model.words[(user + 4) / 4] = 0; _ = target.step();
+            try t.expect(running.display_work.?.phase == .prepare and first_word.* == prior_first);
+            _ = target.step();
+        }
+        try t.expect(target.phase == .ready and running.display_work.?.phase == .submitted and note_words[0] == 0 and
+            channel_owner.ring.issued == point and model.words[user / 4] == channel_owner.ring.put * 4);
+        model.words[(user + 4) / 4] = model.words[user / 4];
+        note_words[0] = (2 << 30) | @as(u32, @intCast(point));
+        _ = target.step();
+        try t.expect(target.phase == .ready and running.display_work == null and channel_owner.ring.completed == point);
+    }
+    try t.expect(wraps == 1 and model.released == 0 and note.valid());
+    try running.retireDisplayChannel(handle, deadline);
+    try pumpDisplayChannel(target, handle, deadline);
+    try t.expect(target.phase == .ready and model.released == 1 and !model.slots[1].active and !model.slots[1].cpu and
+        model.slots[0].active and model.slots[0].cpu and note.valid());
+    try t.expectError(error.Stale, running.displayChannelStatus(handle));
+    _ = target.stop();
+    try t.expect(table_owner.failed and note.failed and model.slots[0].active and model.slots[0].cpu);
 }
 const FifoCounts = struct { allocations: usize = 0, frees: usize = 0, enables: usize = 0, disables: usize = 0, event: bool = false };
 fn replyCopyMapping(target: *@import("gsp_device.zig").Device) !void {
@@ -3254,7 +3358,7 @@ fn checkDeviceCopies(target: *@import("gsp_device.zig").Device, table: *a.Driver
     }
     if (fifo_owner.info()) |value| {
         try t.expect(value.config.copy_class == 0xc7b5 and value.config.system_userd and value.config.userd == fifo_owner.commands.?.backing.pages[2]);
-        if (std.mem.startsWith(u8, scenario, "context_upload")) { try checkDeviceDisplayUpload(target, handle, deadline, scenario); return; }
+        if (std.mem.startsWith(u8, scenario, "context_upload") or std.mem.startsWith(u8, scenario, "context_display")) { try checkDeviceDisplayUpload(target, table, handle, deadline, scenario); return; }
         const data_handle = try allocateContextBuffer(target, 8191, deadline, false);
         const data_info = (try running.nativeBufferStatus(data_handle)).info.?;
         model.install(table, data_info.reference.buffer.id - 801);

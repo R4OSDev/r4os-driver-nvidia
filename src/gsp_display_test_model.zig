@@ -27,7 +27,7 @@ pub const Model = struct {
     fn select(input: a.GfxBufferHandle) ?usize { for (0..slots.len) |i| if (std.meta.eql(input, ref(i))) return i; return null; }
     pub fn address(index: usize) u64 { return 0x8000000000 + index * 0x100000; }
     fn create(d: *const a.GfxBufferDescriptor, out: *a.GfxBufferReference) callconv(.c) i32 {
-        std.debug.assert(d.byte_length == 4096 and d.alignment == 4096 and d.location == 0 and d.usage == 7);
+        std.debug.assert(d.byte_length == 4096 and d.alignment == 4096 and d.location == 0 and (d.usage == 7 or d.usage == 15));
         if (is("display_dma_oom")) return a.gfx_buffer_error_capacity;
         for (&slots, 0..) |*slot, i| if (!slot.active) {
             slot.* = .{ .active = true, .descriptor = d.* }; @memset(&slot.data, 0xa5);
@@ -40,18 +40,20 @@ pub const Model = struct {
         std.debug.assert(slots[i].active); out.* = slots[i].descriptor; return a.gfx_buffer_result_ok;
     }
     fn map(input: *const a.GfxBufferHandle, access: u32, offset: u64, length: u64, out: *a.GfxBufferMap) callconv(.c) i32 {
-        const i = select(input.*).?; const slot = &slots[i];
-        std.debug.assert(slot.active and !slot.cpu and slot.dma.lease.id == 0 and access == a.gfx_buffer_map_write and offset == 0 and length == 4096);
+        const i = select(input.*) orelse { const call: *const fn (*const a.GfxBufferHandle, u32, u64, u64, *a.GfxBufferMap) callconv(.c) i32 = @ptrFromInt(original.buffer_map); return call(input, access, offset, length, out); };
+        const slot = &slots[i];
+        std.debug.assert(slot.active and !slot.cpu and access == a.gfx_buffer_map_write and offset == 0 and length == 4096);
         slot.cpu = true; out.* = .{ .lease = cpuRef(i), .cpu_address = @intFromPtr(&slot.data), .byte_length = length, .cache_policy = a.gfx_buffer_cache_write_back };
+        if (is("context_display_map") and slot.dma.lease.id != 0 and slot.descriptor.usage == 15) out.byte_length -= 1;
         return a.gfx_buffer_result_ok;
     }
     fn unmap(input: *const a.GfxBufferHandle) callconv(.c) i32 {
         for (&slots, 0..) |*slot, i| if (std.meta.eql(input.*, cpuRef(i))) {
-            std.debug.assert(slot.active and slot.cpu and slot.dma.lease.id == 0);
+            std.debug.assert(slot.active and slot.cpu);
             if (is("display_dma_unmap")) return a.gfx_buffer_error_busy;
-            slot.cpu = false; slot.synced = std.mem.allEqual(u8, &slot.data, 0); return a.gfx_buffer_result_ok;
+            slot.cpu = false; slot.synced = slot.dma.lease.id != 0 or std.mem.allEqual(u8, &slot.data, 0); return a.gfx_buffer_result_ok;
         };
-        unreachable;
+        const call: *const fn (*const a.GfxBufferHandle) callconv(.c) i32 = @ptrFromInt(original.buffer_unmap); return call(input);
     }
     fn acquire(input: *const a.GfxBufferHandle, request: *const a.GfxDeviceRequest, out: *a.GfxDeviceLease) callconv(.c) i32 {
         const i = select(input.*) orelse { const call: *const fn (*const a.GfxBufferHandle, *const a.GfxDeviceRequest, *a.GfxDeviceLease) callconv(.c) i32 = @ptrFromInt(original.device_acquire); return call(input, request, out); };

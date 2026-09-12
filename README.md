@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.80; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.81; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -12,24 +12,24 @@ Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
 
-Native display preparation (NVIDIA 0.1.80):
-The internal Device/GSP runtime owns C670/C67D/C67E, a retained 64KB VRAM
-instance, physical 4KB command rings and an 8KB RAMHT with up to 64 physical
-DMA contexts. Contexts retain native storage independently of its creator.
-The existing CE uploads the 10KB table image from protected SYS staging;
-exact Device admission checks the actual transfer and release commands.
-Only GPU completion publishes the revision. Queued faults take priority;
-uncertain effects retain all reachable storage. The initial table is sealed
-when the first display channel is created, including after channel Free.
-Channel retirement itself still requires ACK plus physical idle evidence.
+Native display preparation (NVIDIA 0.1.81):
+The internal Device/GSP runtime owns display roots/channels, a retained
+64KB VRAM instance and a CE-published RAMHT. Private coherent SYS notifiers
+and command rings now support typed C67D core initialization and UPDATE.
+Exact Device admission validates the owner, deadline and actual commands.
+The single outstanding operation completes only on notifier FINISHED;
+GET and BEGUN do not suffice. Ring wrap publishes JUMP0/PUT0 and waits for
+GET0 before writing the beginning. Queued faults take priority; uncertain
+effects retain all reachable storage. Command buffers require Free ACK
+plus physical retirement; notifier/table/instance remain held afterward.
 
-64 original-C entries and seven targeted Device scenarios pass within the
-51 existing groups; the module builds. Roadmap 0.79.13 remains open:
-notifier ownership, display methods/PUT/completion, own presentation buffers,
-mode adoption/commit and rollback still require software implementation.
-Display rings remain empty and these internal APIs are not automatically
-invoked. Passive bootfb remains default. Current evidence and links to
-previous checkpoints: GrafikScanout07913.json; hardware work: OssiGPU.txt.
+Original-header vectors and six targeted Device scenarios, including
+128 updates with ring wrap, pass within the 51 existing tests; the module
+builds. These internal APIs are not automatically invoked. Roadmap 0.79.13
+remains open: window image/state, own presentation buffers, safe mode
+adoption/commit, confirmation and rollback still require implementation.
+Core completion does not prove visible scanout. Passive bootfb remains
+default. Evidence: GrafikScanout07913.json; physical follow-up: OssiGPU.txt.
 
 Fault diagnosis and quarantine (NVIDIA 0.1.77):
 Roadmap 0.79.11 is software complete, including its combined targeted

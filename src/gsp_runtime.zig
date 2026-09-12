@@ -47,11 +47,19 @@ pub const DisplayEngineHandle = struct { epoch: u64, root: u32 };
 pub const DisplayEngineStatus = struct { state: display_engine.State, info: ?display_engine.Info, rejected: ?u32, unavailable: bool };
 pub const display_channel = @import("gsp_display_channel.zig");
 pub const DisplayChannelHandle = struct { epoch: u64, handle: u32, slot: u8 };
-pub const DisplayChannelStatus = struct { state: display_channel.State, info: ?display_channel.Info, rejected: ?u32, host_rejected: ?anyerror };
+pub const DisplayChannelStatus = struct { state: display_channel.State, info: ?display_channel.Info, rejected: ?u32, host_rejected: ?anyerror, initialized: bool, completed: u64 };
 pub const display_resources = @import("gsp_display_resources.zig");
 pub const display_upload = @import("gsp_display_upload.zig");
 const DisplayResourcesSlot = struct { owner: ?*display_resources.Owner = null, allocation: r4os.abi.DriverHeapAllocation = .{}, heap: ?r4os.r4dev.DriverHeapContext = null };
 pub const DisplayTableStatus = struct { entries: u32, revision: u64, published_revision: u64, uploading: bool };
+pub const DisplayWork = struct {
+    handle: DisplayChannelHandle,
+    notifier: *display_resources.notifier.Owner,
+    config: display_channel.push.commands.Config,
+    deadline: u64,
+    phase: enum { prepare, rewind, submitted } = .prepare,
+    ticket: ?display_channel.push.Ticket = null,
+};
 const subscriptions = @import("gsp_event_objects.zig");
 const outputs = @import("gsp_outputs.zig");
 const inventory = @import("gsp_memory_inventory.zig");
@@ -133,6 +141,7 @@ pub const Owner = struct {
     display_channel_active: ?u8 = null,
     display_resources_slot: DisplayResourcesSlot = .{},
     display_upload_job: ?struct { operation: display_upload.Upload = .{}, channel_handle: ChannelHandle } = null,
+    display_work: ?DisplayWork = null,
     rm_rejection: ?u32 = null,
     outputs: outputs.Owner = .{},
     output_refresh: bool = false,
@@ -250,6 +259,8 @@ pub const Owner = struct {
                 owner.last_control,owner.last_state,owner.backing.retained});
         if (self.display_resources_slot.owner) |owner| self.log("NVIDIA gsp-display-table: failed={s} entries={d} revision={d} published={d} upload-held={} storage=retained",
             .{@errorName(err),owner.table.count,owner.table.revision,owner.table.uploaded_revision,self.display_upload_job != null});
+        if (self.display_work) |*work| self.log("NVIDIA gsp-display-push: failed={s} channel={x} phase={s} point={d} notifier={x} storage=retained",
+            .{@errorName(err),work.handle.handle,@tagName(work.phase),if(work.ticket)|ticket|ticket.point else 0,if(work.notifier.result)|result|result.word else 0});
     }
     fn recordFault(self: *Owner, value: diagnostics.Record) !void {
         var record = value;
@@ -331,7 +342,7 @@ pub const Owner = struct {
     }
     pub fn nativeObject(self: *Owner) ?display.Object {
         if (self.self_address != @intFromPtr(self) or self.failure != null or self.graph == null or
-            self.display_upload_job != null or
+            self.display_upload_job != null or self.display_work != null or
             self.graph.?.self_address != @intFromPtr(&self.graph.?) or self.graph.?.state != .loaned or
             self.display_object == null or self.channel == null or self.activeChannel() != &self.channel.? or
             self.channel.?.session.state != .active) return null;
@@ -450,7 +461,8 @@ pub const Owner = struct {
     }
     pub fn displayChannelStatus(self: *Owner, handle: DisplayChannelHandle) !DisplayChannelStatus {
         const owner = try self.findDisplayChannel(handle);
-        return .{ .state = owner.state, .info = owner.info(), .rejected = owner.rejected, .host_rejected = owner.host_rejected };
+        return .{ .state = owner.state, .info = owner.info(), .rejected = owner.rejected, .host_rejected = owner.host_rejected,
+            .initialized = owner.ring.initialized, .completed = owner.ring.completed };
     }
     pub fn retireDisplayChannel(self: *Owner, handle: DisplayChannelHandle, deadline: u64) !void {
         const owner = try self.findDisplayChannel(handle);
@@ -476,6 +488,16 @@ pub const Owner = struct {
         return owner.bindNative(@intCast(slot), storage) catch |err| {
             if (err == error.Descriptor or err == error.Retained) self.stop(err);
             return err;
+        };
+    }
+    pub fn createDisplayNotifier(self: *Owner, handle: DisplayEngineHandle, kind: display_channel.wire.Kind, index: u32) !u32 {
+        const parent = try self.idleDisplayTable(handle);
+        const config = parent.info() orelse return error.State;
+        const slot = try display_channel.wire.slot(kind, index);
+        if ((kind == .core and !config.core) or (kind == .window and (!config.window or config.hardware.windows & (@as(u32, 1) << @intCast(index)) == 0))) return error.Unsupported;
+        const owner = try self.ensureDisplayResources(parent);
+        return owner.createNotifier(&self.ctx.?, @intCast(slot)) catch |err| {
+            if (err == error.Descriptor or err == error.Retained) self.stop(err); return err;
         };
     }
     fn idleDisplayTable(self: *Owner, handle: DisplayEngineHandle) !*display_engine.Owner {
@@ -534,7 +556,26 @@ pub const Owner = struct {
             return err;
         };
     }
-    fn copyBusy(self: *const Owner) bool { return self.copy_job != null or self.display_upload_job != null; }
+    /// Initial core methods and a notifier-backed UPDATE. This does not
+    /// assert that a mode was adopted or that an image is visibly scanned.
+    pub fn commitDisplayCore(self: *Owner, handle: DisplayChannelHandle, deadline: u64) !void {
+        const owner = try self.findDisplayChannel(handle);
+        const value = owner.info() orelse return error.State;
+        if (value.config.kind != .core) return error.Unsupported;
+        if (self.copyBusy() or self.graph_closing or self.sequence.self_address != 0 or self.nativeObject() == null or
+            self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
+        const resources = self.display_resources_slot.owner orelse return error.State;
+        const note = resources.publishedNotifier(0) orelse return error.State;
+        if (resources.instance != &owner.parent.instance_storage or !std.meta.eql(resources.binding.?, value.config.root)) return error.Stale;
+        try self.channel.?.guard(deadline);
+        if (owner.ring.self_address == 0) owner.ring.open(&owner.backing, value.config) catch |err| {
+            if (err == error.Descriptor or err == error.Retained) self.stop(err); return err;
+        };
+        const root = owner.parent.info() orelse return error.State;
+        self.display_work = .{ .handle = handle, .notifier = note, .deadline = deadline,
+            .config = .{ .notifier = note.handle, .windows = root.hardware.windows, .initialize = !owner.ring.initialized } };
+    }
+    fn copyBusy(self: *const Owner) bool { return self.copy_job != null or self.display_upload_job != null or self.display_work != null; }
     /// Discover the engine and create its RM group/share in this VA space.
     /// Channel children retain the context separately before using it.
     pub fn createExecutionContext(self: *Owner, rm_engine: u32, deadline: u64) !ContextHandle {
@@ -842,6 +883,37 @@ pub const Owner = struct {
         work.operation.ticket = try fifo.prepareCopy(transfer);
         try self.device.?.submitCopy(fifo, work.operation.ticket.?, work.operation.deadline);
         try work.operation.submitted(work.operation.ticket.?); return true;
+    }
+    fn advanceDisplay(self: *Owner, current: u64) !bool {
+        const work = if (self.display_work) |*value| value else return false;
+        const owner = try self.findDisplayChannel(work.handle);
+        const resources = self.display_resources_slot.owner orelse return error.State;
+        if (owner.info() == null or resources.publishedNotifier(0) != work.notifier or !owner.ring.valid()) return error.Stale;
+        if (work.phase == .submitted) {
+            if (try work.notifier.poll()) |_| {
+                try owner.ring.finish(work.ticket.?.point); self.display_work = null; return true;
+            }
+            if (current >= work.deadline) return error.Timeout;
+            return false;
+        }
+        if (current >= work.deadline) return error.Timeout;
+        if (self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return false;
+        const cursors = (try self.device.?.readDisplayCursor(owner, work.deadline)) orelse return false;
+        if (cursors.put != owner.ring.put) return error.Completion;
+        if (work.phase == .rewind) {
+            if (!try owner.ring.rewound(cursors.get)) return false;
+            work.phase = .prepare; work.ticket = null; return true;
+        }
+        work.ticket = owner.ring.prepare(cursors.get, work.config) catch |err| {
+            if (err == error.Busy) return false; return err;
+        };
+        const ticket = work.ticket.?;
+        if (ticket.kind == .frame) try work.notifier.arm(ticket.point, work.deadline);
+        try self.device.?.submitDisplay(owner, ticket, work.config, work.deadline);
+        if (ticket.kind == .rewind) work.phase = .rewind else {
+            try work.notifier.submitted(ticket.point, work.deadline); work.phase = .submitted;
+        }
+        return true;
     }
     /// Called by the serialized native engine worker after queue.take. The
     /// common queue authenticates the full job/driver generation and supplies
@@ -1187,6 +1259,7 @@ pub const Owner = struct {
             }
         }
         if (try self.advanceDisplayUpload(current)) return .progress;
+        if (try self.advanceDisplay(current)) return .progress;
         if (try self.advanceCopy(current)) return .progress;
         if (self.nativeObject() != null and try self.collectNativeBuffer(if (self.graph_closing) self.close_deadline else try std.math.add(u64, current, 5 * std.time.ns_per_s))) return .progress;
         if (self.graph_closing and self.graph.?.state == .loaned) graph_close: {

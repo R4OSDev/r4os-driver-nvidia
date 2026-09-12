@@ -1,4 +1,4 @@
-//! One private coherent 4KB display pushbuffer; physical DMA, no GPU VA.
+//! One private coherent 4KB display pushbuffer/notifier; physical DMA, no GPU VA.
 //! Device/RM reachability is retained independently of the CPU producer map.
 const std = @import("std");
 const r4os = @import("r4os");
@@ -6,6 +6,7 @@ const a = r4os.abi;
 pub const Error = error{Busy, Api, Memory, Descriptor, Map, Retained};
 pub const bytes: u64 = 4096;
 const mask: u64 = (@as(u64, 1) << 40) - 1;
+pub const Role = enum { pushbuffer, notifier };
 pub const Storage = struct {
     self_address: usize = 0,
     memory: ?r4os.driver_memory.Context = null,
@@ -20,12 +21,18 @@ pub const Storage = struct {
     epoch: u64 = 0,
     ready: bool = false,
     retained: bool = false,
+    role: Role = .pushbuffer,
+    role_stamp: Role = .pushbuffer,
 
     pub fn prepare(self: *Storage, ctx: *const r4os.r4dev.DriverContext, adapter: u32, epoch: u64) Error!void {
+        return self.prepareRole(ctx, adapter, epoch, .pushbuffer);
+    }
+    pub fn prepareRole(self: *Storage, ctx: *const r4os.r4dev.DriverContext, adapter: u32, epoch: u64, role: Role) Error!void {
         if (self.self_address != 0) return error.Busy;
         if (adapter == 0 or epoch == 0) return error.Descriptor;
         const memory = ctx.memory() orelse return error.Api;
         self.self_address = @intFromPtr(self); self.memory = memory; self.adapter = adapter; self.epoch = epoch;
+        self.role = role; self.role_stamp = role;
         self.prepareInner() catch |err| {
             // Malformed partially returned ownership is never guessed away.
             if (err == error.Descriptor or err == error.Retained) self.retained = true;
@@ -35,7 +42,8 @@ pub const Storage = struct {
     fn prepareInner(self: *Storage) Error!void {
         const memory = self.memory.?;
         const descriptor: a.GfxBufferDescriptor = .{ .byte_length = bytes, .alignment = bytes,
-            .usage = a.gfx_buffer_usage_cpu_read | a.gfx_buffer_usage_cpu_write | a.gfx_buffer_usage_transfer_source };
+            .usage = a.gfx_buffer_usage_cpu_read | a.gfx_buffer_usage_cpu_write | a.gfx_buffer_usage_transfer_source |
+                (if (self.role == .notifier) a.gfx_buffer_usage_transfer_target else @as(u32, 0)) };
         const created = memory.bufferCreate(&descriptor, &self.reference);
         self.reference_stamp = self.reference;
         if (created != a.gfx_buffer_result_ok and self.reference.reference.id == 0 and self.reference.buffer.id == 0) return error.Memory;
@@ -53,8 +61,9 @@ pub const Storage = struct {
         const ptr: [*]u8 = @ptrFromInt(cpu.cpu_address); @memset(ptr[0..bytes], 0);
         if (memory.bufferUnmap(&cpu.lease) != a.gfx_buffer_result_ok) return error.Retained;
         self.cpu = .{};
-        // Private command storage remains CPU-producible while DMA-resident.
-        // Unlike image data it has no public reference or independent users.
+        // These private CPU/GPU protocol fields remain mapped while DMA-
+        // resident. Their concrete ring/notifier owner controls concurrency;
+        // no public reference or independent producer can access them.
         const acquired = memory.deviceAcquire(&ref.reference, &.{ .byte_length = bytes, .adapter_id = self.adapter,
             .device_generation = self.epoch, .access = 4, .dma_mask = mask }, &self.dma);
         self.dma_stamp = self.dma;
@@ -72,6 +81,7 @@ pub const Storage = struct {
     }
     pub fn physical(self: *const Storage) ?u64 {
         if (self.self_address != @intFromPtr(self) or !self.ready or self.memory == null or self.cpu.lease.id != 0 or self.epoch == 0 or self.adapter == 0 or
+            self.role != self.role_stamp or
             !std.meta.eql(self.reference, self.reference_stamp) or !std.meta.eql(self.dma, self.dma_stamp) or !std.meta.eql(self.segment, self.segment_stamp)) return null;
         return self.segment.dma_address;
     }

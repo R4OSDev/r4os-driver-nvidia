@@ -1,0 +1,16 @@
+{
+  "vectors": {
+    "sha256": "4ecaf8e780948276c6fe50def8ba33647cef1dc4f629b098f716f258c984c880",
+    "bytes": 484,
+    "path": "Repositories/Drivers/NVIDIA/src/fixtures/display-commands.bin"
+  },
+  "nvidia": "570.144",
+  "archive": "ExFiles/Reference/GFX/Nvidia/0.79.13/display-submit-20260912",
+  "linux": "7.2.4",
+  "scope": "Original C67D/C37B/507C definitions and Nouveau DRF macros; four complete packets plus cursor/notifier fields. No physical GPU proof.",
+  "generator": {
+    "sha256": "99d8178e73bbe01b5f63cecd7bcb910775e0a7eca3c1735148ee23fbd5fd95f8",
+    "bytes": 3494,
+    "path": "Temp/gfx-display-submit-20260912/Original-Commands.c"
+  }
+}

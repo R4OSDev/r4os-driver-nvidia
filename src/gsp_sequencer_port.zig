@@ -143,6 +143,7 @@ pub const RecoveryOwner = struct {
     admit: *const fn (*anyopaque, *const Port) anyerror!void,
     access: *const fn (*anyopaque, Access, u32) anyerror!void,
 };
+pub const DisplayAccess = enum { read, publish };
 pub const Owner = struct {
     context: *anyopaque,
     generation: *const fn (*anyopaque) u64,
@@ -183,6 +184,7 @@ pub const Owner = struct {
     admit_command: ?*const fn (*anyopaque, *const Port, u64) anyerror!void = null,
     admit_copy: ?*const fn (*anyopaque, *const Port, *@import("gsp_fifo.zig").Owner, @import("gsp_copy_ring.zig").Ticket, u64) anyerror!void = null,
     admit_display_retirement: ?*const fn (*anyopaque, *const Port, *@import("gsp_display_channel.zig").Owner, u64) anyerror!void = null,
+    admit_display_push: ?*const fn (*anyopaque, *const Port, *@import("gsp_display_channel.zig").Owner, u64, DisplayAccess) anyerror!void = null,
     recovery: ?RecoveryOwner = null,
 };
 pub const Run = struct { epoch: u64, deadline_ns: u64, resume_args: ?core.Resume = null };
@@ -627,6 +629,48 @@ pub const Port = struct {
         self.pointer(offset).* = ticket.token; fence();
         if (try self.readFor(scope, 0) != self.boot0) return error.IdentityChanged;
         try fifo.ring.notified(ticket);
+    }
+    pub fn readDisplayCursor(self: *Port, channel: *@import("gsp_display_channel.zig").Owner, deadline: u64) !?struct { put: u16, get: u16 } {
+        const push = @import("gsp_display_push.zig");
+        const scope: Scope = .{ .request = deadline };
+        errdefer |err| self.recordFailure(err);
+        try self.guardFor(scope);
+        if (self.phase != .runtime or !self.retained) return error.Phase;
+        const endpoint = self.owner.?;
+        const admit_push = endpoint.admit_display_push orelse return error.Unsupported;
+        try admit_push(endpoint.context, self, channel, deadline, .read);
+        const base = try push.userBase(channel.config.kind, channel.config.index);
+        if (!self.supports(.read, base) or !self.supports(.read, base + 4)) return error.Register;
+        if (try self.readFor(scope, 0) != self.boot0) return error.IdentityChanged;
+        var values: [2][2]u32 = undefined;
+        for (&values) |*sample| for (0..2) |i| {
+            try self.guardFor(scope); try admit_push(endpoint.context, self, channel, deadline, .read);
+            fence(); sample[i] = self.pointer(base + @as(u32, @intCast(i)) * 4).*; fence();
+        };
+        if (try self.readFor(scope, 0) != self.boot0) return error.IdentityChanged;
+        try admit_push(endpoint.context, self, channel, deadline, .read);
+        if (!std.meta.eql(values[0], values[1])) return null;
+        return .{ .put = try push.cursor(values[0][0]), .get = try push.cursor(values[0][1]) };
+    }
+    pub fn submitDisplay(self: *Port, channel: *@import("gsp_display_channel.zig").Owner, ticket: @import("gsp_display_push.zig").Ticket,
+        config: @import("gsp_display_commands.zig").Config, deadline: u64) !void
+    {
+        const push = @import("gsp_display_push.zig");
+        const scope: Scope = .{ .request = deadline };
+        errdefer |err| self.recordFailure(err);
+        try self.guardFor(scope);
+        if (self.phase != .runtime or !self.retained) return error.Phase;
+        const endpoint = self.owner.?;
+        const admit_push = endpoint.admit_display_push orelse return error.Unsupported;
+        try admit_push(endpoint.context, self, channel, deadline, .publish);
+        const base = try push.userBase(channel.config.kind, channel.config.index);
+        if (!self.supports(.write, base) or !self.supports(.read, base)) return error.Register;
+        if (try self.readFor(scope, 0) != self.boot0) return error.IdentityChanged;
+        if (try push.cursor(self.pointer(base).*) != channel.ring.put) return error.Completion;
+        try admit_push(endpoint.context, self, channel, deadline, .publish);
+        try channel.ring.publish(ticket, config);
+        self.pointer(base).* = @as(u32, ticket.put) << 2; fence();
+        if (try self.readFor(scope, 0) != self.boot0) return error.IdentityChanged;
     }
     /// Exact display-channel owner, read-only GA106 retirement registers.
     /// No generic sequencer permission or caller-selected MMIO is introduced.

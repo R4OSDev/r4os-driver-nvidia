@@ -347,6 +347,7 @@ pub const Device = struct {
             .admit_firmware = admitFirmware, .admit_cold = admitCold, .queue_memory = self.memory,
             .admit_runtime = admitRuntime, .admit_command = admitCommand, .admit_copy = admitCopy,
             .admit_display_retirement = admitDisplayRetirement,
+            .admit_display_push = admitDisplayPush,
             .recovery = .{ .generation = recoveryGeneration, .admit = admitRecovery, .access = recoveryAccess } };
     }
     fn generation(raw: *anyopaque) u64 {
@@ -464,7 +465,7 @@ pub const Device = struct {
         if (self.phase != .ready or port != &self.port or port.phase != .runtime or self.session == null or self.inLockdown() or
             self.running.self_address != @intFromPtr(&self.running) or self.running.failure != null or self.running.sequence.self_address != 0 or
             self.running.fifo_active != null or self.running.context_active != null or self.running.native_active != null or self.running.buffer_active != null or
-            self.running.outputs.active() or self.running.graph_closing or self.running.display_engine_active or self.running.display_channel_active != null) return error.State;
+            self.running.outputs.active() or self.running.graph_closing or self.running.display_engine_active or self.running.display_channel_active != null or self.running.display_work != null) return error.State;
         const channel_handle = if (self.running.display_upload_job) |*work| blk: {
             const resources = self.running.display_resources_slot.owner orelse return error.Binding;
             const root = if (self.running.display_engine_owner) |*value| value else return error.Binding;
@@ -489,6 +490,35 @@ pub const Device = struct {
         const rpc = self.running.activeChannel() orelse return error.State;
         if (rpc.session != &self.session.? or port.runtime_session != rpc.session or rpc.session.pending != null or
             rpc.phase != .idle or rpc.pending != null or rpc.in_lockdown or ticket.epoch != self.epoch) return error.Binding;
+        try rpc.guard(deadline);
+    }
+    fn admitDisplayPush(raw: *anyopaque, port: *const native.Port, channel: *@import("gsp_display_channel.zig").Owner, deadline: u64, access_kind: native.DisplayAccess) !void {
+        const self = from(raw);
+        try self.checkLive(false);
+        if (self.phase != .ready or port != &self.port or port.phase != .runtime or self.session == null or self.inLockdown() or
+            self.running.self_address != @intFromPtr(&self.running) or self.running.failure != null or self.running.sequence.self_address != 0 or
+            self.running.fifo_active != null or self.running.context_active != null or self.running.native_active != null or self.running.buffer_active != null or
+            self.running.outputs.active() or self.running.graph_closing or self.running.display_engine_active or self.running.display_channel_active != null or
+            self.running.copy_job != null or self.running.display_upload_job != null) return error.State;
+        const work = if (self.running.display_work) |*value| value else return error.Binding;
+        const resources = self.running.display_resources_slot.owner orelse return error.Binding;
+        const root = if (self.running.display_engine_owner) |*value| value else return error.Binding;
+        const root_info = root.info() orelse return error.Binding;
+        if (!resources.valid()) return error.Binding;
+        if (work.handle.epoch != self.epoch or work.handle.slot != 0 or work.deadline != deadline or self.running.display_channels[0] == null or
+            &self.running.display_channels[0].? != channel or channel.config.handle != work.handle.handle or channel.config.kind != .core or
+            channel.parent != root or channel.info() == null or !channel.ring.valid() or resources.instance != &root.instance_storage or
+            !std.meta.eql(resources.binding.?, root.binding) or resources.publishedNotifier(0) != work.notifier or
+            work.config.notifier != work.notifier.handle or work.config.windows != root_info.hardware.windows or
+            work.config.initialize == channel.ring.initialized) return error.Binding;
+        if (access_kind == .publish) {
+            if (work.phase != .prepare or work.ticket == null or !channel.ring.matches(work.ticket.?, work.config)) return error.Binding;
+            if (work.ticket.?.kind == .frame and (work.notifier.phase != .armed or work.notifier.point != work.ticket.?.point or work.notifier.deadline != deadline)) return error.Binding;
+        } else if (work.phase != .prepare and work.phase != .rewind) return error.Binding;
+        const rpc = self.running.activeChannel() orelse return error.State;
+        const canonical = if (self.running.channel) |*value| value else return error.State;
+        if (rpc != canonical or rpc.session != &self.session.? or port.runtime_session != rpc.session or rpc.session.pending != null or
+            rpc.phase != .idle or rpc.pending != null or rpc.in_lockdown or rpc.request.len != 0) return error.Binding;
         try rpc.guard(deadline);
     }
     fn access(raw: *anyopaque, kind: native.Access, address: u32) !void {
