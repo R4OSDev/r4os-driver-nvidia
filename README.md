@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.60; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.61; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -11,6 +11,16 @@ Starting with R4OS 0.79.9, `IMAGE_SCOPE=slim` includes the current module in
 Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
+
+Observed head routing (NVIDIA 0.1.61, 2026-09-12):
+
+The existing RM channel now reads total head count and each active display
+assignment, including firmware state. It repeats the observation around the
+port pass and discards changed generations. Rejected heads stay unknown;
+zero means successfully observed inactive. These observations never become
+mode capabilities or routing leases. Existing 51 owner cases and the module
+build pass; fixed layouts are verified against complete pinned 570.144 headers.
+No additional guest run. Details: Docs/Drivers/GrafikEmpfaenger07912.txt/.json.
 
 Receiver catalog publication (NVIDIA 0.1.60 / Kernel 0.1.153, 2026-09-12):
 
@@ -348,8 +358,8 @@ Errors retain exact status, and ambiguous failures retain graph ownership.
 module build pass. NVIDIA 0.1.44 stays byte-identical. Six complete original
 references/logs: ExFiles/Reference/GFX/Nvidia/0.79.12/topology-20260911;
 topology_checkpoint in Docs/Drivers/GrafikFirmware07910.json. No new gate.
-Native integration, hardware corroboration, head assignment, receiver/
-catalog publication and physical HDMI/audio remain open. OssiPC untouched.
+This historical preparation is integrated by NVIDIA 0.1.59-0.1.61 above.
+Bus transport completion and physical HDMI/audio qualification remain open.
 
 Coherent receiver refresh with shared R4GFX parser (source preparation, 2026-09-11):
 

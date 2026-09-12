@@ -202,6 +202,15 @@ pub const Owner = struct {
                         self.outputs.data.topology.count, self.outputs.data.count});
                 if (self.outputs.data.final_rejection orelse self.outputs.data.topology.rejected) |rejected|
                     self.log("NVIDIA gsp-outputs: rejected command={x} rpc={?} rm={?}", .{@intFromEnum(rejected.command), rejected.rpc, rejected.control});
+                if (self.outputs.data.coherent) {
+                    const catalog = &self.outputs.data.topology;
+                    self.log("NVIDIA gsp-heads: generation={d} count={?} observation=queried lease=no", .{self.output_generation, catalog.head_count});
+                    for (catalog.routes[0..catalog.count]) |*route|
+                        self.log("NVIDIA gsp-route: display={x} active-heads={?} or={?} dcb-slot={?} ddc-port={?} communication-port={?}",
+                            .{route.id, catalog.activeHeads(route.id), if (route.resource) |resource| resource.index else null,
+                                if (route.resource) |resource| resource.dcb_index else null, if (route.buses) |buses| buses.ddc else null,
+                                if (route.buses) |buses| buses.communication else null});
+                }
                 return .progress;
             }
             const before = self.outputs.data.count;

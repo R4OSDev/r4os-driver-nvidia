@@ -106,8 +106,9 @@ pub const function: u32 = 76;
 pub const header_bytes = 24;
 pub const max_edid_bytes = 2048;
 pub const max_request_bytes = header_bytes + 16 + max_edid_bytes;
-pub const Command = enum(u32) { supported = 0x730107, connected = 0x730108, edid = 0x730245, connectors = 0x730250, resource = 0x73028b, buses = 0x730211 };
-pub const Query = union(Command) { supported: void, connected: u32, edid: u32, connectors: u32, resource: u32, buses: u32 };
+pub const max_heads = 32;
+pub const Command = enum(u32) { heads = 0x730102, active = 0x73010c, supported = 0x730107, connected = 0x730108, edid = 0x730245, connectors = 0x730250, resource = 0x73028b, buses = 0x730211 };
+pub const Query = union(Command) { heads: void, active: u32, supported: void, connected: u32, edid: u32, connectors: u32, resource: u32, buses: u32 };
 pub const Object = struct { epoch: u64, client: u32, display: u32 };
 pub const Supported = struct { displays: u32, ddc: u32 };
 pub const Connector = struct { index: u32 = 0, kind: u32 = 0, location: u32 = 0 };
@@ -138,6 +139,8 @@ pub const Resource = struct {
 };
 pub const Buses = struct { communication: u32, ddc: u32 }; // RM port IDs; zero means NONE, not CCB index 0.
 pub const Reply = union(enum) {
+    heads: u32,
+    active: u32,
     supported: Supported,
     connected: u32,
     connectors: Connectors,
@@ -166,7 +169,8 @@ fn put(bytes: []u8, offset: usize, value: u32) void {
 }
 fn paramsSize(query: Query) usize {
     return switch (query) {
-        .supported => 12,
+        .supported, .heads => 12,
+        .active => 16,
         .connected => 16,
         .edid => 16 + max_edid_bytes,
         .connectors => 72,
@@ -184,7 +188,8 @@ fn oneBit(mask: u32) bool {
 pub fn encode(object: Object, query: Query, output: []u8) Error![]const u8 {
     if (object.epoch == 0 or object.client == 0 or object.display == 0) return error.Handle;
     switch (query) {
-        .supported => {},
+        .supported, .heads => {},
+        .active => |head| if (head >= max_heads) return error.Query,
         .connected => |mask| if (mask == 0) return error.Query,
         .edid, .connectors, .resource, .buses => |id| if (!oneBit(id)) return error.Query,
     }
@@ -200,7 +205,8 @@ pub fn encode(object: Object, query: Query, output: []u8) Error![]const u8 {
     // with COPY_CACHE=NO and DISPMUX=DEFAULT. Display IDs are RM masks,
     // never VBIOS physical connector indices or GPIO numbers.
     switch (query) {
-        .supported => {},
+        .supported, .heads => {},
+        .active => |head| put(bytes, header_bytes + 4, head),
         .connected => |mask| put(bytes, header_bytes + 8, mask),
         .connectors, .resource, .buses => |id| put(bytes, header_bytes + 4, id),
         .edid => |id| {
@@ -231,6 +237,16 @@ pub fn decode(object: Object, query: Query, record: message.Record) Error!Reply 
     const params = bytes[header_bytes..];
     if (word(params, 0) != 0) return error.Unexpected;
     return switch (query) {
+        .heads => blk: {
+            if (word(params, 4) != 0 or word(params, 8) > max_heads) return error.Payload;
+            break :blk .{ .heads = word(params, 8) };
+        },
+        .active => |head| blk: {
+            if (word(params, 4) != head or word(params, 8) != 0) return error.Unexpected;
+            const id = word(params, 12);
+            if (id != 0 and !oneBit(id)) return error.Payload;
+            break :blk .{ .active = id };
+        },
         .supported => blk: {
             const supported = Supported{ .displays = word(params, 4), .ddc = word(params, 8) };
             if (supported.ddc & ~supported.displays != 0) return error.Payload;
@@ -274,6 +290,7 @@ pub const Channel = struct {
     request_bytes: [max_request_bytes]u8 = undefined,
     request_revision: u64 = 0,
     supported: ?Supported = null,
+    heads: ?u32 = null,
     connected: u32 = 0,
     pending: ?Dispatch = null,
 
@@ -286,11 +303,13 @@ pub const Channel = struct {
     }
     fn fail(self: *Channel, reason: Error) Error {
         self.connected = 0;
+        self.heads = null;
         return self.exchange.fail(reason);
     }
     pub fn invalidate(self: *Channel) Error!void {
         try self.exchange.invalidate();
         self.connected = 0;
+        self.heads = null;
     }
     pub fn begin(self: *Channel, query: Query, deadline: u64) Error!void {
         if (self.exchange.phase != .idle) return error.State;
@@ -298,6 +317,11 @@ pub const Channel = struct {
         self.exchange.guard(@min(self.exchange.deadline orelse deadline, deadline)) catch |err| return self.fail(err);
         switch (query) {
             .supported => {},
+            .heads => if (self.supported == null) return error.Query,
+            .active => |head| {
+                const count = self.heads orelse return error.Query;
+                if (head >= count) return error.Query;
+            },
             .connected => |mask| {
                 const available = self.supported orelse return error.Query;
                 if (mask == 0 or mask & ~available.displays != 0) return error.Query;
@@ -337,7 +361,10 @@ pub const Channel = struct {
             if (err == error.Pending) return err;
             return self.fail(err);
         } orelse return null;
-        if (self.exchange.revision != old_revision) self.connected = 0;
+        if (self.exchange.revision != old_revision) {
+            self.connected = 0;
+            self.heads = null;
+        }
         var dispatch = Dispatch{ .ticket = received.ticket, .rpc = received.record.rpc, .value = undefined };
         if (received.response) {
             var reply = decode(self.object, self.request.?, received.record) catch |err| return self.fail(err);
@@ -372,7 +399,9 @@ pub const Channel = struct {
                     .supported => |value| {
                         self.supported = value;
                         self.connected = 0;
+                        self.heads = null;
                     },
+                    .heads => |value| self.heads = value,
                     .connected => |mask| self.connected = (self.connected & ~self.request.?.connected) | mask,
                     else => {},
                 }
@@ -391,6 +420,7 @@ pub const Channel = struct {
         const runtime = try self.exchange.handoff(deadline);
         self.connected = 0;
         self.supported = null;
+        self.heads = null;
         return runtime;
     }
 };

@@ -2334,6 +2334,11 @@ fn checkDeviceOutputs(target: *@import("gsp_device.zig").Device, words: []u32, f
             interleaved = true;
         }
         switch (query) {
+            .heads => outputWord(payload, 32, if (scenario == .outputs_empty) 0 else if (scenario == .outputs_all) 32 else 4),
+            .active => |head| {
+                outputWord(payload, 36, if (head == 0) mask & 1 else if (head == 3) mask & 0x80000000 else 0);
+                if (scenario == .outputs_partial and head == 1) outputWord(payload, 12, 0x55);
+            },
             .supported => {
                 const changed = (scenario == .outputs_changed and owner.state == .topology and owner.probe.?.state == .verify) or
                     (scenario == .outputs_final_changed and owner.state == .final_check);
@@ -2424,8 +2429,10 @@ fn checkDeviceOutputs(target: *@import("gsp_device.zig").Device, words: []u32, f
     if (scenario == .outputs_partial) try t.expect(data.topology.routes[0].connectors == null and data.topology.routes[0].rejections[0].?.control.? == 0x55)
     else try t.expect(data.topology.routes[0].connectors.?.data[0].index == 17 and data.topology.routes[0].connectors.?.data[1].kind == 0xffffffff);
     try t.expect(data.topology.routes[0].buses.?.communication == 0 and data.topology.routes[0].buses.?.ddc == 37);
+    if (scenario == .outputs_partial) try t.expect(data.topology.activeHeads(1) == null and data.topology.heads[1].rejected.?.control.? == 0x55)
+    else try t.expect(data.topology.activeHeads(1).? == 1 and data.topology.activeHeads(0x80000000).? == 8);
     if (scenario == .outputs_all) {
-        try t.expect(requests == 163 and data.final_receipt_serial != 0 and data.receivers[31].display_id == 0x80000000);
+        try t.expect(requests == 229 and data.final_receipt_serial != 0 and data.receivers[31].display_id == 0x80000000);
         for (&data.receivers) |*capture| try t.expect(capture.status == .disconnected and capture.edid_bytes == 0);
     } else {
         const expected_status: @import("gsp_receiver.zig").Status = switch (scenario) {

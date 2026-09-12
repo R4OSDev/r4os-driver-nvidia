@@ -679,7 +679,7 @@ fn displayReply(model: *Model, channel: *display_rpc.Channel, status: u32, value
                 byte.* = @truncate(i);
             };
         },
-        .connectors, .resource, .buses => unreachable, // Dedicated bounded topology fixture below.
+        .heads, .active, .connectors, .resource, .buses => unreachable, // Dedicated bounded topology fixture below.
     }
     // The RPC sequence and private result deliberately do not echo the request.
     try model.replyRpc(channel.exchange.session, .{ .function = 76, .result = 0, .result_private = 0x19283746, .sequence = 0xdeadbeef }, encoded);
@@ -700,9 +700,9 @@ fn checkDisplayRpc(model: *Model) !void {
     // Original-header byte offsets, sizes and command IDs are independent
     // of the encoder, and travel through the real framing/queue model below.
     var payload: [2089]u8 = undefined;
-    const queries = [_]display_rpc.Query{ .supported, .{ .connected = 0x80000005 }, .{ .edid = 0x80000000 }, .{ .connectors = 0x80000000 }, .{ .resource = 0x80000000 }, .{ .buses = 0x80000000 } };
-    const sizes = [_]usize{ 36, 40, 2088, 96, 80, 40 };
-    const commands = [_]u32{ 0x730107, 0x730108, 0x730245, 0x730250, 0x73028b, 0x730211 };
+    const queries = [_]display_rpc.Query{ .supported, .{ .connected = 0x80000005 }, .{ .edid = 0x80000000 }, .{ .connectors = 0x80000000 }, .{ .resource = 0x80000000 }, .{ .buses = 0x80000000 }, .heads, .{ .active = 31 } };
+    const sizes = [_]usize{ 36, 40, 2088, 96, 80, 40, 36, 40 };
+    const commands = [_]u32{ 0x730107, 0x730108, 0x730245, 0x730250, 0x73028b, 0x730211, 0x730102, 0x73010c };
     for (queries, sizes, commands) |query, size, command| {
         @memset(&payload, 0xa5);
         const bytes = try display_rpc.encode(display_object, query, &payload);
@@ -711,6 +711,8 @@ fn checkDisplayRpc(model: *Model) !void {
         for ([_]u32{ 0xc100, 0xd073, command, 0, @intCast(size - 24), 0, 0 }, 0..) |value, i|
             try t.expectEqual(value, get(bytes, i * 4));
         if (query == .connected) try t.expectEqual(@as(u32, 0x80000005), get(bytes, 32));
+        if (query == .heads) try t.expect(get(bytes, 28) == 0 and get(bytes, 32) == 0);
+        if (query == .active) try t.expect(get(bytes, 28) == 31 and get(bytes, 32) == 0 and get(bytes, 36) == 0);
         if (query == .edid) {
             try t.expectEqual(@as(u32, 0x80000000), get(bytes, 28));
             try t.expectEqual(@as(u32, 0), get(bytes, 32));
@@ -1887,7 +1889,7 @@ fn checkReceiver(model: *Model) !void {
     }
 }
 
-fn topologyReply(model: *Model, probe: *topology.Discovery, status: u32, mask: u32) !void {
+fn topologyReply(model: *Model, probe: *topology.Discovery, status: u32, mask: u32, head_count: u32, head_changed: bool) !void {
     const query = probe.channel.request.?;
     // A replying firmware peer has consumed this command. Advance its read
     // cursor so discovery of all 32 IDs exercises real ring wraparound,
@@ -1899,6 +1901,8 @@ fn topologyReply(model: *Model, probe: *topology.Discovery, status: u32, mask: u
     const payload = try display_rpc.encode(probe.channel.object, query, &bytes);
     put(&bytes, 12, status);
     switch (query) {
+        .heads => put(&bytes, 32, head_count),
+        .active => |head| put(&bytes, 36, if (head_changed) 0 else if (head == 0) mask & 1 else if (head == head_count - 1) mask & 0x80000000 else 0),
         .connectors => {
             put(&bytes, 32, 1);
             put(&bytes, 36, 0x80000005);
@@ -1956,10 +1960,21 @@ fn checkTopology(model: *Model) !void {
     raw[72] = 2;
     try t.expectError(error.Payload, display_rpc.decode(display_object, .{ .resource = 1 }, record));
     for ([_]display_rpc.Query{ .{ .connectors = 0 }, .{ .resource = 3 }, .{ .buses = 0xffffffff } }) |query| try t.expectError(error.Query, display_rpc.encode(display_object, query, &raw));
+    try t.expectError(error.Query, display_rpc.encode(display_object, .{ .active = 32 }, &raw));
+    encoded = try display_rpc.encode(display_object, .heads, &raw);
+    record.payload = encoded;
+    put(&raw, 32, 33);
+    try t.expectError(error.Payload, display_rpc.decode(display_object, .heads, record));
+    encoded = try display_rpc.encode(display_object, .{ .active = 0 }, &raw);
+    record.payload = encoded;
+    put(&raw, 36, 3);
+    try t.expectError(error.Payload, display_rpc.decode(display_object, .{ .active = 0 }, record));
+    put(&raw, 36, 0);
+    try t.expect((try display_rpc.decode(display_object, .{ .active = 0 }, record)).active == 0);
 
     const catalog = try t.allocator.create(topology.Catalog);
     defer t.allocator.destroy(catalog);
-    const Case = enum { valid, empty, full, changed, partial, verify_error, hpd, canceled, ack, expiry, release_expired };
+    const Case = enum { valid, empty, full, changed, partial, verify_error, hpd, canceled, ack, expiry, release_expired, heads_rejected, active_rejected, head_changed, head_count_changed };
     for (std.enums.values(Case)) |case| {
         var session: transport.Session = undefined;
         var boot = try startBoot(model, &session);
@@ -1971,6 +1986,8 @@ fn checkTopology(model: *Model) !void {
         model.count = 0;
         var probe = try topology.Discovery.init(&owner, catalog, deadline);
         try t.expectError(error.Query, probe.channel.begin(.{ .connectors = 1 }, deadline));
+        try t.expectError(error.Query, probe.channel.begin(.heads, deadline));
+        try t.expectError(error.Query, probe.channel.begin(.{ .active = 0 }, deadline));
         try probe.release(deadline);
         try t.expect(owner.state == .ready and model.count == 0);
         probe = try topology.Discovery.init(&owner, catalog, deadline);
@@ -1981,7 +1998,7 @@ fn checkTopology(model: *Model) !void {
         };
         var steps: usize = 0;
         while (probe.state != .complete and probe.state != .obsolete and probe.state != .failed) : (steps += 1) {
-            try t.expect(steps < 110);
+            try t.expect(steps < 180);
             model.count = 0;
             try t.expectError(error.State, probe.borrow(deadline));
             if (case == .canceled and probe.state == .resource) {
@@ -2007,8 +2024,12 @@ fn checkTopology(model: *Model) !void {
                 try dispatch.step();
                 try t.expect(probe.channel.exchange.phase == .waiting);
             }
-            const status: u32 = if ((case == .partial and probe.state == .connectors) or (case == .verify_error and probe.state == .verify)) 0x55 else 0;
-            try topologyReply(model, &probe, status, if (case == .changed and probe.state == .verify) 1 else mask);
+            const status: u32 = if ((case == .partial and probe.state == .connectors) or (case == .verify_error and probe.state == .verify) or
+                (case == .heads_rejected and (probe.state == .heads or probe.state == .verify_heads)) or
+                (case == .active_rejected and (probe.state == .active or probe.state == .verify_active) and probe.head_cursor == 1)) 0x55 else 0;
+            const count: u32 = if (case == .empty) 0 else if (case == .full) 32 else if (case == .head_count_changed and probe.state == .verify_heads) 3 else 4;
+            try topologyReply(model, &probe, status, if (case == .changed and probe.state == .verify) 1 else mask, count,
+                case == .head_changed and probe.state == .verify_active and probe.head_cursor == 0);
             if (case == .ack and probe.state == .resource) {
                 model.fault = model.count + 4;
                 model.after = true;
@@ -2026,7 +2047,7 @@ fn checkTopology(model: *Model) !void {
             try t.expect((try probe.poll()) == null);
         }
         if (probe.state == .failed) continue;
-        if (case == .hpd or case == .changed or case == .canceled) {
+        if (case == .hpd or case == .changed or case == .canceled or case == .head_changed or case == .head_count_changed) {
             try t.expect(probe.state == .obsolete and session.pending == null);
             try t.expectError(error.State, probe.borrow(deadline));
         } else {
@@ -2034,6 +2055,13 @@ fn checkTopology(model: *Model) !void {
             try t.expect(value.epoch == session.epoch and value.client == owner.reservation.client and value.receipt_serial != 0);
             try t.expectEqual(@as(usize, if (case == .verify_error) 0 else @popCount(mask)), value.count);
             if (case == .verify_error) try t.expect(value.rejected.?.control.? == 0x55 and value.supported == null);
+            if (case == .heads_rejected) try t.expect(value.head_count == null and value.heads_rejected.?.control.? == 0x55 and value.activeHeads(1) == null)
+            else if (case == .active_rejected) try t.expect(value.heads[1].display_id == null and value.heads[1].rejected.?.control.? == 0x55 and value.activeHeads(1) == null)
+            else if (case == .empty) try t.expect(value.head_count.? == 0 and value.activeHeads(1).? == 0)
+            else if (case != .verify_error) {
+                try t.expect(value.activeHeads(1).? == 1 and value.activeHeads(4).? == 0);
+                try t.expect(value.activeHeads(0x80000000).? == @as(u32, if (case == .full) 0x80000000 else 8));
+            }
             if (case == .valid or case == .partial) {
                 const first = &value.routes[0];
                 const dynamic = &value.routes[2];

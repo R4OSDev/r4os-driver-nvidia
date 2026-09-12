@@ -1,3 +1,26 @@
+// Nvidia570.144/src/common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073system.h
+// /*
+//  * SPDX-FileCopyrightText: Copyright (c) 2005-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//  * SPDX-License-Identifier: MIT
+//  *
+//  * Permission is hereby granted, free of charge, to any person obtaining a
+//  * copy of this software and associated documentation files (the "Software"),
+//  * to deal in the Software without restriction, including without limitation
+//  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//  * and/or sell copies of the Software, and to permit persons to whom the
+//  * Software is furnished to do so, subject to the following conditions:
+//  *
+//  * The above copyright notice and this permission notice shall be included in
+//  * all copies or substantial portions of the Software.
+//  *
+//  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+//  * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+//  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+//  * DEALINGS IN THE SOFTWARE.
+//  */
 // NVIDIA570.144 topology controls/NVKMS (MIT), with independent Nouveau
 // discovery reference (MIT). Original R4OS ownership/relations: Apache-2.0.
 // Nvidia570.144/src/common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073specific.h
@@ -86,6 +109,7 @@ pub const Route = struct {
     buses: ?display.Buses = null,
     rejections: [3]?Rejection = @splat(null),
 };
+pub const Head = struct { display_id: ?u32 = null, rejected: ?Rejection = null };
 pub const Catalog = struct {
     epoch: u64 = 0,
     client: u32 = 0,
@@ -93,10 +117,26 @@ pub const Catalog = struct {
     receipt_serial: u64 = 0,
     supported: ?display.Supported = null,
     rejected: ?Rejection = null,
+    head_count: ?u32 = null,
+    heads_rejected: ?Rejection = null,
+    heads: [display.max_heads]Head = @splat(.{}),
     count: usize = 0,
     routes: [max_routes]Route = @splat(.{}),
+
+    /// Current observed assignments, not a lease or a possible-routing mask.
+    /// One rejected head leaves the aggregate unknown; zero is known inactive.
+    pub fn activeHeads(self: *const Catalog, id: u32) ?u32 {
+        if (id == 0 or id & (id - 1) != 0) return null;
+        const count = self.head_count orelse return null;
+        var mask: u32 = 0;
+        for (self.heads[0..count], 0..) |head, index| {
+            const current = head.display_id orelse return null;
+            if (current == id) mask |= @as(u32, 1) << @as(u5, @intCast(index));
+        }
+        return mask;
+    }
 };
-pub const State = enum { supported, connectors, resource, buses, verify, drain, complete, obsolete, failed, released };
+pub const State = enum { supported, heads, active, connectors, resource, buses, verify_heads, verify_active, verify, drain, complete, obsolete, failed, released };
 
 /// A relation to the validated passive VBIOS, not an active routing lease.
 /// RM's explicit dcb_index selects the original DCB slot, never log2(id).
@@ -127,6 +167,7 @@ pub const Discovery = struct {
     state: State = .supported,
     deadline: u64,
     cursor: usize = 0,
+    head_cursor: u32 = 0,
     self_address: usize = 0,
     invalidated: bool = false,
     failure: ?Error = null,
@@ -163,6 +204,8 @@ pub const Discovery = struct {
     fn query(self: *Discovery) Error!display.Query {
         return switch (self.state) {
             .supported, .verify => .supported,
+            .heads, .verify_heads => .heads,
+            .active, .verify_active => .{ .active = self.head_cursor },
             .connectors => .{ .connectors = self.catalog.routes[self.cursor].id },
             .resource => .{ .resource = self.catalog.routes[self.cursor].id },
             .buses => .{ .buses = self.catalog.routes[self.cursor].id },
@@ -180,10 +223,35 @@ pub const Discovery = struct {
             .resource => self.state = .buses,
             .buses => {
                 self.cursor += 1;
-                self.state = if (self.cursor == self.catalog.count) .verify else .connectors;
+                self.state = if (self.cursor == self.catalog.count) .verify_heads else .connectors;
             },
             else => unreachable,
         }
+    }
+    fn nextHead(self: *Discovery) void {
+        self.head_cursor += 1;
+        if (self.head_cursor == self.catalog.head_count.?)
+            self.state = if (self.state == .active) (if (self.catalog.count == 0) State.verify_heads else State.connectors) else .verify;
+    }
+    fn takeHeads(self: *Discovery, count: ?u32, rejection: ?Rejection) void {
+        const verifying = self.state == .verify_heads;
+        if (verifying) {
+            if (self.catalog.head_count != count) self.invalidated = true;
+        } else {
+            self.catalog.head_count = count;
+            self.catalog.heads_rejected = rejection;
+        }
+        self.head_cursor = 0;
+        self.state = if (count != null and count.? != 0 and !self.invalidated)
+            (if (verifying) State.verify_active else State.active)
+        else if (verifying) .verify else if (self.catalog.count == 0) .verify_heads else .connectors;
+    }
+    fn takeActive(self: *Discovery, value: Head) void {
+        if (value.display_id) |id| if (id & ~self.catalog.supported.?.displays != 0) { self.invalidated = true; };
+        if (self.state == .verify_active) {
+            if (self.catalog.heads[self.head_cursor].display_id != value.display_id) self.invalidated = true;
+        } else self.catalog.heads[self.head_cursor] = value;
+        self.nextHead();
     }
     fn consume(self: *Discovery, reply: display.Reply) Error!void {
         if (reply == .obsolete) {
@@ -192,7 +260,11 @@ pub const Discovery = struct {
         }
         if (reply == .rpc_error or reply == .control_error) {
             const rejection = Rejection{ .command = std.meta.activeTag(try self.query()), .rpc = if (reply == .rpc_error) reply.rpc_error else null, .control = if (reply == .control_error) reply.control_error else null };
-            if (self.state == .supported or self.state == .verify) {
+            if (self.state == .heads or self.state == .verify_heads) {
+                self.takeHeads(null, rejection);
+            } else if (self.state == .active or self.state == .verify_active) {
+                self.takeActive(.{ .rejected = rejection });
+            } else if (self.state == .supported or self.state == .verify) {
                 // No successful final supported-mask comparison: no usable
                 // catalog, even if earlier per-display queries succeeded.
                 self.catalog.rejected = rejection;
@@ -221,7 +293,15 @@ pub const Discovery = struct {
                     self.catalog.routes[self.catalog.count] = .{ .id = id };
                     self.catalog.count += 1;
                 }
-                self.state = if (self.catalog.count == 0) .verify else .connectors;
+                self.state = .heads;
+            },
+            .heads, .verify_heads => {
+                if (reply != .heads) return error.Unexpected;
+                self.takeHeads(reply.heads, null);
+            },
+            .active, .verify_active => {
+                if (reply != .active) return error.Unexpected;
+                self.takeActive(.{ .display_id = reply.active });
             },
             .verify => {
                 if (reply != .supported) return error.Unexpected;
