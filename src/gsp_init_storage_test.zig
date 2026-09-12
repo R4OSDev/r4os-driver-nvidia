@@ -1523,6 +1523,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         control_short, control_bounds, control_map_address, control_ack, control_timeout, control_unmap, control_free, control_dma_unmap, control_release, control_gpu_acquire, control_gpu_release,
         memory_caps_reject, memory_caps_none, memory_caps_rpc, memory_caps_short, memory_caps_wrong, memory_caps_ack, memory_caps_timeout,
         mapping_success, mapping_reject, mapping_offset, mapping_ack, mapping_timeout, mapping_release, mapping_segment, mapping_gpu,
+        vram_success, vram_budget, vram_physical_reject, vram_virtual_reject, vram_map_reject, vram_commit, vram_size, vram_ack, vram_timeout, vram_free, vram_finish,
         outputs_empty, outputs_all, outputs_rejected, outputs_partial, outputs_missing, outputs_incomplete, outputs_bad_edid,
         outputs_edid_rejected, outputs_ddc, outputs_ddc_bus_changed, outputs_aux, outputs_wiring, outputs_virtual, outputs_changed, outputs_final_changed, outputs_final_rejected, outputs_hpd, outputs_sequence, outputs_ack, outputs_timeout, catalog_rejected,
         runtime_healthy, runtime_lockdown, runtime_unknown, runtime_unowned, runtime_sequence_timeout,
@@ -1673,6 +1674,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
             if (target.phase == .ready) try checkDeviceIrq(target, words, held.plan.?.frts.offset, case);
             if (target.phase == .ready and !target.stopped) try checkDeviceRm(target, words, held.plan.?.frts.offset, case);
             if (target.phase == .ready and std.mem.startsWith(u8, @tagName(case), "mapping_")) try checkDeviceMappings(target, table, @tagName(case));
+            if (target.phase == .ready and std.mem.startsWith(u8, @tagName(case), "vram_")) try checkDeviceVram(target, table, @tagName(case));
             if (target.phase == .ready and !target.stopped) try checkDeviceOutputs(target, words, held.plan.?.frts.offset, case);
             if (exercise_runtime) try checkDeviceRuntime(target, words, held.plan.?.frts.offset, case);
         } else {
@@ -2566,6 +2568,139 @@ fn outputEdidFull(bytes: *[4096]u8) void {
     bytes[127] -%= 30;
     for (2..32) |index| { bytes[index * 128] = 0x99; bytes[index * 128 + 127] = 0 -% @as(u8, 0x99); }
 }
+fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, scenario: []const u8) !void {
+    const model = @import("gsp_vram_test_model.zig").Model;
+    const runtime = @import("gsp_runtime.zig");
+    const running = &target.running;
+    const session = &target.session.?;
+    const deadline = clock + 5 * std.time.ns_per_s;
+    const command = init.queues_offset + init.command_offset;
+    const status = init.queues_offset + init.status_offset;
+    model.install(table, scenario);
+    defer model.dispose(table);
+    var handles: [2]runtime.BufferHandle = undefined;
+    var messages: usize = 0;
+    var interleaved = false;
+    const full = 64 * 1024 * 1024;
+    const total: usize = if (model.is("vram_success")) 2 else 1;
+    errdefer |err| std.debug.print("native VRAM {s}: {s} phase={s} failure={?} active={?} messages={d} charge={d}\n",
+        .{scenario, @errorName(err), @tagName(target.phase), target.failure, running.native_active, messages, model.charged});
+    for (0..total) |index| {
+        const bytes: u64 = if (index == 0) full - 5 else 4091;
+        handles[index] = try running.allocateNativeBuffer(bytes, deadline);
+        var forged = handles[index]; forged.serial += 1;
+        try t.expectError(error.Stale, running.nativeBufferStatus(forged));
+        var steps: usize = 0;
+        while (target.phase == .ready and running.native_active != null and steps < 80) : (steps += 1) {
+            _ = target.step();
+            if (target.phase != .ready or running.native_active == null) break;
+            const channel = running.activeChannel().?;
+            if (channel.phase != .waiting) continue;
+            const owner = running.native_buffers[running.native_active.?].owner.?;
+            const op = owner.operation.?;
+            const cursor = (session.tx_write + 62) % 63;
+            const record = try transport.message.decode(session.profile, backing.?[command + 4096 + cursor * 4096 ..][0..4096], session.tx_sequence - 1);
+            try t.expectEqualSlices(u8, channel.request, record.payload);
+            messages += 1;
+            channel.phase = .prepared;
+            try target.port.owner.?.admit_command.?(target.port.owner.?.context, &target.port, deadline);
+            var moved = owner.*;
+            try t.expect(!moved.matches(channel, deadline));
+            try t.expectError(error.Stale, moved.poll());
+            const original = channel.request; channel.request = record.payload;
+            try t.expectError(error.Binding, target.port.owner.?.admit_command.?(target.port.owner.?.context, &target.port, deadline));
+            channel.request = original; channel.phase = .waiting;
+            std.mem.writeInt(u32, backing.?[status + 64 ..][0..4], session.tx_write, .little);
+            var response: [160]u8 = @splat(0);
+            @memcpy(response[0..channel.request.len], record.payload);
+            if (op == .allocate_memory or op == .allocate_virtual) {
+                try t.expect(std.mem.readInt(u32, response[12..16], .little) == @as(u32, if (op == .allocate_memory) 0x40 else 0x50a0));
+                try t.expect(std.mem.readInt(u64, response[96..104], .little) == owner.bytes);
+                std.mem.writeInt(u64, response[112..120], if (op == .allocate_memory) 0x80000000 else model.address(index), .little);
+                std.mem.writeInt(u64, response[120..128], owner.bytes - 1, .little);
+                if ((op == .allocate_memory and model.is("vram_physical_reject")) or (op == .allocate_virtual and model.is("vram_virtual_reject"))) outputWord(&response, 16, 0x57);
+                if (op == .allocate_memory and model.is("vram_size")) std.mem.writeInt(u64, response[96..104], owner.bytes + 65536, .little);
+            } else if (op == .map) {
+                try t.expect(std.mem.readInt(u32, response[32..36], .little) == 0x100 and model.slots[index].live and !model.slots[index].published);
+                std.mem.writeInt(u64, response[40..48], model.address(index), .little);
+                if (model.is("vram_map_reject")) outputWord(&response, 48, 0x57);
+                if (!interleaved) {
+                    var print: [9]u8 = @splat(0); print[4] = 1; print[8] = 'V';
+                    try nativeEvent(session, 0x100c, &print);
+                    _ = target.step();
+                    try t.expect(channel.phase == .waiting and channel.deadline == deadline and owner.info() == null);
+                    interleaved = true;
+                }
+            }
+            if (op == .map and model.is("vram_timeout")) clock = deadline else {
+                try nativeReply(session, channel.function, 0, response[0..channel.request.len]);
+                if (op == .map and model.is("vram_ack")) range_failure_call = range_calls + 4;
+            }
+            _ = target.step(); range_failure_call = 0;
+        }
+        try t.expect(steps < 80);
+        if (target.phase != .ready) break;
+        const result = try running.nativeBufferStatus(handles[index]);
+        try t.expect(result.state == .handed_off);
+        if (result.info) |info| {
+            try t.expect(info.address == model.address(index) and info.logical_bytes == bytes and info.allocation_bytes == @as(u64, if (index == 0) full else 65536));
+            try t.expect(model.slots[index].published and model.slots[index].reference);
+            var loan = try running.channel.?.handoff(deadline);
+            try running.graph.?.reclaim(&loan, deadline);
+            const sent = session.tx_sequence;
+            try t.expectError(error.Retained, running.graph.?.beginDestroy(deadline));
+            try t.expect(session.tx_sequence == sent);
+            var returned = try running.graph.?.loan(deadline);
+            running.channel = try @import("gsp_exchange.zig").Exchange.init(&returned.runtime, deadline);
+        } else {
+            try t.expect(result.rejected != null or result.host_rejected != null);
+            try t.expect(model.charged == 0 and !model.slots[index].live);
+            try running.releaseNativeBuffer(handles[index]);
+            if (model.is("vram_budget")) try t.expect(messages == 0 and model.aborted == 0) else try t.expect(model.aborted == 1);
+            break;
+        }
+    }
+    if (target.phase == .ready) {
+        if (model.is("vram_success")) model.slots[0].imported = true;
+        if (model.is("vram_success")) @import("gsp_buffer_test_model.zig").Model.closeHeapAdmission(table);
+        try t.expectError(error.Busy, running.beginDestroyGraph(deadline, false));
+        try running.beginDestroyGraph(deadline, true);
+        var steps: usize = 0;
+        while (target.phase == .ready and steps < 160) : (steps += 1) {
+            _ = target.step();
+            if (model.is("vram_success") and model.released == 1 and model.slots[0].imported) {
+                try t.expect(model.charged == full and model.slots[0].live and !model.slots[0].claimed and !model.slots[0].reference);
+                model.slots[0].imported = false;
+            }
+            if (target.phase != .ready) break;
+            const channel = running.activeChannel().?;
+            if (channel.phase != .waiting) continue;
+            var response: [160]u8 = @splat(0); @memcpy(response[0..channel.request.len], channel.request);
+            if (running.native_active) |index| {
+                const owner = running.native_buffers[index].owner.?;
+                try t.expect(owner.state == .destroying and model.slots[index].claimed);
+                if (owner.operation.? == .unmap) {
+                    try t.expect(std.mem.readInt(u64, response[24..32], .little) == model.address(index));
+                    if (model.is("vram_free")) outputWord(&response, 32, 0x57);
+                }
+            } else try t.expect(model.charged == 0); // Before the first parent free.
+            std.mem.writeInt(u32, backing.?[status + 64 ..][0..4], session.tx_write, .little);
+            try nativeReply(session, channel.function, 0, response[0..channel.request.len]);
+            _ = target.step();
+        }
+        try t.expect(steps < 160);
+    }
+    const uncertain = model.is("vram_size") or model.is("vram_ack") or model.is("vram_timeout") or model.is("vram_free") or model.is("vram_finish");
+    try t.expect(target.phase == .recovering and target.failure != null);
+    if (uncertain) {
+        try t.expect(model.charged == full and model.slots[0].live and running.native_buffers[0].owner != null);
+        try t.expect(running.native_buffers[0].owner.?.namespace_live);
+    } else {
+        try t.expect(target.failure.? == error.RmClosed and model.charged == 0);
+        if (model.is("vram_success")) try t.expect(model.released == 2 and model.aborted == 0);
+    }
+}
+
 fn checkDeviceMappings(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, scenario: []const u8) !void {
     const model = @import("gsp_buffer_test_model.zig").Model;
     const runtime = @import("gsp_runtime.zig");
@@ -2684,6 +2819,7 @@ fn checkDeviceMappings(target: *@import("gsp_device.zig").Device, table: *a.Driv
         if (model.is("mapping_release")) break;
     }
     if (target.phase == .ready) {
+        if (model.is("mapping_success")) model.closeHeapAdmission(table);
         try t.expectError(error.Busy, running.beginDestroyGraph(deadline, false));
         try running.beginDestroyGraph(deadline, true);
         var steps: usize = 0;

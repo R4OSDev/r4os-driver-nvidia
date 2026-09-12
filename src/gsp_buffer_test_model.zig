@@ -34,6 +34,8 @@ pub const Model = struct {
         };
     }
     pub fn is(name: []const u8) bool { return std.mem.eql(u8, name, scenario); }
+    pub fn closeHeapAdmission(table: *a.DriverApi) void { table.heap_query = heapClosed; }
+    fn heapClosed(_: *a.DriverHeapApi) callconv(.c) i32 { return a.driver_heap_error_closed; }
     pub fn page(index: usize, offset: u64) u64 { return 0x6000000000 + index * 0x100000000 + offset * 2; }
     pub fn address(index: usize) u64 { return 0x10000000 + index * 0x10000000; }
     fn reference(index: usize) a.GfxBufferHandle { return .{ .id = @intCast(171 + index), .generation = 331 }; }

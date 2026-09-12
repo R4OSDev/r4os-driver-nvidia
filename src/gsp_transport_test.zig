@@ -1724,8 +1724,36 @@ fn checkRmGraph(model: *Model) !void {
         }
         try t.expect(offset == golden.len and address == 0x600000 and wire.max_registration_pages == 8175);
         try t.expectError(error.Bounds, wire.validatePart(binding, .{ .total_bytes = 4096, .offset = 4096, .byte_length = 4096 }));
-        try t.expectError(error.Bounds, wire.validatePart(binding, .{ .total_bytes = 80 * 1024 * 1024, .byte_length = 8176 * 4096 }));
+        const large: wire.Part = .{ .total_bytes = 80 * 1024 * 1024, .byte_length = 8176 * 4096 };
+        try wire.validatePart(binding, large); // Valid VA extent; only registration is transport bounded.
+        var small: [160]u8 = undefined;
+        try t.expectError(error.Bounds, wire.encodePart(binding, large, .register, &.{}, 0, &small));
         try t.expectError(error.Bounds, wire.encodePart(binding, part, .map, &.{}, 0, &request));
+    }
+    {
+        const wire = @import("gsp_vram_wire.zig");
+        const golden = @embedFile("fixtures/vram-570.144.bin");
+        const binding: wire.Binding = .{ .space = .{ .epoch = 7, .client = 0xc1d00000, .device = 0x10000000, .handle = 0x10000006,
+            .base = 0x200000, .bytes = 0x100000000, .big_page_bytes = 65536 }, .memory = 0x10000007, .virtual = 0x10000008 };
+        var request: [160]u8 = undefined;
+        var address: u64 = 0;
+        var offset: usize = 0;
+        for (std.enums.values(wire.Operation)) |operation| {
+            const encoded = try wire.encode(binding, 64 * 1024 * 1024, operation, address, &request);
+            const size = encoded.bytes.len;
+            try t.expectEqualSlices(u8, golden[offset..][0..size], encoded.bytes);
+            const reply = try wire.decode(binding, 64 * 1024 * 1024, operation, encoded.bytes,
+                .{ .shape = .{ .message_bytes = size + 80, .checksum_bytes = size + 80, .storage_bytes = 4096, .elements = 1 },
+                    .queue_sequence = 0, .rpc = .{ .function = encoded.function, .result = 0 }, .payload = golden[offset+size..][0..size] }, address);
+            try t.expect(reply == .ok);
+            if (operation == .allocate_virtual) address = reply.ok;
+            offset += size * 2;
+        }
+        try t.expect(offset == 896 and golden.len == 896 and address == 0x600000);
+        var wide_space = binding; wide_space.space.bytes = @as(u64, 1) << 48;
+        // A virtual allocation has no 32-bit page-count field. Its encoder
+        // must not narrow the extent as though it were a registration list.
+        _ = try wire.encode(wide_space, @as(u64, 1) << 46, .allocate_virtual, 0, &request);
     }
     // Bounded bookkeeping capacity is separate from consumed wire IDs.
     var ledger = try rm_names.Ledger.init(7);

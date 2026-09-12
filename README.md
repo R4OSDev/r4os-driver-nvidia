@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.70; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.71; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -11,6 +11,21 @@ Starting with R4OS 0.79.9, `IMAGE_SCOPE=slim` includes the current module in
 Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
+
+Native driver-owned VRAM (NVIDIA 0.1.71 / Kernel 0.1.157):
+The runtime reserves a common BO, allocates RM-owned local memory and a
+GPU-VA mapping, then commits the reference after acknowledged success.
+Raw linear transfer BOs use 64-KB allocation alignment and 4-KB GPU pages.
+RM owns physical placement; no allocator is inferred from screened regions.
+Logical reference release waits for imports/queue/device uses, then exact
+common tickets gate unmap/free and budget release before parent teardown.
+Closing cleanup uses cached BO and heap tables; uncertain effects retain
+resources. The optional 152-byte memory table preserves its 112-byte prefix.
+Existing51 NVIDIA groups, original896-byte C pairs, builds and a focused
+SMP4 common-owner case pass. Engine consumers, instance resources, surface
+layouts and channels remain open; no execution backend or physical claim.
+Evidence: GrafikSpeicher07911.json / owned_vram_checkpoint.
+The following checkpoints describe earlier implementation stages.
 
 General queued-system-BO mappings (NVIDIA 0.1.70 / Kernel 0.1.156):
 The actual runtime maps queue-retained source/target references through

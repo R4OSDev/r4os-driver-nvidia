@@ -232,7 +232,7 @@ pub fn validatePart(binding: Binding, part: Part) Error!void {
     if (part.total_bytes == 0 or part.byte_length == 0 or
         (part.total_bytes | part.offset | part.byte_length) & 4095 != 0 or
         part.total_bytes > info.bytes or part.byte_length > part.total_bytes or
-        part.offset > part.total_bytes - part.byte_length or part.byte_length / 4096 > max_registration_pages) return error.Bounds;
+        part.offset > part.total_bytes - part.byte_length) return error.Bounds;
 }
 pub fn function(operation: Operation) u32 {
     return switch (operation) {
@@ -268,9 +268,9 @@ pub fn encodePart(binding: Binding, part: Part, operation: Operation, page_addre
     try validatePart(binding, part);
     const size = partLength(operation, part);
     if (out.len < size) return error.Bounds;
-    const page_count: u32 = @intCast(part.byte_length / 4096);
     if (operation == .register) {
-        if (page_addresses.len != page_count) return error.Bounds;
+        if (part.byte_length / 4096 > max_registration_pages) return error.Bounds;
+        if (page_addresses.len != part.byte_length / 4096) return error.Bounds;
         for (page_addresses) |page| {
             if (page == 0 or page & 4095 != 0 or page >= @as(u64, 1) << 47) return error.Bounds;
         }
@@ -281,6 +281,7 @@ pub fn encodePart(binding: Binding, part: Part, operation: Operation, page_addre
     put(dst, 0, binding.space.client);
     switch (operation) {
         .register => {
+            const page_count: u32 = @intCast(part.byte_length / 4096);
             put(dst, 4, binding.space.device);
             put(dst, 8, binding.memory);
             put(dst, 12, 0x81);
@@ -337,6 +338,7 @@ pub fn decodePart(binding: Binding, part: Part, operation: Operation, request: [
     // Registration has no secondary status or output. The pinned RPC caller
     // consumes only the RPC status, including a payload-free acknowledgement.
     if (operation == .register) {
+        if (part.byte_length / 4096 > max_registration_pages) return error.Bounds;
         if (record.payload.len != 0 and !std.mem.eql(u8, request, record.payload)) return error.Payload;
         return if (record.rpc.result == 0) .{ .ok = 0 } else .{ .rejected = record.rpc.result };
     }

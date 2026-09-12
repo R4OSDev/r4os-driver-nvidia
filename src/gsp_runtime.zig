@@ -45,9 +45,12 @@ const subscriptions = @import("gsp_event_objects.zig");
 const outputs = @import("gsp_outputs.zig");
 const inventory = @import("gsp_memory_inventory.zig");
 pub const buffer_mapping = @import("gsp_buffer_mapping.zig");
+pub const vram = @import("gsp_vram.zig");
 pub const BufferHandle = struct { epoch: u64, serial: u64, slot: u16 };
 pub const BufferStatus = struct { state: buffer_mapping.State, info: ?buffer_mapping.Info, rejected: ?u32, host_rejected: ?buffer_mapping.Error };
-const BufferSlot = struct { owner: ?*buffer_mapping.Owner = null, allocation: r4os.abi.DriverHeapAllocation = .{}, serial: u64 = 0 };
+const BufferSlot = struct { owner: ?*buffer_mapping.Owner = null, allocation: r4os.abi.DriverHeapAllocation = .{}, heap: ?r4os.r4dev.DriverHeapContext = null, serial: u64 = 0 };
+pub const NativeBufferStatus = struct { state: vram.State, info: ?vram.Info, rejected: ?u32, host_rejected: ?i32 };
+const NativeBufferSlot = struct { owner: ?*vram.Owner = null, allocation: r4os.abi.DriverHeapAllocation = .{}, heap: ?r4os.r4dev.DriverHeapContext = null, serial: u64 = 0 };
 pub const Progress = enum { idle, progress };
 pub const Snapshot = struct {
     polls: u64 = 0,
@@ -98,6 +101,8 @@ pub const Owner = struct {
     buffers: [256]BufferSlot = @splat(.{}),
     buffer_active: ?u16 = null,
     buffer_serial: u64 = 0,
+    native_buffers: [256]NativeBufferSlot = @splat(.{}),
+    native_active: ?u16 = null,
     graph_closing: bool = false,
     close_deadline: u64 = 0,
     words: [logs.output_bytes]u8 = undefined,
@@ -177,6 +182,7 @@ pub const Owner = struct {
         }
     }
     pub fn activeChannel(self: *Owner) ?*exchange.Exchange {
+        if (self.native_active) |index| if (self.native_buffers[index].owner) |owner| return &owner.exchange;
         if (self.buffer_active) |index| if (self.buffers[index].owner) |owner| return &owner.exchange;
         if (self.outputs.channel()) |channel| return &channel.exchange;
         if (self.graph) |*graph| if (graph.channel()) |channel| return channel;
@@ -223,7 +229,7 @@ pub const Owner = struct {
     /// the reference; diagnostic buffer IDs are never imported here.
     pub fn mapQueuedBuffer(self: *Owner, fence: *const r4os.abi.GfxFence, which: u32, deadline: u64) !BufferHandle {
         _ = try self.now();
-        if (self.graph_closing or self.buffer_active != null or self.sequence.self_address != 0 or self.outputs.active()) return error.Busy;
+        if (self.graph_closing or self.native_active != null or self.buffer_active != null or self.sequence.self_address != 0 or self.outputs.active()) return error.Busy;
         const space = (self.nativeAddressSpace() orelse return error.State).*;
         if (self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         try self.channel.?.guard(deadline);
@@ -236,6 +242,7 @@ pub const Owner = struct {
         const memory = self.ctx.?.memory() orelse return error.Api;
         const queue = self.ctx.?.graphicsQueue() orelse return error.Api;
         const slot = &self.buffers[index];
+        slot.heap = heap;
         const result = heap.allocate(@sizeOf(buffer_mapping.Owner), @alignOf(buffer_mapping.Owner), &slot.allocation);
         const allocation = slot.allocation;
         if (result != r4os.abi.driver_heap_ok and allocation.handle == 0) return error.Memory;
@@ -281,7 +288,7 @@ pub const Owner = struct {
     }
     pub fn retireBuffer(self: *Owner, handle: BufferHandle, deadline: u64, quiesced: bool) !void {
         const owner = try self.findBuffer(handle);
-        if (!quiesced or self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or
+        if (!quiesced or self.native_active != null or self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or
             self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         if (owner.state != .handed_off) return error.State;
         var token = try self.channel.?.handoff(deadline);
@@ -294,13 +301,94 @@ pub const Owner = struct {
         };
         self.buffer_active = handle.slot;
     }
+    /// Returns a runtime handle immediately; nativeBufferStatus publishes a
+    /// borrowed driver reference only after RM allocation/map ACKs and common
+    /// commit. Consumers import that reference through the common API.
+    pub fn allocateNativeBuffer(self: *Owner, bytes: u64, deadline: u64) !BufferHandle {
+        _ = try self.now();
+        if (self.graph_closing or self.native_active != null or self.buffer_active != null or self.sequence.self_address != 0 or self.outputs.active()) return error.Busy;
+        const space = (self.nativeAddressSpace() orelse return error.State).*;
+        if (self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
+        try self.channel.?.guard(deadline);
+        const serial = try std.math.add(u64, self.buffer_serial, 1);
+        const index: u16 = blk: {
+            for (&self.native_buffers, 0..) |*slot, i| if (slot.allocation.handle == 0) break :blk @intCast(i);
+            return error.Exhausted;
+        };
+        const heap = self.ctx.?.heap() orelse return error.Api;
+        const slot = &self.native_buffers[index];
+        slot.heap = heap;
+        const result = heap.allocate(@sizeOf(vram.Owner), @alignOf(vram.Owner), &slot.allocation);
+        const allocation = slot.allocation;
+        if (result != r4os.abi.driver_heap_ok and allocation.handle == 0) return error.Memory;
+        if (allocation.version != 1 or allocation.size < @sizeOf(r4os.abi.DriverHeapAllocation) or allocation.handle == 0 or
+            allocation.cpu_address == 0 or allocation.cpu_address % @alignOf(vram.Owner) != 0 or allocation.reserved != 0 or
+            allocation.byte_length < @sizeOf(vram.Owner) or allocation.alignment < @alignOf(vram.Owner) or
+            allocation.cpu_address > std.math.maxInt(u64) - allocation.byte_length) {
+            self.stop(error.Descriptor); return error.Descriptor;
+        }
+        errdefer if (heap.release(allocation.handle) == r4os.abi.driver_heap_ok) { slot.* = .{}; } else self.stop(error.Retained);
+        if (result != r4os.abi.driver_heap_ok) return error.Memory;
+        var token = try self.channel.?.handoff(deadline);
+        const value = vram.Owner.init(&token, &self.ctx.?, self.adapter_id, space, self.graph.?.reservation, bytes, deadline) catch |err| {
+            self.channel = exchange.Exchange.init(&token, deadline) catch |restore| { self.stop(restore); return restore; };
+            return err;
+        };
+        const owner: *vram.Owner = @ptrFromInt(allocation.cpu_address);
+        owner.* = value; slot.owner = owner; slot.serial = serial;
+        self.buffer_serial = serial; self.native_active = index;
+        return .{ .epoch = self.epoch, .serial = serial, .slot = index };
+    }
+    fn findNativeBuffer(self: *Owner, handle: BufferHandle) !*vram.Owner {
+        _ = try self.now();
+        if (handle.epoch != self.epoch or handle.slot >= self.native_buffers.len or handle.serial == 0 or
+            self.native_buffers[handle.slot].serial != handle.serial) return error.Stale;
+        return self.native_buffers[handle.slot].owner orelse return error.Stale;
+    }
+    pub fn nativeBufferStatus(self: *Owner, handle: BufferHandle) !NativeBufferStatus {
+        const owner = try self.findNativeBuffer(handle);
+        return .{ .state = owner.state, .info = owner.info(), .rejected = owner.rejected, .host_rejected = owner.host_rejected };
+    }
+    pub fn releaseNativeBuffer(self: *Owner, handle: BufferHandle) !void {
+        const owner = try self.findNativeBuffer(handle);
+        try owner.closeReference();
+        if (!owner.common_live and !owner.namespace_live) try self.freeNativeSlot(handle.slot);
+    }
+    fn freeNativeSlot(self: *Owner, index: usize) !void {
+        const slot = &self.native_buffers[index];
+        const heap = slot.heap orelse return error.Api;
+        if (heap.release(slot.allocation.handle) != r4os.abi.driver_heap_ok) return error.Retained;
+        slot.* = .{};
+    }
+    fn collectNativeBuffer(self: *Owner, deadline: u64) !bool {
+        if (self.native_active != null or self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or
+            self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return false;
+        const memory = blk: {
+            for (&self.native_buffers) |*slot| if (slot.owner) |owner| { if (owner.closing and owner.common_live) break :blk owner.memory; };
+            return false;
+        };
+        var ticket: r4os.abi.GfxOwnedBufferRelease = .{};
+        const result = memory.bufferTakeRelease(self.adapter_id, self.epoch, &ticket);
+        if (result == r4os.abi.gfx_buffer_error_busy) return false;
+        if (result != r4os.abi.gfx_buffer_result_ok) return error.Retained;
+        for (&self.native_buffers, 0..) |*slot, index| if (slot.owner) |owner| {
+            if (!owner.accepts(ticket)) continue;
+            var token = try self.channel.?.handoff(deadline);
+            try owner.beginDestroy(&token, ticket, deadline);
+            self.native_active = @intCast(index); return true;
+        };
+        return error.Descriptor; // Claimed unknown identity remains held.
+    }
     /// Requires all engine users independently quiesced. Each child mapping
     /// is drained before graph.beginDestroy may send any parent/event free.
     pub fn beginDestroyGraph(self: *Owner, deadline: u64, quiesced: bool) !void {
         _ = try self.now();
-        if (!quiesced or self.graph_closing or self.buffer_active != null or self.outputs.active() or
+        if (!quiesced or self.graph_closing or self.native_active != null or self.buffer_active != null or self.outputs.active() or
             self.sequence.self_address != 0 or self.nativeObject() == null or self.channel.?.phase != .idle) return error.Busy;
         try self.channel.?.guard(deadline);
+        for (&self.native_buffers, 0..) |*slot, index| if (slot.owner != null) {
+            try self.releaseNativeBuffer(.{ .epoch = self.epoch, .serial = slot.serial, .slot = @intCast(index) });
+        };
         self.graph_closing = true;
         self.close_deadline = deadline;
     }
@@ -323,6 +411,22 @@ pub const Owner = struct {
             }
             return .progress;
         }
+        if (self.native_active) |index| {
+            const owner = self.native_buffers[index].owner orelse return error.State;
+            if (owner.state == .ready or owner.state == .closed) {
+                const deadline = owner.deadline;
+                var token = try owner.handoff();
+                self.channel = try exchange.Exchange.init(&token, deadline);
+                if (owner.state == .finished) try self.freeNativeSlot(index);
+                self.native_active = null;
+                return .progress;
+            }
+            if (try owner.poll()) |dispatch| {
+                try self.notification(&owner.exchange, dispatch, current);
+                return .progress;
+            }
+            return if (owner.exchange.phase == .waiting) .idle else .progress;
+        }
         if (self.buffer_active) |index| {
             const slot = &self.buffers[index];
             const owner = slot.owner orelse return error.State;
@@ -330,7 +434,7 @@ pub const Owner = struct {
                 var token = try owner.handoff(owner.deadline);
                 self.channel = try exchange.Exchange.init(&token, owner.deadline);
                 if (owner.state == .finished) {
-                    const heap = self.ctx.?.heap() orelse return error.Api;
+                    const heap = slot.heap orelse return error.Api;
                     if (heap.release(slot.allocation.handle) != r4os.abi.driver_heap_ok) return error.Retained;
                     slot.* = .{};
                 }
@@ -343,12 +447,14 @@ pub const Owner = struct {
             }
             return if (owner.exchange.phase == .waiting) .idle else .progress;
         }
-        if (self.graph_closing and self.graph.?.state == .loaned) {
+        if (self.nativeObject() != null and try self.collectNativeBuffer(if (self.graph_closing) self.close_deadline else try std.math.add(u64, current, 5 * std.time.ns_per_s))) return .progress;
+        if (self.graph_closing and self.graph.?.state == .loaned) graph_close: {
             try channel.guard(self.close_deadline);
             for (&self.buffers, 0..) |*slot, index| if (slot.owner != null) {
                 try self.retireBuffer(.{ .epoch = self.epoch, .serial = slot.serial, .slot = @intCast(index) }, self.close_deadline, true);
                 return .progress;
             };
+            for (&self.native_buffers) |*slot| if (slot.owner != null) break :graph_close;
             var token = try channel.handoff(self.close_deadline);
             try self.graph.?.reclaim(&token, self.close_deadline);
             try self.graph.?.beginDestroy(self.close_deadline);
@@ -518,7 +624,7 @@ pub const Owner = struct {
             self.log("NVIDIA gsp-rm: creating client={x} deadline-ns={d}", .{self.graph.?.reservation.client, end});
             return .progress;
         }
-        if (self.graph != null and self.graph.?.state == .loaned and channel.phase == .idle and !channel.in_lockdown and
+        if (!self.graph_closing and self.graph != null and self.graph.?.state == .loaned and channel.phase == .idle and !channel.in_lockdown and
             (self.outputs.state == .detached or (self.output_refresh and current >= self.output_next_ns))) {
             const end = try std.math.add(u64, current, 10 * std.time.ns_per_s);
             self.output_generation = try std.math.add(u64, self.output_generation, 1);

@@ -1,0 +1,31 @@
+{
+  "source": "NVIDIA Open GPU Kernel Modules 570.144",
+  "commit": "8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f",
+  "bytes": 896,
+  "sha256": "d9f4b7368af9c506dbe866b7dbebf788fc36a321d9d7c0c376d30e808ce5ae53",
+  "pairs": 6,
+  "virtual_bytes": 67108864,
+  "allocation_alignment": 65536,
+  "gpu_page_bytes": 4096,
+  "physical_class": "NV01_MEMORY_LOCAL_USER (0x40)",
+  "virtual_class": "NV50_MEMORY_VIRTUAL (0x50a0)",
+  "producer": "Temp/gfx-owned-vram-20260912/Vram-ABI.c; Vector.ps1",
+  "sources": [
+    {
+      "path": "ExFiles/Reference/GFX/Nvidia/OpenKernelModules-570.144/src/common/sdk/nvidia/inc/nvos.h",
+      "sha256": "9e878195c522919f133c497aefbc3f4c076aae8bda25d4c7915e8981bb43563a"
+    },
+    {
+      "path": "ExFiles/Reference/GFX/Nvidia/OpenKernelModules-570.144/src/common/sdk/nvidia/inc/class/cl0040.h",
+      "sha256": "8e6fef4c77c91a352b862767d7292951fe44f5a4b2271fa5bbc7b03b3c7bd414"
+    },
+    {
+      "path": "ExFiles/Reference/GFX/Nvidia/OpenKernelModules-570.144/src/nvidia/src/kernel/mem_mgr/video_mem.c",
+      "sha256": "c461f85d8f1a9f612ecc38f43cf24c89fa2961028aa8632150611d047906cc36"
+    },
+    {
+      "path": "ExFiles/Reference/GFX/Nvidia/OpenKernelModules-570.144/src/nvidia-modeset/kapi/src/nvkms-kapi.c",
+      "sha256": "6a4b72ce4dd6ae31998cf8ecf5997991b82f21b232c913b99f54d127e9f4b000"
+    }
+  ]
+}
