@@ -2,6 +2,8 @@
 //! Views never carry a kernel unmap handle. The mapping grants no register
 //! policy, device mutation, reset or quiescence; each consumer owns that work.
 //! Serialized driver init/work owner only, never concurrent or IRQ mutation.
+//! A pinned IRQ consumer may use an immutable View while retaining its lease;
+//! acquisition, validation and release of that lease remain in Init/Work.
 const std = @import("std");
 const r4os = @import("r4os");
 const identity = @import("identity.zig");

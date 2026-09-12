@@ -1,5 +1,33 @@
-//! Resident post-INIT_DONE queue owner. This is CPU polling and diagnostic
-//! delivery, not an IRQ service, firmware heartbeat or native display owner.
+// Nouveau/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r570/client.c
+// /* SPDX-License-Identifier: MIT
+//  *
+//  * Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+//  */
+//
+// Original Linux MIT license text:
+// MIT License
+//
+// Copyright (c) <year> <copyright holders>
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the "Software"),
+// to deal in the Software without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, sublicense,
+// and/or sell copies of the Software, and to permit persons to whom the
+// Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+// DEALINGS IN THE SOFTWARE.
+//! Resident post-INIT_DONE owner for RM discovery, object creation and events.
+//! Queue work is serialized; object handles do not imply native display takeover.
 //! Every message uses the actual retained native port and its exact receipt.
 const std = @import("std");
 const r4os = @import("r4os");
@@ -11,6 +39,9 @@ const logs = @import("gsp_logs.zig");
 const init = @import("gsp_init.zig");
 const static = @import("gsp_static.zig");
 const postinit = @import("gsp_postinit.zig");
+const rm = @import("gsp_rm_graph.zig");
+const display = @import("gsp_display_rpc.zig");
+const subscriptions = @import("gsp_event_objects.zig");
 pub const Progress = enum { idle, progress };
 pub const Snapshot = struct {
     polls: u64 = 0,
@@ -24,6 +55,8 @@ pub const Snapshot = struct {
     moving_logs: u64 = 0,
     last_poll_ns: u64 = 0,
     last_event_ns: u64 = 0,
+    hotplug_events: u64 = 0,
+    dp_irq_events: u64 = 0,
 };
 pub const Owner = struct {
     self_address: usize = 0,
@@ -45,6 +78,10 @@ pub const Owner = struct {
     physical_bytes: u64 = 0,
     startup_deadline: u64 = 0,
     post: postinit.Owner = .{},
+    rm_enabled: bool = false, // Set by the real device only after IRQ installation.
+    graph: ?rm.Owner = null,
+    display_object: ?display.Object = null,
+    rm_rejection: ?u32 = null,
     words: [logs.output_bytes]u8 = undefined,
 
     pub fn open(self: *Owner, ctx: *const r4os.r4dev.DriverContext, device: *native.Port,
@@ -74,7 +111,7 @@ pub const Owner = struct {
     fn now(self: *Owner) !u64 {
         if (self.self_address == 0 or self.self_address != @intFromPtr(self) or self.failure != null) return error.State;
         const device = self.device orelse return error.State;
-        const channel = if (self.channel) |*value| value else return error.State;
+        const channel = self.activeChannel() orelse return error.State;
         if (device.phase != .runtime or device.runtime_session != channel.session or
             channel.session.epoch != self.epoch or channel.session.port.generation(channel.session.port.context) != self.epoch) return error.Stale;
         const current = channel.session.port.now_ns(channel.session.port.context);
@@ -86,20 +123,44 @@ pub const Owner = struct {
         if (self.self_address == 0 or self.self_address != @intFromPtr(self) or self.failure != null) return error.State;
         return self.advance() catch |err| {
             self.failure = err;
-            if (self.channel) |*channel| {
+            if (self.activeChannel()) |channel| {
                 self.protocol_failure = channel.fail(error.Handler);
+                // A failed token transition can leave only handed-off views.
+                // They cannot ACK or poison another owner; stop the one retained
+                // session explicitly while the outer device retains its DMA.
+                channel.session.stop();
                 if (channel.last_rpc) |rpc| self.log("NVIDIA gsp-runtime: failed={s} last-rpc={x} sequence={d} result={x} receipt={s}",
                     .{@errorName(err), rpc.function, rpc.sequence, rpc.result, if (channel.session.pending != null) @as([]const u8, "retained") else "none"});
                 if (self.post.self_address != 0 and self.post.state != .complete)
                     self.log("NVIDIA gsp-postinit: failed={s} command={x} status={x} replies={d}",
                         .{@errorName(err), @intFromEnum(self.post.command), self.post.last_status orelse exchange.message.pending, self.post.replies});
             }
+            if (self.graph) |*graph| {
+                if (graph.state != .finished) graph.base.exchange.session.rm_names.retain(graph.reservation) catch {};
+                self.log("NVIDIA gsp-rm: failed={s} state={s} client={x} rejection={?}",
+                    .{@errorName(err), @tagName(graph.state), graph.reservation.client, self.rm_rejection});
+            }
             return err;
         };
     }
+    pub fn activeChannel(self: *Owner) ?*exchange.Exchange {
+        if (self.graph) |*graph| if (graph.channel()) |channel| return channel;
+        return if (self.channel) |*channel| channel else null;
+    }
+    pub fn nativeObject(self: *Owner) ?display.Object {
+        if (self.self_address != @intFromPtr(self) or self.failure != null or self.graph == null or
+            self.graph.?.self_address != @intFromPtr(&self.graph.?) or self.graph.?.state != .loaned or
+            self.display_object == null or self.activeChannel() == null or self.activeChannel().?.session.state != .active) return null;
+        return self.display_object;
+    }
+    pub fn takeDisplayChanges(self: *Owner) !subscriptions.Changes {
+        const current = try self.now();
+        if (self.nativeObject() == null) return error.State;
+        return self.graph.?.takeChanges(try std.math.add(u64, current, std.time.ns_per_s));
+    }
     fn advance(self: *Owner) !Progress {
         const current = try self.now();
-        const channel = &self.channel.?;
+        const channel = self.activeChannel() orelse return error.State;
         self.snapshot.polls +|= 1;
         self.snapshot.last_poll_ns = current;
         if (self.sequence.self_address != 0) {
@@ -110,6 +171,48 @@ pub const Owner = struct {
                 self.snapshot.last_event_ns = current;
             }
             return .progress;
+        }
+        if (self.graph) |*graph| {
+            switch (graph.state) {
+                .ready => {
+                    var loan = try graph.loan(graph.deadline);
+                    self.channel = try exchange.Exchange.init(&loan.runtime, graph.deadline);
+                    self.display_object = loan.object;
+                    self.log("NVIDIA gsp-rm: objects=ready client={x} device={x} subdevice={x} display={x} events=HPD,DP native-output=unavailable",
+                        .{graph.base.plan.handles.client, graph.base.plan.handles.device, graph.base.plan.handles.subdevice, loan.object.display});
+                    return .progress;
+                },
+                .rejected => {
+                    // A validated RM rejection was ACKed by its exact owner.
+                    // Destroy only the proven live prefix, in reverse order.
+                    const status = if (graph.subscriptions) |*owner| blk: {
+                        const result = owner.last_status orelse return error.State;
+                        break :blk if (result.result == .rm_error) result.result.rm_error else return error.State;
+                    } else blk: {
+                        const result = graph.base.last_status orelse return error.State;
+                        break :blk if (result.result == .rm_error) result.result.rm_error else return error.State;
+                    };
+                    self.rm_rejection = status;
+                    const end = @min(self.startup_deadline, try std.math.add(u64, current, 5 * std.time.ns_per_s));
+                    self.log("NVIDIA gsp-rm: rejected status={x} cleanup=proven-objects deadline-ns={d}", .{status, end});
+                    try graph.beginDestroy(end);
+                    return .progress;
+                },
+                .closed => {
+                    var token = try graph.finish(graph.deadline);
+                    self.channel = try exchange.Exchange.init(&token, graph.deadline);
+                    return error.RmRejected; // Object frees do not stop GPU DMA.
+                },
+                .base_creating, .events_creating, .events_destroying, .base_destroying => {
+                    if (try graph.poll()) |dispatch| {
+                        try self.notification(self.activeChannel() orelse return error.State, dispatch, current);
+                        return .progress;
+                    }
+                    return if ((self.activeChannel() orelse return error.State).phase == .waiting) .idle else .progress;
+                },
+                .loaned => {},
+                else => return error.State,
+            }
         }
         if (self.static_info != null and self.post.state != .complete and channel.phase == .idle) {
             if (self.post.self_address == 0) try self.post.open(channel, &self.static_info.?);
@@ -138,21 +241,16 @@ pub const Owner = struct {
                     .{info.client, info.device, info.subdevice, info.fb_bytes, info.region_count, info.bar1_pdb, info.bar2_pdb});
                 return .progress;
             }
-            if (dispatch.record.rpc.function == @intFromEnum(boot.Kind.cpu_sequencer)) {
-                try self.sequence.begin(self.device.?, channel, .{
-                    .default_timeout_ns = std.time.ns_per_s,
-                    .poll_interval_ns = std.time.ns_per_ms,
-                    .register_bytes = self.device.?.window.byte_length,
-                });
-                return .progress;
-            }
-            self.ordinary = try events.Dispatch.init(channel, .{
-                .context = self, .generation = generation, .admit = admit, .deliver = deliver,
-            });
-            try self.ordinary.?.step();
-            self.snapshot.events +|= 1;
-            self.snapshot.last_event_ns = current;
-            self.ordinary = null; // No borrowed payload survives its ACK.
+            try self.notification(channel, dispatch, current);
+            return .progress;
+        }
+        if (self.rm_enabled and self.graph == null and self.post.snapshot() != null and channel.phase == .idle and !channel.in_lockdown) {
+            const end = @min(self.startup_deadline, try std.math.add(u64, current, 5 * std.time.ns_per_s));
+            var token = try channel.handoff(end);
+            // Nouveau r570's kernel client uses processID=~0 and an empty
+            // name. This is not a fabricated R4OS program or host pointer.
+            self.graph = try rm.Owner.init(&token, std.math.maxInt(u32), "", end);
+            self.log("NVIDIA gsp-rm: creating client={x} deadline-ns={d}", .{self.graph.?.reservation.client, end});
             return .progress;
         }
         // No busy wait or raw-log dump on every empty queue. One ring per
@@ -163,6 +261,23 @@ pub const Owner = struct {
         }
         return .idle;
     }
+    fn notification(self: *Owner, channel: *exchange.Exchange, dispatch: exchange.Dispatch, current: u64) !void {
+        if (dispatch.response) return error.Unexpected;
+        if (dispatch.record.rpc.function == @intFromEnum(boot.Kind.cpu_sequencer)) {
+            try self.sequence.begin(self.device.?, channel, .{
+                .default_timeout_ns = std.time.ns_per_s, .poll_interval_ns = std.time.ns_per_ms,
+                .register_bytes = self.device.?.window.byte_length,
+            });
+            return;
+        }
+        self.ordinary = try events.Dispatch.init(channel, .{
+            .context = self, .generation = generation, .admit = admit, .deliver = deliver,
+        });
+        try self.ordinary.?.step();
+        self.snapshot.events +|= 1;
+        self.snapshot.last_event_ns = current;
+        self.ordinary = null;
+    }
     fn from(raw: *anyopaque) *Owner { return @ptrCast(@alignCast(raw)); }
     fn generation(raw: *anyopaque) u64 {
         const self = from(raw);
@@ -172,19 +287,31 @@ pub const Owner = struct {
     fn admit(raw: *anyopaque, scope: events.Scope, event: events.Event) error{ Denied, Unsupported }!void {
         const self = from(raw);
         if (generation(raw) != scope.epoch or self.epoch != scope.epoch) return error.Denied;
-        // These are diagnostic delivery and queue lockdown only. Channel,
-        // display, interrupt and reset actions require their actual owners;
-        // logging them must never masquerade as handling those side effects.
+        // Diagnostics/lockdown stay here. Display changes require an exact
+        // live RM event registration; other effects still need their owners.
         switch (event) {
             .libos_print, .lockdown, .os_error, .nocat => {},
+            .post_event => {
+                const graph = if (self.graph) |*value| value else return error.Unsupported;
+                const sink = graph.eventSink() catch return error.Denied;
+                try sink.admit(sink.context, scope, event);
+            },
             else => return error.Unsupported,
         }
     }
-    fn deliver(raw: *anyopaque, _: events.Scope, event: events.Event) !void {
+    fn deliver(raw: *anyopaque, scope: events.Scope, event: events.Event) !void {
         const self = from(raw);
         switch (event) {
             .libos_print => |v| self.logBytes("print", v.engine, v.bytes),
             .lockdown => {}, // Exchange owns engage-before-I/O and release-after-ACK.
+            .post_event => |post| {
+                const graph = if (self.graph) |*value| value else return error.Unsupported;
+                const sink = try graph.eventSink();
+                try sink.deliver(sink.context, scope, event);
+                const kind = (try post.display()) orelse return error.Unexpected;
+                if (kind == .hotplug) self.snapshot.hotplug_events +|= 1 else self.snapshot.dp_irq_events +|= 1;
+                self.log("NVIDIA gsp-event: kind={s} status={x} data={x} refresh=required", .{@tagName(kind), post.status, post.data});
+            },
             .os_error => |v| {
                 self.snapshot.xid_count +|= 1;
                 self.snapshot.last_xid = v.xid;

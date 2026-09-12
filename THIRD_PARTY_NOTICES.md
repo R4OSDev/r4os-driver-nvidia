@@ -1,5 +1,15 @@
 ﻿# Third-Party Notices
 
+Runtime RM objects and display events (NVIDIA 0.1.58, 2026-09-12):
+The existing object, event and client-name owners now run on the actual
+firmware queue. Their NVIDIA 570.144 and Nouveau source notices remain
+in the source preambles and are appended in full to the existing runtime
+license resource in both module and Distribution. The r570 kernel-client
+constructor notice is also retained in gsp_runtime.zig. The previous
+82,408 bytes remain unchanged; 18 complete notices and 29 full
+original files are archived with 51 ABI-field comparisons under
+0.79.10/gsp-rm-20260912. R4OS lifetime/binding code remains Apache-2.0.
+
 GA106 GSP interrupts (NVIDIA 0.1.57, 2026-09-12):
 The bounded VFN/Falcon/MSI interrupt sequence follows NVIDIA 570.144
 register definitions and Nouveau GA106/r535 sources. Thirteen complete

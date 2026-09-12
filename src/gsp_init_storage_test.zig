@@ -1431,6 +1431,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         static_bad_region, static_ack_failure, static_timeout,
         post_control_error, post_wrong_gpc, post_bad_vector, post_ack_failure, post_timeout,
         irq_intx, irq_register_error, irq_msi_uncertain, irq_cause, irq_wake_failure, irq_close_busy, irq_unregister_failure,
+        rm_base_reject, rm_event_reject, rm_free_error, rm_timeout, rm_ack_failure, rm_foreign_event, rm_event_ack,
         runtime_healthy, runtime_lockdown, runtime_unknown, runtime_unowned, runtime_sequence_timeout,
         runtime_log_failure, runtime_moving_log };
     for (std.enums.values(Case)) |case| {
@@ -1559,6 +1560,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
             try checkDeviceStatic(target, words, held.plan.?.frts.offset, case);
             if (target.phase == .ready) try checkDevicePostInit(target, words, held.plan.?.frts.offset, case);
             if (target.phase == .ready) try checkDeviceIrq(target, words, held.plan.?.frts.offset, case);
+            if (target.phase == .ready and !target.stopped) try checkDeviceRm(target, words, held.plan.?.frts.offset, case);
             if (exercise_runtime) try checkDeviceRuntime(target, words, held.plan.?.frts.offset, case);
         } else {
             try t.expect(target.phase == .failed and target.failure != null);
@@ -1961,6 +1963,192 @@ fn checkDeviceIrq(target: *@import("gsp_device.zig").Device, words: []u32, frts:
         try t.expect(steps < 12000 and target.recovery.report != null and endpoint.closed and !endpoint.registered and !endpoint.msi);
     }
     try t.expect(target.memory.?.retained and target.display.?.firmware_owner == @intFromPtr(target));
+}
+
+fn devicePost(target: *@import("gsp_device.zig").Device, dp: bool, foreign: bool) !void {
+    const graph = &target.running.graph.?;
+    const owner = &graph.subscriptions.?;
+    var bytes: [40]u8 = @splat(0);
+    std.mem.writeInt(u32, bytes[0..4], graph.reservation.client + @as(u32, @intFromBool(foreign)), .little);
+    std.mem.writeInt(u32, bytes[4..8], if (dp) owner.plan.handles.dp_irq else owner.plan.handles.hotplug, .little);
+    std.mem.writeInt(u32, bytes[8..12], if (dp) 7 else 1, .little);
+    std.mem.writeInt(u32, bytes[12..16], 0x79, .little);
+    std.mem.writeInt(u32, bytes[24..28], if (dp) 4 else 8, .little);
+    bytes[28] = @intFromBool(!dp); // Exercise notify-list and addressed forms.
+    // POST_EVENT's flexible payload starts at29; sizeof(header) is32.
+    std.mem.writeInt(u32, bytes[29..33], if (dp) 0x82 else 0x80000005, .little);
+    std.mem.writeInt(u32, bytes[33..37], 0x80000004, .little);
+    try nativeEvent(&target.session.?, 0x1003, bytes[0..if (dp) @as(usize, 36) else 40]);
+}
+
+fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: u64, scenario: anytype) !void {
+    const objects = @import("gsp_objects.zig");
+    const rm_names = @import("gsp_rm_names.zig");
+    const running = &target.running;
+    const session = &target.session.?;
+    const command = init.queues_offset + init.command_offset;
+    const status = init.queues_offset + init.status_offset;
+    const original_sequence = session.tx_sequence;
+    var requests: usize = 0;
+    var creates: usize = 0;
+    var cleanups: usize = 0;
+    var steps: usize = 0;
+    errdefer |err| std.debug.print("actual RM graph scenario={s} error={s} phase={s} failure={?} graph={s} requests={d} creates={d} frees={d}\n",
+        .{@tagName(scenario), @errorName(err), @tagName(target.phase), target.failure,
+            if (running.graph) |*graph| @tagName(graph.state) else "none", requests, creates, cleanups});
+    try t.expect(running.rm_enabled and running.graph == null and running.nativeObject() == null and target.interrupts.registered);
+    while (target.phase == .ready and running.nativeObject() == null and steps < 90) : (steps += 1) {
+        _ = target.step();
+        if (target.phase != .ready) break;
+        const channel = running.activeChannel().?;
+        if (channel.phase != .waiting) continue;
+        const graph = &running.graph.?;
+        try t.expect(channel != &running.channel.? and running.channel.?.phase == .handed_off);
+        try t.expect(graph.base.plan.process_id == 0xffffffff and std.mem.allEqual(u8, &graph.base.plan.process_name, 0));
+        try t.expect(graph.reservation.client == rm_names.client_base and graph.reservation.client != running.static_info.?.client);
+        const deadline = channel.deadline.?;
+        const cursor = (session.tx_write + 62) % 63;
+        const request = try transport.message.decode(session.profile,
+            backing.?[command + 4096 + @as(usize, cursor) * 4096 ..][0..4096], session.tx_sequence - 1);
+        var response: [objects.max_request_bytes]u8 = @splat(0);
+        @memcpy(response[0..request.payload.len], request.payload);
+        const function = request.rpc.function;
+        const payload = request.payload;
+        std.mem.writeInt(u32, backing.?[status + 64 ..][0..4], session.tx_write, .little);
+        try t.expect(std.mem.readInt(u32, payload[0..4], .little) == graph.reservation.client);
+        const destroying = graph.state == .events_destroying or graph.state == .base_destroying;
+        var length = payload.len;
+        var result: u32 = 0;
+        if (destroying) {
+            if (scenario == .rm_base_reject) {
+                try t.expect(cleanups == 0 and function == 10 and std.mem.readInt(u32, payload[8..12], .little) == graph.reservation.client);
+            } else {
+                const expected = [_]u32{ graph.subscriptions.?.plan.handles.hotplug,
+                    graph.subscriptions.?.plan.handles.hotplug, graph.base.plan.handles.display,
+                    graph.base.plan.handles.subdevice, graph.base.plan.handles.device, graph.reservation.client };
+                try t.expect(cleanups < expected.len);
+                if (cleanups == 0) {
+                    try t.expect(function == 76 and std.mem.readInt(u32, payload[24..28], .little) == 1 and
+                        std.mem.readInt(u32, payload[28..32], .little) == 0);
+                } else try t.expect(function == 10 and std.mem.readInt(u32, payload[8..12], .little) == expected[cleanups]);
+            }
+            if (scenario == .rm_free_error) result = 0x66;
+            cleanups += 1;
+        } else {
+            const expected_functions = [_]u32{ 103, 103, 103, 103, 103, 76, 103, 76 };
+            const expected_classes = [_]u32{ 0, 0x80, 0x2080, 0x73, 0x7e, 0, 0x7e, 0 };
+            try t.expect(creates < expected_functions.len and function == expected_functions[creates]);
+            if (function == 103) try t.expect(std.mem.readInt(u32, payload[12..16], .little) == expected_classes[creates]);
+            if (creates == 0) {
+                try t.expect(payload.len == 152 and std.mem.readInt(u32, payload[36..40], .little) == 0xffffffff);
+                try t.expect(std.mem.allEqual(u8, payload[40..], 0));
+                // Inject only host metadata to challenge the real notifier's
+                // identity checks; neither rejection may issue queue/MMIO I/O.
+                const io = target.port.owner.?;
+                const saved_request = channel.request;
+                const original_function = channel.function;
+                const before_binding = range_calls;
+                var foreign_request: [objects.max_request_bytes]u8 = @splat(0);
+                @memcpy(foreign_request[0..saved_request.len], saved_request);
+                channel.phase = .prepared;
+                channel.request = foreign_request[0..saved_request.len];
+                try t.expectError(error.Binding, io.admit_command.?(io.context, &target.port, deadline));
+                channel.request = saved_request;
+                channel.function = 76;
+                try t.expectError(error.Binding, io.admit_command.?(io.context, &target.port, deadline));
+                channel.function = original_function;
+                try io.admit_command.?(io.context, &target.port, deadline);
+                var copied_graph = graph.*;
+                try t.expect(!copied_graph.matches(channel, deadline));
+                channel.phase = .waiting;
+                try t.expect(range_calls == before_binding and session.state == .active);
+                // The old runtime cannot re-use the transferred queue token.
+                try t.expectError(error.State, running.channel.?.poll(deadline));
+                try t.expect(session.state == .active and channel.phase == .waiting);
+                try deviceSequence(target, &.{ 3, 1 });
+                try t.expect(target.step() == .progress and running.sequence.self_address != 0);
+                for (0..10) |_| {
+                    if (running.sequence.self_address == 0) break;
+                    clock += 1000;
+                    _ = target.step();
+                }
+                try t.expect(running.sequence.self_address == 0 and channel.deadline == deadline and channel.phase == .waiting);
+                try nativeEvent(session, 0x101c, &.{1});
+                try t.expect(target.step() == .progress and channel.in_lockdown and !running.channel.?.in_lockdown);
+                try t.expectError(error.Lockdown, io.access(io.context, .read, @import("gsp_core.zig").reg.mailbox0));
+                try nativeEvent(session, 0x101c, &.{0});
+                try t.expect(target.step() == .progress and !channel.in_lockdown and channel.deadline == deadline);
+            }
+            if (creates == 7) {
+                try devicePost(target, false, scenario == .rm_foreign_event);
+                _ = target.step();
+                if (scenario == .rm_foreign_event) break;
+                try t.expect(channel.phase == .waiting and channel.deadline == deadline and graph.subscriptions.?.changes.serial == 1);
+            }
+            if (scenario == .rm_base_reject and creates == 1) result = 0x55;
+            if ((scenario == .rm_event_reject or scenario == .rm_free_error) and creates == 5) result = 0x55;
+            creates += 1;
+        }
+        // Responses may be the original fixed allocation result only.
+        if (function == 103) length = 32;
+        std.mem.writeInt(u32, response[if (function == 103) @as(usize, 16) else 12 ..][0..4], result, .little);
+        if (function == 76 and result == 0) {
+            response[32] = 1;
+            std.mem.writeInt(u32, response[36..40], 0xdeadbeef, .little);
+        }
+        if (scenario == .rm_timeout and requests == 0) {
+            clock = deadline;
+        } else {
+            try nativeEvent(session, function, response[0..length]);
+            if (scenario == .rm_ack_failure and creates == 8) range_failure_call = range_calls + 4;
+        }
+        _ = target.step();
+        range_failure_call = 0;
+        requests += 1;
+    }
+    try t.expect(steps < 90);
+    if (target.phase == .ready) {
+        const graph = &running.graph.?;
+        const object = running.nativeObject() orelse return error.MissingRmObjects;
+        try t.expect(creates == 8 and requests == 8 and cleanups == 0 and graph.state == .loaned);
+        try t.expect(object.client == graph.reservation.client and object.display == graph.base.plan.handles.display);
+        try t.expect(session.tx_sequence == original_sequence + 8 and running.activeChannel() == &running.channel.?);
+        try t.expect(session.pending == null and graph.base.exchange.phase == .handed_off and graph.subscriptions.?.exchange.phase == .handed_off);
+        const first = try running.takeDisplayChanges();
+        try t.expect(first.serial == 1 and first.plug == 0x80000005 and first.unplug == 0x80000004 and first.dp_irq == 0);
+        try devicePost(target, true, false);
+        if (scenario == .rm_event_ack) range_failure_call = range_calls + 4;
+        _ = target.step();
+        range_failure_call = 0;
+        if (scenario != .rm_event_ack) {
+            const changes = try running.takeDisplayChanges();
+            try t.expect(changes.serial == 2 and changes.plug == 0 and changes.unplug == 0 and changes.dp_irq == 0x82);
+            const cleared = try running.takeDisplayChanges();
+            try t.expect(cleared.serial == 2 and cleared.dp_irq == 0);
+            try t.expect(running.snapshot.hotplug_events == 1 and running.snapshot.dp_irq_events == 1 and running.nativeObject() != null);
+            return;
+        }
+    }
+    const graph = &running.graph.?;
+    try t.expect(running.nativeObject() == null and running.failure != null and target.phase == .recovering);
+    if (scenario == .rm_base_reject or scenario == .rm_event_reject) {
+        try t.expect(running.failure.? == error.RmRejected and running.rm_rejection.? == 0x55 and graph.state == .finished);
+        try t.expect(cleanups == @as(usize, if (scenario == .rm_base_reject) 1 else 6));
+        try t.expectError(error.Stale, session.rm_names.validate(graph.reservation));
+    } else {
+        try t.expectError(error.Retained, session.rm_names.retire(graph.reservation));
+        if (scenario == .rm_free_error) try t.expect(cleanups == 1 and running.rm_rejection.? == 0x55);
+    }
+    const receipt = session.pending;
+    const sent = session.tx_sequence;
+    var recovery_steps: usize = 0;
+    while (target.phase != .failed and recovery_steps < 12000) : (recovery_steps += 1) {
+        clock += 1000;
+        DeviceModel.tick(words, frts, false);
+        _ = target.step();
+    }
+    try t.expect(recovery_steps < 12000 and target.recovery.report != null and target.memory.?.retained);
+    try t.expect(target.interrupts.closed and std.meta.eql(receipt, session.pending) and session.tx_sequence == sent);
 }
 
 fn checkDeviceRuntime(target: *@import("gsp_device.zig").Device, words: []u32, frts: u64, scenario: anytype) !void {

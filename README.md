@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.57; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.58; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -11,6 +11,30 @@ Starting with R4OS 0.79.9, `IMAGE_SCOPE=slim` includes the current module in
 Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
+
+Runtime RM object graph (NVIDIA 0.1.58, 2026-09-12):
+
+After IRQ installation, the actual runtime creates its own root/device/
+subdevice/display objects and HPD/DP event subscriptions. Eight requests share
+the original queue token and a bounded startup budget. The native notifier
+admits only the current graph owner's exact request; sequencer and lockdown
+messages follow that same owner while a response is outstanding.
+
+The completed graph returns the queue to the runtime and exposes its display
+object. Registered events retain change masks for later connector refresh.
+Creation rejection frees the proven object prefix in reverse order; uncertain
+cleanup, timeout or ACK failure retains names, receipts and GPU dependencies.
+Object destruction alone does not establish DMA quiescence or restore UEFI.
+
+One existing host run passes all 51 tests, including the actual device chain,
+interleaved events and partial-failure cleanup. One module build, 51 original
+ABI-field comparisons and exact legal staging pass. No new test group, guest
+or hardware run. The 29 full upstream files and 18 complete source notices
+are archived under ExFiles/Reference/GFX/Nvidia/0.79.10/gsp-rm-20260912.
+Kernel152 and passive defaults remain unchanged. Physical firmware/IRQ/RM,
+health/thermals, connector queries, full restore and native output remain open.
+
+The entries below describe preceding checkpoints.
 
 GSP interrupt endpoint (NVIDIA 0.1.57, 2026-09-12):
 
@@ -40,8 +64,6 @@ Kernel150/NVIDIA50 passive. Sixteen complete upstream files, thirteen source
 notices and the unchanged kernel/SDK dependencies are archived under
 ExFiles/Reference/GFX/Nvidia/0.79.10/gsp-irq-20260912. Firmware health, host RM
 objects, full GPU/UEFI restore and native video/audio remain necessary work.
-
-The entries below describe preceding checkpoints.
 
 Internal RM discovery (NVIDIA 0.1.56, 2026-09-12):
 

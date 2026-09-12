@@ -1,5 +1,6 @@
-//! Resident GA106 startup/runtime owner. All device access runs in serialized
-//! DriverInit/DriverWork, with the actual boot hold and complete DMA lease.
+//! Resident GA106 startup/runtime owner in serialized DriverInit/DriverWork.
+//! The separate bounded gsp_irq endpoint ACKs registers and signals its worker;
+//! queue/DMA mutation stays here under the actual boot hold and complete lease.
 //! The first implementation retains the device through poweroff: successful
 //! firmware teardown does not yet prove UEFI restoration or global DMA stop.
 const std = @import("std");
@@ -183,6 +184,7 @@ pub const Device = struct {
                     if (!self.inLockdown() and self.running.sequence.self_address == 0) {
                         try self.interrupts.open(&self.ctx.?, &self.display.?.registers, &self.display.?.snapshot.?,
                             self.display.?.chip.?, inventory, self.irq_wake orelse return error.IrqWake, self.port.boot0);
+                        self.running.rm_enabled = true;
                         self.ctx.?.logInfo("NVIDIA gsp-irq: configured=yes source=GSP wake=semaphore worker=serialized native-output=unavailable");
                         return true;
                     }
@@ -379,12 +381,14 @@ pub const Device = struct {
         if (self.phase != .ready or port != &self.port or port.phase != .runtime or self.session == null or
             self.running.self_address != @intFromPtr(&self.running) or self.running.failure != null or
             self.running.sequence.self_address != 0) return error.State;
-        const channel = if (self.running.channel) |*value| value else return error.State;
+        const channel = self.running.activeChannel() orelse return error.State;
         if (channel.session != &self.session.? or port.runtime_session != channel.session or
             channel.phase != .prepared or channel.pending != null or channel.session.pending != null or
             channel.deadline != deadline) return error.Binding;
         if (channel.in_lockdown) return error.Lockdown;
-        if (self.running.static_info == null) {
+        if (self.running.graph) |*graph| {
+            if (!graph.matches(channel, deadline)) return error.Binding;
+        } else if (self.running.static_info == null) {
             if (channel.function != @import("gsp_static.zig").function or
                 channel.request.ptr != self.running.static_request[0..].ptr or channel.request.len != self.running.static_request.len) return error.Binding;
         } else if (!self.running.post.matches(channel, deadline)) return error.Binding;
@@ -396,7 +400,7 @@ pub const Device = struct {
         if (!allowed(kind, address)) return error.Register;
     }
     fn inLockdown(self: *Device) bool {
-        if (self.running.channel) |*channel| return channel.in_lockdown;
+        if (self.running.activeChannel()) |channel| return channel.in_lockdown;
         return if (self.boot) |*boot| boot.in_lockdown else false;
     }
     fn recoveryGeneration(raw: *anyopaque) u64 {

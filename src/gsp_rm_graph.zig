@@ -63,6 +63,38 @@ pub const Owner = struct {
             else => error.State,
         };
     }
+    /// The actual retained semantic channel, including its failure receipt.
+    /// Loaned/finished children must never shadow the current runtime owner.
+    pub fn channel(self: *Owner) ?*exchange.Exchange {
+        if (self.subscriptions) |*value| if (value.exchange.phase != .handed_off) return &value.exchange;
+        if (self.base.exchange.phase != .handed_off) return &self.base.exchange;
+        return null;
+    }
+    /// Pure queue-notifier admission for this graph's exact encoded request.
+    /// This is not generic permission to submit RM alloc/control/free calls.
+    pub fn matches(self: *Owner, current: *const exchange.Exchange, deadline: u64) bool {
+        if (self.self_address != @intFromPtr(self) or self.failure != null or
+            current.session.epoch != self.reservation.epoch or current.phase != .prepared or
+            current.deadline != deadline or self.deadline != deadline) return false;
+        switch (self.state) {
+            .base_creating, .base_destroying => {
+                const owner = &self.base;
+                const operation = owner.outstanding orelse return false;
+                const size: usize = switch (operation) { .allocate => |kind| 32 + objects.paramsSize(kind), .free => 16 };
+                return current == &owner.exchange and current.request.ptr == owner.request_bytes[0..].ptr and
+                    current.request.len == size and current.function == @as(u32, if (operation == .allocate) 103 else 10);
+            },
+            .events_creating, .events_destroying => {
+                const owner = if (self.subscriptions) |*value| value else return false;
+                const operation = owner.outstanding orelse return false;
+                const size: usize = switch (operation) { .allocate => 56, .enable, .disable => 44, .free => 16 };
+                const function: u32 = switch (operation) { .allocate => 103, .enable, .disable => 76, .free => 10 };
+                return current == &owner.exchange and current.request.ptr == owner.request[0..].ptr and
+                    current.request.len == size and current.function == function;
+            },
+            else => return false,
+        }
+    }
     pub fn eventSink(self: *Owner) Error!runtime_events.Sink {
         try self.stable();
         if (self.state == .failed or self.state == .closed or self.state == .finished) return error.State;
