@@ -46,6 +46,10 @@ const outputs = @import("gsp_outputs.zig");
 const inventory = @import("gsp_memory_inventory.zig");
 pub const buffer_mapping = @import("gsp_buffer_mapping.zig");
 pub const vram = @import("gsp_vram.zig");
+pub const execution_context = @import("gsp_context.zig");
+pub const ContextHandle = struct { epoch: u64, serial: u64, slot: u16 };
+pub const ContextStatus = struct { state: execution_context.State, info: ?execution_context.Info, rejected: ?u32, unavailable: ?execution_context.Unavailable };
+const ContextSlot = struct { owner: ?*execution_context.Owner = null, allocation: r4os.abi.DriverHeapAllocation = .{}, heap: ?r4os.r4dev.DriverHeapContext = null, serial: u64 = 0 };
 pub const BufferHandle = struct { epoch: u64, serial: u64, slot: u16 };
 pub const BufferStatus = struct { state: buffer_mapping.State, info: ?buffer_mapping.Info, rejected: ?u32, host_rejected: ?buffer_mapping.Error };
 const BufferSlot = struct { owner: ?*buffer_mapping.Owner = null, allocation: r4os.abi.DriverHeapAllocation = .{}, heap: ?r4os.r4dev.DriverHeapContext = null, serial: u64 = 0 };
@@ -103,6 +107,8 @@ pub const Owner = struct {
     buffer_serial: u64 = 0,
     native_buffers: [256]NativeBufferSlot = @splat(.{}),
     native_active: ?u16 = null,
+    contexts: [64]ContextSlot = @splat(.{}),
+    context_active: ?u16 = null,
     graph_closing: bool = false,
     close_deadline: u64 = 0,
     words: [logs.output_bytes]u8 = undefined,
@@ -182,6 +188,7 @@ pub const Owner = struct {
         }
     }
     pub fn activeChannel(self: *Owner) ?*exchange.Exchange {
+        if (self.context_active) |index| if (self.contexts[index].owner) |owner| return &owner.exchange;
         if (self.native_active) |index| if (self.native_buffers[index].owner) |owner| return &owner.exchange;
         if (self.buffer_active) |index| if (self.buffers[index].owner) |owner| return &owner.exchange;
         if (self.outputs.channel()) |channel| return &channel.exchange;
@@ -224,12 +231,81 @@ pub const Owner = struct {
             owner.backing.epoch != self.epoch or !std.meta.eql(owner.binding.space, space.*)) return null;
         return owner.info();
     }
+    /// Discover the engine and create its RM group/share in this VA space.
+    /// Channel children retain the context separately before using it.
+    pub fn createExecutionContext(self: *Owner, rm_engine: u32, deadline: u64) !ContextHandle {
+        _ = try self.now();
+        if (self.graph_closing or self.context_active != null or self.native_active != null or self.buffer_active != null or self.sequence.self_address != 0 or self.outputs.active()) return error.Busy;
+        const space = (self.nativeAddressSpace() orelse return error.State).*;
+        const subdevice = self.graph.?.base.plan.handles.subdevice;
+        if (self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
+        _ = try execution_context.wire.nvEngine(rm_engine);
+        try self.channel.?.guard(deadline);
+        const serial = try std.math.add(u64, self.buffer_serial, 1);
+        const index: u16 = blk: {
+            for (&self.contexts, 0..) |*slot, i| if (slot.allocation.handle == 0) break :blk @intCast(i);
+            return error.Exhausted;
+        };
+        const heap = self.ctx.?.heap() orelse return error.Api;
+        const slot = &self.contexts[index]; slot.heap = heap;
+        const result = heap.allocate(@sizeOf(execution_context.Owner), @alignOf(execution_context.Owner), &slot.allocation);
+        const allocation = slot.allocation;
+        if (result != r4os.abi.driver_heap_ok and allocation.handle == 0) return error.Memory;
+        if (allocation.version != 1 or allocation.size < @sizeOf(r4os.abi.DriverHeapAllocation) or allocation.handle == 0 or
+            allocation.cpu_address == 0 or allocation.cpu_address % @alignOf(execution_context.Owner) != 0 or allocation.reserved != 0 or
+            allocation.byte_length < @sizeOf(execution_context.Owner) or allocation.alignment < @alignOf(execution_context.Owner) or
+            allocation.cpu_address > std.math.maxInt(u64) - allocation.byte_length) {
+            self.stop(error.Descriptor); return error.Descriptor;
+        }
+        errdefer if (heap.release(allocation.handle) == r4os.abi.driver_heap_ok) { slot.* = .{}; } else self.stop(error.Retained);
+        if (result != r4os.abi.driver_heap_ok) return error.Memory;
+        var token = try self.channel.?.handoff(deadline);
+        const value = execution_context.Owner.init(&token, self.graph.?.reservation, space, subdevice, rm_engine, deadline) catch |err| {
+            self.channel = exchange.Exchange.init(&token, deadline) catch |restore| { self.stop(restore); return restore; }; return err;
+        };
+        const owner: *execution_context.Owner = @ptrFromInt(allocation.cpu_address);
+        owner.* = value; slot.owner = owner; slot.serial = serial; self.buffer_serial = serial; self.context_active = index;
+        return .{ .epoch = self.epoch, .serial = serial, .slot = index };
+    }
+    fn findContext(self: *Owner, handle: ContextHandle) !*execution_context.Owner {
+        _ = try self.now();
+        if (handle.epoch != self.epoch or handle.slot >= self.contexts.len or handle.serial == 0 or self.contexts[handle.slot].serial != handle.serial) return error.Stale;
+        return self.contexts[handle.slot].owner orelse return error.Stale;
+    }
+    pub fn executionContextStatus(self: *Owner, handle: ContextHandle) !ContextStatus {
+        const owner = try self.findContext(handle);
+        return .{ .state = owner.state, .info = owner.info(), .rejected = owner.rejected, .unavailable = owner.unavailable };
+    }
+    pub fn retainExecutionContext(self: *Owner, handle: ContextHandle) !execution_context.Child {
+        if (self.graph_closing) return error.Busy;
+        return (try self.findContext(handle)).retainChild();
+    }
+    pub fn releaseExecutionContextChild(self: *Owner, handle: ContextHandle, child: execution_context.Child, quiesced: bool) !void {
+        try (try self.findContext(handle)).releaseChild(child, quiesced);
+    }
+    pub fn retireExecutionContext(self: *Owner, handle: ContextHandle, deadline: u64) !void {
+        const owner = try self.findContext(handle);
+        if (self.context_active != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or
+            self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
+        if (owner.held()) return error.Retained;
+        var token = try self.channel.?.handoff(deadline);
+        owner.beginDestroy(&token, deadline) catch |err| {
+            self.channel = exchange.Exchange.init(&token, deadline) catch |restore| { self.stop(restore); return restore; }; return err;
+        };
+        self.context_active = handle.slot;
+    }
+    fn freeContextSlot(self: *Owner, index: usize) !void {
+        const slot = &self.contexts[index];
+        const heap = slot.heap orelse return error.Api;
+        if (heap.release(slot.allocation.handle) != r4os.abi.driver_heap_ok) return error.Retained;
+        slot.* = .{};
+    }
     /// Called by the serialized native engine worker after queue.take. The
     /// common queue authenticates the full job/driver generation and supplies
     /// the reference; diagnostic buffer IDs are never imported here.
     pub fn mapQueuedBuffer(self: *Owner, fence: *const r4os.abi.GfxFence, which: u32, deadline: u64) !BufferHandle {
         _ = try self.now();
-        if (self.graph_closing or self.native_active != null or self.buffer_active != null or self.sequence.self_address != 0 or self.outputs.active()) return error.Busy;
+        if (self.graph_closing or self.context_active != null or self.native_active != null or self.buffer_active != null or self.sequence.self_address != 0 or self.outputs.active()) return error.Busy;
         const space = (self.nativeAddressSpace() orelse return error.State).*;
         if (self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         try self.channel.?.guard(deadline);
@@ -288,7 +364,7 @@ pub const Owner = struct {
     }
     pub fn retireBuffer(self: *Owner, handle: BufferHandle, deadline: u64, quiesced: bool) !void {
         const owner = try self.findBuffer(handle);
-        if (!quiesced or self.native_active != null or self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or
+        if (!quiesced or self.context_active != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or
             self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         if (owner.state != .handed_off) return error.State;
         var token = try self.channel.?.handoff(deadline);
@@ -315,7 +391,7 @@ pub const Owner = struct {
     }
     fn allocateNativePlan(self: *Owner, plan: vram.surface.Plan, deadline: u64) !BufferHandle {
         _ = try self.now();
-        if (self.graph_closing or self.native_active != null or self.buffer_active != null or self.sequence.self_address != 0 or self.outputs.active()) return error.Busy;
+        if (self.graph_closing or self.context_active != null or self.native_active != null or self.buffer_active != null or self.sequence.self_address != 0 or self.outputs.active()) return error.Busy;
         const space = (self.nativeAddressSpace() orelse return error.State).*;
         if (self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         try self.channel.?.guard(deadline);
@@ -370,7 +446,7 @@ pub const Owner = struct {
         slot.* = .{};
     }
     fn collectNativeBuffer(self: *Owner, deadline: u64) !bool {
-        if (self.native_active != null or self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or
+        if (self.context_active != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or
             self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return false;
         const memory = blk: {
             for (&self.native_buffers) |*slot| if (slot.owner) |owner| { if (owner.closing and owner.common_live) break :blk owner.memory; };
@@ -392,7 +468,7 @@ pub const Owner = struct {
     /// is drained before graph.beginDestroy may send any parent/event free.
     pub fn beginDestroyGraph(self: *Owner, deadline: u64, quiesced: bool) !void {
         _ = try self.now();
-        if (!quiesced or self.graph_closing or self.native_active != null or self.buffer_active != null or self.outputs.active() or
+        if (!quiesced or self.graph_closing or self.context_active != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or
             self.sequence.self_address != 0 or self.nativeObject() == null or self.channel.?.phase != .idle) return error.Busy;
         try self.channel.?.guard(deadline);
         for (&self.native_buffers, 0..) |*slot, index| if (slot.owner != null) {
@@ -419,6 +495,19 @@ pub const Owner = struct {
                 self.snapshot.last_event_ns = current;
             }
             return .progress;
+        }
+        if (self.context_active) |index| {
+            const owner = self.contexts[index].owner orelse return error.State;
+            if (owner.state == .ready or owner.state == .closed) {
+                if (owner.info()) |info| self.log("NVIDIA gsp-context: group={x} share={x} engine={x} runlist={d} fifo=unallocated",
+                    .{info.binding.group, info.binding.share, info.nv_engine, info.engine.data[3]});
+                const deadline = owner.deadline; var token = try owner.handoff();
+                self.channel = try exchange.Exchange.init(&token, deadline);
+                if (owner.state == .finished) try self.freeContextSlot(index);
+                self.context_active = null; return .progress;
+            }
+            if (try owner.poll()) |dispatch| { try self.notification(&owner.exchange, dispatch, current); return .progress; }
+            return if (owner.exchange.phase == .waiting) .idle else .progress;
         }
         if (self.native_active) |index| {
             const owner = self.native_buffers[index].owner orelse return error.State;
@@ -459,6 +548,13 @@ pub const Owner = struct {
         if (self.nativeObject() != null and try self.collectNativeBuffer(if (self.graph_closing) self.close_deadline else try std.math.add(u64, current, 5 * std.time.ns_per_s))) return .progress;
         if (self.graph_closing and self.graph.?.state == .loaned) graph_close: {
             try channel.guard(self.close_deadline);
+            for (&self.contexts, 0..) |*slot, index| if (slot.owner) |owner| {
+                if (!owner.held()) {
+                    try self.retireExecutionContext(.{ .epoch = self.epoch, .serial = slot.serial, .slot = @intCast(index) }, self.close_deadline);
+                    return .progress;
+                }
+            };
+            for (&self.contexts) |*slot| if (slot.owner != null) break :graph_close;
             for (&self.buffers, 0..) |*slot, index| if (slot.owner != null) {
                 try self.retireBuffer(.{ .epoch = self.epoch, .serial = slot.serial, .slot = @intCast(index) }, self.close_deadline, true);
                 return .progress;

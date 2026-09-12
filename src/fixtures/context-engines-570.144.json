@@ -1,0 +1,15 @@
+{
+  "source_pin": "NVIDIA 570.144 / 8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f",
+  "vector": {
+    "path": "Temp/gfx-channel-context-20260912/context-engines-570.144.bin",
+    "bytes": 224,
+    "sha256": "e0f2e8b0030154effbb9946e08c3cd66e25675b98304ab53b7c0f8af6478b87e"
+  },
+  "generator": {
+    "path": "Temp/gfx-channel-context-20260912/Context-ABI.c",
+    "bytes": 32781,
+    "sha256": "a02003172214d756c4ccda9a8891412b7f1cebbb0442c483d0d3fc25f4b85a76"
+  },
+  "scope": "Original C class/control/allocation layouts; eight request/reply pairs and28 RM/NV2080 engine ID pairs. No physical GPU execution.",
+  "archive": "ExFiles/Reference/GFX/Nvidia/0.79.11/channel-context-20260912"
+}

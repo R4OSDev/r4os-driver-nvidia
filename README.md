@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.72; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.73; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -11,6 +11,16 @@ Starting with R4OS 0.79.9, `IMAGE_SCOPE=slim` includes the current module in
 Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
+
+RM execution contexts (NVIDIA 0.1.73):
+The production runtime discovers the complete engine table and required
+Ampere classes, then creates a group and synchronous context share in its
+existing VA space. Acknowledged results and bounded child references gate
+publication and reverse teardown; held contexts retain their parents while
+unrelated contexts can retire. Closing cleanup uses cached heap ownership.
+Original C vectors,51 existing groups and the module build pass. Instance/
+FIFO backing, bind/schedule and actual engine consumers remain open.
+Evidence: GrafikSpeicher07911.json / context_checkpoint.
 
 Native surface storage (NVIDIA 0.1.72 / Kernel 0.1.158):
 The runtime plans linear or capability-qualified blocklinear XRGB/ARGB/R8/

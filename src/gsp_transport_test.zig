@@ -1611,6 +1611,7 @@ fn graphDestroy(model: *Model, owner: *rm_graph.Owner) !boot_events.Handoff {
 }
 fn checkRmGraph(model: *Model) !void {
     try @import("gsp_surface_layout_test.zig").check();
+    try @import("gsp_context_test.zig").check();
     {
         const caps = @import("gsp_memory_caps.zig");
         const golden = @embedFile("fixtures/memory-caps-570.144.bin");

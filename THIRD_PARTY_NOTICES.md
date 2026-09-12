@@ -1,5 +1,13 @@
 ﻿# Third-Party Notices
 
+RM execution contexts (NVIDIA 0.1.73, 2026-09-12):
+Engine/class discovery, group/share allocation and engine ID conversion
+follow pinned570.144 MIT SDK and RM sources. Complete notices remain in
+gsp_context_wire.zig, gsp_context.zig and the identical embedded/image
+runtime license. Thirteen complete originals and a C-ABI/macro comparison
+are archived under0.79.11/channel-context-20260912. No new upstream C
+implementation is linked; original R4OS runtime ownership is Apache-2.0.
+
 Native surface storage (NVIDIA 0.1.72, 2026-09-12):
 Pitch/GOB geometry, automatic block height, uncompressed NVIDIA modifiers
 and RM allocation attributes follow the pinned 570.144 MIT sources.

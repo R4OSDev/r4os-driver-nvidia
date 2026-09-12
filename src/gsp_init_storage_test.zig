@@ -1525,6 +1525,8 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         mapping_success, mapping_reject, mapping_offset, mapping_ack, mapping_timeout, mapping_release, mapping_segment, mapping_gpu,
         vram_success, vram_budget, vram_physical_reject, vram_virtual_reject, vram_map_reject, vram_commit, vram_size, vram_ack, vram_timeout, vram_free, vram_finish,
         vram_surface_linear, vram_surface_tiled, vram_surface_changed, vram_surface_contiguity,
+        context_success, context_classes, context_engine, context_query_reject, context_page, context_duplicate,
+        context_group_reject, context_share_reject, context_share_changed, context_ack, context_timeout, context_free,
         outputs_empty, outputs_all, outputs_rejected, outputs_partial, outputs_missing, outputs_incomplete, outputs_bad_edid,
         outputs_edid_rejected, outputs_ddc, outputs_ddc_bus_changed, outputs_aux, outputs_wiring, outputs_virtual, outputs_changed, outputs_final_changed, outputs_final_rejected, outputs_hpd, outputs_sequence, outputs_ack, outputs_timeout, catalog_rejected,
         runtime_healthy, runtime_lockdown, runtime_unknown, runtime_unowned, runtime_sequence_timeout,
@@ -1676,6 +1678,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
             if (target.phase == .ready and !target.stopped) try checkDeviceRm(target, words, held.plan.?.frts.offset, case);
             if (target.phase == .ready and std.mem.startsWith(u8, @tagName(case), "mapping_")) try checkDeviceMappings(target, table, @tagName(case));
             if (target.phase == .ready and std.mem.startsWith(u8, @tagName(case), "vram_")) try checkDeviceVram(target, table, @tagName(case));
+            if (target.phase == .ready and std.mem.startsWith(u8, @tagName(case), "context_")) try checkDeviceContexts(target, table, @tagName(case));
             if (target.phase == .ready and !target.stopped) try checkDeviceOutputs(target, words, held.plan.?.frts.offset, case);
             if (exercise_runtime) try checkDeviceRuntime(target, words, held.plan.?.frts.offset, case);
         } else {
@@ -2568,6 +2571,136 @@ fn outputEdidFull(bytes: *[4096]u8) void {
     bytes[126] = 31;
     bytes[127] -%= 30;
     for (2..32) |index| { bytes[index * 128] = 0x99; bytes[index * 128 + 127] = 0 -% @as(u8, 0x99); }
+}
+fn checkDeviceContexts(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, scenario: []const u8) !void {
+    const model = @import("gsp_buffer_test_model.zig").Model;
+    const runtime = @import("gsp_runtime.zig");
+    const vectors = @import("gsp_context_test.zig");
+    const wire = runtime.execution_context.wire;
+    const running = &target.running;
+    const session = &target.session.?;
+    const deadline = clock + 5 * std.time.ns_per_s;
+    const command = init.queues_offset + init.command_offset;
+    const status = init.queues_offset + init.status_offset;
+    model.install(table, scenario); defer model.dispose(table);
+    const success = model.is("context_success");
+    var handles: [2]runtime.ContextHandle = undefined;
+    var held: ?runtime.execution_context.Child = null;
+    var allocations: usize = 0;
+    var frees: usize = 0;
+    var interleaved = false;
+    errdefer |err| std.debug.print("context {s}: {s} phase={s} failure={?} active={?} alloc={d} free={d}\n",
+        .{scenario,@errorName(err),@tagName(target.phase),target.failure,running.context_active,allocations,frees});
+    for (0..@as(usize, if (success) 2 else 1)) |index| {
+        handles[index] = try running.createExecutionContext(19, deadline);
+        var forged = handles[index]; forged.serial += 1;
+        try t.expectError(error.Stale, running.executionContextStatus(forged));
+        try t.expectError(error.State, running.allocateNativeBuffer(4096, deadline));
+        var steps: usize = 0;
+        while (target.phase == .ready and running.context_active != null and steps < 100) : (steps += 1) {
+            _ = target.step();
+            if (target.phase != .ready or running.context_active == null) break;
+            const owner = running.contexts[running.context_active.?].owner.?;
+            const channel = running.activeChannel().?;
+            if (channel.phase != .waiting) continue;
+            const op = owner.operation.?;
+            const vector_index: usize = switch (op) { .classes => 0, .engines => if (owner.base == 0) 1 else 2, .method_size => 3, .group => 4, .share => 5, .free_share => 6, .free_group => 7 };
+            const cursor = (session.tx_write + 62) % 63;
+            const record = try transport.message.decode(session.profile, backing.?[command + 4096 + cursor * 4096..][0..4096], session.tx_sequence - 1);
+            try t.expectEqualSlices(u8, channel.request, record.payload);
+            try t.expect(owner.info() == null);
+            channel.phase = .prepared;
+            try target.port.owner.?.admit_command.?(target.port.owner.?.context, &target.port, deadline);
+            var moved = owner.*; try t.expect(!moved.matches(channel, deadline)); try t.expectError(error.Stale, moved.poll());
+            const original = channel.request; channel.request = record.payload;
+            try t.expectError(error.Binding, target.port.owner.?.admit_command.?(target.port.owner.?.context, &target.port, deadline));
+            channel.request = original; channel.phase = .waiting;
+            std.mem.writeInt(u32, backing.?[status + 64..][0..4], session.tx_write, .little);
+            var response: [wire.max_bytes]u8 = @splat(0);
+            @memcpy(response[0..channel.request.len], channel.request);
+            const header: usize = if (wire.function(op) == 76) 24 else if (wire.function(op) == 103) 32 else 16;
+            @memcpy(response[header..channel.request.len], vectors.response(vector_index)[header..]);
+            if (wire.function(op) == 103) allocations += 1;
+            if (wire.function(op) == 10) frees += 1;
+            if (op == .classes and model.is("context_classes")) outputWord(&response, 24, 0);
+            if (op == .engines) {
+                if (model.is("context_page")) outputWord(&response, 24, owner.base + 1);
+                if (owner.base == 0 and model.is("context_duplicate")) outputWord(&response, 44, 19);
+                if (owner.base == 32 and model.is("context_engine")) outputWord(&response, 44, 20);
+                if (!interleaved) {
+                    var print: [9]u8 = @splat(0); print[4] = 1; print[8] = 'C';
+                    try nativeEvent(session, 0x100c, &print); _ = target.step();
+                    try t.expect(channel.phase == .waiting and channel.deadline == deadline and owner.info() == null);
+                    interleaved = true;
+                }
+            }
+            if (op == .method_size and model.is("context_query_reject")) outputWord(&response, 12, 0x57);
+            if ((op == .group and model.is("context_group_reject")) or (op == .share and model.is("context_share_reject"))) outputWord(&response, 16, 0x57);
+            if (op == .share and model.is("context_share_changed")) response[36] ^= 1;
+            if (op == .share and model.is("context_timeout")) clock = deadline else {
+                try nativeReply(session, channel.function, 0, response[0..channel.request.len]);
+                if (op == .share and model.is("context_ack")) range_failure_call = range_calls + 4;
+            }
+            _ = target.step(); range_failure_call = 0;
+        }
+        try t.expect(steps < 100);
+        if (target.phase != .ready) break;
+        const result = try running.executionContextStatus(handles[index]);
+        try t.expect(result.state == .handed_off);
+        if (result.info) |info| {
+            try t.expect(info.binding.client == running.graph.?.reservation.client and info.rm_engine == 19 and info.nv_engine == 0x34);
+            try t.expect(info.engine.data[3] == 7 and info.method_bytes == 0x6000 and info.subcontext == 0);
+            var token = try running.channel.?.handoff(deadline); try running.graph.?.reclaim(&token, deadline);
+            const sent = session.tx_sequence; try t.expectError(error.Retained, running.graph.?.beginDestroy(deadline)); try t.expect(sent == session.tx_sequence);
+            var loan = try running.graph.?.loan(deadline); running.channel = try @import("gsp_exchange.zig").Exchange.init(&loan.runtime, deadline);
+            if (success and index == 0) {
+                held = try running.retainExecutionContext(handles[0]);
+                try t.expectError(error.Retained, running.retireExecutionContext(handles[0], deadline));
+                var wrong = held.?; wrong.serial += 1;
+                try t.expectError(error.Stale, running.releaseExecutionContextChild(handles[0], wrong, true));
+            }
+        } else {
+            try t.expect(result.unavailable != null or result.rejected != null);
+            try t.expect(!running.contexts[handles[index].slot].owner.?.namespace_live);
+            try t.expect(allocations == @as(usize, if (model.is("context_group_reject")) 1 else if (model.is("context_share_reject")) 2 else 0));
+            try t.expect(frees == @as(usize, if (model.is("context_share_reject")) 1 else 0));
+        }
+    }
+    if (target.phase == .ready) {
+        if (success) model.closeHeapAdmission(table);
+        try running.beginDestroyGraph(deadline, true);
+        try t.expectError(error.Busy, running.retainExecutionContext(handles[0]));
+        var steps: usize = 0;
+        while (target.phase == .ready and steps < 180) : (steps += 1) {
+            _ = target.step();
+            if (target.phase != .ready) break;
+            if (success and frees == 2 and running.context_active == null and held != null) {
+                try t.expect(running.contexts[1].owner == null and running.contexts[0].owner.?.held());
+                try t.expectError(error.Retained, running.releaseExecutionContextChild(handles[0], held.?, false));
+                try running.releaseExecutionContextChild(handles[0], held.?, true);
+                try t.expectError(error.Stale, running.releaseExecutionContextChild(handles[0], held.?, true)); held = null;
+            }
+            const channel = running.activeChannel().?;
+            if (channel.phase != .waiting) continue;
+            var response: [wire.max_bytes]u8 = @splat(0); @memcpy(response[0..channel.request.len], channel.request);
+            if (running.context_active) |index| {
+                const owner = running.contexts[index].owner.?;
+                try t.expect(owner.state == .destroying and !owner.held());
+                try t.expect(owner.operation.? == .free_share or owner.operation.? == .free_group); frees += 1;
+                if (model.is("context_free")) outputWord(&response, 12, 0x57);
+            } else for (&running.contexts) |*slot| try t.expect(slot.owner == null);
+            std.mem.writeInt(u32, backing.?[status + 64..][0..4], session.tx_write, .little);
+            try nativeReply(session, channel.function, 0, response[0..channel.request.len]); _ = target.step();
+        }
+        try t.expect(steps < 180);
+    }
+    const uncertain = model.is("context_page") or model.is("context_duplicate") or model.is("context_share_changed") or model.is("context_ack") or model.is("context_timeout") or model.is("context_free");
+    try t.expect(target.phase == .recovering and target.failure != null);
+    if (uncertain) try t.expect(running.contexts[0].owner.?.namespace_live and running.contexts[0].owner.?.failure != null) else {
+        try t.expect(target.failure.? == error.RmClosed);
+        for (&running.contexts) |*slot| try t.expect(slot.owner == null);
+        if (success) try t.expect(allocations == 4 and frees == 4);
+    }
 }
 fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, scenario: []const u8) !void {
     const model = @import("gsp_vram_test_model.zig").Model;
