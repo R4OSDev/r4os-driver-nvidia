@@ -432,7 +432,15 @@ pub const Device = struct {
             channel.phase != .prepared or channel.pending != null or channel.session.pending != null or
             channel.deadline != deadline) return error.Binding;
         if (channel.in_lockdown) return error.Lockdown;
-        if (self.running.display_channel_active) |index| {
+        if (self.running.mode_control_active) {
+            const mode = if (self.running.mode_control_owner) |*value| value else return error.Binding;
+            const root = if (self.running.mode_control_root) |value| value else return error.Binding;
+            const engine = if (self.running.display_engine_owner) |*value| value else return error.Binding;
+            const snapshot = self.running.outputs.snapshot() orelse return error.Binding;
+            const rebound = runtime.boot_mode.bind(mode.mode, snapshot, self.epoch, self.display_epoch) catch return error.Binding;
+            if (root.epoch != self.epoch or root.root != engine.binding.root or engine.info() == null or
+                !std.meta.eql(rebound, mode.mode) or !mode.matches(channel, deadline)) return error.Binding;
+        } else if (self.running.display_channel_active) |index| {
             const display_dma = if (self.running.display_channels[index]) |*value| value else return error.Binding;
             if (!display_dma.matches(channel, deadline)) return error.Binding;
         } else if (self.running.display_engine_active) {
@@ -479,7 +487,7 @@ pub const Device = struct {
         if (self.phase != .ready or port != &self.port or port.phase != .runtime or self.session == null or self.inLockdown() or
             self.running.self_address != @intFromPtr(&self.running) or self.running.failure != null or self.running.sequence.self_address != 0 or
             self.running.fifo_active != null or self.running.context_active != null or self.running.native_active != null or self.running.buffer_active != null or
-            self.running.outputs.active() or self.running.graph_closing or self.running.display_engine_active or self.running.display_channel_active != null or self.running.display_work != null) return error.State;
+            self.running.outputs.active() or self.running.graph_closing or self.running.display_engine_active or self.running.display_channel_active != null or self.running.display_work != null or self.running.mode_control_active) return error.State;
         const channel_handle = if (self.running.display_upload_job) |*work| blk: {
             const resources = self.running.display_resources_slot.owner orelse return error.Binding;
             const root = if (self.running.display_engine_owner) |*value| value else return error.Binding;
@@ -520,7 +528,7 @@ pub const Device = struct {
         if (self.phase != .ready or port != &self.port or port.phase != .runtime or self.session == null or self.inLockdown() or
             self.running.self_address != @intFromPtr(&self.running) or self.running.failure != null or self.running.sequence.self_address != 0 or
             self.running.fifo_active != null or self.running.context_active != null or self.running.native_active != null or self.running.buffer_active != null or
-            self.running.outputs.active() or self.running.graph_closing or self.running.display_engine_active or self.running.display_channel_active != null or
+            self.running.outputs.active() or self.running.graph_closing or self.running.display_engine_active or self.running.display_channel_active != null or self.running.mode_control_active or
             self.running.copy_job != null or self.running.display_upload_job != null or self.running.initial_image != null) return error.State;
         const work = if (self.running.display_work) |*value| value else return error.Binding;
         const resources = self.running.display_resources_slot.owner orelse return error.Binding;

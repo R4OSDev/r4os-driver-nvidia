@@ -1547,6 +1547,9 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         context_display_present_initial_acquire, context_display_present_initial_retry,
         context_native_unknown, context_native_connected, context_native_prepare_reject,
         context_native_receipt, context_native_timeout, context_native_link_reject, context_native_stale,
+        context_native_mode_missing, context_native_mode_reject, context_native_mode_free_reject,
+        context_native_mode_clock, context_native_mode_impossible, context_native_mode_timeout, context_native_mode_stale,
+        context_native_mode_retire,
         display_root_success, display_root_classes, display_root_reject, display_root_static, display_root_preserve, display_root_free,
         display_root_ack, display_root_timeout, display_root_wrong,
         display_dma_success, display_dma_instance_ack, display_dma_instance_reject, display_dma_oom, display_dma_segment, display_dma_unmap,
@@ -2966,6 +2969,7 @@ const NativeCommon = struct {
     var prepares: usize = 0;
     var commits: usize = 0;
     var restores: usize = 0;
+    var mode_requests: [5]usize = @splat(0);
     var published = false;
     var scenario: []const u8 = "";
     fn is(name: []const u8) bool { return std.mem.eql(u8, scenario, name); }
@@ -3060,6 +3064,7 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
     target.irq_wake = .{ .context = @intFromPtr(target), .signal = copy.wakePresentation };
     NativeCommon.target = target; NativeCommon.scenario = scenario;
     NativeCommon.prepares = 0; NativeCommon.commits = 0; NativeCommon.restores = 0; NativeCommon.published = false; NativeCommon.registration = .{};
+    NativeCommon.mode_requests = @splat(0);
     for (&NativeCommon.pixels, 0..) |*byte, i| byte.* = @truncate(i * 17 + 23);
     table.gfx_output_query = NativeCommon.outputs; table.gfx_display_query = NativeCommon.display;
     captured.boot.display = target.ctx.?.graphicsDisplay();
@@ -3098,10 +3103,42 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
         clock += 1000;
         _ = target.step();
         if (target.phase != .ready) break;
+        if (NativeCommon.is("context_native_mode_retire") and target.native_output.phase == .instance_allocate) {
+            checkpoint = "mode control retirement";
+            const handle = target.native_output.mode_control.?;
+            const engine = target.native_output.engine.?;
+            const deadline = clock + std.time.ns_per_s;
+            try t.expectError(error.Busy, run.retireDisplayEngine(engine, deadline));
+            try run.retireModeControl(handle, deadline);
+            for (0..16) |_| {
+                clock += 1000; _ = try run.step();
+                if (!run.mode_control_active) break;
+                const channel = run.activeChannel().?;
+                if (channel.phase == .waiting) {
+                    try t.expect(run.mode_control_owner.?.live and run.mode_control_owner.?.namespace_live);
+                    try replyNativeProduct(target);
+                }
+            }
+            try t.expect(run.mode_control_owner == null and !run.mode_control_active);
+            try t.expectError(error.Stale, run.modeControlStatus(handle));
+            try t.expect((try run.displayEngineStatus(engine)).info != null);
+            const next = try run.createModeControl(engine, target.native_output.mode.?, deadline);
+            try t.expect(next.epoch == handle.epoch and next.handle > handle.handle);
+            try t.expectEqualSlices(usize, &.{ 1, 1, 1, 1, 1 }, &NativeCommon.mode_requests);
+            _ = target.stop();
+            try t.expect(copy.shadow_creates == 0 and NativeCommon.prepares == 0 and NativeCommon.commits == 0);
+            return;
+        }
         if (run.fifo_active != null) { try replyDeviceFifo(target, &counts, scenario); continue; }
         if (run.buffer_active != null) { try replyCopyMapping(target); continue; }
         const rpc = run.activeChannel();
-        if (rpc != null and rpc.?.phase == .waiting) { try replyNativeProduct(target); continue; }
+        if (rpc != null and rpc.?.phase == .waiting) {
+            if (run.mode_control_active and run.mode_control_owner.?.operation == .possible) {
+                if (NativeCommon.is("context_native_mode_timeout")) { clock = run.mode_control_owner.?.deadline; continue; }
+                if (NativeCommon.is("context_native_mode_stale")) run.outputs.data.generation += 1;
+            }
+            try replyNativeProduct(target); continue;
+        }
         if (run.display_upload_job) |*upload| if (upload.operation.phase == .submitted) {
             const channel = run.fifos[target.native_output.copy.?.slot].owner.?;
             const wire = @import("gsp_copy_wire.zig");
@@ -3142,7 +3179,10 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
         }
         if (NativeCommon.is("context_native_stale") and target.native_output.phase == .image_upload) run.outputs.data.generation += 1;
     }
-    try t.expect(steps < 1200 and copy.shadow_creates == 1 and !copy.shadow_cpu and NativeCommon.prepares == 1);
+    const early_mode_failure = std.mem.startsWith(u8, scenario, "context_native_mode_");
+    try t.expect(steps < 1200 and !copy.shadow_cpu and
+        copy.shadow_creates == @as(usize, if (early_mode_failure) 0 else 1) and
+        NativeCommon.prepares == @as(usize, if (early_mode_failure) 0 else 1));
     const success = NativeCommon.is("context_native_unknown") or NativeCommon.is("context_native_connected");
     if (success) {
         try t.expect(target.phase == .ready and target.native_output.phase == .active and NativeCommon.commits == 1 and captured.boot.native_adopted);
@@ -3173,6 +3213,27 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
             if (copy.completed == 1) break;
         }
         try t.expect(copy.completed == 1 and copy.result == a.gfx_queue_result_complete and target.failure == null);
+        if (NativeCommon.is("context_native_unknown")) {
+            checkpoint = "fresh mode query";
+            const handle = target.native_output.mode_control.?;
+            const plan = target.native_output.mode.?;
+            const previous = (try run.modeControlStatus(handle)).info.?;
+            var stale_mode = plan; stale_mode.output_generation += 1;
+            try t.expectError(error.Stale, run.queryDisplayMode(handle, stale_mode, clock + std.time.ns_per_s));
+            try t.expectEqual(previous.receipt, (try run.modeControlStatus(handle)).info.?.receipt);
+            try run.queryDisplayMode(handle, plan, clock + std.time.ns_per_s);
+            try t.expect((try run.modeControlStatus(handle)).info == null);
+            for (0..30) |_| {
+                clock += 1000; _ = target.step();
+                if (!run.mode_control_active) break;
+                const channel = run.activeChannel().?;
+                if (channel.phase == .waiting) try replyNativeProduct(target);
+            }
+            const current = (try run.modeControlStatus(handle)).info.?;
+            try t.expect(!run.mode_control_active and current.possible and current.receipt > previous.receipt and
+                current.source_clock_hz == 600000000 and current.min_bandwidth_kbps == 123456);
+            try t.expectEqualSlices(usize, &.{ 1, 1, 2, 2, 0 }, &NativeCommon.mode_requests);
+        }
         checkpoint = "restore";
         const read = captured.boot.read;
         try t.expect(!captured.boot.close() and NativeCommon.restores == 1 and std.meta.eql(read, captured.boot.read));
@@ -3181,7 +3242,21 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
     } else {
         try t.expect(target.phase != .ready and target.native_output.failure != null and !NativeCommon.published);
         try t.expect(NativeCommon.commits == @as(usize, if (NativeCommon.is("context_native_receipt")) 1 else 0));
-        try t.expect(target.memory.?.retained and native.released == 0 and copy.heldReferences() != 0);
+        try t.expect(target.memory.?.retained and native.released == 0);
+        if (early_mode_failure) {
+            try t.expect(copy.heldReferences() == 0 and run.display_resources_slot.owner == null and run.presentation == null);
+            const owner = &run.mode_control_owner.?;
+            if (NativeCommon.is("context_native_mode_reject"))
+                try t.expect(!owner.live and !owner.namespace_live and NativeCommon.mode_requests[4] == 1);
+            if (NativeCommon.is("context_native_mode_free_reject"))
+                try t.expect(owner.live and owner.namespace_live and owner.state == .failed);
+            if (NativeCommon.is("context_native_mode_missing"))
+                try t.expect(owner.unavailable and !owner.namespace_live and NativeCommon.mode_requests[1] == 0);
+            if (NativeCommon.is("context_native_mode_clock"))
+                try t.expect(owner.result != null and owner.result.?.over_clock and NativeCommon.mode_requests[3] == 0);
+            if (NativeCommon.is("context_native_mode_impossible"))
+                try t.expect(owner.result != null and !owner.result.?.possible and !owner.result.?.over_clock);
+        } else try t.expect(copy.heldReferences() != 0);
         try t.expect(!target.native_output.ownsNative(DeviceModel.boot_info));
     }
     checkpoint = "stop";
@@ -3217,6 +3292,22 @@ fn replyNativeProduct(target: *@import("gsp_device.zig").Device) !void {
             .map => std.mem.writeInt(u64, response[40..48], native.address(slot), .little),
             else => return error.Unexpected,
         }
+    } else if (run.mode_control_active) {
+        const op = run.mode_control_owner.?.operation.?;
+        try t.expect(run.mode_control_owner.?.info() == null);
+        NativeCommon.mode_requests[@intFromEnum(op)] += 1;
+        switch (op) {
+            .classes => { outputWord(&response, 24, 1); outputWord(&response, 28, if (NativeCommon.is("context_native_mode_missing")) 0 else 0xc372); },
+            .pclk => { outputWord(&response, 32, 0); outputWord(&response, 36, if (NativeCommon.is("context_native_mode_clock")) 100000 else 600000); outputWord(&response, 40, 0); },
+            .possible => {
+                response[24 + 1904] = if (NativeCommon.is("context_native_mode_impossible")) 0 else 1;
+                outputWord(&response, 24 + 1924, 123456); outputWord(&response, 24 + 1928, 90000);
+                outputWord(&response, 24 + 1932, 200000); outputWord(&response, 24 + 2004, 300000);
+            },
+            .allocate, .free => {},
+        }
+        if ((op == .pclk and NativeCommon.is("context_native_mode_reject")) or
+            ((op == .pclk or op == .free) and NativeCommon.is("context_native_mode_free_reject"))) outputWord(&response, 12, 0x57);
     } else if (run.display_engine_active) {
         const op = run.display_engine_owner.?.operation.?;
         if (op != .instance) {

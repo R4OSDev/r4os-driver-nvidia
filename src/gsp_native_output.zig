@@ -12,7 +12,7 @@ const Outputs = @TypeOf(@as(r4os.r4dev.DriverContext, undefined).graphicsOutputs
 pub const Phase = enum {
     detached, waiting, context_start, context_wait, context_retire, context_retiring,
     methods_allocate, methods_attach, copy_allocate, copy_create, copy_wait,
-    engine_create, engine_wait, instance_allocate, instance_attach, instance_wait,
+    engine_create, engine_wait, mode_create, mode_wait, instance_allocate, instance_attach, instance_wait,
     core_notifier, window_notifier, surface_allocate, surface_bind,
     storage_wait, storage_release, table_upload, table_wait,
     core_create, core_wait, window_create, window_wait, immediate_create, immediate_wait,
@@ -42,6 +42,8 @@ pub const Owner = struct {
     storage: ?runtime.BufferHandle = null,
     copy: ?runtime.ChannelHandle = null,
     engine: ?runtime.DisplayEngineHandle = null,
+    mode_control: ?runtime.ModeControlHandle = null,
+    mode_admission: ?runtime.mode_control.Result = null,
     core: ?runtime.DisplayChannelHandle = null,
     window: ?runtime.DisplayChannelHandle = null,
     immediate: ?runtime.DisplayChannelHandle = null,
@@ -182,6 +184,19 @@ pub const Owner = struct {
                 const snapshot = run.nativeOutputs() orelse return error.Busy;
                 self.mode = try runtime.boot_mode.bind(saved, snapshot, run.epoch, held.boot.held_generation);
                 self.link = try runtime.hdmi_link.derive(self.mode.?, run.nativeObject() orelse return error.Busy, snapshot);
+                self.next(.mode_create);
+            },
+            .mode_create => {
+                self.mode_control = try run.createModeControl(self.engine.?, self.mode.?, self.phase_deadline);
+                self.next(.mode_wait);
+            },
+            .mode_wait => {
+                const status = try run.modeControlStatus(self.mode_control.?);
+                if (status.state != .handed_off) return false;
+                if (status.rejected != null or status.unavailable) return error.Unsupported;
+                const admission = status.info orelse return error.State;
+                if (!admission.possible or admission.over_clock or admission.receipt == 0 or !std.meta.eql(admission.mode, self.mode.?)) return error.Unsupported;
+                self.mode_admission = admission;
                 self.next(.instance_allocate);
             },
             .instance_allocate => try self.allocate(65536, .instance_attach),
@@ -390,6 +405,8 @@ pub const Owner = struct {
     fn validateCompletion(self: *Owner) !void {
         try self.validateRoute();
         const run = self.running.?;
+        const mode_status = try run.modeControlStatus(self.mode_control.?);
+        if (mode_status.info == null or self.mode_admission == null or !std.meta.eql(mode_status.info.?, self.mode_admission.?)) return error.Completion;
         const image = try run.displayImageStatus(self.engine.?, self.mode.?.window) orelse return error.State;
         if (run.display_work != null or run.initial_image != null or run.presentation == null or
             run.presentation.?.initial_point == 0 or run.presentation.?.initial_failure != null or

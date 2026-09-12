@@ -1,5 +1,17 @@
 ﻿# Third-Party Notices
 
+Display mode feasibility (NVIDIA 0.1.89, 2026-09-13):
+NVC372 display-control allocation, NV0073 source pixel-clock limits and
+the IMP head/window query follow the MIT NVIDIA 570.144 source pin
+8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f. Twenty-six complete originals
+and ten independent C payloads are archived under
+0.79.13/mode-admission-20260913. Full applicable source notices are retained
+in gsp_mode_control.zig. The identical module/image runtime license adds
+the clc372sw.h, nvdisptypes.h and nvkms-dpy.c notices and preserves the
+preceding 354786 bytes; its size is now 358737 bytes. Original R4OS
+ownership and generation policy is Apache-2.0. No firmware changed;
+the original-header C generator is host-only.
+
 HDMI control integration (NVIDIA 0.1.87, 2026-09-12):
 RM setter layouts and packet fields use MIT NVIDIA570.144
 /8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f; NVKMS and Nouveau r535/disp

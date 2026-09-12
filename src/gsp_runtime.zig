@@ -45,6 +45,9 @@ const display = @import("gsp_display_rpc.zig");
 pub const display_engine = @import("gsp_display_engine.zig");
 pub const DisplayEngineHandle = struct { epoch: u64, root: u32 };
 pub const DisplayEngineStatus = struct { state: display_engine.State, info: ?display_engine.Info, rejected: ?u32, unavailable: bool };
+pub const mode_control = @import("gsp_mode_control.zig");
+pub const ModeControlHandle = struct { epoch: u64, handle: u32 };
+pub const ModeControlStatus = struct { state: mode_control.State, info: ?mode_control.Result, rejected: ?u32, unavailable: bool };
 pub const display_channel = @import("gsp_display_channel.zig");
 pub const DisplayChannelHandle = struct { epoch: u64, handle: u32, slot: u8 };
 pub const DisplayChannelStatus = struct { state: display_channel.State, info: ?display_channel.Info, rejected: ?u32, host_rejected: ?anyerror, initialized: bool, completed: u64 };
@@ -160,6 +163,9 @@ pub const Owner = struct {
     display_object: ?display.Object = null,
     display_engine_owner: ?display_engine.Owner = null,
     display_engine_active: bool = false,
+    mode_control_owner: ?mode_control.Owner = null,
+    mode_control_active: bool = false,
+    mode_control_root: ?DisplayEngineHandle = null,
     display_channels: [17]?display_channel.Owner = @splat(null),
     display_channel_active: ?u8 = null,
     display_resources_slot: DisplayResourcesSlot = .{},
@@ -280,6 +286,8 @@ pub const Owner = struct {
         }
         if (self.display_engine_owner) |*owner| self.log("NVIDIA gsp-display-engine: failed={s} root={x} operation={s} status={?} confirmed={} possible={} boot=retained",
             .{@errorName(err),owner.binding.root,if (owner.operation) |op| @tagName(op) else "none",owner.last_status,owner.live,owner.allocation_possible});
+        if (self.mode_control_owner) |*owner| self.log("NVIDIA gsp-mode-query: failed={s} handle={x} operation={s} status={?} clock-limit-hz={d} control-live={} resources=retained",
+            .{@errorName(err),owner.binding.control,if (owner.operation) |op| @tagName(op) else "none",owner.last_status,owner.source_clock_hz,owner.live});
         for (&self.display_channels) |*slot| if (slot.*) |*owner| self.log("NVIDIA gsp-display-channel: failed={s} handle={x} class={x} index={d} rm-live={} possible={} control={x} state={x} storage-held={}",
             .{@errorName(err),owner.config.handle,display_channel.wire.class(owner.config.kind),owner.config.index,owner.live,owner.allocation_possible,
                 owner.last_control,owner.last_state,owner.backing.retained});
@@ -384,6 +392,7 @@ pub const Owner = struct {
             .irq_messages = @atomicLoad(u64, &endpoint.messages, .acquire) }) catch {};
     }
     pub fn activeChannel(self: *Owner) ?*exchange.Exchange {
+        if (self.mode_control_active) if (self.mode_control_owner) |*owner| return &owner.exchange;
         if (self.display_channel_active) |index| if (self.display_channels[index]) |*owner| return &owner.exchange;
         if (self.display_engine_active) if (self.display_engine_owner) |*owner| return &owner.exchange;
         if (self.fifo_active) |index| if (self.fifos[index].owner) |owner| return owner.channel();
@@ -463,6 +472,7 @@ pub const Owner = struct {
     }
     pub fn retireDisplayEngine(self: *Owner, handle: DisplayEngineHandle, deadline: u64) !void {
         const owner = try self.findDisplayEngine(handle);
+        if (self.mode_control_owner != null) return error.Busy;
         if (self.display_engine_active or self.copyBusy() or self.sequence.self_address != 0 or self.nativeObject() == null or
             self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         try self.channel.?.guard(deadline);
@@ -471,6 +481,63 @@ pub const Owner = struct {
             self.channel = exchange.Exchange.init(&token, deadline) catch |restore| { self.stop(restore); return restore; }; return err;
         };
         self.display_engine_active = true;
+    }
+    fn validateModeQuery(self: *Owner, root: DisplayEngineHandle, plan: boot_mode.Plan) !void {
+        const engine = (try self.findDisplayEngine(root)).info() orelse return error.State;
+        if (plan.head >= engine.hardware.heads or plan.window >= 8 or
+            engine.hardware.windows & (@as(u32, 1) << @intCast(plan.window)) == 0) return error.Bounds;
+        const snapshot = self.outputs.snapshot() orelse return error.Busy;
+        const held = self.reservation.?.display orelse return error.Stale;
+        const rebound = try boot_mode.bind(plan, snapshot, self.epoch, held.boot.held_generation);
+        if (!std.meta.eql(rebound, plan)) return error.Stale;
+    }
+    pub fn createModeControl(self: *Owner, root: DisplayEngineHandle, plan: boot_mode.Plan, deadline: u64) !ModeControlHandle {
+        _ = try self.now();
+        if (self.mode_control_owner != null or self.graph_closing or self.copyBusy() or self.sequence.self_address != 0) return error.Busy;
+        const object = self.nativeObject() orelse return error.Busy;
+        try self.validateModeQuery(root, plan);
+        if (self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
+        try self.channel.?.guard(deadline);
+        var token = try self.channel.?.handoff(deadline);
+        const owner = mode_control.Owner.init(&token, self.graph.?.reservation, self.graph.?.base.plan.handles.device, object.display, plan, deadline) catch |err| {
+            self.channel = exchange.Exchange.init(&token, deadline) catch |restore| { self.stop(restore); return restore; }; return err;
+        };
+        self.mode_control_owner = owner; self.mode_control_root = root; self.mode_control_active = true;
+        return .{ .epoch = self.epoch, .handle = owner.binding.control };
+    }
+    fn findModeControl(self: *Owner, handle: ModeControlHandle) !*mode_control.Owner {
+        _ = try self.now();
+        const owner = if (self.mode_control_owner) |*value| value else return error.Stale;
+        if (handle.epoch != self.epoch or handle.handle == 0 or handle.handle != owner.binding.control) return error.Stale;
+        return owner;
+    }
+    pub fn modeControlStatus(self: *Owner, handle: ModeControlHandle) !ModeControlStatus {
+        const owner = try self.findModeControl(handle);
+        try self.validateModeQuery(self.mode_control_root.?, owner.mode);
+        return .{ .state = owner.state, .info = owner.info(), .rejected = owner.rejected, .unavailable = owner.unavailable };
+    }
+    pub fn queryDisplayMode(self: *Owner, handle: ModeControlHandle, plan: boot_mode.Plan, deadline: u64) !void {
+        const owner = try self.findModeControl(handle);
+        if (self.copyBusy() or self.sequence.self_address != 0 or self.nativeObject() == null or self.channel.?.phase != .idle or
+            self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
+        try self.validateModeQuery(self.mode_control_root.?, plan);
+        try self.channel.?.guard(deadline);
+        var token = try self.channel.?.handoff(deadline);
+        owner.beginQuery(&token, plan, deadline) catch |err| {
+            self.channel = exchange.Exchange.init(&token, deadline) catch |restore| { self.stop(restore); return restore; }; return err;
+        };
+        self.mode_control_active = true;
+    }
+    pub fn retireModeControl(self: *Owner, handle: ModeControlHandle, deadline: u64) !void {
+        const owner = try self.findModeControl(handle);
+        if (self.copyBusy() or self.sequence.self_address != 0 or self.nativeObject() == null or self.channel.?.phase != .idle or
+            self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
+        try self.channel.?.guard(deadline);
+        var token = try self.channel.?.handoff(deadline);
+        owner.beginDestroy(&token, deadline) catch |err| {
+            self.channel = exchange.Exchange.init(&token, deadline) catch |restore| { self.stop(restore); return restore; }; return err;
+        };
+        self.mode_control_active = true;
     }
     pub fn attachDisplayInstance(self: *Owner, handle: DisplayEngineHandle, source: BufferHandle, deadline: u64) !void {
         const owner = try self.findDisplayEngine(handle);
@@ -806,7 +873,7 @@ pub const Owner = struct {
             std.meta.eql(resources.publishedImage(entry.window.slot, value.dma), value) and
             resources.publishedStorage(entry.window.slot, value.dma) == entry.surface.target;
     }
-    fn copyBusy(self: *const Owner) bool { return self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.initial_image != null; }
+    fn copyBusy(self: *const Owner) bool { return self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.initial_image != null or self.mode_control_active; }
     /// Called after the product owner populated and unmapped its CPU shadow
     /// from the same immutable capture used by common commit. This private
     /// operation does not invent a common queue fence.
@@ -1637,7 +1704,7 @@ pub const Owner = struct {
     /// is drained before graph.beginDestroy may send any parent/event free.
     pub fn beginDestroyGraph(self: *Owner, deadline: u64, quiesced: bool) !void {
         _ = try self.now();
-        if (self.copyBusy() or self.display_engine_owner != null) return error.Busy;
+        if (self.copyBusy() or self.display_engine_owner != null or self.mode_control_owner != null) return error.Busy;
         if (!quiesced or self.graph_closing or self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or
             self.sequence.self_address != 0 or self.nativeObject() == null or self.channel.?.phase != .idle) return error.Busy;
         try self.channel.?.guard(deadline);
@@ -1685,6 +1752,26 @@ pub const Owner = struct {
                 if (!owner.hardware_retired) return .idle;
             }
             if (owner.poll() catch |err| { self.rmFailure(.display_channel, owner.config.handle, owner.last_status); return err; }) |dispatch| {
+                try self.notification(&owner.exchange, dispatch, current); return .progress;
+            }
+            return if (owner.exchange.phase == .waiting) .idle else .progress;
+        }
+        if (self.mode_control_active) {
+            const owner = if (self.mode_control_owner) |*value| value else return error.State;
+            if (owner.state == .ready or owner.state == .closed) {
+                if (owner.state == .ready) {
+                    try self.rejection(.display_engine, owner.binding.control, owner.rejected, null);
+                    try self.validateModeQuery(self.mode_control_root.?, owner.mode);
+                }
+                if (owner.info()) |value| self.log("NVIDIA gsp-mode-query: handle={x} possible={} over-clock={} source-hz={d} bandwidth-kbps={d} floor-kbps={d} receipt={d} reservation=no",
+                    .{owner.binding.control,value.possible,value.over_clock,value.source_clock_hz,value.min_bandwidth_kbps,value.floor_bandwidth_kbps,value.receipt});
+                const deadline = owner.deadline; var token = try owner.handoff();
+                const finished = owner.state == .finished;
+                self.channel = try exchange.Exchange.init(&token, deadline);
+                if (finished) { self.mode_control_owner = null; self.mode_control_root = null; }
+                self.mode_control_active = false; return .progress;
+            }
+            if (owner.poll() catch |err| { self.rmFailure(.display_engine, owner.binding.control, owner.last_status); return err; }) |dispatch| {
                 try self.notification(&owner.exchange, dispatch, current); return .progress;
             }
             return if (owner.exchange.phase == .waiting) .idle else .progress;
