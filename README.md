@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.58; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.59; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -11,6 +11,37 @@ Starting with R4OS 0.79.9, `IMAGE_SCOPE=slim` includes the current module in
 Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
+
+Native topology and receiver acquisition (NVIDIA 0.1.59, 2026-09-12):
+
+After RM/IRQ setup, the actual runtime queries every supported display's
+connector/resource/bus relationships and RAW EDID through its existing graph.
+The shared R4GFX parser retains modes, CTA audio and explicit missing, invalid,
+incomplete or rejected data. Each generation has one ten-second budget and
+fixed resident storage for up to 32 display IDs; there is no second queue.
+
+Per-receiver masks and a final supported-mask reply/ACK/drain protect the
+complete generation. Interleaved events invalidate all candidates. HPD/DP
+also invalidates already returned data and coalesces a later refresh, with
+at least one second between acquisitions. CPU sequencer/lockdown use the
+display-semantic bridges; ambiguous failures retain receipts and GPU backing.
+The snapshot is currently private to the driver; platform catalog publication,
+physical DDC/AUX, native scanout and HDMI audio remain unfinished.
+
+Both targeted host runs pass 51/51 existing tests; both module builds pass.
+The final run followed an additional cross-receiver/final-mask consistency
+check found during review. 42 fields from original C declarations and exact
+legal staging pass. No new test group, guest or hardware run. 22 upstream files
+and the unchanged parser sources are archived under
+ExFiles/Reference/GFX/Nvidia/0.79.10/gsp-outputs-20260912.
+
+Thermal review: Nouveau disables its legacy thermal owner under GSP-RM. No
+suitable public temperature-read contract was found in the reviewed 570.144
+sources; PERF_GET_POWERSTATE reports AC/battery. Existing zero boost flags
+and the three-entry boot registry stay unchanged. No temperature, fan,
+voltage or clock setting is fabricated. Physical confirmation remains open.
+
+The entries below describe preceding checkpoints.
 
 Runtime RM object graph (NVIDIA 0.1.58, 2026-09-12):
 
@@ -33,8 +64,6 @@ or hardware run. The 29 full upstream files and 18 complete source notices
 are archived under ExFiles/Reference/GFX/Nvidia/0.79.10/gsp-rm-20260912.
 Kernel152 and passive defaults remain unchanged. Physical firmware/IRQ/RM,
 health/thermals, connector queries, full restore and native output remain open.
-
-The entries below describe preceding checkpoints.
 
 GSP interrupt endpoint (NVIDIA 0.1.57, 2026-09-12):
 

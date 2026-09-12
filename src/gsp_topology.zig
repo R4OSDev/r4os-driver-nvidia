@@ -169,6 +169,11 @@ pub const Discovery = struct {
             else => error.State,
         };
     }
+    pub fn matches(self: *Discovery, current: *const @import("gsp_exchange.zig").Exchange, deadline: u64) bool {
+        if (self.self_address != @intFromPtr(self) or self.failure != null or self.deadline != deadline) return false;
+        const request = self.query() catch return false;
+        return self.channel.matches(current, request, deadline);
+    }
     fn advance(self: *Discovery) void {
         switch (self.state) {
             .connectors => self.state = .resource,

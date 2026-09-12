@@ -314,6 +314,13 @@ pub const Channel = struct {
         self.request_revision = self.exchange.revision;
         if (query == .connected) self.connected &= ~query.connected;
     }
+    /// Pure native notifier admission for this exact encoded display query.
+    pub fn matches(self: *const Channel, current: *const exchange.Exchange, query: Query, deadline: u64) bool {
+        return current == &self.exchange and current.phase == .prepared and self.pending == null and
+            self.request != null and std.meta.eql(self.request.?, query) and self.object.epoch == current.session.epoch and
+            current.function == function and current.deadline == deadline and
+            current.request.ptr == self.request_bytes[0..].ptr and current.request.len == header_bytes + paramsSize(query);
+    }
     pub fn poll(self: *Channel, deadline: u64) Error!?Dispatch {
         if (self.exchange.phase == .prepared and self.pending == null and
             self.request.? != .supported and self.request_revision != self.exchange.revision)

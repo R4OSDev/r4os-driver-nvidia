@@ -42,6 +42,7 @@ const postinit = @import("gsp_postinit.zig");
 const rm = @import("gsp_rm_graph.zig");
 const display = @import("gsp_display_rpc.zig");
 const subscriptions = @import("gsp_event_objects.zig");
+const outputs = @import("gsp_outputs.zig");
 pub const Progress = enum { idle, progress };
 pub const Snapshot = struct {
     polls: u64 = 0,
@@ -82,6 +83,10 @@ pub const Owner = struct {
     graph: ?rm.Owner = null,
     display_object: ?display.Object = null,
     rm_rejection: ?u32 = null,
+    outputs: outputs.Owner = .{},
+    output_refresh: bool = false,
+    output_generation: u64 = 0,
+    output_next_ns: u64 = 0,
     words: [logs.output_bytes]u8 = undefined,
 
     pub fn open(self: *Owner, ctx: *const r4os.r4dev.DriverContext, device: *native.Port,
@@ -144,14 +149,21 @@ pub const Owner = struct {
         };
     }
     pub fn activeChannel(self: *Owner) ?*exchange.Exchange {
+        if (self.outputs.channel()) |channel| return &channel.exchange;
         if (self.graph) |*graph| if (graph.channel()) |channel| return channel;
         return if (self.channel) |*channel| channel else null;
     }
     pub fn nativeObject(self: *Owner) ?display.Object {
         if (self.self_address != @intFromPtr(self) or self.failure != null or self.graph == null or
             self.graph.?.self_address != @intFromPtr(&self.graph.?) or self.graph.?.state != .loaned or
-            self.display_object == null or self.activeChannel() == null or self.activeChannel().?.session.state != .active) return null;
+            self.display_object == null or self.channel == null or self.activeChannel() != &self.channel.? or
+            self.channel.?.session.state != .active) return null;
         return self.display_object;
+    }
+    pub fn nativeOutputs(self: *Owner) ?*const outputs.Snapshot {
+        _ = self.now() catch return null;
+        if (self.nativeObject() == null) return null;
+        return self.outputs.snapshot();
     }
     pub fn takeDisplayChanges(self: *Owner) !subscriptions.Changes {
         const current = try self.now();
@@ -171,6 +183,33 @@ pub const Owner = struct {
                 self.snapshot.last_event_ns = current;
             }
             return .progress;
+        }
+        if (self.outputs.active()) {
+            if (self.outputs.state == .complete or self.outputs.state == .obsolete) {
+                var loan = try self.graph.?.loan(self.outputs.deadline);
+                self.channel = try exchange.Exchange.init(&loan.runtime, self.outputs.deadline);
+                try self.outputs.returned(current);
+                self.output_next_ns = try std.math.add(u64, current, std.time.ns_per_s);
+                self.log("NVIDIA gsp-outputs: generation={d} inventory={s} routes={d} receivers={d} native-output=unavailable",
+                    .{self.output_generation, if (!self.outputs.data.coherent) @as([]const u8, "obsolete") else if (self.outputs.data.topology.rejected != null) "query-rejected" else "complete",
+                        self.outputs.data.topology.count, self.outputs.data.count});
+                if (self.outputs.data.final_rejection orelse self.outputs.data.topology.rejected) |rejected|
+                    self.log("NVIDIA gsp-outputs: rejected command={x} rpc={?} rm={?}", .{@intFromEnum(rejected.command), rejected.rpc, rejected.control});
+                return .progress;
+            }
+            const before = self.outputs.data.count;
+            if (try self.outputs.poll()) |dispatch| {
+                const source = self.outputs.channel() orelse return error.State;
+                try self.notification(&source.exchange, try source.exchange.borrow(dispatch.ticket), current);
+                return .progress;
+            }
+            if (self.outputs.data.count != before) {
+                const capture = &self.outputs.data.receivers[before];
+                self.log("NVIDIA gsp-receiver: candidate generation={d} display={x} status={s} edid={d} modes={d} audio={d} warnings={x} rpc={?} rm={?}",
+                    .{self.output_generation, capture.display_id, @tagName(capture.status), capture.edid_bytes,
+                        capture.report.mode_count, capture.report.audio_count, capture.report.warnings, capture.rpc_status, capture.control_status});
+            }
+            return if ((self.activeChannel() orelse return error.State).phase == .waiting) .idle else .progress;
         }
         if (self.graph) |*graph| {
             switch (graph.state) {
@@ -253,6 +292,17 @@ pub const Owner = struct {
             self.log("NVIDIA gsp-rm: creating client={x} deadline-ns={d}", .{self.graph.?.reservation.client, end});
             return .progress;
         }
+        if (self.graph != null and self.graph.?.state == .loaned and channel.phase == .idle and !channel.in_lockdown and
+            (self.outputs.state == .detached or (self.output_refresh and current >= self.output_next_ns))) {
+            const end = try std.math.add(u64, current, 10 * std.time.ns_per_s);
+            self.output_generation = try std.math.add(u64, self.output_generation, 1);
+            var token = try channel.handoff(end);
+            try self.graph.?.reclaim(&token, end);
+            try self.outputs.begin(&self.graph.?, self.output_generation, end);
+            self.output_refresh = false;
+            self.log("NVIDIA gsp-outputs: acquiring generation={d} deadline-ns={d}", .{self.output_generation, end});
+            return .progress;
+        }
         // No busy wait or raw-log dump on every empty queue. One ring per
         // second bounds DMA copying and output, even under continual logging.
         if (current >= self.next_log and self.reader.?.enabled) {
@@ -263,16 +313,21 @@ pub const Owner = struct {
     }
     fn notification(self: *Owner, channel: *exchange.Exchange, dispatch: exchange.Dispatch, current: u64) !void {
         if (dispatch.response) return error.Unexpected;
+        const source = self.outputs.channel();
+        if (source != null and &source.?.exchange != channel) return error.Binding;
+        if (dispatch.record.rpc.function != @intFromEnum(boot.Kind.libos_print)) try self.outputs.invalidate();
         if (dispatch.record.rpc.function == @intFromEnum(boot.Kind.cpu_sequencer)) {
-            try self.sequence.begin(self.device.?, channel, .{
+            const limits = @import("gsp_sequencer.zig").Limits{
                 .default_timeout_ns = std.time.ns_per_s, .poll_interval_ns = std.time.ns_per_ms,
                 .register_bytes = self.device.?.window.byte_length,
-            });
+            };
+            if (source) |owner| try self.sequence.beginDisplay(self.device.?, owner, limits) else try self.sequence.begin(self.device.?, channel, limits);
             return;
         }
-        self.ordinary = try events.Dispatch.init(channel, .{
+        const sink = events.Sink{
             .context = self, .generation = generation, .admit = admit, .deliver = deliver,
-        });
+        };
+        self.ordinary = if (source) |owner| try events.Dispatch.initDisplay(owner, sink) else try events.Dispatch.init(channel, sink);
         try self.ordinary.?.step();
         self.snapshot.events +|= 1;
         self.snapshot.last_event_ns = current;
@@ -309,6 +364,7 @@ pub const Owner = struct {
                 const sink = try graph.eventSink();
                 try sink.deliver(sink.context, scope, event);
                 const kind = (try post.display()) orelse return error.Unexpected;
+                self.output_refresh = true; // Coalesced; no new scan until current receipts drain.
                 if (kind == .hotplug) self.snapshot.hotplug_events +|= 1 else self.snapshot.dp_irq_events +|= 1;
                 self.log("NVIDIA gsp-event: kind={s} status={x} data={x} refresh=required", .{@tagName(kind), post.status, post.data});
             },

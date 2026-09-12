@@ -1432,6 +1432,8 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         post_control_error, post_wrong_gpc, post_bad_vector, post_ack_failure, post_timeout,
         irq_intx, irq_register_error, irq_msi_uncertain, irq_cause, irq_wake_failure, irq_close_busy, irq_unregister_failure,
         rm_base_reject, rm_event_reject, rm_free_error, rm_timeout, rm_ack_failure, rm_foreign_event, rm_event_ack,
+        outputs_empty, outputs_all, outputs_rejected, outputs_partial, outputs_missing, outputs_incomplete, outputs_bad_edid,
+        outputs_edid_rejected, outputs_changed, outputs_final_changed, outputs_final_rejected, outputs_hpd, outputs_sequence, outputs_ack, outputs_timeout,
         runtime_healthy, runtime_lockdown, runtime_unknown, runtime_unowned, runtime_sequence_timeout,
         runtime_log_failure, runtime_moving_log };
     for (std.enums.values(Case)) |case| {
@@ -1561,6 +1563,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
             if (target.phase == .ready) try checkDevicePostInit(target, words, held.plan.?.frts.offset, case);
             if (target.phase == .ready) try checkDeviceIrq(target, words, held.plan.?.frts.offset, case);
             if (target.phase == .ready and !target.stopped) try checkDeviceRm(target, words, held.plan.?.frts.offset, case);
+            if (target.phase == .ready and !target.stopped) try checkDeviceOutputs(target, words, held.plan.?.frts.offset, case);
             if (exercise_runtime) try checkDeviceRuntime(target, words, held.plan.?.frts.offset, case);
         } else {
             try t.expect(target.phase == .failed and target.failure != null);
@@ -2149,6 +2152,233 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
     }
     try t.expect(recovery_steps < 12000 and target.recovery.report != null and target.memory.?.retained);
     try t.expect(target.interrupts.closed and std.meta.eql(receipt, session.pending) and session.tx_sequence == sent);
+}
+
+fn outputWord(bytes: []u8, offset: usize, value: u32) void {
+    std.mem.writeInt(u32, bytes[offset..][0..4], value, .little);
+}
+fn outputEdid(bytes: []u8, incomplete: bool, corrupt: bool) void {
+    @memset(bytes, 0);
+    @memcpy(bytes[0..8], &[_]u8{ 0, 255, 255, 255, 255, 255, 255, 0 });
+    bytes[8] = 0x48;
+    bytes[9] = 0xcf; // Synthetic RFO monitor, never a Hisense measurement.
+    bytes[18] = 1;
+    bytes[19] = 4;
+    bytes[20] = 0x80;
+    @memset(bytes[38..54], 1);
+    for (0..4) |i| bytes[54 + i * 18 + 3] = 0x10;
+    bytes[126] = if (incomplete) 2 else 1;
+    @memcpy(bytes[128..144], &[_]u8{ 2, 3, 16, 0x40, 0x41, 16, 0x23, 0x09, 7, 7, 0x65, 3, 12, 0, 0x10, 0 });
+    for (0..2) |i| {
+        var sum: u8 = 0;
+        const block = bytes[i * 128 ..][0..128];
+        for (block) |value| sum +%= value;
+        block[127] = 0 -% sum;
+    }
+    if (corrupt) bytes[0] = 1;
+}
+fn checkDeviceOutputs(target: *@import("gsp_device.zig").Device, words: []u32, frts: u64, scenario: anytype) !void {
+    const rpc = @import("gsp_display_rpc.zig");
+    const running = &target.running;
+    const owner = &running.outputs;
+    const session = &target.session.?;
+    const command = init.queues_offset + init.command_offset;
+    const status = init.queues_offset + init.status_offset;
+    const initial_sequence = session.tx_sequence;
+    const mask: u32 = if (scenario == .outputs_empty) 0 else if (scenario == .outputs_all) 0xffffffff else 0x80000001;
+    var steps: usize = 0;
+    var requests: usize = 0;
+    var passes: usize = 0;
+    var interleaved = false;
+    errdefer |err| std.debug.print("actual outputs scenario={s} error={s} phase={s} failure={?} state={s} requests={d} count={d}\n",
+        .{@tagName(scenario), @errorName(err), @tagName(target.phase), target.failure, @tagName(owner.state), requests, owner.data.count});
+    try t.expect(owner.state == .detached and running.nativeOutputs() == null and running.nativeObject() != null);
+    while (target.phase == .ready and steps < 1200) : (steps += 1) {
+        _ = target.step();
+        if (target.phase != .ready) break;
+        if (owner.state == .returned) {
+            try t.expect(running.nativeObject() != null and owner.channel() == null);
+            if (scenario != .outputs_hpd or passes == 2) break;
+            if (passes == 0) {
+                try t.expect(interleaved and running.nativeOutputs() == null and !owner.data.coherent);
+            } else {
+                try t.expect(running.nativeOutputs() != null);
+                try devicePost(target, true, false); // Invalidate an already published generation.
+                _ = target.step();
+                try t.expect(running.nativeOutputs() == null);
+            }
+            try t.expect(running.output_refresh);
+            const sent = session.tx_sequence;
+            try t.expect(target.step() == .idle and session.tx_sequence == sent); // One-second coalescing bound.
+            clock = running.output_next_ns;
+            passes += 1;
+            _ = target.step();
+            try t.expect(owner.state == .topology and !running.output_refresh);
+        }
+        try t.expect(running.nativeOutputs() == null and running.nativeObject() == null);
+        const source = owner.channel() orelse continue;
+        const channel = &source.exchange;
+        if (channel.phase != .waiting) continue;
+        const query = source.request.?;
+        const deadline = channel.deadline.?;
+        const cursor = (session.tx_write + 62) % 63;
+        const request = try transport.message.decode(session.profile,
+            backing.?[command + 4096 + @as(usize, cursor) * 4096 ..][0..4096], session.tx_sequence - 1);
+        try t.expect(request.rpc.function == 76 and std.mem.readInt(u32, request.payload[0..4], .little) == running.graph.?.reservation.client);
+        try t.expect(std.mem.readInt(u32, request.payload[4..8], .little) == running.graph.?.base.plan.handles.display);
+        try t.expect(std.mem.readInt(u32, request.payload[8..12], .little) == @intFromEnum(std.meta.activeTag(query)));
+        try t.expect(std.mem.readInt(u32, request.payload[20..24], .little) == 0 and channel == running.activeChannel());
+        var response: [rpc.max_request_bytes]u8 = @splat(0);
+        const payload = response[0..request.payload.len];
+        @memcpy(payload, request.payload);
+        outputWord(backing.?, status + 64, session.tx_write); // Real modeled command consumer, including ring wrap.
+        if (requests == 0) {
+            const native = target.port.owner.?;
+            const saved = channel.request;
+            const function = channel.function;
+            const before = range_calls;
+            var foreign: [rpc.max_request_bytes]u8 = @splat(0);
+            @memcpy(foreign[0..saved.len], saved);
+            channel.phase = .prepared;
+            channel.request = foreign[0..saved.len];
+            try t.expectError(error.Binding, native.admit_command.?(native.context, &target.port, deadline));
+            channel.request = saved;
+            channel.function = 103;
+            try t.expectError(error.Binding, native.admit_command.?(native.context, &target.port, deadline));
+            channel.function = function;
+            try native.admit_command.?(native.context, &target.port, deadline);
+            channel.phase = .waiting;
+            try t.expect(range_calls == before and running.channel.?.phase == .handed_off);
+            try t.expectError(error.State, running.channel.?.poll(deadline));
+            try t.expect(session.state == .active);
+        }
+        if (scenario == .outputs_hpd and passes == 0 and !interleaved and owner.data.count == 1) {
+            try devicePost(target, false, false);
+            _ = target.step();
+            try t.expect(owner.invalidated and source.pending == null and session.pending == null and channel.phase == .waiting);
+            interleaved = true;
+        }
+        if (scenario == .outputs_sequence and query == .edid and !interleaved) {
+            try deviceSequence(target, &.{ 3, 1 });
+            _ = target.step();
+            try t.expect(running.sequence.self_address != 0 and source.pending != null);
+            for (0..10) |_| {
+                if (running.sequence.self_address == 0) break;
+                clock += 1000;
+                _ = target.step();
+            }
+            try t.expect(running.sequence.self_address == 0 and source.pending == null and session.pending == null);
+            try nativeEvent(session, 0x101c, &.{1});
+            _ = target.step();
+            try t.expect(channel.in_lockdown and !running.channel.?.in_lockdown);
+            try nativeEvent(session, 0x101c, &.{0});
+            _ = target.step();
+            try t.expect(!channel.in_lockdown and channel.deadline == deadline and owner.invalidated and source.pending == null);
+            interleaved = true;
+        }
+        switch (query) {
+            .supported => {
+                const changed = (scenario == .outputs_changed and owner.state == .topology and owner.probe.?.state == .verify) or
+                    (scenario == .outputs_final_changed and owner.state == .final_check);
+                outputWord(payload, 28, if (changed) 1 else mask);
+                outputWord(payload, 32, if (changed) 1 else mask);
+                if (scenario == .outputs_rejected) outputWord(payload, 12, 0x55);
+                if (scenario == .outputs_final_rejected and owner.state == .final_check) outputWord(payload, 12, 0x66);
+            },
+            .connectors => |id| {
+                outputWord(payload, 32, 1);
+                outputWord(payload, 36, 0x80000001);
+                outputWord(payload, 40, 2);
+                outputWord(payload, 44, 17);
+                outputWord(payload, 48, 0x61);
+                outputWord(payload, 52, 4);
+                outputWord(payload, 56, 19);
+                outputWord(payload, 60, 0xffffffff);
+                outputWord(payload, 64, 2);
+                if (scenario == .outputs_partial and id == 1) outputWord(payload, 12, 0x55);
+            },
+            .resource => |id| {
+                outputWord(payload, 32, 0xffffffff); // Unassigned OR must remain unassigned.
+                outputWord(payload, 36, 2);
+                outputWord(payload, 40, 1);
+                outputWord(payload, 56, 1);
+                outputWord(payload, 60, 27); // DCB index is not log2(RM display ID).
+                payload[72] = 1;
+                payload[73] = @intFromBool(id == 0x80000000);
+            },
+            .buses => {
+                outputWord(payload, 32, 0);
+                outputWord(payload, 36, 37);
+            },
+            .connected => |id| outputWord(payload, 32, if (id == 1 and scenario != .outputs_all) 1 else 0),
+            .edid => {
+                try t.expect(std.mem.readInt(u32, payload[36..40], .little) == 2); // RAW; no cached boot EDID.
+                outputWord(payload, 32, if (scenario == .outputs_missing) 0 else 256);
+                outputEdid(payload[40..296], scenario == .outputs_incomplete, scenario == .outputs_bad_edid);
+                if (scenario == .outputs_edid_rejected) outputWord(payload, 12, 0x55);
+            },
+        }
+        if (scenario == .outputs_timeout and requests == 0) clock = deadline else {
+            try nativeEvent(session, 76, payload);
+            if (scenario == .outputs_ack and owner.state == .receivers and owner.data.count == 1 and query == .connected)
+                range_failure_call = range_calls + 4;
+        }
+        _ = target.step();
+        range_failure_call = 0;
+        requests += 1;
+    }
+    try t.expect(steps < 1200);
+    if (target.phase != .ready) {
+        try t.expect(scenario == .outputs_ack or scenario == .outputs_timeout);
+        try t.expect(target.phase == .recovering and running.nativeOutputs() == null and running.nativeObject() == null);
+        try t.expectError(error.Retained, session.rm_names.retire(running.graph.?.reservation));
+        const pending = session.pending;
+        const sent = session.tx_sequence;
+        var count: usize = 0;
+        while (target.phase != .failed and count < 12000) : (count += 1) {
+            clock += 1000;
+            DeviceModel.tick(words, frts, false);
+            _ = target.step();
+        }
+        try t.expect(count < 12000 and target.memory.?.retained and target.interrupts.closed and target.recovery.report != null);
+        try t.expect(session.tx_sequence == sent and std.meta.eql(pending, session.pending));
+        return;
+    }
+    try t.expect(session.tx_sequence == initial_sequence + requests and session.pending == null and running.graph.?.state == .loaned);
+    try t.expect(owner.state == .returned and running.output_generation == @as(u64, if (scenario == .outputs_hpd) 3 else 1));
+    if (scenario == .outputs_changed or scenario == .outputs_final_changed or scenario == .outputs_final_rejected or scenario == .outputs_sequence) {
+        try t.expect(!owner.data.coherent and running.nativeOutputs() == null);
+        if (scenario == .outputs_final_rejected) try t.expect(owner.data.final_rejection.?.control.? == 0x66);
+        return;
+    }
+    const data = running.nativeOutputs() orelse return error.MissingOutputs;
+    const expected: usize = if (scenario == .outputs_rejected or scenario == .outputs_empty) 0 else @popCount(mask);
+    try t.expect(data.count == expected and data.topology.count == expected and data.coherent);
+    try t.expect(data.topology.epoch == target.epoch and data.topology.client == running.graph.?.reservation.client);
+    if (scenario == .outputs_rejected) try t.expect(data.topology.rejected.?.control.? == 0x55);
+    if (expected == 0) return;
+    const first = &data.receivers[0];
+    try t.expect(first.display_id == 1 and first.client == data.topology.client and first.epoch == target.epoch);
+    try t.expect(data.topology.routes[0].resource.?.index == 0xffffffff and data.topology.routes[0].resource.?.dcb_index == 27);
+    if (scenario == .outputs_partial) try t.expect(data.topology.routes[0].connectors == null and data.topology.routes[0].rejections[0].?.control.? == 0x55)
+    else try t.expect(data.topology.routes[0].connectors.?.data[0].index == 17 and data.topology.routes[0].connectors.?.data[1].kind == 0xffffffff);
+    try t.expect(data.topology.routes[0].buses.?.communication == 0 and data.topology.routes[0].buses.?.ddc == 37);
+    if (scenario == .outputs_all) {
+        try t.expect(requests == 163 and data.final_receipt_serial != 0 and data.receivers[31].display_id == 0x80000000);
+        for (&data.receivers) |*capture| try t.expect(capture.status == .disconnected and capture.edid_bytes == 0);
+    } else {
+        const expected_status: @import("gsp_receiver.zig").Status = switch (scenario) {
+            .outputs_missing => .edid_missing,
+            .outputs_incomplete => .incomplete_edid,
+            .outputs_bad_edid => .invalid_edid,
+            .outputs_edid_rejected => .edid_rejected,
+            else => .valid_edid,
+        };
+        try t.expect(first.status == expected_status and first.connected.?);
+        if (first.status == .valid_edid) try t.expect(first.report.hdmi and first.report.mode_count != 0 and first.report.audio_count != 0);
+        try t.expect(data.receivers[1].display_id == 0x80000000 and data.receivers[1].status == .disconnected);
+        try t.expect(data.receivers[1].report.audio_count == 0 and data.receivers[1].edid_bytes == 0);
+    }
 }
 
 fn checkDeviceRuntime(target: *@import("gsp_device.zig").Device, words: []u32, frts: u64, scenario: anytype) !void {

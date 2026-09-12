@@ -386,7 +386,9 @@ pub const Device = struct {
             channel.phase != .prepared or channel.pending != null or channel.session.pending != null or
             channel.deadline != deadline) return error.Binding;
         if (channel.in_lockdown) return error.Lockdown;
-        if (self.running.graph) |*graph| {
+        if (self.running.outputs.active()) {
+            if (!self.running.outputs.matches(channel, deadline)) return error.Binding;
+        } else if (self.running.graph) |*graph| {
             if (!graph.matches(channel, deadline)) return error.Binding;
         } else if (self.running.static_info == null) {
             if (channel.function != @import("gsp_static.zig").function or

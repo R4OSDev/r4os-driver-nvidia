@@ -1,5 +1,14 @@
 ﻿# Third-Party Notices
 
+Native topology and EDID acquisition (NVIDIA 0.1.59, 2026-09-12):
+The fixed display controls and existing shared R4GFX parser now run on
+the actual runtime queue. Six complete NVIDIA/Nouveau source notices and
+the libdisplay-info MIT license for the compiled CTA timing table are
+appended to NVIDIA-GSP-RUNTIME-LICENSE.txt, embedded and staged exactly.
+The previous 105,101 bytes remain unchanged. Complete originals, C ABI
+comparison and unchanged parser/provenance are archived under
+0.79.10/gsp-outputs-20260912. R4OS acquisition/lifetime is Apache-2.0.
+
 Runtime RM objects and display events (NVIDIA 0.1.58, 2026-09-12):
 The existing object, event and client-name owners now run on the actual
 firmware queue. Their NVIDIA 570.144 and Nouveau source notices remain

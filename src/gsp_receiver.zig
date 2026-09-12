@@ -150,6 +150,11 @@ pub const Refresh = struct {
             else => error.State,
         };
     }
+    pub fn matches(self: *Refresh, current: *const @import("gsp_exchange.zig").Exchange, deadline: u64) bool {
+        if (self.self_address != @intFromPtr(self) or self.failure != null or self.deadline != deadline) return false;
+        const request = self.query() catch return false;
+        return self.channel.matches(current, request, deadline);
+    }
     fn consume(self: *Refresh, reply: display.Reply) Error!void {
         if (reply == .obsolete) {
             self.invalidated = true;
