@@ -46,6 +46,10 @@ const outputs = @import("gsp_outputs.zig");
 const inventory = @import("gsp_memory_inventory.zig");
 pub const buffer_mapping = @import("gsp_buffer_mapping.zig");
 pub const vram = @import("gsp_vram.zig");
+pub const execution_fifo = @import("gsp_fifo.zig");
+pub const ChannelHandle = struct { epoch: u64, serial: u64, slot: u16 };
+pub const ChannelStatus = struct { state: execution_fifo.State, info: ?execution_fifo.Info, rejected: ?u32, host_rejected: ?anyerror };
+const ChannelSlot = struct { owner: ?*execution_fifo.Owner = null, allocation: r4os.abi.DriverHeapAllocation = .{}, heap: ?r4os.r4dev.DriverHeapContext = null, serial: u64 = 0 };
 pub const execution_context = @import("gsp_context.zig");
 pub const ContextHandle = struct { epoch: u64, serial: u64, slot: u16 };
 pub const ContextStatus = struct { state: execution_context.State, info: ?execution_context.Info, rejected: ?u32, unavailable: ?execution_context.Unavailable };
@@ -107,6 +111,8 @@ pub const Owner = struct {
     buffer_serial: u64 = 0,
     native_buffers: [256]NativeBufferSlot = @splat(.{}),
     native_active: ?u16 = null,
+    fifos: [64]ChannelSlot = @splat(.{}),
+    fifo_active: ?u16 = null,
     contexts: [64]ContextSlot = @splat(.{}),
     context_active: ?u16 = null,
     graph_closing: bool = false,
@@ -188,6 +194,7 @@ pub const Owner = struct {
         }
     }
     pub fn activeChannel(self: *Owner) ?*exchange.Exchange {
+        if (self.fifo_active) |index| if (self.fifos[index].owner) |owner| return owner.channel();
         if (self.context_active) |index| if (self.contexts[index].owner) |owner| return &owner.exchange;
         if (self.native_active) |index| if (self.native_buffers[index].owner) |owner| return &owner.exchange;
         if (self.buffer_active) |index| if (self.buffers[index].owner) |owner| return &owner.exchange;
@@ -235,7 +242,7 @@ pub const Owner = struct {
     /// Channel children retain the context separately before using it.
     pub fn createExecutionContext(self: *Owner, rm_engine: u32, deadline: u64) !ContextHandle {
         _ = try self.now();
-        if (self.graph_closing or self.context_active != null or self.native_active != null or self.buffer_active != null or self.sequence.self_address != 0 or self.outputs.active()) return error.Busy;
+        if (self.graph_closing or self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or self.sequence.self_address != 0 or self.outputs.active()) return error.Busy;
         const space = (self.nativeAddressSpace() orelse return error.State).*;
         const subdevice = self.graph.?.base.plan.handles.subdevice;
         if (self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
@@ -284,13 +291,13 @@ pub const Owner = struct {
         try (try self.findContext(handle)).releaseChild(child, quiesced);
     }
     pub fn attachContextMethods(self: *Owner, context: ContextHandle, runqueue: u8, buffer: BufferHandle) !void {
-        if (self.graph_closing or self.context_active != null or self.native_active != null) return error.Busy;
+        if (self.graph_closing or self.fifo_active != null or self.context_active != null or self.native_active != null) return error.Busy;
         const owner = try self.findContext(context);
         try owner.attachMethods(runqueue, try self.findNativeBuffer(buffer));
     }
     pub fn retireExecutionContext(self: *Owner, handle: ContextHandle, deadline: u64) !void {
         const owner = try self.findContext(handle);
-        if (self.context_active != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or
+        if (self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or
             self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         if (owner.held()) return error.Retained;
         var token = try self.channel.?.handoff(deadline);
@@ -305,12 +312,79 @@ pub const Owner = struct {
         if (heap.release(slot.allocation.handle) != r4os.abi.driver_heap_ok) return error.Retained;
         slot.* = .{};
     }
+    /// Attach an empty private GPFIFO to an existing context and native BOs.
+    /// Only this driver API accepts storage owners; no physical app address.
+    pub fn createExecutionChannel(self: *Owner, context_handle: ContextHandle, runqueue: u8, instance: BufferHandle, userd: BufferHandle, deadline: u64) !ChannelHandle {
+        _ = try self.now();
+        if (self.graph_closing or self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or self.sequence.self_address != 0 or self.outputs.active()) return error.Busy;
+        _ = self.nativeAddressSpace() orelse return error.State;
+        if (self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
+        const parent = try self.findContext(context_handle);
+        const inst = try self.findNativeBuffer(instance); const usr = try self.findNativeBuffer(userd);
+        try self.channel.?.guard(deadline);
+        const serial = try std.math.add(u64, self.buffer_serial, 1);
+        const index: u16 = blk: {
+            for (&self.fifos, 0..) |*slot, i| if (slot.allocation.handle == 0) break :blk @intCast(i);
+            return error.Exhausted;
+        };
+        const heap = self.ctx.?.heap() orelse return error.Api;
+        const slot = &self.fifos[index]; slot.heap = heap;
+        const result = heap.allocate(@sizeOf(execution_fifo.Owner), @alignOf(execution_fifo.Owner), &slot.allocation);
+        const allocation = slot.allocation;
+        if (result != r4os.abi.driver_heap_ok and allocation.handle == 0) return error.Memory;
+        if (allocation.version != 1 or allocation.size < @sizeOf(r4os.abi.DriverHeapAllocation) or allocation.handle == 0 or
+            allocation.cpu_address == 0 or allocation.cpu_address % @alignOf(execution_fifo.Owner) != 0 or allocation.reserved != 0 or
+            allocation.byte_length < @sizeOf(execution_fifo.Owner) or allocation.alignment < @alignOf(execution_fifo.Owner) or
+            allocation.cpu_address > std.math.maxInt(u64) - allocation.byte_length) {
+            self.stop(error.Descriptor); return error.Descriptor;
+        }
+        var retained = false;
+        errdefer if (!retained) {
+            if (heap.release(allocation.handle) == r4os.abi.driver_heap_ok) slot.* = .{} else self.stop(error.Retained);
+        };
+        if (result != r4os.abi.driver_heap_ok) return error.Memory;
+        const owner: *execution_fifo.Owner = @ptrFromInt(allocation.cpu_address); owner.* = .{};
+        var token = try self.channel.?.handoff(deadline);
+        owner.open(&token, &self.ctx.?, self.adapter_id, self.graph.?.reservation, parent, runqueue, inst, usr, deadline) catch |err| {
+            if (owner.failure != null) {
+                retained = true; slot.owner = owner; slot.serial = serial; self.buffer_serial = serial;
+                self.stop(err); return err;
+            }
+            self.channel = exchange.Exchange.init(&token, deadline) catch |restore| { self.stop(restore); return restore; }; return err;
+        };
+        slot.owner = owner; slot.serial = serial; self.buffer_serial = serial; self.fifo_active = index;
+        return .{ .epoch = self.epoch, .serial = serial, .slot = index };
+    }
+    fn findChannel(self: *Owner, handle: ChannelHandle) !*execution_fifo.Owner {
+        _ = try self.now();
+        if (handle.epoch != self.epoch or handle.slot >= self.fifos.len or handle.serial == 0 or self.fifos[handle.slot].serial != handle.serial) return error.Stale;
+        return self.fifos[handle.slot].owner orelse return error.Stale;
+    }
+    pub fn executionChannelStatus(self: *Owner, handle: ChannelHandle) !ChannelStatus {
+        const owner = try self.findChannel(handle);
+        return .{ .state = owner.state, .info = owner.info(), .rejected = owner.rejected, .host_rejected = owner.host_rejected };
+    }
+    pub fn retireExecutionChannel(self: *Owner, handle: ChannelHandle, deadline: u64, quiesced: bool) !void {
+        const owner = try self.findChannel(handle);
+        if (self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or
+            self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
+        var token = try self.channel.?.handoff(deadline);
+        owner.beginDestroy(&token, deadline, quiesced) catch |err| {
+            self.channel = exchange.Exchange.init(&token, deadline) catch |restore| { self.stop(restore); return restore; }; return err;
+        };
+        self.fifo_active = handle.slot;
+    }
+    fn freeChannelSlot(self: *Owner, index: usize) !void {
+        const slot = &self.fifos[index]; const heap = slot.heap orelse return error.Api;
+        if (heap.release(slot.allocation.handle) != r4os.abi.driver_heap_ok) return error.Retained;
+        slot.* = .{};
+    }
     /// Called by the serialized native engine worker after queue.take. The
     /// common queue authenticates the full job/driver generation and supplies
     /// the reference; diagnostic buffer IDs are never imported here.
     pub fn mapQueuedBuffer(self: *Owner, fence: *const r4os.abi.GfxFence, which: u32, deadline: u64) !BufferHandle {
         _ = try self.now();
-        if (self.graph_closing or self.context_active != null or self.native_active != null or self.buffer_active != null or self.sequence.self_address != 0 or self.outputs.active()) return error.Busy;
+        if (self.graph_closing or self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or self.sequence.self_address != 0 or self.outputs.active()) return error.Busy;
         const space = (self.nativeAddressSpace() orelse return error.State).*;
         if (self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         try self.channel.?.guard(deadline);
@@ -369,7 +443,7 @@ pub const Owner = struct {
     }
     pub fn retireBuffer(self: *Owner, handle: BufferHandle, deadline: u64, quiesced: bool) !void {
         const owner = try self.findBuffer(handle);
-        if (!quiesced or self.context_active != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or
+        if (!quiesced or self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or
             self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         if (owner.state != .handed_off) return error.State;
         var token = try self.channel.?.handoff(deadline);
@@ -410,7 +484,7 @@ pub const Owner = struct {
     }
     fn allocateNativePlanStorage(self: *Owner, plan: vram.surface.Plan, policy: ?vram.storage.Policy, deadline: u64) !BufferHandle {
         _ = try self.now();
-        if (self.graph_closing or self.context_active != null or self.native_active != null or self.buffer_active != null or self.sequence.self_address != 0 or self.outputs.active()) return error.Busy;
+        if (self.graph_closing or self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or self.sequence.self_address != 0 or self.outputs.active()) return error.Busy;
         const space = (self.nativeAddressSpace() orelse return error.State).*;
         if (self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         try self.channel.?.guard(deadline);
@@ -469,7 +543,7 @@ pub const Owner = struct {
         slot.* = .{};
     }
     fn collectNativeBuffer(self: *Owner, deadline: u64) !bool {
-        if (self.context_active != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or
+        if (self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or
             self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return false;
         const memory = blk: {
             for (&self.native_buffers) |*slot| if (slot.owner) |owner| { if (owner.closing and owner.common_live) break :blk owner.memory; };
@@ -491,7 +565,7 @@ pub const Owner = struct {
     /// is drained before graph.beginDestroy may send any parent/event free.
     pub fn beginDestroyGraph(self: *Owner, deadline: u64, quiesced: bool) !void {
         _ = try self.now();
-        if (!quiesced or self.graph_closing or self.context_active != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or
+        if (!quiesced or self.graph_closing or self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or
             self.sequence.self_address != 0 or self.nativeObject() == null or self.channel.?.phase != .idle) return error.Busy;
         try self.channel.?.guard(deadline);
         for (&self.native_buffers, 0..) |*slot, index| if (slot.owner != null) {
@@ -518,6 +592,19 @@ pub const Owner = struct {
                 self.snapshot.last_event_ns = current;
             }
             return .progress;
+        }
+        if (self.fifo_active) |index| {
+            const owner = self.fifos[index].owner orelse return error.State;
+            if (owner.state == .ready or owner.state == .closed) {
+                if (owner.info()) |fifo_info| self.log("NVIDIA gsp-fifo: channel={x} cid={d} engine={x} scheduled=yes commands=empty",
+                    .{fifo_info.config.handle,fifo_info.cid,fifo_info.config.rm_engine});
+                const deadline = owner.deadline; var token = try owner.handoff();
+                self.channel = try exchange.Exchange.init(&token, deadline);
+                if (owner.state == .finished) try self.freeChannelSlot(index);
+                self.fifo_active = null; return .progress;
+            }
+            if (try owner.poll()) |dispatch| { try self.notification(owner.channel().?, dispatch, current); return .progress; }
+            return if (owner.channel().?.phase == .waiting) .idle else .progress;
         }
         if (self.context_active) |index| {
             const owner = self.contexts[index].owner orelse return error.State;
@@ -571,6 +658,10 @@ pub const Owner = struct {
         if (self.nativeObject() != null and try self.collectNativeBuffer(if (self.graph_closing) self.close_deadline else try std.math.add(u64, current, 5 * std.time.ns_per_s))) return .progress;
         if (self.graph_closing and self.graph.?.state == .loaned) graph_close: {
             try channel.guard(self.close_deadline);
+            for (&self.fifos, 0..) |*slot, index| if (slot.owner != null) {
+                try self.retireExecutionChannel(.{ .epoch = self.epoch, .serial = slot.serial, .slot = @intCast(index) }, self.close_deadline, true);
+                return .progress;
+            };
             for (&self.contexts, 0..) |*slot, index| if (slot.owner) |owner| {
                 if (!owner.held()) {
                     try self.retireExecutionContext(.{ .epoch = self.epoch, .serial = slot.serial, .slot = @intCast(index) }, self.close_deadline);

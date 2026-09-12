@@ -14,7 +14,7 @@ pub const Model = struct {
     pub var segments: usize = 0;
     pub var scenario: []const u8 = "";
     const Allocation = struct { bytes: ?[]align(8) u8 = null, handle: u64 = 0 };
-    var allocations: [8]Allocation = @splat(.{});
+    var allocations: [16]Allocation = @splat(.{});
     var serial: u64 = 0;
     pub fn install(table: *a.DriverApi, name: []const u8) void {
         original = table.*;

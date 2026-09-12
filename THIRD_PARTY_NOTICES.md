@@ -1,5 +1,15 @@
 ﻿# Third-Party Notices
 
+Channel GPFIFO (NVIDIA 0.1.75, 2026-09-12):
+Pinned570.144 allocation/control layouts, context parenting, native memory
+descriptors and USERD selection follow the complete archived originals in
+0.79.11/channel-fifo-20260912. Nouveau r535 provides the documented geometry
+and teardown reference. All notices, including the COPYING default MIT
+notice for the headerless ABI checklist, accompany the new sources and the
+identical embedded/image runtime license. Seven original-C packet pairs
+validate368-byte channel parameters and inherited controls. No additional
+upstream implementation is linked; R4OS ownership/integration is Apache-2.0.
+
 Private native storage (NVIDIA 0.1.74, 2026-09-12):
 Contiguous allocation attributes, the initial-clearing capability and the
 group-owned method-buffer lifetime follow pinned570.144 MIT sources.

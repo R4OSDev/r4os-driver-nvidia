@@ -1529,6 +1529,8 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         context_success, context_classes, context_engine, context_query_reject, context_page, context_duplicate,
         context_group_reject, context_share_reject, context_share_changed, context_ack, context_timeout, context_free,
         context_methods, context_methods_acquire, context_methods_free, context_methods_release,
+        context_fifo_success, context_fifo_allocate, context_fifo_bind, context_fifo_token, context_fifo_enable,
+        context_fifo_changed, context_fifo_ack, context_fifo_timeout, context_fifo_disable, context_fifo_free, context_fifo_dma,
         outputs_empty, outputs_all, outputs_rejected, outputs_partial, outputs_missing, outputs_incomplete, outputs_bad_edid,
         outputs_edid_rejected, outputs_ddc, outputs_ddc_bus_changed, outputs_aux, outputs_wiring, outputs_virtual, outputs_changed, outputs_final_changed, outputs_final_rejected, outputs_hpd, outputs_sequence, outputs_ack, outputs_timeout, catalog_rejected,
         runtime_healthy, runtime_lockdown, runtime_unknown, runtime_unowned, runtime_sequence_timeout,
@@ -2591,14 +2593,15 @@ fn allocateContextStorage(target: *@import("gsp_device.zig").Device, bytes: u64,
         try t.expectEqualSlices(u8, channel.request, record.payload);
         try t.expect(owner.info() == null);
         var response: [160]u8 = @splat(0); @memcpy(response[0..channel.request.len], record.payload);
+        const slot_index = owner.reservation.buffer.id - 801;
         switch (owner.operation.?) {
             .allocate_memory, .allocate_virtual => {
                 const physical = owner.operation.? == .allocate_memory;
-                std.mem.writeInt(u64, response[112..120], if (physical) owner.storage_policy.?.physical_bytes / 2 else model.address(0), .little);
+                std.mem.writeInt(u64, response[112..120], if (physical) owner.storage_policy.?.physical_bytes / 2 + slot_index * 65536 else model.address(slot_index), .little);
                 std.mem.writeInt(u64, response[120..128], owner.bytes - 1, .little);
                 if (physical) try t.expect(((std.mem.readInt(u32, response[56..60], .little) >> 27) & 3) == 2);
             },
-            .map => std.mem.writeInt(u64, response[40..48], model.address(0), .little),
+            .map => std.mem.writeInt(u64, response[40..48], model.address(slot_index), .little),
             else => return error.Unexpected,
         }
         std.mem.writeInt(u32, backing.?[status + 64..][0..4], session.tx_write, .little);
@@ -2618,7 +2621,8 @@ fn checkDeviceContexts(target: *@import("gsp_device.zig").Device, table: *a.Driv
     const command = init.queues_offset + init.command_offset;
     const status = init.queues_offset + init.status_offset;
     model.install(table, scenario); defer model.dispose(table);
-    const methods = std.mem.startsWith(u8, scenario, "context_methods");
+    const fifo = std.mem.startsWith(u8, scenario, "context_fifo");
+    const methods = std.mem.startsWith(u8, scenario, "context_methods") or fifo;
     const success = model.is("context_success") or model.is("context_methods");
     var handles: [2]runtime.ContextHandle = undefined;
     var held: ?runtime.execution_context.Child = null;
@@ -2705,6 +2709,7 @@ fn checkDeviceContexts(target: *@import("gsp_device.zig").Device, table: *a.Driv
                     try t.expect(std.meta.eql(context.methodStorage(0).?.reference, context.methods[0].reference));
                 }
             }
+            if (fifo) { try checkDeviceFifos(target, table, scenario, handles[0], deadline); return; }
             var token = try running.channel.?.handoff(deadline); try running.graph.?.reclaim(&token, deadline);
             const sent = session.tx_sequence; try t.expectError(error.Retained, running.graph.?.beginDestroy(deadline)); try t.expect(sent == session.tx_sequence);
             var loan = try running.graph.?.loan(deadline); running.channel = try @import("gsp_exchange.zig").Exchange.init(&loan.runtime, deadline);
@@ -2772,6 +2777,172 @@ fn checkDeviceContexts(target: *@import("gsp_device.zig").Device, table: *a.Driv
         } else try t.expect(model.released == 1 and model.charged == 0 and !model.slots[0].live);
     }
 }
+const FifoCounts = struct { allocations: usize = 0, frees: usize = 0, enables: usize = 0, disables: usize = 0, event: bool = false };
+fn replyDeviceFifo(target: *@import("gsp_device.zig").Device, counts: *FifoCounts, scenario: []const u8) !void {
+    const model = @import("gsp_vram_test_model.zig").Model;
+    const fifo_model = @import("gsp_fifo_test_model.zig").Model;
+    const running = &target.running; const session = &target.session.?;
+    const owner = running.fifos[running.fifo_active.?].owner.?;
+    const channel = owner.channel().?;
+    if (channel.phase != .waiting) return;
+    const deadline = owner.deadline;
+    const command = init.queues_offset + init.command_offset; const status = init.queues_offset + init.status_offset;
+    const cursor = (session.tx_write + 62) % 63;
+    const record = try transport.message.decode(session.profile, backing.?[command + 4096 + cursor * 4096..][0..4096], session.tx_sequence - 1);
+    try t.expectEqualSlices(u8, channel.request, record.payload);
+    try t.expect(owner.info() == null and owner.parent.?.held());
+    try t.expect(owner.instance.info() != null and owner.userd.info() != null and model.slots[0].imported);
+    channel.phase = .prepared;
+    try target.port.owner.?.admit_command.?(target.port.owner.?.context, &target.port, deadline);
+    var moved = owner.*; try t.expect(!moved.matches(channel, deadline)); try t.expectError(error.Stale, moved.poll());
+    const original = channel.request; channel.request = record.payload;
+    try t.expectError(error.Binding, target.port.owner.?.admit_command.?(target.port.owner.?.context, &target.port, deadline));
+    channel.request = original; channel.phase = .waiting;
+    var response: [400]u8 = @splat(0); @memcpy(response[0..channel.request.len], channel.request);
+    var fifo_operation: ?@import("gsp_fifo_wire.zig").Operation = null;
+    if (owner.state == .command_creating or owner.state == .command_destroying) {
+        const commands = &owner.commands.?;
+        if (commands.caps_active) @memcpy(response[24..27], &running.graph.?.control_buffer.?.caps.?.raw) else switch (commands.operation.?) {
+            .allocate => {
+                const index = commands.backing.reference.reference.id - 901;
+                std.mem.writeInt(u64, response[112..120], fifo_model.address(index), .little);
+                std.mem.writeInt(u64, response[120..128], 12287, .little);
+            },
+            .map => std.mem.writeInt(u64, response[40..48], commands.address, .little),
+            .unmap, .free_virtual, .free_memory => try t.expect(!owner.live and !owner.enabled),
+            .register => try t.expect(!owner.live),
+        }
+    } else {
+        const op = owner.operation.?;
+        fifo_operation = op;
+        switch (op) {
+            .allocate => {
+                counts.allocations += 1; outputWord(&response, 164, @intCast(37 + counts.allocations));
+                try t.expect(@import("gsp_fifo_wire.zig").word(response[0..], 4) == owner.config.context.group);
+                try t.expect(@import("gsp_fifo_wire.zig").word(response[0..], 56) == owner.config.context.share);
+                try t.expect(@import("gsp_fifo_wire.zig").word(response[0..], 60) == 0);
+            },
+            .bind => try t.expect(owner.live and !owner.bound and !owner.enabled),
+            .token => { try t.expect(owner.bound and !owner.enabled); outputWord(&response, 24, 0x13572468); },
+            .enable => { counts.enables += 1; try t.expect(owner.work_submit_token != null and !owner.enabled); },
+            .disable => { counts.disables += 1; try t.expect(owner.enabled); },
+            .free => { counts.frees += 1; try t.expect(owner.live and !owner.enabled); },
+        }
+        if ((op == .allocate and model.is("context_fifo_allocate")) or (op == .bind and model.is("context_fifo_bind")) or
+            (op == .token and model.is("context_fifo_token")) or (op == .enable and model.is("context_fifo_enable")) or
+            (op == .disable and model.is("context_fifo_disable")) or (op == .free and model.is("context_fifo_free")))
+            outputWord(&response, if (op == .allocate) 16 else 12, 0x57);
+        if (op == .allocate and model.is("context_fifo_changed")) response[56] ^= 1;
+        if (op == .bind and !counts.event) {
+            var print: [9]u8 = @splat(0); print[4] = 1; print[8] = 'F';
+            try nativeEvent(session, 0x100c, &print); _ = target.step();
+            try t.expect(channel.phase == .waiting and channel.deadline == deadline and !owner.bound); counts.event = true;
+        }
+    }
+    std.mem.writeInt(u32, backing.?[status + 64..][0..4], session.tx_write, .little);
+    if (fifo_operation == .enable and model.is("context_fifo_timeout")) clock = deadline else {
+        try nativeReply(session, channel.function, 0, response[0..channel.request.len]);
+        if (fifo_operation == .enable and model.is("context_fifo_ack")) range_failure_call = range_calls + 4;
+    }
+    _ = scenario;
+    _ = target.step(); range_failure_call = 0;
+}
+fn driveDeviceFifo(target: *@import("gsp_device.zig").Device, counts: *FifoCounts, scenario: []const u8) !void {
+    var steps: usize = 0;
+    while (target.phase == .ready and target.running.fifo_active != null and steps < 140) : (steps += 1) {
+        _ = target.step();
+        if (target.phase != .ready or target.running.fifo_active == null) break;
+        try replyDeviceFifo(target, counts, scenario);
+    }
+    try t.expect(steps < 140);
+}
+fn checkDeviceFifos(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, scenario: []const u8,
+    context_handle: @import("gsp_runtime.zig").ContextHandle, deadline: u64) !void
+{
+    const model = @import("gsp_vram_test_model.zig").Model;
+    const fifo_model = @import("gsp_fifo_test_model.zig").Model;
+    const running = &target.running; const session = &target.session.?;
+    const parent = running.contexts[context_handle.slot].owner.?;
+    const count: usize = if (model.is("context_fifo_success")) 2 else 1;
+    var handles: [2]@import("gsp_runtime.zig").ChannelHandle = undefined;
+    var counts: FifoCounts = .{};
+    fifo_model.install(table, scenario);
+    errdefer |err| std.debug.print("fifo {s}: {s} phase={s} failure={?} active={?} alloc={d} free={d}\n",
+        .{scenario,@errorName(err),@tagName(target.phase),target.failure,running.fifo_active,counts.allocations,counts.frees});
+    for (0..count) |i| {
+        const instance = try allocateContextStorage(target, 4096, deadline);
+        const userd = try allocateContextStorage(target, 512, deadline);
+        const sent = session.tx_sequence;
+        try t.expectError(error.State, running.createExecutionChannel(context_handle, 1, instance, userd, deadline));
+        try t.expectError(error.Bounds, running.createExecutionChannel(context_handle, 0, instance, instance, deadline));
+        try t.expect(session.tx_sequence == sent and !model.slots[1 + i * 2].imported);
+        handles[i] = try running.createExecutionChannel(context_handle, 0, instance, userd, deadline);
+        var forged = handles[i]; forged.serial += 1; try t.expectError(error.Stale, running.executionChannelStatus(forged));
+        try t.expectError(error.Busy, running.createExecutionContext(19, deadline));
+        try running.releaseNativeBuffer(instance); try running.releaseNativeBuffer(userd);
+        try driveDeviceFifo(target, &counts, scenario);
+        if (target.phase != .ready) break;
+        const result = try running.executionChannelStatus(handles[i]);
+        try t.expect(result.state == .handed_off);
+        if (result.info) |fifo_info| {
+            try t.expect(fifo_info.config.context.group == parent.binding.group and fifo_info.config.context.share == parent.binding.share);
+            try t.expect(fifo_info.work_submit_token == 0x13572468 and fifo_info.config.address == fifo_model.address(i));
+            try t.expect(fifo_model.slots[i].active and fifo_model.slots[i].synced and parent.held());
+            try t.expectError(error.Retained, running.retireExecutionContext(context_handle, deadline));
+            try t.expectError(error.Retained, running.retireExecutionChannel(handles[i], deadline, false));
+            if (i == 1) {
+                const previous = (try running.executionChannelStatus(handles[0])).info.?;
+                try t.expect(previous.config.handle != fifo_info.config.handle and previous.config.instance != fifo_info.config.instance and
+                    previous.config.userd != fifo_info.config.userd and previous.config.address != fifo_info.config.address and previous.config.methods == fifo_info.config.methods);
+            }
+        } else try t.expect(result.rejected.? == 0x57 and !parent.held() and fifo_model.released == 1);
+    }
+    if (target.phase == .ready) {
+        @import("gsp_buffer_test_model.zig").Model.closeHeapAdmission(table);
+        if (count == 2) {
+            try running.retireExecutionChannel(handles[0], deadline, true);
+            try driveDeviceFifo(target, &counts, scenario);
+            try t.expectError(error.Stale, running.executionChannelStatus(handles[0]));
+            try t.expect((try running.executionChannelStatus(handles[1])).info != null and parent.held() and parent.methodStorage(0) != null);
+            try t.expect(!fifo_model.slots[0].active and fifo_model.slots[1].active and model.slots[0].imported);
+        }
+        try running.beginDestroyGraph(deadline, true);
+        var steps: usize = 0;
+        while (target.phase == .ready and steps < 300) : (steps += 1) {
+            _ = target.step();
+            if (target.phase != .ready) break;
+            if (running.fifo_active != null) { try replyDeviceFifo(target, &counts, scenario); continue; }
+            const channel = running.activeChannel().?;
+            if (channel.phase != .waiting) continue;
+            if (running.context_active != null) {
+                for (&running.fifos) |*slot| try t.expect(slot.owner == null);
+                try t.expect(!parent.held() and model.slots[0].imported);
+            }
+            var response: [4096]u8 = @splat(0); @memcpy(response[0..channel.request.len], channel.request);
+            const status = init.queues_offset + init.status_offset;
+            std.mem.writeInt(u32, backing.?[status + 64..][0..4], session.tx_write, .little);
+            try nativeReply(session, channel.function, 0, response[0..channel.request.len]); _ = target.step();
+        }
+        try t.expect(steps < 300);
+    }
+    const uncertain = model.is("context_fifo_changed") or model.is("context_fifo_ack") or model.is("context_fifo_timeout") or
+        model.is("context_fifo_disable") or model.is("context_fifo_free") or model.is("context_fifo_dma");
+    try t.expect(target.phase == .recovering and target.failure != null);
+    if (uncertain) {
+        const owner = running.fifos[handles[0].slot].owner.?;
+        try t.expect(owner.namespace_live and owner.failure != null and parent.held() and model.slots[0].imported and
+            owner.instance.info() != null and owner.userd.info() != null and fifo_model.slots[0].active);
+        try t.expect(model.charged == 3 * 65536);
+        if (model.is("context_fifo_dma")) try t.expect(!owner.live and !owner.enabled and !owner.commands.?.registered);
+    } else {
+        try t.expect(target.failure.? == error.RmClosed and model.charged == 0 and model.released == 1 + count * 2 and fifo_model.released == count);
+        for (&running.fifos) |*slot| try t.expect(slot.owner == null);
+        for (&running.contexts) |*slot| try t.expect(slot.owner == null);
+        try t.expect(counts.allocations == count and counts.frees == if (model.is("context_fifo_allocate")) @as(usize, 0) else count);
+        if (count == 2) try t.expect(counts.enables == 2 and counts.disables == 2);
+    }
+}
+
 fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, scenario: []const u8) !void {
     const model = @import("gsp_vram_test_model.zig").Model;
     const runtime = @import("gsp_runtime.zig");

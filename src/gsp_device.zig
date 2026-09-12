@@ -419,7 +419,10 @@ pub const Device = struct {
             channel.phase != .prepared or channel.pending != null or channel.session.pending != null or
             channel.deadline != deadline) return error.Binding;
         if (channel.in_lockdown) return error.Lockdown;
-        if (self.running.context_active) |index| {
+        if (self.running.fifo_active) |index| {
+            const fifo = self.running.fifos[index].owner orelse return error.Binding;
+            if (!fifo.matches(channel, deadline)) return error.Binding;
+        } else if (self.running.context_active) |index| {
             const context = self.running.contexts[index].owner orelse return error.Binding;
             if (!context.matches(channel, deadline)) return error.Binding;
         } else if (self.running.native_active) |index| {
