@@ -273,7 +273,7 @@ pub const Device = struct {
         if (boot.state == .init_done) {
             self.handoff = try self.port.handoffBoot(boot);
             self.phase = .ready;
-            try self.running.open(&self.ctx.?, &self.port, &self.handoff.?, self.reader.?, self.deadline);
+            try self.running.open(&self.ctx.?, &self.port, &self.handoff.?, self.reader.?, self.vram.?, self.deadline);
             self.ctx.?.logInfo("NVIDIA gsp-start: firmware-ready=INIT_DONE ack=complete rm-static=awaiting runtime=polling memory=retained display=held native-output=unavailable");
         }
         return true;

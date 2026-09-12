@@ -623,3 +623,11 @@ DCB4.x document. Nouveau xpio.c is retained as an independent comparison;
 its complete MIT notice is also in vbios_xpio.zig and the identically
 embedded/staged NVIDIA-CONNECTORS-LICENSE.txt. Type-specific GPIO
 functions and DCB4.1 pad masks are never relabeled as HPD pins or SORs.
+
+Memory inventory (NVIDIA 0.1.65, 2026-09-12):
+gsp_memory_inventory.zig follows the original MIT ctrl2080fb.h region
+semantics and mem_mgr_gsp_client.c reserved-region policy at the pinned
+570.144 commit. Both complete source notices are repeated in that file
+and already included in NVIDIA-GSP-RUNTIME-LICENSE.txt, unchanged in the
+module and Distribution. Four complete verified originals are archived
+under 0.79.11/memory-20260912. R4OS interval/lifetime code: Apache-2.0.

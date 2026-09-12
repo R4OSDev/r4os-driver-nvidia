@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.64; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.65; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -11,6 +11,20 @@ Starting with R4OS 0.79.9, `IMAGE_SCOPE=slim` includes the current module in
 Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
+
+Memory inventory (NVIDIA 0.1.65, roadmap 0.79.11 T1):
+The actual static-RPC owner now binds firmware regions to retained boot,
+VGA, translated surface, page-table, display-instance and payload extents.
+The exact byte union counts aliases once. Publication requires the response
+ACK and the original lease generation; failures expose no partial catalog.
+Speculative RM amounts exclude entire regions, never an invented reserved
+tail. Firmware layout changes screen no bytes. PCI BAR0/1/3 are reported
+separately from VRAM capacity; ReBAR is observed without resizing.
+GSP-MEMORY, GSP-REGION and GSP-APERTURE provide bounded startup diagnostics.
+screened_bytes is interval screening only, not free or allocated GPU memory.
+RM allocations, GPU mappings/TLBs, layouts, channels and visibility remain
+open software work. All 51 existing groups and the module build pass.
+Evidence: Docs/Drivers/GrafikSpeicher07911.txt/.json.
 
 Roadmap0.79.12 is complete in software (NVIDIA0.1.64, 2026-09-12).
 The actual Device retains PCI-bound VBIOS wiring, correlates RM heads,

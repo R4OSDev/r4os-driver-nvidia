@@ -1341,6 +1341,9 @@ const DeviceModel = struct {
     var wiring_logs: usize = 0;
     var hpd_logs: usize = 0;
     var xpio_logs: usize = 0;
+    var memory_logs: usize = 0;
+    var region_logs: usize = 0;
+    var aperture_logs: usize = 0;
     fn log(text: [*:0]const u8) callconv(.c) void {
         const line = std.mem.span(text);
         if (std.mem.startsWith(u8, line, "NVIDIA gsp-receiver:")) receiver_logs += 1;
@@ -1349,6 +1352,9 @@ const DeviceModel = struct {
         if (std.mem.startsWith(u8, line, "NVIDIA gsp-wire:")) wiring_logs += 1;
         if (std.mem.startsWith(u8, line, "NVIDIA gsp-hpd:")) hpd_logs += 1;
         if (std.mem.startsWith(u8, line, "NVIDIA gsp-xpio:")) xpio_logs += 1;
+        if (std.mem.startsWith(u8, line, "NVIDIA gsp-memory:")) memory_logs += 1;
+        if (std.mem.startsWith(u8, line, "NVIDIA gsp-region:")) region_logs += 1;
+        if (std.mem.startsWith(u8, line, "NVIDIA gsp-aperture:")) aperture_logs += 1;
     }
     fn tick(words: []u32, frts: u64, bad_frts: bool) void {
         const core = @import("gsp_core.zig");
@@ -1464,6 +1470,20 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
     DeviceModel.boot_info = .{ .generation = 1, .physical_address = 0xd0000000, .byte_length = 4096,
         .width = 32, .height = 32, .pitch = 128, .state = a.display_state_preparing };
     capture.original_boot = DeviceModel.boot_info;
+    // The earlier storage-lifetime fixture did not need translated extents.
+    // Supply an explicit retained physical surface for the real runtime's
+    // memory inventory; the independent BAR1 reader tests own translation.
+    const boot_mapping = held.boot_mapping.?;
+    try t.expect(boot_mapping.range_count == 0 and boot_mapping.page_count == 0);
+    boot_mapping.ranges[0] = .{ .address = 0x10000, .bytes = 4096 };
+    boot_mapping.range_count = 1;
+    boot_mapping.surface_bytes = 4096;
+    boot_mapping.framebuffer_bytes = held.plan.?.fb_bytes;
+    defer {
+        boot_mapping.range_count = 0;
+        boot_mapping.surface_bytes = 0;
+        boot_mapping.framebuffer_bytes = 0;
+    }
     capture.boot.display = .{ .table = .{ .boot_info = @intFromPtr(&DeviceModel.bootInfo) } };
     try capture.registers.open(ctx, &snapshot, chip);
     try capture.register_access.acquire(&capture.registers, ctx, &snapshot, chip);
@@ -1705,6 +1725,10 @@ fn checkDeviceStatic(target: *@import("gsp_device.zig").Device, words: []u32, fr
     const status = init.queues_offset + init.status_offset;
     const physical = target.vram.?.plan.?.fb_bytes;
     try t.expect(target.running.static_info == null and channel.phase == .prepared);
+    try t.expect(target.running.nativeMemory() == null);
+    const memory_logs = DeviceModel.memory_logs;
+    const region_logs = DeviceModel.region_logs;
+    const aperture_logs = DeviceModel.aperture_logs;
     // A firmware CPU command cannot acquire the queue notifier's authority.
     if (!channel.in_lockdown) {
         try t.expectError(error.Register, owner.access(owner.context, .write, native.command_queue_head));
@@ -1740,6 +1764,8 @@ fn checkDeviceStatic(target: *@import("gsp_device.zig").Device, words: []u32, fr
     std.mem.writeInt(u64, response[1224..1232], physical, .little);
     std.mem.writeInt(u64, response[1536..1544], physical - 65536, .little);
     std.mem.writeInt(u64, response[1544..1552], physical - 131072, .little);
+    std.mem.writeInt(u64, response[1640..1648], target.vram.?.plan.?.non_wpr_heap.offset, .little);
+    std.mem.writeInt(u64, response[1648..1656], target.vram.?.plan.?.frts.offset, .little);
     for ([_]u32{0xcaf00001, 0xcaf00002, 0xcaf00003}, 0..) |value, index|
         std.mem.writeInt(u32, response[1600 + index * 4 ..][0..4], value, .little);
     if (scenario == .static_timeout) {
@@ -1764,12 +1790,26 @@ fn checkDeviceStatic(target: *@import("gsp_device.zig").Device, words: []u32, fr
         try t.expect(info.client == 0xcaf00001 and info.device == 0xcaf00002 and info.subdevice == 0xcaf00003);
         try t.expect(info.fb_bytes == physical and info.region_count == 2 and info.regions[1].protected and info.regions[1].reserved == 4096);
         try t.expect(info.regions[0].iso and info.regions[0].compressed and info.regions[0].bytes == physical / 2);
+        const memory = target.running.nativeMemory() orelse return error.MissingMemoryInventory;
+        try t.expect(memory.epoch == session.epoch and memory.boot_epoch == target.vram.?.epoch);
+        try t.expect(memory.reported_bytes == physical and memory.physical_bytes == physical and memory.region_bytes == physical and memory.region_holes == 0);
+        try t.expect(memory.speculative_reserved == 4096 and memory.firmware_layout_matches and !memory.rebar_present);
+        try t.expect(memory.surface_extents == 1 and memory.table_pages == 0 and memory.instance_active and memory.payload_extents == 0);
+        try t.expect(memory.retained_count == 4 and memory.retained_bytes == target.vram.?.plan.?.reserved.bytes + 131072 + 65536 + 4096);
+        try t.expect(memory.screened_bytes == physical / 2 - 131072 - 65536 - 4096);
+        try t.expect(memory.windows[1].base == 0xd0000000 and memory.windows[1].bytes == 0x10000000 and memory.windows[1].status == .measured);
+        try t.expect(memory.windows[2].pci_index == 3 and memory.windows[2].bytes == 0x2000000);
+        try t.expect(DeviceModel.memory_logs == memory_logs + 2 and DeviceModel.region_logs == region_logs + 2 and DeviceModel.aperture_logs == aperture_logs + 3);
+        if (scenario == .success) try checkMemoryInventory(target, &info);
         // Snapshot survives reuse of the borrowed DMA receive buffer.
         @memset(&target.rx, 0xa5);
         try t.expect(target.running.static_info.?.client == info.client);
+        try t.expect(target.running.nativeMemory() == memory and memory.reported_bytes == physical);
         return;
     }
     try t.expect(target.running.static_info == null and target.running.failure != null);
+    try t.expect(target.running.nativeMemory() == null and target.running.memory_inventory.snapshot() == null);
+    try t.expect(DeviceModel.memory_logs == memory_logs and DeviceModel.region_logs == region_logs and DeviceModel.aperture_logs == aperture_logs);
     try t.expectEqual(if (scenario == .static_timeout) error.Deadline else if (scenario == .static_bad_region) error.Region else error.Io,
         target.running.failure.?);
     const receipt = session.pending;
@@ -1782,6 +1822,72 @@ fn checkDeviceStatic(target: *@import("gsp_device.zig").Device, words: []u32, fr
     }
     try t.expect(steps < 12000 and target.phase == .failed and target.memory.?.retained and target.recovery.report != null);
     try t.expect(std.meta.eql(receipt, session.pending) and target.port.phase == .recovery and !target.reader.?.enabled);
+}
+
+fn checkMemoryInventory(target: *@import("gsp_device.zig").Device, info: *const @import("gsp_static.zig").Info) !void {
+    const inventory = @import("gsp_memory_inventory.zig");
+    const live = &target.running.memory_inventory;
+    const lease = target.vram.?;
+    const physical = info.fb_bytes;
+    try t.expectEqual(inventory.Placement.requires_rm_allocation, try live.placement(.{ .base = 0x20000, .bytes = 4096 }));
+    try t.expectEqual(inventory.Placement.boot_retained, try live.placement(.{ .base = 0x10000, .bytes = 4096 }));
+    try t.expectEqual(inventory.Placement.boot_retained, try live.placement(.{ .base = lease.plan.?.reserved.offset, .bytes = 1 }));
+    try t.expectEqual(inventory.Placement.protected, try live.placement(.{ .base = physical / 2, .bytes = 4096 }));
+    try t.expectEqual(inventory.Placement.region_gap, try live.placement(.{ .base = physical / 2 - 4096, .bytes = 8192 }));
+    try t.expectEqual(inventory.Placement.invalid, try live.placement(.{ .base = std.math.maxInt(u64), .bytes = 4096 }));
+    try t.expectEqual(inventory.Placement.invalid, try live.placement(.{ .base = 0, .bytes = 0 }));
+    lease.serial += 1;
+    try t.expect(target.running.nativeMemory() == null);
+    try t.expectError(error.MemoryStale, live.placement(.{ .base = 0x20000, .bytes = 4096 }));
+    lease.serial -= 1;
+    try t.expect(target.running.nativeMemory() != null);
+
+    // Same real retained lease, varied firmware metadata. These observations
+    // never allocate memory or extend the device port's allowed operations.
+    const model = try t.allocator.create(inventory.Owner);
+    defer t.allocator.destroy(model);
+    var sample = info.*;
+    sample.regions[0].reserved = 1;
+    model.* = .{};
+    try model.prepare(lease, &sample, target.epoch);
+    try t.expect(model.snapshot() == null);
+    try model.publish();
+    try t.expect(model.snapshot().?.screened_bytes == 0);
+    try t.expectEqual(inventory.Placement.rm_reserved, try model.placement(.{ .base = 0x20000, .bytes = 4096 }));
+    try t.expectEqual(inventory.Placement.rm_reserved, try model.placement(.{ .base = physical / 2 - 1, .bytes = 1 }));
+    model.invalidate();
+    try t.expect(model.snapshot() == null);
+
+    // A reported layout change is visible but authorizes no screened region.
+    sample = info.*;
+    sample.non_wpr_heap += 4096;
+    model.* = .{};
+    try model.prepare(lease, &sample, target.epoch);
+    try model.publish();
+    try t.expect(!model.snapshot().?.firmware_layout_matches and model.snapshot().?.screened_bytes == 0);
+    try t.expectEqual(inventory.Placement.firmware_layout_changed, try model.placement(.{ .base = 0x20000, .bytes = 4096 }));
+
+    // Holes are not free, region order does not imply address order, aliases
+    // are counted once, and partial batch failure never publishes a catalog.
+    sample = info.*;
+    sample.regions[0].base = 0x40000;
+    sample.regions[0].bytes -= 0x40000;
+    std.mem.swap(@import("gsp_static.zig").Region, &sample.regions[0], &sample.regions[1]);
+    const boot_map = lease.boot_mapping.?;
+    const original = boot_map.ranges[0];
+    boot_map.ranges[0] = .{ .address = 0x100000, .bytes = 4096 }; // Alias inside instance backup.
+    defer boot_map.ranges[0] = original;
+    model.* = .{};
+    try model.prepare(lease, &sample, target.epoch);
+    try model.publish();
+    try t.expect(model.snapshot().?.region_holes == 0x40000 and model.snapshot().?.retained_count == 3);
+    try t.expect(model.snapshot().?.retained_bytes == live.data.retained_bytes - 4096);
+    try t.expectEqual(inventory.Placement.region_gap, try model.placement(.{ .base = 0x20000, .bytes = 4096 }));
+    try t.expectEqual(inventory.Placement.requires_rm_allocation, try model.placement(.{ .base = 0x40000, .bytes = 4096 }));
+    sample.regions[1].base = physical - 1;
+    model.* = .{};
+    try t.expectError(error.MemoryBounds, model.prepare(lease, &sample, target.epoch));
+    try t.expect(model.snapshot() == null);
 }
 
 fn checkDevicePostInit(target: *@import("gsp_device.zig").Device, words: []u32, frts: u64, scenario: anytype) !void {

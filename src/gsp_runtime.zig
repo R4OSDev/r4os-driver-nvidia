@@ -43,6 +43,7 @@ const rm = @import("gsp_rm_graph.zig");
 const display = @import("gsp_display_rpc.zig");
 const subscriptions = @import("gsp_event_objects.zig");
 const outputs = @import("gsp_outputs.zig");
+const inventory = @import("gsp_memory_inventory.zig");
 pub const Progress = enum { idle, progress };
 pub const Snapshot = struct {
     polls: u64 = 0,
@@ -76,6 +77,8 @@ pub const Owner = struct {
     protocol_failure: ?exchange.Error = null,
     static_request: [static.payload_bytes]u8 = @splat(0),
     static_info: ?static.Info = null,
+    reservation: ?*const @import("boot_vram_lease.zig").Lease = null,
+    memory_inventory: inventory.Owner = .{},
     physical_bytes: u64 = 0,
     startup_deadline: u64 = 0,
     post: postinit.Owner = .{},
@@ -90,16 +93,18 @@ pub const Owner = struct {
     words: [logs.output_bytes]u8 = undefined,
 
     pub fn open(self: *Owner, ctx: *const r4os.r4dev.DriverContext, device: *native.Port,
-        handoff: *boot.Handoff, reader: *logs.Reader, deadline: u64) !void
+        handoff: *boot.Handoff, reader: *logs.Reader, reservation: *const @import("boot_vram_lease.zig").Lease, deadline: u64) !void
     {
         if (self.self_address != 0) return error.Busy;
         if (device.phase != .runtime or device.runtime_session != handoff.session or
             reader.memory == null or device.owner == null or device.owner.?.queue_memory != reader.memory or
-            reader.generation() != handoff.session.epoch or !reader.enabled or reader.busy) return error.Binding;
+            reader.generation() != handoff.session.epoch or !reader.enabled or reader.busy or
+            reservation.backing != reader.memory.?.boot_storage) return error.Binding;
         self.self_address = @intFromPtr(self);
         self.ctx = ctx.*;
         self.device = device;
         self.reader = reader;
+        self.reservation = reservation;
         self.epoch = handoff.session.epoch;
         self.startup_deadline = deadline;
         errdefer |err| self.failure = err;
@@ -136,6 +141,7 @@ pub const Owner = struct {
     pub fn stop(self: *Owner, err: anyerror) void {
         if (self.self_address == 0 or self.self_address != @intFromPtr(self) or self.failure != null) return;
         self.outputs.invalidate() catch {};
+        self.memory_inventory.invalidate();
         self.failure = err;
         if (self.activeChannel()) |channel| {
             self.protocol_failure = channel.fail(error.Handler);
@@ -171,6 +177,10 @@ pub const Owner = struct {
         _ = self.now() catch return null;
         if (self.nativeObject() == null) return null;
         return self.outputs.snapshot();
+    }
+    pub fn nativeMemory(self: *Owner) ?*const inventory.Summary {
+        _ = self.now() catch return null;
+        return self.memory_inventory.snapshot();
     }
     pub fn takeDisplayChanges(self: *Owner) !subscriptions.Changes {
         const current = try self.now();
@@ -318,10 +328,13 @@ pub const Owner = struct {
                 }
                 if (channel.function != static.function) return error.Unexpected;
                 const info = try static.decode(dispatch.record, self.physical_bytes);
+                try self.memory_inventory.prepare(self.reservation.?, &info, self.epoch);
                 try channel.complete(dispatch.ticket);
                 self.static_info = info; // Publish no observation before a successful ACK.
+                try self.memory_inventory.publish();
                 self.log("NVIDIA gsp-static: client={x} device={x} subdevice={x} fb-bytes={d} regions={d} bar1-pdb={x} bar2-pdb={x}",
                     .{info.client, info.device, info.subdevice, info.fb_bytes, info.region_count, info.bar1_pdb, info.bar2_pdb});
+                self.logMemory();
                 return .progress;
             }
             try self.notification(channel, dispatch, current);
@@ -354,6 +367,20 @@ pub const Owner = struct {
             try self.captureLog(deadline);
         }
         return .idle;
+    }
+    fn logMemory(self: *Owner) void {
+        const data = self.nativeMemory() orelse return;
+        self.log("NVIDIA gsp-memory: epoch={d} physical={d} reported={d} regions={d} holes={d} rm-budget={d} retained={d} screened={d} allocation=none",
+            .{data.epoch, data.physical_bytes, data.reported_bytes, data.region_count, data.region_holes,
+                data.speculative_reserved, data.retained_bytes, data.screened_bytes});
+        self.log("NVIDIA gsp-memory: union={d} surface-extents={d} table-pages={d} instance={any} payload-extents={d} firmware-layout-matches={any}",
+            .{data.retained_count, data.surface_extents, data.table_pages, data.instance_active, data.payload_extents, data.firmware_layout_matches});
+        for (data.windows) |bar|
+            self.log("NVIDIA gsp-aperture: pci-bar={d} base={x} bytes={d} status={s} prefetch={any} rebar-present={any} resize=no",
+                .{bar.pci_index, bar.base, bar.bytes, @tagName(bar.status), bar.prefetchable, data.rebar_present});
+        for (self.memory_inventory.regions[0..data.region_count], 0..) |*region, index|
+            self.log("NVIDIA gsp-region: index={d} base={x} bytes={d} rm-budget={d} protected={any} iso={any} compressed={any} performance={d}",
+                .{index, region.base, region.bytes, region.reserved, region.protected, region.iso, region.compressed, region.performance});
     }
     fn notification(self: *Owner, channel: *exchange.Exchange, dispatch: exchange.Dispatch, current: u64) !void {
         if (dispatch.response) return error.Unexpected;
