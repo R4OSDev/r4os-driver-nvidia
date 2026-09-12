@@ -100,7 +100,7 @@ pub const Error = base.Error;
 pub const Binding = base.Binding;
 pub const Operation = enum { allocate_memory, allocate_virtual, map, unmap, free_virtual, free_memory };
 pub const alignment: u64 = 65536;
-pub const Layout = struct { blocklinear: bool = false, scanout: bool = false };
+pub const Layout = struct { blocklinear: bool = false, scanout: bool = false, contiguous: bool = false };
 pub fn function(op: Operation) u32 { return switch (op) { .allocate_memory, .allocate_virtual => 103, .map => 14, .unmap => 15, .free_virtual, .free_memory => 10 }; }
 fn translated(op: Operation) base.Operation { return switch (op) { .allocate_memory, .allocate_virtual => .allocate, .map => .map, .unmap => .unmap, .free_virtual => .free_virtual, .free_memory => .free_memory }; }
 fn part(bytes: u64) base.Part { return .{ .total_bytes = bytes, .byte_length = bytes }; }
@@ -125,7 +125,7 @@ pub fn encodeLayout(binding: Binding, bytes: u64, layout: Layout, op: Operation,
             put(out, 12, 0x40); // NV01_MEMORY_LOCAL_USER.
             put(p, 4, if (layout.scanout) 8 else 0); // PRIMARY or IMAGE.
             put(p, 8, if (layout.scanout) 0x102 else 0x1102); // Scanout never sets NO_SCANOUT.
-            put(p, 24, (if (layout.scanout) @as(u32, 0x10800000) else 0x08800000) | format);
+            put(p, 24, (if (layout.scanout or layout.contiguous) @as(u32, 0x10800000) else 0x08800000) | format);
             put(p, 108, 0);
         }
     } else if (op == .map) put(out, 32, 0x100); // 4K, no CPU snoop; immediate TLB update.
@@ -157,7 +157,7 @@ pub fn decode(binding: Binding, bytes: u64, op: Operation, request: []const u8, 
     const physicality = (attr >> 27) & 3;
     const requested_attr = word(request[32..], 24);
     if ((attr & ~@as(u32, 3 << 27)) != (requested_attr & ~@as(u32, 3 << 27)) or
-        (physicality != 1 and physicality != 2) or (word(request[32..], 4) == 8 and physicality != 2)) return error.Payload;
+        (physicality != 1 and physicality != 2) or (((requested_attr >> 27) & 3) == 2 and physicality != 2)) return error.Payload;
     for (p, 0..) |v, i| {
         if ((i >= 24 and i < 28) or (i >= 80 and i < 96)) continue;
         if (v != request[32 + i]) return error.Payload;

@@ -9,9 +9,10 @@ const names = @import("gsp_rm_names.zig");
 const vaspace = @import("gsp_vaspace.zig");
 pub const wire = @import("gsp_vram_wire.zig");
 pub const surface = @import("gsp_surface_layout.zig");
-pub const Error = wire.Error || names.Error || surface.Error || error{ Api, Descriptor, Memory, Busy, Retained };
+pub const storage = @import("gsp_native_backing.zig");
+pub const Error = wire.Error || names.Error || surface.Error || storage.Error || error{ Api, Descriptor, Memory, Busy, Retained };
 pub const State = enum { creating, unwinding, ready, handed_off, destroying, closed, finished, failed };
-pub const Info = struct { reference: a.GfxBufferReference, address: u64, logical_bytes: u64, allocation_bytes: u64, epoch: u64, surface: surface.Plan };
+pub const Info = struct { reference: a.GfxBufferReference, address: u64, logical_bytes: u64, allocation_bytes: u64, epoch: u64, surface: surface.Plan, physical: ?storage.Physical = null };
 pub const Owner = struct {
     self_address: usize = 0,
     exchange: exchange.Exchange,
@@ -23,6 +24,9 @@ pub const Owner = struct {
     logical_bytes: u64,
     bytes: u64,
     layout: surface.Plan,
+    storage_policy: ?storage.Policy = null,
+    physical_extent: ?storage.Physical = null,
+    storage_claimed: bool = false,
     state: State = .creating,
     reservation: a.GfxOwnedBufferReservation = .{},
     reservation_stamp: a.GfxOwnedBufferReservation = .{},
@@ -53,6 +57,11 @@ pub const Owner = struct {
     pub fn initPlanned(token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext, adapter: u32, space: vaspace.Info,
         parent: names.Lease, plan: surface.Plan, deadline: u64) Error!Owner
     {
+        return initStorage(token, ctx, adapter, space, parent, plan, null, deadline);
+    }
+    pub fn initStorage(token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext, adapter: u32, space: vaspace.Info,
+        parent: names.Lease, plan: surface.Plan, policy: ?storage.Policy, deadline: u64) Error!Owner
+    {
         if (token.claimed or token.session.state != .active or token.session.pending != null or adapter == 0 or
             space.epoch != token.session.epoch or parent.epoch != space.epoch or parent.client != space.client) return error.Stale;
         try token.session.guard(deadline);
@@ -60,12 +69,16 @@ pub const Owner = struct {
         if (memory.table.size < 152 or memory.table.buffer_reserve == 0 or memory.table.buffer_commit == 0 or
             memory.table.buffer_abort == 0 or memory.table.buffer_take_release == 0 or memory.table.buffer_finish_release == 0) return error.Api;
         try plan.validate(adapter, space);
+        if (policy) |value| {
+            if (plan.request != null) return error.Descriptor;
+            try value.validate(space, plan.allocation_bytes);
+        }
         const children = try token.session.rm_names.reserveChildren(parent, 2);
         errdefer token.session.rm_names.retireChildren(children) catch {};
         const binding: wire.Binding = .{ .space = space, .memory = try children.object(0), .virtual = try children.object(1) };
         return .{ .exchange = try exchange.Exchange.init(token, deadline), .memory = memory, .names = children,
             .binding = binding, .adapter = adapter, .logical_bytes = plan.descriptor.byte_length,
-            .bytes = plan.allocation_bytes, .layout = plan, .deadline = deadline };
+            .bytes = plan.allocation_bytes, .layout = plan, .storage_policy = policy, .deadline = deadline };
     }
     fn stable(self: *const Owner) Error!void {
         if ((self.self_address != 0 and self.self_address != @intFromPtr(self)) or self.binding.space.epoch != self.exchange.session.epoch or
@@ -83,7 +96,23 @@ pub const Owner = struct {
         if (self.self_address != @intFromPtr(self) or !self.committed or !self.reference_live or self.closing or !self.mapped or
             self.exchange.session.state != .active or (self.state != .ready and self.state != .handed_off)) return null;
         return .{ .reference = self.reference, .address = self.address, .logical_bytes = self.logical_bytes,
-            .allocation_bytes = self.bytes, .epoch = self.binding.space.epoch, .surface = self.layout };
+            .allocation_bytes = self.bytes, .epoch = self.binding.space.epoch, .surface = self.layout, .physical = self.physical_extent };
+    }
+    pub fn retainStorage(self: *Owner, use: *storage.Use) Error!void {
+        const value = self.info() orelse return error.State;
+        const physical = value.physical orelse return error.Unsupported;
+        const policy = self.storage_policy orelse return error.Unsupported;
+        try policy.validate(self.binding.space, self.bytes);
+        // Clearing is an allocation-time guarantee, not a reusable clean
+        // state after a channel/group may have written its control storage.
+        if (self.storage_claimed) return error.Busy;
+        use.acquire(self.memory, .{ .reference = self.reference, .physical = physical, .address = self.address,
+            .bytes = self.logical_bytes, .epoch = self.binding.space.epoch, .adapter = self.adapter,
+            .driver_owner = self.reservation.driver_owner }) catch |err| {
+            if (err == error.Descriptor or err == error.Retained) return self.fail(err);
+            return err;
+        };
+        self.storage_claimed = true;
     }
     fn reserve(self: *Owner) Error!void {
         const result = self.memory.bufferReserve(&self.layout.descriptor, self.binding.memory, &self.reservation);
@@ -138,7 +167,8 @@ pub const Owner = struct {
                 self.state = if (self.state == .unwinding) .ready else .closed;
                 return null;
             };
-            const encoded = try wire.encodeLayout(self.binding, self.bytes, .{ .blocklinear = self.layout.blocklinear(), .scanout = self.layout.scanout() }, op, self.address, &self.request);
+            const encoded = try wire.encodeLayout(self.binding, self.bytes, .{ .blocklinear = self.layout.blocklinear(), .scanout = self.layout.scanout(),
+                .contiguous = self.storage_policy != null }, op, self.address, &self.request);
             try self.exchange.begin(encoded.function, encoded.bytes, self.deadline);
             self.operation = op; self.request_bytes = encoded.bytes.len;
         }
@@ -146,17 +176,23 @@ pub const Owner = struct {
         if (!dispatch.response) return dispatch;
         const op = self.operation.?;
         const reply = try wire.decode(self.binding, self.bytes, op, self.request[0..self.request_bytes], dispatch.record, self.address);
+        if (op == .allocate_memory and reply == .ok) if (self.storage_policy) |policy| {
+            if (reply.ok == 0 or reply.ok > policy.physical_bytes or self.bytes > policy.physical_bytes - reply.ok) return error.Bounds;
+        };
         try self.exchange.complete(dispatch.ticket);
         if (reply == .rejected) {
             if (self.state != .creating) return error.FirmwareResult;
             self.rejected = reply.rejected; self.state = .unwinding;
         } else switch (op) {
-            .allocate_memory => self.physical = true,
+            .allocate_memory => {
+                self.physical = true;
+                if (self.storage_policy != null) self.physical_extent = .{ .base = reply.ok, .bytes = self.bytes };
+            },
             .allocate_virtual => { self.virtual = true; self.address = reply.ok; },
             .map => self.mapped = true,
             .unmap => self.mapped = false,
             .free_virtual => { self.virtual = false; self.address = 0; },
-            .free_memory => self.physical = false,
+            .free_memory => { self.physical = false; self.physical_extent = null; },
         }
         self.operation = null;
         return null;

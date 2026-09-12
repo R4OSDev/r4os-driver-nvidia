@@ -1525,8 +1525,10 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         mapping_success, mapping_reject, mapping_offset, mapping_ack, mapping_timeout, mapping_release, mapping_segment, mapping_gpu,
         vram_success, vram_budget, vram_physical_reject, vram_virtual_reject, vram_map_reject, vram_commit, vram_size, vram_ack, vram_timeout, vram_free, vram_finish,
         vram_surface_linear, vram_surface_tiled, vram_surface_changed, vram_surface_contiguity,
+        vram_storage, vram_storage_bounds, vram_storage_contiguity, vram_storage_acquire, vram_storage_descriptor, vram_storage_no_clear,
         context_success, context_classes, context_engine, context_query_reject, context_page, context_duplicate,
         context_group_reject, context_share_reject, context_share_changed, context_ack, context_timeout, context_free,
+        context_methods, context_methods_acquire, context_methods_free, context_methods_release,
         outputs_empty, outputs_all, outputs_rejected, outputs_partial, outputs_missing, outputs_incomplete, outputs_bad_edid,
         outputs_edid_rejected, outputs_ddc, outputs_ddc_bus_changed, outputs_aux, outputs_wiring, outputs_virtual, outputs_changed, outputs_final_changed, outputs_final_rejected, outputs_hpd, outputs_sequence, outputs_ack, outputs_timeout, catalog_rejected,
         runtime_healthy, runtime_lockdown, runtime_unknown, runtime_unowned, runtime_sequence_timeout,
@@ -2572,8 +2574,41 @@ fn outputEdidFull(bytes: *[4096]u8) void {
     bytes[127] -%= 30;
     for (2..32) |index| { bytes[index * 128] = 0x99; bytes[index * 128 + 127] = 0 -% @as(u8, 0x99); }
 }
+fn allocateContextStorage(target: *@import("gsp_device.zig").Device, bytes: u64, deadline: u64) !@import("gsp_runtime.zig").BufferHandle {
+    const model = @import("gsp_vram_test_model.zig").Model;
+    const running = &target.running; const session = &target.session.?;
+    const command = init.queues_offset + init.command_offset; const status = init.queues_offset + init.status_offset;
+    const handle = try running.allocateNativeStorage(bytes, deadline);
+    var steps: usize = 0;
+    while (target.phase == .ready and running.native_active != null and steps < 80) : (steps += 1) {
+        _ = target.step();
+        if (target.phase != .ready or running.native_active == null) break;
+        const owner = running.native_buffers[running.native_active.?].owner.?;
+        const channel = running.activeChannel().?;
+        if (channel.phase != .waiting) continue;
+        const cursor = (session.tx_write + 62) % 63;
+        const record = try transport.message.decode(session.profile, backing.?[command + 4096 + cursor * 4096..][0..4096], session.tx_sequence - 1);
+        try t.expectEqualSlices(u8, channel.request, record.payload);
+        try t.expect(owner.info() == null);
+        var response: [160]u8 = @splat(0); @memcpy(response[0..channel.request.len], record.payload);
+        switch (owner.operation.?) {
+            .allocate_memory, .allocate_virtual => {
+                const physical = owner.operation.? == .allocate_memory;
+                std.mem.writeInt(u64, response[112..120], if (physical) owner.storage_policy.?.physical_bytes / 2 else model.address(0), .little);
+                std.mem.writeInt(u64, response[120..128], owner.bytes - 1, .little);
+                if (physical) try t.expect(((std.mem.readInt(u32, response[56..60], .little) >> 27) & 3) == 2);
+            },
+            .map => std.mem.writeInt(u64, response[40..48], model.address(0), .little),
+            else => return error.Unexpected,
+        }
+        std.mem.writeInt(u32, backing.?[status + 64..][0..4], session.tx_write, .little);
+        try nativeReply(session, channel.function, 0, response[0..channel.request.len]); _ = target.step();
+    }
+    try t.expect(steps < 80 and target.phase == .ready and (try running.nativeBufferStatus(handle)).info != null);
+    return handle;
+}
 fn checkDeviceContexts(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, scenario: []const u8) !void {
-    const model = @import("gsp_buffer_test_model.zig").Model;
+    const model = @import("gsp_vram_test_model.zig").Model;
     const runtime = @import("gsp_runtime.zig");
     const vectors = @import("gsp_context_test.zig");
     const wire = runtime.execution_context.wire;
@@ -2583,7 +2618,8 @@ fn checkDeviceContexts(target: *@import("gsp_device.zig").Device, table: *a.Driv
     const command = init.queues_offset + init.command_offset;
     const status = init.queues_offset + init.status_offset;
     model.install(table, scenario); defer model.dispose(table);
-    const success = model.is("context_success");
+    const methods = std.mem.startsWith(u8, scenario, "context_methods");
+    const success = model.is("context_success") or model.is("context_methods");
     var handles: [2]runtime.ContextHandle = undefined;
     var held: ?runtime.execution_context.Child = null;
     var allocations: usize = 0;
@@ -2650,6 +2686,25 @@ fn checkDeviceContexts(target: *@import("gsp_device.zig").Device, table: *a.Driv
         if (result.info) |info| {
             try t.expect(info.binding.client == running.graph.?.reservation.client and info.rm_engine == 19 and info.nv_engine == 0x34);
             try t.expect(info.engine.data[3] == 7 and info.method_bytes == 0x6000 and info.subcontext == 0);
+            if (methods and index == 0) {
+                const buffer = try allocateContextStorage(target, info.method_bytes, deadline);
+                const context = running.contexts[handles[0].slot].owner.?;
+                try t.expectError(error.Bounds, running.attachContextMethods(handles[0], 2, buffer));
+                if (model.is("context_methods_acquire")) {
+                    try t.expectError(error.Memory, running.attachContextMethods(handles[0], 0, buffer));
+                    try t.expect(context.methodStorage(0) == null and context.methods[0].self_address == 0 and !model.slots[0].imported);
+                } else {
+                    try running.attachContextMethods(handles[0], 0, buffer);
+                    try t.expect(context.methodStorage(0).?.bytes == info.method_bytes and model.slots[0].gpu.lease.id != 0);
+                    try t.expectError(error.Busy, running.attachContextMethods(handles[0], 0, buffer));
+                }
+                try running.releaseNativeBuffer(buffer);
+                try t.expect(!model.slots[0].reference and model.slots[0].live);
+                if (!model.is("context_methods_acquire")) {
+                    try t.expect(context.methodStorage(0) != null);
+                    try t.expect(std.meta.eql(context.methodStorage(0).?.reference, context.methods[0].reference));
+                }
+            }
             var token = try running.channel.?.handoff(deadline); try running.graph.?.reclaim(&token, deadline);
             const sent = session.tx_sequence; try t.expectError(error.Retained, running.graph.?.beginDestroy(deadline)); try t.expect(sent == session.tx_sequence);
             var loan = try running.graph.?.loan(deadline); running.channel = try @import("gsp_exchange.zig").Exchange.init(&loan.runtime, deadline);
@@ -2667,7 +2722,7 @@ fn checkDeviceContexts(target: *@import("gsp_device.zig").Device, table: *a.Driv
         }
     }
     if (target.phase == .ready) {
-        if (success) model.closeHeapAdmission(table);
+        if (success or methods) @import("gsp_buffer_test_model.zig").Model.closeHeapAdmission(table);
         try running.beginDestroyGraph(deadline, true);
         try t.expectError(error.Busy, running.retainExecutionContext(handles[0]));
         var steps: usize = 0;
@@ -2687,19 +2742,34 @@ fn checkDeviceContexts(target: *@import("gsp_device.zig").Device, table: *a.Driv
                 const owner = running.contexts[index].owner.?;
                 try t.expect(owner.state == .destroying and !owner.held());
                 try t.expect(owner.operation.? == .free_share or owner.operation.? == .free_group); frees += 1;
-                if (model.is("context_free")) outputWord(&response, 12, 0x57);
-            } else for (&running.contexts) |*slot| try t.expect(slot.owner == null);
+                if (methods and index == handles[0].slot and !model.is("context_methods_acquire"))
+                    try t.expect(model.slots[0].imported and model.slots[0].gpu.lease.id != 0 and model.charged == 65536);
+                if (model.is("context_free") or (model.is("context_methods_free") and owner.operation.? == .free_group)) outputWord(&response, 12, 0x57);
+            } else if (running.native_active != null) {
+                try t.expect(methods and !model.slots[0].imported and model.slots[0].gpu.lease.id == 0 and model.slots[0].claimed);
+                if (!model.is("context_methods_acquire")) for (&running.contexts) |*slot| try t.expect(slot.owner == null);
+            } else {
+                for (&running.contexts) |*slot| try t.expect(slot.owner == null);
+                try t.expect(model.charged == 0);
+            }
             std.mem.writeInt(u32, backing.?[status + 64..][0..4], session.tx_write, .little);
             try nativeReply(session, channel.function, 0, response[0..channel.request.len]); _ = target.step();
         }
         try t.expect(steps < 180);
     }
-    const uncertain = model.is("context_page") or model.is("context_duplicate") or model.is("context_share_changed") or model.is("context_ack") or model.is("context_timeout") or model.is("context_free");
+    const uncertain = model.is("context_page") or model.is("context_duplicate") or model.is("context_share_changed") or model.is("context_ack") or model.is("context_timeout") or model.is("context_free") or
+        model.is("context_methods_free") or model.is("context_methods_release");
     try t.expect(target.phase == .recovering and target.failure != null);
     if (uncertain) try t.expect(running.contexts[0].owner.?.namespace_live and running.contexts[0].owner.?.failure != null) else {
         try t.expect(target.failure.? == error.RmClosed);
         for (&running.contexts) |*slot| try t.expect(slot.owner == null);
         if (success) try t.expect(allocations == 4 and frees == 4);
+    }
+    if (methods) {
+        if (uncertain) {
+            try t.expect(model.slots[0].live and model.slots[0].imported and model.slots[0].gpu.lease.id != 0 and model.charged == 65536);
+            if (model.is("context_methods_release")) try t.expect(!running.contexts[0].owner.?.group_live);
+        } else try t.expect(model.released == 1 and model.charged == 0 and !model.slots[0].live);
     }
 }
 fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, scenario: []const u8) !void {
@@ -2717,7 +2787,9 @@ fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverAp
     var interleaved = false;
     const surface = runtime.vram.surface;
     const surfaces = std.mem.startsWith(u8, scenario, "vram_surface_");
-    const success = model.is("vram_success") or model.is("vram_surface_linear") or model.is("vram_surface_tiled");
+    const private_storage = std.mem.startsWith(u8, scenario, "vram_storage");
+    var storage_use: runtime.vram.storage.Use = .{};
+    const success = model.is("vram_success") or model.is("vram_surface_linear") or model.is("vram_surface_tiled") or model.is("vram_storage");
     const layout: surface.Layout = if (model.is("vram_surface_linear")) .linear else .blocklinear;
     const requests = [_]surface.Request{
         if (model.is("vram_surface_contiguity")) .{ .width = 1920, .height = 1080, .usage = 44, .layout = layout }
@@ -2725,13 +2797,22 @@ fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverAp
         .{ .width = 1920, .height = 1080, .format = .argb8888, .usage = 44, .layout = layout },
     };
     const full: u64 = if (surfaces) (try surface.create(running.adapter_id, running.nativeAddressSpace().?.*, running.nativeMemoryCapabilities().?, requests[0])).allocation_bytes else 64 * 1024 * 1024;
-    const total: usize = if (success) 2 else 1;
+    const total: usize = if (model.is("vram_storage_no_clear")) 0 else if (success) 2 else 1;
+    if (model.is("vram_storage_no_clear")) {
+        const caps = &running.graph.?.control_buffer.?.caps.?;
+        const original = caps.*; caps.raw[2] &= ~@as(u8, 2);
+        const sent = session.tx_sequence;
+        try t.expectError(error.Unsupported, running.allocateNativeStorage(4096, deadline));
+        try t.expect(sent == session.tx_sequence and running.native_active == null and model.charged == 0);
+        caps.* = original;
+    }
     errdefer |err| std.debug.print("native VRAM {s}: {s} phase={s} failure={?} active={?} messages={d} charge={d}\n",
         .{scenario, @errorName(err), @tagName(target.phase), target.failure, running.native_active, messages, model.charged});
     for (0..total) |index| {
         const plan = if (surfaces) try surface.create(running.adapter_id, running.nativeAddressSpace().?.*, running.nativeMemoryCapabilities().?, requests[index]) else null;
         const bytes: u64 = if (plan) |p| p.descriptor.byte_length else if (index == 0) full - 5 else 4091;
-        handles[index] = if (surfaces) try running.allocateNativeSurface(requests[index], deadline) else try running.allocateNativeBuffer(bytes, deadline);
+        handles[index] = if (surfaces) try running.allocateNativeSurface(requests[index], deadline)
+            else if (private_storage) try running.allocateNativeStorage(bytes, deadline) else try running.allocateNativeBuffer(bytes, deadline);
         var forged = handles[index]; forged.serial += 1;
         try t.expectError(error.Stale, running.nativeBufferStatus(forged));
         var steps: usize = 0;
@@ -2764,6 +2845,15 @@ fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverAp
                 std.mem.writeInt(u64, response[120..128], owner.bytes - 1, .little);
                 if ((op == .allocate_memory and model.is("vram_physical_reject")) or (op == .allocate_virtual and model.is("vram_virtual_reject"))) outputWord(&response, 16, 0x57);
                 if (op == .allocate_memory and model.is("vram_size")) std.mem.writeInt(u64, response[96..104], owner.bytes + 65536, .little);
+                if (private_storage and op == .allocate_memory) {
+                    const policy = owner.storage_policy.?;
+                    const attr = std.mem.readInt(u32, response[56..60], .little);
+                    try t.expect(((attr >> 27) & 3) == 2 and std.mem.readInt(u32, response[36..40], .little) == 0 and
+                        std.mem.readInt(u32, response[40..44], .little) & 0x1000 != 0 and owner.physical_extent == null);
+                    std.mem.writeInt(u64, response[112..120], (policy.physical_bytes / 4 * (index + 1)) & ~@as(u64, 65535), .little);
+                    if (model.is("vram_storage_bounds")) std.mem.writeInt(u64, response[112..120], policy.physical_bytes, .little);
+                    if (model.is("vram_storage_contiguity")) response[59] ^= 0x18;
+                }
                 if (surfaces) {
                     const attr = std.mem.readInt(u32, response[56..60], .little);
                     try t.expect(((attr >> 16) & 3) == @as(u32, if (layout == .blocklinear) 2 else 0));
@@ -2801,6 +2891,30 @@ fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverAp
             try t.expect(info.address == model.address(index) and info.logical_bytes == bytes and info.allocation_bytes == @as(u64, if (plan) |p| p.allocation_bytes else if (index == 0) full else 65536));
             if (plan) |p| try t.expect(std.meta.eql(info.surface, p));
             try t.expect(model.slots[index].published and model.slots[index].reference);
+            if (private_storage) {
+                try t.expect(info.physical.?.bytes == info.allocation_bytes and info.physical.?.base != info.address);
+                if (index == 0 and !model.is("vram_storage_no_clear")) {
+                    if (model.is("vram_storage_acquire")) {
+                        try t.expectError(error.Memory, running.retainNativeStorage(handles[0], &storage_use));
+                        try t.expect(storage_use.self_address == 0 and !model.slots[0].imported and model.slots[0].gpu.lease.id == 0);
+                    } else if (model.is("vram_storage_descriptor")) {
+                        try t.expectError(error.Descriptor, running.retainNativeStorage(handles[0], &storage_use));
+                        try t.expect(storage_use.retained and !storage_use.close(true) and model.slots[0].imported and model.slots[0].gpu.lease.id != 0);
+                        _ = target.step(); break;
+                    } else {
+                        try running.retainNativeStorage(handles[0], &storage_use);
+                        try t.expect(std.meta.eql(storage_use.info().?.physical, info.physical.?));
+                        try t.expect(!std.meta.eql(storage_use.info().?.reference.reference, info.reference.reference));
+                        var second_use: runtime.vram.storage.Use = .{};
+                        try t.expectError(error.Busy, running.retainNativeStorage(handles[0], &second_use));
+                        try t.expect(second_use.self_address == 0);
+                        var moved = storage_use; try t.expect(moved.info() == null and !moved.close(true));
+                        const saved = storage_use.source; storage_use.source.?.physical.base += 65536;
+                        try t.expect(storage_use.info() == null and !storage_use.close(true)); storage_use.source = saved;
+                        try t.expect(!storage_use.close(false) and storage_use.info() != null);
+                    }
+                }
+            } else try t.expect(info.physical == null);
             var loan = try running.channel.?.handoff(deadline);
             try running.graph.?.reclaim(&loan, deadline);
             const sent = session.tx_sequence;
@@ -2817,7 +2931,7 @@ fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverAp
         }
     }
     if (target.phase == .ready) {
-        if (success) model.slots[0].imported = true;
+        if (success and !private_storage) model.slots[0].imported = true;
         if (success) @import("gsp_buffer_test_model.zig").Model.closeHeapAdmission(table);
         try t.expectError(error.Busy, running.beginDestroyGraph(deadline, false));
         try running.beginDestroyGraph(deadline, true);
@@ -2826,7 +2940,7 @@ fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverAp
             _ = target.step();
             if (success and model.released == 1 and model.slots[0].imported) {
                 try t.expect(model.charged == full and model.slots[0].live and !model.slots[0].claimed and !model.slots[0].reference);
-                model.slots[0].imported = false;
+                if (private_storage) try t.expect(storage_use.close(true)) else model.slots[0].imported = false;
             }
             if (target.phase != .ready) break;
             const channel = running.activeChannel().?;
@@ -2846,7 +2960,8 @@ fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverAp
         }
         try t.expect(steps < 160);
     }
-    const uncertain = model.is("vram_size") or model.is("vram_ack") or model.is("vram_timeout") or model.is("vram_free") or model.is("vram_finish") or model.is("vram_surface_changed") or model.is("vram_surface_contiguity");
+    const uncertain = model.is("vram_size") or model.is("vram_ack") or model.is("vram_timeout") or model.is("vram_free") or model.is("vram_finish") or model.is("vram_surface_changed") or model.is("vram_surface_contiguity") or
+        model.is("vram_storage_bounds") or model.is("vram_storage_contiguity") or model.is("vram_storage_descriptor");
     try t.expect(target.phase == .recovering and target.failure != null);
     if (uncertain) {
         try t.expect(model.charged == full and model.slots[0].live and running.native_buffers[0].owner != null);

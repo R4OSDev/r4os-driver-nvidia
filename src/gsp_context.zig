@@ -304,8 +304,9 @@ const std = @import("std");
 const boot = @import("gsp_boot_events.zig");
 const exchange = @import("gsp_exchange.zig");
 const names = @import("gsp_rm_names.zig");
+const vram = @import("gsp_vram.zig");
 pub const wire = @import("gsp_context_wire.zig");
-pub const Error = wire.Error || names.Error || error{Retained, Busy};
+pub const Error = wire.Error || names.Error || vram.Error || error{Retained, Busy};
 pub const State = enum { creating, unwinding, ready, handed_off, destroying, closed, finished, failed };
 pub const Unavailable = enum { classes, engine };
 pub const Info = struct { binding: wire.Binding, rm_engine: u32, nv_engine: u32, engine: wire.Engine, method_bytes: u32, subcontext: u32 };
@@ -328,6 +329,7 @@ pub const Owner = struct {
     share_live: bool = false,
     child_serial: u64 = 0,
     children: [64]u64 = @splat(0),
+    methods: [2]vram.storage.Use = @splat(.{}),
     request: [wire.max_bytes]u8 = undefined,
     operation: ?wire.Operation = null,
     rejected: ?u32 = null,
@@ -373,6 +375,25 @@ pub const Owner = struct {
         };
         return error.Exhausted;
     }
+    pub fn attachMethods(self: *Owner, runqueue: u8, source: *vram.Owner) Error!void {
+        const context = self.info() orelse return error.State;
+        if (self.state != .handed_off or self.held()) return error.Busy;
+        if (runqueue >= self.methods.len or runqueue >= context.engine.count) return error.Bounds;
+        if (self.methods[runqueue].self_address != 0) return error.Busy;
+        const source_info = source.info() orelse return error.State;
+        const space = source.binding.space;
+        if (space.epoch != self.binding.epoch or space.client != self.binding.client or space.device != self.binding.device or
+            space.handle != self.binding.vaspace) return error.Stale;
+        if (source_info.logical_bytes != self.method_bytes) return error.Bounds;
+        source.retainStorage(&self.methods[runqueue]) catch |err| {
+            if (err == error.Descriptor or err == error.Retained) return self.fail(err);
+            return err;
+        };
+    }
+    pub fn methodStorage(self: *const Owner, runqueue: u8) ?vram.storage.Source {
+        if (self.info() == null or runqueue >= self.methods.len) return null;
+        return self.methods[runqueue].info();
+    }
     pub fn releaseChild(self: *Owner, child: Child, quiesced: bool) Error!void {
         try self.stable();
         if (self.state != .handed_off or child.epoch != self.binding.epoch or child.group != self.binding.group or child.serial == 0) return error.Stale;
@@ -400,6 +421,9 @@ pub const Owner = struct {
                 if (!self.share_live) break :blk .share;
                 self.state = .ready; return null;
             } else if (self.share_live) .free_share else if (self.group_live) .free_group else {
+                // GSP installs the fault-method descriptor in the group.
+                // It outlives individual channel objects and context shares.
+                for (&self.methods) |*storage| if (!storage.close(true)) return error.Retained;
                 if (self.namespace_live) { try self.exchange.session.rm_names.retireChildren(self.reservation); self.namespace_live = false; }
                 self.state = if (self.state == .unwinding) .ready else .closed; return null;
             };

@@ -283,6 +283,11 @@ pub const Owner = struct {
     pub fn releaseExecutionContextChild(self: *Owner, handle: ContextHandle, child: execution_context.Child, quiesced: bool) !void {
         try (try self.findContext(handle)).releaseChild(child, quiesced);
     }
+    pub fn attachContextMethods(self: *Owner, context: ContextHandle, runqueue: u8, buffer: BufferHandle) !void {
+        if (self.graph_closing or self.context_active != null or self.native_active != null) return error.Busy;
+        const owner = try self.findContext(context);
+        try owner.attachMethods(runqueue, try self.findNativeBuffer(buffer));
+    }
     pub fn retireExecutionContext(self: *Owner, handle: ContextHandle, deadline: u64) !void {
         const owner = try self.findContext(handle);
         if (self.context_active != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or
@@ -389,7 +394,21 @@ pub const Owner = struct {
         const caps = self.nativeMemoryCapabilities() orelse return error.State;
         return self.allocateNativePlan(try vram.surface.create(self.adapter_id, space, caps, request), deadline);
     }
+    /// Private instance/USERD/method backing: RM must guarantee initial
+    /// clearing and confirm a contiguous extent. Ordinary BOs stay opaque.
+    pub fn allocateNativeStorage(self: *Owner, bytes: u64, deadline: u64) !BufferHandle {
+        const space = (self.nativeAddressSpace() orelse return error.State).*;
+        const caps = self.nativeMemoryCapabilities() orelse return error.State;
+        const memory_summary = self.nativeMemory() orelse return error.State;
+        const policy: vram.storage.Policy = .{ .capabilities = caps, .physical_bytes = @min(memory_summary.physical_bytes, memory_summary.reported_bytes) };
+        const plan = try vram.surface.raw(self.adapter_id, space, bytes);
+        try policy.validate(space, plan.allocation_bytes);
+        return self.allocateNativePlanStorage(plan, policy, deadline);
+    }
     fn allocateNativePlan(self: *Owner, plan: vram.surface.Plan, deadline: u64) !BufferHandle {
+        return self.allocateNativePlanStorage(plan, null, deadline);
+    }
+    fn allocateNativePlanStorage(self: *Owner, plan: vram.surface.Plan, policy: ?vram.storage.Policy, deadline: u64) !BufferHandle {
         _ = try self.now();
         if (self.graph_closing or self.context_active != null or self.native_active != null or self.buffer_active != null or self.sequence.self_address != 0 or self.outputs.active()) return error.Busy;
         const space = (self.nativeAddressSpace() orelse return error.State).*;
@@ -415,7 +434,7 @@ pub const Owner = struct {
         errdefer if (heap.release(allocation.handle) == r4os.abi.driver_heap_ok) { slot.* = .{}; } else self.stop(error.Retained);
         if (result != r4os.abi.driver_heap_ok) return error.Memory;
         var token = try self.channel.?.handoff(deadline);
-        const value = vram.Owner.initPlanned(&token, &self.ctx.?, self.adapter_id, space, self.graph.?.reservation, plan, deadline) catch |err| {
+        const value = vram.Owner.initStorage(&token, &self.ctx.?, self.adapter_id, space, self.graph.?.reservation, plan, policy, deadline) catch |err| {
             self.channel = exchange.Exchange.init(&token, deadline) catch |restore| { self.stop(restore); return restore; };
             return err;
         };
@@ -433,6 +452,10 @@ pub const Owner = struct {
     pub fn nativeBufferStatus(self: *Owner, handle: BufferHandle) !NativeBufferStatus {
         const owner = try self.findNativeBuffer(handle);
         return .{ .state = owner.state, .info = owner.info(), .rejected = owner.rejected, .host_rejected = owner.host_rejected };
+    }
+    pub fn retainNativeStorage(self: *Owner, handle: BufferHandle, use: *vram.storage.Use) !void {
+        if (self.graph_closing) return error.Busy;
+        try (try self.findNativeBuffer(handle)).retainStorage(use);
     }
     pub fn releaseNativeBuffer(self: *Owner, handle: BufferHandle) !void {
         const owner = try self.findNativeBuffer(handle);

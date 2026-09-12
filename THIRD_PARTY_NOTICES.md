@@ -1,5 +1,14 @@
 ﻿# Third-Party Notices
 
+Private native storage (NVIDIA 0.1.74, 2026-09-12):
+Contiguous allocation attributes, the initial-clearing capability and the
+group-owned method-buffer lifetime follow pinned570.144 MIT sources.
+Five full sources/notices and a six-pair original-C wire comparison are
+archived under0.79.11/channel-backing-20260912. Full notices are preserved
+in gsp_native_backing.zig and the identical embedded/image runtime license.
+No new upstream implementation is linked; R4OS BO/runtime ownership is
+original Apache-2.0 code.
+
 RM execution contexts (NVIDIA 0.1.73, 2026-09-12):
 Engine/class discovery, group/share allocation and engine ID conversion
 follow pinned570.144 MIT SDK and RM sources. Complete notices remain in
