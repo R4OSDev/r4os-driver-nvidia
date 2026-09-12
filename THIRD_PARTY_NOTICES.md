@@ -1,5 +1,15 @@
 ﻿# Third-Party Notices
 
+Coupled WIMM position (NVIDIA 0.1.86, 2026-09-12):
+The C67B class, point/update fields and WINIM retirement definitions follow
+MIT NVIDIA570.144 and OpenGpuDoc GA102. Nouveau wimmc37b, wndwc37e,
+gv100 and r535/disp provide the channel/interlock reference. Complete
+original sources, notices and C fixtures are archived under
+0.79.13/window-position-20260912. The affected source notices and unchanged
+352032-byte runtime/distribution license retain the applicable complete
+NVIDIA 2020/2021 and Red Hat 2018/2023 MIT notices. Original R4OS policy and
+ownership code is Apache-2.0; reference C generators are host-only.
+
 Boot Head/SOR programming (NVIDIA 0.1.85, 2026-09-12):
 The C67D raster, clock, output and colour fields follow the pinned MIT
 NVIDIA 570.144 class header and nvkms-evo3.c, with Nouveau headc57d,

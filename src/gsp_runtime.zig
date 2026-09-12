@@ -52,16 +52,24 @@ pub const display_resources = @import("gsp_display_resources.zig");
 pub const display_upload = @import("gsp_display_upload.zig");
 const DisplayResourcesSlot = struct { owner: ?*display_resources.Owner = null, allocation: r4os.abi.DriverHeapAllocation = .{}, heap: ?r4os.r4dev.DriverHeapContext = null };
 pub const DisplayTableStatus = struct { entries: u32, revision: u64, published_revision: u64, uploading: bool };
+pub const DisplayPhase = enum { prepare, rewind, submitted, complete };
 pub const DisplaySubmission = struct {
     handle: DisplayChannelHandle,
     notifier: *display_resources.notifier.Owner,
     config: display_channel.push.commands.Config,
-    phase: enum { prepare, rewind, submitted, complete } = .prepare,
+    phase: DisplayPhase = .prepare,
     ticket: ?display_channel.push.Ticket = null,
 };
+pub const PositionSubmission = struct {
+    handle: DisplayChannelHandle,
+    config: display_channel.push.commands.Config,
+    phase: DisplayPhase = .prepare,
+    ticket: ?display_channel.push.Ticket = null,
+};
+pub const DisplayPosition = struct { handle: DisplayChannelHandle, point: display_channel.push.commands.Point, sequence: u64 };
 pub const boot_mode = @import("gsp_boot_mode.zig");
-pub const DisplayWork = struct { core: DisplaySubmission, window: ?DisplaySubmission = null, deadline: u64, boot_mode: ?boot_mode.Plan = null };
-pub const ActiveDisplayImage = struct { image: display_resources.image.Image, head: u32, core_point: u64, window_point: u64, boot_mode: ?boot_mode.Plan = null };
+pub const DisplayWork = struct { core: DisplaySubmission, window: ?DisplaySubmission = null, position: ?PositionSubmission = null, deadline: u64, boot_mode: ?boot_mode.Plan = null };
+pub const ActiveDisplayImage = struct { image: display_resources.image.Image, head: u32, core_point: u64, window_point: u64, boot_mode: ?boot_mode.Plan = null, position: ?DisplayPosition = null };
 const subscriptions = @import("gsp_event_objects.zig");
 const outputs = @import("gsp_outputs.zig");
 const inventory = @import("gsp_memory_inventory.zig");
@@ -150,7 +158,7 @@ pub const Owner = struct {
     display_object: ?display.Object = null,
     display_engine_owner: ?display_engine.Owner = null,
     display_engine_active: bool = false,
-    display_channels: [9]?display_channel.Owner = @splat(null),
+    display_channels: [17]?display_channel.Owner = @splat(null),
     display_channel_active: ?u8 = null,
     display_resources_slot: DisplayResourcesSlot = .{},
     display_upload_job: ?struct { operation: display_upload.Upload = .{}, channel_handle: ChannelHandle } = null,
@@ -279,6 +287,8 @@ pub const Owner = struct {
             .{@errorName(err),work.core.handle.handle,@tagName(work.core.phase),if(work.core.ticket)|ticket|ticket.point else 0,if(work.core.notifier.result)|result|result.word else 0});
         if (self.display_work) |*work| if (work.window) |*window| self.log("NVIDIA gsp-display-image: failed={s} window={d} phase={s} point={d} image={x} storage=retained",
             .{@errorName(err),window.config.route.?.window,@tagName(window.phase),if(window.ticket)|ticket|ticket.point else 0,window.config.scanout.?.dma});
+        if (self.display_work) |*work| if (work.position) |*position| self.log("NVIDIA gsp-display-position: failed={s} channel={x} phase={s} point={d} storage=retained",
+            .{@errorName(err),position.handle.handle,@tagName(position.phase),if(position.ticket)|ticket|ticket.point else 0});
         if (self.initial_image) |*work| self.log("NVIDIA gsp-initial-image: failed={s} submitted={} point={d} source-held={} storage=retained",
             .{@errorName(err),work.operation.submitted,if(work.operation.ticket)|ticket|ticket.point else 0,work.operation.gpu.lease.id != 0});
     }
@@ -479,9 +489,13 @@ pub const Owner = struct {
             self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         const slot = try display_channel.wire.slot(kind, index);
         if (self.display_channels[slot] != null) return error.Busy;
-        if (kind == .window) {
+        if (kind != .core) {
             const core_channel = if (self.display_channels[0]) |*value| value else return error.State;
             if (core_channel.info() == null) return error.State;
+        }
+        if (kind == .immediate) {
+            const window_channel = if (self.display_channels[1 + index]) |*value| value else return error.State;
+            if (window_channel.info() == null or window_channel.parent != parent) return error.State;
         }
         try self.channel.?.guard(deadline);
         var token = try self.channel.?.handoff(deadline);
@@ -520,6 +534,7 @@ pub const Owner = struct {
     /// Live-table replacement needs a later independent display-quiescence
     /// protocol; an idle RM exchange or a CE completion alone is insufficient.
     pub fn bindDisplayStorage(self: *Owner, handle: DisplayEngineHandle, kind: display_channel.wire.Kind, index: u32, source: BufferHandle) !u32 {
+        if (kind == .immediate) return error.Unsupported; // WIMM has no RAMHT DMA contexts.
         const parent = try self.idleDisplayTable(handle);
         const config = parent.info() orelse return error.State;
         const slot = try display_channel.wire.slot(kind, index);
@@ -532,6 +547,7 @@ pub const Owner = struct {
         };
     }
     pub fn createDisplayNotifier(self: *Owner, handle: DisplayEngineHandle, kind: display_channel.wire.Kind, index: u32) !u32 {
+        if (kind == .immediate) return error.Unsupported; // Completion belongs to the coupled Window/Core.
         const parent = try self.idleDisplayTable(handle);
         const config = parent.info() orelse return error.State;
         const slot = try display_channel.wire.slot(kind, index);
@@ -642,9 +658,8 @@ pub const Owner = struct {
         const snapshot = self.outputs.snapshot() orelse return error.Busy;
         return boot_mode.bind(plan, snapshot, self.epoch, saved.boot.held_generation);
     }
-    /// The same Window/Core transaction now carries the exact boot signal.
-    /// Completion still needs both actual notifiers. WIMM position and common
-    /// native adoption are independent prerequisites of the product caller.
+    /// Carry the exact boot signal and primary position in one interlocked
+    /// WIMM/Window/Core transaction. Common native adoption follows separately.
     pub fn commitBootDisplayImage(self: *Owner, core_handle: DisplayChannelHandle, window_handle: DisplayChannelHandle, image_handle: u32, deadline: u64) !void {
         const core = try self.findDisplayChannel(core_handle);
         const window = try self.findDisplayChannel(window_handle);
@@ -654,9 +669,32 @@ pub const Owner = struct {
         const resources = self.display_resources_slot.owner orelse return error.State;
         const image = resources.publishedImage(window_handle.slot, image_handle) orelse return error.State;
         if (image.width != plan.width or image.height != plan.height) return error.Descriptor;
-        try self.commitDisplayImage(core_handle, window_handle, image_handle, plan.head, deadline);
+        const slot = try display_channel.wire.slot(.immediate, window.config.index);
+        const position = if (self.display_channels[slot]) |*value| value else return error.Unsupported;
+        try self.commitPositionedDisplayImage(core_handle, window_handle,
+            .{ .epoch = self.epoch, .handle = position.config.handle, .slot = @intCast(slot) }, image_handle, plan.head, .{}, deadline);
         self.display_work.?.core.config.signal = plan.signal;
         self.display_work.?.boot_mode = plan;
+    }
+    pub fn commitPositionedDisplayImage(self: *Owner, core_handle: DisplayChannelHandle, window_handle: DisplayChannelHandle,
+        immediate_handle: DisplayChannelHandle, image_handle: u32, head: u32, point: display_channel.push.commands.Point, deadline: u64) !void
+    {
+        const window = try self.findDisplayChannel(window_handle);
+        const owner = try self.findDisplayChannel(immediate_handle);
+        const value = owner.info() orelse return error.State;
+        const root = owner.parent.info() orelse return error.State;
+        if (!root.immediate or value.config.kind != .immediate or window.config.kind != .window or owner.parent != window.parent or
+            value.config.index != window.config.index or immediate_handle.slot != 9 + window.config.index) return error.Unsupported;
+        if (self.copyBusy()) return error.Busy;
+        if (owner.ring.self_address == 0) owner.ring.open(&owner.backing, value.config, 0) catch |err| {
+            if (err == error.Descriptor or err == error.Retained) self.stop(err); return err;
+        };
+        if (!owner.ring.valid() or owner.ring.pending != null or owner.ring.issued != owner.ring.completed) return error.Busy;
+        try self.commitDisplayImage(core_handle, window_handle, image_handle, head, deadline);
+        const work = &self.display_work.?;
+        work.window.?.config.with_position = true;
+        work.position = .{ .handle = immediate_handle, .config = .{ .kind = .immediate, .notifier = 0, .windows = root.hardware.windows,
+            .initialize = !owner.ring.initialized, .route = work.window.?.config.route, .position = point } };
     }
     pub fn commitDisplayImage(self: *Owner, core_handle: DisplayChannelHandle, window_handle: DisplayChannelHandle, image_handle: u32, head: u32, deadline: u64) !void {
         if (self.presentation) |entry| {
@@ -1198,6 +1236,8 @@ pub const Owner = struct {
     }
     fn advanceDisplay(self: *Owner, current: u64) !bool {
         const work = if (self.display_work) |*value| value else return false;
+        if (work.position) |*position| if (position.phase == .prepare or position.phase == .rewind)
+            return self.advanceDisplayPosition(position, work.deadline, current);
         if (work.window) |*window| {
             // Submit both interlocked channels before waiting for either.
             // Waiting for Window BEGUN first would deadlock the core UPDATE.
@@ -1211,21 +1251,56 @@ pub const Owner = struct {
             if (window.phase != .complete) return progressed;
         }
         if (work.core.phase != .complete) return progressed;
+        if (work.position) |*position| {
+            progressed = try self.advanceDisplayPosition(position, work.deadline, current) or progressed;
+            if (position.phase != .complete) return progressed;
+        }
         if (work.window) |window| {
             const route = window.config.route.?;
             var mode = work.boot_mode;
+            var position: ?DisplayPosition = if (work.position) |value| .{ .handle = value.handle,
+                .point = value.config.position.?, .sequence = value.ticket.?.point } else null;
             if (mode) |plan| {
                 const core = try self.findDisplayChannel(work.core.handle);
                 const expected = try self.bootDisplayPlan(.{ .epoch = self.epoch, .root = core.parent.binding.root }, route.window);
                 if (!std.meta.eql(plan, expected) or !std.meta.eql(work.core.config.signal, @as(?boot_mode.Signal, expected.signal))) return error.Stale;
             } else if (self.display_images[route.window]) |prior| {
-                if (prior.head == route.head and prior.image.width == window.config.scanout.?.width and prior.image.height == window.config.scanout.?.height)
+                if (prior.head == route.head and prior.image.width == window.config.scanout.?.width and prior.image.height == window.config.scanout.?.height) {
                     mode = prior.boot_mode;
+                    if (position == null) position = prior.position;
+                }
             }
             self.display_images[route.window] = .{ .image = window.config.scanout.?, .head = route.head,
-                .core_point = work.core.ticket.?.point, .window_point = window.ticket.?.point, .boot_mode = mode };
+                .core_point = work.core.ticket.?.point, .window_point = window.ticket.?.point, .boot_mode = mode, .position = position };
         }
         self.display_work = null; return true;
+    }
+    fn advanceDisplayPosition(self: *Owner, work: *PositionSubmission, deadline: u64, current: u64) !bool {
+        if (work.phase == .complete) return false;
+        if (current >= deadline) return error.Timeout;
+        const owner = try self.findDisplayChannel(work.handle);
+        if (owner.info() == null or !owner.ring.valid() or owner.config.kind != .immediate) return error.Stale;
+        if (self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return false;
+        const cursors = (try self.device.?.readDisplayCursor(owner, deadline)) orelse return false;
+        if (cursors.put != owner.ring.put) return error.Completion;
+        if (work.phase == .submitted) {
+            // No WIMM notifier exists. Both interlocked Window/Core notifiers
+            // must have completed before observing GET and retiring this point.
+            const pair = &self.display_work.?;
+            if (pair.window == null or pair.core.phase != .complete or pair.window.?.phase != .complete) return error.State;
+            if (cursors.get != work.ticket.?.put) return false;
+            try owner.ring.finish(work.ticket.?.point); work.phase = .complete; return true;
+        }
+        if (work.phase == .rewind) {
+            if (!try owner.ring.rewound(cursors.get)) return false;
+            work.phase = .prepare; work.ticket = null; return true;
+        }
+        work.ticket = owner.ring.prepare(cursors.get, work.config) catch |err| {
+            if (err == error.Busy) return false; return err;
+        };
+        try self.device.?.submitDisplay(owner, work.ticket.?, work.config, deadline);
+        work.phase = if (work.ticket.?.kind == .rewind) .rewind else .submitted;
+        return true;
     }
     fn advanceDisplaySubmission(self: *Owner, work: *DisplaySubmission, deadline: u64, current: u64) !bool {
         if (work.phase == .complete) return false;

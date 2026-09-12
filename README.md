@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.85; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.86; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -12,23 +12,23 @@ Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
 
-Native display preparation (NVIDIA 0.1.85):
-The Device runtime owns RGB scanout storage, RAMHT, paired Window/Core,
-initial CE upload and common Present copies. An initial SYS semaphore
-completion permits activation; later frames reuse the real source mapping.
+Native display preparation (NVIDIA 0.1.86):
+The Device runtime owns RGB scanout buffers, RAMHT, initial CE upload and
+common Present copies. The saved RGB8 TMDS timing binds to the actual RM
+route and held generation; no replacement mode is inferred from missing EDID.
 
-The boot-signal planner now binds the saved progressive RGB8 TMDS timing
-to an actual coherent RM route and held Device generation. Coupled commit
-sets Head raster/viewports/min-frame-idle, exact clock including 1000/1001,
-displayId, identity colour state and SOR. Old cursor/LUT DMA handles are
-disabled. Device admission and paired completion revalidate the plan.
-An off receiver without EDID supplies no invented replacement mode.
+The boot image commit now requires the acknowledged C67B WIMM class and
+sets position (0,0) through a coupled WIMM/Window/Core transaction. Hardware
+channel 33 is distinct from software slot 9. Core FINISHED, Window BEGUN and
+the final WIMM GET/PUT observation jointly publish the internal image state.
+GET alone cannot complete it. Late timeout/fault retains dependencies;
+WIMM must physically retire before its Window and Core.
 
-All 51 existing tests, the independent 512-byte original-header C vector and
-the module build pass. Product prepare_held/transition wiring, WIMM position,
-complete link state, atomic mode changes and rollback remain open in 0.79.13.
-These internal APIs are not automatically invoked; passive bootfb remains
-default. Evidence: GrafikScanout07913.json; physical checks: OssiGPU.txt.
+All 51 existing tests, original-header C vectors and the module build pass.
+Product prepare_held/transition wiring, complete HDMI link state, atomic
+mode changes, confirmation and rollback remain open in 0.79.13. These internal
+APIs are not automatically invoked; passive bootfb remains the default.
+Evidence: GrafikScanout07913.json; physical checks: OssiGPU.txt.
 
 Fault diagnosis and quarantine (NVIDIA 0.1.77):
 Roadmap 0.79.11 is software complete, including its combined targeted

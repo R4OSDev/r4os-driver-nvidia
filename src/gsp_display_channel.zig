@@ -73,7 +73,7 @@
 //  * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 //  * OTHER DEALINGS IN THE SOFTWARE.
 //  */
-//! Retained native core/window DMA channel. Worker-owned, one RPC at a time.
+//! Retained native core/window/WIMM DMA channel. Worker-owned, one RPC at a time.
 const std = @import("std");
 const r4os = @import("r4os");
 const boot = @import("gsp_boot_events.zig");
@@ -122,6 +122,8 @@ pub const Owner = struct {
         if (parent.state != .handed_off or token.session != parent.exchange.session or token.claimed or adapter == 0 or !root.instance_bound or
             parent.instance_storage.info() == null or parent.children[parent_slot] != 0) return error.State;
         if ((kind == .core and !root.core) or (kind == .window and (!root.window or parent.children[0] == 0 or root.hardware.windows & (@as(u32, 1) << @intCast(index)) == 0))) return error.Unsupported;
+        if (kind == .immediate and (!root.immediate or !root.window or parent.children[0] == 0 or parent.children[1 + index] == 0 or
+            root.hardware.windows & (@as(u32, 1) << @intCast(index)) == 0)) return error.Unsupported;
         try token.session.guard(deadline);
         const reservation = try token.session.rm_names.reserveChildren(parent.reservation.parent, 1);
         errdefer token.session.rm_names.retireChildren(reservation) catch {};
@@ -228,6 +230,7 @@ pub const Owner = struct {
         // Core Free may purge satellites across RM clients. Our windows must
         // retire first, even if a caller claims that the GPU is quiescent.
         if (self.config.kind == .core) for (self.parent.children[1..]) |child| if (child != 0) return error.Retained;
+        if (self.config.kind == .window and self.parent.children[9 + self.config.index] != 0) return error.Retained;
         self.exchange = try exchange.Exchange.init(token, deadline); self.deadline = deadline; self.state = .destroying;
     }
     pub fn handoff(self: *Owner) Error!boot.Handoff {

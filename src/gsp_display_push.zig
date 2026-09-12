@@ -202,7 +202,8 @@ pub const Ring = struct {
     }
 };
 pub fn userBase(kind: channel_wire.Kind, index: u32) Error!u32 {
-    return switch (kind) { .core => if (index == 0) 0x680000 else error.Bounds, .window => if (index < 8) 0x690000 + index * 4096 else error.Bounds };
+    _ = try channel_wire.slot(kind, index);
+    return switch (kind) { .core => 0x680000, .window => 0x690000 + index * 4096, .immediate => 0x6b0000 + index * 4096 };
 }
 pub fn cursor(raw: u32) Error!u16 {
     if (raw & ~@as(u32, 0xffc) != 0) return error.Completion;

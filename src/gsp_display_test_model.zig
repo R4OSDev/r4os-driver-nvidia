@@ -5,7 +5,7 @@ const a = @import("r4os").abi;
 pub const Model = struct {
     const Slot = struct { data: [4096]u8 align(4096) = undefined, active: bool = false, cpu: bool = false, synced: bool = false,
         descriptor: a.GfxBufferDescriptor = .{}, dma: a.GfxDeviceLease = .{}, hardware: bool = false, control: u32 = 0, state: u32 = 0 };
-    pub var slots: [4]Slot = @splat(.{});
+    pub var slots: [5]Slot = @splat(.{});
     var original: a.GfxDriverMemoryApi = .{};
     var scenario: []const u8 = "";
     pub var released: usize = 0;

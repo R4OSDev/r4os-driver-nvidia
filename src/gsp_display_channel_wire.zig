@@ -23,6 +23,7 @@
 //  */
 //
 // ExFiles/Reference/GFX/Nvidia/OpenKernelModules-570.144/src/common/sdk/nvidia/inc/class/clc67d.h
+// ExFiles/Reference/GFX/Nvidia/OpenKernelModules-570.144/src/common/sdk/nvidia/inc/class/clc67b.h
 // /*
 //  * SPDX-FileCopyrightText: Copyright (c) 2020 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //  * SPDX-License-Identifier: MIT
@@ -165,20 +166,20 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
-//! GA106/C67D/C67E physical display DMA channels, NVIDIA570.144 protocol.
+//! GA106/C67D/C67E/C67B physical display DMA channels, NVIDIA570.144 protocol.
 const std = @import("std");
 const root = @import("gsp_display_engine_wire.zig");
 const exchange = @import("gsp_exchange.zig");
 pub const Error = root.Error;
-pub const Kind = enum { core, window };
+pub const Kind = enum { core, window, immediate };
 pub const Operation = enum { pushbuffer, allocate, free };
 pub const Config = struct { root: root.Binding, kind: Kind, index: u32, handle: u32, physical: u64 };
 pub const max_bytes = 80;
 pub const Reply = union(enum) { ok: void, rejected: u32 };
-pub fn class(kind: Kind) u32 { return if (kind == .core) 0xc67d else 0xc67e; }
-pub fn slot(kind: Kind, index: u32) Error!usize {
+pub fn class(kind: Kind) u32 { return switch (kind) { .core => 0xc67d, .window => 0xc67e, .immediate => 0xc67b }; }
+pub fn slot(kind: Kind, index: u32) error{Bounds}!usize {
     if ((kind == .core and index != 0) or index >= 8) return error.Bounds;
-    return if (kind == .core) 0 else 1 + index;
+    return switch (kind) { .core => 0, .window => 1 + index, .immediate => 9 + index };
 }
 pub fn validate(config: Config) Error!void {
     try root.validate(config.root); _ = try slot(config.kind, config.index);
@@ -230,11 +231,19 @@ pub fn decode(config: Config, op: Operation, request: []const u8, record: exchan
     }
     return .{ .ok = {} };
 }
-pub fn controlRegister(kind: Kind, index: u32) Error!u32 { return 0x6104e0 + @as(u32, @intCast(try slot(kind, index))) * 4; }
-pub fn statusRegister(kind: Kind, index: u32) Error!u32 { _ = try slot(kind, index); return if (kind == .core) 0x610630 else 0x610664 + index * 4; }
+pub fn controlRegister(kind: Kind, index: u32) Error!u32 {
+    _ = try slot(kind, index);
+    // Hardware WIMM channels start at33; the compact software slot is9.
+    return 0x6104e0 + 4 * switch (kind) { .core => @as(u32, 0), .window => 1 + index, .immediate => 33 + index };
+}
+pub fn statusRegister(kind: Kind, index: u32) Error!u32 {
+    _ = try slot(kind, index);
+    return switch (kind) { .core => 0x610630, .window => 0x610664 + index * 4, .immediate => 0x6106e4 + index * 4 };
+}
 pub fn retired(kind: Kind, control: u32, status: u32) bool {
     // DEALLOC, empty method FIFO, no pending reads/notification writes and
     // idle stages. IDLE while still allocated/connected is insufficient.
     const state_mask: u32 = if (kind == .core) 0x001f0000 else 0x000f0000;
-    return control != 0xffffffff and status != 0xffffffff and control & 0x13 == 0 and status & (state_mask | 0x8e0000ff) == 0;
+    const mp_mask: u32 = if (kind == .immediate) 0x0f else 0xff;
+    return control != 0xffffffff and status != 0xffffffff and control & 0x13 == 0 and status & (state_mask | 0x8e000000 | mp_mask) == 0;
 }

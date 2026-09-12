@@ -25,6 +25,32 @@ pub fn check() !void {
     try t.expectError(error.Completion, push.cursor(0xffffffff));
     try checkImages();
     try checkBootMode();
+    try checkPosition();
+}
+fn checkPosition() !void {
+    const vectors = @embedFile("fixtures/display-position.bin");
+    try t.expect(vectors.len == 124 and std.mem.readInt(u32, vectors[0..4], .little) == 4);
+    var at: usize = 4;
+    for (0..4) |_| {
+        const config: commands.Config = .{ .kind = .immediate, .notifier = 0, .windows = 9, .initialize = true,
+            .route = .{ .head = 1, .window = 3 }, .position = .{
+                .x = @intCast(std.mem.readInt(i32, vectors[at..][0..4], .little)),
+                .y = @intCast(std.mem.readInt(i32, vectors[at + 4..][0..4], .little)) } };
+        at += 8;
+        const result = try commands.encode(config);
+        try t.expectEqual(@as(u16, 5), result.count);
+        for (result.words[0..result.count]) |value| { try t.expectEqual(std.mem.readInt(u32, vectors[at..][0..4], .little), value); at += 4; }
+        var invalid = config; invalid.notifier = 1; try t.expectError(error.Descriptor, commands.encode(invalid));
+        invalid = config; invalid.position = null; try t.expectError(error.Descriptor, commands.encode(invalid));
+        invalid = config; invalid.route.?.window = 2; try t.expectError(error.Bounds, commands.encode(invalid));
+    }
+    const image: commands.image.Image = .{ .dma = 123, .channel = 4, .width = 65, .height = 20, .pitch = 512,
+        .format = 0x34325258, .bytes = 10240, .offset = 0 };
+    const result = try commands.window(.{ .kind = .window, .notifier = 12, .windows = 9, .initialize = false,
+        .scanout = image, .route = .{ .window = 3, .head = 1 }, .with_position = true });
+    for (result.words[result.count - 2..result.count]) |value| { try t.expectEqual(std.mem.readInt(u32, vectors[at..][0..4], .little), value); at += 4; }
+    try t.expectEqual(vectors.len, at);
+    try t.expectEqual(@as(u32, 0x6b3000), try push.userBase(.immediate, 3));
 }
 pub fn bootFixture(width: u32, height: u32) @import("boot_scanout.zig").Raw {
     var raw: @import("boot_scanout.zig").Raw = .{ .capabilities = 0x0802, .window_mask = 255, .counts = 0x800402 };
