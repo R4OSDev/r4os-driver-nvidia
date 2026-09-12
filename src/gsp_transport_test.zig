@@ -1571,30 +1571,65 @@ fn graphOperation(model: *Model, owner: *rm_graph.Owner, status: u32) !void {
             put(&reply, if (encoded.function == 103) 16 else 12, status);
             try model.replyRpc(child.exchange.session, .{ .function = encoded.function, .result = 0 }, encoded.bytes);
         },
+        .vaspace_creating, .vaspace_destroying => {
+            const child = &owner.address_space.?;
+            if (child.outstanding == null) return;
+            var reply: [80]u8 = undefined;
+            const encoded = try objects.encode(&child.plan, child.outstanding.?, &reply);
+            put(&reply, if (encoded.function == 103) 16 else 12, status);
+            if (encoded.function == 103 and status == 0) {
+                std.mem.writeInt(u64, reply[40..48], 0x100000000, .little);
+                std.mem.writeInt(u64, reply[72..80], 0x200000, .little);
+            }
+            try model.replyRpc(child.exchange.session, .{ .function = encoded.function, .result = 0 }, encoded.bytes);
+        },
         .closed => return,
         else => return error.InvalidGraphProgress,
     }
     try t.expect((try owner.poll()) == null);
 }
 fn graphCreate(model: *Model, owner: *rm_graph.Owner) !void {
-    for (0..13) |_| {
+    for (0..16) |_| {
         if (owner.state == .ready) break;
         try graphOperation(model, owner, 0);
     }
     try t.expect(owner.state == .ready and owner.base.state == .loaned and owner.subscriptions.?.state == .ready);
     try t.expect(owner.i2c.?.live and owner.i2c.?.state == .handed_off);
+    const info = owner.address_space.?.info orelse return error.MissingAddressSpace;
+    try t.expect(owner.address_space.?.state == .handed_off and info.base == 0x200000 and info.bytes == 0x100000000);
 }
 fn graphDestroy(model: *Model, owner: *rm_graph.Owner) !boot_events.Handoff {
     try owner.beginDestroy(deadline);
-    for (0..13) |_| {
+    for (0..16) |_| {
         if (owner.state == .closed) break;
         try graphOperation(model, owner, 0);
     }
     try t.expect(owner.state == .closed and owner.base.state == .objects_closed);
     try t.expect(!owner.i2c.?.live and owner.i2c.?.state == .finished);
+    try t.expect(owner.address_space.?.info == null and owner.address_space.?.state == .finished);
     return owner.finish(deadline);
 }
 fn checkRmGraph(model: *Model) !void {
+    {
+        const vaspace = @import("gsp_vaspace.zig");
+        const golden = @embedFile("fixtures/vaspace-570.144.bin");
+        const plan = try objects.Plan.init(7, .{ .client = 0xc1d00000, .device = 0x10000000,
+            .subdevice = 0x10000001, .display = 0x10000002, .i2c = 0x10000005, .vaspace = 0x10000006 }, 0xffffffff, "");
+        var request: [80]u8 = undefined;
+        const encoded = try objects.encode(&plan, .{ .allocate = .vaspace }, &request);
+        try t.expect(encoded.function == 103 and encoded.bytes.len == 80);
+        try t.expectEqualSlices(u8, golden[0..80], encoded.bytes);
+        const info = try vaspace.decodeInfo(&plan, golden[80..160]);
+        try t.expect(info.base == 0x200000 and info.bytes == 0x100000000 and info.base + info.bytes == 0x100200000);
+        try t.expect(info.handle == plan.handles.vaspace and info.big_page_bytes == 65536);
+        try t.expectError(error.Payload, vaspace.decodeInfo(&plan, golden[80..112]));
+        var response: [80]u8 = golden[80..160].*;
+        put(&response, 36, 8); // External ownership was never requested.
+        try t.expectError(error.Payload, vaspace.decodeInfo(&plan, &response));
+        response = golden[80..160].*;
+        std.mem.writeInt(u64, response[72..80], std.math.maxInt(u64) - 4095, .little);
+        try t.expectError(error.Bounds, vaspace.decodeInfo(&plan, &response));
+    }
     // Bounded bookkeeping capacity is separate from consumed wire IDs.
     var ledger = try rm_names.Ledger.init(7);
     var leases: [rm_names.max_clients]rm_names.Lease = undefined;

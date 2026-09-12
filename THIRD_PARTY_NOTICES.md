@@ -631,3 +631,12 @@ semantics and mem_mgr_gsp_client.c reserved-region policy at the pinned
 and already included in NVIDIA-GSP-RUNTIME-LICENSE.txt, unchanged in the
 module and Distribution. Four complete verified originals are archived
 under 0.79.11/memory-20260912. R4OS interval/lifetime code: Apache-2.0.
+
+RM-owned address space (NVIDIA 0.1.66, 2026-09-12):
+gsp_vaspace.zig and gsp_objects.zig retain the original MIT nvos.h,
+cl90f1.h and vaspace_api.c notices. The new full notices extend the
+unchanged129,329-byte runtime license prefix to131,939 bytes, embedded
+and staged identically. The pinned constructor defines returned vaSize
+as a byte length; the contradictory header comment is not implemented.
+Twenty-one complete verified originals, original C ABI/fixture and logs
+are archived under0.79.11/vaspace-20260912. R4OS owner code:Apache-2.0.

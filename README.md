@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.65; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.66; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -11,6 +11,18 @@ Starting with R4OS 0.79.9, `IMAGE_SCOPE=slim` includes the current module in
 Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
+
+RM-owned address space (NVIDIA 0.1.66, roadmap 0.79.11):
+The actual graph creates a private FERMI_VASPACE_A child through its one
+queue, with default base/size and explicit64-KB big pages. The full success
+reply supplies a checked base and BYTE LENGTH, following the pinned570.144
+constructor rather than the contradictory nvos.h end-address comment.
+Only ACKed metadata becomes visible. RM rejection preserves receivers;
+uncertain results retain names/backing. Reverse teardown frees events,
+VASpace, I2C and base objects; a failed child free retains its parents.
+All51 existing groups, original C wire comparison and module build pass.
+GPU buffer mappings, channels and visibility remain open software work.
+Evidence: Docs/Drivers/GrafikSpeicher07911.txt/.json.
 
 Memory inventory (NVIDIA 0.1.65, roadmap 0.79.11 T1):
 The actual static-RPC owner now binds firmware regions to retained boot,

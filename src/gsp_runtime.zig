@@ -182,6 +182,13 @@ pub const Owner = struct {
         _ = self.now() catch return null;
         return self.memory_inventory.snapshot();
     }
+    pub fn nativeAddressSpace(self: *Owner) ?*const @import("gsp_vaspace.zig").Info {
+        _ = self.now() catch return null;
+        if (self.nativeObject() == null) return null;
+        const owner = if (self.graph.?.address_space) |*value| value else return null;
+        if (owner.self_address != @intFromPtr(owner) or owner.state != .handed_off or owner.exchange.session.state != .active) return null;
+        return if (owner.info) |*info| info else null;
+    }
     pub fn takeDisplayChanges(self: *Owner) !subscriptions.Changes {
         const current = try self.now();
         if (self.nativeObject() == null) return error.State;
@@ -273,6 +280,10 @@ pub const Owner = struct {
                     self.display_object = loan.object;
                     self.log("NVIDIA gsp-rm: objects=ready client={x} device={x} subdevice={x} display={x} events=HPD,DP native-output=unavailable",
                         .{graph.base.plan.handles.client, graph.base.plan.handles.device, graph.base.plan.handles.subdevice, loan.object.display});
+                    if (self.nativeAddressSpace()) |info|
+                        self.log("NVIDIA gsp-vaspace: handle={x} base={x} bytes={x} big-page={d} page-tables=RM buffer-mappings=none",
+                            .{info.handle, info.base, info.bytes, info.big_page_bytes})
+                    else self.log("NVIDIA gsp-vaspace: unavailable rm={?} receiver-inventory=available", .{graph.address_space.?.rejected});
                     return .progress;
                 },
                 .rejected => {
@@ -296,7 +307,7 @@ pub const Owner = struct {
                     self.channel = try exchange.Exchange.init(&token, graph.deadline);
                     return error.RmRejected; // Object frees do not stop GPU DMA.
                 },
-                .base_creating, .i2c_creating, .events_creating, .events_destroying, .i2c_destroying, .base_destroying => {
+                .base_creating, .i2c_creating, .vaspace_creating, .events_creating, .events_destroying, .vaspace_destroying, .i2c_destroying, .base_destroying => {
                     if (try graph.poll()) |dispatch| {
                         try self.notification(self.activeChannel() orelse return error.State, dispatch, current);
                         return .progress;

@@ -9,13 +9,15 @@ const runtime_events = @import("gsp_runtime_events.zig");
 const exchange = @import("gsp_exchange.zig");
 const names = @import("gsp_rm_names.zig");
 const i2c_object = @import("gsp_i2c_object.zig");
+const vaspace = @import("gsp_vaspace.zig");
 pub const Error = exchange.Error || names.Error;
-pub const State = enum { base_creating, i2c_creating, events_creating, ready, loaned, rejected, events_destroying, i2c_destroying, base_destroying, closed, finished, failed };
+pub const State = enum { base_creating, i2c_creating, vaspace_creating, events_creating, ready, loaned, rejected, events_destroying, vaspace_destroying, i2c_destroying, base_destroying, closed, finished, failed };
 pub const Owner = struct {
     reservation: names.Lease,
     base: objects.Owner,
     subscriptions: ?events.Owner = null,
     i2c: ?i2c_object.Owner = null,
+    address_space: ?vaspace.Owner = null,
     state: State = .base_creating,
     self_address: usize = 0,
     failure: ?Error = null,
@@ -28,7 +30,7 @@ pub const Owner = struct {
         try runtime.session.guard(deadline);
         // Reject bad caller inputs before consuming any names or queue token.
         if (process_name.len >= 100 or std.mem.indexOfScalar(u8, process_name, 0) != null) return error.Payload;
-        const reservation = try runtime.session.rm_names.reserve(6);
+        const reservation = try runtime.session.rm_names.reserve(7);
         errdefer runtime.session.rm_names.retire(reservation) catch {};
         const plan = try objects.Plan.init(runtime.session.epoch, .{
             .client = reservation.client,
@@ -36,6 +38,7 @@ pub const Owner = struct {
             .subdevice = try reservation.object(1),
             .display = try reservation.object(2),
             .i2c = try reservation.object(5),
+            .vaspace = try reservation.object(6),
         }, process_id, process_name);
         return .{ .reservation = reservation, .base = try objects.Owner.init(runtime, plan, deadline), .deadline = deadline };
     }
@@ -64,6 +67,7 @@ pub const Owner = struct {
             .base_creating, .base_destroying => &self.base.exchange,
             .events_creating, .events_destroying => &self.subscriptions.?.exchange,
             .i2c_creating, .i2c_destroying => &self.i2c.?.exchange,
+            .vaspace_creating, .vaspace_destroying => &self.address_space.?.exchange,
             else => error.State,
         };
     }
@@ -71,6 +75,7 @@ pub const Owner = struct {
     /// Loaned/finished children must never shadow the current runtime owner.
     pub fn channel(self: *Owner) ?*exchange.Exchange {
         if (self.subscriptions) |*value| if (value.exchange.phase != .handed_off) return &value.exchange;
+        if (self.address_space) |*value| if (value.exchange.phase != .handed_off) return &value.exchange;
         if (self.i2c) |*value| if (value.exchange.phase != .handed_off) return &value.exchange;
         if (self.base.exchange.phase != .handed_off) return &self.base.exchange;
         return null;
@@ -83,6 +88,7 @@ pub const Owner = struct {
             current.deadline != deadline or self.deadline != deadline) return false;
         switch (self.state) {
             .i2c_creating, .i2c_destroying => return if (self.i2c) |*owner| owner.matches(current, deadline) else false,
+            .vaspace_creating, .vaspace_destroying => return if (self.address_space) |*owner| owner.matches(current, deadline) else false,
             .base_creating, .base_destroying => {
                 const owner = &self.base;
                 const operation = owner.outstanding orelse return false;
@@ -110,8 +116,8 @@ pub const Owner = struct {
     /// One existing bounded owner step or one token transition per call.
     /// Notifications are returned for the appropriate real owner to handle.
     pub fn poll(self: *Owner) Error!?exchange.Dispatch {
-        if (self.state != .base_creating and self.state != .i2c_creating and self.state != .events_creating and
-            self.state != .events_destroying and self.state != .i2c_destroying and self.state != .base_destroying) return error.State;
+        if (self.state != .base_creating and self.state != .i2c_creating and self.state != .vaspace_creating and self.state != .events_creating and
+            self.state != .events_destroying and self.state != .vaspace_destroying and self.state != .i2c_destroying and self.state != .base_destroying) return error.State;
         try self.stable();
         self.self_address = @intFromPtr(self);
         self.session().guard(self.deadline) catch |err| return self.fail(err);
@@ -133,12 +139,21 @@ pub const Owner = struct {
             .i2c_creating => {
                 if (self.i2c.?.state == .ready) {
                     var token = self.i2c.?.handoff(self.deadline) catch |err| return self.fail(err);
+                    self.address_space = vaspace.Owner.init(&token, self.base.plan, self.deadline) catch |err| return self.fail(err);
+                    self.state = .vaspace_creating;
+                    return null;
+                }
+                return self.i2c.?.poll() catch |err| { if (err == error.Pending) return err; return self.fail(err); };
+            },
+            .vaspace_creating => {
+                if (self.address_space.?.state == .ready) {
+                    var token = self.address_space.?.handoff(self.deadline) catch |err| return self.fail(err);
                     const plan = events.Plan.init(self.base.plan, .{ .hotplug = try self.reservation.object(3), .dp_irq = try self.reservation.object(4) }) catch |err| return self.fail(err);
                     self.subscriptions = events.Owner.init(&token, plan, self.deadline) catch |err| return self.fail(err);
                     self.state = .events_creating;
                     return null;
                 }
-                return self.i2c.?.poll() catch |err| { if (err == error.Pending) return err; return self.fail(err); };
+                return self.address_space.?.poll() catch |err| { if (err == error.Pending) return err; return self.fail(err); };
             },
             .events_creating => {
                 const dispatch = self.subscriptions.?.poll() catch |err| {
@@ -155,11 +170,23 @@ pub const Owner = struct {
             .events_destroying => {
                 if (self.subscriptions.?.state == .objects_closed) {
                     var token = self.subscriptions.?.finish(self.deadline) catch |err| return self.fail(err);
+                    self.address_space.?.beginDestroy(&token, self.deadline) catch |err| return self.fail(err);
+                    self.state = .vaspace_destroying;
+                    return null;
+                }
+                return self.subscriptions.?.poll() catch |err| {
+                    if (err == error.Pending) return err;
+                    return self.fail(err);
+                };
+            },
+            .vaspace_destroying => {
+                if (self.address_space.?.state == .closed) {
+                    var token = self.address_space.?.handoff(self.deadline) catch |err| return self.fail(err);
                     self.i2c.?.beginDestroy(&token, self.deadline) catch |err| return self.fail(err);
                     self.state = .i2c_destroying;
                     return null;
                 }
-                return self.subscriptions.?.poll() catch |err| {
+                return self.address_space.?.poll() catch |err| {
                     if (err == error.Pending) return err;
                     return self.fail(err);
                 };

@@ -214,6 +214,7 @@ pub const Plan = struct {
         for (names, 0..) |name, i| {
             if (name == 0) return error.Handle;
             if (base.handles.i2c != 0 and name == base.handles.i2c) return error.Handle;
+            if (base.handles.vaspace != 0 and name == base.handles.vaspace) return error.Handle;
             for (names[0..i]) |previous| if (name == previous) return error.Handle;
         }
         return .{ .base = base, .handles = handles };

@@ -1,0 +1,14 @@
+{
+  "source_commit": "8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f",
+  "fixture_bytes": 160,
+  "fixture_sha256": "9059a3be996efe42366b6c5321867b061df4b43c2d20e9bdd7e998052bf4bad3",
+  "pairs": [
+    "80-byte GSP RM allocation request then80-byte successful response"
+  ],
+  "client": "0xc1d00000",
+  "device": "0x10000000",
+  "object": "0x10000006",
+  "response": "vaBase=0x200000;vaSize=0x100000000 BYTE LENGTH per original570.144 constructor",
+  "generator": "Vaspace-ABI.c in ExFiles/Reference/GFX/Nvidia/0.79.11/vaspace-20260912",
+  "license": "Original NVIDIA MIT notices in gsp_vaspace.zig and NVIDIA-GSP-RUNTIME-LICENSE.txt"
+}

@@ -1344,6 +1344,7 @@ const DeviceModel = struct {
     var memory_logs: usize = 0;
     var region_logs: usize = 0;
     var aperture_logs: usize = 0;
+    var vaspace_logs: usize = 0;
     fn log(text: [*:0]const u8) callconv(.c) void {
         const line = std.mem.span(text);
         if (std.mem.startsWith(u8, line, "NVIDIA gsp-receiver:")) receiver_logs += 1;
@@ -1355,6 +1356,7 @@ const DeviceModel = struct {
         if (std.mem.startsWith(u8, line, "NVIDIA gsp-memory:")) memory_logs += 1;
         if (std.mem.startsWith(u8, line, "NVIDIA gsp-region:")) region_logs += 1;
         if (std.mem.startsWith(u8, line, "NVIDIA gsp-aperture:")) aperture_logs += 1;
+        if (std.mem.startsWith(u8, line, "NVIDIA gsp-vaspace:")) vaspace_logs += 1;
     }
     fn tick(words: []u32, frts: u64, bad_frts: bool) void {
         const core = @import("gsp_core.zig");
@@ -1509,6 +1511,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         post_control_error, post_wrong_gpc, post_bad_vector, post_ack_failure, post_timeout,
         irq_intx, irq_register_error, irq_msi_uncertain, irq_cause, irq_wake_failure, irq_close_busy, irq_unregister_failure,
         rm_base_reject, rm_i2c_reject, rm_event_reject, rm_free_error, rm_timeout, rm_ack_failure, rm_foreign_event, rm_event_ack,
+        rm_vaspace_reject, rm_vaspace_short, rm_vaspace_bounds, rm_vaspace_ack, rm_vaspace_timeout, rm_vaspace_free,
         outputs_empty, outputs_all, outputs_rejected, outputs_partial, outputs_missing, outputs_incomplete, outputs_bad_edid,
         outputs_edid_rejected, outputs_ddc, outputs_ddc_bus_changed, outputs_aux, outputs_wiring, outputs_virtual, outputs_changed, outputs_final_changed, outputs_final_rejected, outputs_hpd, outputs_sequence, outputs_ack, outputs_timeout, catalog_rejected,
         runtime_healthy, runtime_lockdown, runtime_unknown, runtime_unowned, runtime_sequence_timeout,
@@ -2178,6 +2181,8 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
     const command = init.queues_offset + init.command_offset;
     const status = init.queues_offset + init.status_offset;
     const original_sequence = session.tx_sequence;
+    const vaspace_logs = DeviceModel.vaspace_logs;
+    try t.expect(running.nativeAddressSpace() == null);
     var requests: usize = 0;
     var creates: usize = 0;
     var cleanups: usize = 0;
@@ -2205,7 +2210,8 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
         const payload = request.payload;
         std.mem.writeInt(u32, backing.?[status + 64 ..][0..4], session.tx_write, .little);
         try t.expect(std.mem.readInt(u32, payload[0..4], .little) == graph.reservation.client);
-        const destroying = graph.state == .events_destroying or graph.state == .i2c_destroying or graph.state == .base_destroying;
+        const destroying = graph.state == .events_destroying or graph.state == .vaspace_destroying or graph.state == .i2c_destroying or graph.state == .base_destroying;
+        const allocating_vaspace = graph.state == .vaspace_creating;
         var length = payload.len;
         var result: u32 = 0;
         if (destroying) {
@@ -2213,7 +2219,7 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
                 try t.expect(cleanups == 0 and function == 10 and std.mem.readInt(u32, payload[8..12], .little) == graph.reservation.client);
             } else {
                 const expected = [_]u32{ graph.subscriptions.?.plan.handles.hotplug,
-                    graph.subscriptions.?.plan.handles.hotplug, graph.base.plan.handles.i2c, graph.base.plan.handles.display,
+                    graph.subscriptions.?.plan.handles.hotplug, graph.base.plan.handles.vaspace, graph.base.plan.handles.i2c, graph.base.plan.handles.display,
                     graph.base.plan.handles.subdevice, graph.base.plan.handles.device, graph.reservation.client };
                 try t.expect(cleanups < expected.len);
                 if (cleanups == 0) {
@@ -2222,10 +2228,11 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
                 } else try t.expect(function == 10 and std.mem.readInt(u32, payload[8..12], .little) == expected[cleanups]);
             }
             if (scenario == .rm_free_error) result = 0x66;
+            if (scenario == .rm_vaspace_free and graph.state == .vaspace_destroying) result = 0x66;
             cleanups += 1;
         } else {
-            const expected_functions = [_]u32{ 103, 103, 103, 103, 103, 103, 76, 103, 76 };
-            const expected_classes = [_]u32{ 0, 0x80, 0x2080, 0x73, 0x402c, 0x7e, 0, 0x7e, 0 };
+            const expected_functions = [_]u32{ 103, 103, 103, 103, 103, 103, 103, 76, 103, 76 };
+            const expected_classes = [_]u32{ 0, 0x80, 0x2080, 0x73, 0x402c, 0x90f1, 0x7e, 0, 0x7e, 0 };
             try t.expect(creates < expected_functions.len and function == expected_functions[creates]);
             if (function == 103) try t.expect(std.mem.readInt(u32, payload[12..16], .little) == expected_classes[creates]);
             if (creates == 0) {
@@ -2268,7 +2275,21 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
                 try nativeEvent(session, 0x101c, &.{0});
                 try t.expect(target.step() == .progress and !channel.in_lockdown and channel.deadline == deadline);
             }
-            if (creates == 8) {
+            if (allocating_vaspace) {
+                try t.expect(creates == 5 and payload.len == 80 and graph.address_space.?.info == null and running.nativeAddressSpace() == null);
+                try t.expect(std.mem.readInt(u32, payload[8..12], .little) == graph.base.plan.handles.vaspace);
+                try t.expect(std.mem.readInt(u32, payload[64..68], .little) == 65536);
+                try t.expect(std.mem.allEqual(u8, payload[32..64], 0) and std.mem.allEqual(u8, payload[68..80], 0));
+                // Exact admission also protects the new allocation; an old
+                // runtime token cannot submit the same bytes on its behalf.
+                const phase = channel.phase;
+                channel.phase = .prepared;
+                try target.port.owner.?.admit_command.?(target.port.owner.?.context, &target.port, deadline);
+                var copy = graph.address_space.?;
+                try t.expect(!copy.matches(channel, deadline));
+                channel.phase = phase;
+            }
+            if (creates == 9) {
                 try devicePost(target, false, scenario == .rm_foreign_event);
                 _ = target.step();
                 if (scenario == .rm_foreign_event) break;
@@ -2276,21 +2297,27 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
             }
             if (scenario == .rm_base_reject and creates == 1) result = 0x55;
             if (scenario == .rm_i2c_reject and creates == 4) result = 0x56;
-            if ((scenario == .rm_event_reject or scenario == .rm_free_error) and creates == 6) result = 0x55;
+            if ((scenario == .rm_event_reject or scenario == .rm_free_error or scenario == .rm_vaspace_free) and creates == 7) result = 0x55;
+            if (scenario == .rm_vaspace_reject and allocating_vaspace) result = 0x51;
             creates += 1;
         }
         // Responses may be the original fixed allocation result only.
         if (function == 103) length = 32;
+        if (allocating_vaspace and result == 0) {
+            length = if (scenario == .rm_vaspace_short) 32 else 80;
+            std.mem.writeInt(u64, response[40..48], 0x100000000, .little); // Actual byte length, not limit.
+            std.mem.writeInt(u64, response[72..80], if (scenario == .rm_vaspace_bounds) (@as(u64, 1) << 49) - 4096 else 0x200000, .little);
+        }
         std.mem.writeInt(u32, response[if (function == 103) @as(usize, 16) else 12 ..][0..4], result, .little);
         if (function == 76 and result == 0) {
             response[32] = 1;
             std.mem.writeInt(u32, response[36..40], 0xdeadbeef, .little);
         }
-        if (scenario == .rm_timeout and requests == 0) {
+        if ((scenario == .rm_timeout and requests == 0) or (scenario == .rm_vaspace_timeout and allocating_vaspace)) {
             clock = deadline;
         } else {
             try nativeEvent(session, function, response[0..length]);
-            if (scenario == .rm_ack_failure and creates == 9) range_failure_call = range_calls + 4;
+            if ((scenario == .rm_ack_failure and creates == 10) or (scenario == .rm_vaspace_ack and allocating_vaspace)) range_failure_call = range_calls + 4;
         }
         _ = target.step();
         range_failure_call = 0;
@@ -2300,9 +2327,18 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
     if (target.phase == .ready) {
         const graph = &running.graph.?;
         const object = running.nativeObject() orelse return error.MissingRmObjects;
-        try t.expect(creates == 9 and requests == 9 and cleanups == 0 and graph.state == .loaned);
+        try t.expect(creates == 10 and requests == 10 and cleanups == 0 and graph.state == .loaned);
         try t.expect(object.client == graph.reservation.client and object.display == graph.base.plan.handles.display);
-        try t.expect(session.tx_sequence == original_sequence + 9 and running.activeChannel() == &running.channel.?);
+        try t.expect(session.tx_sequence == original_sequence + 10 and running.activeChannel() == &running.channel.?);
+        try t.expect(DeviceModel.vaspace_logs == vaspace_logs + 1);
+        if (scenario == .rm_vaspace_reject) {
+            try t.expect(running.nativeAddressSpace() == null and graph.address_space.?.rejected.? == 0x51);
+        } else {
+            const address_space = running.nativeAddressSpace() orelse return error.MissingAddressSpace;
+            try t.expect(address_space.epoch == session.epoch and address_space.client == graph.reservation.client);
+            try t.expect(address_space.handle == graph.base.plan.handles.vaspace and address_space.base == 0x200000);
+            try t.expect(address_space.bytes == 0x100000000 and address_space.big_page_bytes == 65536);
+        }
         if (scenario == .rm_i2c_reject) try t.expect(object.i2c == 0 and !graph.i2c.?.live and graph.i2c.?.rejected.? == 0x56)
         else try t.expect(object.i2c == graph.base.plan.handles.i2c and graph.i2c.?.live);
         try t.expect(session.pending == null and graph.base.exchange.phase == .handed_off and graph.subscriptions.?.exchange.phase == .handed_off);
@@ -2323,13 +2359,23 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
     }
     const graph = &running.graph.?;
     try t.expect(running.nativeObject() == null and running.failure != null and target.phase == .recovering);
+    try t.expect(running.nativeAddressSpace() == null);
     if (scenario == .rm_base_reject or scenario == .rm_event_reject) {
         try t.expect(running.failure.? == error.RmRejected and running.rm_rejection.? == 0x55 and graph.state == .finished);
-        try t.expect(cleanups == @as(usize, if (scenario == .rm_base_reject) 1 else 7));
+        try t.expect(cleanups == @as(usize, if (scenario == .rm_base_reject) 1 else 8));
         try t.expectError(error.Stale, session.rm_names.validate(graph.reservation));
     } else {
         try t.expectError(error.Retained, session.rm_names.retire(graph.reservation));
         if (scenario == .rm_free_error) try t.expect(cleanups == 1 and running.rm_rejection.? == 0x55);
+        if (scenario == .rm_vaspace_free) try t.expect(cleanups == 3 and graph.address_space.?.info != null and graph.address_space.?.state == .failed);
+        if (scenario == .rm_vaspace_short or scenario == .rm_vaspace_bounds or scenario == .rm_vaspace_ack or scenario == .rm_vaspace_timeout) {
+            // The parent graph can detect its shared deadline before the
+            // child polls. Retention and failed session are authoritative;
+            // a child-local phase is not a separate teardown guarantee.
+            try t.expect(cleanups == 0 and graph.address_space.?.info == null and
+                graph.address_space.?.exchange.session.state == .failed and DeviceModel.vaspace_logs == vaspace_logs);
+            try t.expect((session.pending == null) == (scenario == .rm_vaspace_timeout));
+        }
     }
     const receipt = session.pending;
     const sent = session.tx_sequence;
