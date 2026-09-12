@@ -2,9 +2,9 @@
 
 Display RAMHT and physical DMA contexts (NVIDIA 0.1.80, 2026-09-12):
 The GA106 table layout, hash and GV100 descriptors follow the pinned
-Nouveau Linux7.2.4 MIT sources (ramht.c, usergv100.c, gv100.c, cl0002.h,
+Nouveau Linux 7.2.4 MIT sources (ramht.c, usergv100.c, gv100.c, cl0002.h,
 device/base.c, r535/disp.c and ga102.c). Full originals/notices and the
-original-C fixture are archived under0.79.13/display-table-20260912.
+original-C fixture are archived under 0.79.13/display-table-20260912.
 The fixture uses verbatim original hash/search/update/insert/bind functions
 and flags statements with host allocation/I/O stubs. Those C functions
 are not linked into the driver; the attributed Zig layout is derived MIT

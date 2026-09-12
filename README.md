@@ -13,10 +13,10 @@ firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
 
 Native display preparation (NVIDIA 0.1.80):
-The internal Device/GSP runtime owns C670/C67D/C67E, a retained64KB VRAM
-instance, physical4KB command rings and an8KB RAMHT with up to64 physical
+The internal Device/GSP runtime owns C670/C67D/C67E, a retained 64KB VRAM
+instance, physical 4KB command rings and an 8KB RAMHT with up to 64 physical
 DMA contexts. Contexts retain native storage independently of its creator.
-The existing CE uploads the10KB table image from protected SYS staging;
+The existing CE uploads the 10KB table image from protected SYS staging;
 exact Device admission checks the actual transfer and release commands.
 Only GPU completion publishes the revision. Queued faults take priority;
 uncertain effects retain all reachable storage. The initial table is sealed
@@ -24,7 +24,7 @@ when the first display channel is created, including after channel Free.
 Channel retirement itself still requires ACK plus physical idle evidence.
 
 64 original-C entries and seven targeted Device scenarios pass within the
-51 existing groups; the module builds. Roadmap0.79.13 remains open:
+51 existing groups; the module builds. Roadmap 0.79.13 remains open:
 notifier ownership, display methods/PUT/completion, own presentation buffers,
 mode adoption/commit and rollback still require software implementation.
 Display rings remain empty and these internal APIs are not automatically
