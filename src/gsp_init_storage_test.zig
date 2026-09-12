@@ -2,6 +2,7 @@ const std = @import("std");
 const r4os = @import("r4os");
 const a = r4os.abi;
 const t = std.testing;
+const ControlModel = @import("gsp_control_test_model.zig").Model;
 const init = @import("gsp_init.zig");
 const radix = @import("gsp_radix.zig");
 const Storage = @import("gsp_init_storage.zig").Storage;
@@ -523,11 +524,14 @@ fn checkNativeQueue(memory: *@import("gsp_run_memory.zig").Lease, ctx: *const r4
 }
 
 fn nativeEvent(session: *transport.Session, function: u32, payload: []const u8) !void {
+    return nativeReply(session, function, 0, payload);
+}
+fn nativeReply(session: *transport.Session, function: u32, result: u32, payload: []const u8) !void {
     try t.expect(session.pending == null and payload.len < 4000);
     const status = init.queues_offset + init.status_offset;
     const cursor = std.mem.readInt(u32, backing.?[status + 16 ..][0..4], .little);
     const start = status + 4096 + @as(usize, cursor) * 4096;
-    _ = try transport.message.encode(session.profile, session.rx_sequence, .{ .function = function, .result = 0 }, payload, backing.?[start..][0..4096]);
+    _ = try transport.message.encode(session.profile, session.rx_sequence, .{ .function = function, .result = result }, payload, backing.?[start..][0..4096]);
     std.mem.writeInt(u32, backing.?[status + 16 ..][0..4], (cursor + 1) % 63, .little);
 }
 
@@ -1345,6 +1349,7 @@ const DeviceModel = struct {
     var region_logs: usize = 0;
     var aperture_logs: usize = 0;
     var vaspace_logs: usize = 0;
+    var control_logs: usize = 0;
     fn log(text: [*:0]const u8) callconv(.c) void {
         const line = std.mem.span(text);
         if (std.mem.startsWith(u8, line, "NVIDIA gsp-receiver:")) receiver_logs += 1;
@@ -1357,6 +1362,7 @@ const DeviceModel = struct {
         if (std.mem.startsWith(u8, line, "NVIDIA gsp-region:")) region_logs += 1;
         if (std.mem.startsWith(u8, line, "NVIDIA gsp-aperture:")) aperture_logs += 1;
         if (std.mem.startsWith(u8, line, "NVIDIA gsp-vaspace:")) vaspace_logs += 1;
+        if (std.mem.startsWith(u8, line, "NVIDIA gsp-control:")) control_logs += 1;
     }
     fn tick(words: []u32, frts: u64, bad_frts: bool) void {
         const core = @import("gsp_core.zig");
@@ -1448,6 +1454,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
     const saved_table = table.*;
     defer table.* = saved_table;
     table.version = a.driver_api_thread_work_version;
+    ControlModel.install(table);
     table.gfx_memory_query = QueueNative.query;
     table.gfx_output_query = CatalogModel.query;
     table.log_info = DeviceModel.log;
@@ -1512,11 +1519,14 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         irq_intx, irq_register_error, irq_msi_uncertain, irq_cause, irq_wake_failure, irq_close_busy, irq_unregister_failure,
         rm_base_reject, rm_i2c_reject, rm_event_reject, rm_free_error, rm_timeout, rm_ack_failure, rm_foreign_event, rm_event_ack,
         rm_vaspace_reject, rm_vaspace_short, rm_vaspace_bounds, rm_vaspace_ack, rm_vaspace_timeout, rm_vaspace_free,
+        control_allocation, control_bounce, control_alias, control_sync, control_register_reject, control_virtual_reject, control_map_reject,
+        control_short, control_bounds, control_map_address, control_ack, control_timeout, control_unmap, control_free, control_dma_unmap, control_release,
         outputs_empty, outputs_all, outputs_rejected, outputs_partial, outputs_missing, outputs_incomplete, outputs_bad_edid,
         outputs_edid_rejected, outputs_ddc, outputs_ddc_bus_changed, outputs_aux, outputs_wiring, outputs_virtual, outputs_changed, outputs_final_changed, outputs_final_rejected, outputs_hpd, outputs_sequence, outputs_ack, outputs_timeout, catalog_rejected,
         runtime_healthy, runtime_lockdown, runtime_unknown, runtime_unowned, runtime_sequence_timeout,
         runtime_log_failure, runtime_moving_log };
     for (std.enums.values(Case)) |case| {
+        ControlModel.reset(@tagName(case));
         const exercise_runtime = @intFromEnum(case) >= @intFromEnum(Case.runtime_healthy);
         const boot_success = case == .success or @intFromEnum(case) >= @intFromEnum(Case.static_bad_region);
         errdefer |err| std.debug.print("native device startup {s}: {s}\n", .{ @tagName(case), @errorName(err) });
@@ -2186,6 +2196,8 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
     var requests: usize = 0;
     var creates: usize = 0;
     var cleanups: usize = 0;
+    var buffer_requests: usize = 0;
+    var buffer_frees: usize = 0;
     var steps: usize = 0;
     errdefer |err| std.debug.print("actual RM graph scenario={s} error={s} phase={s} failure={?} graph={s} requests={d} creates={d} frees={d}\n",
         .{@tagName(scenario), @errorName(err), @tagName(target.phase), target.failure,
@@ -2204,12 +2216,64 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
         const cursor = (session.tx_write + 62) % 63;
         const request = try transport.message.decode(session.profile,
             backing.?[command + 4096 + @as(usize, cursor) * 4096 ..][0..4096], session.tx_sequence - 1);
-        var response: [objects.max_request_bytes]u8 = @splat(0);
+        var response: [@max(objects.max_request_bytes, @import("gsp_buffer_wire.zig").max_request_bytes)]u8 = @splat(0);
         @memcpy(response[0..request.payload.len], request.payload);
         const function = request.rpc.function;
         const payload = request.payload;
         std.mem.writeInt(u32, backing.?[status + 64 ..][0..4], session.tx_write, .little);
         try t.expect(std.mem.readInt(u32, payload[0..4], .little) == graph.reservation.client);
+        if (graph.state == .control_creating or graph.state == .control_destroying) {
+            const control = &graph.control_buffer.?;
+            const operation = control.operation.?;
+            try t.expect(control.backing.retained and !control.backing.close());
+            try t.expect(ControlModel.active and ControlModel.pinned and ControlModel.mapped and ControlModel.synced);
+            try t.expect(running.nativeControlBuffer() == null);
+            const phase = channel.phase;
+            channel.phase = .prepared;
+            try target.port.owner.?.admit_command.?(target.port.owner.?.context, &target.port, deadline);
+            var copy = control.*;
+            try t.expect(!copy.matches(channel, deadline));
+            try t.expectError(error.Stale, copy.poll());
+            try t.expect(!copy.backing.close());
+            channel.phase = phase;
+            if (operation == .register or operation == .allocate or operation == .map) buffer_requests += 1 else buffer_frees += 1;
+            var rpc_result: u32 = 0;
+            var result_size = payload.len;
+            switch (operation) {
+                .register => {
+                    try t.expect(function == 4 and payload.len == 80 and std.mem.readInt(u32, payload[12..16], .little) == 0x81);
+                    for (ControlModel.pages, 0..) |page, i| try t.expect(std.mem.readInt(u64, payload[56 + 8 * i ..][0..8], .little) == page >> 12);
+                    if (scenario == .control_register_reject) rpc_result = 0x51;
+                    if (scenario == .control_register_reject or scenario == .outputs_empty) result_size = 0;
+                },
+                .allocate => {
+                    try t.expect(function == 103 and payload.len == 160 and std.mem.readInt(u32, payload[12..16], .little) == 0x50a0);
+                    std.mem.writeInt(u64, response[112..120], if (scenario == .control_bounds) 0x10000000000 else 0x600000, .little);
+                    std.mem.writeInt(u64, response[120..128], 12287, .little);
+                    if (scenario == .control_virtual_reject) std.mem.writeInt(u32, response[16..20], 0x52, .little);
+                    if (scenario == .control_short) result_size = 32;
+                },
+                .map => {
+                    try t.expect(function == 14 and payload.len == 56 and control.address == 0x600000);
+                    std.mem.writeInt(u64, response[40..48], if (scenario == .control_map_address) 0x700000 else control.address, .little);
+                    if (scenario == .control_map_reject) std.mem.writeInt(u32, response[48..52], 0x53, .little);
+                },
+                .unmap => {
+                    try t.expect(function == 15 and payload.len == 40 and std.mem.readInt(u32, payload[16..20], .little) == 0);
+                    if (scenario == .control_unmap) std.mem.writeInt(u32, response[32..36], 0x54, .little);
+                },
+                .free_virtual, .free_memory => {
+                    try t.expect(function == 10 and payload.len == 16);
+                    if (scenario == .control_free) std.mem.writeInt(u32, response[12..16], 0x55, .little);
+                },
+            }
+            if (scenario == .control_timeout and operation == .map) clock = deadline else {
+                try nativeReply(session, function, rpc_result, response[0..result_size]);
+                if (scenario == .control_ack and operation == .map) range_failure_call = range_calls + 4;
+            }
+            _ = target.step();range_failure_call = 0;
+            continue;
+        }
         const destroying = graph.state == .events_destroying or graph.state == .vaspace_destroying or graph.state == .i2c_destroying or graph.state == .base_destroying;
         const allocating_vaspace = graph.state == .vaspace_creating;
         var length = payload.len;
@@ -2297,7 +2361,8 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
             }
             if (scenario == .rm_base_reject and creates == 1) result = 0x55;
             if (scenario == .rm_i2c_reject and creates == 4) result = 0x56;
-            if ((scenario == .rm_event_reject or scenario == .rm_free_error or scenario == .rm_vaspace_free) and creates == 7) result = 0x55;
+            if ((scenario == .rm_event_reject or scenario == .rm_free_error or scenario == .rm_vaspace_free or
+                scenario == .control_unmap or scenario == .control_free or scenario == .control_dma_unmap or scenario == .control_release) and creates == 7) result = 0x55;
             if (scenario == .rm_vaspace_reject and allocating_vaspace) result = 0x51;
             creates += 1;
         }
@@ -2329,7 +2394,7 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
         const object = running.nativeObject() orelse return error.MissingRmObjects;
         try t.expect(creates == 10 and requests == 10 and cleanups == 0 and graph.state == .loaned);
         try t.expect(object.client == graph.reservation.client and object.display == graph.base.plan.handles.display);
-        try t.expect(session.tx_sequence == original_sequence + 10 and running.activeChannel() == &running.channel.?);
+        try t.expect(session.tx_sequence == original_sequence + 10 + buffer_requests + buffer_frees and running.activeChannel() == &running.channel.?);
         try t.expect(DeviceModel.vaspace_logs == vaspace_logs + 1);
         if (scenario == .rm_vaspace_reject) {
             try t.expect(running.nativeAddressSpace() == null and graph.address_space.?.rejected.? == 0x51);
@@ -2338,6 +2403,24 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
             try t.expect(address_space.epoch == session.epoch and address_space.client == graph.reservation.client);
             try t.expect(address_space.handle == graph.base.plan.handles.vaspace and address_space.base == 0x200000);
             try t.expect(address_space.bytes == 0x100000000 and address_space.big_page_bytes == 65536);
+            if (running.nativeControlBuffer()) |info| {
+                try t.expect(info.address == 0x600000 and info.bytes == 12288 and info.epoch == session.epoch and buffer_requests == 3);
+                try t.expect(ControlModel.active and ControlModel.synced and ControlModel.releases == 0);
+                try t.expect(!graph.control_buffer.?.backing.close());
+                const backing_owner = &graph.control_buffer.?.backing;
+                const original_page = backing_owner.pages[0];
+                backing_owner.pages[0] += 4096;
+                try t.expect(running.nativeControlBuffer() == null);
+                backing_owner.pages[0] = original_page;
+                try t.expect(running.nativeControlBuffer() != null);
+                graph.address_space.?.info.?.handle += 1;
+                try t.expect(running.nativeControlBuffer() == null);
+                graph.address_space.?.info.?.handle -= 1;
+                try t.expect(running.nativeControlBuffer() != null);
+            } else {
+                try t.expect(ControlModel.releases == 1 and !ControlModel.active and !ControlModel.pinned and !ControlModel.mapped);
+                try t.expect(graph.control_buffer.?.rejected != null or graph.control_buffer.?.host_rejected != null);
+            }
         }
         if (scenario == .rm_i2c_reject) try t.expect(object.i2c == 0 and !graph.i2c.?.live and graph.i2c.?.rejected.? == 0x56)
         else try t.expect(object.i2c == graph.base.plan.handles.i2c and graph.i2c.?.live);
@@ -2360,6 +2443,18 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
     const graph = &running.graph.?;
     try t.expect(running.nativeObject() == null and running.failure != null and target.phase == .recovering);
     try t.expect(running.nativeAddressSpace() == null);
+    try t.expect(running.nativeControlBuffer() == null);
+    if (std.mem.startsWith(u8, @tagName(scenario), "control_")) {
+        const control = &graph.control_buffer.?;
+        try t.expect(ControlModel.active and control.info() == null);
+        try t.expectError(error.Retained, session.rm_names.retire(graph.reservation));
+        if (scenario == .control_dma_unmap or scenario == .control_release) {
+            try t.expect(buffer_frees == 3 and !control.mapped and !control.allocated and !control.registered);
+        } else {
+            try t.expect(control.backing.retained and !control.backing.close());
+            try t.expect(ControlModel.pinned and ControlModel.mapped);
+        }
+    }
     if (scenario == .rm_base_reject or scenario == .rm_event_reject) {
         try t.expect(running.failure.? == error.RmRejected and running.rm_rejection.? == 0x55 and graph.state == .finished);
         try t.expect(cleanups == @as(usize, if (scenario == .rm_base_reject) 1 else 8));

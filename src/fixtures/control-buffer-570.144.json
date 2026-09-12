@@ -1,0 +1,32 @@
+{
+  "source_commit": "8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f",
+  "generator": "Temp/gfx-buffer-map-20260912/Buffer-ABI.c",
+  "bytes": 736,
+  "sha256": "276e2d532efcb31052b6efa327b3c0e1526efcf82fb5abf3d0a96b4c49402cf7",
+  "pairs": [
+    {
+      "operation": "register",
+      "bytes": 80
+    },
+    {
+      "operation": "allocate",
+      "bytes": 160
+    },
+    {
+      "operation": "map",
+      "bytes": 56
+    },
+    {
+      "operation": "unmap",
+      "bytes": 40
+    },
+    {
+      "operation": "free_virtual",
+      "bytes": 16
+    },
+    {
+      "operation": "free_memory",
+      "bytes": 16
+    }
+  ]
+}

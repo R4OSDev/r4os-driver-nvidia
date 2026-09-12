@@ -159,6 +159,10 @@ pub const Owner = struct {
             if (graph.state != .finished) graph.base.exchange.session.rm_names.retain(graph.reservation) catch {};
             self.log("NVIDIA gsp-rm: failed={s} state={s} client={x} rejection={?}",
                 .{@errorName(err), @tagName(graph.state), graph.reservation.client, self.rm_rejection});
+            if (graph.control_buffer) |*owner|
+                self.log("NVIDIA gsp-control: failed={s} operation={s} reply={?} registered={} allocated={} mapped={} retained={}",
+                    .{@errorName(err), if (owner.operation) |operation| @tagName(operation) else "none", owner.last_status,
+                        owner.registered, owner.allocated, owner.mapped, owner.backing.retained});
         }
     }
     pub fn activeChannel(self: *Owner) ?*exchange.Exchange {
@@ -188,6 +192,12 @@ pub const Owner = struct {
         const owner = if (self.graph.?.address_space) |*value| value else return null;
         if (owner.self_address != @intFromPtr(owner) or owner.state != .handed_off or owner.exchange.session.state != .active) return null;
         return if (owner.info) |*info| info else null;
+    }
+    pub fn nativeControlBuffer(self: *Owner) ?@import("gsp_control_buffer.zig").Info {
+        const space = self.nativeAddressSpace() orelse return null;
+        const owner = if (self.graph.?.control_buffer) |*value| value else return null;
+        if (!std.meta.eql(owner.binding.space, space.*)) return null;
+        return owner.info();
     }
     pub fn takeDisplayChanges(self: *Owner) !subscriptions.Changes {
         const current = try self.now();
@@ -281,9 +291,15 @@ pub const Owner = struct {
                     self.log("NVIDIA gsp-rm: objects=ready client={x} device={x} subdevice={x} display={x} events=HPD,DP native-output=unavailable",
                         .{graph.base.plan.handles.client, graph.base.plan.handles.device, graph.base.plan.handles.subdevice, loan.object.display});
                     if (self.nativeAddressSpace()) |info|
-                        self.log("NVIDIA gsp-vaspace: handle={x} base={x} bytes={x} big-page={d} page-tables=RM buffer-mappings=none",
+                        self.log("NVIDIA gsp-vaspace: handle={x} base={x} bytes={x} big-page={d} page-tables=RM app-mappings=none",
                             .{info.handle, info.base, info.bytes, info.big_page_bytes})
                     else self.log("NVIDIA gsp-vaspace: unavailable rm={?} receiver-inventory=available", .{graph.address_space.?.rejected});
+                    if (self.nativeControlBuffer()) |info|
+                        self.log("NVIDIA gsp-control: memory={x} virtual={x} gpu-va={x} bytes={d} pages=system-linear gpu-cache=disabled channels=none",
+                            .{info.memory, info.virtual, info.address, info.bytes})
+                    else if (graph.control_buffer) |*owner|
+                        self.log("NVIDIA gsp-control: unavailable rm={?} host={s} receiver-inventory=available",
+                            .{owner.rejected, if (owner.host_rejected) |err| @errorName(err) else "none"});
                     return .progress;
                 },
                 .rejected => {
@@ -307,7 +323,7 @@ pub const Owner = struct {
                     self.channel = try exchange.Exchange.init(&token, graph.deadline);
                     return error.RmRejected; // Object frees do not stop GPU DMA.
                 },
-                .base_creating, .i2c_creating, .vaspace_creating, .events_creating, .events_destroying, .vaspace_destroying, .i2c_destroying, .base_destroying => {
+                .base_creating, .i2c_creating, .vaspace_creating, .control_creating, .events_creating, .events_destroying, .control_destroying, .vaspace_destroying, .i2c_destroying, .base_destroying => {
                     if (try graph.poll()) |dispatch| {
                         try self.notification(self.activeChannel() orelse return error.State, dispatch, current);
                         return .progress;
@@ -357,6 +373,7 @@ pub const Owner = struct {
             // Nouveau r570's kernel client uses processID=~0 and an empty
             // name. This is not a fabricated R4OS program or host pointer.
             self.graph = try rm.Owner.init(&token, std.math.maxInt(u32), "", end);
+            self.graph.?.control_context = self.ctx;
             self.log("NVIDIA gsp-rm: creating client={x} deadline-ns={d}", .{self.graph.?.reservation.client, end});
             return .progress;
         }

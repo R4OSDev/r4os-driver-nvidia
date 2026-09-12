@@ -50,6 +50,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseSafe,
     }) });
     const unit_step = b.step("unit-test", "Passive PCI identity and bounded NVIDIA firmware parsing");
+    unit.root_module.addImport("r4os", host_sdk);
     unit.root_module.addImport("r4gfx_edid", receiver_parser);
     unit_step.dependOn(&b.addRunArtifact(unit).step);
     const lifecycle = b.createModule(.{ .root_source_file = b.path("src/lifecycle_test.zig"), .target = b.graph.host, .optimize = .ReleaseSafe });

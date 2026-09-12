@@ -1611,6 +1611,32 @@ fn graphDestroy(model: *Model, owner: *rm_graph.Owner) !boot_events.Handoff {
 }
 fn checkRmGraph(model: *Model) !void {
     {
+        const wire = @import("gsp_buffer_wire.zig");
+        const golden = @embedFile("fixtures/control-buffer-570.144.bin");
+        const binding = wire.Binding{ .space = .{ .epoch = 7, .client = 0xc1d00000, .device = 0x10000000,
+            .handle = 0x10000006, .base = 0x200000, .bytes = 0x100000000, .big_page_bytes = 65536 }, .memory = 0x10000007, .virtual = 0x10000008 };
+        const pages = [_]u64{0x100000000,0x300000000,0x100004000};
+        var request: [wire.max_request_bytes]u8 = undefined;
+        var offset: usize = 0;
+        var address: u64 = 0;
+        for (std.enums.values(wire.Operation)) |operation| {
+            const encoded = try wire.encode(binding, operation, &pages, address, &request);
+            const size = wire.length(operation);
+            try t.expectEqualSlices(u8, golden[offset..][0..size], encoded.bytes);
+            const reply = try wire.decode(binding, operation, encoded.bytes,
+                .{ .shape = .{ .message_bytes = size + 80, .checksum_bytes = size + 80, .storage_bytes = 4096, .elements = 1 },
+                    .queue_sequence = 0, .rpc = .{ .function = encoded.function, .result = 0 }, .payload = golden[offset+size..][0..size] }, address);
+            try t.expect(reply == .ok);
+            if (operation == .allocate) address = reply.ok;
+            offset += size * 2;
+        }
+        try t.expect(offset == golden.len and address == 0x600000);
+        try t.expectError(error.Bounds, wire.addressValid(binding, 0x200000 - 4096));
+        try t.expectError(error.Bounds, wire.addressValid(binding, 0x100200000 - 4096));
+        var alias = pages;alias[2] = alias[0];
+        try t.expectError(error.Bounds, wire.encode(binding, .register, &alias, 0, &request));
+    }
+    {
         const vaspace = @import("gsp_vaspace.zig");
         const golden = @embedFile("fixtures/vaspace-570.144.bin");
         const plan = try objects.Plan.init(7, .{ .client = 0xc1d00000, .device = 0x10000000,
