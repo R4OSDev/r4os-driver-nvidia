@@ -1635,6 +1635,7 @@ fn checkRmGraph(model: *Model) !void {
     try @import("gsp_native_backing_test.zig").check();
     try @import("gsp_fifo_test.zig").check();
     try @import("gsp_display_engine_test.zig").check();
+    try @import("gsp_display_channel_test.zig").check();
     {
         const caps = @import("gsp_memory_caps.zig");
         const golden = @embedFile("fixtures/memory-caps-570.144.bin");

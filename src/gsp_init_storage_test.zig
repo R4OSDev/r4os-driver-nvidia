@@ -1536,6 +1536,8 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         context_copy_capacity, context_copy_oom, context_copy_invalid, context_copy_lost_idle, context_copy_fastpath,
         display_root_success, display_root_classes, display_root_reject, display_root_static, display_root_preserve, display_root_free,
         display_root_ack, display_root_timeout, display_root_wrong,
+        display_dma_success, display_dma_instance_ack, display_dma_instance_reject, display_dma_oom, display_dma_segment, display_dma_unmap,
+        display_dma_pushbuffer, display_dma_allocate, display_dma_ack, display_dma_free, display_dma_busy, display_dma_release, display_dma_fault,
         outputs_empty, outputs_all, outputs_rejected, outputs_partial, outputs_missing, outputs_incomplete, outputs_bad_edid,
         outputs_edid_rejected, outputs_ddc, outputs_ddc_bus_changed, outputs_aux, outputs_wiring, outputs_virtual, outputs_changed, outputs_final_changed, outputs_final_rejected, outputs_hpd, outputs_sequence, outputs_ack, outputs_timeout, catalog_rejected,
         runtime_healthy, runtime_lockdown, runtime_unknown, runtime_unowned, runtime_sequence_timeout,
@@ -1689,6 +1691,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
             if (target.phase == .ready and std.mem.startsWith(u8, @tagName(case), "vram_")) try checkDeviceVram(target, table, @tagName(case));
             if (target.phase == .ready and std.mem.startsWith(u8, @tagName(case), "context_")) try checkDeviceContexts(target, table, @tagName(case));
             if (target.phase == .ready and std.mem.startsWith(u8, @tagName(case), "display_root_")) try checkDeviceDisplayEngine(target, @tagName(case));
+            if (target.phase == .ready and std.mem.startsWith(u8, @tagName(case), "display_dma_")) try checkDeviceDisplayChannels(target, table, words, @tagName(case));
             if (target.phase == .ready and !target.stopped) try checkDeviceOutputs(target, words, held.plan.?.frts.offset, case);
             if (exercise_runtime) try checkDeviceRuntime(target, words, held.plan.?.frts.offset, case);
         } else {
@@ -2736,6 +2739,194 @@ fn checkDeviceDisplayEngine(target: *@import("gsp_device.zig").Device, scenario:
         }
         prior = handle;
     }
+}
+fn checkDeviceDisplayChannels(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, words: []u32, scenario: []const u8) !void {
+    const runtime = @import("gsp_runtime.zig");
+    const native_model = @import("gsp_vram_test_model.zig").Model;
+    const model = @import("gsp_display_test_model.zig").Model;
+    const root_vectors = @import("gsp_display_engine_test.zig");
+    const running = &target.running; const session = &target.session.?;
+    const deadline = clock + 5 * std.time.ns_per_s;
+    native_model.install(table, scenario); defer native_model.dispose(table);
+    model.install(table, scenario, words);
+    errdefer |err| std.debug.print("display DMA {s}: {s} phase={s} failure={?} root-active={} channel-active={?}\n",
+        .{scenario,@errorName(err),@tagName(target.phase),target.failure,running.display_engine_active,running.display_channel_active});
+    const root_handle = try running.createDisplayEngine(deadline);
+    var steps: usize = 0;
+    while (running.display_engine_active and steps < 60) : (steps += 1) {
+        _ = target.step(); try t.expect(target.phase == .ready);
+        if (!running.display_engine_active) break;
+        const root_owner = &running.display_engine_owner.?; const rpc = &root_owner.exchange;
+        if (rpc.phase != .waiting) continue;
+        const op = root_owner.operation.?;
+        var response: [428]u8 = undefined; @memcpy(response[0..rpc.request.len], root_vectors.response(op));
+        const header: usize = if (op == .allocate) 32 else 24; @memcpy(response[0..header], rpc.request[0..header]);
+        if (op == .classes) { outputWord(&response, 24, 3); outputWord(&response, 32, 0xc67d); outputWord(&response, 36, 0xc67e); }
+        if (op == .static_info) outputWord(&response, 28, 9); // Windows 0 and 3 only.
+        std.mem.writeInt(u32, backing.?[init.queues_offset + init.status_offset + 64..][0..4], session.tx_write, .little);
+        try nativeReply(session, rpc.function, 0, response[0..rpc.request.len]); _ = target.step();
+    }
+    try t.expect(steps < 60 and !running.display_engine_active);
+    try t.expectError(error.State, running.createDisplayChannel(root_handle, .core, 0, deadline));
+    const instance = try allocateContextStorage(target, 65536, deadline);
+    try running.attachDisplayInstance(root_handle, instance, deadline);
+    steps = 0;
+    while (running.display_engine_active and target.phase == .ready and steps < 60) : (steps += 1) {
+        _ = target.step(); if (!running.display_engine_active or target.phase != .ready) break;
+        const root_owner = &running.display_engine_owner.?; const rpc = &root_owner.exchange;
+        if (rpc.phase != .waiting) continue;
+        try t.expect(root_owner.operation.? == .instance and rpc.request.len == 48 and root_owner.instance_possible and !root_owner.instance_bound);
+        try t.expect(std.mem.readInt(u64, rpc.request[24..32], .little) == root_owner.instance_storage.info().?.physical.base);
+        try t.expect(native_model.slots[0].imported and native_model.slots[0].gpu.lease.id != 0);
+        var response: [48]u8 = undefined; @memcpy(&response, rpc.request);
+        if (model.is("display_dma_instance_reject")) outputWord(&response, 12, 0x57);
+        std.mem.writeInt(u32, backing.?[init.queues_offset + init.status_offset + 64..][0..4], session.tx_write, .little);
+        try nativeReply(session, rpc.function, 0, &response);
+        if (model.is("display_dma_instance_ack")) range_failure_call = range_calls + 4;
+        _ = target.step(); range_failure_call = 0;
+    }
+    try t.expect(steps < 60);
+    if (target.phase != .ready) {
+        try t.expect((model.is("display_dma_instance_ack") or model.is("display_dma_instance_reject")) and target.failure != null);
+        try t.expect(!running.display_engine_owner.?.instance_bound and running.display_engine_owner.?.instance_possible and native_model.charged == 65536 and native_model.slots[0].imported);
+        if (model.is("display_dma_instance_ack")) try t.expect(session.pending != null);
+        return;
+    }
+    try t.expect((try running.displayEngineStatus(root_handle)).info.?.instance_bound);
+    try t.expectError(error.Retained, running.retireDisplayEngine(root_handle, deadline));
+    try t.expectError(error.State, running.createDisplayChannel(root_handle, .window, 3, deadline));
+    try t.expectError(error.Bounds, running.createDisplayChannel(root_handle, .core, 1, deadline));
+    try running.releaseNativeBuffer(instance); // The device-owned instance stays reachable.
+    try t.expect(!native_model.slots[0].reference and native_model.slots[0].imported and native_model.charged == 65536);
+    const core_handle = try running.createDisplayChannel(root_handle, .core, 0, deadline);
+    try pumpDisplayChannel(target, core_handle, deadline);
+    if (target.phase == .ready) {
+        const current = try running.displayChannelStatus(core_handle);
+        const rejected = model.is("display_dma_oom") or model.is("display_dma_pushbuffer") or model.is("display_dma_allocate");
+        try t.expect(current.state == .handed_off and (current.info == null) == rejected);
+        if (rejected) {
+            try t.expect((current.host_rejected != null) == model.is("display_dma_oom"));
+            try t.expect(!running.display_channels[0].?.namespace_live and !model.slots[0].active);
+        } else {
+            try t.expectError(error.Busy, running.createDisplayChannel(root_handle, .core, 0, deadline));
+            try t.expectError(error.Unsupported, running.createDisplayChannel(root_handle, .window, 2, deadline));
+            try t.expectError(error.Bounds, running.createDisplayChannel(root_handle, .window, 8, deadline));
+            var forged = core_handle; forged.epoch += 1; try t.expectError(error.Stale, running.displayChannelStatus(forged));
+            if (model.is("display_dma_success")) {
+                const window_handle = try running.createDisplayChannel(root_handle, .window, 3, deadline);
+                try pumpDisplayChannel(target, window_handle, deadline);
+                try t.expect((try running.displayChannelStatus(window_handle)).info != null);
+                try t.expectError(error.Retained, running.retireDisplayChannel(core_handle, deadline));
+                try t.expect(running.display_channel_active == null and model.slots[0].active and model.slots[1].active);
+                try running.retireDisplayChannel(window_handle, deadline);
+                try pumpDisplayChannel(target, window_handle, deadline);
+                try t.expectError(error.Stale, running.displayChannelStatus(window_handle));
+                try t.expect(model.released == 1 and model.slots[0].active and !model.slots[1].active);
+            }
+        }
+        try running.retireDisplayChannel(core_handle, deadline);
+        try pumpDisplayChannel(target, core_handle, deadline);
+    }
+    try t.expect(native_model.charged == 65536 and native_model.slots[0].imported and native_model.slots[0].gpu.lease.id != 0 and native_model.released == 0);
+    if (target.phase == .ready) {
+        try t.expectError(error.Stale, running.displayChannelStatus(core_handle));
+        try t.expect(running.display_engine_owner.?.instance_storage.info() != null);
+        try t.expectError(error.Retained, running.retireDisplayEngine(root_handle, deadline));
+        try t.expectError(error.Busy, running.beginDestroyGraph(deadline, true));
+        if (model.is("display_dma_success")) try t.expect(model.released == 2);
+        try t.expect(target.stop());
+    } else {
+        try t.expect(target.failure != null and session.state == .failed and model.slots[0].active and model.released == 0);
+        const dma_owner = &running.display_channels[0].?;
+        try t.expect(dma_owner.namespace_live and !dma_owner.backing.close());
+        if (model.is("display_dma_ack")) try t.expect(session.pending != null and !dma_owner.live and dma_owner.allocation_possible);
+        if (model.is("display_dma_busy")) try t.expect(dma_owner.retirement_reads >= 3 and !dma_owner.hardware_retired);
+        if (model.is("display_dma_release")) try t.expect(dma_owner.hardware_retired and !dma_owner.live);
+        if (model.is("display_dma_fault")) try t.expect(dma_owner.retirement_reads == 0 and !dma_owner.hardware_retired);
+    }
+    _ = runtime;
+}
+fn pumpDisplayChannel(target: *@import("gsp_device.zig").Device, handle: @import("gsp_runtime.zig").DisplayChannelHandle, deadline: u64) !void {
+    const model = @import("gsp_display_test_model.zig").Model;
+    const wire = @import("gsp_display_channel_wire.zig");
+    const vectors = @import("gsp_display_channel_test.zig");
+    const running = &target.running; const session = &target.session.?;
+    var steps: usize = 0; var observed = false; var interleaved = false;
+    var checkpoint: []const u8 = "poll";
+    errdefer |err| if (running.display_channels[handle.slot]) |*value| std.debug.print("display channel {s}: {s} step={d} check={s} state={s} rpc={s} op={?} reads={d} admit={} backing={?}\n",
+        .{@tagName(value.config.kind),@errorName(err),steps,checkpoint,@tagName(value.state),@tagName(value.exchange.phase),value.operation,value.retirement_reads,value.admitsRetirement(deadline),value.backing.physical()});
+    while (target.phase == .ready and running.display_channel_active != null and steps < 100) : (steps += 1) {
+        const owner = &running.display_channels[handle.slot].?;
+        if (owner.retirementPending()) {
+            const ctl = try wire.controlRegister(owner.config.kind, owner.config.index);
+            const stat = try wire.statusRegister(owner.config.kind, owner.config.index);
+            // Hardware retirement uses the channel's fixed deadline after
+            // the acknowledged RPC has returned to an empty idle Exchange.
+            if (!observed) {
+                const io = target.port.owner.?;
+                var copied = owner.*;
+                try t.expectError(error.Binding, io.admit_display_retirement.?(io.context, &target.port, &copied, deadline));
+                try t.expectError(error.Binding, io.admit_display_retirement.?(io.context, &target.port, owner, deadline + 1));
+                const saved = owner.config; owner.config.index += 1;
+                try t.expectError(error.Binding, io.admit_display_retirement.?(io.context, &target.port, owner, deadline));
+                owner.config = saved; checkpoint = "admit retirement";
+                try io.admit_display_retirement.?(io.context, &target.port, owner, deadline);
+                observed = true;
+            }
+            if (owner.retirement_reads == 1) { model.words[ctl / 4] = 0; model.words[stat / 4] = 1 << 26; }
+            if (owner.retirement_reads == 2) model.words[stat / 4] = 1 << 31;
+            if (owner.retirement_reads >= 3) {
+                if (model.is("display_dma_busy")) clock = deadline else { model.words[ctl / 4] = 0; model.words[stat / 4] = 0; }
+            }
+            const slot_index = (owner.config.physical - model.address(0)) / 0x100000;
+            try t.expect(model.slots[slot_index].active and model.slots[slot_index].dma.lease.id != 0 and !owner.backing.close());
+            if (model.is("display_dma_fault") and !interleaved) {
+                try nativeEvent(session, 0x10ff, &.{}); interleaved = true;
+            }
+        }
+        _ = target.step();
+        if (target.phase != .ready or running.display_channel_active == null) break;
+        const rpc = &owner.exchange;
+        if (rpc.phase != .waiting) continue;
+        const op = owner.operation.?;
+        try t.expect(owner.info() == null and owner.backing.physical() != null and owner.backing.retained);
+        const cursor = (session.tx_write + 62) % 63;
+        const record = try transport.message.decode(session.profile, backing.?[init.queues_offset + init.command_offset + 4096 + cursor * 4096..][0..4096], session.tx_sequence - 1);
+        try t.expectEqualSlices(u8, rpc.request, record.payload);
+        if (op == .pushbuffer) {
+            const io = target.port.owner.?; const saved = rpc.request;
+            var copied = owner.*; try t.expect(!copied.matches(rpc, deadline));
+            var foreign: [80]u8 = undefined; @memcpy(foreign[0..saved.len], saved);
+            rpc.phase = .prepared; rpc.request = foreign[0..saved.len];
+            try t.expectError(error.Binding, io.admit_command.?(io.context, &target.port, deadline));
+            rpc.request = saved; owner.request[32] ^= 1;
+            try t.expectError(error.Binding, io.admit_command.?(io.context, &target.port, deadline));
+            owner.request[32] ^= 1; checkpoint = "admit pushbuffer";
+            try io.admit_command.?(io.context, &target.port, deadline);
+            rpc.phase = .waiting;
+        }
+        if (op == .allocate and model.is("display_dma_success") and !interleaved) {
+            try devicePost(target, false, false); _ = target.step();
+            try t.expect(rpc.phase == .waiting and rpc.pending == null and !owner.live); interleaved = true;
+        }
+        var response: [80]u8 = undefined; @memcpy(response[0..rpc.request.len], rpc.request);
+        if (op == .allocate) {
+            @memcpy(response[48..56], vectors.response(owner.config.kind, op)[48..56]);
+            const slot_index = (owner.config.physical - model.address(0)) / 0x100000;
+            const slot = &model.slots[slot_index]; slot.hardware = true;
+            slot.control = try wire.controlRegister(owner.config.kind, owner.config.index); slot.state = try wire.statusRegister(owner.config.kind, owner.config.index);
+            if (!model.is("display_dma_allocate")) {
+                model.words[slot.control / 4] = 0x13; model.words[slot.state / 4] = if (owner.config.kind == .core) 11 << 16 else 4 << 16;
+            }
+        }
+        if ((op == .pushbuffer and model.is("display_dma_pushbuffer")) or (op == .allocate and model.is("display_dma_allocate")) or (op == .free and model.is("display_dma_free")))
+            outputWord(&response, if (op == .allocate) 16 else 12, 0x57);
+        std.mem.writeInt(u32, backing.?[init.queues_offset + init.status_offset + 64..][0..4], session.tx_write, .little);
+        try nativeReply(session, rpc.function, 0, response[0..rpc.request.len]);
+        if (op == .allocate and model.is("display_dma_ack")) range_failure_call = range_calls + 4;
+        _ = target.step(); range_failure_call = 0;
+    }
+    try t.expect(steps < 100);
 }
 fn checkDeviceContexts(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, scenario: []const u8) !void {
     const model = @import("gsp_vram_test_model.zig").Model;

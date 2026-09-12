@@ -346,6 +346,7 @@ pub const Device = struct {
             .retain = retain, .quiesced = quiesced, .log_polling = polling,
             .admit_firmware = admitFirmware, .admit_cold = admitCold, .queue_memory = self.memory,
             .admit_runtime = admitRuntime, .admit_command = admitCommand, .admit_copy = admitCopy,
+            .admit_display_retirement = admitDisplayRetirement,
             .recovery = .{ .generation = recoveryGeneration, .admit = admitRecovery, .access = recoveryAccess } };
     }
     fn generation(raw: *anyopaque) u64 {
@@ -420,7 +421,10 @@ pub const Device = struct {
             channel.phase != .prepared or channel.pending != null or channel.session.pending != null or
             channel.deadline != deadline) return error.Binding;
         if (channel.in_lockdown) return error.Lockdown;
-        if (self.running.display_engine_active) {
+        if (self.running.display_channel_active) |index| {
+            const display_dma = if (self.running.display_channels[index]) |*value| value else return error.Binding;
+            if (!display_dma.matches(channel, deadline)) return error.Binding;
+        } else if (self.running.display_engine_active) {
             const display_root = if (self.running.display_engine_owner) |*value| value else return error.Binding;
             if (!display_root.matches(channel, deadline)) return error.Binding;
         } else if (self.running.fifo_active) |index| {
@@ -444,13 +448,23 @@ pub const Device = struct {
                 channel.request.ptr != self.running.static_request[0..].ptr or channel.request.len != self.running.static_request.len) return error.Binding;
         } else if (!self.running.post.matches(channel, deadline)) return error.Binding;
     }
+    fn admitDisplayRetirement(raw: *anyopaque, port: *const native.Port, display_dma: *@import("gsp_display_channel.zig").Owner, deadline: u64) !void {
+        const self = from(raw);
+        try self.checkLive(false);
+        if (self.phase != .ready or port != &self.port or port.phase != .runtime or self.session == null or self.inLockdown() or
+            self.running.self_address != @intFromPtr(&self.running) or self.running.failure != null or self.running.sequence.self_address != 0) return error.State;
+        const index = self.running.display_channel_active orelse return error.State;
+        const current = if (self.running.display_channels[index]) |*value| value else return error.Binding;
+        if (current != display_dma or !current.admitsRetirement(deadline) or self.running.activeChannel() != &current.exchange or
+            current.exchange.session != &self.session.? or port.runtime_session != &self.session.? or self.session.?.pending != null) return error.Binding;
+    }
     fn admitCopy(raw: *anyopaque, port: *const native.Port, fifo: *@import("gsp_fifo.zig").Owner, ticket: @import("gsp_copy_ring.zig").Ticket, deadline: u64) !void {
         const self = from(raw);
         try self.checkLive(false);
         if (self.phase != .ready or port != &self.port or port.phase != .runtime or self.session == null or self.inLockdown() or
             self.running.self_address != @intFromPtr(&self.running) or self.running.failure != null or self.running.sequence.self_address != 0 or
             self.running.fifo_active != null or self.running.context_active != null or self.running.native_active != null or self.running.buffer_active != null or
-            self.running.outputs.active() or self.running.graph_closing or self.running.display_engine_active) return error.State;
+            self.running.outputs.active() or self.running.graph_closing or self.running.display_engine_active or self.running.display_channel_active != null) return error.State;
         const work = if (self.running.copy_job) |*value| value else return error.Binding;
         if (work.submitted or work.ticket == null or !std.meta.eql(work.ticket.?, ticket) or !std.meta.eql(work.job, work.job_stamp) or
             work.deadline != deadline or work.channel_handle.epoch != self.epoch or work.channel_handle.slot >= self.running.fifos.len) return error.Binding;

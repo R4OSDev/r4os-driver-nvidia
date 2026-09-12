@@ -1,5 +1,15 @@
 ﻿# Third-Party Notices
 
+Native display channels (NVIDIA 0.1.79, 2026-09-12):
+Instance/channel layouts and lifetime follow NVIDIA 570.144 MIT headers/RM,
+Nouveau r535/r570 and the pinned GA102 OpenGpuDoc register manual.
+Eighteen complete originals, seven C packet pairs and 134 independent
+register cases are archived under 0.79.13/display-channels-20260912.
+Full source notices and the identical embedded/image runtime license
+preserve all previous license bytes. Only trailing whitespace in added
+notices is normalized. No additional upstream C implementation is linked;
+original R4OS ownership/integration remains Apache-2.0.
+
 Native display root (NVIDIA 0.1.78, 2026-09-12):
 The C670 allocation, internal static query and one-shot PRESERVE_HW
 control follow pinned NVIDIA 570.144 MIT headers/RM and Nouveau r535/r570.

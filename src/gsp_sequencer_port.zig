@@ -1,3 +1,23 @@
+// ExFiles/Reference/GFX/Nvidia/OpenGpuDoc/manuals/ampere/ga102/dev_display_withoffset.ref.txt
+// Copyright (c) 2021, NVIDIA CORPORATION. All rights reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the "Software"),
+// to deal in the Software without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, sublicense,
+// and/or sell copies of the Software, and to permit persons to whom the
+// Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+// THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+// DEALINGS IN THE SOFTWARE.
 // Queue notification adapted from NVIDIA570.144 (MIT); R4OS owner/facade Apache-2.0.
 // src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
 // /*
@@ -162,6 +182,7 @@ pub const Owner = struct {
     // from CPU-sequencer register access and runs before TX and before MMIO.
     admit_command: ?*const fn (*anyopaque, *const Port, u64) anyerror!void = null,
     admit_copy: ?*const fn (*anyopaque, *const Port, *@import("gsp_fifo.zig").Owner, @import("gsp_copy_ring.zig").Ticket, u64) anyerror!void = null,
+    admit_display_retirement: ?*const fn (*anyopaque, *const Port, *@import("gsp_display_channel.zig").Owner, u64) anyerror!void = null,
     recovery: ?RecoveryOwner = null,
 };
 pub const Run = struct { epoch: u64, deadline_ns: u64, resume_args: ?core.Resume = null };
@@ -606,6 +627,31 @@ pub const Port = struct {
         self.pointer(offset).* = ticket.token; fence();
         if (try self.readFor(scope, 0) != self.boot0) return error.IdentityChanged;
         try fifo.ring.notified(ticket);
+    }
+    /// Exact display-channel owner, read-only GA106 retirement registers.
+    /// No generic sequencer permission or caller-selected MMIO is introduced.
+    pub fn observeDisplayRetirement(self: *Port, channel: *@import("gsp_display_channel.zig").Owner, deadline: u64) !void {
+        const wire = @import("gsp_display_channel_wire.zig");
+        const scope: Scope = .{ .request = deadline };
+        errdefer |err| self.recordFailure(err);
+        try self.guardFor(scope);
+        if (self.phase != .runtime or !self.retained) return error.Phase;
+        const endpoint = self.owner.?;
+        const admit_display = endpoint.admit_display_retirement orelse return error.Unsupported;
+        try admit_display(endpoint.context, self, channel, deadline);
+        const offsets = [_]u32{try wire.controlRegister(channel.config.kind, channel.config.index), try wire.statusRegister(channel.config.kind, channel.config.index)};
+        for (offsets) |offset| if (!self.supports(.read, offset)) return error.Register;
+        if (try self.readFor(scope, 0) != self.boot0) return error.IdentityChanged;
+        var samples: [2][2]u32 = undefined;
+        for (&samples) |*sample| for (offsets, 0..) |offset, i| {
+            try self.guardFor(scope); try admit_display(endpoint.context, self, channel, deadline);
+            fence(); sample[i] = self.pointer(offset).*; fence();
+            try self.guardFor(scope); try admit_display(endpoint.context, self, channel, deadline);
+        };
+        if (try self.readFor(scope, 0) != self.boot0) return error.IdentityChanged;
+        if (std.meta.eql(samples[0], samples[1])) try channel.observeRetirement(samples[1][0], samples[1][1]) else {
+            channel.last_control = samples[1][0]; channel.last_state = samples[1][1]; channel.retirement_reads +|= 1;
+        }
     }
     fn read32(p: *anyopaque, offset: u32) anyerror!u32 {
         return cast(p).read(offset);

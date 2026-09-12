@@ -1,3 +1,29 @@
+// ExFiles/Reference/GFX/Nvidia/OpenKernelModules-570.144/src/nvidia/inc/kernel/os/nv_memory_type.h
+// /*
+//  * SPDX-FileCopyrightText: Copyright (c) 2020 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//  * SPDX-License-Identifier: MIT
+//  *
+//  * Permission is hereby granted, free of charge, to any person obtaining a
+//  * copy of this software and associated documentation files (the "Software"),
+//  * to deal in the Software without restriction, including without limitation
+//  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//  * and/or sell copies of the Software, and to permit persons to whom the
+//  * Software is furnished to do so, subject to the following conditions:
+//  *
+//  * The above copyright notice and this permission notice shall be included in
+//  * all copies or substantial portions of the Software.
+//  *
+//  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+//  * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+//  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+//  * DEALINGS IN THE SOFTWARE.
+//  */
+//
+// ExFiles/Reference/GFX/Nvidia/Nouveau/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r570/nvrm/disp.h
+// /* SPDX-License-Identifier: MIT */
 // NVIDIA570.144/src/common/sdk/nvidia/inc/nvtypes.h
 // /*
 //  * SPDX-FileCopyrightText: Copyright (c) 1993-2020 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
@@ -278,7 +304,7 @@
 const std = @import("std");
 const exchange = @import("gsp_exchange.zig");
 pub const Error = exchange.Error || error{Unsupported};
-pub const Operation = enum { classes, static_info, allocate, preserve, free };
+pub const Operation = enum { classes, static_info, allocate, preserve, free, instance };
 pub const max_bytes = 428;
 pub const root_class: u32 = 0xc670;
 pub const Binding = struct { epoch: u64, client: u32, device: u32, root: u32, internal_client: u32, internal_subdevice: u32 };
@@ -288,8 +314,8 @@ pub const StaticInfo = struct {
 };
 pub const Reply = union(enum) { rejected: u32, ok: []const u8 };
 pub fn function(op: Operation) u32 { return switch (op) { .allocate => 103, .free => 10, else => 76 }; }
-pub fn length(op: Operation) usize { return switch (op) { .classes => 428, .static_info => 60, .allocate, .preserve => 32, .free => 16 }; }
-pub fn command(op: Operation) u32 { return switch (op) { .classes => 0x800292, .static_info => 0x20800a01, .preserve => 0x50700117, else => 0 }; }
+pub fn length(op: Operation) usize { return switch (op) { .classes => 428, .static_info => 60, .allocate, .preserve => 32, .free => 16, .instance => 48 }; }
+pub fn command(op: Operation) u32 { return switch (op) { .classes => 0x800292, .static_info => 0x20800a01, .preserve => 0x50700117, .instance => 0x20800a49, else => 0 }; }
 pub fn word(data: []const u8, at: usize) u32 { return std.mem.readInt(u32, data[at..][0..4], .little); }
 fn put(out: []u8, at: usize, value: u32) void { std.mem.writeInt(u32, out[at..][0..4], value, .little); }
 pub fn validate(binding: Binding) Error!void {
@@ -311,7 +337,17 @@ pub fn encode(binding: Binding, op: Operation, output: []u8) Error![]const u8 {
         },
         .allocate => { put(out, 4, binding.device); put(out, 8, binding.root); put(out, 12, root_class); },
         .free => put(out, 8, binding.root),
+        .instance => return error.Unsupported, // Requires retained physical storage.
     }
+    return out;
+}
+pub fn encodeInstance(binding: Binding, physical: u64, output: []u8) Error![]const u8 {
+    try validate(binding);
+    if (physical == 0 or physical & 0xffff != 0 or physical > std.math.maxInt(u64) - 65536 or output.len < 48) return error.Bounds;
+    const out = output[0..48]; @memset(out, 0);
+    put(out, 0, binding.internal_client); put(out, 4, binding.internal_subdevice); put(out, 8, command(.instance)); put(out, 16, 24);
+    std.mem.writeInt(u64, out[24..32], physical, .little); std.mem.writeInt(u64, out[32..40], 65536, .little);
+    put(out, 40, 2); put(out, 44, 2); // ADDR_FBMEM; NV_MEMORY_WRITECOMBINED.
     return out;
 }
 pub fn decode(binding: Binding, op: Operation, request: []const u8, record: exchange.message.Record) Error!Reply {
@@ -333,14 +369,17 @@ pub fn decode(binding: Binding, op: Operation, request: []const u8, record: exch
     switch (op) {
         .classes => if (word(payload, 0) > 100) return error.Bounds,
         .static_info => { _ = try staticInfo(payload); },
-        .preserve => if (!std.mem.eql(u8, payload, request[header..])) return error.Payload,
+        .preserve, .instance => if (!std.mem.eql(u8, payload, request[header..])) return error.Payload,
         .allocate, .free => {},
     }
     return .{ .ok = payload };
 }
 pub fn supports(data: []const u8) bool {
+    return supportsClass(data, root_class);
+}
+pub fn supportsClass(data: []const u8, class: u32) bool {
     if (data.len != 404 or word(data, 0) > 100) return false;
-    for (0..word(data, 0)) |i| if (word(data, 4 + i * 4) == root_class) return true;
+    for (0..word(data, 0)) |i| if (word(data, 4 + i * 4) == class) return true;
     return false;
 }
 pub fn staticInfo(data: []const u8) Error!StaticInfo {

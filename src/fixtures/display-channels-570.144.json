@@ -1,0 +1,21 @@
+{
+  "register_pin": "9fdf5c4062007929d9f4e6cbad9c9771fe61b880",
+  "registers": {
+    "sha256": "3187ec4f40c8162d97b5731adc16a7afa3939bf4f90705773bb5b1811bddc628",
+    "path": "Repositories/Drivers/NVIDIA/src/fixtures/display-retirement-ga102.bin",
+    "bytes": 3752
+  },
+  "scope": "Original-C packets and GA102 register macros; software verification only.",
+  "generator": {
+    "sha256": "fd1765f652dad9e393bce227090c75d1dccfc5f929d37d5955252b386913967a",
+    "path": "Temp/gfx-display-channels-20260912/Display-ABI.c",
+    "bytes": 4259
+  },
+  "archive": "ExFiles/Reference/GFX/Nvidia/0.79.13/display-channels-20260912",
+  "source_pin": "8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f",
+  "packets": {
+    "sha256": "e21af887abfd712e5e7100b2da91fb8e356ab57cacbcf9e8a23143d14ec26d90",
+    "path": "Repositories/Drivers/NVIDIA/src/fixtures/display-channels-570.144.bin",
+    "bytes": 768
+  }
+}
