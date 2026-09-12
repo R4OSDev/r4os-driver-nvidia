@@ -1335,7 +1335,15 @@ test "firmware CPU storage GSP init owns bidirectional logs and queues with exac
 const DeviceModel = struct {
     var boot_info: a.GfxNativeBootInfo = .{};
     fn bootInfo(out: *a.GfxNativeBootInfo) callconv(.c) i32 { out.* = boot_info; return a.gfx_output_ok; }
-    fn log(_: [*:0]const u8) callconv(.c) void {}
+    var receiver_logs: usize = 0;
+    var ddc_logs: usize = 0;
+    var aux_logs: usize = 0;
+    fn log(text: [*:0]const u8) callconv(.c) void {
+        const line = std.mem.span(text);
+        if (std.mem.startsWith(u8, line, "NVIDIA gsp-receiver:")) receiver_logs += 1;
+        if (std.mem.startsWith(u8, line, "NVIDIA gsp-ddc:")) ddc_logs += 1;
+        if (std.mem.startsWith(u8, line, "NVIDIA gsp-aux:")) aux_logs += 1;
+    }
     fn tick(words: []u32, frts: u64, bad_frts: bool) void {
         const core = @import("gsp_core.zig");
         const hs = @import("falcon_hs.zig");
@@ -1476,7 +1484,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         irq_intx, irq_register_error, irq_msi_uncertain, irq_cause, irq_wake_failure, irq_close_busy, irq_unregister_failure,
         rm_base_reject, rm_i2c_reject, rm_event_reject, rm_free_error, rm_timeout, rm_ack_failure, rm_foreign_event, rm_event_ack,
         outputs_empty, outputs_all, outputs_rejected, outputs_partial, outputs_missing, outputs_incomplete, outputs_bad_edid,
-        outputs_edid_rejected, outputs_ddc, outputs_ddc_bus_changed, outputs_changed, outputs_final_changed, outputs_final_rejected, outputs_hpd, outputs_sequence, outputs_ack, outputs_timeout, catalog_rejected,
+        outputs_edid_rejected, outputs_ddc, outputs_ddc_bus_changed, outputs_aux, outputs_changed, outputs_final_changed, outputs_final_rejected, outputs_hpd, outputs_sequence, outputs_ack, outputs_timeout, catalog_rejected,
         runtime_healthy, runtime_lockdown, runtime_unknown, runtime_unowned, runtime_sequence_timeout,
         runtime_log_failure, runtime_moving_log };
     for (std.enums.values(Case)) |case| {
@@ -2236,9 +2244,19 @@ fn outputEdid(bytes: []u8, incomplete: bool, corrupt: bool) void {
     }
     if (corrupt) bytes[0] = 1;
 }
+fn outputEdidFull(bytes: *[4096]u8) void {
+    @memset(bytes, 0);
+    outputEdid(bytes[0..256], false, false);
+    bytes[126] = 31;
+    bytes[127] -%= 30;
+    for (2..32) |index| { bytes[index * 128] = 0x99; bytes[index * 128 + 127] = 0 -% @as(u8, 0x99); }
+}
 fn checkDeviceOutputs(target: *@import("gsp_device.zig").Device, words: []u32, frts: u64, scenario: anytype) !void {
     const rpc = @import("gsp_display_rpc.zig");
     const ddc_case = scenario == .outputs_ddc or scenario == .outputs_ddc_bus_changed;
+    DeviceModel.receiver_logs = 0;
+    DeviceModel.ddc_logs = 0;
+    DeviceModel.aux_logs = 0;
     const running = &target.running;
     const owner = &running.outputs;
     const session = &target.session.?;
@@ -2250,6 +2268,8 @@ fn checkDeviceOutputs(target: *@import("gsp_device.zig").Device, words: []u32, f
     var requests: usize = 0;
     var passes: usize = 0;
     var interleaved = false;
+    var aux_segment: u8 = 0;
+    var aux_offset: u8 = 0;
     errdefer |err| std.debug.print("actual outputs scenario={s} error={s} phase={s} failure={?} state={s} requests={d} count={d}\n",
         .{@tagName(scenario), @errorName(err), @tagName(target.phase), target.failure, @tagName(owner.state), requests, owner.data.count});
     try t.expect(owner.state == .detached and running.nativeOutputs() == null and running.nativeObject() != null);
@@ -2289,7 +2309,7 @@ fn checkDeviceOutputs(target: *@import("gsp_device.zig").Device, words: []u32, f
         try t.expect(std.mem.readInt(u32, request.payload[4..8], .little) ==
             (if (query == .ports or query == .ddc) running.graph.?.base.plan.handles.i2c else running.graph.?.base.plan.handles.display));
         try t.expect(std.mem.readInt(u32, request.payload[8..12], .little) == @intFromEnum(std.meta.activeTag(query)));
-        try t.expect(std.mem.readInt(u32, request.payload[20..24], .little) == @as(u32, if (query == .ddc) 2 else 0) and channel == running.activeChannel());
+        try t.expect(std.mem.readInt(u32, request.payload[20..24], .little) == @as(u32, if (query == .ddc) 2 else if (query == .aux) 1 else 0) and channel == running.activeChannel());
         var response: [rpc.max_request_bytes]u8 = @splat(0);
         const payload = response[0..request.payload.len];
         @memcpy(payload, request.payload);
@@ -2367,7 +2387,7 @@ fn checkDeviceOutputs(target: *@import("gsp_device.zig").Device, words: []u32, f
             .resource => |id| {
                 outputWord(payload, 32, 0xffffffff); // Unassigned OR must remain unassigned.
                 outputWord(payload, 36, 2);
-                outputWord(payload, 40, 1);
+                outputWord(payload, 40, if (scenario == .outputs_aux) 8 else 1);
                 outputWord(payload, 56, 1);
                 outputWord(payload, 60, 27); // DCB index is not log2(RM display ID).
                 payload[72] = 1;
@@ -2381,7 +2401,7 @@ fn checkDeviceOutputs(target: *@import("gsp_device.zig").Device, words: []u32, f
             .edid => {
                 try t.expect(std.mem.readInt(u32, payload[36..40], .little) == 2); // RAW; no cached boot EDID.
                 outputWord(payload, 32, if (scenario == .outputs_missing) 0 else 256);
-                outputEdid(payload[40..296], scenario == .outputs_incomplete or ddc_case, scenario == .outputs_bad_edid);
+                outputEdid(payload[40..296], scenario == .outputs_incomplete or ddc_case or scenario == .outputs_aux, scenario == .outputs_bad_edid);
                 if (scenario == .outputs_edid_rejected) outputWord(payload, 12, 0x55);
             },
             .ports => {
@@ -2392,11 +2412,28 @@ fn checkDeviceOutputs(target: *@import("gsp_device.zig").Device, words: []u32, f
             .ddc => |ddc| {
                 try t.expect(ddc_case and ddc.port == @as(u8, if (scenario == .outputs_ddc_bus_changed) 3 else 2) and ddc.display_id == 1);
                 var blob: [4096]u8 = @splat(0);
-                outputEdid(blob[0..256], false, false);
-                blob[126] = 31;
-                blob[127] -%= 30;
-                for (2..32) |index| { blob[index * 128] = 0x99; blob[index * 128 + 127] = 0 -% @as(u8, 0x99); }
+                outputEdidFull(&blob);
                 _ = try rpc.ddc_wire.encode(.{ .port = ddc.port, .block = ddc.block }, blob[@as(usize, ddc.block) * 128 ..][0..128], payload[24..]);
+            },
+            .aux => |request_aux| {
+                try t.expect(scenario == .outputs_aux and request_aux.display_id == 1);
+                const operation = request_aux.operation;
+                const count = rpc.aux_wire.length(operation);
+                outputWord(payload, 60, count);
+                switch (operation) {
+                    .caps => payload[44] = 0x14,
+                    .segment => |segment| aux_segment = segment,
+                    .offset => |offset| aux_offset = offset,
+                    .read => |read| {
+                        var blob: [4096]u8 = undefined;
+                        outputEdidFull(&blob);
+                        const position = @as(usize, aux_segment) * 256 + aux_offset;
+                        @memcpy(payload[44..][0..count], blob[position..][0..count]);
+                        aux_offset +%= count;
+                        if (read.last) aux_segment = 0;
+                    },
+                    else => return error.UnexpectedAux,
+                }
             },
         }
         if (scenario == .outputs_timeout and requests == 0) clock = deadline else {
@@ -2466,6 +2503,9 @@ fn checkDeviceOutputs(target: *@import("gsp_device.zig").Device, words: []u32, f
         try t.expect(first.status == expected_status and first.connected.?);
         if (first.status == .valid_edid) try t.expect(first.report.hdmi and first.report.mode_count != 0 and first.report.audio_count != 0);
         if (scenario == .outputs_ddc) try t.expect(first.source == .ddc and first.edid_bytes == 4096 and first.report.declared_extensions == 31 and first.report.complete());
+        if (scenario == .outputs_aux) try t.expect(first.source == .aux and first.edid_bytes == 4096 and first.aux_caps_bytes == 16 and first.report.complete());
+        if (scenario == .outputs_ddc) try t.expect(DeviceModel.receiver_logs == 2 and DeviceModel.ddc_logs == 1);
+        if (scenario == .outputs_aux) try t.expect(DeviceModel.receiver_logs == 2 and DeviceModel.aux_logs == 1);
         const published = &CatalogModel.first;
         try t.expect(published.flags & a.gfx_output_flag_connected != 0 and CatalogModel.last.edid_bytes == 0 and CatalogModel.last.mode_count == 0);
         switch (first.status) {

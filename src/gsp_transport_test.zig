@@ -679,7 +679,7 @@ fn displayReply(model: *Model, channel: *display_rpc.Channel, status: u32, value
                 byte.* = @truncate(i);
             };
         },
-        .heads, .active, .connectors, .resource, .buses, .ports, .ddc => unreachable, // Dedicated bounded topology/DDC fixtures below.
+        .heads, .active, .connectors, .resource, .buses, .ports, .ddc, .aux => unreachable, // Dedicated bounded topology/DDC fixtures below.
     }
     // The RPC sequence and private result deliberately do not echo the request.
     try model.replyRpc(channel.exchange.session, .{ .function = 76, .result = 0, .result_private = 0x19283746, .sequence = 0xdeadbeef }, encoded);
@@ -1832,6 +1832,14 @@ fn checkReceiver(model: *Model) !void {
                     try t.expect(owner.state == .ready);
                     continue;
                 }
+                if (refresh.state == .resource) {
+                    try t.expect((try refresh.poll()) == null);
+                    var bytes: [80]u8 = undefined;
+                    const payload = try display_rpc.encode(refresh.channel.object, refresh.channel.request.?, &bytes);
+                    put(&bytes, 36, 2); put(&bytes, 40, 1);
+                    try model.replyRpc(&session, .{ .function = 76, .result = 0 }, payload);
+                    try t.expect((try refresh.poll()) == null);
+                }
                 if (refresh.state == .buses) {
                     try t.expect((try refresh.poll()) == null);
                     var bytes: [40]u8 = undefined;
@@ -2150,6 +2158,192 @@ fn checkDdcWire() !void {
         try t.expectError(error.Query, wire.encode(request, null, &encoded));
 }
 
+fn checkAuxWire() !void {
+    const wire = display_rpc.aux_wire;
+    const golden = @embedFile("fixtures/aux-570.144.bin");
+    const operations = [_]wire.Operation{ .caps, .{ .segment = 15 }, .{ .offset = 128 }, .segment_status, .offset_status,
+        .{ .read = .{ .count = 16, .last = false } }, .{ .read = .{ .count = 1, .last = true } }, .stop };
+    var buffer: [49]u8 = @splat(0xa5);
+    for (operations, 0..) |operation, i| {
+        const request = wire.Request{ .display_id = 0x80000000, .operation = operation };
+        const pair = golden[i * 96 ..][0..96];
+        try t.expectEqualSlices(u8, pair[0..48], try wire.encode(request, &buffer));
+        try t.expect(buffer[48] == 0xa5);
+        const reply = try wire.decode(request, 0, pair[48..96]);
+        try t.expect(reply.kind == .ack and reply.count == wire.length(operation));
+        if (operation == .read or operation == .caps) for (reply.data[0..reply.count], 0..) |value, j| try t.expectEqual(@as(u8, @truncate(j * 23 + i)), value);
+        for (0..48) |size| {
+            try t.expectError(error.Bounds, wire.encode(request, buffer[0..size]));
+            try t.expectError(error.Payload, wire.decode(request, 0, pair[48..][0..size]));
+        }
+        @memcpy(buffer[0..48], pair[48..96]);
+        put(&buffer, 36, wire.length(operation) + 1);
+        try t.expectError(error.Payload, wire.decode(request, 0, buffer[0..48]));
+        put(&buffer, 40, 7);
+        try t.expectError(error.Payload, wire.decode(request, 0, buffer[0..48]));
+        put(&buffer, 44, 0xffffffff);
+        const error_reply = try wire.decode(request, 0x66, buffer[0..48]);
+        try t.expect(error_reply.status == 0x66 and error_reply.retry_ms == 0xffffffff and error_reply.count == 0);
+        try t.expect((try wire.decode(request, 0x1f, buffer[0..48])).retry_ms == 0);
+    }
+    for ([_]wire.Operation{ .{ .segment = 16 }, .{ .read = .{ .count = 0, .last = false } }, .{ .read = .{ .count = 17, .last = true } } }) |operation|
+        try t.expectError(error.Query, wire.encode(.{ .display_id = 1, .operation = operation }, &buffer));
+}
+
+fn checkAuxReceiver(model: *Model) !void {
+    const capture = try t.allocator.create(receiver.Capture);
+    defer t.allocator.destroy(capture);
+    const end = 20 * std.time.ns_per_ms;
+    const Case = enum { full, short_final, defer_reply, defer_exhausted, rm_retry, prefix_nack, zero_read,
+        hpd, prepared_hpd, stop_failure, stop_rpc, stop_ack, ack, expired, changed_base, caps_rejected, dynamic, dvi };
+    for (std.enums.values(Case)) |case| {
+        var session: transport.Session = undefined;
+        var boot = try startBoot(model, &session);
+        try model.replyRpc(&session, .{ .function = 0x1001, .result = 0 }, &.{ 0, 0, 0, 0 });
+        try boot.complete((try boot.poll()).?.ticket);
+        var token = try boot.handoff(deadline);
+        var parent = try rm_graph.Owner.init(&token, 1, "AUX", deadline);
+        try graphCreate(model, &parent);
+        var refresh = try receiver.Refresh.init(&parent, 1, capture, end);
+        var blob: [4096]u8 = undefined;
+        receiverFixture(&blob);
+        if (case == .dvi) receiverFixture(blob[0..128]);
+        var segment: u8 = 0;
+        var offset: u8 = 0;
+        var aux_requests: usize = 0;
+        var stops: usize = 0;
+        var defers: usize = 0;
+        var changed = false;
+        var steps: usize = 0;
+        errdefer |err| std.debug.print("AUX case={s} error={s} state={s} block={d} cursor={?} bytes={d} requests={d} stops={d}\n",
+            .{@tagName(case), @errorName(err), @tagName(refresh.state), refresh.block, if (refresh.aux) |r| r.cursor else null, capture.edid_bytes, aux_requests, stops});
+        while (refresh.state != .complete and refresh.state != .obsolete and steps < 1000) : (steps += 1) {
+            model.count = 0;
+            if (refresh.waiting()) {
+                const sent = session.tx_sequence;
+                try t.expect((try refresh.poll()) == null and sent == session.tx_sequence);
+                model.now = if (case == .expired) end else @max(refresh.retry_at_ns, if (refresh.aux) |r| r.retry_at_ns else 0);
+            }
+            if (case == .expired and model.now == end) {
+                try t.expectError(error.Deadline, refresh.poll());
+                break;
+            }
+            if (case == .prepared_hpd and refresh.state == .aux_read and refresh.aux.?.state == .offset and !changed) {
+                var post: [40]u8 = undefined;
+                const notice = registeredPost(&post, .hotplug, true);
+                put(&post, 0, parent.reservation.client); put(&post, 4, try parent.reservation.object(3));
+                try model.replyRpc(&session, .{ .function = 0x1003, .result = 0 }, notice);
+                const sent = session.tx_sequence;
+                _ = (try refresh.poll()).?;
+                try t.expect(refresh.channel.exchange.phase == .prepared and session.tx_sequence == sent);
+                var delivery = try runtime_events.Dispatch.initDisplay(&refresh.channel, try parent.eventSink());
+                try delivery.step();
+                changed = true;
+            }
+            try t.expect((try refresh.poll()) == null);
+            if (refresh.channel.exchange.phase != .waiting) continue;
+            const query = refresh.channel.request.?;
+            model.peerPut(session.link.?.command_read, get(&model.peer[0], 16));
+            var buffer: [display_rpc.max_request_bytes]u8 = undefined;
+            const payload = try display_rpc.encode(refresh.channel.object, query, &buffer);
+            switch (query) {
+                .supported => { put(&buffer, 28, 1); put(&buffer, 32, 1); },
+                .connected => put(&buffer, 32, 1),
+                .edid => put(&buffer, 32, 0), // Missing RAW data triggers the independent AUX path.
+                .resource => { put(&buffer, 36, 2); put(&buffer, 40, 8); buffer[73] = @intFromBool(case == .dynamic); },
+                .aux => |request| {
+                    aux_requests += 1;
+                    try t.expect(get(&buffer, 4) == parent.base.plan.handles.display and get(&buffer, 20) == 1);
+                    const operation = request.operation;
+                    var count: u32 = display_rpc.aux_wire.length(operation);
+                    if (operation == .caps) {
+                        buffer[44] = 0x14;
+                        if (case == .caps_rejected) put(&buffer, 12, 0x1f);
+                    } else if (operation == .segment) {
+                        segment = operation.segment;
+                    } else if (operation == .offset) {
+                        offset = operation.offset;
+                    } else if (operation == .read) {
+                        const position = @as(usize, segment) * 256 + offset;
+                        if (case == .short_final and operation.read.last and !changed) { count = 7; changed = true; }
+                        if (case == .zero_read and operation.read.last) count = 0;
+                        @memcpy(buffer[44..][0..count], blob[position..][0..count]);
+                        if (case == .changed_base and refresh.aux_verifying and offset == 0) buffer[53] ^= 1;
+                        offset +%= @intCast(count);
+                        if (operation.read.last) segment = 0;
+                        if ((case == .prefix_nack and refresh.block == 2 and !refresh.aux_verifying) or
+                            case == .stop_failure or case == .stop_rpc or case == .stop_ack) put(&buffer, 64, 4);
+                        if (case == .hpd and !changed) {
+                            var post: [40]u8 = undefined;
+                            const notice = registeredPost(&post, .hotplug, true);
+                            put(&post, 0, parent.reservation.client); put(&post, 4, try parent.reservation.object(3));
+                            try model.replyRpc(&session, .{ .function = 0x1003, .result = 0 }, notice);
+                            _ = (try refresh.poll()).?;
+                            var delivery = try runtime_events.Dispatch.initDisplay(&refresh.channel, try parent.eventSink());
+                            try delivery.step();
+                            changed = true;
+                        }
+                    } else if (operation == .stop) {
+                        stops += 1;
+                        segment = 0;
+                        if (case == .stop_failure) put(&buffer, 12, 0x1f);
+                    }
+                    if ((case == .defer_reply or case == .defer_exhausted) and
+                        (operation == .offset or operation == .offset_status) and (case == .defer_exhausted or defers < 7)) {
+                        put(&buffer, 64, 8); defers += 1;
+                    }
+                    if ((case == .rm_retry and defers < 2) or case == .expired) {
+                        if (operation == .offset) { put(&buffer, 12, 3); put(&buffer, 68, if (case == .expired) 1000 else 2); defers += 1; }
+                    }
+                    put(&buffer, 60, count);
+                },
+                else => return error.UnexpectedAux,
+            }
+            const stop = query == .aux and query.aux.operation == .stop;
+            try model.replyRpc(&session, .{ .function = 76, .result = if (case == .stop_rpc and stop) 0x66 else 0 }, payload);
+            if ((case == .ack and query == .aux and query.aux.operation == .read) or (case == .stop_ack and stop)) { model.fault = model.count + 4; model.after = true; }
+            if ((case == .ack and query == .aux and query.aux.operation == .read) or
+                ((case == .stop_failure or case == .stop_rpc or case == .stop_ack) and stop)) {
+                try t.expectError(if (case == .ack or case == .stop_ack) error.Io else error.FirmwareResult, refresh.poll());
+                break;
+            }
+            try t.expect((try refresh.poll()) == null);
+        }
+        try t.expect(steps < 1000);
+        if (case == .ack or case == .expired or case == .stop_failure or case == .stop_rpc or case == .stop_ack) {
+            try t.expect(session.state == .failed and refresh.state == .failed and parent.state == .loaned);
+            try t.expectError(error.State, refresh.release(end + 1));
+            continue;
+        }
+        try t.expect(refresh.channel.aux_open == null);
+        if (case == .hpd or case == .prepared_hpd or case == .changed_base) {
+            try t.expect(refresh.state == .obsolete);
+            if (case == .hpd or case == .prepared_hpd) try t.expect(stops == 1);
+        } else {
+            const result = try refresh.borrow(end);
+            const expected: receiver.Status = switch (case) {
+                .caps_rejected, .dynamic => .edid_missing,
+                .prefix_nack => .incomplete_edid,
+                .defer_exhausted, .zero_read => .edid_rejected,
+                else => .valid_edid,
+            };
+            try t.expectEqual(expected, result.status);
+            if (expected == .valid_edid) {
+                const size: usize = if (case == .dvi) 128 else 4096;
+                try t.expect(result.source == .aux and result.edid_bytes == size);
+                try t.expectEqualSlices(u8, blob[0..size], result.bytes[0..size]);
+            }
+            if (case == .dvi) try t.expect(result.report.audio_count == 0 and !result.report.hdmi);
+            if (case == .defer_reply or case == .defer_exhausted) try t.expect(result.aux_retries == 7);
+            if (case == .rm_retry) try t.expect(result.aux_retries == 2 and model.now >= 4 * std.time.ns_per_ms);
+            if (case == .prefix_nack) try t.expect(stops == 1 and result.edid_bytes == 256);
+            if (case == .dynamic) try t.expect(aux_requests == 0);
+        }
+        try refresh.release(end);
+        try t.expect(parent.state == .ready and session.state == .active);
+    }
+}
+
 fn checkI2cGraph(model: *Model) !void {
     const Case = enum { rejected, alloc_ack, alloc_rpc, free_reject, free_ack };
     for (std.enums.values(Case)) |case| {
@@ -2256,6 +2450,7 @@ fn checkDdcReceiver(model: *Model) !void {
                     @memcpy(bytes[40..][0..raw_size], blob[0..raw_size]);
                 },
                 .buses => put(&bytes, 36, if (case == .changed_bus and refresh.state == .bus_verify) 4 else 3),
+                .resource => { put(&bytes, 36, 2); put(&bytes, 40, 1); },
                 .ports => {
                     bytes[26] = if (case == .no_ddc_port) 1 else 7;
                     if (case == .rejected_ports) put(&bytes, 12, 0x55);
@@ -2329,6 +2524,7 @@ test "GSP transport orders range publication, explicit acknowledgement and termi
     const model = try t.allocator.create(Model);
     defer t.allocator.destroy(model);
     try checkDdcWire();
+    try checkAuxWire();
     try checkDisplayRpc(model);
     try checkObjects(model);
     try checkRuntimeEvents(model);
@@ -2337,6 +2533,7 @@ test "GSP transport orders range publication, explicit acknowledgement and termi
     try checkI2cGraph(model);
     try checkReceiver(model);
     try checkDdcReceiver(model);
+    try checkAuxReceiver(model);
     try checkTopology(model);
     for (0..4) |flags| {
         var session = try model.start(@intCast(flags));

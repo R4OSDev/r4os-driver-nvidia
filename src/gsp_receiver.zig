@@ -96,14 +96,15 @@
 //! semantics belong to the shared R4GFX parser; no duplicate driver parser.
 //! Caller-owned capture storage stays off the worker stack and is readable
 //! only after the full query/validation/drain sequence completes. No modeset,
-//! power inference or cached boot EDID substitution. Only an explicit DDC
-//! read rejection can retry, within three attempts and the original deadline.
+//! power inference or cached boot EDID substitution. DDC/AUX retries and
+//! transaction cleanup remain bounded by the original acquisition deadline.
 const std = @import("std");
 const graph = @import("gsp_rm_graph.zig");
 const display = @import("gsp_display_rpc.zig");
+const aux_edid = @import("gsp_aux_edid.zig");
 pub const edid = @import("r4gfx_edid");
 pub const Error = graph.Error;
-pub const State = enum { supported, connected, edid, buses, ports, ddc, ddc_verify, bus_verify, verify, drain, complete, obsolete, failed, released };
+pub const State = enum { supported, connected, edid, resource, aux_caps, aux_read, aux_verify_resource, buses, ports, ddc, ddc_verify, bus_verify, verify, drain, complete, obsolete, failed, released };
 pub const Status = enum { pending, not_supported, disconnected, edid_missing, edid_rejected, invalid_edid, unsupported_data, incomplete_edid, valid_edid, query_rejected };
 pub const Capture = struct {
     epoch: u64 = 0,
@@ -121,12 +122,19 @@ pub const Capture = struct {
     edid_bytes: usize = 0,
     bytes: [edid.max_blocks * 128]u8 = @splat(0),
     report: edid.Report = .{},
-    source: enum { rm_raw, ddc } = .rm_raw,
+    source: enum { rm_raw, ddc, aux } = .rm_raw,
+    resource: ?display.Resource = null,
     buses: ?display.Buses = null,
     port_info: ?u8 = null,
     ddc_retries: u16 = 0,
     ddc_rpc_status: ?u32 = null,
     ddc_control_status: ?u32 = null,
+    aux_caps: [16]u8 = @splat(0),
+    aux_caps_bytes: u8 = 0,
+    aux_retries: u16 = 0,
+    aux_rpc_status: ?u32 = null,
+    aux_control_status: ?u32 = null,
+    aux_reply: ?display.aux_wire.ReplyType = null,
 };
 pub const Refresh = struct {
     owner: *graph.Owner,
@@ -142,6 +150,8 @@ pub const Refresh = struct {
     blocks: u8 = 1,
     attempts: u8 = 0,
     retry_at_ns: u64 = 0,
+    aux: ?aux_edid.Reader = null,
+    aux_verifying: bool = false,
 
     /// Storage and graph remain exclusively borrowed until release. Moving
     /// this value is allowed only before its first poll; never copy it live.
@@ -182,6 +192,9 @@ pub const Refresh = struct {
             .supported => .supported,
             .connected, .verify => .{ .connected = self.capture.display_id },
             .edid => .{ .edid = self.capture.display_id },
+            .resource, .aux_verify_resource => .{ .resource = self.capture.display_id },
+            .aux_caps => .{ .aux = .{ .display_id = self.capture.display_id, .operation = .caps } },
+            .aux_read => .{ .aux = try self.aux.?.query(self.capture.display_id) },
             .buses, .bus_verify => .{ .buses = self.capture.display_id },
             .ports => .ports,
             .ddc, .ddc_verify => .{ .ddc = .{ .display_id = self.capture.display_id,
@@ -201,10 +214,55 @@ pub const Refresh = struct {
         self.capture.status = if (self.capture.report.complete()) .valid_edid else .incomplete_edid;
     }
     fn fallback(self: *Refresh) void {
-        self.state = if (self.capture.status != .valid_edid and self.channel.object.i2c != 0 and self.capture.supported_ddc) .buses else .verify;
+        self.state = if (self.capture.status != .valid_edid) .resource else .verify;
     }
     pub fn waiting(self: *const Refresh) bool {
-        return self.retry_at_ns > self.channel.exchange.session.last_clock;
+        const now = self.channel.exchange.session.last_clock;
+        return self.retry_at_ns > now or (self.aux != null and self.aux.?.retry_at_ns > now);
+    }
+    fn startData(self: *Refresh) void {
+        self.capture.edid_bytes = 0;
+        self.capture.report = .{};
+        self.capture.parse_error = null;
+        self.capture.rpc_status = null;
+        self.capture.control_status = null;
+        self.capture.rejected_command = null;
+        self.capture.status = .pending;
+        @memset(&self.capture.bytes, 0);
+    }
+    fn takeAux(self: *Refresh) Error!void {
+        const reader = &self.aux.?;
+        if (reader.failure_status) |status| self.capture.aux_control_status = status;
+        if (reader.failure_reply) |kind| self.capture.aux_reply = kind;
+        if (reader.state == .rejected) {
+            if (self.aux_verifying) { self.invalidated = true; return; }
+            self.parseCapture();
+            if (self.capture.edid_bytes == 0) self.capture.status = .edid_rejected;
+            if (self.capture.edid_bytes != 0) {
+                self.aux_verifying = true;
+                self.aux = try aux_edid.Reader.init(0, self.block >= 2);
+            } else self.state = .verify;
+            return;
+        }
+        if (reader.state != .complete) return;
+        if (self.aux_verifying) {
+            if (!std.mem.eql(u8, self.capture.bytes[0..128], &reader.bytes)) self.invalidated = true;
+            self.state = .aux_verify_resource;
+            return;
+        }
+        @memcpy(self.capture.bytes[@as(usize, self.block) * 128 ..][0..128], &reader.bytes);
+        self.capture.edid_bytes += 128;
+        if (self.block == 0) {
+            self.parseCapture();
+            if (self.capture.parse_error != null) { self.state = .verify; return; }
+            self.blocks = @intCast(@min(@as(u16, self.capture.bytes[126]) + 1, edid.max_blocks));
+        }
+        self.block += 1;
+        if (self.block == self.blocks) {
+            self.parseCapture();
+            self.aux_verifying = true;
+            self.aux = try aux_edid.Reader.init(0, self.blocks > 2);
+        } else self.aux = try aux_edid.Reader.init(self.block, false);
     }
     pub fn matches(self: *Refresh, current: *const @import("gsp_exchange.zig").Exchange, deadline: u64) bool {
         if (self.self_address != @intFromPtr(self) or self.failure != null or self.deadline != deadline) return false;
@@ -217,6 +275,19 @@ pub const Refresh = struct {
             return;
         }
         if (reply == .rpc_error or reply == .control_error) {
+            if (self.state == .aux_read) {
+                if (reply == .rpc_error) self.capture.aux_rpc_status = reply.rpc_error else self.capture.aux_control_status = reply.control_error;
+                if (self.aux.?.state == .stop) return error.FirmwareResult;
+                self.aux.?.abort(self.channel.aux_open != null);
+                try self.takeAux();
+                return;
+            }
+            if (self.state == .resource or self.state == .aux_caps or self.state == .aux_verify_resource) {
+                if (reply == .rpc_error) self.capture.aux_rpc_status = reply.rpc_error else self.capture.aux_control_status = reply.control_error;
+                if (self.state == .aux_verify_resource) self.invalidated = true;
+                self.state = .verify;
+                return;
+            }
             if (self.state == .ddc or self.state == .ddc_verify) {
                 if (reply == .rpc_error) self.capture.ddc_rpc_status = reply.rpc_error else self.capture.ddc_control_status = reply.control_error;
                 // Only complete, ACKable RM results can retry. No copyout,
@@ -282,6 +353,49 @@ pub const Refresh = struct {
                 self.parseCapture();
                 self.fallback();
             },
+            .resource => {
+                if (reply != .resource) return error.Unexpected;
+                self.capture.resource = reply.resource;
+                self.state = if (display.nativeDp(reply.resource)) .aux_caps else
+                    if (!reply.resource.dynamic and self.channel.object.i2c != 0 and self.capture.supported_ddc) .buses else .verify;
+            },
+            .aux_caps => {
+                if (reply != .aux) return error.Unexpected;
+                const value = reply.aux;
+                const deferred = value.status == 0 and (value.kind == .defer_reply or value.kind == .i2c_defer);
+                if (((value.status == 3 or value.status == 0x66) and self.attempts < 2) or (deferred and self.attempts < 7)) {
+                    self.attempts += 1;
+                    self.capture.aux_retries += 1;
+                    self.retry_at_ns = std.math.add(u64, self.channel.exchange.session.last_clock,
+                        @max(500 * std.time.ns_per_us, @as(u64, value.retry_ms) * std.time.ns_per_ms)) catch return error.Clock;
+                    return;
+                }
+                self.attempts = 0;
+                self.retry_at_ns = 0;
+                if (value.status != 0 or value.kind != .ack) {
+                    if (value.status != 0) self.capture.aux_control_status = value.status else self.capture.aux_reply = value.kind;
+                    self.state = .verify;
+                    return;
+                }
+                self.capture.aux_caps = value.data;
+                self.capture.aux_caps_bytes = value.count;
+                self.capture.source = .aux;
+                self.startData();
+                self.aux = try aux_edid.Reader.init(0, false);
+                self.state = .aux_read;
+            },
+            .aux_read => {
+                if (reply != .aux) return error.Unexpected;
+                const old_retries = self.aux.?.retries;
+                try self.aux.?.consume(reply.aux, self.channel.exchange.session.last_clock, self.channel.aux_open != null);
+                self.capture.aux_retries += self.aux.?.retries - old_retries;
+                try self.takeAux();
+            },
+            .aux_verify_resource => {
+                if (reply != .resource) return error.Unexpected;
+                if (!std.meta.eql(self.capture.resource.?, reply.resource)) self.invalidated = true;
+                self.state = .verify;
+            },
             .buses => {
                 if (reply != .buses) return error.Unexpected;
                 self.capture.buses = reply.buses;
@@ -295,14 +409,7 @@ pub const Refresh = struct {
                 self.capture.port_info = info;
                 if (info & 5 != 5) { self.state = .verify; return; }
                 self.capture.source = .ddc;
-                self.capture.edid_bytes = 0;
-                self.capture.report = .{};
-                self.capture.parse_error = null;
-                self.capture.rpc_status = null;
-                self.capture.control_status = null;
-                self.capture.rejected_command = null;
-                self.capture.status = .pending;
-                @memset(&self.capture.bytes, 0);
+                self.startData();
                 self.state = .ddc;
             },
             .ddc, .ddc_verify => {
@@ -346,8 +453,14 @@ pub const Refresh = struct {
         self.guard() catch |err| return self.fail(err);
         if (self.channel.pending != null) return error.Pending;
         if (self.invalidated and self.channel.exchange.phase == .idle) {
-            self.state = .obsolete;
-            return null;
+            if (self.channel.aux_open != null) {
+                if (self.aux == null) self.aux = try aux_edid.Reader.init(0, false);
+                if (self.aux.?.state != .stop) self.aux.?.abort(true);
+                self.state = .aux_read;
+            } else {
+                self.state = .obsolete;
+                return null;
+            }
         }
         if (self.channel.exchange.phase == .idle and self.state != .drain and !self.waiting()) {
             self.channel.begin(try self.query(), self.deadline) catch |err| return self.fail(err);
@@ -356,7 +469,11 @@ pub const Refresh = struct {
             if (err == error.Pending) return err;
             if (err == error.Obsolete) {
                 self.invalidated = true;
-                self.state = .obsolete;
+                if (self.channel.aux_open != null) {
+                    if (self.aux == null) self.aux = try aux_edid.Reader.init(0, false);
+                    self.aux.?.abort(true);
+                    self.state = .aux_read;
+                } else self.state = .obsolete;
                 return null;
             }
             return self.fail(err);
@@ -364,11 +481,17 @@ pub const Refresh = struct {
         self.guard() catch |err| return self.fail(err);
         if (pending) |dispatch| {
             if (dispatch.value == .notification) return dispatch;
-            if (!self.invalidated) self.consume(dispatch.value.reply) catch |err| return self.fail(err);
-            self.channel.complete(dispatch.ticket) catch |err| return self.fail(err);
+            const stopping = self.channel.request.? == .aux and self.channel.request.?.aux.operation == .stop;
+            // AUX replies own their small value payload. Retire the receipt
+            // first, so the block reader sees whether final-read/STOP closed
+            // MOT. RAW EDID remains borrowed and is consumed before its ACK.
+            const aux_value = dispatch.value.reply == .aux;
+            if (aux_value) self.channel.complete(dispatch.ticket) catch |err| return self.fail(err);
+            if (!self.invalidated or stopping) self.consume(dispatch.value.reply) catch |err| return self.fail(err);
+            if (!aux_value) self.channel.complete(dispatch.ticket) catch |err| return self.fail(err);
             self.capture.receipt_serial = dispatch.ticket.serial;
             self.guard() catch |err| return self.fail(err);
-            if (self.invalidated) self.state = .obsolete;
+            if (self.invalidated and self.channel.aux_open == null) self.state = .obsolete;
         } else if (self.state == .drain) {
             // A final idle receive closes queued-notice races before exposing
             // the capture. Later physical changes still require normal HPD work.

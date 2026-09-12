@@ -1,5 +1,14 @@
 ﻿# Third-Party Notices
 
+AUX acquisition (NVIDIA 0.1.63, 2026-09-12):
+The fixed AUX ABI, copyout-on-error contract and EDID transaction workflow
+follow pinned NVIDIA 570.144, Nouveau and drm_dp_helper.c from Linux 7.2.4.
+Their complete MIT and Keith Packard permission/disclaimer notices remain
+in the adapted sources and the identically embedded/staged runtime notice.
+Full originals and hash verification accompany 0.79.12/aux-20260912. Eight
+original C request/response pairs independently validate the wire layout.
+No Linux or NVIDIA C implementation is newly linked into NVIDIA.R4D.
+
 DDC block acquisition (NVIDIA 0.1.62, 2026-09-12):
 The bounded FINN EDID codec, NV40_I2C graph child, port and retry contracts
 use the pinned 570.144 sources. Complete source notices are retained in

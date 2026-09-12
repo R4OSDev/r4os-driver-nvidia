@@ -1,3 +1,50 @@
+// AUX protocol reference notices; original R4OS ownership code remains Apache-2.0.
+// Nvidia/OpenKernelModules-570.144/src/nvidia/inc/kernel/rmapi/control.h
+// /*
+//  * SPDX-FileCopyrightText: Copyright (c) 2004-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//  * SPDX-License-Identifier: MIT
+//  *
+//  * Permission is hereby granted, free of charge, to any person obtaining a
+//  * copy of this software and associated documentation files (the "Software"),
+//  * to deal in the Software without restriction, including without limitation
+//  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//  * and/or sell copies of the Software, and to permit persons to whom the
+//  * Software is furnished to do so, subject to the following conditions:
+//  *
+//  * The above copyright notice and this permission notice shall be included in
+//  * all copies or substantial portions of the Software.
+//  *
+//  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+//  * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+//  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+//  * DEALINGS IN THE SOFTWARE.
+//  */
+// Nvidia/OpenKernelModules-570.144/src/nvidia/generated/g_disp_objs_nvoc.c
+// Except where noted otherwise, the individual files within this package are
+// licensed as MIT:
+//
+//     Copyright (c) 2021 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//
+//     Permission is hereby granted, free of charge, to any person obtaining a
+//     copy of this software and associated documentation files (the "Software"),
+//     to deal in the Software without restriction, including without limitation
+//     the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//     and/or sell copies of the Software, and to permit persons to whom the
+//     Software is furnished to do so, subject to the following conditions:
+//
+//     The above copyright notice and this permission notice shall be included in
+//     all copies or substantial portions of the Software.
+//
+//     THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//     IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//     FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+//     THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//     LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+//     FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+//     DEALINGS IN THE SOFTWARE.
 // DDC/I2C reference notices: unchanged NVIDIA 570.144 attribution.
 // Nvidia570.144/src/common/sdk/nvidia/inc/ctrl/ctrl402c.h
 // /*
@@ -172,15 +219,16 @@ const exchange = @import("gsp_exchange.zig");
 const transport = exchange.transport;
 const message = transport.message;
 pub const ddc_wire = @import("gsp_ddc_wire.zig");
+pub const aux_wire = @import("gsp_aux_wire.zig");
 pub const Error = boot_events.Error || error{ Handle, Query, Unexpected, Obsolete, Bounds };
 pub const function: u32 = 76;
 pub const header_bytes = 24;
 pub const max_edid_bytes = 2048;
 pub const max_request_bytes = header_bytes + 16 + max_edid_bytes;
 pub const max_heads = 32;
-pub const Command = enum(u32) { heads = 0x730102, active = 0x73010c, supported = 0x730107, connected = 0x730108, edid = 0x730245, connectors = 0x730250, resource = 0x73028b, buses = 0x730211, ports = 0x402c0101, ddc = ddc_wire.command };
+pub const Command = enum(u32) { heads = 0x730102, active = 0x73010c, supported = 0x730107, connected = 0x730108, edid = 0x730245, connectors = 0x730250, resource = 0x73028b, buses = 0x730211, ports = 0x402c0101, ddc = ddc_wire.command, aux = aux_wire.command };
 pub const Ddc = struct { display_id: u32, port: u8, block: u8 };
-pub const Query = union(Command) { heads: void, active: u32, supported: void, connected: u32, edid: u32, connectors: u32, resource: u32, buses: u32, ports: void, ddc: Ddc };
+pub const Query = union(Command) { heads: void, active: u32, supported: void, connected: u32, edid: u32, connectors: u32, resource: u32, buses: u32, ports: void, ddc: Ddc, aux: aux_wire.Request };
 pub const Object = struct { epoch: u64, client: u32, display: u32, i2c: u32 = 0 };
 pub const Supported = struct { displays: u32, ddc: u32 };
 pub const Connector = struct { index: u32 = 0, kind: u32 = 0, location: u32 = 0 };
@@ -220,6 +268,7 @@ pub const Reply = union(enum) {
     buses: Buses,
     ports: [16]u8,
     ddc: [ddc_wire.block_bytes]u8,
+    aux: aux_wire.Reply,
     // Raw, bounded bytes only. An empty blob is not an EDID; the receiver
     // parser must validate the header, all advertised blocks and checksums.
     edid: []const u8,
@@ -252,6 +301,7 @@ fn paramsSize(query: Query) usize {
         .buses => 16,
         .ports => 16,
         .ddc => ddc_wire.bytes,
+        .aux => aux_wire.bytes,
     };
 }
 fn oneBit(mask: u32) bool {
@@ -261,15 +311,18 @@ fn oneBit(mask: u32) bool {
 fn target(object: Object, query: Query) u32 {
     return if (query == .ports or query == .ddc) object.i2c else object.display;
 }
-fn flags(query: Query) u32 { return if (query == .ddc) ddc_wire.rpc_flags else 0; }
-/// Encode only the fixed allowlist. The DDC read alone uses FINN serialization;
-/// no request permits copyout-on-error or sends CPU pointers to firmware.
+fn flags(query: Query) u32 { return if (query == .ddc) ddc_wire.rpc_flags else if (query == .aux) aux_wire.rpc_flags else 0; }
+fn stopping(query: Query) bool { return query == .aux and query.aux.operation == .stop; }
+pub fn nativeDp(resource: Resource) bool { return resource.kind == 2 and (resource.protocol == 8 or resource.protocol == 9) and !resource.dynamic; }
+/// Encode only the fixed allowlist. DDC alone uses FINN serialization; AUX
+/// alone requests the documented retry delay on RM errors. No CPU pointers.
 /// Output-only fields and the complete EDID array start at zero.
 pub fn encode(object: Object, query: Query, output: []u8) Error![]const u8 {
     if (object.epoch == 0 or object.client == 0 or object.display == 0 or target(object, query) == 0) return error.Handle;
     switch (query) {
         .supported, .heads, .ports => {},
         .ddc => |request| if (!oneBit(request.display_id) or request.port >= 16 or request.block >= ddc_wire.max_blocks) return error.Query,
+        .aux => |request| if (!oneBit(request.display_id)) return error.Query,
         .active => |head| if (head >= max_heads) return error.Query,
         .connected => |mask| if (mask == 0) return error.Query,
         .edid, .connectors, .resource, .buses => |id| if (!oneBit(id)) return error.Query,
@@ -289,6 +342,7 @@ pub fn encode(object: Object, query: Query, output: []u8) Error![]const u8 {
     switch (query) {
         .supported, .heads, .ports => {},
         .ddc => |request| { _ = try ddc_wire.encode(.{ .port = request.port, .block = request.block }, null, bytes[header_bytes..]); },
+        .aux => |request| { _ = try aux_wire.encode(request, bytes[header_bytes..]); },
         .active => |head| put(bytes, header_bytes + 4, head),
         .connected => |mask| put(bytes, header_bytes + 8, mask),
         .connectors, .resource, .buses => |id| put(bytes, header_bytes + 4, id),
@@ -315,6 +369,7 @@ pub fn decode(object: Object, query: Query, record: message.Record) Error!Reply 
         word(bytes, 8) != @intFromEnum(std.meta.activeTag(query))) return error.Unexpected;
     if (word(bytes, 16) != size or word(bytes, 20) != flags(query)) return error.Payload;
     const status = word(bytes, 12);
+    if (query == .aux) return .{ .aux = try aux_wire.decode(query.aux, status, bytes[header_bytes..]) };
     // NONE disallows using even retry-time/output bytes on a control error.
     if (status != 0) return .{ .control_error = status };
     const params = bytes[header_bytes..];
@@ -326,7 +381,7 @@ pub fn decode(object: Object, query: Query, record: message.Record) Error!Reply 
     }
     if (word(params, 0) != 0) return error.Unexpected;
     return switch (query) {
-        .ports, .ddc => unreachable,
+        .ports, .ddc, .aux => unreachable,
         .heads => blk: {
             if (word(params, 4) != 0 or word(params, 8) > max_heads) return error.Payload;
             break :blk .{ .heads = word(params, 8) };
@@ -383,6 +438,10 @@ pub const Channel = struct {
     heads: ?u32 = null,
     ports: ?[16]u8 = null,
     ddc_bus: ?struct { display_id: u32, port: u32 } = null,
+    aux_dp: ?u32 = null,
+    // An in-progress I2C transaction survives metadata invalidation. Only a
+    // validated final read/STOP plus its ACK can retire this obligation.
+    aux_open: ?u32 = null,
     connected: u32 = 0,
     pending: ?Dispatch = null,
 
@@ -398,6 +457,7 @@ pub const Channel = struct {
         self.heads = null;
         self.ports = null;
         self.ddc_bus = null;
+        self.aux_dp = null;
         return self.exchange.fail(reason);
     }
     pub fn invalidate(self: *Channel) Error!void {
@@ -406,13 +466,20 @@ pub const Channel = struct {
         self.heads = null;
         self.ports = null;
         self.ddc_bus = null;
+        self.aux_dp = null;
     }
     pub fn begin(self: *Channel, query: Query, deadline: u64) Error!void {
         if (self.exchange.phase != .idle) return error.State;
         if (self.pending != null) return error.Pending;
         self.exchange.guard(@min(self.exchange.deadline orelse deadline, deadline)) catch |err| return self.fail(err);
+        if (self.aux_open) |id| if (query != .aux or query.aux.display_id != id or query.aux.operation == .caps) return error.Query;
         switch (query) {
             .supported => {},
+            .aux => |request| {
+                if (request.operation == .stop) {
+                    if (self.aux_open == null or self.aux_open.? != request.display_id) return error.Query;
+                } else if (self.aux_dp != request.display_id or request.display_id & self.connected == 0) return error.Query;
+            },
             .ports => if (self.supported == null or self.object.i2c == 0) return error.Query,
             .ddc => |request| {
                 const available = self.supported orelse return error.Query;
@@ -441,8 +508,10 @@ pub const Channel = struct {
         try self.exchange.begin(function, bytes, deadline);
         self.request = query;
         self.request_revision = self.exchange.revision;
+        if (query == .aux and query.aux.operation != .caps and query.aux.operation != .stop) self.aux_open = query.aux.display_id;
         if (query == .connected) self.connected &= ~query.connected;
         if (query == .buses) self.ddc_bus = null;
+        if (query == .resource) self.aux_dp = null;
         if (query == .ports) self.ports = null;
     }
     /// Pure native notifier admission for this exact encoded display query.
@@ -454,7 +523,7 @@ pub const Channel = struct {
     }
     pub fn poll(self: *Channel, deadline: u64) Error!?Dispatch {
         if (self.exchange.phase == .prepared and self.pending == null and
-            self.request.? != .supported and self.request_revision != self.exchange.revision)
+            self.request.? != .supported and !stopping(self.request.?) and self.request_revision != self.exchange.revision)
         {
             const end = @min(self.exchange.deadline.?, deadline);
             self.exchange.guard(end) catch |err| return self.fail(err);
@@ -473,11 +542,12 @@ pub const Channel = struct {
             self.heads = null;
             self.ports = null;
             self.ddc_bus = null;
+            self.aux_dp = null;
         }
         var dispatch = Dispatch{ .ticket = received.ticket, .rpc = received.record.rpc, .value = undefined };
         if (received.response) {
             var reply = decode(self.object, self.request.?, received.record) catch |err| return self.fail(err);
-            if (reply != .supported and self.request_revision != self.exchange.revision) reply = .obsolete;
+            if (reply != .supported and !stopping(self.request.?) and self.request_revision != self.exchange.revision) reply = .obsolete;
             dispatch.value = .{ .reply = reply };
         } else {
             dispatch.value = .{ .notification = received.record.payload };
@@ -492,7 +562,7 @@ pub const Channel = struct {
         };
         var dispatch = self.pending orelse return error.Stale;
         if (dispatch.value == .reply and
-            dispatch.value.reply != .supported and self.request_revision != self.exchange.revision)
+            dispatch.value.reply != .supported and !stopping(self.request.?) and self.request_revision != self.exchange.revision)
         {
             dispatch.value = .{ .reply = .obsolete };
             self.pending = dispatch;
@@ -511,10 +581,16 @@ pub const Channel = struct {
                         self.heads = null;
                         self.ports = null;
                         self.ddc_bus = null;
+                        self.aux_dp = null;
                     },
                     .heads => |value| self.heads = value,
                     .ports => |value| self.ports = value,
                     .buses => |value| self.ddc_bus = .{ .display_id = self.request.?.buses, .port = value.ddc },
+                    .resource => |value| self.aux_dp = if (nativeDp(value)) self.request.?.resource else null,
+                    .aux => |value| {
+                        const operation = self.request.?.aux.operation;
+                        if (value.status == 0 and value.kind == .ack and (operation == .stop or (operation == .read and operation.read.last))) self.aux_open = null;
+                    },
                     .connected => |mask| self.connected = (self.connected & ~self.request.?.connected) | mask,
                     else => {},
                 }
@@ -529,13 +605,14 @@ pub const Channel = struct {
         return self.fail(error.Handler);
     }
     pub fn handoff(self: *Channel, deadline: u64) Error!boot_events.Handoff {
-        if (self.pending != null) return error.State;
+        if (self.pending != null or self.aux_open != null) return error.State;
         const runtime = try self.exchange.handoff(deadline);
         self.connected = 0;
         self.supported = null;
         self.heads = null;
         self.ports = null;
         self.ddc_bus = null;
+        self.aux_dp = null;
         return runtime;
     }
 };

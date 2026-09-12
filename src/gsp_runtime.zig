@@ -221,10 +221,18 @@ pub const Owner = struct {
             }
             if (self.outputs.data.count != before) {
                 const capture = &self.outputs.data.receivers[before];
-                self.log("NVIDIA gsp-receiver: candidate generation={d} display={x} status={s} edid={d} modes={d} audio={d} warnings={x} rpc={?} rm={?} source={s} ddc-retries={d} ddc-rpc={?} ddc-rm={?}",
+                self.log("NVIDIA gsp-receiver: candidate generation={d} display={x} status={s} edid={d} modes={d} audio={d} warnings={x} rpc={?} rm={?} source={s}",
                     .{self.output_generation, capture.display_id, @tagName(capture.status), capture.edid_bytes,
-                        capture.report.mode_count, capture.report.audio_count, capture.report.warnings, capture.rpc_status, capture.control_status,
-                        @tagName(capture.source), capture.ddc_retries, capture.ddc_rpc_status, capture.ddc_control_status});
+                        capture.report.mode_count, capture.report.audio_count, capture.report.warnings, capture.rpc_status, capture.control_status, @tagName(capture.source)});
+                if (capture.buses != null or capture.ddc_rpc_status != null or capture.ddc_control_status != null)
+                    self.log("NVIDIA gsp-ddc: generation={d} display={x} port={?} flags={?} retries={d} rpc={?} rm={?}",
+                        .{self.output_generation, capture.display_id, if (capture.buses) |buses| @as(?u32, buses.ddc) else null,
+                            capture.port_info, capture.ddc_retries, capture.ddc_rpc_status, capture.ddc_control_status});
+                if (capture.source == .aux or capture.aux_rpc_status != null or capture.aux_control_status != null or capture.aux_reply != null)
+                    self.log("NVIDIA gsp-aux: generation={d} display={x} dpcd={d} retries={d} rpc={?} rm={?} reply={?}",
+                        .{self.output_generation, capture.display_id, capture.aux_caps_bytes, capture.aux_retries,
+                            capture.aux_rpc_status, capture.aux_control_status,
+                            if (capture.aux_reply) |reply| @as(?u32, @intFromEnum(reply)) else null});
             }
             if (self.outputs.refresh) |*refresh| if (refresh.waiting()) return .idle;
             return if ((self.activeChannel() orelse return error.State).phase == .waiting) .idle else .progress;

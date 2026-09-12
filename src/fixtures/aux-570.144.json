@@ -1,0 +1,19 @@
+{
+  "source_commit": "8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f",
+  "fixture_sha256": "6a91aef6b9510fb82889e89645d4b7d5b58ef78e9d050710b7b1060cbadd4434",
+  "fixture_bytes": 768,
+  "pairs": [
+    "DPCD caps 16",
+    "segment 15",
+    "offset 128",
+    "segment status",
+    "offset status",
+    "read 16 MOT",
+    "read 1 final",
+    "address-only STOP"
+  ],
+  "display_id": "0x80000000",
+  "response": "48-byte original NV0073_CTRL_DP_AUXCH_CTRL_PARAMS request then 48-byte ACK response; returned read byte j=(j*23+pair) mod256",
+  "generator": "Aux-Reference.c in ExFiles/Reference/GFX/Nvidia/0.79.12/aux-20260912",
+  "license": "NVIDIA MIT; full source attribution in gsp_aux_wire.zig and NVIDIA-GSP-RUNTIME-LICENSE.txt"
+}

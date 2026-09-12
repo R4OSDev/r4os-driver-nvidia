@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.62; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.63; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -11,6 +11,17 @@ Starting with R4OS 0.79.9, `IMAGE_SCOPE=slim` includes the current module in
 Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
+
+AUX receiver acquisition (NVIDIA 0.1.63, 2026-09-12):
+
+Confirmed static DP resources use bounded DPCD and I2C-over-AUX reads on
+the actual shared RM channel. Full EDID blocks, short replies, write-status
+DEFER handling, original deadlines and explicit MOT/STOP retirement reach
+the common catalog. Eight original C layout vectors, 51 existing owner
+tests, the module build and complete license staging pass. The actual Device
+fixture publishes 4096 AUX bytes and checks the bounded diagnostic lines.
+Physical port/GPIO correlation remains open; DP training and MST retain
+their later roadmap stages. OssiPC remains untouched.
 
 Bounded DDC acquisition (NVIDIA 0.1.62, 2026-09-12):
 
