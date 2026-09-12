@@ -124,6 +124,7 @@ pub const Error = error{ Stale, Bounds, Unsupported, Descriptor, Memory, Busy, R
 pub const Policy = struct {
     capabilities: caps.Info,
     physical_bytes: u64,
+    role: enum { control, scanout } = .control,
     pub fn validate(self: Policy, space: vaspace.Info, bytes: u64) Error!void {
         const binding = self.capabilities.binding;
         if (binding.epoch != space.epoch or binding.client != space.client or binding.device != space.device) return error.Stale;

@@ -71,7 +71,13 @@ pub const Owner = struct {
             memory.table.buffer_abort == 0 or memory.table.buffer_take_release == 0 or memory.table.buffer_finish_release == 0) return error.Api;
         try plan.validate(adapter, space);
         if (policy) |value| {
-            if (plan.request != null) return error.Descriptor;
+            switch (value.role) {
+                .control => if (plan.request != null) return error.Descriptor,
+                .scanout => {
+                    _ = try @import("gsp_display_image.zig").create(plan, 1, 1);
+                    if (plan.descriptor.usage & a.gfx_buffer_usage_transfer_target == 0) return error.Descriptor;
+                },
+            }
             try value.validate(space, plan.allocation_bytes);
         }
         const children = try token.session.rm_names.reserveChildren(parent, 2);

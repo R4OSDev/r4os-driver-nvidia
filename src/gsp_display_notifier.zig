@@ -1,5 +1,76 @@
 // Derived display protocol portions: MIT, original sources/notices below.
 //
+// Original/Nouveau/dispnv50/wndw.c
+// /*
+//  * Copyright 2018 Red Hat Inc.
+//  *
+//  * Permission is hereby granted, free of charge, to any person obtaining a
+//  * copy of this software and associated documentation files (the "Software"),
+//  * to deal in the Software without restriction, including without limitation
+//  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//  * and/or sell copies of the Software, and to permit persons to whom the
+//  * Software is furnished to do so, subject to the following conditions:
+//  *
+//  * The above copyright notice and this permission notice shall be included in
+//  * all copies or substantial portions of the Software.
+//  *
+//  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+//  * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
+//  * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+//  * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+//  * OTHER DEALINGS IN THE SOFTWARE.
+//  */
+//
+// Original/Nvidia570144/src/nvidia-modeset/src/nvkms-headsurface.c
+// /*
+//  * SPDX-FileCopyrightText: Copyright (c) 2017-2020 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//  * SPDX-License-Identifier: MIT
+//  *
+//  * Permission is hereby granted, free of charge, to any person obtaining a
+//  * copy of this software and associated documentation files (the "Software"),
+//  * to deal in the Software without restriction, including without limitation
+//  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//  * and/or sell copies of the Software, and to permit persons to whom the
+//  * Software is furnished to do so, subject to the following conditions:
+//  *
+//  * The above copyright notice and this permission notice shall be included in
+//  * all copies or substantial portions of the Software.
+//  *
+//  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+//  * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+//  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+//  * DEALINGS IN THE SOFTWARE.
+//  */
+//
+// Original/Nouveau/include/nvhw/class/cl507c.h
+// /*
+//  * Copyright (c) 1993-2014, NVIDIA CORPORATION. All rights reserved.
+//  *
+//  * Permission is hereby granted, free of charge, to any person obtaining a
+//  * copy of this software and associated documentation files (the "Software"),
+//  * to deal in the Software without restriction, including without limitation
+//  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//  * and/or sell copies of the Software, and to permit persons to whom the
+//  * Software is furnished to do so, subject to the following conditions:
+//  *
+//  * The above copyright notice and this permission notice shall be included in
+//  * all copies or substantial portions of the Software.
+//  *
+//  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+//  * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+//  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+//  * DEALINGS IN THE SOFTWARE.
+//  */
+// Derived display protocol portions: MIT, original sources/notices below.
+//
 // Original/Nvidia570144/src/nvidia-modeset/src/nvkms-rm.c
 // /*
 //  * SPDX-FileCopyrightText: Copyright (c) 2013-2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
@@ -80,7 +151,7 @@ const r4os = @import("r4os");
 const a = r4os.abi;
 const storage = @import("gsp_display_storage.zig");
 pub const Error = storage.Error || error{State, Stale, Bounds, Completion};
-pub const Phase = enum { ready, armed, submitted, complete, failed };
+pub const Phase = enum { ready, armed, submitted, complete, begun, failed };
 pub const Result = struct { word: u32, timestamp: u64 };
 pub const Owner = struct {
     self_address: usize = 0,
@@ -95,6 +166,8 @@ pub const Owner = struct {
     point: u64 = 0,
     deadline: u64 = 0,
     result: ?Result = null,
+    offset: u16 = 0,
+    window_used: u2 = 0,
     failed: bool = false,
 
     pub fn open(self: *Owner, ctx: *const r4os.r4dev.DriverContext, adapter: u32, epoch: u64, channel: u32, handle: u32) Error!void {
@@ -127,18 +200,42 @@ pub const Owner = struct {
     fn word(self: *const Owner, index: usize) *volatile u32 { return @ptrFromInt(self.cpu.cpu_address + index * 4); }
     pub fn arm(self: *Owner, point: u64, deadline: u64) Error!void {
         if (!self.valid()) return error.Stale;
-        if ((self.phase != .ready and self.phase != .complete) or point == 0 or point <= self.point or deadline == 0 or deadline == std.math.maxInt(u64)) return error.State;
-        // The previous operation must already have a hardware completion.
-        // This exact private mapping has no independent CPU writer.
-        for (0..4) |i| self.word(i).* = 0;
-        fence(); self.point = point; self.deadline = deadline; self.result = null; self.phase = .armed;
+        if (self.channel != 0 or (self.phase != .ready and self.phase != .complete)) return error.State;
+        try self.reset(point, deadline, 0);
+    }
+    fn reset(self: *Owner, point: u64, deadline: u64, offset: u16) Error!void {
+        if (point == 0 or point <= self.point or deadline == 0 or deadline == std.math.maxInt(u64)) return error.State;
+        // The selected record must be unused or FINISHED. A window's
+        // current BEGUN record remains untouched in the alternate slot.
+        for (0..4) |i| self.word(offset / 4 + i).* = 0;
+        fence(); self.offset = offset; self.point = point; self.deadline = deadline; self.result = null; self.phase = .armed;
+    }
+    /// Windows alternate notifier records. BEGUN confirms a new image;
+    /// FINISHED on a previous record authorizes reuse of that record only.
+    /// Neither status releases the separately retained scanout allocation.
+    pub fn nextWindowOffset(self: *const Owner) Error!u16 {
+        if (!self.valid() or self.channel == 0 or self.offset > 16) return error.Stale;
+        if (self.phase != .ready and self.phase != .begun) return error.Busy;
+        const next: u16 = if (self.window_used == 0) 0 else self.offset ^ 16;
+        const used = self.window_used & (@as(u2, 1) << @intCast(next / 16)) != 0;
+        if (used) {
+            fence(); const status = self.word(next / 4).* >> 30;
+            if (status == 3) return error.Completion;
+            if (status != 2) return error.Busy;
+        }
+        return next;
+    }
+    pub fn armWindow(self: *Owner, point: u64, deadline: u64, offset: u16) Error!void {
+        if (try self.nextWindowOffset() != offset) return error.Stale;
+        try self.reset(point, deadline, offset);
+        self.window_used |= @as(u2, 1) << @intCast(offset / 16);
     }
     pub fn submitted(self: *Owner, point: u64, deadline: u64) Error!void {
         if (!self.valid() or self.phase != .armed or self.point != point or self.deadline != deadline) return error.Stale;
         self.phase = .submitted;
     }
     pub fn poll(self: *Owner) Error!?Result {
-        if (!self.valid() or self.phase != .submitted) return error.State;
+        if (!self.valid() or self.phase != .submitted or self.channel != 0 or self.offset != 0) return error.State;
         const first = self.word(0).*; fence();
         const status = first >> 30;
         if (status == 3) return error.Completion;
@@ -147,6 +244,20 @@ pub const Owner = struct {
         if (self.word(0).* != first) return null;
         self.result = .{ .word = first, .timestamp = (@as(u64, hi) << 32) | lo };
         self.phase = .complete; return self.result;
+    }
+    pub fn pollWindow(self: *Owner) Error!?Result {
+        if (!self.valid() or self.phase != .submitted or self.channel == 0 or self.offset > 16) return error.State;
+        const at = self.offset / 4;
+        const first = self.word(at).*; fence();
+        const status = first >> 30;
+        if (status == 0) return null;
+        // No other producer may replace this newly submitted image while
+        // it is awaiting activation; a prematurely finished record is lost.
+        if (status != 1) return error.Completion;
+        const lo = self.word(at + 2).*; const hi = self.word(at + 3).*; fence();
+        if (self.word(at).* != first) return null;
+        self.result = .{ .word = first, .timestamp = (@as(u64, hi) << 32) | lo };
+        self.phase = .begun; return self.result;
     }
     pub fn quarantine(self: *Owner) void { self.failed = true; self.phase = .failed; self.backing.retained = true; }
     /// Only an unpublished table may abandon this allocation. There is no

@@ -1,5 +1,123 @@
 // Derived display protocol portions: MIT, original sources/notices below.
 //
+// Original/Nouveau/dispnv50/wndwc67e.c
+// /*
+//  * Copyright 2021 Red Hat Inc.
+//  *
+//  * Permission is hereby granted, free of charge, to any person obtaining a
+//  * copy of this software and associated documentation files (the "Software"),
+//  * to deal in the Software without restriction, including without limitation
+//  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//  * and/or sell copies of the Software, and to permit persons to whom the
+//  * Software is furnished to do so, subject to the following conditions:
+//  *
+//  * The above copyright notice and this permission notice shall be included in
+//  * all copies or substantial portions of the Software.
+//  *
+//  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+//  * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
+//  * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+//  * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+//  * OTHER DEALINGS IN THE SOFTWARE.
+//  */
+//
+// Original/Nouveau/dispnv50/wndwc37e.c
+// /*
+//  * Copyright 2018 Red Hat Inc.
+//  *
+//  * Permission is hereby granted, free of charge, to any person obtaining a
+//  * copy of this software and associated documentation files (the "Software"),
+//  * to deal in the Software without restriction, including without limitation
+//  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//  * and/or sell copies of the Software, and to permit persons to whom the
+//  * Software is furnished to do so, subject to the following conditions:
+//  *
+//  * The above copyright notice and this permission notice shall be included in
+//  * all copies or substantial portions of the Software.
+//  *
+//  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+//  * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
+//  * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+//  * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+//  * OTHER DEALINGS IN THE SOFTWARE.
+//  */
+//
+// Original/Nouveau/dispnv50/wndwc57e.c
+// /*
+//  * Copyright 2018 Red Hat Inc.
+//  *
+//  * Permission is hereby granted, free of charge, to any person obtaining a
+//  * copy of this software and associated documentation files (the "Software"),
+//  * to deal in the Software without restriction, including without limitation
+//  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//  * and/or sell copies of the Software, and to permit persons to whom the
+//  * Software is furnished to do so, subject to the following conditions:
+//  *
+//  * The above copyright notice and this permission notice shall be included in
+//  * all copies or substantial portions of the Software.
+//  *
+//  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+//  * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
+//  * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+//  * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+//  * OTHER DEALINGS IN THE SOFTWARE.
+//  */
+//
+// Original/Nvidia570144/src/common/sdk/nvidia/inc/class/clc67e.h
+// /*
+//  * SPDX-FileCopyrightText: Copyright (c) 2020 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//  * SPDX-License-Identifier: MIT
+//  *
+//  * Permission is hereby granted, free of charge, to any person obtaining a
+//  * copy of this software and associated documentation files (the "Software"),
+//  * to deal in the Software without restriction, including without limitation
+//  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//  * and/or sell copies of the Software, and to permit persons to whom the
+//  * Software is furnished to do so, subject to the following conditions:
+//  *
+//  * The above copyright notice and this permission notice shall be included in
+//  * all copies or substantial portions of the Software.
+//  *
+//  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+//  * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+//  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+//  * DEALINGS IN THE SOFTWARE.
+//  */
+//
+// Original/Nvidia570144/src/nvidia-modeset/src/nvkms-evo3.c
+// /*
+//  * SPDX-FileCopyrightText: Copyright (c) 2010-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//  * SPDX-License-Identifier: MIT
+//  *
+//  * Permission is hereby granted, free of charge, to any person obtaining a
+//  * copy of this software and associated documentation files (the "Software"),
+//  * to deal in the Software without restriction, including without limitation
+//  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//  * and/or sell copies of the Software, and to permit persons to whom the
+//  * Software is furnished to do so, subject to the following conditions:
+//  *
+//  * The above copyright notice and this permission notice shall be included in
+//  * all copies or substantial portions of the Software.
+//  *
+//  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+//  * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+//  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+//  * DEALINGS IN THE SOFTWARE.
+//  */
+// Derived display protocol portions: MIT, original sources/notices below.
+//
 // Original/Nouveau/dispnv50/corec57d.c
 // /*
 //  * Copyright 2018 Red Hat Inc.
@@ -115,12 +233,21 @@
 //  * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 //  * OTHER DEALINGS IN THE SOFTWARE.
 //  */
-//! GA106 core-channel method packets. Only typed display operations are
+//! GA106 core/window method packets. Only typed display operations are
 //! encoded; neither arbitrary methods nor caller-selected register writes.
 const std = @import("std");
-pub const Error = error{Bounds, Handle};
-pub const Config = struct { notifier: u32, windows: u32, initialize: bool };
-pub const max_words: usize = 64;
+pub const image = @import("gsp_display_image.zig");
+pub const Error = image.Error || error{Bounds, Handle};
+pub const Kind = @import("gsp_display_channel_wire.zig").Kind;
+pub const Route = struct { window: u32, head: u32 };
+pub const Config = struct {
+    notifier: u32, windows: u32, initialize: bool,
+    kind: Kind = .core,
+    notifier_offset: u16 = 0,
+    route: ?Route = null,
+    scanout: ?image.Image = null,
+};
+pub const max_words: usize = 96;
 pub const Program = struct {
     words: [max_words]u32 = @splat(0),
     count: u16 = 0,
@@ -132,6 +259,7 @@ pub const Program = struct {
     }
 };
 pub fn core(config: Config) Error!Program {
+    if (config.kind != .core or config.scanout != null or config.notifier_offset != 0) return error.Descriptor;
     if (config.notifier == 0) return error.Handle;
     if (config.windows == 0 or config.windows & ~@as(u32, 0xff) != 0) return error.Bounds;
     var out: Program = .{};
@@ -145,12 +273,52 @@ pub fn core(config: Config) Error!Program {
             try out.method(base + 0x10, &.{0x00117fff});
         };
     }
+    var interlocks: u32 = 0;
+    if (config.route) |route| {
+        if (route.window >= 8 or route.head >= 8 or config.windows & (@as(u32, 1) << @intCast(route.window)) == 0) return error.Bounds;
+        try out.method(0x1000 + route.window * 0x80, &.{route.head});
+        interlocks = @as(u32, 1) << @intCast(route.window);
+    }
     // A private16-byte notifier at offset0; no interrupt callback is needed.
     // Its completion establishes method execution, not visible scanout.
     try out.method(0x20c, &.{0x1000});
-    try out.method(0x218, &.{ 0, 0 });
+    try out.method(0x218, &.{ 0, interlocks });
     try out.method(0x200, &.{1});
     try out.method(0x20c, &.{0});
     return out;
 }
+pub fn window(config: Config) Error!Program {
+    if (config.kind != .window or config.notifier == 0 or config.notifier_offset > 16 or config.notifier_offset & 15 != 0) return error.Descriptor;
+    const value = config.scanout orelse return error.Descriptor;
+    const route = config.route orelse return error.Descriptor;
+    try image.validate(value);
+    if (route.window >= 8 or route.head >= 8 or value.channel != 1 + route.window or
+        config.windows & (@as(u32, 1) << @intCast(route.window)) == 0 or config.windows & ~@as(u32, 255) != 0) return error.Bounds;
+    var out: Program = .{};
+    try out.method(0x218, &.{0}); // Disable the release/acquire semaphore context.
+    try out.method(0x21c, &.{ config.notifier, config.notifier_offset }); // WRITE, 16-byte-aligned offset.
+    // C67E uses the context page kind for pitch; SET_STORAGE has no old
+    // MEMORY_LAYOUT bit. The first implementation is mono, unscaled RGB.
+    try out.method(0x308, &.{1}); // Non-tearing, minimum interval1, no timestamp.
+    const size = value.width | (value.height << 16);
+    try out.method(0x224, &.{ size, 0, if (value.format == 0x34325258) @as(u32, 0xe6) else 0xcf, value.pitch >> 6, 0, 0 });
+    try out.method(0x240, &.{ value.dma, 0, 0, 0, 0, 0 }); // Mono RGB: only plane0/left is live.
+    try out.method(0x260, &.{ @as(u32, @intCast(value.offset >> 8)), 0, 0, 0, 0, 0 });
+    try out.method(0x290, &.{0});
+    try out.method(0x298, &.{size});
+    try out.method(0x2a4, &.{ size, 0x11 }); // Output size, horizontal/vertical two-tap scaler.
+    try out.method(0x338, &.{ 0, 0 }); // Disable acquire-only semaphore; scan top-to-bottom, left-to-right.
+    if (config.initialize) {
+        try out.method(0x444, &.{0}); // Identity ILUT when no input LUT is bound.
+        for ([_]u32{ 0x45c, 0x4bc, 0x53c, 0x59c, 0x4a0, 0x580 }) |control| try out.method(control, &.{0});
+        try out.method(0x400, &.{ 0x10000, 0, 0, 0, 0, 0x10000, 0, 0, 0, 0, 0x10000, 0 });
+        // Opaque primary layer: full constant alpha, source K1, destination
+        // 1-K1, color keys disabled; other composition inputs are explicit.
+        try out.method(0x2ec, &.{ 0, 255, 0x4422, 0xffff0000, 0xffff0000, 0xffff0000, 0xffff0000 });
+    }
+    try out.method(0x370, &.{ 1, 0 }); // Interlock with the corresponding core UPDATE.
+    try out.method(0x200, &.{1});
+    return out;
+}
+pub fn encode(config: Config) Error!Program { return if (config.kind == .core) core(config) else window(config); }
 pub fn same(a: Program, b: Program) bool { return a.count == b.count and std.mem.eql(u32, &a.words, &b.words); }

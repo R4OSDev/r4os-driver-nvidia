@@ -52,14 +52,15 @@ pub const display_resources = @import("gsp_display_resources.zig");
 pub const display_upload = @import("gsp_display_upload.zig");
 const DisplayResourcesSlot = struct { owner: ?*display_resources.Owner = null, allocation: r4os.abi.DriverHeapAllocation = .{}, heap: ?r4os.r4dev.DriverHeapContext = null };
 pub const DisplayTableStatus = struct { entries: u32, revision: u64, published_revision: u64, uploading: bool };
-pub const DisplayWork = struct {
+pub const DisplaySubmission = struct {
     handle: DisplayChannelHandle,
     notifier: *display_resources.notifier.Owner,
     config: display_channel.push.commands.Config,
-    deadline: u64,
-    phase: enum { prepare, rewind, submitted } = .prepare,
+    phase: enum { prepare, rewind, submitted, complete } = .prepare,
     ticket: ?display_channel.push.Ticket = null,
 };
+pub const DisplayWork = struct { core: DisplaySubmission, window: ?DisplaySubmission = null, deadline: u64 };
+pub const ActiveDisplayImage = struct { image: display_resources.image.Image, head: u32, core_point: u64, window_point: u64 };
 const subscriptions = @import("gsp_event_objects.zig");
 const outputs = @import("gsp_outputs.zig");
 const inventory = @import("gsp_memory_inventory.zig");
@@ -142,6 +143,7 @@ pub const Owner = struct {
     display_resources_slot: DisplayResourcesSlot = .{},
     display_upload_job: ?struct { operation: display_upload.Upload = .{}, channel_handle: ChannelHandle } = null,
     display_work: ?DisplayWork = null,
+    display_images: [8]?ActiveDisplayImage = @splat(null),
     rm_rejection: ?u32 = null,
     outputs: outputs.Owner = .{},
     output_refresh: bool = false,
@@ -260,7 +262,9 @@ pub const Owner = struct {
         if (self.display_resources_slot.owner) |owner| self.log("NVIDIA gsp-display-table: failed={s} entries={d} revision={d} published={d} upload-held={} storage=retained",
             .{@errorName(err),owner.table.count,owner.table.revision,owner.table.uploaded_revision,self.display_upload_job != null});
         if (self.display_work) |*work| self.log("NVIDIA gsp-display-push: failed={s} channel={x} phase={s} point={d} notifier={x} storage=retained",
-            .{@errorName(err),work.handle.handle,@tagName(work.phase),if(work.ticket)|ticket|ticket.point else 0,if(work.notifier.result)|result|result.word else 0});
+            .{@errorName(err),work.core.handle.handle,@tagName(work.core.phase),if(work.core.ticket)|ticket|ticket.point else 0,if(work.core.notifier.result)|result|result.word else 0});
+        if (self.display_work) |*work| if (work.window) |*window| self.log("NVIDIA gsp-display-image: failed={s} window={d} phase={s} point={d} image={x} storage=retained",
+            .{@errorName(err),window.config.route.?.window,@tagName(window.phase),if(window.ticket)|ticket|ticket.point else 0,window.config.scanout.?.dma});
     }
     fn recordFault(self: *Owner, value: diagnostics.Record) !void {
         var record = value;
@@ -559,6 +563,10 @@ pub const Owner = struct {
     /// Initial core methods and a notifier-backed UPDATE. This does not
     /// assert that a mode was adopted or that an image is visibly scanned.
     pub fn commitDisplayCore(self: *Owner, handle: DisplayChannelHandle, deadline: u64) !void {
+        const core = try self.prepareDisplayCore(handle, deadline);
+        self.display_work = .{ .core = core, .deadline = deadline };
+    }
+    fn prepareDisplayCore(self: *Owner, handle: DisplayChannelHandle, deadline: u64) !DisplaySubmission {
         const owner = try self.findDisplayChannel(handle);
         const value = owner.info() orelse return error.State;
         if (value.config.kind != .core) return error.Unsupported;
@@ -566,14 +574,43 @@ pub const Owner = struct {
             self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         const resources = self.display_resources_slot.owner orelse return error.State;
         const note = resources.publishedNotifier(0) orelse return error.State;
+        if (note.phase != .ready and note.phase != .complete) return error.Busy;
         if (resources.instance != &owner.parent.instance_storage or !std.meta.eql(resources.binding.?, value.config.root)) return error.Stale;
         try self.channel.?.guard(deadline);
-        if (owner.ring.self_address == 0) owner.ring.open(&owner.backing, value.config) catch |err| {
+        if (owner.ring.self_address == 0) owner.ring.open(&owner.backing, value.config, note.point) catch |err| {
             if (err == error.Descriptor or err == error.Retained) self.stop(err); return err;
         };
         const root = owner.parent.info() orelse return error.State;
-        self.display_work = .{ .handle = handle, .notifier = note, .deadline = deadline,
+        return .{ .handle = handle, .notifier = note,
             .config = .{ .notifier = note.handle, .windows = root.hardware.windows, .initialize = !owner.ring.initialized } };
+    }
+    pub fn commitDisplayImage(self: *Owner, core_handle: DisplayChannelHandle, window_handle: DisplayChannelHandle, image_handle: u32, head: u32, deadline: u64) !void {
+        const owner = try self.findDisplayChannel(window_handle);
+        const value = owner.info() orelse return error.State;
+        if (value.config.kind != .window) return error.Unsupported;
+        const root = owner.parent.info() orelse return error.State;
+        if (head >= root.hardware.heads) return error.Bounds;
+        const resources = self.display_resources_slot.owner orelse return error.State;
+        const image = resources.publishedImage(window_handle.slot, image_handle) orelse return error.State;
+        const note = resources.publishedNotifier(window_handle.slot) orelse return error.State;
+        const offset = try note.nextWindowOffset();
+        var core = try self.prepareDisplayCore(core_handle, deadline);
+        const core_owner = try self.findDisplayChannel(core_handle);
+        if (core_owner.parent != owner.parent or resources.instance != &owner.parent.instance_storage) return error.Stale;
+        if (owner.ring.self_address == 0) owner.ring.open(&owner.backing, value.config, note.point) catch |err| {
+            if (err == error.Descriptor or err == error.Retained) self.stop(err); return err;
+        };
+        const route: display_channel.push.commands.Route = .{ .window = owner.config.index, .head = head };
+        core.config.route = route;
+        self.display_work = .{ .core = core, .deadline = deadline,
+            .window = .{ .handle = window_handle, .notifier = note,
+                .config = .{ .notifier = note.handle, .windows = root.hardware.windows, .initialize = !owner.ring.initialized,
+                    .kind = .window, .notifier_offset = offset, .scanout = image, .route = route } } };
+    }
+    pub fn displayImageStatus(self: *Owner, root: DisplayEngineHandle, window: u32) !?ActiveDisplayImage {
+        _ = try self.findDisplayEngine(root);
+        if (window >= self.display_images.len) return error.Bounds;
+        return self.display_images[window];
     }
     fn copyBusy(self: *const Owner) bool { return self.copy_job != null or self.display_upload_job != null or self.display_work != null; }
     /// Discover the engine and create its RM group/share in this VA space.
@@ -886,19 +923,43 @@ pub const Owner = struct {
     }
     fn advanceDisplay(self: *Owner, current: u64) !bool {
         const work = if (self.display_work) |*value| value else return false;
+        if (work.window) |*window| {
+            // Submit both interlocked channels before waiting for either.
+            // Waiting for Window BEGUN first would deadlock the core UPDATE.
+            if (window.phase == .prepare or window.phase == .rewind)
+                return self.advanceDisplaySubmission(window, work.deadline, current);
+        }
+        var progressed = try self.advanceDisplaySubmission(&work.core, work.deadline, current);
+        if (progressed and work.core.phase != .complete) return true;
+        if (work.window) |*window| {
+            progressed = try self.advanceDisplaySubmission(window, work.deadline, current) or progressed;
+            if (window.phase != .complete) return progressed;
+        }
+        if (work.core.phase != .complete) return progressed;
+        if (work.window) |window| {
+            const route = window.config.route.?;
+            self.display_images[route.window] = .{ .image = window.config.scanout.?, .head = route.head,
+                .core_point = work.core.ticket.?.point, .window_point = window.ticket.?.point };
+        }
+        self.display_work = null; return true;
+    }
+    fn advanceDisplaySubmission(self: *Owner, work: *DisplaySubmission, deadline: u64, current: u64) !bool {
+        if (work.phase == .complete) return false;
         const owner = try self.findDisplayChannel(work.handle);
         const resources = self.display_resources_slot.owner orelse return error.State;
-        if (owner.info() == null or resources.publishedNotifier(0) != work.notifier or !owner.ring.valid()) return error.Stale;
+        if (owner.info() == null or resources.publishedNotifier(work.handle.slot) != work.notifier or !owner.ring.valid()) return error.Stale;
         if (work.phase == .submitted) {
-            if (try work.notifier.poll()) |_| {
-                try owner.ring.finish(work.ticket.?.point); self.display_work = null; return true;
+            if (work.notifier.point != work.ticket.?.point or work.notifier.deadline != deadline) return error.Stale;
+            const result = if (work.config.kind == .core) try work.notifier.poll() else try work.notifier.pollWindow();
+            if (result != null) {
+                try owner.ring.finish(work.ticket.?.point); work.phase = .complete; return true;
             }
-            if (current >= work.deadline) return error.Timeout;
+            if (current >= deadline) return error.Timeout;
             return false;
         }
-        if (current >= work.deadline) return error.Timeout;
+        if (current >= deadline) return error.Timeout;
         if (self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return false;
-        const cursors = (try self.device.?.readDisplayCursor(owner, work.deadline)) orelse return false;
+        const cursors = (try self.device.?.readDisplayCursor(owner, deadline)) orelse return false;
         if (cursors.put != owner.ring.put) return error.Completion;
         if (work.phase == .rewind) {
             if (!try owner.ring.rewound(cursors.get)) return false;
@@ -908,10 +969,13 @@ pub const Owner = struct {
             if (err == error.Busy) return false; return err;
         };
         const ticket = work.ticket.?;
-        if (ticket.kind == .frame) try work.notifier.arm(ticket.point, work.deadline);
-        try self.device.?.submitDisplay(owner, ticket, work.config, work.deadline);
+        if (ticket.kind == .frame) {
+            if (work.config.kind == .core) try work.notifier.arm(ticket.point, deadline)
+            else try work.notifier.armWindow(ticket.point, deadline, work.config.notifier_offset);
+        }
+        try self.device.?.submitDisplay(owner, ticket, work.config, deadline);
         if (ticket.kind == .rewind) work.phase = .rewind else {
-            try work.notifier.submitted(ticket.point, work.deadline); work.phase = .submitted;
+            try work.notifier.submitted(ticket.point, deadline); work.phase = .submitted;
         }
         return true;
     }
@@ -1007,6 +1071,18 @@ pub const Owner = struct {
         const space = (self.nativeAddressSpace() orelse return error.State).*;
         const caps = self.nativeMemoryCapabilities() orelse return error.State;
         return self.allocateNativePlan(try vram.surface.create(self.adapter_id, space, caps, request), deadline);
+    }
+    /// Own scanout requires a verified contiguous physical extent in the
+    /// display DMA context, while retaining the common native BO descriptor.
+    pub fn allocateDisplaySurface(self: *Owner, request: vram.surface.Request, deadline: u64) !BufferHandle {
+        const space = (self.nativeAddressSpace() orelse return error.State).*;
+        const caps = self.nativeMemoryCapabilities() orelse return error.State;
+        const summary = self.nativeMemory() orelse return error.State;
+        const plan = try vram.surface.create(self.adapter_id, space, caps, request);
+        _ = try display_resources.image.create(plan, 1, 1);
+        const policy: vram.storage.Policy = .{ .capabilities = caps, .physical_bytes = @min(summary.physical_bytes, summary.reported_bytes), .role = .scanout };
+        try policy.validate(space, plan.allocation_bytes);
+        return self.allocateNativePlanStorage(plan, policy, deadline);
     }
     /// Private instance/USERD/method backing: RM must guarantee initial
     /// clearing and confirm a contiguous extent. Ordinary BOs stay opaque.

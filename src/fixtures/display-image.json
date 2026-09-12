@@ -1,0 +1,16 @@
+{
+  "nvidia": "570.144",
+  "archive": "ExFiles/Reference/GFX/Nvidia/0.79.13/display-image-20260912",
+  "linux": "7.2.4",
+  "vectors": {
+    "sha256": "7303b911a8b6ecedcfbf5827c81c6bc80354935654b295760d5b1c7fbd82e818",
+    "path": "Repositories/Drivers/NVIDIA/src/fixtures/display-image.bin",
+    "bytes": 984
+  },
+  "scope": "Original C67D/C67E/C37B definitions and Nouveau DRF macros: routed core init/repeat and RGB/ARGB window init/repeat, notifier16 and nonzero image origin. No physical GPU proof.",
+  "generator": {
+    "sha256": "acdd521211d74a2a6482cb909e295848e172804857c0146c16fd6c1c5dc0bcb7",
+    "path": "Temp/gfx-display-image-20260912/Original-Image.c",
+    "bytes": 7399
+  }
+}

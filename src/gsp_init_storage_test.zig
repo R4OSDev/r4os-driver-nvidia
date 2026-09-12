@@ -1537,6 +1537,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         context_upload_success, context_upload_timeout, context_upload_fault, context_upload_sync,
         context_upload_release, context_upload_acquire, context_upload_retry,
         context_display_success, context_display_timeout, context_display_fault, context_display_cursor, context_display_notifier, context_display_map,
+        context_display_image, context_display_image_timeout, context_display_image_fault, context_display_image_lost,
         display_root_success, display_root_classes, display_root_reject, display_root_static, display_root_preserve, display_root_free,
         display_root_ack, display_root_timeout, display_root_wrong,
         display_dma_success, display_dma_instance_ack, display_dma_instance_reject, display_dma_oom, display_dma_segment, display_dma_unmap,
@@ -2592,15 +2593,20 @@ fn allocateContextStorage(target: *@import("gsp_device.zig").Device, bytes: u64,
     return allocateContextBuffer(target, bytes, deadline, true);
 }
 fn allocateContextBuffer(target: *@import("gsp_device.zig").Device, bytes: u64, deadline: u64, private: bool) !@import("gsp_runtime.zig").BufferHandle {
+    const handle = if (private) try target.running.allocateNativeStorage(bytes, deadline) else try target.running.allocateNativeBuffer(bytes, deadline);
+    return finishContextBuffer(target, handle, deadline);
+}
+fn finishContextBuffer(target: *@import("gsp_device.zig").Device, handle: @import("gsp_runtime.zig").BufferHandle, deadline: u64) !@import("gsp_runtime.zig").BufferHandle {
+    _ = deadline;
     const model = @import("gsp_vram_test_model.zig").Model;
     const running = &target.running; const session = &target.session.?;
     const command = init.queues_offset + init.command_offset; const status = init.queues_offset + init.status_offset;
-    const handle = if (private) try running.allocateNativeStorage(bytes, deadline) else try running.allocateNativeBuffer(bytes, deadline);
     var steps: usize = 0;
     while (target.phase == .ready and running.native_active != null and steps < 80) : (steps += 1) {
         _ = target.step();
         if (target.phase != .ready or running.native_active == null) break;
         const owner = running.native_buffers[running.native_active.?].owner.?;
+        const private = owner.storage_policy != null;
         const channel = running.activeChannel().?;
         if (channel.phase != .waiting) continue;
         const cursor = (session.tx_write + 62) % 63;
@@ -3130,6 +3136,7 @@ fn checkDeviceDisplayUpload(target: *@import("gsp_device.zig").Device, table: *a
     try t.expect(steps < 30 and running.display_engine_owner.?.instance_bound);
     try running.releaseNativeBuffer(instance);
     const display_case = std.mem.startsWith(u8, scenario, "context_display");
+    const image_case = std.mem.startsWith(u8, scenario, "context_display_image");
     if (display_case) {
         const words: [*]u32 = @ptrFromInt(target.port.window.cpu_address);
         @import("gsp_display_test_model.zig").Model.install(table, scenario, words[0..@intCast(target.port.window.byte_length / 4)]);
@@ -3139,14 +3146,18 @@ fn checkDeviceDisplayUpload(target: *@import("gsp_device.zig").Device, table: *a
         }
         _ = try running.createDisplayNotifier(root, .core, 0);
         try t.expectError(error.Busy, running.createDisplayNotifier(root, .core, 0));
+        if (image_case) _ = try running.createDisplayNotifier(root, .window, 3);
     }
-    const data = try allocateContextStorage(target, 65536, deadline);
+    const data = if (image_case) try finishContextBuffer(target,
+        try running.allocateDisplaySurface(.{ .width = 641, .height = 480, .usage = 40 }, deadline), deadline)
+        else try allocateContextStorage(target, 65536, deadline);
     const data_index = (try running.nativeBufferStatus(data)).info.?.reference.buffer.id - 801;
     try t.expectError(error.Unsupported, running.bindDisplayStorage(root, .window, 2, data));
     const dma = try running.bindDisplayStorage(root, .window, 3, data);
     try running.releaseNativeBuffer(data);
     const table_owner = running.display_resources_slot.owner.?;
-    try t.expect(table_owner.valid() and table_owner.table.count == @as(u32, if (display_case) 2 else 1) and !table_owner.table.published(4, dma) and
+    const entries: u32 = if (image_case) 3 else if (display_case) 2 else 1;
+    try t.expect(table_owner.valid() and table_owner.table.count == entries and !table_owner.table.published(4, dma) and
         model.slots[data_index].imported and model.slots[data_index].gpu.lease.id != 0 and !model.slots[data_index].reference);
     var forged = root; forged.epoch += 1; try t.expectError(error.Stale, running.displayTableStatus(forged));
     const first_deadline = if (model.is("context_upload_retry")) clock + 1 else deadline;
@@ -3213,7 +3224,7 @@ fn checkDeviceDisplayUpload(target: *@import("gsp_device.zig").Device, table: *a
         return;
     }
     try t.expect(target.phase == .ready and running.display_upload_job == null and !ControlModel.reading and !ControlModel.cpu_mapped and
-        table_owner.table.published(4, dma) and (try running.displayTableStatus(root)).published_revision == @as(u32, if (display_case) 2 else 1) and running.copy_completed == 0);
+        table_owner.table.published(4, dma) and (try running.displayTableStatus(root)).published_revision == entries and running.copy_completed == 0);
     try t.expectError(error.Busy, running.uploadDisplayTable(root, handle, deadline));
     try t.expectError(error.Busy, running.beginDestroyGraph(deadline, true));
     try t.expectError(error.Retained, running.retireDisplayEngine(root, deadline));
@@ -3221,15 +3232,120 @@ fn checkDeviceDisplayUpload(target: *@import("gsp_device.zig").Device, table: *a
     const core_handle = try running.createDisplayChannel(root, .core, 0, deadline);
     try t.expect(running.display_engine_owner.?.channels_started);
     try t.expectError(error.Busy, running.bindDisplayStorage(root, .core, 0, data));
+    if (image_case) { try checkDeviceDisplayImage(target, root, core_handle, dma, deadline, scenario); return; }
     if (display_case) { try checkDeviceDisplaySubmissions(target, core_handle, deadline, scenario); return; }
     _ = target.stop();
     try t.expect(table_owner.failed and model.slots[data_index].imported and ControlModel.active and ControlModel.releases == 0);
+}
+fn checkDeviceDisplayImage(target: *@import("gsp_device.zig").Device, root: @import("gsp_runtime.zig").DisplayEngineHandle,
+    core_handle: @import("gsp_runtime.zig").DisplayChannelHandle, dma: u32, deadline: u64, scenario: []const u8) !void
+{
+    const model = @import("gsp_display_test_model.zig").Model;
+    const native_model = @import("gsp_vram_test_model.zig").Model;
+    const push = @import("gsp_display_push.zig");
+    const running = &target.running;
+    errdefer |err| std.debug.print("display image {s}: {s} phase={s} failure={?} core={?} window={?}\n", .{
+        scenario, @errorName(err), @tagName(target.phase), target.failure,
+        if (running.display_work) |work| work.core.phase else null,
+        if (running.display_work) |work| if (work.window) |window| window.phase else null else null });
+    try pumpDisplayChannel(target, core_handle, deadline);
+    const window_handle = try running.createDisplayChannel(root, .window, 3, deadline);
+    try pumpDisplayChannel(target, window_handle, deadline);
+    const core_owner = &running.display_channels[0].?;
+    const window_owner = &running.display_channels[4].?;
+    const table_owner = running.display_resources_slot.owner.?;
+    const core_note = table_owner.publishedNotifier(0).?;
+    const window_note = table_owner.publishedNotifier(4).?;
+    const core_words: [*]u32 = @ptrFromInt(core_note.cpu.cpu_address);
+    const window_words: [*]u32 = @ptrFromInt(window_note.cpu.cpu_address);
+    const core_user = try push.userBase(.core, 0);
+    const window_user = try push.userBase(.window, 3);
+    const image = table_owner.publishedImage(4, dma).?;
+    try t.expect(image.width == 641 and image.height == 480 and image.pitch == 2816 and image.bytes >= 2816 * 480);
+    try t.expect(table_owner.publishedImage(1, dma) == null and try running.displayImageStatus(root, 3) == null);
+    try t.expectError(error.Bounds, running.commitDisplayImage(core_handle, window_handle, dma, 8, deadline));
+    try t.expectError(error.State, running.commitDisplayImage(core_handle, window_handle, dma + 1, 1, deadline));
+    table_owner.surfaces[2].?.descriptor.width += 1;
+    try t.expect(table_owner.publishedImage(4, dma) == null); table_owner.surfaces[2].?.descriptor.width -= 1;
+    const source_index = table_owner.storage[2].info().?.reference.buffer.id - 801;
+    try t.expect(native_model.slots[source_index].live and native_model.slots[source_index].imported and
+        !native_model.slots[source_index].reference and native_model.slots[source_index].gpu.lease.id != 0);
+    const endpoint = target.port.owner.?;
+    const admit = endpoint.admit_display_push.?;
+    for (1..4) |point| {
+        if (point == 3) {
+            // A prior image's BEGUN record cannot be reused before the GPU
+            // reports FINISHED, even though the newer image has begun.
+            try t.expect(window_words[0] >> 30 == 1 and window_words[4] >> 30 == 1);
+            try t.expectError(error.Busy, running.commitDisplayImage(core_handle, window_handle, dma, 1, deadline));
+            try t.expect(running.display_work == null and window_owner.ring.issued == 2);
+            window_words[0] = 2 << 30;
+        }
+        try running.commitDisplayImage(core_handle, window_handle, dma, 1, deadline);
+        const window_part = &running.display_work.?.window.?;
+        try t.expect(window_part.config.notifier_offset == if (point == 2) @as(u16, 16) else 0);
+        try t.expectError(error.Busy, running.commitDisplayCore(core_handle, deadline));
+        try t.expectError(error.Busy, running.retireDisplayChannel(window_handle, deadline));
+        try t.expectError(error.Binding, admit(endpoint.context, &target.port, core_owner, deadline, .read));
+        try admit(endpoint.context, &target.port, window_owner, deadline, .read);
+        if (point == 1) {
+            window_part.config.scanout.?.pitch += 64;
+            try t.expectError(error.Binding, admit(endpoint.context, &target.port, window_owner, deadline, .read));
+            window_part.config.scanout.?.pitch -= 64;
+            window_part.ticket = try window_owner.ring.prepare(0, window_part.config);
+            try window_note.armWindow(window_part.ticket.?.point, deadline, window_part.config.notifier_offset);
+            try admit(endpoint.context, &target.port, window_owner, deadline, .publish);
+            const command: *u32 = @ptrFromInt(window_owner.ring.cpu.cpu_address + 4);
+            command.* ^= 1;
+            try t.expectError(error.Binding, admit(endpoint.context, &target.port, window_owner, deadline, .publish)); command.* ^= 1;
+            window_note.offset = 16;
+            try t.expectError(error.Binding, admit(endpoint.context, &target.port, window_owner, deadline, .publish)); window_note.offset = 0;
+            // CPU-only test preparation: no PUT was published.
+            window_owner.ring.pending = null; window_owner.ring.program = null; window_part.ticket = null;
+            window_note.phase = .ready; window_note.point = 0; window_note.deadline = 0; window_note.window_used = 0;
+        }
+        _ = target.step();
+        try t.expect(target.phase == .ready and window_part.phase == .submitted and running.display_work.?.core.phase == .prepare and
+            window_owner.ring.issued == point and core_owner.ring.issued == point - 1);
+        try t.expect(model.words[window_user / 4] == window_owner.ring.put * 4);
+        _ = target.step();
+        try t.expect(target.phase == .ready and running.display_work.?.core.phase == .submitted and core_owner.ring.issued == point);
+        model.words[(window_user + 4) / 4] = model.words[window_user / 4];
+        model.words[(core_user + 4) / 4] = model.words[core_user / 4];
+        core_words[0] = 2 << 30; _ = target.step();
+        try t.expect(target.phase == .ready and running.display_work != null and core_owner.ring.completed == point and window_owner.ring.completed == point - 1);
+        if (point == 1) try t.expect(try running.displayImageStatus(root, 3) == null);
+        const at = window_note.offset / 4;
+        if (model.is("context_display_image_timeout")) clock = deadline else {
+            window_words[at + 2] = @intCast(100 + point); window_words[at + 3] = 7;
+            window_words[at] = if (model.is("context_display_image_lost")) 2 << 30 else 1 << 30;
+            if (model.is("context_display_image_fault")) try nativeEvent(&target.session.?, 0x10ff, &.{});
+        }
+        _ = target.step();
+        if (!model.is("context_display_image")) {
+            try t.expect(target.phase == .recovering and running.display_work != null and running.display_images[3] == null and
+                table_owner.failed and window_note.failed and window_owner.ring.completed == 0 and model.released == 0 and
+                native_model.slots[source_index].imported and native_model.slots[source_index].gpu.lease.id != 0);
+            for (&model.slots) |*slot| try t.expect(slot.active and slot.cpu and slot.dma.lease.id != 0);
+            return;
+        }
+        const active_image = (try running.displayImageStatus(root, 3)).?;
+        try t.expect(target.phase == .ready and running.display_work == null and window_owner.ring.completed == point and
+            core_owner.ring.completed == point and std.meta.eql(active_image.image, image) and active_image.head == 1 and
+            active_image.core_point == point and active_image.window_point == point and window_note.result.?.timestamp == (@as(u64, 7) << 32) + 100 + point);
+    }
+    try running.retireDisplayChannel(window_handle, deadline); try pumpDisplayChannel(target, window_handle, deadline);
+    try running.retireDisplayChannel(core_handle, deadline); try pumpDisplayChannel(target, core_handle, deadline);
+    try t.expect(model.released == 2 and model.slots[0].active and model.slots[1].active and
+        !model.slots[2].active and !model.slots[3].active and native_model.slots[source_index].imported and table_owner.valid());
+    _ = target.stop();
+    try t.expect(table_owner.failed and model.released == 2 and native_model.slots[source_index].live);
 }
 fn checkDeviceDisplaySubmissions(target: *@import("gsp_device.zig").Device, handle: @import("gsp_runtime.zig").DisplayChannelHandle, deadline: u64, scenario: []const u8) !void {
     const model = @import("gsp_display_test_model.zig").Model;
     const push = @import("gsp_display_push.zig");
     const running = &target.running;
-    errdefer |err| std.debug.print("display submission {s}: {s} phase={s} failure={?} work={?}\n", .{scenario,@errorName(err),@tagName(target.phase),target.failure,if(running.display_work)|work|work.phase else null});
+    errdefer |err| std.debug.print("display submission {s}: {s} phase={s} failure={?} work={?}\n", .{scenario,@errorName(err),@tagName(target.phase),target.failure,if(running.display_work)|work|work.core.phase else null});
     try pumpDisplayChannel(target, handle, deadline);
     try t.expect(target.phase == .ready and (try running.displayChannelStatus(handle)).info != null);
     const channel_owner = &running.display_channels[0].?;
@@ -3249,7 +3365,7 @@ fn checkDeviceDisplaySubmissions(target: *@import("gsp_device.zig").Device, hand
     try t.expectError(error.Binding, admit(endpoint.context, &target.port, &copied, deadline, .read));
     // Exercise the actual write admission before the worker publishes PUT.
     // Roll back only this test's CPU-only preparation, never submitted work.
-    const first = &running.display_work.?;
+    const first = &running.display_work.?.core;
     first.ticket = try channel_owner.ring.prepare(0, first.config);
     try note.arm(first.ticket.?.point, deadline);
     try admit(endpoint.context, &target.port, channel_owner, deadline, .publish);
@@ -3264,7 +3380,7 @@ fn checkDeviceDisplaySubmissions(target: *@import("gsp_device.zig").Device, hand
     if (model.is("context_display_cursor")) model.words[(user + 4) / 4] = 0xffffffff;
     _ = target.step();
     if (!model.is("context_display_cursor")) {
-        try t.expect(target.phase == .ready and running.display_work.?.phase == .submitted and channel_owner.ring.issued == 1 and
+        try t.expect(target.phase == .ready and running.display_work.?.core.phase == .submitted and channel_owner.ring.issued == 1 and
             model.words[user / 4] == channel_owner.ring.put * 4 and note.phase == .submitted);
         model.words[(user + 4) / 4] = model.words[user / 4];
         note_words[0] = 1 << 30; _ = target.step(); // GET and BEGUN are not completion.
@@ -3291,16 +3407,16 @@ fn checkDeviceDisplaySubmissions(target: *@import("gsp_device.zig").Device, hand
         try running.commitDisplayCore(handle, deadline);
         const prior_first = first_word.*;
         _ = target.step(); try t.expect(target.phase == .ready);
-        if (running.display_work.?.phase == .rewind) {
+        if (running.display_work.?.core.phase == .rewind) {
             wraps += 1;
             try t.expect(model.words[user / 4] == 0 and model.words[(user + 4) / 4] != 0 and first_word.* == prior_first);
             _ = target.step();
-            try t.expect(running.display_work.?.phase == .rewind and first_word.* == prior_first and channel_owner.ring.issued == point - 1);
+            try t.expect(running.display_work.?.core.phase == .rewind and first_word.* == prior_first and channel_owner.ring.issued == point - 1);
             model.words[(user + 4) / 4] = 0; _ = target.step();
-            try t.expect(running.display_work.?.phase == .prepare and first_word.* == prior_first);
+            try t.expect(running.display_work.?.core.phase == .prepare and first_word.* == prior_first);
             _ = target.step();
         }
-        try t.expect(target.phase == .ready and running.display_work.?.phase == .submitted and note_words[0] == 0 and
+        try t.expect(target.phase == .ready and running.display_work.?.core.phase == .submitted and note_words[0] == 0 and
             channel_owner.ring.issued == point and model.words[user / 4] == channel_owner.ring.put * 4);
         model.words[(user + 4) / 4] = model.words[user / 4];
         note_words[0] = (2 << 30) | @as(u32, @intCast(point));

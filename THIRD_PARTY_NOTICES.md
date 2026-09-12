@@ -1,5 +1,16 @@
 ﻿# Third-Party Notices
 
+Window scanout submission (NVIDIA 0.1.82, 2026-09-12):
+Typed C67E image/state and paired C67D completion follow MIT NVIDIA
+570.144 class definitions, nvkms-evo3.c and nvkms-headsurface.c, plus
+Nouveau Linux 7.2.4 wndwc67e/wndwc37e/wndwc57e/wndw and class/DRF headers.
+Eleven full originals, notices and independent original-header C vectors
+are archived under 0.79.13/display-image-20260912. Derived portions in
+gsp_display_commands/notifier/image.zig retain full applicable notices.
+The runtime and distribution license copies include every added notice;
+the preceding 338768 license bytes remain unchanged. Original R4OS owner
+integration is Apache-2.0; reference C implementations are not linked.
+
 Core display submission and notifiers (NVIDIA 0.1.81, 2026-09-12):
 The GA106 method/PUT/GET/notifier protocol follows pinned MIT NVIDIA
 570.144 C67D definitions, nvkms-rm.c and nvkms-dma.c, plus Nouveau Linux

@@ -122,11 +122,12 @@ pub const Ring = struct {
     published: bool = false,
     failed: bool = false,
 
-    pub fn open(self: *Ring, backing: *storage.Storage, binding: channel_wire.Config) Error!void {
+    pub fn open(self: *Ring, backing: *storage.Storage, binding: channel_wire.Config, prior_point: u64) Error!void {
         if (self.self_address != 0) return error.Busy;
-        if (binding.kind != .core or binding.index != 0 or backing.role != .pushbuffer or !backing.retained or
+        if ((binding.kind == .core and binding.index != 0) or binding.index >= 8 or backing.role != .pushbuffer or !backing.retained or
             backing.physical() != binding.physical or backing.epoch != binding.root.epoch) return error.State;
-        self.* = .{ .self_address = @intFromPtr(self), .backing = backing, .binding = binding, .binding_stamp = binding };
+        self.* = .{ .self_address = @intFromPtr(self), .backing = backing, .binding = binding, .binding_stamp = binding,
+            .issued = prior_point, .completed = prior_point };
         const status = backing.memory.?.bufferMap(&backing.reference.reference, a.gfx_buffer_map_write, 0, storage.bytes, &self.cpu);
         self.cpu_stamp = self.cpu;
         if (status != a.gfx_buffer_result_ok and self.cpu.lease.id == 0) { self.* = .{}; return error.Map; }
@@ -147,8 +148,8 @@ pub const Ring = struct {
     pub fn prepare(self: *Ring, get: u16, config: commands.Config) Error!Ticket {
         if (!self.valid()) return error.Stale;
         if (self.pending != null or self.issued != self.completed or get != self.put) return error.Busy;
-        if (config.initialize == self.initialized) return error.State;
-        const program = try commands.core(config);
+        if (config.initialize == self.initialized or config.kind != self.binding.?.kind) return error.State;
+        const program = try commands.encode(config);
         const point = std.math.add(u64, self.issued, 1) catch return error.Exhausted;
         var ticket: Ticket = .{ .owner = @intFromPtr(self), .epoch = self.binding.?.root.epoch,
             .channel = self.binding.?.handle, .point = point, .kind = .frame, .start = self.put, .put = self.put + program.count };
@@ -167,10 +168,10 @@ pub const Ring = struct {
         notifier.fence(); self.pending = ticket; return ticket;
     }
     pub fn matches(self: *const Ring, ticket: Ticket, config: commands.Config) bool {
-        if (!self.valid() or self.published or self.pending == null or !std.meta.eql(self.pending.?, ticket) or config.initialize == self.initialized) return false;
+        if (!self.valid() or self.published or self.pending == null or !std.meta.eql(self.pending.?, ticket) or config.initialize == self.initialized or config.kind != self.binding.?.kind) return false;
         notifier.fence();
         if (ticket.kind == .rewind) return self.program == null and ticket.start == self.put and ticket.put == 0 and self.word(ticket.start).* == jump_zero;
-        const expected = commands.core(config) catch return false;
+        const expected = commands.encode(config) catch return false;
         if (self.program == null or !commands.same(self.program.?, expected) or ticket.start != self.put or ticket.put != ticket.start + expected.count) return false;
         for (expected.words[0..expected.count], 0..) |value, i| if (self.word(ticket.start + i).* != value) return false;
         return true;

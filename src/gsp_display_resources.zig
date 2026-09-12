@@ -8,6 +8,7 @@ const wire = @import("gsp_display_engine_wire.zig");
 pub const notifier = @import("gsp_display_notifier.zig");
 const r4os = @import("r4os");
 pub const layout = @import("gsp_display_table.zig");
+pub const image = @import("gsp_display_image.zig");
 pub const Error = layout.Error || vram.Error || names.Error || notifier.Error || error{State};
 pub const Owner = struct {
     self_address: usize = 0,
@@ -19,6 +20,8 @@ pub const Owner = struct {
     instance_stamp: ?vram.storage.Source = null,
     table: layout.Table = .{},
     storage: [layout.capacity]vram.storage.Use = @splat(.{}),
+    surfaces: [layout.capacity]?vram.surface.Plan = @splat(null),
+    surface_stamps: [layout.capacity]u64 = @splat(0),
     notifiers: [9]notifier.Owner = @splat(.{}),
     failed: bool = false,
 
@@ -40,18 +43,23 @@ pub const Owner = struct {
             !std.meta.eql(self.instance.?.info(), self.instance_stamp) or !self.table.valid() or
             self.table.epoch != self.binding.?.epoch or self.table.client != self.binding.?.client or self.table.root != self.binding.?.root) return false;
         self.session.?.rm_names.validateChildren(self.reservation orelse return false) catch return false;
-        for (&self.storage, &self.table.entries) |*use, *entry| {
+        for (&self.storage, &self.table.entries, 0..) |*use, *entry, i| {
             if (entry.*) |descriptor| {
                 if (descriptor.target == .vram) {
                     const value = use.info() orelse return false;
                     if (value.epoch != self.table.epoch or descriptor.physical != value.physical.base or descriptor.bytes != value.bytes) return false;
+                    if (self.surfaces[i]) |plan| {
+                        if (surfaceHash(plan) != self.surface_stamps[i] or plan.descriptor.byte_length != value.bytes or
+                            plan.descriptor.adapter_id != value.adapter or plan.descriptor.device_generation != value.epoch) return false;
+                        _ = image.create(plan, descriptor.handle, descriptor.channel) catch return false;
+                    } else if (self.surface_stamps[i] != 0) return false;
                 } else {
-                    if (descriptor.channel >= self.notifiers.len or use.self_address != 0) return false;
+                    if (descriptor.channel >= self.notifiers.len or use.self_address != 0 or self.surfaces[i] != null or self.surface_stamps[i] != 0) return false;
                     const note = &self.notifiers[descriptor.channel];
                     if (!note.valid() or !note.backing.retained or note.handle != descriptor.handle or note.epoch != self.table.epoch or
                         note.channel != descriptor.channel or note.physical_stamp != descriptor.physical or descriptor.bytes != 4096) return false;
                 }
-            } else if (use.self_address != 0) return false;
+            } else if (use.self_address != 0 or self.surfaces[i] != null or self.surface_stamps[i] != 0) return false;
         }
         return true;
     }
@@ -60,6 +68,8 @@ pub const Owner = struct {
         if (self.table.uploading) return error.Busy;
         if (self.table.count >= layout.capacity or self.table.revision == std.math.maxInt(u64)) return error.Exhausted;
         const src = source.info() orelse return error.Stale;
+        try src.surface.validate(source.adapter, source.binding.space);
+        if (src.surface.scanout()) _ = try image.create(src.surface, 1, channel);
         const physical = src.physical orelse return error.Unsupported;
         if (src.epoch != self.binding.?.epoch or source.binding.space.client != self.binding.?.client or
             source.binding.space.device != self.binding.?.device or source.adapter != self.instance_stamp.?.adapter) return error.Stale;
@@ -73,7 +83,19 @@ pub const Owner = struct {
             if (!self.storage[index].close(true)) { self.quarantine(); return error.Retained; }
             return err;
         };
+        self.surfaces[index] = if (src.surface.scanout()) src.surface else null;
+        self.surface_stamps[index] = if (self.surfaces[index]) |plan| surfaceHash(plan) else 0;
         return handle;
+    }
+    pub fn publishedImage(self: *Owner, channel: u32, handle: u32) ?image.Image {
+        if (!self.valid() or !self.table.published(channel, handle)) return null;
+        for (&self.table.entries, 0..) |*entry, i| if (entry.*) |descriptor| {
+            if (descriptor.channel == channel and descriptor.handle == handle) {
+                const plan = self.surfaces[i] orelse return null;
+                return image.create(plan, handle, channel) catch null;
+            }
+        };
+        return null;
     }
     pub fn createNotifier(self: *Owner, ctx: *const r4os.r4dev.DriverContext, channel: u32) Error!u32 {
         if (!self.valid()) return error.Stale;
@@ -104,3 +126,6 @@ pub const Owner = struct {
     // scanout image stopped being fetched. A later display recovery/handoff
     // owner must establish physical resource retirement before release.
 };
+fn surfaceHash(plan: vram.surface.Plan) u64 {
+    var digest = std.hash.Wyhash.init(0); std.hash.autoHash(&digest, plan); return digest.final();
+}

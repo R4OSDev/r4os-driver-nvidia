@@ -5,7 +5,7 @@ const a = @import("r4os").abi;
 pub const Model = struct {
     const Slot = struct { data: [4096]u8 align(4096) = undefined, active: bool = false, cpu: bool = false, synced: bool = false,
         descriptor: a.GfxBufferDescriptor = .{}, dma: a.GfxDeviceLease = .{}, hardware: bool = false, control: u32 = 0, state: u32 = 0 };
-    pub var slots: [2]Slot = @splat(.{});
+    pub var slots: [4]Slot = @splat(.{});
     var original: a.GfxDriverMemoryApi = .{};
     var scenario: []const u8 = "";
     pub var released: usize = 0;
@@ -73,7 +73,7 @@ pub const Model = struct {
         return a.gfx_buffer_result_ok;
     }
     fn releaseDevice(input: *const a.GfxDeviceLease, quiesced: u32) callconv(.c) i32 {
-        if (input.lease.id < 1341 or input.lease.id > 1342) { const call: *const fn (*const a.GfxDeviceLease, u32) callconv(.c) i32 = @ptrFromInt(original.device_release); return call(input, quiesced); }
+        if (input.lease.id < 1341 or input.lease.id >= 1341 + slots.len) { const call: *const fn (*const a.GfxDeviceLease, u32) callconv(.c) i32 = @ptrFromInt(original.device_release); return call(input, quiesced); }
         const slot = &slots[input.lease.id - 1341]; std.debug.assert(slot.active and quiesced == 1 and std.meta.eql(input.*, slot.dma));
         if (slot.hardware) std.debug.assert(words[slot.control / 4] == 0 and words[slot.state / 4] == 0);
         if (is("display_dma_release")) return a.gfx_buffer_error_busy;

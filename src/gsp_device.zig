@@ -505,16 +505,30 @@ pub const Device = struct {
         const root = if (self.running.display_engine_owner) |*value| value else return error.Binding;
         const root_info = root.info() orelse return error.Binding;
         if (!resources.valid()) return error.Binding;
-        if (work.handle.epoch != self.epoch or work.handle.slot != 0 or work.deadline != deadline or self.running.display_channels[0] == null or
-            &self.running.display_channels[0].? != channel or channel.config.handle != work.handle.handle or channel.config.kind != .core or
+        if (work.core.handle.slot != 0 or work.deadline != deadline) return error.Binding;
+        const part = if (channel.config.kind == .core) &work.core else if (work.window) |*value| value else return error.Binding;
+        const slot = part.handle.slot;
+        if (part.handle.epoch != self.epoch or slot >= self.running.display_channels.len or self.running.display_channels[slot] == null or
+            &self.running.display_channels[slot].? != channel or channel.config.handle != part.handle.handle or channel.config.kind != part.config.kind or
             channel.parent != root or channel.info() == null or !channel.ring.valid() or resources.instance != &root.instance_storage or
-            !std.meta.eql(resources.binding.?, root.binding) or resources.publishedNotifier(0) != work.notifier or
-            work.config.notifier != work.notifier.handle or work.config.windows != root_info.hardware.windows or
-            work.config.initialize == channel.ring.initialized) return error.Binding;
+            !std.meta.eql(resources.binding.?, root.binding) or resources.publishedNotifier(slot) != part.notifier or
+            part.config.notifier != part.notifier.handle or part.config.windows != root_info.hardware.windows or
+            part.config.initialize == channel.ring.initialized) return error.Binding;
+        if (work.window) |*window_part| {
+            const route = work.core.config.route orelse return error.Binding;
+            if (route.window >= 8 or route.head >= root_info.hardware.heads or window_part.handle.slot != 1 + route.window or
+                work.core.config.kind != .core or window_part.config.kind != .window or
+                !std.meta.eql(window_part.config.route, work.core.config.route) or
+                window_part.config.scanout == null or !std.meta.eql(resources.publishedImage(window_part.handle.slot, window_part.config.scanout.?.dma), window_part.config.scanout)) return error.Binding;
+            if (part.config.kind == .core) {
+                if (window_part.phase != .submitted and window_part.phase != .complete) return error.Binding;
+            } else if (work.core.phase != .prepare) return error.Binding;
+        } else if (part.config.route != null or part.config.scanout != null or part.config.kind != .core) return error.Binding;
         if (access_kind == .publish) {
-            if (work.phase != .prepare or work.ticket == null or !channel.ring.matches(work.ticket.?, work.config)) return error.Binding;
-            if (work.ticket.?.kind == .frame and (work.notifier.phase != .armed or work.notifier.point != work.ticket.?.point or work.notifier.deadline != deadline)) return error.Binding;
-        } else if (work.phase != .prepare and work.phase != .rewind) return error.Binding;
+            if (part.phase != .prepare or part.ticket == null or !channel.ring.matches(part.ticket.?, part.config)) return error.Binding;
+            if (part.ticket.?.kind == .frame and (part.notifier.phase != .armed or part.notifier.point != part.ticket.?.point or
+                part.notifier.deadline != deadline or part.notifier.offset != part.config.notifier_offset)) return error.Binding;
+        } else if (part.phase != .prepare and part.phase != .rewind) return error.Binding;
         const rpc = self.running.activeChannel() orelse return error.State;
         const canonical = if (self.running.channel) |*value| value else return error.State;
         if (rpc != canonical or rpc.session != &self.session.? or port.runtime_session != rpc.session or rpc.session.pending != null or
