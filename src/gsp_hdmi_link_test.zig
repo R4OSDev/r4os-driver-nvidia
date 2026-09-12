@@ -6,6 +6,18 @@ const link = @import("gsp_hdmi_link.zig");
 const vectors = @embedFile("fixtures/display-hdmi-570.144.bin");
 fn word(at: usize) u32 { return std.mem.readInt(u32, vectors[at..][0..4], .little); }
 pub fn reference(op: link.Operation, plan: link.Plan) ![]const u8 {
+    if (op == .avi and plan.mode.cta_vic != 0) {
+        const receiver = @embedFile("fixtures/display-receiver-hdmi-570.144.bin");
+        var offset: usize = 4;
+        for (0..std.mem.readInt(u32, receiver[0..4], .little)) |_| {
+            const vic = std.mem.readInt(u32, receiver[offset..][0..4], .little);
+            const n = std.mem.readInt(u32, receiver[offset + 4..][0..4], .little);
+            offset += 8;
+            if (vic == plan.mode.cta_vic) return receiver[offset..][0..n];
+            offset += n;
+        }
+        return error.Fixture;
+    }
     var at: usize = 4;
     for (0..word(0)) |_| {
         const n = word(at + 16);

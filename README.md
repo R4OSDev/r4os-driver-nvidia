@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.89; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.90; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -12,7 +12,7 @@ Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
 
-Native boot output (NVIDIA 0.1.89):
+Native output (NVIDIA 0.1.90):
 Explicit `OPTION NVIDIA mode=native` now drives resource allocation and the
 common handoff from the serialized Device worker: actual CE engine/context,
 display masks, private VRAM/RAMHT, Core/Window/WIMM, SYSTEM shadow, output
@@ -29,6 +29,16 @@ Rejected queries finish RM cleanup before product failure; uncertain frees
 retain resources. A live control supports fresh queries without name reuse.
 Feasibility is an observation, not a performance reservation or mode commit.
 
+The runtime now selects progressive RGB8 timings by the actual published
+receiver mode ID. Complete connected EDID, retained routing and current
+generation are required. Every RM and display gate reconstructs the plan
+from the immutable boot capture and receiver catalog. A fresh matching
+source-clock/IMP receipt admits the coupled WIMM/Window/Core/HDMI commit;
+the same receipt cannot be reused after completion. AVI retains the CTA VIC.
+Undeclared higher TMDS limits, 420-only/interlaced and extended AVI VIC modes
+remain unsupported. Current presentation storage still fixes image geometry;
+the common atomic bridge and replacement-buffer lifecycle remain open.
+
 Receiver refresh cannot overwrite the owner's promoted native port.
 Unknown presence permits only authenticated held boot geometry, without
 inventing EDID or a connected sink. HDMI/DVI and SCDC limits remain bound
@@ -39,7 +49,7 @@ and retain reachable resources. Native close follows actual recovery
 generations; physical restoration is still unimplemented and refuses to
 acknowledge quiescence. Passive bootfb remains the default.
 
-Current 51 NVIDIA groups, original-C mode vectors and module build pass.
+Current 51 NVIDIA groups, original-C raster/AVI vectors and module build pass.
 The unchanged Kernel52/EXAMPLE SMP4 evidence remains from 0.1.88. Models do
 not prove physical NVIDIA execution or a visible image. Atomic mode changes,
 pattern/confirmation, timer rollback, diagnostics and restoration remain

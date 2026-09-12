@@ -3088,7 +3088,7 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
     vectors.outputFixture(&run.outputs.data, run.epoch, run.graph.?.reservation.client);
     run.output_generation = run.outputs.data.generation; run.output_refresh = false;
     run.output_next_ns = clock + std.time.ns_per_s; run.outputs.invalidated = false;
-    if (NativeCommon.is("context_native_connected")) run.outputs.data.receivers[0].connected = true;
+    if (NativeCommon.is("context_native_connected")) try @import("gsp_receiver_mode_test.zig").install(&run.outputs.data.receivers[0]);
     try target.native_output.request(&target.ctx.?, run, captured);
     var counts: FifoCounts = .{};
     var steps: usize = 0;
@@ -3234,6 +3234,10 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
                 current.source_clock_hz == 600000000 and current.min_bandwidth_kbps == 123456);
             try t.expectEqualSlices(usize, &.{ 1, 1, 2, 2, 0 }, &NativeCommon.mode_requests);
         }
+        if (NativeCommon.is("context_native_connected")) {
+            checkpoint = "receiver mode switch";
+            try checkReceiverModeSwitch(target);
+        }
         checkpoint = "restore";
         const read = captured.boot.read;
         try t.expect(!captured.boot.close() and NativeCommon.restores == 1 and std.meta.eql(read, captured.boot.read));
@@ -3262,6 +3266,88 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
     checkpoint = "stop";
     _ = target.stop();
     try t.expect(native.released == 0 and display.released == 0 and !NativeCommon.published);
+}
+fn checkReceiverModeSwitch(target: *@import("gsp_device.zig").Device) !void {
+    const run = &target.running;
+    const product = &target.native_output;
+    const display = @import("gsp_display_test_model.zig").Model;
+    const push = @import("gsp_display_push.zig");
+    const root = product.engine.?;
+    const handle = product.mode_control.?;
+    const plan = try run.displayModePlan(root, product.mode.?.window, 1);
+    const deadline = clock + std.time.ns_per_s;
+    const previous = (try run.displayImageStatus(root, plan.window)).?;
+    const admission = (try run.modeControlStatus(handle)).info.?;
+    try t.expect(plan.width == 65 and plan.height == 20 and plan.signal.clock == 1_000_000 and plan.receiver_mode_id == 1);
+    try t.expectError(error.Unsupported, run.commitModeDisplayImage(product.core.?, product.window.?, product.dma, 1, deadline));
+    try t.expect(run.display_work == null and std.meta.eql(previous, (try run.displayImageStatus(root, plan.window)).?));
+    for (0..5) |index| {
+        var forged = plan;
+        switch (index) {
+            0 => forged.signal.clock += 1,
+            1 => forged.width += 1,
+            2 => forged.boot_generation += 1,
+            3 => forged.cta_vic = 16,
+            4 => forged.signal.polarity ^= 4,
+            else => unreachable,
+        }
+        try t.expectError(error.Stale, run.queryDisplayMode(handle, forged, deadline));
+    }
+    try t.expect((try run.modeControlStatus(handle)).info.?.receipt == admission.receipt);
+    try run.queryDisplayMode(handle, plan, deadline);
+    for (0..30) |_| {
+        clock += 1000; _ = target.step();
+        try t.expect(target.phase == .ready);
+        if (!run.mode_control_active) break;
+        const channel = run.activeChannel().?;
+        if (channel.phase == .waiting) try replyNativeProduct(target);
+    }
+    const checked = (try run.modeControlStatus(handle)).info.?;
+    try t.expect(checked.possible and !checked.over_clock and checked.receipt > admission.receipt and std.meta.eql(plan, checked.mode));
+    try run.commitModeDisplayImage(product.core.?, product.window.?, product.dma, 1, deadline);
+    try t.expect(run.display_work.?.mode_receipt == checked.receipt);
+    const receipt = run.display_work.?.mode_receipt;
+    run.display_work.?.mode_receipt -= 1;
+    try t.expectError(error.Stale, run.validateDisplayLink());
+    run.display_work.?.mode_receipt = receipt;
+    try run.validateDisplayLink();
+    for (0..160) |_| {
+        clock += 1000; _ = target.step();
+        try t.expect(target.phase == .ready);
+        if (run.display_work == null) break;
+        const channel = run.activeChannel().?;
+        if (channel.phase == .waiting) { try replyNativeProduct(target); continue; }
+        const work = &run.display_work.?;
+        // Publish the same real hardware observations used for adoption.
+        // The second frame has fresh notifier offsets and sequence points.
+        if (work.position) |position| if (position.phase == .submitted) {
+            const user = try push.userBase(.immediate, plan.window);
+            display.words[(user + 4) / 4] = display.words[user / 4];
+        };
+        if (work.core.phase == .submitted) {
+            const user = try push.userBase(.core, 0);
+            display.words[(user + 4) / 4] = display.words[user / 4];
+            const note: *u32 = @ptrFromInt(work.core.notifier.cpu.cpu_address);
+            note.* = 2 << 30;
+        }
+        if (work.window) |window| if (window.phase == .submitted) {
+            const user = try push.userBase(.window, plan.window);
+            display.words[(user + 4) / 4] = display.words[user / 4];
+            const words: [*]u32 = @ptrFromInt(window.notifier.cpu.cpu_address);
+            words[window.notifier.offset / 4 + 2] = 102; words[window.notifier.offset / 4 + 3] = 8;
+            words[window.notifier.offset / 4] = 1 << 30;
+        };
+    }
+    try t.expect(run.display_work == null);
+    const current = (try run.displayImageStatus(root, plan.window)).?;
+    try t.expect(current.boot_mode != null and std.meta.eql(current.boot_mode.?, plan) and current.link.?.acknowledged == 7 and
+        current.link.?.receipt > previous.link.?.receipt and current.core_point > previous.core_point and current.window_point > previous.window_point and
+        current.position.?.sequence > previous.position.?.sequence);
+    try t.expect(current.mode_receipt == checked.receipt);
+    try t.expectError(error.Stale, run.commitModeDisplayImage(product.core.?, product.window.?, product.dma, 1, deadline));
+    try t.expect(run.display_work == null and std.meta.eql(current, (try run.displayImageStatus(root, plan.window)).?));
+    try t.expectEqualSlices(usize, &.{ 1, 1, 2, 2, 0 }, &NativeCommon.mode_requests);
+    try t.expect(NativeCommon.commits == 1); // Common geometry transition is separate work.
 }
 fn replyNativeProduct(target: *@import("gsp_device.zig").Device) !void {
     const run = &target.running;

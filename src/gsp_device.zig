@@ -436,10 +436,9 @@ pub const Device = struct {
             const mode = if (self.running.mode_control_owner) |*value| value else return error.Binding;
             const root = if (self.running.mode_control_root) |value| value else return error.Binding;
             const engine = if (self.running.display_engine_owner) |*value| value else return error.Binding;
-            const snapshot = self.running.outputs.snapshot() orelse return error.Binding;
-            const rebound = runtime.boot_mode.bind(mode.mode, snapshot, self.epoch, self.display_epoch) catch return error.Binding;
+            self.running.validateModeQuery(root, mode.mode) catch return error.Binding;
             if (root.epoch != self.epoch or root.root != engine.binding.root or engine.info() == null or
-                !std.meta.eql(rebound, mode.mode) or !mode.matches(channel, deadline)) return error.Binding;
+                !mode.matches(channel, deadline)) return error.Binding;
         } else if (self.running.display_channel_active) |index| {
             const display_dma = if (self.running.display_channels[index]) |*value| value else return error.Binding;
             if (!display_dma.matches(channel, deadline)) return error.Binding;
@@ -557,7 +556,7 @@ pub const Device = struct {
                 const link = if (work.link) |*value| value else return error.Binding;
                 if (link.phase != .scanout or link.pending or link.acknowledged != @as(u8, if (plan.transport_hdmi) 3 else 2) or link.last_receipt == 0) return error.Binding;
                 self.running.validateDisplayLink() catch return error.Binding;
-                const expected = self.running.bootDisplayPlan(.{ .epoch = self.epoch, .root = root.binding.root }, route.window) catch return error.Binding;
+                const expected = self.running.displayModePlan(.{ .epoch = self.epoch, .root = root.binding.root }, route.window, plan.receiver_mode_id) catch return error.Binding;
                 if (!std.meta.eql(plan, expected) or !std.meta.eql(work.core.config.signal, @as(?runtime.boot_mode.Signal, expected.signal)) or
                     plan.head != route.head or window_part.config.scanout == null or window_part.config.scanout.?.width != plan.width or
                     window_part.config.scanout.?.height != plan.height) return error.Binding;

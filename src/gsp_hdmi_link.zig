@@ -191,6 +191,7 @@ pub fn derive(saved: mode.Plan, object: display.Object, snapshot: *const outputs
     result.hdmi_vic = @intCast(vic);
     for (snapshot.receivers[0..snapshot.count]) |*receiver| if (receiver.display_id == saved.signal.display_id) {
         if (receiver.status == .pending or receiver.status == .not_supported or receiver.status == .disconnected) return error.Stale;
+        if (saved.receiver_mode_id != 0 and (receiver.connected != true or receiver.status != .valid_edid or !receiver.report.complete())) return error.Stale;
         if (receiver.status == .valid_edid and receiver.report.complete()) {
             const report = &receiver.report;
             result.receiver_known = true;
@@ -208,9 +209,13 @@ pub fn derive(saved: mode.Plan, object: display.Object, snapshot: *const outputs
     const adjusted = saved.signal.clock & 0x80000000 != 0;
     const numerator = @as(u64, saved.signal.clock & 0x7fffffff) * @as(u64, if (adjusted) 1000 else 1);
     const denominator: u64 = if (adjusted) 1001 else 1;
-    const limit: u64 = if (saved.transport_hdmi) 600_000_000 else 165_000_000;
+    // An unspecified EDID maximum grants no higher TMDS rate for a new
+    // mode. Keep the single-link 165 MHz ceiling until the receiver declares
+    // a higher limit. Retained boot adoption keeps its separate policy.
+    const limit: u64 = if (!saved.transport_hdmi or (saved.receiver_mode_id != 0 and result.max_tmds_hz == 0)) 165_000_000 else 600_000_000;
     if (numerator > limit * denominator or (result.max_tmds_hz != 0 and numerator > result.max_tmds_hz * denominator) or
         (numerator > 340_000_000 * denominator and result.caps & 5 != 5)) return error.Unsupported;
+    if (saved.receiver_mode_id != 0 and !result.receiver_known) return error.Stale;
     return result;
 }
 
@@ -227,7 +232,8 @@ fn checksum(packet: []u8) void {
 }
 pub fn encode(plan: Plan, op: Operation, bytes: *[max_bytes]u8) !usize {
     if (plan.object.epoch == 0 or plan.object.client == 0 or plan.object.display == 0 or plan.object.epoch != plan.mode.epoch or
-        plan.caps & ~@as(u32, 7) != 0 or (!plan.mode.transport_hdmi and op != .caps and op != .enable)) return error.Descriptor;
+        plan.caps & ~@as(u32, 7) != 0 or (!plan.mode.transport_hdmi and op != .caps and op != .enable) or
+        plan.mode.cta_vic > 127 or (plan.mode.cta_vic != 0 and (!plan.mode.transport_hdmi or plan.mode.receiver_mode_id == 0 or plan.hdmi_vic != 0))) return error.Descriptor;
     try mode.validate(plan.mode.signal, plan.mode.head);
     @memset(bytes, 0);
     const cmd = command(op, plan);
@@ -249,9 +255,11 @@ pub fn encode(plan: Plan, op: Operation, bytes: *[max_bytes]u8) !usize {
         const length: u32 = switch (op) {
             .avi => blk: {
                 packet[0] = 0x82; packet[1] = 2; packet[2] = 13;
-                // RGB8 identity output: full range, no scaling/repetition,
-                // unclaimed CTA VIC/aspect. Legacy HDMI VIC is in its VSI.
+                // RGB8 identity output: full range, no scaling/repetition.
+                // Receiver modes retain their exact CTA VIC. A captured
+                // boot HDMI VIC remains in its separate legacy VSI.
                 packet[6] = 8;
+                packet[7] = plan.mode.cta_vic;
                 checksum(packet[0..17]); break :blk 17;
             },
             .vsi => blk: {

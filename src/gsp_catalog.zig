@@ -116,20 +116,37 @@ pub fn encode(output: *a.GfxReceiverInfo, route: *const topology.Route, capture:
     if (output.edid_bytes != capture.edid_bytes) output.flags |= a.gfx_output_flag_receiver_incomplete;
     @memcpy(output.edid[0..output.edid_bytes], capture.bytes[0..output.edid_bytes]);
     if (capture.status != .valid_edid and capture.status != .incomplete_edid) return;
-    for (capture.report.modes[0..capture.report.mode_count]) |timing| {
-        const mode = gfx.modeFromTiming(timing, output.mode_count + 1) orelse {
-            output.flags |= a.gfx_output_flag_receiver_incomplete;
-            continue;
-        };
-        if (output.mode_count == output.modes.len) {
-            output.flags |= a.gfx_output_flag_receiver_incomplete;
-            break;
-        }
+    var modes: Modes = .{ .report = &capture.report };
+    while (modes.next()) |entry| {
+        const mode = entry.mode;
         output.modes[output.mode_count] = mode;
         output.mode_count += 1;
         if (output.preferred_mode_id == 0 and mode.flags & a.gfx_output_mode_preferred != 0) output.preferred_mode_id = mode.mode_id;
     }
+    if (modes.incomplete) output.flags |= a.gfx_output_flag_receiver_incomplete;
 }
+
+/// Both publication and native selection enumerate the same bounded IDs.
+/// Recognizable but incomplete timings do not consume a published mode ID.
+pub const Modes = struct {
+    report: *const receiver.edid.Report,
+    index: usize = 0,
+    count: u32 = 0,
+    incomplete: bool = false,
+    pub const Entry = struct { timing: receiver.edid.timing.Timing, mode: a.GfxOutputMode };
+    pub fn next(self: *Modes) ?Entry {
+        if (self.report.mode_count > self.report.modes.len) { self.incomplete = true; return null; }
+        while (self.index < self.report.mode_count) {
+            const timing = self.report.modes[self.index];
+            self.index += 1;
+            const mode = gfx.modeFromTiming(timing, self.count + 1) orelse { self.incomplete = true; continue; };
+            if (self.count == (a.GfxReceiverInfo{}).modes.len) { self.incomplete = true; return null; }
+            self.count += 1;
+            return .{ .timing = timing, .mode = mode };
+        }
+        return null;
+    }
+};
 
 // Physical connector values from the already pinned NVIDIA 570.144
 // ctrl0073specific.h. Neither a sink HDMI VSDB nor an SOR protocol proves

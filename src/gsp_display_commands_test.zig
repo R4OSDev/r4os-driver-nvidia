@@ -25,6 +25,7 @@ pub fn check() !void {
     try t.expectError(error.Completion, push.cursor(0xffffffff));
     try checkImages();
     try checkBootMode();
+    try @import("gsp_receiver_mode_test.zig").check();
     try @import("gsp_hdmi_link_test.zig").check();
     try checkPosition();
 }

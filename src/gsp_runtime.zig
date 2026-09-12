@@ -73,8 +73,8 @@ pub const DisplayPosition = struct { handle: DisplayChannelHandle, point: displa
 pub const boot_mode = @import("gsp_boot_mode.zig");
 pub const hdmi_link = @import("gsp_hdmi_link.zig");
 pub const DisplayLink = struct { plan: hdmi_link.Plan, acknowledged: u8, receipt: u64 };
-pub const DisplayWork = struct { core: DisplaySubmission, window: ?DisplaySubmission = null, position: ?PositionSubmission = null, deadline: u64, boot_mode: ?boot_mode.Plan = null, link: ?hdmi_link.Work = null };
-pub const ActiveDisplayImage = struct { image: display_resources.image.Image, head: u32, core_point: u64, window_point: u64, boot_mode: ?boot_mode.Plan = null, position: ?DisplayPosition = null, link: ?DisplayLink = null };
+pub const DisplayWork = struct { core: DisplaySubmission, window: ?DisplaySubmission = null, position: ?PositionSubmission = null, deadline: u64, boot_mode: ?boot_mode.Plan = null, mode_receipt: u64 = 0, link: ?hdmi_link.Work = null };
+pub const ActiveDisplayImage = struct { image: display_resources.image.Image, head: u32, core_point: u64, window_point: u64, boot_mode: ?boot_mode.Plan = null, mode_receipt: u64 = 0, position: ?DisplayPosition = null, link: ?DisplayLink = null };
 const subscriptions = @import("gsp_event_objects.zig");
 const outputs = @import("gsp_outputs.zig");
 const inventory = @import("gsp_memory_inventory.zig");
@@ -482,14 +482,10 @@ pub const Owner = struct {
         };
         self.display_engine_active = true;
     }
-    fn validateModeQuery(self: *Owner, root: DisplayEngineHandle, plan: boot_mode.Plan) !void {
-        const engine = (try self.findDisplayEngine(root)).info() orelse return error.State;
-        if (plan.head >= engine.hardware.heads or plan.window >= 8 or
-            engine.hardware.windows & (@as(u32, 1) << @intCast(plan.window)) == 0) return error.Bounds;
-        const snapshot = self.outputs.snapshot() orelse return error.Busy;
-        const held = self.reservation.?.display orelse return error.Stale;
-        const rebound = try boot_mode.bind(plan, snapshot, self.epoch, held.boot.held_generation);
-        if (!std.meta.eql(rebound, plan)) return error.Stale;
+    pub fn validateModeQuery(self: *Owner, root: DisplayEngineHandle, plan: boot_mode.Plan) !void {
+        const expected = try self.displayModePlan(root, plan.window, plan.receiver_mode_id);
+        if (!std.meta.eql(expected, plan)) return error.Stale;
+        _ = try hdmi_link.derive(expected, self.display_object.?, self.outputs.snapshot().?);
     }
     pub fn createModeControl(self: *Owner, root: DisplayEngineHandle, plan: boot_mode.Plan, deadline: u64) !ModeControlHandle {
         _ = try self.now();
@@ -711,6 +707,9 @@ pub const Owner = struct {
     /// Derive the candidate again from the actual retained Device capture and
     /// current coherent RM catalog; callers cannot submit arbitrary timings.
     pub fn bootDisplayPlan(self: *Owner, root_handle: DisplayEngineHandle, window: u32) !boot_mode.Plan {
+        return self.displayModePlan(root_handle, window, 0);
+    }
+    pub fn displayModePlan(self: *Owner, root_handle: DisplayEngineHandle, window: u32, receiver_mode_id: u32) !boot_mode.Plan {
         const root = try self.findDisplayEngine(root_handle);
         const info = root.info() orelse return error.State;
         const held = self.reservation orelse return error.State;
@@ -721,23 +720,35 @@ pub const Owner = struct {
         const plan = try boot_mode.capture(&saved.scanout_original.?, &saved.original_boot.?, window);
         if (!info.core or !info.window or plan.head >= info.hardware.heads or
             info.hardware.windows & (@as(u32, 1) << @intCast(window)) == 0) return error.Unsupported;
-        // nativeObject deliberately excludes an outstanding display commit.
-        // The submission gate must nevertheless revalidate its saved catalog
-        // while that exact work owns the otherwise idle canonical RM channel.
+        // Pure revalidation also runs while the mode-control owner holds the
+        // canonical exchange. Requiring the main exchange here would exclude
+        // the actual RPC gate; accepting caller-supplied timings would forge
+        // the source of an otherwise valid RM query.
+        const channel = self.activeChannel() orelse return error.Busy;
         if (self.graph == null or self.graph.?.state != .loaned or self.display_object == null or self.channel == null or
-            self.activeChannel() != &self.channel.? or self.channel.?.session.state != .active or self.failure != null) return error.Busy;
+            channel.session.state != .active or self.failure != null) return error.Busy;
         const snapshot = self.outputs.snapshot() orelse return error.Busy;
-        return boot_mode.bind(plan, snapshot, self.epoch, saved.boot.held_generation);
+        const bound = try boot_mode.bind(plan, snapshot, self.epoch, saved.boot.held_generation);
+        return if (receiver_mode_id == 0) bound else @import("gsp_receiver_mode.zig").select(bound, snapshot, receiver_mode_id);
     }
     /// Carry the exact boot signal and primary position in one interlocked
     /// WIMM/Window/Core transaction. Common native adoption follows separately.
     pub fn commitBootDisplayImage(self: *Owner, core_handle: DisplayChannelHandle, window_handle: DisplayChannelHandle, image_handle: u32, deadline: u64) !void {
+        return self.commitModeDisplayImage(core_handle, window_handle, image_handle, 0, deadline);
+    }
+    /// A receiver mode requires the matching completed source-clock/IMP
+    /// query. The image and all interlocked channels must already be prepared;
+    /// this operation does not allocate buffers or change common geometry.
+    pub fn commitModeDisplayImage(self: *Owner, core_handle: DisplayChannelHandle, window_handle: DisplayChannelHandle,
+        image_handle: u32, receiver_mode_id: u32, deadline: u64) !void
+    {
         const core = try self.findDisplayChannel(core_handle);
         const window = try self.findDisplayChannel(window_handle);
         if (core.parent != window.parent or window.config.kind != .window) return error.Stale;
         const root: DisplayEngineHandle = .{ .epoch = self.epoch, .root = core.parent.binding.root };
-        const plan = try self.bootDisplayPlan(root, window.config.index);
+        const plan = try self.displayModePlan(root, window.config.index, receiver_mode_id);
         const link = try hdmi_link.derive(plan, self.display_object.?, self.outputs.snapshot().?);
+        const receipt = try self.modeAdmission(root, plan);
         const resources = self.display_resources_slot.owner orelse return error.State;
         const image = resources.publishedImage(window_handle.slot, image_handle) orelse return error.State;
         if (image.width != plan.width or image.height != plan.height) return error.Descriptor;
@@ -747,7 +758,18 @@ pub const Owner = struct {
             .{ .epoch = self.epoch, .handle = position.config.handle, .slot = @intCast(slot) }, image_handle, plan.head, .{}, deadline);
         self.display_work.?.core.config.signal = plan.signal;
         self.display_work.?.boot_mode = plan;
+        self.display_work.?.mode_receipt = receipt;
         self.display_work.?.link = .{ .plan = link };
+    }
+    fn modeAdmission(self: *Owner, root: DisplayEngineHandle, plan: boot_mode.Plan) !u64 {
+        if (plan.receiver_mode_id == 0) return 0;
+        if (self.mode_control_active) return error.Busy;
+        const owner = if (self.mode_control_owner) |*value| value else return error.State;
+        if (self.mode_control_root == null or !std.meta.eql(self.mode_control_root.?, root)) return error.Stale;
+        const result = owner.info() orelse return error.Busy;
+        if (!std.meta.eql(result.mode, plan) or !result.possible or result.over_clock or result.receipt == 0) return error.Unsupported;
+        if (self.display_images[plan.window]) |prior| if (result.receipt <= prior.mode_receipt) return error.Stale;
+        return result.receipt;
     }
     pub fn commitPositionedDisplayImage(self: *Owner, core_handle: DisplayChannelHandle, window_handle: DisplayChannelHandle,
         immediate_handle: DisplayChannelHandle, image_handle: u32, head: u32, point: display_channel.push.commands.Point, deadline: u64) !void
@@ -1316,9 +1338,10 @@ pub const Owner = struct {
         const core = try self.findDisplayChannel(work.core.handle);
         const actual = try self.findDisplayChannel(window.handle);
         if (actual.parent != core.parent or actual.config.kind != .window or work.boot_mode == null) return error.Stale;
-        const expected = try self.bootDisplayPlan(.{ .epoch = self.epoch, .root = core.parent.binding.root }, actual.config.index);
+        const root: DisplayEngineHandle = .{ .epoch = self.epoch, .root = core.parent.binding.root };
+        const expected = try self.displayModePlan(root, actual.config.index, work.boot_mode.?.receiver_mode_id);
         const planned = try hdmi_link.derive(expected, self.display_object.?, self.outputs.snapshot().?);
-        if (!std.meta.eql(link.plan, planned) or !std.meta.eql(work.boot_mode.?, expected) or
+        if (work.mode_receipt != try self.modeAdmission(root, expected) or !std.meta.eql(link.plan, planned) or !std.meta.eql(work.boot_mode.?, expected) or
             !std.meta.eql(work.core.config.signal, @as(?boot_mode.Signal, expected.signal)) or
             window.config.scanout == null or window.config.scanout.?.width != expected.width or window.config.scanout.?.height != expected.height or
             !std.meta.eql(work.core.config.route, @as(?display_channel.push.commands.Route, .{ .head = expected.head, .window = expected.window }))) return error.Stale;
@@ -1394,7 +1417,7 @@ pub const Owner = struct {
                 .point = value.config.position.?, .sequence = value.ticket.?.point } else null;
             if (mode) |plan| {
                 const core = try self.findDisplayChannel(work.core.handle);
-                const expected = try self.bootDisplayPlan(.{ .epoch = self.epoch, .root = core.parent.binding.root }, route.window);
+                const expected = try self.displayModePlan(.{ .epoch = self.epoch, .root = core.parent.binding.root }, route.window, plan.receiver_mode_id);
                 if (!std.meta.eql(plan, expected) or !std.meta.eql(work.core.config.signal, @as(?boot_mode.Signal, expected.signal))) return error.Stale;
             } else if (self.display_images[route.window]) |prior| {
                 if (prior.head == route.head and prior.image.width == window.config.scanout.?.width and prior.image.height == window.config.scanout.?.height) {
@@ -1404,7 +1427,9 @@ pub const Owner = struct {
                 }
             }
             self.display_images[route.window] = .{ .image = window.config.scanout.?, .head = route.head,
-                .core_point = work.core.ticket.?.point, .window_point = window.ticket.?.point, .boot_mode = mode, .position = position, .link = link };
+                .core_point = work.core.ticket.?.point, .window_point = window.ticket.?.point, .boot_mode = mode,
+                .mode_receipt = if (work.mode_receipt != 0) work.mode_receipt else if (self.display_images[route.window]) |prior| prior.mode_receipt else 0,
+                .position = position, .link = link };
         }
         self.display_work = null; return true;
     }

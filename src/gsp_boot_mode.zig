@@ -54,6 +54,11 @@ pub const Plan = struct {
     width: u32,
     height: u32,
     refresh_micro_hz: u64,
+    // Zero identifies the retained firmware timing. Other values identify
+    // the published mode in the current receiver capture, never an index
+    // into its raw parser array. Runtime rederives either source at each gate.
+    receiver_mode_id: u32 = 0,
+    cta_vic: u8 = 0,
     transport_hdmi: bool = false,
     signal: Signal,
 };

@@ -1,5 +1,16 @@
 ﻿# Third-Party Notices
 
+Receiver mode selection (NVIDIA 0.1.90, 2026-09-13):
+Raster conversion and AVI fields follow MIT NVIDIA 570.144, source pin
+8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f. Twelve complete originals, four
+C raster vectors and four complete C AVI payloads are archived under
+0.79.13/receiver-mode-20260913. The new timing source retains the complete
+2014/2020 MIT notice. Full nvtiming.h and nvkms-evo.c notices extend the
+identical module/image runtime license to 361687 bytes; the preceding
+358737 bytes are unchanged. Original R4OS selection, generation and
+ownership policy remains Apache-2.0. Reference C generators are host-only;
+no firmware changed.
+
 Display mode feasibility (NVIDIA 0.1.89, 2026-09-13):
 NVC372 display-control allocation, NV0073 source pixel-clock limits and
 the IMP head/window query follow the MIT NVIDIA 570.144 source pin
