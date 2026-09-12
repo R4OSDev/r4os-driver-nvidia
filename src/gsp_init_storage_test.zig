@@ -1534,6 +1534,8 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         context_copy_success, context_copy_class, context_copy_allocate, context_copy_changed, context_copy_timeout, context_copy_completion,
         context_copy_rc, context_copy_rc_unmatched, context_copy_mmu, context_copy_xid, context_copy_fault_ack, context_copy_irq,
         context_copy_capacity, context_copy_oom, context_copy_invalid, context_copy_lost_idle, context_copy_fastpath,
+        display_root_success, display_root_classes, display_root_reject, display_root_static, display_root_preserve, display_root_free,
+        display_root_ack, display_root_timeout, display_root_wrong,
         outputs_empty, outputs_all, outputs_rejected, outputs_partial, outputs_missing, outputs_incomplete, outputs_bad_edid,
         outputs_edid_rejected, outputs_ddc, outputs_ddc_bus_changed, outputs_aux, outputs_wiring, outputs_virtual, outputs_changed, outputs_final_changed, outputs_final_rejected, outputs_hpd, outputs_sequence, outputs_ack, outputs_timeout, catalog_rejected,
         runtime_healthy, runtime_lockdown, runtime_unknown, runtime_unowned, runtime_sequence_timeout,
@@ -1686,6 +1688,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
             if (target.phase == .ready and std.mem.startsWith(u8, @tagName(case), "mapping_")) try checkDeviceMappings(target, table, @tagName(case));
             if (target.phase == .ready and std.mem.startsWith(u8, @tagName(case), "vram_")) try checkDeviceVram(target, table, @tagName(case));
             if (target.phase == .ready and std.mem.startsWith(u8, @tagName(case), "context_")) try checkDeviceContexts(target, table, @tagName(case));
+            if (target.phase == .ready and std.mem.startsWith(u8, @tagName(case), "display_root_")) try checkDeviceDisplayEngine(target, @tagName(case));
             if (target.phase == .ready and !target.stopped) try checkDeviceOutputs(target, words, held.plan.?.frts.offset, case);
             if (exercise_runtime) try checkDeviceRuntime(target, words, held.plan.?.frts.offset, case);
         } else {
@@ -2615,6 +2618,124 @@ fn allocateContextBuffer(target: *@import("gsp_device.zig").Device, bytes: u64, 
     }
     try t.expect(steps < 80 and target.phase == .ready and (try running.nativeBufferStatus(handle)).info != null);
     return handle;
+}
+fn checkDeviceDisplayEngine(target: *@import("gsp_device.zig").Device, scenario: []const u8) !void {
+    const runtime = @import("gsp_runtime.zig");
+    const vectors = @import("gsp_display_engine_test.zig");
+    const wire = runtime.display_engine.wire;
+    const running = &target.running; const session = &target.session.?;
+    const deadline = clock + 5 * std.time.ns_per_s;
+    const command = init.queues_offset + init.command_offset; const status = init.queues_offset + init.status_offset;
+    const success = std.mem.eql(u8, scenario, "display_root_success");
+    const unsupported = std.mem.eql(u8, scenario, "display_root_classes");
+    const rejected = std.mem.eql(u8, scenario, "display_root_reject");
+    const static_bad = std.mem.eql(u8, scenario, "display_root_static");
+    const preserve_bad = std.mem.eql(u8, scenario, "display_root_preserve");
+    const free_bad = std.mem.eql(u8, scenario, "display_root_free");
+    const ack_bad = std.mem.eql(u8, scenario, "display_root_ack");
+    const expired = std.mem.eql(u8, scenario, "display_root_timeout");
+    const wrong = std.mem.eql(u8, scenario, "display_root_wrong");
+    const hold = try running.reservation.?.binding(.metadata);
+    var prior: ?runtime.DisplayEngineHandle = null;
+    errdefer |err| std.debug.print("display engine {s}: {s} phase={s} failure={?} active={} state={s}\n",
+        .{scenario,@errorName(err),@tagName(target.phase),target.failure,running.display_engine_active,
+            if (running.display_engine_owner) |*value| @tagName(value.state) else "none"});
+    for (0..@as(usize, if (success) 2 else 1)) |_| {
+        const handle = try running.createDisplayEngine(deadline);
+        if (prior) |old| { try t.expect(old.root != handle.root); try t.expectError(error.Stale, running.displayEngineStatus(old)); }
+        var forged = handle; forged.epoch += 1; try t.expectError(error.Stale, running.displayEngineStatus(forged));
+        try t.expectError(error.Busy, running.createDisplayEngine(deadline));
+        try t.expectError(error.State, running.allocateNativeBuffer(4096, deadline));
+        var retiring = false; var requests: [5]u32 = @splat(0); var interleaved = false;
+        var steps: usize = 0;
+        while (target.phase == .ready and steps < 80) : (steps += 1) {
+            _ = target.step();
+            if (target.phase != .ready) break;
+            if (!running.display_engine_active) {
+                if (retiring) break;
+                const current = try running.displayEngineStatus(handle);
+                try t.expect(current.state == .handed_off);
+                if (unsupported or rejected) {
+                    try t.expect(current.info == null and current.unavailable == unsupported and (current.rejected != null) == rejected);
+                    try t.expect(!running.display_engine_owner.?.namespace_live and !running.display_engine_owner.?.allocation_possible);
+                } else {
+                    const value = current.info orelse return error.Unexpected;
+                    try t.expect(value.binding.root == handle.root and value.hardware.heads == 4 and value.hardware.windows == 255 and value.hardware.channels == 81);
+                    try t.expect(value.binding.internal_client == running.static_info.?.client and value.binding.internal_subdevice == running.static_info.?.subdevice);
+                }
+                try t.expectError(error.Busy, running.beginDestroyGraph(deadline, true));
+                try running.retireDisplayEngine(handle, deadline); retiring = true; continue;
+            }
+            const owner = &running.display_engine_owner.?; const rpc = running.activeChannel().?;
+            if (rpc.phase != .waiting) continue;
+            const op = owner.operation.?; requests[@intFromEnum(op)] += 1;
+            try t.expect(requests[@intFromEnum(op)] == 1 and owner.info() == null);
+            const cursor = (session.tx_write + 62) % 63;
+            const record = try transport.message.decode(session.profile, backing.?[command + 4096 + cursor * 4096..][0..4096], session.tx_sequence - 1);
+            try t.expectEqualSlices(u8, rpc.request, record.payload);
+            if (op == .static_info) try t.expect(wire.word(record.payload, 0) == running.static_info.?.client and wire.word(record.payload, 4) == running.static_info.?.subdevice);
+            if (op == .allocate) try t.expect(record.payload.len == 32 and wire.word(record.payload, 12) == 0xc670 and wire.word(record.payload, 20) == 0);
+            if (op == .preserve) try t.expect(owner.live and !owner.preserve and wire.word(record.payload, 28) == 1);
+            if (op == .free) try t.expect(owner.live and owner.preserve and requests[@intFromEnum(wire.Operation.preserve)] == 1);
+            // Device admission binds the actual owner, pointer, function and
+            // fixed deadline, not merely a valid-looking copy of the bytes.
+            if (op == .classes) {
+                const io = target.port.owner.?; const saved = rpc.request; const old_function = rpc.function;
+                var copy = owner.*; try t.expect(!copy.matches(rpc, deadline));
+                var foreign: [wire.max_bytes]u8 = undefined; @memcpy(foreign[0..saved.len], saved);
+                const before = range_calls; rpc.phase = .prepared; rpc.request = foreign[0..saved.len];
+                try t.expectError(error.Binding, io.admit_command.?(io.context, &target.port, deadline));
+                rpc.request = saved; rpc.function = 103;
+                try t.expectError(error.Binding, io.admit_command.?(io.context, &target.port, deadline));
+                rpc.function = old_function;
+                try t.expectError(error.Binding, io.admit_command.?(io.context, &target.port, deadline + 1));
+                try io.admit_command.?(io.context, &target.port, deadline);
+                rpc.phase = .waiting; try t.expect(range_calls == before);
+                try t.expectError(error.State, running.channel.?.poll(deadline));
+            }
+            if (op == .allocate and success and !interleaved) {
+                try devicePost(target, false, false); _ = target.step();
+                try t.expect(rpc.phase == .waiting and rpc.pending == null and owner.info() == null and rpc.deadline == deadline);
+                interleaved = true;
+            }
+            var response: [wire.max_bytes]u8 = undefined;
+            @memcpy(response[0..rpc.request.len], vectors.response(op));
+            const header: usize = if (op == .allocate) 32 else if (op == .free) 16 else 24;
+            @memcpy(response[0..header], record.payload[0..header]);
+            if (op == .classes and unsupported) outputWord(&response, 24, 0);
+            if (op == .static_info and static_bad) outputWord(&response, 36, 9);
+            if (op == .static_info and wrong) response[4] ^= 1;
+            if ((op == .allocate and rejected) or (op == .preserve and preserve_bad) or (op == .free and free_bad))
+                outputWord(&response, if (op == .allocate) 16 else 12, 0x57);
+            std.mem.writeInt(u32, backing.?[status + 64..][0..4], session.tx_write, .little);
+            if (op == .allocate and expired) clock = deadline else {
+                try nativeReply(session, rpc.function, 0, response[0..rpc.request.len]);
+                if (op == .allocate and ack_bad) range_failure_call = range_calls + 4;
+            }
+            _ = target.step(); range_failure_call = 0;
+        }
+        try t.expect(steps < 80 and running.reservation.?.validates(hold) and target.memory.?.retained);
+        if (success or unsupported or rejected) {
+            try t.expect(target.phase == .ready and running.display_engine_owner == null and !running.display_engine_active);
+            try t.expectError(error.Stale, running.displayEngineStatus(handle));
+            try t.expect(requests[@intFromEnum(wire.Operation.allocate)] == @as(u32, if (unsupported) 0 else 1));
+            try t.expect(requests[@intFromEnum(wire.Operation.free)] == @as(u32, if (success) 1 else 0));
+            try t.expect(session.state == .active and session.pending == null and running.nativeObject() != null);
+        } else {
+            try t.expect(target.phase != .ready and running.failure != null and session.state == .failed);
+            const owner = &running.display_engine_owner.?;
+            try t.expect(owner.state == .failed and owner.namespace_live and owner.info() == null);
+            try t.expect(owner.allocation_possible == (preserve_bad or free_bad or ack_bad or expired));
+            if (preserve_bad) try t.expect(requests[@intFromEnum(wire.Operation.free)] == 0);
+            if (free_bad) try t.expect(!owner.preserve and owner.live);
+            if (ack_bad) try t.expect(owner.exchange.pending != null and session.pending != null and !owner.live);
+            if (wrong or static_bad) try t.expect(requests[@intFromEnum(wire.Operation.allocate)] == 0);
+            const before = range_calls;
+            try t.expectError(error.State, running.retireDisplayEngine(handle, deadline + 1));
+            try t.expect(range_calls == before and owner.namespace_live);
+        }
+        prior = handle;
+    }
 }
 fn checkDeviceContexts(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, scenario: []const u8) !void {
     const model = @import("gsp_vram_test_model.zig").Model;

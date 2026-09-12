@@ -420,7 +420,10 @@ pub const Device = struct {
             channel.phase != .prepared or channel.pending != null or channel.session.pending != null or
             channel.deadline != deadline) return error.Binding;
         if (channel.in_lockdown) return error.Lockdown;
-        if (self.running.fifo_active) |index| {
+        if (self.running.display_engine_active) {
+            const display_root = if (self.running.display_engine_owner) |*value| value else return error.Binding;
+            if (!display_root.matches(channel, deadline)) return error.Binding;
+        } else if (self.running.fifo_active) |index| {
             const fifo = self.running.fifos[index].owner orelse return error.Binding;
             if (!fifo.matches(channel, deadline)) return error.Binding;
         } else if (self.running.context_active) |index| {
@@ -447,7 +450,7 @@ pub const Device = struct {
         if (self.phase != .ready or port != &self.port or port.phase != .runtime or self.session == null or self.inLockdown() or
             self.running.self_address != @intFromPtr(&self.running) or self.running.failure != null or self.running.sequence.self_address != 0 or
             self.running.fifo_active != null or self.running.context_active != null or self.running.native_active != null or self.running.buffer_active != null or
-            self.running.outputs.active() or self.running.graph_closing) return error.State;
+            self.running.outputs.active() or self.running.graph_closing or self.running.display_engine_active) return error.State;
         const work = if (self.running.copy_job) |*value| value else return error.Binding;
         if (work.submitted or work.ticket == null or !std.meta.eql(work.ticket.?, ticket) or !std.meta.eql(work.job, work.job_stamp) or
             work.deadline != deadline or work.channel_handle.epoch != self.epoch or work.channel_handle.slot >= self.running.fifos.len) return error.Binding;

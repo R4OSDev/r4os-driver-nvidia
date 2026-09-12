@@ -1,5 +1,14 @@
 ﻿# Third-Party Notices
 
+Native display root (NVIDIA 0.1.78, 2026-09-12):
+The C670 allocation, internal static query and one-shot PRESERVE_HW
+control follow pinned NVIDIA 570.144 MIT headers/RM and Nouveau r535/r570.
+Twelve full originals and a five-pair C vector are archived under
+0.79.13/display-root-20260912. Complete notices accompany the new sources
+and the identical embedded/image runtime license; the previous license
+prefix is byte-identical. Only trailing whitespace in added notices is
+normalized. Original R4OS runtime ownership remains Apache-2.0.
+
 Channel GPFIFO (NVIDIA 0.1.75, 2026-09-12):
 Pinned570.144 allocation/control layouts, context parenting, native memory
 descriptors and USERD selection follow the complete archived originals in

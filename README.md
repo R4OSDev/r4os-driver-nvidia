@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.77; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.78; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -11,6 +11,16 @@ Starting with R4OS 0.79.9, `IMAGE_SCOPE=slim` includes the current module in
 Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
+
+Native display root (NVIDIA 0.1.78):
+Roadmap 0.79.13 has started. A dedicated owner in the existing Device/GSP
+runtime discovers C670 and the internal display geometry, then manages
+root allocation and one-shot hardware-preserving Free. Exact ACKs gate
+publication; uncertain replies retain objects and the outer boot hold.
+Five original-C packet pairs, nine targeted Device scenarios within the
+51 existing groups and the module build pass. Channels, own scanout,
+mode adoption/commit and rollback remain open software work.
+Evidence: GrafikScanout07913.json. The passive default is unchanged.
 
 Fault diagnosis and quarantine (NVIDIA 0.1.77):
 Roadmap 0.79.11 is software complete, including its combined targeted

@@ -1,0 +1,15 @@
+{
+  "source_pin": "8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f",
+  "archive": "ExFiles/Reference/GFX/Nvidia/0.79.13/display-root-20260912",
+  "generator": {
+    "sha256": "f1a79e2763916bfb0570bfba5fe5c5dbff6bb33a57214b8ff531bf0936a4019d",
+    "bytes": 2537,
+    "path": "Temp/gfx-native-scanout-20260912/Display-ABI.c"
+  },
+  "vector": {
+    "sha256": "3563b57609541d4c50b7a6ca09f3cfa17ffdd05a8106984448177a1f28e7acc5",
+    "bytes": 1136,
+    "path": "Repositories/Drivers/NVIDIA/src/fixtures/display-engine-570.144.bin"
+  },
+  "scope": "Five original-C request/reply pairs; software ABI verification only."
+}
