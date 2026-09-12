@@ -820,3 +820,15 @@ original sources, notices and C fixtures are archived under
 352032-byte runtime/distribution license retain the applicable complete
 NVIDIA 2020/2021 and Red Hat 2018/2023 MIT notices. Original R4OS policy and
 ownership code is Apache-2.0; reference C generators are host-only.
+
+HDMI control integration (NVIDIA 0.1.87, 2026-09-12):
+RM setter layouts and packet fields use MIT NVIDIA570.144
+/8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f; NVKMS and Nouveau r535/disp
+provide the sequencing references. Sixteen complete originals and14 C
+payloads are archived under0.79.13/hdmi-link-20260912. Full source notices
+are retained in gsp_hdmi_link.zig. The identical354786-byte module/image
+runtime license adds the original nvtiming.h and hdmi_spec.h MIT notices;
+its former352032-byte prefix is preserved. R4GFX EDID flag facts follow
+the already pinned MIT libdisplay-info source and its existing license.
+Original R4OS state/ownership policy is Apache-2.0. No firmware changed;
+the original-header C generator is host-only.

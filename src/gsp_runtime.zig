@@ -68,8 +68,10 @@ pub const PositionSubmission = struct {
 };
 pub const DisplayPosition = struct { handle: DisplayChannelHandle, point: display_channel.push.commands.Point, sequence: u64 };
 pub const boot_mode = @import("gsp_boot_mode.zig");
-pub const DisplayWork = struct { core: DisplaySubmission, window: ?DisplaySubmission = null, position: ?PositionSubmission = null, deadline: u64, boot_mode: ?boot_mode.Plan = null };
-pub const ActiveDisplayImage = struct { image: display_resources.image.Image, head: u32, core_point: u64, window_point: u64, boot_mode: ?boot_mode.Plan = null, position: ?DisplayPosition = null };
+pub const hdmi_link = @import("gsp_hdmi_link.zig");
+pub const DisplayLink = struct { plan: hdmi_link.Plan, acknowledged: u8, receipt: u64 };
+pub const DisplayWork = struct { core: DisplaySubmission, window: ?DisplaySubmission = null, position: ?PositionSubmission = null, deadline: u64, boot_mode: ?boot_mode.Plan = null, link: ?hdmi_link.Work = null };
+pub const ActiveDisplayImage = struct { image: display_resources.image.Image, head: u32, core_point: u64, window_point: u64, boot_mode: ?boot_mode.Plan = null, position: ?DisplayPosition = null, link: ?DisplayLink = null };
 const subscriptions = @import("gsp_event_objects.zig");
 const outputs = @import("gsp_outputs.zig");
 const inventory = @import("gsp_memory_inventory.zig");
@@ -291,6 +293,8 @@ pub const Owner = struct {
             .{@errorName(err),position.handle.handle,@tagName(position.phase),if(position.ticket)|ticket|ticket.point else 0});
         if (self.initial_image) |*work| self.log("NVIDIA gsp-initial-image: failed={s} submitted={} point={d} source-held={} storage=retained",
             .{@errorName(err),work.operation.submitted,if(work.operation.ticket)|ticket|ticket.point else 0,work.operation.gpu.lease.id != 0});
+        if (self.display_work) |*work| if (work.link) |*link| self.log("NVIDIA gsp-hdmi: failed={s} display={x} phase={s} operation={s} replies={d} receipt={d} status={?} rpc={} storage=retained",
+            .{@errorName(err),link.plan.mode.signal.display_id,@tagName(link.phase),@tagName(link.operation),link.acknowledged,link.last_receipt,link.last_status,link.rpc_error});
     }
     fn recordFault(self: *Owner, value: diagnostics.Record) !void {
         var record = value;
@@ -666,6 +670,7 @@ pub const Owner = struct {
         if (core.parent != window.parent or window.config.kind != .window) return error.Stale;
         const root: DisplayEngineHandle = .{ .epoch = self.epoch, .root = core.parent.binding.root };
         const plan = try self.bootDisplayPlan(root, window.config.index);
+        const link = try hdmi_link.derive(plan, self.display_object.?, self.outputs.snapshot().?);
         const resources = self.display_resources_slot.owner orelse return error.State;
         const image = resources.publishedImage(window_handle.slot, image_handle) orelse return error.State;
         if (image.width != plan.width or image.height != plan.height) return error.Descriptor;
@@ -675,6 +680,7 @@ pub const Owner = struct {
             .{ .epoch = self.epoch, .handle = position.config.handle, .slot = @intCast(slot) }, image_handle, plan.head, .{}, deadline);
         self.display_work.?.core.config.signal = plan.signal;
         self.display_work.?.boot_mode = plan;
+        self.display_work.?.link = .{ .plan = link };
     }
     pub fn commitPositionedDisplayImage(self: *Owner, core_handle: DisplayChannelHandle, window_handle: DisplayChannelHandle,
         immediate_handle: DisplayChannelHandle, image_handle: u32, head: u32, point: display_channel.push.commands.Point, deadline: u64) !void
@@ -1234,8 +1240,62 @@ pub const Owner = struct {
         work.operation.submitted = true;
         return true;
     }
+    pub fn validateDisplayLink(self: *Owner) !void {
+        const work = if (self.display_work) |*value| value else return error.State;
+        const link = if (work.link) |*value| value else return error.State;
+        const window = if (work.window) |*value| value else return error.State;
+        const position = if (work.position) |*value| value else return error.State;
+        const core = try self.findDisplayChannel(work.core.handle);
+        const actual = try self.findDisplayChannel(window.handle);
+        if (actual.parent != core.parent or actual.config.kind != .window or work.boot_mode == null) return error.Stale;
+        const expected = try self.bootDisplayPlan(.{ .epoch = self.epoch, .root = core.parent.binding.root }, actual.config.index);
+        const planned = try hdmi_link.derive(expected, self.display_object.?, self.outputs.snapshot().?);
+        if (!std.meta.eql(link.plan, planned) or !std.meta.eql(work.boot_mode.?, expected) or
+            !std.meta.eql(work.core.config.signal, @as(?boot_mode.Signal, expected.signal)) or
+            window.config.scanout == null or window.config.scanout.?.width != expected.width or window.config.scanout.?.height != expected.height or
+            !std.meta.eql(work.core.config.route, @as(?display_channel.push.commands.Route, .{ .head = expected.head, .window = expected.window }))) return error.Stale;
+        switch (link.phase) {
+            .before_scanout => if (work.core.phase != .prepare or window.phase != .prepare or position.phase != .prepare) return error.State,
+            .after_scanout, .complete => if (work.core.phase != .complete or window.phase != .complete or position.phase != .complete) return error.State,
+            .scanout => {},
+        }
+    }
+    fn advanceDisplayLink(self: *Owner, current: u64) !Progress {
+        const work = &self.display_work.?;
+        const link = &work.link.?;
+        const channel = &self.channel.?;
+        try self.validateDisplayLink();
+        if (current >= work.deadline) return error.Timeout;
+        if (!link.pending) {
+            link.length = try hdmi_link.encode(link.plan, link.operation, &link.request);
+            try channel.begin(hdmi_link.function, link.request[0..link.length], work.deadline);
+            link.pending = true;
+            return .progress;
+        }
+        if (try channel.poll(work.deadline)) |dispatch| {
+            if (!dispatch.response) {
+                try self.notification(channel, dispatch, current); return .progress;
+            }
+            const reply = try hdmi_link.decode(link.plan, link.operation, dispatch.record);
+            link.last_status = reply.status; link.rpc_error = reply.rpc_error;
+            try channel.complete(dispatch.ticket);
+            if (reply.status != 0) {
+                link.pending = false;
+                self.rmFailure(.display_channel, link.plan.object.display, reply.status);
+                return error.RmRejected;
+            }
+            try link.afterAck(dispatch.ticket.serial);
+            return .progress;
+        }
+        return if (channel.phase == .waiting) .idle else .progress;
+    }
     fn advanceDisplay(self: *Owner, current: u64) !bool {
         const work = if (self.display_work) |*value| value else return false;
+        if (current >= work.deadline) return error.Timeout;
+        if (work.link) |*link| {
+            if (link.phase != .scanout and link.phase != .complete) return error.State;
+            try self.validateDisplayLink();
+        }
         if (work.position) |*position| if (position.phase == .prepare or position.phase == .rewind)
             return self.advanceDisplayPosition(position, work.deadline, current);
         if (work.window) |*window| {
@@ -1255,9 +1315,13 @@ pub const Owner = struct {
             progressed = try self.advanceDisplayPosition(position, work.deadline, current) or progressed;
             if (position.phase != .complete) return progressed;
         }
+        if (work.link) |*link| if (link.phase == .scanout) {
+            try link.scanoutComplete(); return true;
+        };
         if (work.window) |window| {
             const route = window.config.route.?;
             var mode = work.boot_mode;
+            var link: ?DisplayLink = if (work.link) |value| .{ .plan = value.plan, .acknowledged = value.acknowledged, .receipt = value.last_receipt } else null;
             var position: ?DisplayPosition = if (work.position) |value| .{ .handle = value.handle,
                 .point = value.config.position.?, .sequence = value.ticket.?.point } else null;
             if (mode) |plan| {
@@ -1267,11 +1331,12 @@ pub const Owner = struct {
             } else if (self.display_images[route.window]) |prior| {
                 if (prior.head == route.head and prior.image.width == window.config.scanout.?.width and prior.image.height == window.config.scanout.?.height) {
                     mode = prior.boot_mode;
+                    link = prior.link;
                     if (position == null) position = prior.position;
                 }
             }
             self.display_images[route.window] = .{ .image = window.config.scanout.?, .head = route.head,
-                .core_point = work.core.ticket.?.point, .window_point = window.ticket.?.point, .boot_mode = mode, .position = position };
+                .core_point = work.core.ticket.?.point, .window_point = window.ticket.?.point, .boot_mode = mode, .position = position, .link = link };
         }
         self.display_work = null; return true;
     }
@@ -1713,6 +1778,11 @@ pub const Owner = struct {
             }
             return if (owner.exchange.phase == .waiting) .idle else .progress;
         }
+        // The display transaction owns these setter replies. Do not let the
+        // generic graph/query dispatcher consume or acknowledge them.
+        if (self.display_work) |*work| if (work.link) |*link| {
+            if (link.phase == .before_scanout or link.phase == .after_scanout) return self.advanceDisplayLink(current);
+        };
         // Drain an already observable GSP fault before publishing CE success.
         // Active RPC owners above already receive before sending their work.
         if (self.copyBusy() and channel.phase == .idle) {

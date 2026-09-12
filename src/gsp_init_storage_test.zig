@@ -1539,6 +1539,9 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         context_display_success, context_display_timeout, context_display_fault, context_display_cursor, context_display_notifier, context_display_map,
         context_display_image, context_display_image_timeout, context_display_image_fault, context_display_image_lost,
         context_display_image_position_timeout, context_display_image_position_fault,
+        context_display_image_link_reject, context_display_image_link_timeout, context_display_image_link_stale,
+        context_display_image_link_late_reject, context_display_image_link_ack, context_display_image_link_fault,
+        context_display_image_link_dvi,
         context_display_present, context_display_present_timeout, context_display_present_fault,
         context_display_present_initial_timeout, context_display_present_initial_fault, context_display_present_initial_release,
         context_display_present_initial_acquire, context_display_present_initial_retry,
@@ -3246,6 +3249,66 @@ fn checkDeviceDisplayUpload(target: *@import("gsp_device.zig").Device, table: *a
     _ = target.stop();
     try t.expect(table_owner.failed and model.slots[data_index].imported and ControlModel.active and ControlModel.releases == 0);
 }
+fn pumpDisplayLink(target: *@import("gsp_device.zig").Device, deadline: u64, phase: @import("gsp_hdmi_link.zig").Phase) !bool {
+    const link_api = @import("gsp_hdmi_link.zig");
+    const model = @import("gsp_display_test_model.zig").Model;
+    const running = &target.running;
+    const session = &target.session.?;
+    var steps: usize = 0;
+    while (target.phase == .ready and running.display_work.?.link.?.phase == phase and steps < 60) : (steps += 1) {
+        const link = &running.display_work.?.link.?;
+        const rpc = &running.channel.?;
+        const prior = link.acknowledged;
+        _ = target.step();
+        if (target.phase != .ready or rpc.phase != .waiting) continue;
+        var response: [link_api.max_bytes]u8 = undefined;
+        const reference = try @import("gsp_hdmi_link_test.zig").reference(link.operation, link.plan);
+        @memcpy(response[0..reference.len], reference);
+        outputWord(&response, 0, link.plan.object.client); outputWord(&response, 4, link.plan.object.display);
+        try t.expectEqualSlices(u8, response[0..reference.len], rpc.request);
+        try t.expect(link.acknowledged == prior and running.display_images[3] == null);
+        const io = target.port.owner.?;
+        rpc.phase = .prepared;
+        const saved = rpc.request;
+        rpc.request = response[0..reference.len];
+        try t.expectError(error.Binding, io.admit_command.?(io.context, &target.port, deadline)); rpc.request = saved;
+        link.request[32] ^= 1;
+        try t.expectError(error.Binding, io.admit_command.?(io.context, &target.port, deadline)); link.request[32] ^= 1;
+        running.outputs.data.generation += 1;
+        try t.expectError(error.Binding, io.admit_command.?(io.context, &target.port, deadline)); running.outputs.data.generation -= 1;
+        try t.expectError(error.Binding, io.admit_command.?(io.context, &target.port, deadline + 1));
+        try io.admit_command.?(io.context, &target.port, deadline);
+        rpc.phase = .waiting;
+        if (phase == .before_scanout and model.is("context_display_image_link_timeout")) { clock = deadline; _ = target.step(); break; }
+        if (phase == .before_scanout and model.is("context_display_image_link_stale")) {
+            running.outputs.data.generation += 1; _ = target.step(); break;
+        }
+        if ((link.operation == .enable and model.is("context_display_image_link_reject")) or
+            (link.operation == .gcp and model.is("context_display_image_link_late_reject"))) outputWord(&response, 12, 0x57);
+        std.mem.writeInt(u32, backing.?[init.queues_offset + init.status_offset + 64..][0..4], session.tx_write, .little);
+        try nativeReply(session, link_api.function, 0, response[0..reference.len]);
+        if (link.operation == .gcp and model.is("context_display_image_link_ack")) range_failure_call = range_calls + 4;
+        _ = target.step();
+        if (target.phase == .ready) try t.expect(link.acknowledged == prior + 1 and link.last_receipt != 0 and !link.pending);
+        if (target.phase == .ready and link.phase == .complete and model.is("context_display_image_link_fault")) {
+            // A fatal event after every successful ACK still wins over final
+            // image publication on the next bounded worker invocation.
+            try nativeEvent(session, 0x10ff, &.{}); _ = target.step(); break;
+        }
+    }
+    try t.expect(steps < 60);
+    if (target.phase != .ready) {
+        try t.expect(target.phase == .recovering and running.display_work != null and running.display_images[3] == null and
+            running.display_resources_slot.owner.?.failed and model.released == 0);
+        for (&model.slots) |*slot| try t.expect(slot.active and slot.cpu and slot.dma.lease.id != 0);
+        if (phase == .before_scanout) try t.expect(running.display_channels[0].?.ring.issued == 0 and running.display_channels[4].?.ring.issued == 0 and running.display_channels[12].?.ring.issued == 0)
+        else try t.expect(running.display_channels[0].?.ring.completed == 1 and running.display_channels[4].?.ring.completed == 1 and running.display_channels[12].?.ring.completed == 1);
+        if (model.is("context_display_image_link_ack")) try t.expect(session.pending != null and running.display_work.?.link.?.acknowledged == 6);
+        return false;
+    }
+    try t.expect(running.display_work.?.link.?.phase == if (phase == .before_scanout) link_api.Phase.scanout else .complete);
+    return true;
+}
 fn checkDeviceDisplayImage(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, fifo_handle: @import("gsp_runtime.zig").ChannelHandle,
     root: @import("gsp_runtime.zig").DisplayEngineHandle,
     core_handle: @import("gsp_runtime.zig").DisplayChannelHandle, dma: u32, deadline: u64, scenario: []const u8) !void
@@ -3256,6 +3319,8 @@ fn checkDeviceDisplayImage(target: *@import("gsp_device.zig").Device, table: *a.
     const running = &target.running;
     const present_case = std.mem.startsWith(u8, scenario, "context_display_present");
     const position_failure = model.is("context_display_image_position_timeout") or model.is("context_display_image_position_fault");
+    const link_case = std.mem.startsWith(u8, scenario, "context_display_image_link_");
+    const dvi_case = model.is("context_display_image_link_dvi");
     errdefer |err| std.debug.print("display image {s}: {s} phase={s} failure={?} core={?} window={?}\n", .{
         scenario, @errorName(err), @tagName(target.phase), target.failure,
         if (running.display_work) |work| work.core.phase else null,
@@ -3289,6 +3354,7 @@ fn checkDeviceDisplayImage(target: *@import("gsp_device.zig").Device, table: *a.
     if (mode_case) {
         const vectors = @import("gsp_display_commands_test.zig");
         var observed = vectors.bootFixture(image.width, image.height);
+        if (dvi_case) observed.heads[1].hdmi = 0;
         // This fixture's original instance was inactive; keep its actual
         // captured dependency contract while supplying a modeled signal.
         observed.instance_control = saved_scanout.?.instance_control;
@@ -3333,6 +3399,10 @@ fn checkDeviceDisplayImage(target: *@import("gsp_device.zig").Device, table: *a.
         else if (point < 3) try running.commitPositionedDisplayImage(core_handle, window_handle, position_handle, dma, 1,
             if (point == 1) .{} else .{ .x = -17, .y = 23 }, deadline)
         else try running.commitDisplayImage(core_handle, window_handle, dma, 1, deadline);
+        if (mode_case and point == 1) {
+            try t.expectError(error.Binding, admit(endpoint.context, &target.port, position_owner, deadline, .read));
+            if (!try pumpDisplayLink(target, deadline, .before_scanout)) return;
+        }
         const window_part = &running.display_work.?.window.?;
         try t.expect(window_part.config.notifier_offset == if (point == 2) @as(u16, 16) else 0);
         try t.expectError(error.Busy, running.commitDisplayCore(core_handle, deadline));
@@ -3415,7 +3485,7 @@ fn checkDeviceDisplayImage(target: *@import("gsp_device.zig").Device, table: *a.
             }
             _ = target.step();
         }
-        if (!model.is("context_display_image") and !present_case) {
+        if (!model.is("context_display_image") and !present_case and !link_case) {
             try t.expect(target.phase == .recovering and running.display_work != null and running.display_images[3] == null and
                 table_owner.failed and window_note.failed and window_owner.ring.completed == @as(u64, if (position_failure) 1 else 0) and
                 position_owner.ring.completed == 0 and model.released == 0 and
@@ -3429,12 +3499,20 @@ fn checkDeviceDisplayImage(target: *@import("gsp_device.zig").Device, table: *a.
             model.words[(position_user + 4) / 4] = model.words[position_user / 4];
             _ = target.step();
         }
+        if (mode_case and point == 1) {
+            try t.expect(running.display_images[3] == null and running.display_work.?.link.?.phase == if (dvi_case) @import("gsp_hdmi_link.zig").Phase.complete else .after_scanout);
+            if (!dvi_case and !try pumpDisplayLink(target, deadline, .after_scanout)) return;
+            try t.expect(running.display_images[3] == null and running.display_work.?.link.?.acknowledged == @as(u8, if (dvi_case) 2 else 7));
+            _ = target.step();
+        }
         const active_image = (try running.displayImageStatus(root, 3)).?;
         try t.expect(active_image.position != null and std.meta.eql(active_image.position.?.handle, position_handle) and
             active_image.position.?.sequence == @min(point, 2) and position_owner.ring.completed == @min(point, 2));
         try t.expect(std.meta.eql(active_image.position.?.point, if (point == 1) push.commands.Point{} else push.commands.Point{ .x = -17, .y = 23 }));
         if (mode_case) try t.expect(active_image.boot_mode != null and active_image.boot_mode.?.signal.clock == (0x80000000 | 148500000) and
             active_image.boot_mode.?.output_generation == 7 and active_image.boot_mode.?.held_generation == target.display_epoch);
+        if (mode_case) try t.expect(active_image.link != null and active_image.link.?.acknowledged == @as(u8, if (dvi_case) 2 else 7) and active_image.link.?.receipt != 0 and
+            active_image.link.?.plan.mode.transport_hdmi == !dvi_case);
         try t.expect(target.phase == .ready and running.display_work == null and window_owner.ring.completed == point and
             core_owner.ring.completed == point and std.meta.eql(active_image.image, image) and active_image.head == 1 and
             active_image.core_point == point and active_image.window_point == point and window_note.result.?.timestamp == (@as(u64, 7) << 32) + 100 + point);

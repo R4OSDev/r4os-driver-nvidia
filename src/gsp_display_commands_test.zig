@@ -25,6 +25,7 @@ pub fn check() !void {
     try t.expectError(error.Completion, push.cursor(0xffffffff));
     try checkImages();
     try checkBootMode();
+    try @import("gsp_hdmi_link_test.zig").check();
     try checkPosition();
 }
 fn checkPosition() !void {
@@ -55,6 +56,7 @@ fn checkPosition() !void {
 pub fn bootFixture(width: u32, height: u32) @import("boot_scanout.zig").Raw {
     var raw: @import("boot_scanout.zig").Raw = .{ .capabilities = 0x0802, .window_mask = 255, .counts = 0x800402 };
     raw.sors[3] = 0x102;
+    raw.heads[1].hdmi = 0x40000000;
     const size = width | (height << 16);
     raw.heads[1].words = .{ 0x40, 0, 0x80000000 | 148500000, 1, size, size,
         (width + 280) | ((height + 45) << 16), 43 | (4 << 16), 191 | (40 << 16),

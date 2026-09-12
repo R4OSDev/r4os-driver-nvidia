@@ -447,6 +447,10 @@ pub const Device = struct {
             if (!mapping.matches(channel, deadline)) return error.Binding;
         } else if (self.running.outputs.active()) {
             if (!self.running.outputs.matches(channel, deadline)) return error.Binding;
+        } else if (self.running.display_work) |*work| {
+            const link = if (work.link) |*value| value else return error.Binding;
+            if (channel != &self.running.channel.? or work.deadline != deadline or !link.matches(channel, deadline)) return error.Binding;
+            self.running.validateDisplayLink() catch return error.Binding;
         } else if (self.running.graph) |*graph| {
             if (!graph.matches(channel, deadline)) return error.Binding;
         } else if (self.running.static_info == null) {
@@ -537,11 +541,14 @@ pub const Device = struct {
         if (work.window) |*window_part| {
             const route = work.core.config.route orelse return error.Binding;
             if (work.boot_mode) |plan| {
+                const link = if (work.link) |*value| value else return error.Binding;
+                if (link.phase != .scanout or link.pending or link.acknowledged != @as(u8, if (plan.transport_hdmi) 3 else 2) or link.last_receipt == 0) return error.Binding;
+                self.running.validateDisplayLink() catch return error.Binding;
                 const expected = self.running.bootDisplayPlan(.{ .epoch = self.epoch, .root = root.binding.root }, route.window) catch return error.Binding;
                 if (!std.meta.eql(plan, expected) or !std.meta.eql(work.core.config.signal, @as(?runtime.boot_mode.Signal, expected.signal)) or
                     plan.head != route.head or window_part.config.scanout == null or window_part.config.scanout.?.width != plan.width or
                     window_part.config.scanout.?.height != plan.height) return error.Binding;
-            } else if (work.core.config.signal != null) return error.Binding;
+            } else if (work.core.config.signal != null or work.link != null) return error.Binding;
             if (window_part.config.signal != null or window_part.config.position != null or work.core.config.position != null or work.core.config.with_position or
                 window_part.config.with_position != (work.position != null)) return error.Binding;
             if (work.position) |*position| {

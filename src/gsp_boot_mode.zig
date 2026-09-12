@@ -54,6 +54,7 @@ pub const Plan = struct {
     width: u32,
     height: u32,
     refresh_micro_hz: u64,
+    transport_hdmi: bool = false,
     signal: Signal,
 };
 
@@ -93,6 +94,7 @@ pub fn capture(raw: *const scanout.Raw, boot: *const a.GfxNativeBootInfo, window
     if (leading < 2 or leading > 0x7fff or trailing > 0x7fff) return error.Bounds;
     return .{ .boot_generation = boot.generation, .head = head, .window = window,
         .width = boot.width, .height = boot.height, .refresh_micro_hz = timing.raster_micro_hz,
+        .transport_hdmi = timing.hdmi_enabled,
         .signal = .{ .sor = sor, .sor_control = raw.sors[sor], .clock = source.get(.clock),
             .total = source.get(.total), .sync_end = source.get(.sync_end), .blank_end = source.get(.blank_end),
             .blank_start = source.get(.blank_start), .viewport = source.get(.viewport_in),
