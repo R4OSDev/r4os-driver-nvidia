@@ -1,5 +1,14 @@
 ﻿# Third-Party Notices
 
+Pitch-aware Present copies (NVIDIA 0.1.83, 2026-09-12):
+The C6B5/C7B5 multiline methods and C56F GPFIFO layout follow the pinned
+MIT NVIDIA 570.144 definitions. Their full notices are already included
+in NVIDIA-GSP-RUNTIME-LICENSE.txt; all 352032 existing bytes remain
+unchanged and match Distribution. Six complete original headers, their
+full notices and independent C/DRF vectors are archived under
+0.79.13/present-20260912. Original R4OS shadow/queue/worker code is
+Apache-2.0; no reference C implementation is linked into the driver.
+
 Window scanout submission (NVIDIA 0.1.82, 2026-09-12):
 Typed C67E image/state and paired C67D completion follow MIT NVIDIA
 570.144 class definitions, nvkms-evo3.c and nvkms-headsurface.c, plus

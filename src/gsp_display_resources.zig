@@ -97,6 +97,13 @@ pub const Owner = struct {
         };
         return null;
     }
+    pub fn publishedStorage(self: *Owner, channel: u32, handle: u32) ?*vram.storage.Use {
+        if (self.publishedImage(channel, handle) == null) return null;
+        for (&self.table.entries, 0..) |*entry, i| if (entry.*) |descriptor| {
+            if (descriptor.channel == channel and descriptor.handle == handle) return &self.storage[i];
+        };
+        return null;
+    }
     pub fn createNotifier(self: *Owner, ctx: *const r4os.r4dev.DriverContext, channel: u32) Error!u32 {
         if (!self.valid()) return error.Stale;
         if (channel >= self.notifiers.len) return error.Bounds;

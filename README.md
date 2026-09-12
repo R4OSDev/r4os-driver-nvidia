@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.82; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.83; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -12,20 +12,24 @@ Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
 
-Native display preparation (NVIDIA 0.1.82):
-The internal Device/GSP runtime owns contiguous RGB scanout buffers and
-retained display contexts. Typed C67E window methods pair with C67D core
-UPDATE: the worker submits both channels, then requires core FINISHED and
-window BEGUN. Two notifier records alternate; an old record requires
-FINISHED before reuse. Actual image geometry, route, deadline and command
-bytes gate submission. Faults retain storage; channel retirement releases
-command buffers while display images/table/notifiers remain held.
+Native display preparation (NVIDIA 0.1.83):
+The internal Device/GSP runtime owns contiguous RGB scanout buffers,
+retained display contexts and paired C67E Window/C67D Core submission.
+Core FINISHED plus Window BEGUN confirms its internal image state; old
+notifier records require FINISHED before reuse.
 
-Original C-header vectors and four targeted Device scenarios extend the
-51 passing tests; the module builds. Common Present integration, complete
-boot-mode adoption, head/output state, atomic commit and rollback remain
-open in 0.79.13. These internal APIs are not automatically invoked; passive
-bootfb remains default. Software evidence: GrafikScanout07913.json.
+The common Present consumer imports the actual CPU shadow and copies
+rectangles into the already retained native image with distinct row
+pitches. One 2D CE packet handles each rectangle; confirmed source GPU
+mappings are reused. Exact ownership and command admission precede PUT.
+Only SYS semaphore completion releases queue access. Pending frames allow
+output queries to drain; uncertain effects retain storage and report loss.
+
+Original header vectors and three targeted Device scenarios extend the
+51 passing tests; the module builds. Initial upload, product display
+handoff, boot-mode adoption, head/output state, atomic commit and rollback
+remain open in 0.79.13. These internal APIs are not automatically invoked;
+passive bootfb remains default. Evidence: GrafikScanout07913.json.
 Physical execution and visible-image qualification: OssiGPU.txt.
 
 Fault diagnosis and quarantine (NVIDIA 0.1.77):

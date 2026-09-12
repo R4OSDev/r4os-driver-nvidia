@@ -348,12 +348,17 @@ pub const Device = struct {
             .admit_runtime = admitRuntime, .admit_command = admitCommand, .admit_copy = admitCopy,
             .admit_display_retirement = admitDisplayRetirement,
             .admit_display_push = admitDisplayPush,
+            .wake_work = wakeWork,
             .recovery = .{ .generation = recoveryGeneration, .admit = admitRecovery, .access = recoveryAccess } };
     }
     fn generation(raw: *anyopaque) u64 {
         const self = from(raw);
         self.checkLive(false) catch return 0;
         return self.epoch;
+    }
+    fn wakeWork(raw: *anyopaque) void {
+        const self = from(raw);
+        if (self.irq_wake) |wake| _ = wake.signal(wake.context);
     }
     fn retain(raw: *anyopaque) !void {
         const self = from(raw);
@@ -482,6 +487,8 @@ pub const Device = struct {
             const work = if (self.running.copy_job) |*value| value else return error.Binding;
             if (work.submitted or work.ticket == null or !std.meta.eql(work.ticket.?, ticket) or !std.meta.eql(work.job, work.job_stamp) or
                 work.deadline != deadline) return error.Binding;
+            const transfer = self.running.copyTransfer() catch return error.Binding;
+            if (!std.meta.eql(work.transfer, transfer) or !fifo.ring.matchesTransfer(ticket, fifo.config.copy_class, transfer)) return error.Binding;
             break :blk work.channel_handle;
         };
         if (channel_handle.epoch != self.epoch or channel_handle.slot >= self.running.fifos.len) return error.Binding;

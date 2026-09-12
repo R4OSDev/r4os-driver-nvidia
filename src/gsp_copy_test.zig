@@ -46,4 +46,29 @@ pub fn check() !void {
     try t.expectError(error.Bounds, copy.encode(0xc7b5, .{ .source = 4096, .target = 8192, .bytes = 4 }, 12288, 0));
     config.address = (1 << 40) - 8192; try t.expectError(error.Bounds, fifo.encode(config, .allocate, &request));
     config.address = 0x600000; config.userd = 1 << 40; try t.expectError(error.Bounds, fifo.encode(config, .allocate, &request));
+    try checkRows();
+}
+fn checkRows() !void {
+    const expected = @embedFile("fixtures/copy-2d.bin");
+    try t.expect(expected.len == 220 and fifo.word(expected, 0) == 2);
+    var offset: usize = 4;
+    var transfer: copy.Transfer = .{ .source = 0x1000001020, .target = 0x1200002080, .bytes = 44,
+        .rows = .{ .count = 4, .source_pitch = 260, .target_pitch = 512 } };
+    for ([_]u32{0xc6b5,0xc7b5}, 0..) |class, i| {
+        for ([_]u32{class,260,512,44,4,19}) |value| { try t.expectEqual(value, fifo.word(expected, offset)); offset += 4; }
+        const encoded = try copy.encodeTransfer(class, transfer, 0x602200, @intCast(37 + i));
+        try t.expect(encoded.count == 19);
+        for (encoded.slice()) |value| { try t.expectEqual(value, fifo.word(expected, offset)); offset += 4; }
+        for (try copy.entryWords(0xabcde01000, encoded.count)) |value| { try t.expectEqual(value, fifo.word(expected, offset)); offset += 4; }
+    }
+    try t.expect(offset == expected.len and try transfer.span(false) == 824 and try transfer.span(true) == 1580);
+    try t.expectError(error.Bounds, copy.entryWords((1 << 40) - 72, 19));
+    try t.expectError(error.Bounds, copy.entryWords(4096, 18));
+    transfer.rows.?.count = 0; try t.expectError(error.Bounds, copy.encodeTransfer(0xc7b5, transfer, 8192, 1));
+    transfer.rows.?.count = 4; transfer.rows.?.source_pitch = 40;
+    try t.expectError(error.Bounds, copy.encodeTransfer(0xc7b5, transfer, 8192, 1));
+    transfer.rows.?.source_pitch = 260; transfer.target = (1 << 49) - 1000;
+    try t.expectError(error.Bounds, copy.encodeTransfer(0xc7b5, transfer, 8192, 1));
+    transfer.target = transfer.source + 800;
+    try t.expectError(error.Bounds, copy.encodeTransfer(0xc7b5, transfer, 8192, 1));
 }

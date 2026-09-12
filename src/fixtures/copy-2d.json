@@ -1,0 +1,48 @@
+{
+  "description": "Independent original-header C56F GPFIFO and C6B5/C7B5 2D virtual-pitch copy commands with SYS semaphore release",
+  "format": "Little-endian u32: count; per record class, source_pitch, target_pitch, line_bytes, rows, command_count, command words, two GPFIFO words",
+  "bytes": 220,
+  "sha256": "2510b17f26bc0aaa1f201392d72e6344100bff345422b303f43459c933827e64",
+  "source_pin": "NVIDIA 570.144 / 8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f; Nouveau Linux 7.2.4",
+  "generated_by": "Original-2D.c includes archived unmodified class headers and Nouveau DRF macros; no Zig driver code linked",
+  "sources": [
+    {
+      "bytes": 12114,
+      "path": "ExFiles/Reference/GFX/Nvidia/Nouveau/drivers/gpu/drm/nouveau/include/nvhw/drf.h",
+      "sha256": "0c2187b2824a1fb0d259cc04b9c1458160ec5ef390bc67f4afe9e54f815f4ca4",
+      "archived": "Original/Nouveau/include/nvhw/drf.h"
+    },
+    {
+      "bytes": 25775,
+      "path": "ExFiles/Reference/GFX/Nvidia/OpenKernelModules-570.144/src/common/sdk/nvidia/inc/nvtypes.h",
+      "sha256": "3fd5e2c20b1432421a214b12e52778f48f7914b87645d4736cf55324d25c9d3c",
+      "archived": "Original/Nvidia570144/src/common/sdk/nvidia/inc/nvtypes.h"
+    },
+    {
+      "bytes": 25985,
+      "path": "ExFiles/Reference/GFX/Nvidia/OpenKernelModules-570.144/src/common/sdk/nvidia/inc/class/clc56f.h",
+      "sha256": "8b7a6d6d5d5e3538f2f3e3b975d00c4aa94bd2480008c49aefcfc2566e3f658e",
+      "archived": "Original/Nvidia570144/src/common/sdk/nvidia/inc/class/clc56f.h"
+    },
+    {
+      "bytes": 23473,
+      "path": "ExFiles/Reference/GFX/Nvidia/OpenKernelModules-570.144/src/common/sdk/nvidia/inc/class/clc6b5.h",
+      "sha256": "38caaf7efa2c9a58849ebf688c042eb43a4e6b1c670155df412e1e82ea580b71",
+      "archived": "Original/Nvidia570144/src/common/sdk/nvidia/inc/class/clc6b5.h"
+    },
+    {
+      "bytes": 25479,
+      "path": "ExFiles/Reference/GFX/Nvidia/OpenKernelModules-570.144/src/common/sdk/nvidia/inc/class/clc7b5.h",
+      "sha256": "9e8dbda2d6741abeb2d2c81bb92cb621445aac7facf8c8113f3cb3d12f1c7660",
+      "archived": "Original/Nvidia570144/src/common/sdk/nvidia/inc/class/clc7b5.h"
+    },
+    {
+      "path": "ExFiles/Reference/GFX/Nvidia/OpenKernelModules-570.144/src/common/sdk/nvidia/inc/cpuopsys.h",
+      "bytes": 11619,
+      "archived": "Original/Nvidia570144/src/common/sdk/nvidia/inc/cpuopsys.h",
+      "sha256": "92114293c250b87a0c78d1bbfe52c3c132eba1c03ceef110a0e8b0ba6a80aca1"
+    }
+  ],
+  "license": "MIT source notices retained in the runtime license and complete archived original files/notices.txt; original generator Apache-2.0",
+  "evidence": "ExFiles/Reference/GFX/Nvidia/0.79.13/present-20260912"
+}

@@ -185,6 +185,7 @@ pub const Owner = struct {
     admit_copy: ?*const fn (*anyopaque, *const Port, *@import("gsp_fifo.zig").Owner, @import("gsp_copy_ring.zig").Ticket, u64) anyerror!void = null,
     admit_display_retirement: ?*const fn (*anyopaque, *const Port, *@import("gsp_display_channel.zig").Owner, u64) anyerror!void = null,
     admit_display_push: ?*const fn (*anyopaque, *const Port, *@import("gsp_display_channel.zig").Owner, u64, DisplayAccess) anyerror!void = null,
+    wake_work: ?*const fn (*anyopaque) void = null,
     recovery: ?RecoveryOwner = null,
 };
 pub const Run = struct { epoch: u64, deadline_ns: u64, resume_args: ?core.Resume = null };

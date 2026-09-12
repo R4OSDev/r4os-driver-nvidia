@@ -164,9 +164,9 @@ pub const Ring = struct {
         if (self.pending != null or self.issued - self.completed >= wire.capacity) return error.Busy;
         const point = std.math.add(u32, self.issued, 1) catch return error.Exhausted;
         const push = wire.push_offset + (self.issued % wire.capacity) * wire.slot_bytes;
-        const commands = try wire.encode(class, transfer, self.address + wire.completion_offset, point);
-        const gp = try wire.entry(self.address + push);
-        for (commands, 0..) |value, i| self.word(push + i * 4).* = value;
+        const commands = try wire.encodeTransfer(class, transfer, self.address + wire.completion_offset, point);
+        const gp = try wire.entryWords(self.address + push, commands.count);
+        for (commands.slice(), 0..) |value, i| self.word(push + i * 4).* = value;
         self.word(self.put * 8).* = gp[0]; self.word(self.put * 8 + 4).* = gp[1];
         const ticket: Ticket = .{ .owner = @intFromPtr(self), .epoch = self.backing.?.epoch,
             .channel = channel_handle, .token = token, .point = point, .put = (self.put + 1) % 512 };
@@ -180,10 +180,10 @@ pub const Ring = struct {
     pub fn matchesTransfer(self: *const Ring, ticket: Ticket, class: u32, transfer: wire.Transfer) bool {
         if (!self.matches(ticket)) return false;
         const push = wire.push_offset + (self.issued % wire.capacity) * wire.slot_bytes;
-        const expected = wire.encode(class, transfer, self.address + wire.completion_offset, ticket.point) catch return false;
-        const gp = wire.entry(self.address + push) catch return false;
+        const expected = wire.encodeTransfer(class, transfer, self.address + wire.completion_offset, ticket.point) catch return false;
+        const gp = wire.entryWords(self.address + push, expected.count) catch return false;
         fence();
-        for (expected, 0..) |value, i| if (self.word(push + i * 4).* != value) return false;
+        for (expected.slice(), 0..) |value, i| if (self.word(push + i * 4).* != value) return false;
         return self.word(self.put * 8).* == gp[0] and self.word(self.put * 8 + 4).* == gp[1];
     }
     pub fn publish(self: *Ring, ticket: Ticket) Error!void {

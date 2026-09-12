@@ -71,6 +71,11 @@ pub const ChannelHandle = struct { epoch: u64, serial: u64, slot: u16 };
 pub const ChannelStatus = struct { state: execution_fifo.State, info: ?execution_fifo.Info, rejected: ?u32, host_rejected: ?anyerror };
 const ChannelSlot = struct { owner: ?*execution_fifo.Owner = null, allocation: r4os.abi.DriverHeapAllocation = .{}, heap: ?r4os.r4dev.DriverHeapContext = null, serial: u64 = 0 };
 const CopyAddress = struct { address: u64, bytes: u64 };
+pub const present = @import("gsp_present.zig");
+pub const Presentation = struct {
+    surface: present.Owner = .{}, channel_handle: ChannelHandle, root: DisplayEngineHandle, window: DisplayChannelHandle,
+    binding: r4os.abi.GfxBackendBinding = .{}, pending: bool = false, registered: bool = false,
+};
 pub const CopyJob = struct {
     queue: r4os.driver_queue.Context,
     memory: r4os.driver_memory.Context,
@@ -84,6 +89,8 @@ pub const CopyJob = struct {
     mappings: [2]?BufferHandle = @splat(null),
     ticket: ?execution_fifo.copy.Ticket = null,
     submitted: bool = false,
+    presentation: bool = false,
+    transfer: ?execution_fifo.copy.wire.Transfer = null,
 };
 pub const execution_context = @import("gsp_context.zig");
 pub const ContextHandle = struct { epoch: u64, serial: u64, slot: u16 };
@@ -144,6 +151,7 @@ pub const Owner = struct {
     display_upload_job: ?struct { operation: display_upload.Upload = .{}, channel_handle: ChannelHandle } = null,
     display_work: ?DisplayWork = null,
     display_images: [8]?ActiveDisplayImage = @splat(null),
+    presentation: ?Presentation = null,
     rm_rejection: ?u32 = null,
     outputs: outputs.Owner = .{},
     output_refresh: bool = false,
@@ -285,13 +293,23 @@ pub const Owner = struct {
         if (self.copy_job) |*work| {
             record.active_fence = work.job.fence;
             if (work.ticket) |ticket| record.copy_point = ticket.point;
-            if (record.fault_address) |va| for (work.addresses, [_]u64{work.job.source_offset, work.job.target_offset}, 0..) |mapped, offset, i| {
-                const span = mapped orelse continue;
-                if (offset > span.bytes or work.job.byte_length > span.bytes - offset or span.address > std.math.maxInt(u64) - offset) continue;
-                const base = span.address + offset;
-                const matches = va >= base and va - base < work.job.byte_length;
-                if (i == 0) record.source_address_match = matches else record.target_address_match = matches;
-            };
+            if (record.fault_address) |va| {
+                if (work.transfer) |transfer| {
+                    // Presentation has no fabricated target queue reference.
+                    // Use the submitted 2D extents, including each row pitch.
+                    for ([_]u64{transfer.source, transfer.target}, 0..) |base, i| {
+                        const bytes = transfer.span(i == 1) catch continue;
+                        const matches = va >= base and va - base < bytes;
+                        if (i == 0) record.source_address_match = matches else record.target_address_match = matches;
+                    }
+                } else for (work.addresses, [_]u64{work.job.source_offset, work.job.target_offset}, 0..) |mapped, offset, i| {
+                    const span = mapped orelse continue;
+                    if (offset > span.bytes or work.job.byte_length > span.bytes - offset or span.address > std.math.maxInt(u64) - offset) continue;
+                    const base = span.address + offset;
+                    const matches = va >= base and va - base < work.job.byte_length;
+                    if (i == 0) record.source_address_match = matches else record.target_address_match = matches;
+                }
+            }
         }
         if (self.display_upload_job) |*work| {
             if (work.operation.ticket) |ticket| record.copy_point = ticket.point;
@@ -469,6 +487,7 @@ pub const Owner = struct {
             .initialized = owner.ring.initialized, .completed = owner.ring.completed };
     }
     pub fn retireDisplayChannel(self: *Owner, handle: DisplayChannelHandle, deadline: u64) !void {
+        if (self.presentation != null) return error.Busy;
         const owner = try self.findDisplayChannel(handle);
         if (self.copyBusy() or self.sequence.self_address != 0 or self.nativeObject() == null or self.channel.?.phase != .idle or
             self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
@@ -612,6 +631,70 @@ pub const Owner = struct {
         if (window >= self.display_images.len) return error.Bounds;
         return self.display_images[window];
     }
+    /// Register the common queue consumer for a prepared private image.
+    /// The display transition owner supplies its real CPU shadow; queued
+    /// uploads are admitted only while that exact image is active.
+    /// Registration alone does not adopt the boot framebuffer or change mode.
+    pub fn registerDisplayPresentation(self: *Owner, handle: ChannelHandle, root: DisplayEngineHandle,
+        window: DisplayChannelHandle, dma: u32, shadow: r4os.abi.GfxBufferHandle, deadline: u64) !r4os.abi.GfxBackendBinding
+    {
+        const fifo = try self.findChannel(handle);
+        const window_owner = try self.findDisplayChannel(window);
+        const engine = try self.findDisplayEngine(root);
+        if (self.presentation != null or self.copy_backend != null or self.copyBusy() or self.nativeObject() == null or
+            self.graph_closing or fifo.info() == null or !fifo.ring.idle() or window_owner.info() == null or window_owner.parent != engine or
+            window_owner.config.kind != .window) return error.Busy;
+        const resources = self.display_resources_slot.owner orelse return error.State;
+        const image = resources.publishedImage(window.slot, dma) orelse return error.State;
+        const target = resources.publishedStorage(window.slot, dma) orelse return error.State;
+        if (fifo.config.context.vaspace != self.nativeAddressSpace().?.handle) return error.Stale;
+        try self.channel.?.guard(deadline);
+        const queue = self.ctx.?.graphicsQueue() orelse return error.Api;
+        const memory = self.ctx.?.memory() orelse return error.Api;
+        if (queue.table.unregister_backend == 0) return error.Api;
+        self.presentation = .{ .channel_handle = handle, .root = root, .window = window };
+        const entry = &self.presentation.?;
+        entry.surface.open(memory, shadow, target, image) catch |err| {
+            if (entry.surface.failed) self.stop(err) else self.presentation = null;
+            return err;
+        };
+        const result = queue.register(&.{ .adapter_id = self.adapter_id, .milestone = r4os.abi.gfx_queue_milestone_device_execution,
+            .notify_callback = @intFromPtr(&notifyPresentation), .context = @intFromPtr(self) }, &entry.binding);
+        if (result != r4os.abi.gfx_queue_ok and entry.binding.device_generation == 0) {
+            if (!entry.surface.closeUnregistered()) { self.stop(error.Retained); return error.Retained; }
+            self.presentation = null; return error.Queue;
+        }
+        entry.registered = true;
+        self.copy_backend = .{ .queue = queue, .binding = entry.binding };
+        if (result != r4os.abi.gfx_queue_ok or entry.binding.version != 1 or entry.binding.size < @sizeOf(r4os.abi.GfxBackendBinding) or
+            entry.binding.adapter_id != self.adapter_id or entry.binding.milestone != r4os.abi.gfx_queue_milestone_device_execution or
+            entry.binding.device_generation == 0 or entry.binding.reset_generation == 0) { self.stop(error.Descriptor); return error.Descriptor; }
+        return entry.binding;
+    }
+    fn notifyPresentation(raw: usize) callconv(.c) i32 {
+        if (raw == 0) return -1;
+        const self: *Owner = @ptrFromInt(raw);
+        if (self.self_address != raw or self.failure != null) return -1;
+        const entry = if (self.presentation) |*value| value else return -1;
+        if (!entry.registered or !entry.surface.valid()) return -1;
+        // Already under the serialized DriverWork owner. Pacing owns waits.
+        entry.pending = true;
+        if (self.device.?.owner) |io| if (io.wake_work) |wake| wake(io.context);
+        return 0;
+    }
+    fn presentationValid(self: *Owner) bool {
+        const entry = if (self.presentation) |*value| value else return false;
+        if (!entry.registered or !entry.surface.valid() or self.copy_backend == null or
+            !std.meta.eql(entry.binding, self.copy_backend.?.binding)) return false;
+        const resources = self.display_resources_slot.owner orelse return false;
+        const channel = self.findDisplayChannel(entry.window) catch return false;
+        const root = self.findDisplayEngine(entry.root) catch return false;
+        const value = entry.surface.scanout.?;
+        const active = self.display_images[channel.config.index] orelse return false;
+        return channel.info() != null and channel.parent == root and std.meta.eql(active.image, value) and
+            std.meta.eql(resources.publishedImage(entry.window.slot, value.dma), value) and
+            resources.publishedStorage(entry.window.slot, value.dma) == entry.surface.target;
+    }
     fn copyBusy(self: *const Owner) bool { return self.copy_job != null or self.display_upload_job != null or self.display_work != null; }
     /// Discover the engine and create its RM group/share in this VA space.
     /// Channel children retain the context separately before using it.
@@ -754,6 +837,7 @@ pub const Owner = struct {
         return .{ .state = owner.state, .info = owner.info(), .rejected = owner.rejected, .host_rejected = owner.host_rejected };
     }
     pub fn retireExecutionChannel(self: *Owner, handle: ChannelHandle, deadline: u64, quiesced: bool) !void {
+        if (self.presentation) |entry| if (std.meta.eql(entry.channel_handle, handle)) return error.Busy;
         const owner = try self.findChannel(handle);
         if (self.copyBusy()) return error.Busy;
         if (self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or
@@ -802,7 +886,14 @@ pub const Owner = struct {
         }
         if ((job.operation != a.gfx_queue_operation_copy and job.operation != a.gfx_queue_operation_upload) or
             job.byte_length == 0 or job.byte_length > std.math.maxInt(u32)) { try self.finishCopy(a.gfx_queue_result_failed); return true; }
-        for (0..2) |i| {
+        if (job.operation == a.gfx_queue_operation_upload and job.target_buffer.id == 0) {
+            if (!self.presentationValid() or !std.meta.eql(self.presentation.?.binding, binding) or
+                self.presentation.?.channel_handle.slot != handle.slot or self.presentation.?.channel_handle.serial != handle.serial or
+                !self.presentation.?.surface.matches(job)) { try self.finishCopy(a.gfx_queue_result_failed); return true; }
+            self.copy_job.?.presentation = true;
+        }
+        const resource_count: usize = if (self.copy_job.?.presentation) 1 else 2;
+        for (0..resource_count) |i| {
             const reference = &self.copy_job.?.references[i];
             const status = queue.retainResource(&job.fence, @intCast(i), reference);
             if (status != a.gfx_queue_ok and reference.reference.id == 0) {
@@ -849,7 +940,8 @@ pub const Owner = struct {
             try self.finishCopy(r4os.abi.gfx_queue_result_failed); return true;
         }
         if (self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return false;
-        for (0..2) |i| {
+        const resource_count: usize = if (work.presentation) 1 else 2;
+        for (0..resource_count) |i| {
             if (work.addresses[i] != null) continue;
             const reference = work.references[i];
             for (&self.native_buffers) |*slot| if (slot.owner) |owner| {
@@ -880,21 +972,46 @@ pub const Owner = struct {
             };
             return true;
         }
-        const job = &work.job;
-        var addresses: [2]u64 = undefined;
-        for (work.addresses, [_]u64{job.source_offset,job.target_offset}, 0..) |source, offset, i| {
-            const value = source.?;
-            if (offset > value.bytes or job.byte_length > value.bytes - offset or value.address > std.math.maxInt(u64) - offset) {
-                try self.finishCopy(r4os.abi.gfx_queue_result_failed); return true;
-            }
-            addresses[i] = value.address + offset;
-        }
-        work.ticket = fifo.prepareCopy(.{ .source = addresses[0], .target = addresses[1], .bytes = job.byte_length }) catch |err| {
+        const transfer = self.copyTransfer() catch |err| {
+            if (err == error.Bounds or err == error.Unsupported or err == error.Overflow) { try self.finishCopy(r4os.abi.gfx_queue_result_failed); return true; }
+            return err;
+        };
+        work.transfer = transfer;
+        work.ticket = fifo.prepareCopy(transfer) catch |err| {
             if (err == error.Bounds or err == error.Unsupported or err == error.Exhausted) { try self.finishCopy(r4os.abi.gfx_queue_result_failed); return true; }
             return err;
         };
         try self.device.?.submitCopy(fifo, work.ticket.?, work.deadline);
         work.submitted = true; return true;
+    }
+    pub fn copyTransfer(self: *Owner) !execution_fifo.copy.wire.Transfer {
+        const work = if (self.copy_job) |*value| value else return error.State;
+        if (!std.meta.eql(work.job, work.job_stamp)) return error.Stale;
+        if (work.presentation) {
+            if (!self.presentationValid() or !std.meta.eql(work.references[0].buffer, work.job.source_buffer) or
+                work.references[0].flags != r4os.abi.gfx_buffer_reference_mapping_only or
+                !std.meta.eql(work.channel_handle, self.presentation.?.channel_handle)) return error.Stale;
+            const source = work.addresses[0] orelse return error.State;
+            const fifo = try self.findChannel(work.channel_handle);
+            var confirmed = false;
+            for (&self.buffers) |*slot| if (slot.owner) |owner| if (owner.info()) |value| {
+                if (std.meta.eql(value.buffer, work.references[0].buffer) and value.epoch == self.epoch and
+                    value.address == source.address and value.logical_bytes == source.bytes and owner.space.handle == fifo.config.context.vaspace)
+                    confirmed = true;
+            };
+            if (!confirmed) return error.Stale;
+            return self.presentation.?.surface.transfer(work.job, source.address, source.bytes);
+        }
+        const job = &work.job;
+        var addresses: [2]u64 = undefined;
+        for (work.addresses, [_]u64{job.source_offset,job.target_offset}, 0..) |source, offset, i| {
+            const value = source orelse return error.State;
+            if (offset > value.bytes or job.byte_length > value.bytes - offset or value.address > std.math.maxInt(u64) - offset) {
+                return error.Bounds;
+            }
+            addresses[i] = value.address + offset;
+        }
+        return .{ .source = addresses[0], .target = addresses[1], .bytes = job.byte_length };
     }
     fn advanceDisplayUpload(self: *Owner, current: u64) !bool {
         const work = if (self.display_upload_job) |*value| value else return false;
@@ -1337,6 +1454,17 @@ pub const Owner = struct {
         if (try self.advanceDisplayUpload(current)) return .progress;
         if (try self.advanceDisplay(current)) return .progress;
         if (try self.advanceCopy(current)) return .progress;
+        if (self.presentation) |*entry| if (entry.pending and !self.copyBusy()) {
+            const taken: ?bool = self.beginCopyWork(entry.channel_handle, entry.binding, try std.math.add(u64, current, 3 * std.time.ns_per_s)) catch |err| blk: {
+                if (err == error.Busy) break :blk null; return err;
+            };
+            if (taken) |claimed| {
+                if (claimed) return .progress;
+                entry.pending = false;
+            }
+            // A pending frame must not starve an output query or other
+            // runtime owner that currently prevents taking the queue job.
+        };
         if (self.nativeObject() != null and try self.collectNativeBuffer(if (self.graph_closing) self.close_deadline else try std.math.add(u64, current, 5 * std.time.ns_per_s))) return .progress;
         if (self.graph_closing and self.graph.?.state == .loaned) graph_close: {
             try channel.guard(self.close_deadline);
