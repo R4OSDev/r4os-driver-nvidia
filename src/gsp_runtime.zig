@@ -50,6 +50,21 @@ pub const execution_fifo = @import("gsp_fifo.zig");
 pub const ChannelHandle = struct { epoch: u64, serial: u64, slot: u16 };
 pub const ChannelStatus = struct { state: execution_fifo.State, info: ?execution_fifo.Info, rejected: ?u32, host_rejected: ?anyerror };
 const ChannelSlot = struct { owner: ?*execution_fifo.Owner = null, allocation: r4os.abi.DriverHeapAllocation = .{}, heap: ?r4os.r4dev.DriverHeapContext = null, serial: u64 = 0 };
+const CopyAddress = struct { address: u64, bytes: u64 };
+pub const CopyJob = struct {
+    queue: r4os.driver_queue.Context,
+    memory: r4os.driver_memory.Context,
+    channel_handle: ChannelHandle,
+    binding: r4os.abi.GfxBackendBinding,
+    job: r4os.abi.GfxDriverJob,
+    job_stamp: r4os.abi.GfxDriverJob,
+    deadline: u64,
+    references: [2]r4os.abi.GfxBufferReference = @splat(.{}),
+    addresses: [2]?CopyAddress = @splat(null),
+    mappings: [2]?BufferHandle = @splat(null),
+    ticket: ?execution_fifo.copy.Ticket = null,
+    submitted: bool = false,
+};
 pub const execution_context = @import("gsp_context.zig");
 pub const ContextHandle = struct { epoch: u64, serial: u64, slot: u16 };
 pub const ContextStatus = struct { state: execution_context.State, info: ?execution_context.Info, rejected: ?u32, unavailable: ?execution_context.Unavailable };
@@ -113,6 +128,8 @@ pub const Owner = struct {
     native_active: ?u16 = null,
     fifos: [64]ChannelSlot = @splat(.{}),
     fifo_active: ?u16 = null,
+    copy_job: ?CopyJob = null,
+    copy_completed: u64 = 0,
     contexts: [64]ContextSlot = @splat(.{}),
     context_active: ?u16 = null,
     graph_closing: bool = false,
@@ -315,12 +332,20 @@ pub const Owner = struct {
     /// Attach an empty private GPFIFO to an existing context and native BOs.
     /// Only this driver API accepts storage owners; no physical app address.
     pub fn createExecutionChannel(self: *Owner, context_handle: ContextHandle, runqueue: u8, instance: BufferHandle, userd: BufferHandle, deadline: u64) !ChannelHandle {
+        return self.createChannel(context_handle, runqueue, instance, userd, deadline);
+    }
+    /// Explicit native worker path; creating it does not publish renderer or
+    /// display capabilities. The CE class is queried and allocated by RM.
+    pub fn createCopyChannel(self: *Owner, context_handle: ContextHandle, runqueue: u8, instance: BufferHandle, deadline: u64) !ChannelHandle {
+        return self.createChannel(context_handle, runqueue, instance, null, deadline);
+    }
+    fn createChannel(self: *Owner, context_handle: ContextHandle, runqueue: u8, instance: BufferHandle, userd: ?BufferHandle, deadline: u64) !ChannelHandle {
         _ = try self.now();
         if (self.graph_closing or self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or self.sequence.self_address != 0 or self.outputs.active()) return error.Busy;
         _ = self.nativeAddressSpace() orelse return error.State;
         if (self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         const parent = try self.findContext(context_handle);
-        const inst = try self.findNativeBuffer(instance); const usr = try self.findNativeBuffer(userd);
+        const inst = try self.findNativeBuffer(instance); const usr = if (userd) |handle| try self.findNativeBuffer(handle) else null;
         try self.channel.?.guard(deadline);
         const serial = try std.math.add(u64, self.buffer_serial, 1);
         const index: u16 = blk: {
@@ -366,6 +391,7 @@ pub const Owner = struct {
     }
     pub fn retireExecutionChannel(self: *Owner, handle: ChannelHandle, deadline: u64, quiesced: bool) !void {
         const owner = try self.findChannel(handle);
+        if (self.copy_job) |*work| if (std.meta.eql(work.channel_handle, handle)) return error.Busy;
         if (self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or
             self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         var token = try self.channel.?.handoff(deadline);
@@ -378,6 +404,120 @@ pub const Owner = struct {
         const slot = &self.fifos[index]; const heap = slot.heap orelse return error.Api;
         if (heap.release(slot.allocation.handle) != r4os.abi.driver_heap_ok) return error.Retained;
         slot.* = .{};
+    }
+    /// Take the canonical job directly from the common queue. No caller can
+    /// supply source addresses, completion points or edited job extents.
+    pub fn beginCopyWork(self: *Owner, handle: ChannelHandle, binding: r4os.abi.GfxBackendBinding, deadline: u64) !bool {
+        const fifo = try self.findChannel(handle);
+        const value = fifo.info() orelse return error.State;
+        if (!value.config.system_userd or !fifo.ring.idle() or self.copy_job != null or self.graph_closing or
+            self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or
+            self.outputs.active() or self.sequence.self_address != 0 or self.channel.?.phase != .idle or self.channel.?.in_lockdown) return error.Busy;
+        try self.channel.?.guard(deadline);
+        const a = r4os.abi;
+        if (binding.version != 1 or binding.size < @sizeOf(a.GfxBackendBinding) or binding.adapter_id != self.adapter_id or
+            binding.milestone != a.gfx_queue_milestone_device_execution or binding.device_generation == 0 or binding.reset_generation == 0) return error.Descriptor;
+        const queue = self.ctx.?.graphicsQueue() orelse return error.Api;
+        const memory = self.ctx.?.memory() orelse return error.Api;
+        var job: a.GfxDriverJob = .{};
+        const result = queue.take(&binding, &job);
+        if (result == a.gfx_queue_error_busy and job.fence.timeline == 0) return false;
+        if (result != a.gfx_queue_ok and job.fence.timeline == 0) return error.Queue;
+        self.copy_job = .{ .queue = queue, .memory = memory, .channel_handle = handle, .binding = binding,
+            .job = job, .job_stamp = job, .deadline = deadline };
+        if (result != a.gfx_queue_ok or job.version != 1 or job.size < @sizeOf(a.GfxDriverJob) or job.reserved0 != 0 or
+            job.fence.adapter_id != binding.adapter_id or job.fence.timeline == 0 or job.fence.point == 0 or
+            job.fence.device_generation != binding.device_generation or job.fence.reset_generation != binding.reset_generation) {
+            self.stop(error.Descriptor); return error.Descriptor;
+        }
+        if ((job.operation != a.gfx_queue_operation_copy and job.operation != a.gfx_queue_operation_upload) or
+            job.byte_length == 0 or job.byte_length > std.math.maxInt(u32)) { try self.finishCopy(a.gfx_queue_result_failed); return true; }
+        for (0..2) |i| {
+            const reference = &self.copy_job.?.references[i];
+            const status = queue.retainResource(&job.fence, @intCast(i), reference);
+            if (status != a.gfx_queue_ok and reference.reference.id == 0) { try self.finishCopy(a.gfx_queue_result_failed); return true; }
+            if (status != a.gfx_queue_ok or reference.version != 1 or reference.size < @sizeOf(a.GfxBufferReference) or
+                reference.flags != a.gfx_buffer_reference_mapping_only or reference.reserved0 != 0 or reference.reference.id == 0 or
+                reference.reference.generation == 0 or reference.reference.reserved0 != 0 or
+                !std.meta.eql(reference.buffer, if (i == 0) job.source_buffer else job.target_buffer)) {
+                self.stop(error.Descriptor); return error.Descriptor;
+            }
+        }
+        return true;
+    }
+    fn finishCopy(self: *Owner, result: u32) !void {
+        self.retireCopy(result) catch |err| { self.stop(err); return err; };
+    }
+    fn retireCopy(self: *Owner, result: u32) !void {
+        const work = &self.copy_job.?;
+        const a = r4os.abi;
+        if (work.queue.complete(&work.job.fence, result, 1) != a.gfx_queue_ok) return error.Retained;
+        for (&work.references) |*reference| if (reference.reference.id != 0) {
+            if (work.memory.bufferRelease(&reference.reference) != a.gfx_buffer_result_ok) return error.Retained;
+            reference.* = .{};
+        };
+        if (result == a.gfx_queue_result_complete) self.copy_completed +|= 1;
+        self.copy_job = null;
+    }
+    fn advanceCopy(self: *Owner, current: u64) !bool {
+        const work = if (self.copy_job) |*value| value else return false;
+        if (!std.meta.eql(work.job, work.job_stamp)) return error.Stale;
+        const fifo = try self.findChannel(work.channel_handle);
+        if (work.submitted) {
+            if (try fifo.ring.poll() >= work.ticket.?.point) {
+                try self.finishCopy(r4os.abi.gfx_queue_result_complete); return true;
+            }
+            if (current >= work.deadline) return error.Timeout; // Retain: a deadline is never quiescence.
+            return false; // Continue processing GSP events while CE runs.
+        }
+        if (current >= work.deadline) { try self.finishCopy(r4os.abi.gfx_queue_result_timeout); return true; }
+        if (self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return false;
+        for (0..2) |i| {
+            if (work.addresses[i] != null) continue;
+            const reference = work.references[i];
+            for (&self.native_buffers) |*slot| if (slot.owner) |owner| {
+                if (owner.queuedInfo(reference)) |value| {
+                    if (value.epoch != self.epoch or owner.binding.space.handle != fifo.config.context.vaspace) return error.Stale;
+                    work.addresses[i] = .{ .address = value.address, .bytes = value.logical_bytes }; break;
+                }
+            };
+            if (work.addresses[i] != null) continue;
+            if (work.mappings[i]) |handle| {
+                const mapped = try self.bufferStatus(handle);
+                if (mapped.state != .handed_off) return false;
+                const value = mapped.info orelse { try self.finishCopy(r4os.abi.gfx_queue_result_failed); return true; };
+                if (!std.meta.eql(value.buffer, reference.buffer) or value.epoch != self.epoch) return error.Stale;
+                work.addresses[i] = .{ .address = value.address, .bytes = value.logical_bytes }; continue;
+            }
+            // Reuse confirmed whole-BO mappings across jobs; no repeated DMA
+            // registration, heap allocation or RPC is needed for this case.
+            for (&self.buffers) |*slot| if (slot.owner) |owner| {
+                if (owner.info()) |value| if (std.meta.eql(value.buffer, reference.buffer) and value.epoch == self.epoch and owner.space.handle == fifo.config.context.vaspace) {
+                    work.addresses[i] = .{ .address = value.address, .bytes = value.logical_bytes }; break;
+                };
+            };
+            if (work.addresses[i] != null) continue;
+            work.mappings[i] = self.mapQueuedBuffer(&work.job.fence, @intCast(i), work.deadline) catch |err| {
+                if (err == error.Retained or err == error.Descriptor or self.failure != null) return err;
+                try self.finishCopy(r4os.abi.gfx_queue_result_failed); return true;
+            };
+            return true;
+        }
+        const job = &work.job;
+        var addresses: [2]u64 = undefined;
+        for (work.addresses, [_]u64{job.source_offset,job.target_offset}, 0..) |source, offset, i| {
+            const value = source.?;
+            if (offset > value.bytes or job.byte_length > value.bytes - offset or value.address > std.math.maxInt(u64) - offset) {
+                try self.finishCopy(r4os.abi.gfx_queue_result_failed); return true;
+            }
+            addresses[i] = value.address + offset;
+        }
+        work.ticket = fifo.prepareCopy(.{ .source = addresses[0], .target = addresses[1], .bytes = job.byte_length }) catch |err| {
+            if (err == error.Bounds or err == error.Unsupported or err == error.Exhausted) { try self.finishCopy(r4os.abi.gfx_queue_result_failed); return true; }
+            return err;
+        };
+        try self.device.?.submitCopy(fifo, work.ticket.?, work.deadline);
+        work.submitted = true; return true;
     }
     /// Called by the serialized native engine worker after queue.take. The
     /// common queue authenticates the full job/driver generation and supplies
@@ -443,6 +583,7 @@ pub const Owner = struct {
     }
     pub fn retireBuffer(self: *Owner, handle: BufferHandle, deadline: u64, quiesced: bool) !void {
         const owner = try self.findBuffer(handle);
+        if (self.copy_job != null) return error.Busy;
         if (!quiesced or self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or
             self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         if (owner.state != .handed_off) return error.State;
@@ -565,6 +706,7 @@ pub const Owner = struct {
     /// is drained before graph.beginDestroy may send any parent/event free.
     pub fn beginDestroyGraph(self: *Owner, deadline: u64, quiesced: bool) !void {
         _ = try self.now();
+        if (self.copy_job != null) return error.Busy;
         if (!quiesced or self.graph_closing or self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or
             self.sequence.self_address != 0 or self.nativeObject() == null or self.channel.?.phase != .idle) return error.Busy;
         try self.channel.?.guard(deadline);
@@ -596,8 +738,8 @@ pub const Owner = struct {
         if (self.fifo_active) |index| {
             const owner = self.fifos[index].owner orelse return error.State;
             if (owner.state == .ready or owner.state == .closed) {
-                if (owner.info()) |fifo_info| self.log("NVIDIA gsp-fifo: channel={x} cid={d} engine={x} scheduled=yes commands=empty",
-                    .{fifo_info.config.handle,fifo_info.cid,fifo_info.config.rm_engine});
+                if (owner.info()) |fifo_info| self.log("NVIDIA gsp-fifo: channel={x} cid={d} engine={x} scheduled=yes copy-class={x}",
+                    .{fifo_info.config.handle,fifo_info.cid,fifo_info.config.rm_engine,fifo_info.config.copy_class});
                 const deadline = owner.deadline; var token = try owner.handoff();
                 self.channel = try exchange.Exchange.init(&token, deadline);
                 if (owner.state == .finished) try self.freeChannelSlot(index);
@@ -655,6 +797,7 @@ pub const Owner = struct {
             }
             return if (owner.exchange.phase == .waiting) .idle else .progress;
         }
+        if (try self.advanceCopy(current)) return .progress;
         if (self.nativeObject() != null and try self.collectNativeBuffer(if (self.graph_closing) self.close_deadline else try std.math.add(u64, current, 5 * std.time.ns_per_s))) return .progress;
         if (self.graph_closing and self.graph.?.state == .loaned) graph_close: {
             try channel.guard(self.close_deadline);
@@ -844,7 +987,7 @@ pub const Owner = struct {
             return .progress;
         }
         if (!self.graph_closing and self.graph != null and self.graph.?.state == .loaned and channel.phase == .idle and !channel.in_lockdown and
-            (self.outputs.state == .detached or (self.output_refresh and current >= self.output_next_ns))) {
+            self.copy_job == null and (self.outputs.state == .detached or (self.output_refresh and current >= self.output_next_ns))) {
             const end = try std.math.add(u64, current, 10 * std.time.ns_per_s);
             self.output_generation = try std.math.add(u64, self.output_generation, 1);
             var token = try channel.handoff(end);

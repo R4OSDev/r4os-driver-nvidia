@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.75; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.76; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -11,6 +11,21 @@ Starting with R4OS 0.79.9, `IMAGE_SCOPE=slim` includes the current module in
 Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
+
+Native CE submission and completion (NVIDIA 0.1.76):
+The internal worker discovers and allocates C7B5/C6B5 under its FIFO, uses
+private system USERD, and submits virtual linear copy/upload jobs taken
+directly from the common queue. Exact Device admission gates the BB0090
+doorbell and RM token. GPU SYS-flush/semaphore completion, rather than GPGet,
+releases the retained job resources. Repeated transfers reuse mappings;
+uncertain effects and timeouts retain reachable memory.514 modeled transfers
+exercise upload/readback and FIFO wrap within the51 existing groups. Both
+original C class vectors and the module build pass.0.79.11 T1-T5 are software
+complete; T6 fault handling and combined acceptance remain open. The passive
+default and unqualified product engine/render/display capabilities remain.
+Evidence: GrafikSpeicher07911.json / copy_checkpoint.
+
+Earlier checkpoint entries below describe their respective implementation state.
 
 Per-channel GPFIFO ownership (NVIDIA 0.1.75):
 The runtime creates C56F under its confirmed group/context share, with a
@@ -23,8 +38,6 @@ original-C packet pairs and the module build.0.79.11 T1-T4 are software
 complete; T5/T6 still need actual engine submission/completion and faults.
 The FIFO is empty and no engine/render capability is advertised.
 Evidence: GrafikSpeicher07911.json / fifo_checkpoint.
-
-Earlier checkpoint entries below describe their respective implementation state.
 
 Private native control storage (NVIDIA 0.1.74):
 The runtime requests contiguous IMAGE/NO_SCANOUT storage only with a bound

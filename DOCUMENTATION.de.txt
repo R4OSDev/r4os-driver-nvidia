@@ -1,7 +1,14 @@
 ﻿NVIDIA: passiver Besitzer fuer 0.79.9
 ===================================
 
-Stand: 11.09.2026; passive Hardwareaufnahme 0.79.9 abgeschlossen.
+Stand: 12.09.2026, NVIDIA 0.1.76. Passive Hardwareaufnahme 0.79.9 abgeschlossen.
+0.79.11 T1-T5 sind softwareseitig umgesetzt; T6 und gemeinsame Abnahmen offen.
+Der interne Copy-Worker nutzt bestaetigte C7B5/C6B5-Objekte, SYS-USERD und
+virtuelle BO-Adressen. GPU-Semaphore mit SYS-Flush bestaetigt Upload/Readback;
+GPGet und Timer erlauben keine Freigabe.51 vorhandene Gruppen und Build
+bestanden. Details: Docs/Drivers/GrafikSpeicher07911.txt/.json, copy_checkpoint.
+Standard bleibt passiv; keine neue Produkt-Capability oder Hardwareabnahme.
+Die folgenden aelteren Abschnitte beschreiben ihren damaligen Stand.
 
 Einmaliger Firmware-Abbau nach Fehlern (NVIDIA 0.1.51)
 ----------------------------------------------------

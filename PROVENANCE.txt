@@ -1,5 +1,17 @@
 ﻿Original R4OS implementation for roadmap 0.79.9, 10.09.2026.
 
+Ampere copy submission (NVIDIA 0.1.76, 2026-09-12):
+Pinned NVIDIA570.144 /8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f class and
+allocation headers, UVM Ampere/Volta/Maxwell producer/CE semantics, plus
+Nouveau VFN base/GA100/r535 geometry. Twenty complete originals and hashes
+are archived under ExFiles/Reference/GFX/Nvidia/0.79.11/copy-submit-20260912.
+Full MIT notices and package-default COPYING accompany the source and the
+identical embedded/image runtime license; its prior190012-byte prefix is
+unchanged.1196 original-C bytes check CE allocation, USERD and methods, including
+the C7B5-only PLC disable override from uvm_ampere_ce.c/uvm_hal.c.
+The bounded R4OS owner, common queue integration and device model are
+Apache-2.0. No new upstream implementation is linked and no firmware changed.
+
 GPIO stride compatibility (NVIDIA 0.1.46, 2026-09-11):
 Measured OssiPC header 41 06 24 06 plus the existing pinned Nouveau gpio.c
 stride/prefix reader and NVIDIA DCB specification. Complete existing MIT

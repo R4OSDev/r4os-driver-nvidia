@@ -344,7 +344,7 @@ pub const Device = struct {
         return .{ .context = self, .generation = generation, .admit = admit, .access = access,
             .retain = retain, .quiesced = quiesced, .log_polling = polling,
             .admit_firmware = admitFirmware, .admit_cold = admitCold, .queue_memory = self.memory,
-            .admit_runtime = admitRuntime, .admit_command = admitCommand,
+            .admit_runtime = admitRuntime, .admit_command = admitCommand, .admit_copy = admitCopy,
             .recovery = .{ .generation = recoveryGeneration, .admit = admitRecovery, .access = recoveryAccess } };
     }
     fn generation(raw: *anyopaque) u64 {
@@ -439,6 +439,23 @@ pub const Device = struct {
             if (channel.function != @import("gsp_static.zig").function or
                 channel.request.ptr != self.running.static_request[0..].ptr or channel.request.len != self.running.static_request.len) return error.Binding;
         } else if (!self.running.post.matches(channel, deadline)) return error.Binding;
+    }
+    fn admitCopy(raw: *anyopaque, port: *const native.Port, fifo: *@import("gsp_fifo.zig").Owner, ticket: @import("gsp_copy_ring.zig").Ticket, deadline: u64) !void {
+        const self = from(raw);
+        try self.checkLive(false);
+        if (self.phase != .ready or port != &self.port or port.phase != .runtime or self.session == null or self.inLockdown() or
+            self.running.self_address != @intFromPtr(&self.running) or self.running.failure != null or self.running.sequence.self_address != 0 or
+            self.running.fifo_active != null or self.running.context_active != null or self.running.native_active != null or self.running.buffer_active != null or
+            self.running.outputs.active() or self.running.graph_closing) return error.State;
+        const work = if (self.running.copy_job) |*value| value else return error.Binding;
+        if (work.submitted or work.ticket == null or !std.meta.eql(work.ticket.?, ticket) or !std.meta.eql(work.job, work.job_stamp) or
+            work.deadline != deadline or work.channel_handle.epoch != self.epoch or work.channel_handle.slot >= self.running.fifos.len) return error.Binding;
+        const slot = &self.running.fifos[work.channel_handle.slot];
+        if (slot.owner != fifo or slot.serial != work.channel_handle.serial or !fifo.matchesCopy(ticket)) return error.Binding;
+        const rpc = self.running.activeChannel() orelse return error.State;
+        if (rpc.session != &self.session.? or port.runtime_session != rpc.session or rpc.session.pending != null or
+            rpc.phase != .idle or rpc.pending != null or rpc.in_lockdown or ticket.epoch != self.epoch) return error.Binding;
+        try rpc.guard(deadline);
     }
     fn access(raw: *anyopaque, kind: native.Access, address: u32) !void {
         const self = from(raw);

@@ -1445,7 +1445,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
     const core = @import("gsp_core.zig");
     const hs = @import("falcon_hs.zig");
     const identity = @import("identity.zig");
-    const words = try t.allocator.alignedAlloc(u32, comptime std.mem.Alignment.fromByteUnits(4096), 0xb82000 / 4);
+    const words = try t.allocator.alignedAlloc(u32, comptime std.mem.Alignment.fromByteUnits(4096), 0xbc0000 / 4);
     defer t.allocator.free(words);
     const target = try t.allocator.create(driver.Device);
     defer t.allocator.destroy(target);
@@ -1531,6 +1531,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         context_methods, context_methods_acquire, context_methods_free, context_methods_release,
         context_fifo_success, context_fifo_allocate, context_fifo_bind, context_fifo_token, context_fifo_enable,
         context_fifo_changed, context_fifo_ack, context_fifo_timeout, context_fifo_disable, context_fifo_free, context_fifo_dma,
+        context_copy_success, context_copy_class, context_copy_allocate, context_copy_changed, context_copy_timeout, context_copy_completion,
         outputs_empty, outputs_all, outputs_rejected, outputs_partial, outputs_missing, outputs_incomplete, outputs_bad_edid,
         outputs_edid_rejected, outputs_ddc, outputs_ddc_bus_changed, outputs_aux, outputs_wiring, outputs_virtual, outputs_changed, outputs_final_changed, outputs_final_rejected, outputs_hpd, outputs_sequence, outputs_ack, outputs_timeout, catalog_rejected,
         runtime_healthy, runtime_lockdown, runtime_unknown, runtime_unowned, runtime_sequence_timeout,
@@ -2577,10 +2578,13 @@ fn outputEdidFull(bytes: *[4096]u8) void {
     for (2..32) |index| { bytes[index * 128] = 0x99; bytes[index * 128 + 127] = 0 -% @as(u8, 0x99); }
 }
 fn allocateContextStorage(target: *@import("gsp_device.zig").Device, bytes: u64, deadline: u64) !@import("gsp_runtime.zig").BufferHandle {
+    return allocateContextBuffer(target, bytes, deadline, true);
+}
+fn allocateContextBuffer(target: *@import("gsp_device.zig").Device, bytes: u64, deadline: u64, private: bool) !@import("gsp_runtime.zig").BufferHandle {
     const model = @import("gsp_vram_test_model.zig").Model;
     const running = &target.running; const session = &target.session.?;
     const command = init.queues_offset + init.command_offset; const status = init.queues_offset + init.status_offset;
-    const handle = try running.allocateNativeStorage(bytes, deadline);
+    const handle = if (private) try running.allocateNativeStorage(bytes, deadline) else try running.allocateNativeBuffer(bytes, deadline);
     var steps: usize = 0;
     while (target.phase == .ready and running.native_active != null and steps < 80) : (steps += 1) {
         _ = target.step();
@@ -2597,9 +2601,9 @@ fn allocateContextStorage(target: *@import("gsp_device.zig").Device, bytes: u64,
         switch (owner.operation.?) {
             .allocate_memory, .allocate_virtual => {
                 const physical = owner.operation.? == .allocate_memory;
-                std.mem.writeInt(u64, response[112..120], if (physical) owner.storage_policy.?.physical_bytes / 2 + slot_index * 65536 else model.address(slot_index), .little);
+                std.mem.writeInt(u64, response[112..120], if (physical) (if (private) owner.storage_policy.?.physical_bytes / 2 else @as(u64, 0x20000000)) + slot_index * 65536 else model.address(slot_index), .little);
                 std.mem.writeInt(u64, response[120..128], owner.bytes - 1, .little);
-                if (physical) try t.expect(((std.mem.readInt(u32, response[56..60], .little) >> 27) & 3) == 2);
+                if (physical) try t.expect(((std.mem.readInt(u32, response[56..60], .little) >> 27) & 3) == if (private) @as(u32, 2) else 1);
             },
             .map => std.mem.writeInt(u64, response[40..48], model.address(slot_index), .little),
             else => return error.Unexpected,
@@ -2621,7 +2625,8 @@ fn checkDeviceContexts(target: *@import("gsp_device.zig").Device, table: *a.Driv
     const command = init.queues_offset + init.command_offset;
     const status = init.queues_offset + init.status_offset;
     model.install(table, scenario); defer model.dispose(table);
-    const fifo = std.mem.startsWith(u8, scenario, "context_fifo");
+    const copy_case = std.mem.startsWith(u8, scenario, "context_copy");
+    const fifo = std.mem.startsWith(u8, scenario, "context_fifo") or copy_case;
     const methods = std.mem.startsWith(u8, scenario, "context_methods") or fifo;
     const success = model.is("context_success") or model.is("context_methods");
     var handles: [2]runtime.ContextHandle = undefined;
@@ -2709,6 +2714,7 @@ fn checkDeviceContexts(target: *@import("gsp_device.zig").Device, table: *a.Driv
                     try t.expect(std.meta.eql(context.methodStorage(0).?.reference, context.methods[0].reference));
                 }
             }
+            if (copy_case) { try checkDeviceCopies(target, table, scenario, handles[0], deadline); return; }
             if (fifo) { try checkDeviceFifos(target, table, scenario, handles[0], deadline); return; }
             var token = try running.channel.?.handoff(deadline); try running.graph.?.reclaim(&token, deadline);
             const sent = session.tx_sequence; try t.expectError(error.Retained, running.graph.?.beginDestroy(deadline)); try t.expect(sent == session.tx_sequence);
@@ -2778,6 +2784,121 @@ fn checkDeviceContexts(target: *@import("gsp_device.zig").Device, table: *a.Driv
     }
 }
 const FifoCounts = struct { allocations: usize = 0, frees: usize = 0, enables: usize = 0, disables: usize = 0, event: bool = false };
+fn replyCopyMapping(target: *@import("gsp_device.zig").Device) !void {
+    const running = &target.running; const session = &target.session.?;
+    const owner = running.buffers[running.buffer_active.?].owner.?;
+    const rpc = &owner.exchange;
+    if (rpc.phase != .waiting) return;
+    var response: [1024]u8 = @splat(0); @memcpy(response[0..rpc.request.len], rpc.request);
+    const index = owner.source.buffer.id - 1101;
+    const mapped_address = @import("gsp_copy_test_model.zig").Model.address(index);
+    switch (owner.operation.?) {
+        .allocate => { std.mem.writeInt(u64, response[112..120], mapped_address, .little); std.mem.writeInt(u64, response[120..128], owner.mapped_bytes - 1, .little); },
+        .map => std.mem.writeInt(u64, response[40..48], mapped_address, .little),
+        else => {},
+    }
+    const status = init.queues_offset + init.status_offset;
+    std.mem.writeInt(u32, backing.?[status + 64..][0..4], session.tx_write, .little);
+    try nativeReply(session, rpc.function, 0, response[0..rpc.request.len]); _ = target.step();
+}
+fn checkDeviceCopies(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, scenario: []const u8,
+    context_handle: @import("gsp_runtime.zig").ContextHandle, deadline: u64) !void
+{
+    const model = @import("gsp_copy_test_model.zig").Model;
+    const vram_model = @import("gsp_vram_test_model.zig").Model;
+    const fifo_model = @import("gsp_fifo_test_model.zig").Model;
+    const running = &target.running; const session = &target.session.?;
+    var counts: FifoCounts = .{};
+    errdefer |err| std.debug.print("copy {s}: {s} phase={s} failure={?} job={} fifo={?} buffer={?} native={?} done={d} outputs={} rpc={s}\n",
+        .{scenario,@errorName(err),@tagName(target.phase),target.failure,running.copy_job != null,running.fifo_active,running.buffer_active,running.native_active,
+          running.copy_completed,running.outputs.active(),if(running.activeChannel())|rpc|@tagName(rpc.phase) else "none"});
+    const instance = try allocateContextStorage(target, 4096, deadline);
+    fifo_model.install(table, scenario);
+    const handle = try running.createCopyChannel(context_handle, 0, instance, deadline);
+    try running.releaseNativeBuffer(instance);
+    try driveDeviceFifo(target, &counts, scenario);
+    const fifo_owner = running.fifos[handle.slot].owner.?;
+    if (target.phase != .ready) {
+        try t.expect(vram_model.is("context_copy_changed") and fifo_owner.failure != null and fifo_owner.namespace_live and
+            fifo_model.slots[0].active and fifo_model.slots[0].cpu and fifo_owner.live);
+        return;
+    }
+    if (fifo_owner.info()) |value| {
+        try t.expect(value.config.copy_class == 0xc7b5 and value.config.system_userd and value.config.userd == fifo_owner.commands.?.backing.pages[2]);
+        const data_handle = try allocateContextBuffer(target, 8191, deadline, false);
+        const data_info = (try running.nativeBufferStatus(data_handle)).info.?;
+        model.install(table, data_info.reference.buffer.id - 801);
+        for (&model.host[0], 0..) |*v, i| v.* = @truncate(i * 37 + 11);
+        const raw: [*]const u8 = @ptrFromInt(target.port.window.cpu_address);
+        const mmio = raw[0..@intCast(target.port.window.byte_length)];
+        const repeats: usize = if (vram_model.is("context_copy_success")) 514 else 1;
+        for (0..repeats) |iteration| {
+            const readback = iteration % 2 == 1;
+            model.enqueue(readback);
+            const prior_tx = session.tx_sequence;
+            try t.expect(try running.beginCopyWork(handle, model.binding, deadline));
+            if (iteration == 0) try running.releaseNativeBuffer(data_handle);
+            var steps: usize = 0;
+            while (target.phase == .ready and running.copy_job != null and !running.copy_job.?.submitted and steps < 100) : (steps += 1) {
+                _ = target.step();
+                if (target.phase == .ready and running.buffer_active != null) try replyCopyMapping(target);
+            }
+            try t.expect(steps < 100 and target.phase == .ready and running.copy_job.?.submitted);
+            if (iteration >= 2) try t.expect(session.tx_sequence == prior_tx); // Repeated transfers reuse actual mappings.
+            try t.expectError(error.Busy, running.retireExecutionChannel(handle, deadline, true));
+            try t.expectError(error.Busy, running.beginDestroyGraph(deadline, true));
+            if (running.copy_job.?.mappings[if (readback) 1 else 0]) |mapped|
+                try t.expectError(error.Busy, running.retireBuffer(mapped, deadline, true));
+            const held = model.heldReferences();
+            try t.expect(held >= 3 and vram_model.slots[model.native_index].imported);
+            try model.fetch(fifo_owner, mmio);
+            _ = target.step(); // GPGet advances; semaphore and completion remain unchanged.
+            try t.expect(model.completed == iteration and running.copy_job != null and model.heldReferences() == held);
+            try model.execute();
+            _ = target.step();
+            try t.expect(model.completed == iteration and model.heldReferences() == held);
+            if (iteration == 1) try t.expect(std.mem.allEqual(u8, model.host[1][71..][0..4091], 0xa5));
+            if (vram_model.is("context_copy_timeout") or vram_model.is("context_copy_completion")) {
+                if (vram_model.is("context_copy_timeout")) clock = deadline
+                else std.mem.writeInt(u32, fifo_model.slots[0].data[8704..8708], fifo_owner.ring.issued + 1, .little);
+                _ = target.step();
+                try t.expect(target.phase == .recovering and running.copy_job != null and model.active and model.heldReferences() == held and
+                    fifo_model.slots[0].active and fifo_model.slots[0].cpu and vram_model.slots[model.native_index].live);
+                try t.expect(target.failure.? == if (vram_model.is("context_copy_timeout")) error.Timeout else error.Completion);
+                return;
+            }
+            try model.signal(); _ = target.step();
+            try t.expect(running.copy_job == null and model.completed == iteration + 1 and model.result == a.gfx_queue_result_complete and fifo_owner.ring.idle());
+            if (readback) try t.expectEqualSlices(u8, model.host[0][33..][0..4091], model.host[1][71..][0..4091])
+            else try t.expectEqualSlices(u8, model.host[0][33..][0..4091], model.vram_data[129..][0..4091]);
+        }
+        try t.expect(fifo_owner.ring.put == 2 and fifo_owner.ring.issued == 514 and running.copy_completed == 514);
+        // Bounds are rejected before a GPU put or doorbell can advance.
+        model.enqueue(false); model.job.byte_length = 9000;
+        const old_put = fifo_owner.ring.put;
+        try t.expect(try running.beginCopyWork(handle, model.binding, deadline)); _ = target.step();
+        try t.expect(running.copy_job == null and model.result == a.gfx_queue_result_failed and fifo_owner.ring.put == old_put);
+        model.closeApp();
+    } else try t.expect((vram_model.is("context_copy_class") or vram_model.is("context_copy_allocate")) and fifo_owner.ring.self_address == 0);
+    @import("gsp_buffer_test_model.zig").Model.closeHeapAdmission(table);
+    try running.beginDestroyGraph(deadline, true);
+    var steps: usize = 0;
+    while (target.phase == .ready and steps < 300) : (steps += 1) {
+        _ = target.step();
+        if (target.phase != .ready) break;
+        if (running.fifo_active != null) { try replyDeviceFifo(target, &counts, scenario); continue; }
+        const rpc = running.activeChannel().?;
+        if (rpc.phase != .waiting) continue;
+        var response: [4096]u8 = @splat(0); @memcpy(response[0..rpc.request.len], rpc.request);
+        const status = init.queues_offset + init.status_offset;
+        std.mem.writeInt(u32, backing.?[status + 64..][0..4], session.tx_write, .little);
+        try nativeReply(session, rpc.function, 0, response[0..rpc.request.len]); _ = target.step();
+    }
+    try t.expect(steps < 300 and target.phase == .recovering and target.failure.? == error.RmClosed and vram_model.charged == 0 and fifo_model.released == 1);
+    for (&running.fifos) |*slot| try t.expect(slot.owner == null);
+    for (&running.buffers) |*slot| try t.expect(slot.owner == null);
+    if (vram_model.is("context_copy_success")) try t.expect(model.heldReferences() == 0);
+}
 fn replyDeviceFifo(target: *@import("gsp_device.zig").Device, counts: *FifoCounts, scenario: []const u8) !void {
     const model = @import("gsp_vram_test_model.zig").Model;
     const fifo_model = @import("gsp_fifo_test_model.zig").Model;
@@ -2791,14 +2912,14 @@ fn replyDeviceFifo(target: *@import("gsp_device.zig").Device, counts: *FifoCount
     const record = try transport.message.decode(session.profile, backing.?[command + 4096 + cursor * 4096..][0..4096], session.tx_sequence - 1);
     try t.expectEqualSlices(u8, channel.request, record.payload);
     try t.expect(owner.info() == null and owner.parent.?.held());
-    try t.expect(owner.instance.info() != null and owner.userd.info() != null and model.slots[0].imported);
+    try t.expect(owner.instance.info() != null and (owner.config.system_userd or owner.userd.info() != null) and model.slots[0].imported);
     channel.phase = .prepared;
     try target.port.owner.?.admit_command.?(target.port.owner.?.context, &target.port, deadline);
     var moved = owner.*; try t.expect(!moved.matches(channel, deadline)); try t.expectError(error.Stale, moved.poll());
     const original = channel.request; channel.request = record.payload;
     try t.expectError(error.Binding, target.port.owner.?.admit_command.?(target.port.owner.?.context, &target.port, deadline));
     channel.request = original; channel.phase = .waiting;
-    var response: [400]u8 = @splat(0); @memcpy(response[0..channel.request.len], channel.request);
+    var response: [428]u8 = @splat(0); @memcpy(response[0..channel.request.len], channel.request);
     var fifo_operation: ?@import("gsp_fifo_wire.zig").Operation = null;
     if (owner.state == .command_creating or owner.state == .command_destroying) {
         const commands = &owner.commands.?;
@@ -2816,6 +2937,7 @@ fn replyDeviceFifo(target: *@import("gsp_device.zig").Device, counts: *FifoCount
         const op = owner.operation.?;
         fifo_operation = op;
         switch (op) {
+            .classes => { outputWord(&response, 24, if (model.is("context_copy_class")) 0 else 2); outputWord(&response, 28, 0xc6b5); outputWord(&response, 32, 0xc7b5); },
             .allocate => {
                 counts.allocations += 1; outputWord(&response, 164, @intCast(37 + counts.allocations));
                 try t.expect(@import("gsp_fifo_wire.zig").word(response[0..], 4) == owner.config.context.group);
@@ -2824,8 +2946,10 @@ fn replyDeviceFifo(target: *@import("gsp_device.zig").Device, counts: *FifoCount
             },
             .bind => try t.expect(owner.live and !owner.bound and !owner.enabled),
             .token => { try t.expect(owner.bound and !owner.enabled); outputWord(&response, 24, 0x13572468); },
+            .allocate_copy => try t.expect(owner.bound and !owner.copy_live and !owner.enabled),
             .enable => { counts.enables += 1; try t.expect(owner.work_submit_token != null and !owner.enabled); },
             .disable => { counts.disables += 1; try t.expect(owner.enabled); },
+            .free_copy => try t.expect(owner.copy_live and !owner.enabled and owner.ring.idle()),
             .free => { counts.frees += 1; try t.expect(owner.live and !owner.enabled); },
         }
         if ((op == .allocate and model.is("context_fifo_allocate")) or (op == .bind and model.is("context_fifo_bind")) or
@@ -2833,6 +2957,8 @@ fn replyDeviceFifo(target: *@import("gsp_device.zig").Device, counts: *FifoCount
             (op == .disable and model.is("context_fifo_disable")) or (op == .free and model.is("context_fifo_free")))
             outputWord(&response, if (op == .allocate) 16 else 12, 0x57);
         if (op == .allocate and model.is("context_fifo_changed")) response[56] ^= 1;
+        if (op == .allocate_copy and model.is("context_copy_allocate")) outputWord(&response, 16, 0x57);
+        if (op == .allocate_copy and model.is("context_copy_changed")) response[36] ^= 1;
         if (op == .bind and !counts.event) {
             var print: [9]u8 = @splat(0); print[4] = 1; print[8] = 'F';
             try nativeEvent(session, 0x100c, &print); _ = target.step();

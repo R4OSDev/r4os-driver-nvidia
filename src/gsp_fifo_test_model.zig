@@ -39,13 +39,16 @@ pub const Model = struct {
     }
     fn map(input: *const a.GfxBufferHandle, access: u32, offset: u64, length: u64, out: *a.GfxBufferMap) callconv(.c) i32 {
         const i = select(input.*).?; const slot = &slots[i];
-        std.debug.assert(slot.active and !slot.cpu and slot.dma.lease.id == 0 and access == 1 and offset == 0 and length == bytes);
+        std.debug.assert(slot.active and !slot.cpu and access == 1 and offset == 0 and length == bytes);
+        if (slot.dma.lease.id != 0) std.debug.assert(slot.gpu.lease.id != 0 and slot.synced);
         slot.cpu = true; out.* = .{ .lease = cpuRef(i), .cpu_address = @intFromPtr(&slot.data), .byte_length = length, .cache_policy = a.gfx_buffer_cache_write_back };
         return a.gfx_buffer_result_ok;
     }
     fn unmap(input: *const a.GfxBufferHandle) callconv(.c) i32 {
         for (&slots, 0..) |*slot, i| if (std.meta.eql(input.*, cpuRef(i))) {
-            std.debug.assert(slot.active and slot.cpu); slot.cpu = false; slot.synced = std.mem.allEqual(u8, &slot.data, 0); return a.gfx_buffer_result_ok;
+            std.debug.assert(slot.active and slot.cpu); slot.cpu = false;
+            if (slot.dma.lease.id == 0) slot.synced = std.mem.allEqual(u8, &slot.data, 0);
+            return a.gfx_buffer_result_ok;
         };
         unreachable;
     }

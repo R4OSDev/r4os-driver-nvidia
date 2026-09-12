@@ -114,6 +114,18 @@ pub const Owner = struct {
         };
         self.storage_claimed = true;
     }
+    /// Called only with a separately retained canonical active-job reference.
+    /// The producer may already have closed its reference; the common queue
+    /// and this retained reference still veto native release-ticket issuance.
+    pub fn queuedInfo(self: *const Owner, reference: a.GfxBufferReference) ?Info {
+        self.stable() catch return null;
+        if (self.self_address != @intFromPtr(self) or !self.committed or !self.common_live or !self.mapped or self.state != .handed_off or
+            self.exchange.session.state != .active or self.storage_policy != null or self.layout.blocklinear() or
+            reference.flags != a.gfx_buffer_reference_mapping_only or reference.reference.id == 0 or
+            !std.meta.eql(reference.buffer, self.reservation.buffer)) return null;
+        return .{ .reference = reference, .address = self.address, .logical_bytes = self.logical_bytes,
+            .allocation_bytes = self.bytes, .epoch = self.binding.space.epoch, .surface = self.layout };
+    }
     fn reserve(self: *Owner) Error!void {
         const result = self.memory.bufferReserve(&self.layout.descriptor, self.binding.memory, &self.reservation);
         self.reservation_stamp = self.reservation;

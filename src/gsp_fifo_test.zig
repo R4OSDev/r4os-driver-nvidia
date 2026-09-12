@@ -11,6 +11,7 @@ pub fn response(index: usize) []const u8 {
     const bytes = wire.length(ops[index]); return golden[at + bytes..][0..bytes];
 }
 pub fn check() !void {
+    try @import("gsp_copy_test.zig").check();
     var config: wire.Config = .{ .context = .{ .epoch = 7, .client = 0xc1d00000, .device = 0x10000000, .subdevice = 0x10000001,
         .vaspace = 0x10000006, .group = 0x10000009, .share = 0x1000000a }, .handle = 0x1000000d, .rm_engine = 19, .runqueue = 0,
         .address = 0x600000, .instance = 0x10000000, .userd = 0x20000000, .methods = 0x30000000, .method_bytes = 0x6000 };

@@ -161,6 +161,7 @@ pub const Owner = struct {
     // Only the bound queue sender may ring queue0. This admission is separate
     // from CPU-sequencer register access and runs before TX and before MMIO.
     admit_command: ?*const fn (*anyopaque, *const Port, u64) anyerror!void = null,
+    admit_copy: ?*const fn (*anyopaque, *const Port, *@import("gsp_fifo.zig").Owner, @import("gsp_copy_ring.zig").Ticket, u64) anyerror!void = null,
     recovery: ?RecoveryOwner = null,
 };
 pub const Run = struct { epoch: u64, deadline_ns: u64, resume_args: ?core.Resume = null };
@@ -586,6 +587,25 @@ pub const Port = struct {
         self.pointer(offset).* = value;
         fence();
         if (try self.readFor(scope, 0) != self.boot0) return error.IdentityChanged;
+    }
+    /// Separate CE producer gate. Sequencers retain their existing register
+    /// policy and cannot write this doorbell, USERD or a caller-selected token.
+    pub fn submitCopy(self: *Port, fifo: *@import("gsp_fifo.zig").Owner, ticket: @import("gsp_copy_ring.zig").Ticket, deadline: u64) !void {
+        const offset = @import("gsp_copy_wire.zig").notify;
+        const scope: Scope = .{ .request = deadline };
+        errdefer |err| self.recordFailure(err);
+        try self.guardFor(scope);
+        if (self.phase != .runtime or !self.retained or !self.supports(.write, offset)) return error.Phase;
+        const owner = self.owner.?; const admit_copy = owner.admit_copy orelse return error.Unsupported;
+        try admit_copy(owner.context, self, fifo, ticket, deadline);
+        if (try self.readFor(scope, 0) != self.boot0) return error.IdentityChanged;
+        try admit_copy(owner.context, self, fifo, ticket, deadline);
+        try fifo.ring.publish(ticket);
+        // USERD is now reachable even if the subsequent MMIO/identity check
+        // fails. The pending ticket and all job resources stay retained.
+        self.pointer(offset).* = ticket.token; fence();
+        if (try self.readFor(scope, 0) != self.boot0) return error.IdentityChanged;
+        try fifo.ring.notified(ticket);
     }
     fn read32(p: *anyopaque, offset: u32) anyerror!u32 {
         return cast(p).read(offset);

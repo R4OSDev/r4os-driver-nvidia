@@ -262,7 +262,8 @@ const control = @import("gsp_control_buffer.zig");
 const vram = @import("gsp_vram.zig");
 const names = @import("gsp_rm_names.zig");
 pub const wire = @import("gsp_fifo_wire.zig");
-pub const Error = context.Error || control.Error;
+pub const copy = @import("gsp_copy_ring.zig");
+pub const Error = context.Error || control.Error || copy.Error;
 pub const State = enum { command_creating, creating, unwinding, ready, handed_off, destroying, command_destroying, closed, finished, failed };
 pub const Info = struct { config: wire.Config, cid: u32, work_submit_token: u32 };
 pub const Owner = struct {
@@ -279,6 +280,8 @@ pub const Owner = struct {
     config_stamp: ?wire.Config = null,
     instance: vram.storage.Use = .{},
     userd: vram.storage.Use = .{},
+    ring: copy.Ring = .{},
+    copy_live: bool = false,
     live: bool = false,
     bound: bool = false,
     enabled: bool = false,
@@ -294,24 +297,31 @@ pub const Owner = struct {
     unwind: bool = false,
 
     pub fn open(self: *Owner, token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext, adapter: u32, graph: names.Lease,
-        parent: *context.Owner, runqueue: u8, instance: *vram.Owner, userd: *vram.Owner, deadline: u64) Error!void
+        parent: *context.Owner, runqueue: u8, instance: *vram.Owner, userd: ?*vram.Owner, deadline: u64) Error!void
     {
         if (self.self_address != 0) return error.State;
         const parent_info = parent.info() orelse return error.State;
         const methods = parent.methodStorage(runqueue) orelse return error.State;
         const inst = instance.info() orelse return error.State;
-        const usr = userd.info() orelse return error.State;
-        if (parent.exchange.session != token.session or graph.epoch != parent_info.binding.epoch or adapter != methods.adapter or instance.adapter != adapter or userd.adapter != adapter or
-            !std.meta.eql(instance.binding.space, userd.binding.space) or instance.binding.space.handle != parent_info.binding.vaspace or
+        if (parent.exchange.session != token.session or graph.epoch != parent_info.binding.epoch or adapter != methods.adapter or instance.adapter != adapter or
+            instance.binding.space.handle != parent_info.binding.vaspace or
             instance.binding.space.client != parent_info.binding.client or instance.binding.space.device != parent_info.binding.device or
             instance.binding.space.epoch != parent_info.binding.epoch) return error.Stale;
-        if (instance == userd or inst.logical_bytes != 4096 or usr.logical_bytes != 512 or runqueue >= parent_info.engine.count) return error.Bounds;
-        if (inst.physical == null or usr.physical == null) return error.State;
+        if (inst.logical_bytes != 4096 or runqueue >= parent_info.engine.count) return error.Bounds;
+        if (inst.physical == null) return error.State;
+        var userd_address: u64 = 4096; // Replaced with held command-page DMA before any channel RPC.
+        if (userd) |source| {
+            const usr = source.info() orelse return error.State;
+            if (source.adapter != adapter or !std.meta.eql(instance.binding.space, source.binding.space)) return error.Stale;
+            if (instance == source or usr.logical_bytes != 512) return error.Bounds;
+            userd_address = (usr.physical orelse return error.State).base;
+        } else if (parent_info.rm_engine < 9) return error.Unsupported;
         try token.session.guard(deadline);
-        const reservation = try token.session.rm_names.reserveChildren(graph, 3);
+        const reservation = try token.session.rm_names.reserveChildren(graph, if (userd == null) 4 else 3);
         self.* = .{ .self_address = @intFromPtr(self), .session = token.session, .parent = parent, .reservation = reservation, .namespace_live = true, .deadline = deadline,
             .config = .{ .context = parent_info.binding, .handle = try reservation.object(2), .rm_engine = parent_info.rm_engine, .runqueue = runqueue,
-                .address = 4096, .instance = inst.physical.?.base, .userd = usr.physical.?.base,
+                .address = 4096, .instance = inst.physical.?.base, .userd = userd_address,
+                .system_userd = userd == null, .copy_handle = if (userd == null) try reservation.object(3) else 0,
                 .methods = methods.physical.base, .method_bytes = parent_info.method_bytes } };
         self.config_stamp = self.config;
         self.acquire(token, ctx, adapter, instance, userd) catch |err| {
@@ -322,11 +332,11 @@ pub const Owner = struct {
             self.* = .{}; return err;
         };
     }
-    fn acquire(self: *Owner, token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext, adapter: u32, instance: *vram.Owner, userd: *vram.Owner) Error!void {
+    fn acquire(self: *Owner, token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext, adapter: u32, instance: *vram.Owner, userd: ?*vram.Owner) Error!void {
         try wire.validate(self.config);
         self.child = try self.parent.?.retainChild();
         try instance.retainStorage(&self.instance);
-        try userd.retainStorage(&self.userd);
+        if (userd) |source| try source.retainStorage(&self.userd);
         const reservation = self.reservation.?;
         self.commands = try control.Owner.init(token, ctx, adapter,
             .{ .space = instance.binding.space, .memory = try reservation.object(0), .virtual = try reservation.object(1) }, self.deadline);
@@ -350,7 +360,10 @@ pub const Owner = struct {
     pub fn info(self: *const Owner) ?Info {
         self.stable() catch return null;
         if ((self.state != .ready and self.state != .handed_off) or !self.live or !self.bound or !self.enabled or
-            self.commands == null or self.commands.?.info() == null or self.instance.info() == null or self.userd.info() == null or self.parent.?.methodStorage(self.config.runqueue) == null) return null;
+            self.commands == null or self.commands.?.info() == null or self.instance.info() == null or self.parent.?.methodStorage(self.config.runqueue) == null) return null;
+        if (self.config.system_userd) {
+            if (!self.ring.valid() or !self.copy_live or self.config.copy_class == 0) return null;
+        } else if (self.userd.info() == null) return null;
         return .{ .config = self.config, .cid = self.cid, .work_submit_token = self.work_submit_token orelse return null };
     }
     pub fn poll(self: *Owner) Error!?exchange.Dispatch {
@@ -367,7 +380,13 @@ pub const Owner = struct {
             var token = try owner.handoff(self.deadline);
             self.exchange = try exchange.Exchange.init(&token, self.deadline);
             if (creating and command_info != null) {
-                self.config.address = command_info.?.address; try wire.validate(self.config); self.config_stamp = self.config; self.state = .creating;
+                self.config.address = command_info.?.address;
+                if (self.config.system_userd) self.config.userd = owner.backing.pages[2];
+                self.config_stamp = self.config; self.state = .creating;
+                self.prepareCommands() catch |err| {
+                    if (err == error.Descriptor) return err;
+                    self.host_rejected = err; self.unwind = true; self.state = .unwinding;
+                };
             } else {
                 if (creating) { self.rejected = owner.rejected; self.host_rejected = owner.host_rejected; self.unwind = true; }
                 try self.finish();
@@ -379,12 +398,15 @@ pub const Owner = struct {
         if (rpc.pending != null) return error.Pending;
         if (self.operation == null) {
             const op: wire.Operation = if (self.state == .creating) blk: {
+                if (self.config.system_userd and self.config.copy_class == 0) break :blk .classes;
                 if (!self.live) break :blk .allocate;
                 if (!self.bound) break :blk .bind;
                 if (self.work_submit_token == null) break :blk .token;
+                if (self.config.system_userd and !self.copy_live) break :blk .allocate_copy;
                 if (!self.enabled) break :blk .enable;
                 self.state = .ready; return null;
-            } else if (self.enabled) .disable else if (self.live) .free else {
+            } else if (self.enabled) .disable else if (self.copy_live) .free_copy else if (self.live) .free else {
+                if (!self.ring.close()) return error.Retained;
                 var token = try rpc.handoff(self.deadline);
                 try self.commands.?.beginDestroy(&token, self.deadline); self.state = .command_destroying; return null;
             };
@@ -400,14 +422,34 @@ pub const Owner = struct {
             if (self.state != .creating) return error.FirmwareResult;
             self.rejected = reply.rejected; self.unwind = true; self.state = .unwinding;
         } else switch (op) {
+            .classes => {
+                if (reply.ok == 0) { self.host_rejected = error.Unsupported; self.unwind = true; self.state = .unwinding; }
+                else { self.config.copy_class = reply.ok; self.config_stamp = self.config; }
+            },
             .allocate => { self.live = true; self.cid = reply.ok; },
             .bind => self.bound = true,
             .token => self.work_submit_token = reply.ok,
+            .allocate_copy => self.copy_live = true,
             .enable => self.enabled = true,
             .disable => self.enabled = false,
+            .free_copy => self.copy_live = false,
             .free => { self.live = false; self.bound = false; },
         }
         self.operation = null; return null;
+    }
+    fn prepareCommands(self: *Owner) Error!void {
+        try wire.validate(self.config);
+        if (self.config.system_userd) try self.ring.open(&self.commands.?.backing, self.config.address);
+    }
+    pub fn prepareCopy(self: *Owner, transfer: copy.wire.Transfer) Error!copy.Ticket {
+        const value = self.info() orelse return error.State;
+        if (!value.config.system_userd or self.state != .handed_off) return error.State;
+        return self.ring.prepare(value.config.copy_class, value.config.handle, value.work_submit_token, transfer);
+    }
+    pub fn matchesCopy(self: *const Owner, ticket: copy.Ticket) bool {
+        const value = self.info() orelse return false;
+        return self.state == .handed_off and value.config.system_userd and value.config.handle == ticket.channel and
+            value.config.context.epoch == ticket.epoch and value.work_submit_token == ticket.token and self.ring.matches(ticket);
     }
     fn releasePrivate(self: *Owner) bool {
         if (!self.userd.close(true) or !self.instance.close(true)) return false;
@@ -415,7 +457,7 @@ pub const Owner = struct {
         return true;
     }
     fn finish(self: *Owner) Error!void {
-        if (self.live or self.enabled or !self.releasePrivate()) return error.Retained;
+        if (self.live or self.enabled or self.copy_live or self.ring.self_address != 0 or !self.releasePrivate()) return error.Retained;
         if (self.namespace_live) { try self.session.?.rm_names.retireChildren(self.reservation.?); self.namespace_live = false; }
         self.state = if (self.unwind) .ready else .closed;
     }
@@ -423,6 +465,7 @@ pub const Owner = struct {
         try self.stable();
         if (self.state != .handed_off or self.exchange == null or token.session != self.exchange.?.session) return error.State;
         if (!quiesced) return error.Retained;
+        if (self.ring.self_address != 0 and !self.ring.idle()) return error.Busy;
         self.exchange = try exchange.Exchange.init(token, deadline); self.deadline = deadline;
         if (!self.namespace_live) { self.unwind = false; self.state = .closed; return; }
         self.unwind = false; self.state = .destroying;
