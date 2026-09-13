@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.90; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.91; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -12,7 +12,7 @@ Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
 
-Native output (NVIDIA 0.1.90):
+Native output (NVIDIA 0.1.91):
 Explicit `OPTION NVIDIA mode=native` now drives resource allocation and the
 common handoff from the serialized Device worker: actual CE engine/context,
 display masks, private VRAM/RAMHT, Core/Window/WIMM, SYSTEM shadow, output
@@ -36,8 +36,15 @@ from the immutable boot capture and receiver catalog. A fresh matching
 source-clock/IMP receipt admits the coupled WIMM/Window/Core/HDMI commit;
 the same receipt cannot be reused after completion. AVI retains the CTA VIC.
 Undeclared higher TMDS limits, 420-only/interlaced and extended AVI VIC modes
-remain unsupported. Current presentation storage still fixes image geometry;
-the common atomic bridge and replacement-buffer lifecycle remain open.
+remain unsupported. The runtime can now add and remove individual live
+scanout resources of different sizes. A new unused descriptor and its
+RAMHT bucket are uploaded separately, each with CE SYS-release completion;
+active entries are preserved. Retiring an image requires completed display
+methods, no current consumer, its last Window use FINISHED, then completed
+RAMHT withdrawal. Native BO/RM release follows. Slots are reusable, while
+wire names remain fresh. Unknown effects retain the resources.
+The registered Present image still fixes geometry. Selecting another image,
+NVIDIA mode-job handling, confirmation and rollback remain to be integrated.
 
 Receiver refresh cannot overwrite the owner's promoted native port.
 Unknown presence permits only authenticated held boot geometry, without
@@ -50,10 +57,14 @@ generations; physical restoration is still unimplemented and refuses to
 acknowledge quiescence. Passive bootfb remains the default.
 
 Current 51 NVIDIA groups, original-C raster/AVI vectors and module build pass.
-The unchanged Kernel52/EXAMPLE SMP4 evidence remains from 0.1.88. Models do
-not prove physical NVIDIA execution or a visible image. Atomic mode changes,
-pattern/confirmation, timer rollback, diagnostics and restoration remain
-open in 0.79.13. Evidence: GrafikScanout07913.json; physical checks: OssiGPU.txt.
+The existing Device case also checks two live image allocations/removals,
+exact CE ranges, delayed publication, reusable slots with fresh names and
+complete deferred RM retirement. Window use tracking covers BEGUN and
+FINISHED across notifier reuse. The common atomic worker is already
+integrated and passed its separate Kernel53/EXAMPLE SMP4 checkpoint.
+NVIDIA mode changes, visible pattern/confirmation, its rollback and
+restoration remain open in 0.79.13. Evidence: GrafikScanout07913.json;
+physical checks: OssiGPU.txt. Models do not prove a physical signal or image.
 
 Fault diagnosis and quarantine (NVIDIA 0.1.77):
 Roadmap 0.79.11 is software complete, including its combined targeted

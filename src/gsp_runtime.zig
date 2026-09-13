@@ -597,16 +597,16 @@ pub const Owner = struct {
         };
         self.display_channel_active = handle.slot;
     }
-    /// Populate the retained instance before display channels can fetch it.
-    /// Live-table replacement needs a later independent display-quiescence
-    /// protocol; an idle RM exchange or a CE completion alone is insufficient.
+    /// Initial population or a fresh live image entry. Live updates never
+    /// rewrite an active DMA descriptor and require drained display methods.
     pub fn bindDisplayStorage(self: *Owner, handle: DisplayEngineHandle, kind: display_channel.wire.Kind, index: u32, source: BufferHandle) !u32 {
         if (kind == .immediate) return error.Unsupported; // WIMM has no RAMHT DMA contexts.
-        const parent = try self.idleDisplayTable(handle);
+        const parent = try self.mutableDisplayTable(handle);
         const config = parent.info() orelse return error.State;
         const slot = try display_channel.wire.slot(kind, index);
         if ((kind == .core and !config.core) or (kind == .window and (!config.window or config.hardware.windows & (@as(u32, 1) << @intCast(index)) == 0))) return error.Unsupported;
         const storage = try self.findNativeBuffer(source);
+        if (parent.channels_started and (kind != .window or !(storage.info() orelse return error.Stale).surface.scanout())) return error.Unsupported;
         const owner = try self.ensureDisplayResources(parent);
         return owner.bindNative(@intCast(slot), storage) catch |err| {
             if (err == error.Descriptor or err == error.Retained) self.stop(err);
@@ -637,6 +637,58 @@ pub const Owner = struct {
         for (parent.children) |child| if (child != 0) return error.Busy;
         return parent;
     }
+    fn mutableDisplayTable(self: *Owner, handle: DisplayEngineHandle) !*display_engine.Owner {
+        const parent = try self.findDisplayEngine(handle);
+        if (!parent.channels_started) return self.idleDisplayTable(handle);
+        if (self.copyBusy() or self.graph_closing or self.sequence.self_address != 0 or self.nativeObject() == null or
+            self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown or
+            self.display_engine_active or self.display_channel_active != null) return error.Busy;
+        try self.displayTableChannelsIdle(parent);
+        return parent;
+    }
+    fn displayTableChannelsIdle(self: *Owner, parent: *display_engine.Owner) !void {
+        if (parent.info() == null or !parent.instance_bound) return error.Stale;
+        for (&self.display_channels) |*entry| if (entry.*) |*owner| {
+            if (owner.parent != parent or owner.info() == null) return error.Busy;
+            if (owner.ring.self_address != 0 and (!owner.ring.valid() or owner.ring.pending != null or
+                owner.ring.issued != owner.ring.completed)) return error.Busy;
+        };
+    }
+    fn displayImageUnused(self: *Owner, descriptor: display_resources.layout.Descriptor) bool {
+        if (descriptor.target != .vram or descriptor.channel == 0 or descriptor.channel > 8) return false;
+        for (&self.display_images) |entry| if (entry) |active| if (active.image.dma == descriptor.handle) return false;
+        if (self.presentation) |entry| if (entry.surface.scanout) |active| if (active.dma == descriptor.handle) return false;
+        if (self.display_work != null or self.initial_image != null or self.copy_job != null) return false;
+        return true;
+    }
+    /// Repeated at the actual Device CE admission boundary, not just at the
+    /// caller-facing API. A stale notifier/GET or current image is not a lease
+    /// to overwrite its descriptor; additions/removals name unused entries.
+    pub fn validateDisplayTableUpdate(self: *Owner) !void {
+        const parent = if (self.display_engine_owner) |*value| value else return error.State;
+        const resources = self.display_resources_slot.owner orelse return error.State;
+        if (!resources.valid() or resources.instance != &parent.instance_storage or
+            !std.meta.eql(resources.binding.?, parent.binding)) return error.Stale;
+        if (!parent.channels_started) {
+            for (&self.display_channels) |*entry| if (entry.* != null) return error.Busy;
+            return;
+        }
+        try self.displayTableChannelsIdle(parent);
+        const change = resources.table.change orelse return error.Stale;
+        const descriptor = resources.table.entries[change.index] orelse return error.Stale;
+        if (resources.surfaces[change.index] == null or !self.displayImageUnused(descriptor)) return error.Busy;
+        if (change.remove and !try resources.imageFinished(descriptor.channel, descriptor.handle)) return error.Busy;
+    }
+    /// A completed replacement selected another image. Clearing the old
+    /// RAMHT binding still precedes releasing its retained native storage.
+    pub fn removeDisplayImage(self: *Owner, handle: DisplayEngineHandle, window: u32, dma: u32) !void {
+        _ = try self.mutableDisplayTable(handle);
+        const resources = self.display_resources_slot.owner orelse return error.State;
+        const slot = try display_channel.wire.slot(.window, window);
+        const index = resources.table.indexOf(@intCast(slot), dma) orelse return error.Stale;
+        if (!self.displayImageUnused(resources.table.entries[index].?)) return error.Busy;
+        try resources.removeImage(@intCast(slot), dma);
+    }
     fn ensureDisplayResources(self: *Owner, parent: *display_engine.Owner) !*display_resources.Owner {
         const slot = &self.display_resources_slot;
         if (slot.owner) |owner| {
@@ -665,9 +717,10 @@ pub const Owner = struct {
         return .{ .entries = owner.table.count, .revision = owner.table.revision, .published_revision = owner.table.uploaded_revision, .uploading = owner.table.uploading };
     }
     pub fn uploadDisplayTable(self: *Owner, root: DisplayEngineHandle, handle: ChannelHandle, deadline: u64) !void {
-        const parent = try self.idleDisplayTable(root);
+        const parent = try self.mutableDisplayTable(root);
         const owner = self.display_resources_slot.owner orelse return error.State;
         if (!owner.valid() or !std.meta.eql(owner.binding.?, parent.binding) or owner.instance != &parent.instance_storage) return error.Stale;
+        try self.validateDisplayTableUpdate();
         const fifo = try self.findChannel(handle);
         const config = fifo.info() orelse return error.State;
         if (!config.config.system_userd or !fifo.ring.idle()) return error.Busy;
@@ -1240,13 +1293,18 @@ pub const Owner = struct {
         const work = if (self.display_upload_job) |*value| value else return false;
         const resources = self.display_resources_slot.owner orelse return error.State;
         const parent = if (self.display_engine_owner) |*value| value else return error.State;
-        if (self.copy_job != null or parent.channels_started or !resources.valid() or !work.operation.valid() or
+        if (self.copy_job != null or !resources.valid() or !work.operation.valid() or
             work.operation.table != &resources.table or work.operation.target != &parent.instance_storage) return error.Stale;
+        try self.validateDisplayTableUpdate();
         const fifo = try self.findChannel(work.channel_handle);
         if (work.operation.phase == .submitted) {
             const point = try fifo.ring.poll();
             if (point >= work.operation.ticket.?.point) {
-                try work.operation.complete(point); self.display_upload_job = null; return true;
+                try work.operation.complete(point);
+                if (work.operation.phase == .complete) {
+                    try resources.finishRemoval(); self.display_upload_job = null;
+                }
+                return true;
             }
             if (current >= work.operation.deadline) return error.Timeout;
             return false;
@@ -1488,7 +1546,10 @@ pub const Owner = struct {
         const ticket = work.ticket.?;
         if (ticket.kind == .frame) {
             if (work.config.kind == .core) try work.notifier.arm(ticket.point, deadline)
-            else try work.notifier.armWindow(ticket.point, deadline, work.config.notifier_offset);
+            else {
+                try work.notifier.armWindow(ticket.point, deadline, work.config.notifier_offset);
+                try resources.recordImageUse(work.handle.slot, work.config.scanout.?.dma, ticket.point, work.config.notifier_offset);
+            }
         }
         try self.device.?.submitDisplay(owner, ticket, work.config, deadline);
         if (ticket.kind == .rewind) work.phase = .rewind else {

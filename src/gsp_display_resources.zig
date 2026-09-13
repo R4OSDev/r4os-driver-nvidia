@@ -22,6 +22,8 @@ pub const Owner = struct {
     storage: [layout.capacity]vram.storage.Use = @splat(.{}),
     surfaces: [layout.capacity]?vram.surface.Plan = @splat(null),
     surface_stamps: [layout.capacity]u64 = @splat(0),
+    dynamic_names: [layout.capacity]?names.Children = @splat(null),
+    last_window_use: [layout.capacity]?struct { point: u64, offset: u16 } = @splat(null),
     notifiers: [9]notifier.Owner = @splat(.{}),
     failed: bool = false,
 
@@ -45,6 +47,11 @@ pub const Owner = struct {
         self.session.?.rm_names.validateChildren(self.reservation orelse return false) catch return false;
         for (&self.storage, &self.table.entries, 0..) |*use, *entry, i| {
             if (entry.*) |descriptor| {
+                if (self.dynamic_names[i]) |lease| {
+                    self.session.?.rm_names.validateChildren(lease) catch return false;
+                    if ((lease.object(0) catch return false) != descriptor.handle or
+                        !std.meta.eql(lease.parent, self.reservation.?.parent)) return false;
+                }
                 if (descriptor.target == .vram) {
                     const value = use.info() orelse return false;
                     if (value.epoch != self.table.epoch or descriptor.physical != value.physical.base or descriptor.bytes != value.bytes) return false;
@@ -59,13 +66,13 @@ pub const Owner = struct {
                     if (!note.valid() or !note.backing.retained or note.handle != descriptor.handle or note.epoch != self.table.epoch or
                         note.channel != descriptor.channel or note.physical_stamp != descriptor.physical or descriptor.bytes != 4096) return false;
                 }
-            } else if (use.self_address != 0 or self.surfaces[i] != null or self.surface_stamps[i] != 0) return false;
+            } else if (use.self_address != 0 or self.surfaces[i] != null or self.surface_stamps[i] != 0 or self.dynamic_names[i] != null or self.last_window_use[i] != null) return false;
         }
         return true;
     }
     pub fn bindNative(self: *Owner, channel: u32, source: *vram.Owner) Error!u32 {
         if (!self.valid()) return error.Stale;
-        if (self.table.uploading) return error.Busy;
+        if (self.table.uploading or self.table.change != null) return error.Busy;
         if (self.table.count >= layout.capacity or self.table.revision == std.math.maxInt(u64)) return error.Exhausted;
         const src = source.info() orelse return error.Stale;
         try src.surface.validate(source.adapter, source.binding.space);
@@ -73,8 +80,13 @@ pub const Owner = struct {
         const physical = src.physical orelse return error.Unsupported;
         if (src.epoch != self.binding.?.epoch or source.binding.space.client != self.binding.?.client or
             source.binding.space.device != self.binding.?.device or source.adapter != self.instance_stamp.?.adapter) return error.Stale;
-        const index = self.table.count;
-        const handle = try self.reservation.?.object(@intCast(index));
+        const index = self.table.freeIndex() orelse return error.Exhausted;
+        // Fresh wire names, reusable storage slots: repeated mode switches do
+        // not exhaust a boot-sized table or recycle a cached DMA identity.
+        const dynamic = if (self.table.uploaded_revision != 0)
+            try self.session.?.rm_names.reserveChildren(self.reservation.?.parent, 1) else null;
+        errdefer if (dynamic) |lease| self.session.?.rm_names.retireChildren(lease) catch {};
+        const handle = if (dynamic) |lease| try lease.object(0) else try self.reservation.?.object(@intCast(index));
         const entry: layout.Descriptor = .{ .channel = channel, .handle = handle, .target = .vram, .physical = physical.base, .bytes = src.logical_bytes };
         try layout.validate(entry);
         try source.retainStorage(&self.storage[index]);
@@ -85,7 +97,42 @@ pub const Owner = struct {
         };
         self.surfaces[index] = if (src.surface.scanout()) src.surface else null;
         self.surface_stamps[index] = if (self.surfaces[index]) |plan| surfaceHash(plan) else 0;
+        self.dynamic_names[index] = dynamic;
         return handle;
+    }
+    pub fn removeImage(self: *Owner, channel: u32, handle: u32) Error!void {
+        if (self.publishedImage(channel, handle) == null) return error.Stale;
+        if (!try self.imageFinished(channel, handle)) return error.Busy;
+        try self.table.remove(channel, handle);
+    }
+    pub fn recordImageUse(self: *Owner, channel: u32, handle: u32, point: u64, offset: u16) Error!void {
+        if (self.publishedImage(channel, handle) == null or channel == 0 or channel >= self.notifiers.len or (offset != 0 and offset != 16)) return error.Stale;
+        const note = &self.notifiers[channel];
+        if (!note.valid() or note.phase != .armed or note.point != point or note.offset != offset or note.window_points[offset / 16] != point) return error.Stale;
+        const index = self.table.indexOf(channel, handle) orelse return error.Stale;
+        self.last_window_use[index] = .{ .point = point, .offset = offset };
+    }
+    pub fn imageFinished(self: *Owner, channel: u32, handle: u32) Error!bool {
+        if (!self.valid() or channel == 0 or channel >= self.notifiers.len) return error.Stale;
+        const index = self.table.indexOf(channel, handle) orelse return error.Stale;
+        const used = self.last_window_use[index] orelse return true;
+        return self.notifiers[channel].windowFinished(used.point, used.offset);
+    }
+    /// Called by Runtime only after the actual final CE receipt and a second
+    /// check that no display or copy consumer names the retiring image.
+    pub fn finishRemoval(self: *Owner) Error!void {
+        if (!self.valid()) return error.Stale;
+        const change = self.table.change orelse return;
+        if (!change.remove or self.table.uploading or self.table.revision != self.table.uploaded_revision) return error.Busy;
+        const index = change.index;
+        const descriptor = self.table.entries[index].?;
+        if (!try self.imageFinished(descriptor.channel, descriptor.handle)) return error.Busy;
+        if (!self.storage[index].close(true)) { self.quarantine(); return error.Retained; }
+        if (self.dynamic_names[index]) |lease| self.session.?.rm_names.retireChildren(lease) catch |err| {
+            self.quarantine(); return err;
+        };
+        _ = try self.table.finishRemove();
+        self.surfaces[index] = null; self.surface_stamps[index] = 0; self.dynamic_names[index] = null; self.last_window_use[index] = null;
     }
     pub fn publishedImage(self: *Owner, channel: u32, handle: u32) ?image.Image {
         if (!self.valid() or !self.table.published(channel, handle)) return null;
@@ -109,7 +156,7 @@ pub const Owner = struct {
         if (channel >= self.notifiers.len) return error.Bounds;
         if (self.table.uploading or self.notifiers[channel].self_address != 0) return error.Busy;
         if (self.table.count >= layout.capacity or self.table.revision == std.math.maxInt(u64)) return error.Exhausted;
-        const handle = try self.reservation.?.object(@intCast(self.table.count));
+        const handle = try self.reservation.?.object(@intCast(self.table.freeIndex() orelse return error.Exhausted));
         const note = &self.notifiers[channel];
         note.open(ctx, self.instance_stamp.?.adapter, self.table.epoch, channel, handle) catch |err| {
             if (note.failed) self.quarantine(); return err;
@@ -127,6 +174,7 @@ pub const Owner = struct {
     pub fn quarantine(self: *Owner) void {
         self.failed = true; self.table.failed = true;
         for (&self.notifiers) |*note| if (note.self_address != 0) note.quarantine();
+        for (&self.dynamic_names) |lease| if (lease) |held| self.session.?.rm_names.retainChildren(held) catch {};
         if (self.reservation) |reservation| self.session.?.rm_names.retainChildren(reservation) catch {};
     }
     // No ordinary close: a freed command channel does not prove its last

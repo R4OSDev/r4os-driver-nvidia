@@ -168,6 +168,7 @@ pub const Owner = struct {
     result: ?Result = null,
     offset: u16 = 0,
     window_used: u2 = 0,
+    window_points: [2]u64 = @splat(0),
     failed: bool = false,
 
     pub fn open(self: *Owner, ctx: *const r4os.r4dev.DriverContext, adapter: u32, epoch: u64, channel: u32, handle: u32) Error!void {
@@ -229,6 +230,19 @@ pub const Owner = struct {
         if (try self.nextWindowOffset() != offset) return error.Stale;
         try self.reset(point, deadline, offset);
         self.window_used |= @as(u2, 1) << @intCast(offset / 16);
+        self.window_points[offset / 16] = point;
+    }
+    /// Proof for this particular use of a record. A later point in the same
+    /// slot is valid evidence only because armWindow already required the
+    /// previous record's FINISHED status before resetting those bytes.
+    pub fn windowFinished(self: *const Owner, point: u64, offset: u16) Error!bool {
+        if (!self.valid() or self.channel == 0 or point == 0 or (offset != 0 and offset != 16)) return error.Stale;
+        const issued = self.window_points[offset / 16];
+        if (issued < point) return error.Stale;
+        if (issued > point) return true;
+        fence(); const first = self.word(offset / 4).*; fence();
+        if (first >> 30 == 3) return error.Completion;
+        return first >> 30 == 2 and self.word(offset / 4).* == first;
     }
     pub fn submitted(self: *Owner, point: u64, deadline: u64) Error!void {
         if (!self.valid() or self.phase != .armed or self.point != point or self.deadline != deadline) return error.Stale;

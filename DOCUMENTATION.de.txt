@@ -1,13 +1,28 @@
 ﻿NVIDIA: passiver Besitzer fuer 0.79.9
 ===================================
 
-Stand: 12.09.2026, NVIDIA 0.1.76. Passive Hardwareaufnahme 0.79.9 abgeschlossen.
-0.79.11 T1-T5 sind softwareseitig umgesetzt; T6 und gemeinsame Abnahmen offen.
-Der interne Copy-Worker nutzt bestaetigte C7B5/C6B5-Objekte, SYS-USERD und
-virtuelle BO-Adressen. GPU-Semaphore mit SYS-Flush bestaetigt Upload/Readback;
-GPGet und Timer erlauben keine Freigabe.51 vorhandene Gruppen und Build
-bestanden. Details: Docs/Drivers/GrafikSpeicher07911.txt/.json, copy_checkpoint.
-Standard bleibt passiv; keine neue Produkt-Capability oder Hardwareabnahme.
+Stand: 13.09.2026, NVIDIA 0.1.91. 0.79.13 ist offen; T1 ist softwareseitig
+abgeschlossen. OPTION NVIDIA mode=native verbindet Bootmodus, gesicherte
+RAM-Pixel, eigene CE-/Displayressourcen und den gemeinsamen Displaybesitz.
+Empfaengermodi werden aus echter EDID abgeleitet und mit frischen
+Pixeltakt-/IMP-Quittungen an WIMM/Window/Core/HDMI gebunden.
+
+Neue Scanout-Ressourcen verschiedener Groessen lassen sich nun bei laufenden
+Anzeigekanaelen einzeln anlegen und entfernen. Der CE schreibt zuerst den
+unbenutzten Deskriptor und nach SYS-Abschluss seinen RAMHT-Eintrag. Aktive
+Eintraege bleiben erhalten. Freigabe braucht ruhende Methoden, keinen
+aktuellen Verbraucher, FINISHED fuer die letzte Window-Nutzung des Bildes
+und danach die quittierte Tabellenentfernung. Erst dann folgen BO-/RM-Abbau.
+Tabellenplaetze sind wiederverwendbar; Drahtnamen werden nicht recycelt.
+
+51 bestehende Pruefgruppen und Modulbuild bestanden. Das Device-Modell
+prueft zwei unterschiedliche Bildressourcen, genaue CE-Bereiche, verzogerte
+Quittungen und vollstaendigen Abbau bis zur Rueckgabe des RPC-Kanals.
+Der gemeinsame Atomic-Worker ist separat mit Kernel53/EXAMPLE-SMP4 geprueft.
+NVIDIA-Present-Pufferwechsel, Modusqueue, Bestaetigung/Rueckkehr, sichtbare
+Moduswahl und wirksamer Restore bleiben offen. Standard bleibt passiv.
+Belege: Docs/Drivers/GrafikScanout07913.txt/.json, live_table_checkpoint.
+Physische Abnahmen: ExFiles/Reports/OssiGPU.txt.
 Die folgenden aelteren Abschnitte beschreiben ihren damaligen Stand.
 
 Einmaliger Firmware-Abbau nach Fehlern (NVIDIA 0.1.51)

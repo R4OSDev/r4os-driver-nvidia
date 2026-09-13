@@ -492,12 +492,12 @@ pub const Device = struct {
             const root = if (self.running.display_engine_owner) |*value| value else return error.Binding;
             const graph = if (self.running.graph) |*value| value else return error.Binding;
             const staging = if (graph.control_buffer) |*value| value else return error.Binding;
-            if (self.running.copy_job != null or self.running.initial_image != null or root.channels_started or root.info() == null or !root.instance_bound or
+            if (self.running.copy_job != null or self.running.initial_image != null or root.info() == null or !root.instance_bound or
                 !resources.valid() or !std.meta.eql(resources.binding.?, root.binding) or resources.instance != &root.instance_storage or
                 work.operation.table != &resources.table or work.operation.source != staging or work.operation.target != &root.instance_storage or
                 !work.operation.matches(ticket, deadline) or fifo.config.context.vaspace != staging.binding.space.handle) return error.Binding;
             if (!fifo.ring.matchesTransfer(ticket, fifo.config.copy_class, work.operation.transfer() catch return error.Binding)) return error.Binding;
-            for (&self.running.display_channels) |*entry| if (entry.* != null) return error.Binding;
+            try self.running.validateDisplayTableUpdate();
             break :blk work.channel_handle;
         } else if (self.running.initial_image) |*work| blk: {
             const entry = if (self.running.presentation) |*value| value else return error.Binding;

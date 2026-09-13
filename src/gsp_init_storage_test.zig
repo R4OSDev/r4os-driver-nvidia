@@ -3237,6 +3237,8 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
         if (NativeCommon.is("context_native_connected")) {
             checkpoint = "receiver mode switch";
             try checkReceiverModeSwitch(target);
+            checkpoint = "live image table";
+            try checkLiveDisplayTable(target);
         }
         checkpoint = "restore";
         const read = captured.boot.read;
@@ -3265,7 +3267,118 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
     }
     checkpoint = "stop";
     _ = target.stop();
-    try t.expect(native.released == 0 and display.released == 0 and !NativeCommon.published);
+    try t.expect(native.released == @as(u32, if (NativeCommon.is("context_native_connected")) 2 else 0) and display.released == 0 and !NativeCommon.published);
+}
+fn checkLiveDisplayTable(target: *@import("gsp_device.zig").Device) !void {
+    errdefer if (@errorReturnTrace()) |trace| std.debug.dumpErrorReturnTrace(trace);
+    const native = @import("gsp_vram_test_model.zig").Model;
+    const run = &target.running; const product = &target.native_output;
+    const table_owner = run.display_resources_slot.owner.?;
+    const active = run.display_images[product.mode.?.window].?;
+    const count = table_owner.table.count;
+    var checkpoint: []const u8 = "active removal guard";
+    errdefer |err| std.debug.print("live table: {s} checkpoint={s} entries={d} revision={d}/{d} live-change={?} upload={} native-active={?}\n",
+        .{@errorName(err),checkpoint,table_owner.table.count,table_owner.table.revision,table_owner.table.uploaded_revision,
+        table_owner.table.change,run.display_upload_job != null,run.native_active});
+    var gpu_table = table_owner.table.image;
+    var previous_name: u32 = 0;
+    var previous_index: ?usize = null;
+    try t.expect(!try table_owner.imageFinished(product.window.?.slot, product.dma));
+    try t.expectError(error.Busy, run.removeDisplayImage(product.engine.?, product.mode.?.window, product.dma));
+    for (0..2) |iteration| {
+        checkpoint = "allocate";
+        const deadline = clock + std.time.ns_per_s;
+        const buffer = try finishContextBuffer(target, try run.allocateDisplaySurface(.{
+            .width = if (iteration == 0) 128 else 96, .height = if (iteration == 0) 96 else 128, .usage = 40 }, deadline), deadline);
+        const source = (try run.nativeBufferStatus(buffer)).info.?;
+        const model_index = source.reference.buffer.id - 801;
+        checkpoint = "bind";
+        const dma = try run.bindDisplayStorage(product.engine.?, .window, product.mode.?.window, buffer);
+        const index = table_owner.table.indexOf(product.window.?.slot, dma).?;
+        try t.expect(previous_index == null or previous_index.? == index);
+        try t.expect(dma != product.dma and dma > previous_name and table_owner.dynamic_names[index] != null);
+        previous_name = dma; previous_index = index;
+        const names = table_owner.dynamic_names[index].?;
+        try run.releaseNativeBuffer(buffer);
+        try t.expect(native.slots[model_index].imported and native.slots[model_index].gpu.lease.id != 0);
+        checkpoint = "upload added";
+        try run.uploadDisplayTable(product.engine.?, product.copy.?, deadline);
+        try pumpLiveTable(target, &gpu_table, 2);
+        const image = table_owner.publishedImage(product.window.?.slot, dma).?;
+        try t.expect(try table_owner.imageFinished(product.window.?.slot, dma)); // Never submitted for scanout.
+        checkpoint = "remove";
+        try t.expect(image.width == (if (iteration == 0) @as(u32, 128) else 96) and image.height != active.image.height);
+        try t.expect(table_owner.table.count == count + 1 and std.meta.eql(active, run.display_images[product.mode.?.window].?));
+        // A pending consumer blocks removal, even if no CPU is waiting for it.
+        const ring = &run.display_channels[product.window.?.slot].?.ring;
+        ring.issued += 1;
+        try t.expectError(error.Busy, run.removeDisplayImage(product.engine.?, product.mode.?.window, dma));
+        ring.issued -= 1;
+        try run.removeDisplayImage(product.engine.?, product.mode.?.window, dma);
+        try t.expect(native.slots[model_index].imported and table_owner.table.count == count + 1);
+        checkpoint = "upload removed";
+        try run.uploadDisplayTable(product.engine.?, product.copy.?, deadline);
+        try pumpLiveTable(target, &gpu_table, 1);
+        try t.expect(!native.slots[model_index].imported and native.slots[model_index].gpu.lease.id == 0);
+        try t.expect(table_owner.table.count == count and table_owner.publishedImage(product.window.?.slot, dma) == null);
+        try t.expectError(error.Stale, target.session.?.rm_names.validateChildren(names));
+        checkpoint = "collect storage";
+        // Continue through the real deferred common BO release and RM
+        // Unmap/Free replies; a freed table slot alone is not freed VRAM.
+        for (0..80) |_| {
+            clock += 1000; _ = target.step();
+            try t.expect(target.phase == .ready);
+            if (!native.slots[model_index].live and run.native_active == null) break;
+            const rpc = run.activeChannel().?;
+            if (rpc.phase == .waiting) try replyNativeProduct(target);
+        }
+        try t.expect(!native.slots[model_index].live and run.native_active == null and native.released == iteration + 1);
+        try t.expect(std.meta.eql(active, run.display_images[product.mode.?.window].?) and table_owner.valid());
+    }
+}
+fn pumpLiveTable(target: *@import("gsp_device.zig").Device, gpu_table: *[@import("gsp_display_table.zig").image_bytes]u8, parts: u8) !void {
+    const run = &target.running; const table_owner = run.display_resources_slot.owner.?;
+    const fifo = run.fifos[target.native_output.copy.?.slot].owner.?;
+    const wire = @import("gsp_copy_wire.zig");
+    const old_revision = table_owner.table.uploaded_revision;
+    const change = table_owner.table.change.?;
+    const get: *u32 = @ptrFromInt(fifo.ring.cpu.cpu_address + wire.userd_offset + 0x88);
+    const completion: *u32 = @ptrFromInt(fifo.ring.cpu.cpu_address + wire.completion_offset);
+    for (0..parts) |part| {
+        const work = &run.display_upload_job.?.operation;
+        try t.expect(work.part == part and work.phase == .prepared and ControlModel.reading);
+        work.part += 1; try t.expect(!work.valid()); work.part -= 1;
+        table_owner.table.change.?.bucket ^= 1; try t.expect(!work.valid()); table_owner.table.change.?.bucket ^= 1;
+        const range = try table_owner.table.uploadRange(@intCast(part));
+        const transfer = try work.transfer();
+        try t.expect(transfer.source == 0x600000 + range.offset and
+            transfer.target == table_owner.instance_stamp.?.address + range.offset and transfer.bytes == range.bytes);
+        clock += 1000; _ = target.step();
+        try t.expect(target.phase == .ready and work.phase == .submitted and fifo.ring.issued == work.ticket.?.point);
+        const command: [*]const u32 = @ptrFromInt(fifo.ring.cpu.cpu_address + wire.push_offset +
+            ((@as(usize, work.ticket.?.point) - 1) % wire.capacity) * wire.slot_bytes);
+        try t.expect(command[0] == 0x20010000 and command[1] == fifo.config.copy_class and command[2] == 0x20040100 and
+            ((@as(u64, command[3]) << 32) | command[4]) == transfer.source and
+            ((@as(u64, command[5]) << 32) | command[6]) == transfer.target and command[8] == range.bytes and
+            command[10] == 0x04000182 and command[14] == work.ticket.?.point and command[16] == 0xc);
+        get.* = fifo.ring.put; clock += 1000; _ = target.step();
+        try t.expect(work.phase == .submitted and table_owner.table.uploaded_revision == old_revision and ControlModel.reading);
+        // Execute only the range described by the actual submitted CE command,
+        // then deliver its SYS-release semaphore. GET alone did not publish it.
+        @memcpy(gpu_table[range.offset..][0..range.bytes], ControlModel.data[range.offset..][0..range.bytes]);
+        completion.* = fifo.ring.issued; clock += 1000; _ = target.step();
+        try t.expect(target.phase == .ready);
+        if (part + 1 < parts) try t.expect(run.display_upload_job != null and ControlModel.reading and
+            table_owner.table.uploaded_revision == old_revision and table_owner.table.change.?.index == change.index);
+    }
+    try t.expect(run.display_upload_job == null and !ControlModel.reading and table_owner.table.uploaded_revision > old_revision);
+    // Retired descriptor bytes can remain in VRAM, but no RAMHT bucket names
+    // them. Every still-live entry and the new descriptor match exactly.
+    try t.expectEqualSlices(u8, table_owner.table.image[0..@import("gsp_display_table.zig").ramht_bytes], gpu_table[0..@import("gsp_display_table.zig").ramht_bytes]);
+    if (!change.remove) {
+        const offset = @import("gsp_display_table.zig").ramht_bytes + @as(usize, change.index) * @import("gsp_display_table.zig").descriptor_bytes;
+        try t.expectEqualSlices(u8, table_owner.table.image[offset..][0..32], gpu_table[offset..][0..32]);
+    }
 }
 fn checkReceiverModeSwitch(target: *@import("gsp_device.zig").Device) !void {
     const run = &target.running;
@@ -3376,7 +3489,7 @@ fn replyNativeProduct(target: *@import("gsp_device.zig").Device) !void {
                 std.mem.writeInt(u64, response[120..128], owner.bytes - 1, .little);
             },
             .map => std.mem.writeInt(u64, response[40..48], native.address(slot), .little),
-            else => return error.Unexpected,
+            .unmap, .free_virtual, .free_memory => {},
         }
     } else if (run.mode_control_active) {
         const op = run.mode_control_owner.?.operation.?;
@@ -3986,6 +4099,13 @@ fn checkDeviceDisplayImage(target: *@import("gsp_device.zig").Device, table: *a.
         try t.expect(target.phase == .ready and running.display_work == null and window_owner.ring.completed == point and
             core_owner.ring.completed == point and std.meta.eql(active_image.image, image) and active_image.head == 1 and
             active_image.core_point == point and active_image.window_point == point and window_note.result.?.timestamp == (@as(u64, 7) << 32) + 100 + point);
+        try t.expect(!try table_owner.imageFinished(window_handle.slot, dma));
+        try t.expect(table_owner.last_window_use[2].?.point == point and table_owner.last_window_use[2].?.offset == window_note.offset);
+        try t.expectError(error.Stale, window_note.windowFinished(point + 1, window_note.offset));
+        if (point == 3) {
+            try t.expect(try window_note.windowFinished(1, 0)); // Slot was reused only after point1 FINISHED.
+            try t.expect(!try window_note.windowFinished(2, 16));
+        }
     }
     if (std.mem.startsWith(u8, scenario, "context_display_present_initial_")) { _ = target.stop(); return; }
     if (present_case) { try checkDevicePresentation(target, fifo_handle, window_handle, dma, scenario); return; }

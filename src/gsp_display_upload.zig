@@ -20,6 +20,9 @@ pub const Upload = struct {
     gpu: a.GfxDeviceLease = .{},
     gpu_stamp: a.GfxDeviceLease = .{},
     revision: u64 = 0,
+    change_stamp: ?tables.Change = null,
+    part: u8 = 0,
+    completed_parts: u8 = 0,
     deadline: u64 = 0,
     phase: Phase = .preparing,
     ticket: ?copy.Ticket = null,
@@ -36,7 +39,7 @@ pub const Upload = struct {
         if (src.address < dst.address + dst.bytes and dst.address < src.address + src.bytes) return error.Bounds;
         _ = try table.beginUpload();
         self.* = .{ .self_address = @intFromPtr(self), .table = table, .source = source, .source_stamp = src,
-            .target = target, .target_stamp = dst, .revision = table.revision, .deadline = deadline };
+            .target = target, .target_stamp = dst, .revision = table.revision, .change_stamp = table.change, .deadline = deadline };
         self.prepare() catch |err| {
             if (err == error.Descriptor or err == error.Retained) { self.quarantine(err); return err; }
             if (!self.release()) { self.quarantine(error.Retained); return error.Retained; }
@@ -77,12 +80,14 @@ pub const Upload = struct {
     pub fn valid(self: *const Upload) bool {
         return self.self_address == @intFromPtr(self) and self.failure == null and self.table != null and
             self.table.?.uploadingRevision(self.revision) and self.source != null and self.target != null and
+            std.meta.eql(self.table.?.change, self.change_stamp) and self.part == self.completed_parts and self.part < self.table.?.uploadParts() and
             std.meta.eql(self.source.?.info(), self.source_stamp) and std.meta.eql(self.target.?.info(), self.target_stamp) and
             self.cpu.lease.id == 0 and self.gpu.lease.id != 0 and std.meta.eql(self.gpu, self.gpu_stamp);
     }
     pub fn transfer(self: *const Upload) Error!copy.wire.Transfer {
         if (!self.valid() or self.phase != .prepared) return error.Stale;
-        return .{ .source = self.source_stamp.?.address, .target = self.target_stamp.?.address, .bytes = tables.image_bytes };
+        const range = try self.table.?.uploadRange(self.part);
+        return .{ .source = self.source_stamp.?.address + range.offset, .target = self.target_stamp.?.address + range.offset, .bytes = range.bytes };
     }
     pub fn matches(self: *const Upload, ticket: copy.Ticket, deadline: u64) bool {
         return self.valid() and self.phase == .prepared and self.deadline == deadline and self.ticket != null and std.meta.eql(self.ticket.?, ticket);
@@ -95,6 +100,10 @@ pub const Upload = struct {
         if (!self.valid() or self.phase != .submitted or self.ticket == null or point < self.ticket.?.point) return error.Stale;
         // Caller reads the actual CE SYS-flush/semaphore completion. Neither
         // GPGet nor a copied cursor or elapsed deadline can call this path.
+        if (self.part + 1 < self.table.?.uploadParts()) {
+            self.completed_parts += 1; self.part = self.completed_parts; self.ticket = null; self.phase = .prepared;
+            return;
+        }
         if (!self.release()) { self.quarantine(error.Retained); return error.Retained; }
         try self.table.?.completeUpload(self.revision); self.phase = .complete;
     }
