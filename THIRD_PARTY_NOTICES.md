@@ -842,3 +842,14 @@ license byte was changed. Five originals, original-header C payloads and
 hashes are archived under 0.79.15/hdmi-audio-20260913 in the GFX references.
 The C generator is host-only; firmware is unchanged. R4OS sequencing,
 metadata ownership and the ELD protocol encoder are original Apache-2.0 code.
+
+
+Hotplug and native retirement (0.79.16):
+The NULL-ISO Window/Core detach protocol follows MIT NVIDIA 570.144
+clc67d.h, clc67e.h, nvkms-evo.c and nvkms-evo3.c at source pin
+8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f. Full original notices accompany
+the derived command source and the embedded/distribution runtime license.
+Four original files, their hashes and the independent C command vectors
+are archived under 0.79.16/hotplug-20260913 in the GFX references.
+Receiver scheduling, common ownership and reconnect policy are original
+R4OS Apache-2.0 code. No additional firmware or Linux code is linked.

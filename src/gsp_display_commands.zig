@@ -1,3 +1,26 @@
+// NVIDIA570.144/src/nvidia-modeset/src/nvkms-evo.c
+// /*
+//  * SPDX-FileCopyrightText: Copyright (c) 2014 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//  * SPDX-License-Identifier: MIT
+//  *
+//  * Permission is hereby granted, free of charge, to any person obtaining a
+//  * copy of this software and associated documentation files (the "Software"),
+//  * to deal in the Software without restriction, including without limitation
+//  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//  * and/or sell copies of the Software, and to permit persons to whom the
+//  * Software is furnished to do so, subject to the following conditions:
+//  *
+//  * The above copyright notice and this permission notice shall be included in
+//  * all copies or substantial portions of the Software.
+//  *
+//  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+//  * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+//  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+//  * DEALINGS IN THE SOFTWARE.
+//  */
 // Derived display protocol portions: MIT, original sources/notices below.
 //
 // Original/Nouveau/dispnv50/wndwc67e.c
@@ -25,6 +48,7 @@
 //
 // Original/Nouveau/dispnv50/wndwc37e.c
 // Original/Nouveau/dispnv50/wimmc37b.c
+// Original/Nouveau/dispnv50/headc37d.c
 // /*
 //  * Copyright 2018 Red Hat Inc.
 //  *
@@ -257,6 +281,9 @@ pub const Config = struct {
     with_core: bool = true,
     cursor_usage: u16 = 0,
     cursor_image: ?cursor_image.Control = null,
+    // Explicit retirement of this route. No image/timing/cursor activation
+    // may be mixed with the NULL ISO and SOR owner-mask transaction.
+    detach_sor: ?u32 = null,
 };
 pub const max_words: usize = 192;
 pub const Program = struct {
@@ -275,6 +302,10 @@ pub fn core(config: Config) Error!Program {
     const cursor_usage = try cursor_image.usageCode(config.cursor_usage);
     if (config.signal == null and config.cursor_usage != 0) return error.Descriptor;
     if (config.windows == 0 or config.windows & ~@as(u32, 0xff) != 0) return error.Bounds;
+    if (config.detach_sor) |sor| {
+        if (sor >= 8 or config.route == null or config.initialize or config.signal != null or
+            config.cursor_usage != 0 or config.cursor_image != null) return error.Descriptor;
+    }
     var out: Program = .{};
     if (config.initialize) {
         try out.method(0x208, &.{config.notifier});
@@ -289,8 +320,20 @@ pub fn core(config: Config) Error!Program {
     var interlocks: u32 = 0;
     if (config.route) |route| {
         if (route.window >= 8 or route.head >= 8 or config.windows & (@as(u32, 1) << @intCast(route.window)) == 0) return error.Bounds;
-        try out.method(0x1000 + route.window * 0x80, &.{route.head});
+        try out.method(0x1000 + route.window * 0x80, &.{if (config.detach_sor != null) @as(u32, 15) else route.head});
         interlocks = @as(u32, 1) << @intCast(route.window);
+    }
+    if (config.detach_sor) |sor| {
+        const base = config.route.?.head * 0x400;
+        // Blank the primary and cursor DMA before disconnecting its SOR.
+        // A Core completion alone still does not release the previous ISO
+        // image: Runtime independently requires its FINISHED notifier.
+        try out.method(base + 0x209c, &.{0xcf});
+        try out.method(base + 0x2088, &.{ 0, 0 });
+        try out.method(base + 0x2090, &.{ 0, 0, 0 });
+        try out.method(base + 0x2288, &.{0});
+        try out.method(0x300 + sor * 0x20, &.{0});
+        try out.method(base + 0x2020, &.{ 0, 0 });
     }
     if (config.signal) |signal| {
         const route = config.route orelse return error.Descriptor;
@@ -354,6 +397,21 @@ pub fn window(config: Config) Error!Program {
     if (config.cursor_image != null or config.cursor_usage != 0) return error.Descriptor;
     if (config.kind != .window or config.notifier == 0 or config.notifier_offset > 16 or config.notifier_offset & 15 != 0 or config.signal != null or config.position != null) return error.Descriptor;
     if (!config.with_core and (config.initialize or config.with_position)) return error.Descriptor;
+    if (config.detach_sor) |sor| {
+        const route = config.route orelse return error.Descriptor;
+        if (sor >= 8 or config.scanout != null or config.initialize or config.with_position or !config.with_core) return error.Descriptor;
+        if (route.window >= 8 or route.head >= 8 or config.windows & ~@as(u32, 255) != 0 or
+            config.windows & (@as(u32, 1) << @intCast(route.window)) == 0) return error.Bounds;
+        var out: Program = .{};
+        try out.method(0x218, &.{0});
+        try out.method(0x21c, &.{ config.notifier, config.notifier_offset });
+        try out.method(0x308, &.{0}); // No interval wait for a NULL image.
+        try out.method(0x240, &.{ 0, 0, 0, 0, 0, 0 });
+        try out.method(0x338, &.{ 0, 0 });
+        try out.method(0x370, &.{ 1, 0 });
+        try out.method(0x200, &.{1});
+        return out;
+    }
     const value = config.scanout orelse return error.Descriptor;
     const route = config.route orelse return error.Descriptor;
     try image.validate(value);
@@ -386,7 +444,7 @@ pub fn window(config: Config) Error!Program {
     return out;
 }
 pub fn immediate(config: Config) Error!Program {
-    if (config.cursor_image != null or config.cursor_usage != 0) return error.Descriptor;
+    if (config.cursor_image != null or config.cursor_usage != 0 or config.detach_sor != null) return error.Descriptor;
     if (config.kind != .immediate or config.notifier != 0 or config.notifier_offset != 0 or config.scanout != null or
         config.signal != null or config.with_position or !config.with_core) return error.Descriptor;
     const point = config.position orelse return error.Descriptor;

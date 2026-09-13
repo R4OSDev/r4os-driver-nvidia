@@ -1,10 +1,10 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.99; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.102; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
-subsystem 1458:4074, VBIOS 94.06.2f.00.d6. The 0.79.10 software stage is complete; physical native qualification remains separate.
+subsystem 1458:4074, VBIOS 94.06.2f.00.d6. Software implementation through 0.79.16 is documented; physical native qualification remains separate.
 The default path inventories NVIDIA display functions once through
 the kernel PCI inventory. Explicit diagnostic/start modes are described below.
 Starting with R4OS 0.79.9, `IMAGE_SCOPE=slim` includes the current module in
@@ -12,7 +12,14 @@ Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
 
-Display timing (NVIDIA 0.1.99, 0.79.14 in progress):
+Hotplug uses the serialized Device worker: bounded receiver debounce/retries,
+NULL-ISO/Core/ARM retirement, retained headless CPU drawing and fresh mode
+admission on return. A new geometry uses the common automatic mode transaction;
+audio is re-enabled only with fresh receiver/ELD receipts. The optional 112-byte
+output API must be negotiated before native takeover. See
+`Docs/Drivers/GrafikHotplug07916.txt` and its evidence JSON for software tests
+and the separate physical qualification backlog.
+Native presentation and display timing:
 After native handoff the existing IRQ endpoint enables the GSP-reported
 display stall vector and only the active head's LAST_DATA source. It shares
 MSI/INTx routing and the retirement gate with GSP delivery. An IRQ copies

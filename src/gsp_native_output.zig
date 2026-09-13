@@ -72,6 +72,7 @@ pub const Owner = struct {
     modes: @import("gsp_native_modes.zig").Owner = .{},
     cursor: @import("gsp_native_cursor.zig").Owner = .{},
     audio: @import("gsp_native_audio.zig").Owner = .{},
+    hotplug: @import("gsp_native_hotplug.zig").Owner = .{},
     frame_count: u8 = 2,
     statistics: @import("gsp_frame_stats.zig").Owner = .{},
 
@@ -85,7 +86,7 @@ pub const Owner = struct {
         const clock = ctx.resources() orelse return error.Api;
         if (display.table.version != 1 or display.table.size < @offsetOf(a.GfxDriverDisplayApi, "prepare_held") + 8 or
             display.table.prepare_held == 0 or display.table.transition == 0 or display.table.boot_info == 0 or
-            outputs.table.publish == 0 or outputs.table.withdraw == 0) return error.Api;
+            outputs.table.publish == 0 or outputs.table.withdraw == 0 or !outputs.supportsHotplug()) return error.Api;
         if (!captured.ready or captured.scanout_original == null or captured.original_boot == null or
             captured.boot.held_generation == 0 or captured.boot.read.lease.id == 0 or captured.boot.read.cpu_address == 0) return error.Binding;
         const boot = captured.original_boot.?;
@@ -392,6 +393,8 @@ pub const Owner = struct {
                 self.ctx.?.logInfo("NVIDIA native-output: state=software-native boot-mode=retained shadow=system scanout=vram completion=CE,WIMM,Window,Core,HDMI common-handoff=confirmed");
             },
             .active => {
+                const changed = try self.hotplug.step(self);
+                if (self.hotplug.phase != .online or changed) return changed;
                 try self.validateRoute();
                 if (run.frame_setup != null) return run.prepareFramePool();
                 if (try self.cursor.step(self)) return true;
@@ -417,7 +420,7 @@ pub const Owner = struct {
         const object = run.nativeObject() orelse return error.Busy;
         if (!std.meta.eql(try runtime.hdmi_link.derive(bound, object, snapshot), self.link.?)) return error.Stale;
     }
-    fn buildPublication(self: *Owner) !void {
+    pub fn buildPublication(self: *Owner) !void {
         try self.validateRoute();
         const snapshot = self.running.?.nativeOutputs().?;
         const mode = self.mode.?;
@@ -442,6 +445,15 @@ pub const Owner = struct {
         // promotes checked receiver timings after native ownership is active.
         self.publication.modes[0] = .{ .mode_id = 1, .flags = a.gfx_output_mode_geometry_only | a.gfx_output_mode_preferred,
             .width = mode.width, .height = mode.height };
+        if (mode.receiver_mode_id != 0) {
+            var found_mode = false;
+            for (self.receiver.modes[0..self.receiver.mode_count]) |value| if (value.mode_id == mode.receiver_mode_id) {
+                self.publication.modes[0] = value;
+                self.publication.info.preferred_mode_id = value.mode_id;
+                found_mode = true; break;
+            };
+            if (!found_mode) return error.Stale;
+        }
         @memcpy(self.publication.edid[0..self.receiver.edid_bytes], self.receiver.edid[0..self.receiver.edid_bytes]);
     }
     fn validateCompletion(self: *Owner) !void {

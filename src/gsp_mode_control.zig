@@ -372,6 +372,7 @@ pub const Owner = struct {
     live: bool = false,
     allocation_possible: bool = false,
     unavailable: bool = false,
+    obsolete: bool = false,
     source_clock_hz: u64 = 0,
     result: ?Result = null,
     rejected: ?u32 = null,
@@ -396,7 +397,7 @@ pub const Owner = struct {
     }
     pub fn info(self: *const Owner) ?Result {
         self.stable() catch return null;
-        if (self.self_address != @intFromPtr(self) or !self.live or self.exchange.session.state != .active or
+        if (self.self_address != @intFromPtr(self) or !self.live or self.obsolete or self.exchange.session.state != .active or
             (self.state != .ready and self.state != .handed_off)) return null;
         return self.result;
     }
@@ -415,6 +416,11 @@ pub const Owner = struct {
         try self.exchange.guard(self.deadline);
         if (self.exchange.pending != null) return error.Pending;
         if (self.operation == null) {
+            // A receiver change drains an already sent query, then returns
+            // the exchange without starting another query for that receiver.
+            if (self.obsolete and self.state == .querying and self.live) {
+                self.result = null; self.state = .ready; return null;
+            }
             const op: Operation = if (self.state == .querying) blk: {
                 if (!self.classes) break :blk .classes;
                 if (!self.live) break :blk .allocate;
@@ -463,7 +469,7 @@ pub const Owner = struct {
         try self.stable(); try validate(self.binding, mode);
         if (self.state != .handed_off or !self.live or token.session != self.exchange.session) return error.State;
         self.exchange = try exchange.Exchange.init(token, deadline); self.deadline = deadline;
-        self.mode = mode; self.source_clock_hz = 0; self.result = null; self.rejected = null; self.state = .querying;
+        self.mode = mode; self.source_clock_hz = 0; self.result = null; self.rejected = null; self.obsolete = false; self.state = .querying;
     }
     pub fn beginDestroy(self: *Owner, token: *boot.Handoff, deadline: u64) Error!void {
         try self.stable();

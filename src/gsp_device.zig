@@ -615,13 +615,24 @@ pub const Device = struct {
             !std.meta.eql(resources.binding.?, root.binding) or config.windows != root_info.hardware.windows or
             config.initialize == channel.ring.initialized) return error.Binding;
         if (part) |value| if (resources.publishedNotifier(slot) != value.notifier or config.notifier != value.notifier.handle) return error.Binding;
-        if (work.window) |*window_part| {
+        if (work.detach != null) {
+            self.running.validateDisplayDetach() catch return error.Binding;
+            const window_part = &work.window.?;
+            const route = work.core.config.route.?;
+            if (route.head >= root_info.hardware.heads or (config.kind != .core and config.kind != .window) or
+                resources.publishedImage(window_part.handle.slot, work.detach.?.image.dma) == null or
+                !std.meta.eql(resources.publishedImage(window_part.handle.slot, work.detach.?.image.dma).?, work.detach.?.image)) return error.Binding;
+            if (config.kind == .core) {
+                if (window_part.phase != .submitted and window_part.phase != .complete) return error.Binding;
+            } else if (work.core.phase != .prepare) return error.Binding;
+        } else if (work.window) |*window_part| {
+            if (work.core.config.detach_sor != null or window_part.config.detach_sor != null) return error.Binding;
             const route = work.core.config.route orelse return error.Binding;
             if (work.boot_mode) |plan| {
                 const link = if (work.link) |*value| value else return error.Binding;
                 if (link.phase != .scanout or link.pending or link.acknowledged != @as(u8, if (plan.transport_hdmi) 3 else 2) or link.last_receipt == 0) return error.Binding;
                 self.running.validateDisplayLink() catch return error.Binding;
-                const expected = self.running.displayModePlan(.{ .epoch = self.epoch, .root = root.binding.root }, route.window, plan.receiver_mode_id) catch return error.Binding;
+                const expected = self.running.displayWorkPlan(.{ .epoch = self.epoch, .root = root.binding.root }, route.window) catch return error.Binding;
                 if (!std.meta.eql(plan, expected) or !std.meta.eql(work.core.config.signal, @as(?runtime.boot_mode.Signal, expected.signal)) or
                     work.core.config.cursor_usage != expected.cursor_size or
                     plan.head != route.head or window_part.config.scanout == null or window_part.config.scanout.?.width != plan.width or
@@ -661,14 +672,14 @@ pub const Device = struct {
             if (config.kind == .core) {
                 if (window_part.phase != .submitted and window_part.phase != .complete) return error.Binding;
             } else if (config.kind == .window and work.core.phase != .prepare) return error.Binding;
-        } else if (config.route != null or config.scanout != null or config.signal != null or config.position != null or config.with_position or
+        } else if (config.route != null or config.scanout != null or config.signal != null or config.position != null or config.with_position or config.detach_sor != null or
             work.boot_mode != null or work.position != null or config.kind != .core) return error.Binding;
         if (access_kind == .publish) {
             if (phase != .prepare or ticket == null or !channel.ring.matches(ticket.?, config.*)) return error.Binding;
             if (part) |value| if (ticket.?.kind == .frame and (value.notifier.phase != .armed or value.notifier.point != ticket.?.point or
                 value.notifier.deadline != deadline or value.notifier.offset != config.notifier_offset)) return error.Binding;
         } else if (phase != .prepare and phase != .rewind and !(position_part != null and phase == .submitted) and
-            !(work.cursor != null and phase == .complete)) return error.Binding;
+            !((work.cursor != null or work.detach != null) and config.kind == .core and phase == .complete)) return error.Binding;
         const rpc = self.running.activeChannel() orelse return error.State;
         const canonical = if (self.running.channel) |*value| value else return error.State;
         if (rpc != canonical or rpc.session != &self.session.? or port.runtime_session != rpc.session or rpc.session.pending != null or

@@ -1,15 +1,20 @@
 ﻿NVIDIA: nativer Grafik- und Displaybesitzer
 =========================================
 
-Stand: 13.09.2026, NVIDIA 0.1.101. 0.79.14 ist softwareseitig abgeschlossen:
+Stand: 13.09.2026, NVIDIA 0.1.102. 0.79.14 ist softwareseitig abgeschlossen:
 VBlank/Flips, zwei/drei Present-Puffer, sichtbare Statistik und Hardwarecursor
 sind an Kernel und Desktop angebunden. 0.79.15 ergaenzt generationstreue
 HDMI-ELD-/Audiofreigabe und HDA-Zuordnung. Stereo-PCM benoetigt vollstaendige
 CTA-Daten und bestaetigte Display-/ELD-/Audioquittungen. Physische GPU-/Ton-
 abnahme bleibt offen in ExFiles/Reports/OssiGPU.txt. Aktuelle Vertraege und
 Belege: Docs/Drivers/GrafikPraesentation07914.txt/.json und
-Docs/Drivers/GrafikAudio07915.txt/.json. Automatische Hotplug-Wiederkehr folgt
-in 0.79.16; bootfb bleibt der dauerhafte Fallback.
+Docs/Drivers/GrafikAudio07915.txt/.json. 0.79.16 ergaenzt entprellte
+Empfaengerabfragen, quittierten NULL-ISO/ARM-Stillstand und automatische
+Wiederkehr mit gleicher oder geaenderter Geometrie. Der RAM-Desktop bleibt
+bei fehlendem Monitor benutzbar. Neuer Modus und ELD brauchen frische
+Quittungen; geaenderte Groessen gehen durch den gemeinsamen Modeworker.
+Details: Docs/Drivers/GrafikHotplug07916.txt/.json.
+bootfb bleibt der dauerhafte Fallback.
 OPTION NVIDIA mode=native verbindet Bootmodus, gesicherte
 RAM-Pixel, eigene CE-/Displayressourcen und den gemeinsamen Displaybesitz.
 Empfaengermodi werden aus echter EDID abgeleitet und mit frischen
@@ -32,7 +37,7 @@ Die vom gemeinsamen Worker geliehene Referenz wird dabei nie freigegeben.
 51 bestehende Pruefgruppen und Modulbuild bestanden. Der vorhandene Device-
 Fall prueft 65x20/96x24, Present im neuen Bild, Rueckkehr, Wiederverwendung
 und Freigabe des alten Bildes. Verzoegerte Quittungen erhalten Ressourcen.
-Der gemeinsame Atomic-Worker ist separat mit Kernel53/EXAMPLE-SMP4 geprueft.
+Der gemeinsame Atomic-Worker ist separat mit Kernel54/EXAMPLE-SMP4 geprueft.
 Der native Worker verarbeitet die gemeinsame Modusqueue. Er veroeffentlicht
 einzeln gepruefte EDID-Modi und verlangt vor Wechsel und Rueckkehr frische
 Pixeltakt-/IMP-Quittungen. Apply baut ein zweites Bild auf; Confirm entfernt

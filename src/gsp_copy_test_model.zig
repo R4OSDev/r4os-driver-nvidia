@@ -172,7 +172,7 @@ pub const Model = struct {
     }
     fn complete(input: *const a.GfxFence, status: u32, quiesced: u32) callconv(.c) i32 {
         std.debug.assert(active and !lost and std.meta.eql(input.*, job.fence) and quiesced == 1);
-        std.debug.assert(status == a.gfx_queue_result_complete or status == a.gfx_queue_result_failed);
+        std.debug.assert(status == a.gfx_queue_result_complete or status == a.gfx_queue_result_failed or status == a.gfx_queue_result_cancelled);
         if (status == a.gfx_queue_result_complete) std.debug.assert(signaled and executed);
         active = false; result = status; completed += 1; native.slots[native_index].imported = heldNative(); return a.gfx_queue_ok;
     }
@@ -192,7 +192,8 @@ pub const Model = struct {
             const call: *const fn (*const a.GfxBufferDescriptor, *a.GfxBufferReference) callconv(.c) i32 = @ptrFromInt(original.buffer_create);
             return call(d, out);
         }
-        std.debug.assert(!shadow_live and d.location == 0 and d.byte_length <= length and d.usage == 7 and d.plane_count == 1);
+        std.debug.assert(!shadow_live and d.location == 0 and d.byte_length <= length and (d.usage == 7 or d.usage == 39) and d.plane_count == 1);
+        for (references) |entry| std.debug.assert(!entry.active or !std.meta.eql(entry.buffer, sys(0)));
         shadow_descriptor = d.*; shadow_live = true; shadow_creates += 1;
         out.* = .{ .buffer = sys(0), .reference = shadowReference() };
         return a.gfx_buffer_result_ok;

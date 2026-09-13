@@ -25,6 +25,43 @@ pub const Owner = struct {
     failure: ?anyerror = null,
 
     pub fn busy(self: *const Owner) bool { return self.job != null; }
+    pub fn pause(self: *Owner, product: anytype) !bool {
+        if (!product.running.?.display_paused) return error.State;
+        product.running.?.cursor_reserving = false;
+        return switch (self.phase) {
+            .allocation_wait, .bind, .release_creator, .table_upload, .table_wait => self.advance(product),
+            else => false,
+        };
+    }
+    pub fn stopped(self: *Owner, product: anytype) !bool {
+        const run = product.running.?;
+        if (!run.display_paused or run.cursor_point != null or run.display_work != null or run.cursor_upload != null or
+            (run.cursor_storage != null and run.cursor_storage.?.active != null)) return error.Busy;
+        if (!self.configured) return true;
+        self.disabled = true;
+        if (self.job == null) {
+            // Disable admission first. A queued common request can make this
+            // busy; consume that bounded request below and return its alias.
+            const info = self.capabilities(product);
+            const result = product.display.?.cursorConfigure(&info);
+            if (result == a.gfx_output_ok) { self.phase = .unavailable; self.configured = false; return true; }
+            if (result != a.gfx_output_error_busy) return error.CursorApi;
+            var job: a.GfxDriverCursorJob = .{};
+            const taken = product.display.?.cursorTake(&product.backend, &job);
+            if (taken == 0 or taken == a.gfx_output_error_busy) return false;
+            if (taken != a.gfx_output_ok or job.version != 1 or job.size < @sizeOf(a.GfxDriverCursorJob) or
+                !std.meta.eql(job.backend, product.backend) or job.sequence == 0 or
+                job.request.display_generation != product.receipt.generation or job.request.head_id != product.mode.?.head) return error.CursorApi;
+            self.job = job;
+        }
+        self.reply(product, false, a.gfx_output_error_unavailable);
+        _ = try self.advance(product);
+        return false;
+    }
+    pub fn resumeOutput(self: *Owner) void {
+        std.debug.assert(self.job == null and !self.configured);
+        self.disabled = false; self.phase = .detached; self.image_sequence = 0; self.image_slot = null;
+    }
     fn exclusive(self: *const Owner) bool {
         const job = self.job orelse return false;
         if (self.phase == .reply or self.phase == .failed) return false;

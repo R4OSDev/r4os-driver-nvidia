@@ -10,7 +10,7 @@ pub const Phase = enum {
     detached, unavailable, catalog_next, catalog_query, catalog_wait, enable, publish,
     idle, decision, query, query_wait, allocate, allocate_wait, bind, release_creator,
     table_upload, table_wait, prepare, image_upload, image_wait, commit, commit_wait,
-    select, retire_shadow, remove_image, withdraw_upload, withdraw_wait, retire_native,
+    select, rollback_stop, rollback_wait, retire_shadow, remove_image, withdraw_upload, withdraw_wait, retire_native,
     reply, failed,
 };
 pub const Owner = struct {
@@ -26,6 +26,8 @@ pub const Owner = struct {
     job: ?a.GfxDriverModeJob = null,
     applied: ?a.GfxDriverModeJob = null,
     previous: ?runtime.ActiveDisplayImage = null,
+    previous_dma: u32 = 0,
+    previous_headless: bool = false,
     previous_storage: ?runtime.BufferHandle = null,
     candidate: u32 = 0,
     candidate_storage: ?runtime.BufferHandle = null,
@@ -35,7 +37,54 @@ pub const Owner = struct {
     outcome: u32 = 0,
     error_code: i32 = 0,
     completed_ticket: u64 = 0,
+    stopping_cleanup: bool = false,
     diagnostic: @import("gsp_mode_diagnostics.zig").Report = .{},
+
+    /// Finish only partially constructed resource bindings. No new mode,
+    /// image upload or scanout is started after receiver invalidation.
+    pub fn pause(self: *Owner, product: anytype) !bool {
+        if (!product.running.?.display_paused) return error.State;
+        return switch (self.phase) {
+            .allocate_wait, .bind, .release_creator, .table_upload, .table_wait, .prepare => self.advance(product),
+            else => false,
+        };
+    }
+    pub fn pending(self: *const Owner) bool { return self.job != null or self.applied != null; }
+    pub fn stopped(self: *Owner, product: anytype) !bool {
+        const run = product.running.?;
+        if (!run.display_paused or run.display_images[product.mode.?.window] != null or
+            run.display_retired[product.mode.?.window] == null) return error.State;
+        if (self.job == null) return if (self.phase == .idle or self.phase == .decision) self.take(product) else false;
+        if (!self.stopping_cleanup) {
+            const keep_candidate = self.job.?.operation == a.gfx_mode_operation_confirm;
+            if (self.candidate == 0) {
+                if (keep_candidate) return error.State;
+                self.outcome = a.gfx_output_outcome_old_preserved;
+                self.error_code = a.gfx_output_error_unavailable;
+                self.phase = .reply;
+            } else {
+                const keep = if (keep_candidate) self.candidate else self.previous_dma;
+                try run.selectHeadlessImage(keep);
+                self.outcome = if (keep_candidate) a.gfx_output_outcome_applied else a.gfx_output_outcome_old_preserved;
+                self.error_code = if (keep_candidate) 0 else a.gfx_output_error_unavailable;
+                switch (self.phase) {
+                    .retire_shadow, .remove_image, .withdraw_upload, .withdraw_wait, .retire_native => {},
+                    .reply => if (self.job.?.operation == a.gfx_mode_operation_apply) {
+                        self.retire_dma = self.candidate; self.retire_storage = self.candidate_storage;
+                        self.retire_group = .{}; self.phase = .retire_shadow;
+                    },
+                    else => {
+                        self.retire_dma = if (keep_candidate) self.previous_dma else self.candidate;
+                        self.retire_storage = if (keep_candidate) self.previous_storage else self.candidate_storage;
+                        self.retire_group = .{};
+                        self.phase = .retire_shadow;
+                    },
+                }
+            }
+            self.stopping_cleanup = true;
+        }
+        return self.advance(product);
+    }
 
     pub fn step(self: *Owner, product: anytype) !bool {
         if (self.phase == .failed or self.phase == .unavailable) return false;
@@ -200,7 +249,7 @@ pub const Owner = struct {
                 self.phase = .commit;
             },
             .commit => {
-                const dma = if (self.job.?.operation == a.gfx_mode_operation_apply) self.candidate else self.previous.?.image.dma;
+                const dma = if (self.job.?.operation == a.gfx_mode_operation_apply) self.candidate else self.previous_dma;
                 try run.commitModeDisplayImage(product.core.?, product.window.?, dma, self.plan.?.receiver_mode_id, self.deadline);
                 self.phase = .commit_wait;
             },
@@ -216,10 +265,20 @@ pub const Owner = struct {
                     try run.selectDisplayPresentationImage(self.candidate);
                     self.outcome = a.gfx_output_outcome_applied; self.phase = .reply;
                 } else {
-                    try run.selectDisplayPresentationImage(self.previous.?.image.dma);
+                    if (self.previous_headless) try run.selectHeadlessImage(self.previous_dma)
+                    else try run.selectDisplayPresentationImage(self.previous_dma);
                     self.retire_dma = self.candidate; self.retire_storage = self.candidate_storage;
                     self.outcome = a.gfx_output_outcome_old_preserved; self.phase = .retire_shadow;
                 }
+            },
+            .rollback_stop => {
+                try run.detachDisplayImage(product.core.?, product.window.?, self.deadline);
+                self.phase = .rollback_wait;
+            },
+            .rollback_wait => {
+                if (run.display_work != null) return false;
+                if (run.display_images[product.mode.?.window] != null or run.display_retired[product.mode.?.window] == null) return error.Completion;
+                self.phase = .select;
             },
             .retire_shadow => {
                 if (self.retire_group.id == 0) self.retire_group = try run.presentationImageBuffer(self.retire_dma);
@@ -264,10 +323,12 @@ pub const Owner = struct {
                     self.applied = job; self.phase = .decision;
                 } else {
                     self.completed_ticket = job.ticket; self.applied = null; self.previous = null; self.previous_storage = null;
+                    self.previous_dma = 0; self.previous_headless = false;
                     self.candidate = 0; self.candidate_storage = null; self.retire_dma = 0; self.retire_storage = null; self.phase = .idle;
                     self.retire_group = .{};
                 }
                 self.job = null;
+                self.stopping_cleanup = false;
             },
             .unavailable, .failed => return false,
         }
@@ -290,9 +351,11 @@ pub const Owner = struct {
             if (job.operation == a.gfx_mode_operation_confirm) {
                 if (!std.meta.eql(product.running.?.presentation.?.surface.shadow.buffer,
                     try product.running.?.presentationImageBuffer(self.candidate))) return error.Stale;
-                self.retire_dma = self.previous.?.image.dma; self.retire_storage = self.previous_storage;
+                self.retire_dma = self.previous_dma; self.retire_storage = self.previous_storage;
                 self.outcome = a.gfx_output_outcome_applied; self.phase = .retire_shadow;
             } else if (job.operation == a.gfx_mode_operation_rollback) {
+                if (product.running.?.display_paused and !product.running.?.display_restoring) { self.phase = .select; return true; }
+                if (self.previous_headless) { self.phase = .rollback_stop; return true; }
                 self.plan = try product.running.?.displayModePlan(product.engine.?, product.mode.?.window, self.previous.?.boot_mode.?.receiver_mode_id);
                 if (!std.meta.eql(self.plan.?, self.previous.?.boot_mode.?)) return error.Stale;
                 self.phase = .query;
@@ -300,8 +363,13 @@ pub const Owner = struct {
         } else {
             if (job.operation != a.gfx_mode_operation_apply or job.ticket <= self.completed_ticket or job.sequence != 1) return error.Stale;
             try self.validateApply(product, job);
-            self.previous = (try product.running.?.displayImageStatus(product.engine.?, product.mode.?.window)) orelse return error.State;
-            self.previous_storage = try imageStorage(product.running.?, self.previous.?.image.dma);
+            if (product.running.?.display_paused and !product.running.?.display_restoring) { self.phase = .query; return true; }
+            self.previous = try product.running.?.displayImageStatus(product.engine.?, product.mode.?.window);
+            self.previous_headless = self.previous == null;
+            if (self.previous_headless and (!product.running.?.display_restoring or
+                product.running.?.display_retired[product.mode.?.window] == null)) return error.State;
+            self.previous_dma = if (self.previous) |value| value.image.dma else product.running.?.presentation.?.surface.scanout.?.dma;
+            self.previous_storage = try imageStorage(product.running.?, self.previous_dma);
             self.plan = try product.running.?.displayModePlan(product.engine.?, product.mode.?.window, job.mode.mode_id);
             self.phase = .query;
         }
@@ -379,7 +447,7 @@ pub const Owner = struct {
         var buffer: [240]u8 = undefined;
         const job = self.job orelse self.applied orelse a.GfxDriverModeJob{};
         const text = std.fmt.bufPrintZ(&buffer, "NVIDIA native-modes: {s} ticket={d} sequence={d} operation={d} phase={s} old={d} new={d} outcome={d} status={d}",
-            .{event,job.ticket,job.sequence,job.operation,@tagName(self.failed_phase orelse self.phase),if(self.previous)|old|old.image.dma else 0,self.candidate,self.outcome,self.last_status}) catch return;
+            .{event,job.ticket,job.sequence,job.operation,@tagName(self.failed_phase orelse self.phase),self.previous_dma,self.candidate,self.outcome,self.last_status}) catch return;
         product.ctx.?.logInfo(text);
     }
 };

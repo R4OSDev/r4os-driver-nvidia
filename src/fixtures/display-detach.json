@@ -1,0 +1,24 @@
+{
+  "source": "NVIDIA Open GPU Kernel Modules 570.144",
+  "inputs": [
+    {
+      "path": "src/common/sdk/nvidia/inc/class/clc67d.h",
+      "sha256": "adccb6c2442b4b8d01717b72efca0dee8f183e1a07204968e840d54e559c564c"
+    },
+    {
+      "path": "src/common/sdk/nvidia/inc/class/clc67e.h",
+      "sha256": "2925642cbfef82ddea42a3c6be1551ae6e0e04e50a0533666042a4e72a1725b9"
+    },
+    {
+      "path": "src/nvidia-modeset/src/nvkms-evo.c",
+      "sha256": "cab100c1c75141693aa9ed5777ca0f53f335e7b7dc1b7492ba23f51fc8d1a25e"
+    },
+    {
+      "path": "src/nvidia-modeset/src/nvkms-evo3.c",
+      "sha256": "8d9feac7175aa6ad7f2dc1d4021cf9a6babe9c290d93bb023d484383858b58b2"
+    }
+  ],
+  "fixture_sha256": "6204bc1d4a2c372d7d4cc4848e4e2d40c87d4b3aa0aa59cb7949629289041387",
+  "bytes": 440,
+  "scope": "two NULL-ISO/Core detach command vectors; no physical hardware proof"
+}

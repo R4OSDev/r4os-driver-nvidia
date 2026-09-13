@@ -29,6 +29,12 @@ pub const Owner = struct {
             (@as(u32, pci.device) << 3) | pci.function, .device = @as(u32, pci.vendor_id) | (@as(u32, pci.device_id) << 16) };
     }
     pub fn busy(self: *const Owner) bool { return self.phase != .idle and self.phase != .failed; }
+    pub fn afterStop(self: *Owner) void {
+        // Preserve the source's monotonic publication revision across every
+        // reconnect; the next transition derives a new ELD from its capture.
+        const old = self.*;
+        self.* = .{ .catalog = old.catalog, .location = old.location, .device = old.device, .revision = old.revision };
+    }
     pub fn beforeInitial(self: *Owner, product: anytype) !bool {
         if (self.catalog == null or !product.mode.?.transport_hdmi or self.settled or self.phase == .failed) return true;
         _ = try self.drive(product, product.mode.?, false);

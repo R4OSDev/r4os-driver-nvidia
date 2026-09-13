@@ -24,12 +24,36 @@ pub fn check() !void {
     try t.expectError(error.Handle, commands.core(.{ .notifier = 0, .windows = 1, .initialize = true }));
     try t.expectError(error.Completion, push.cursor(0xffffffff));
     try checkImages();
+    try checkDetach();
     try checkBootMode();
     try @import("gsp_receiver_mode_test.zig").check();
     try @import("gsp_hdmi_link_test.zig").check();
     try @import("gsp_hdmi_audio_test.zig").check();
     try checkPosition();
     try @import("gsp_cursor_image_test.zig").check();
+}
+fn checkDetach() !void {
+    const vectors = @embedFile("fixtures/display-detach.bin");
+    var at: usize = 0;
+    for (0..2) |_| {
+        var fields: [6]u32 = undefined;
+        for (&fields) |*field| { field.* = std.mem.readInt(u32, vectors[at..][0..4], .little); at += 4; }
+        for ([_]commands.Kind{ .core, .window }, 0..) |kind, index| {
+            const config: commands.Config = .{ .kind = kind, .notifier = 0x1234, .windows = 255, .initialize = false,
+                .route = .{ .head = fields[0], .window = fields[1] }, .detach_sor = fields[2],
+                .notifier_offset = if (kind == .window) @intCast(fields[3]) else 0 };
+            const result = try commands.encode(config);
+            try t.expectEqual(fields[4 + index], result.count);
+            for (result.words[0..result.count]) |value| {
+                try t.expectEqual(std.mem.readInt(u32, vectors[at..][0..4], .little), value); at += 4;
+            }
+            var invalid = config; invalid.initialize = true; try t.expectError(error.Descriptor, commands.encode(invalid));
+            invalid = config; invalid.detach_sor = 8; try t.expectError(error.Descriptor, commands.encode(invalid));
+            invalid = config; invalid.cursor_usage = 256; try t.expectError(error.Descriptor, commands.encode(invalid));
+            invalid = config; invalid.with_position = true; try t.expectError(error.Descriptor, commands.encode(invalid));
+        }
+    }
+    try t.expectEqual(vectors.len, at);
 }
 fn checkPosition() !void {
     const vectors = @embedFile("fixtures/display-position.bin");

@@ -216,7 +216,7 @@ pub const Owner = struct {
     /// Neither status releases the separately retained scanout allocation.
     pub fn nextWindowOffset(self: *const Owner) Error!u16 {
         if (!self.valid() or self.channel == 0 or self.offset > 16) return error.Stale;
-        if (self.phase != .ready and self.phase != .begun) return error.Busy;
+        if (self.phase != .ready and self.phase != .begun and self.phase != .complete) return error.Busy;
         const next: u16 = if (self.window_used == 0) 0 else self.offset ^ 16;
         const used = self.window_used & (@as(u2, 1) << @intCast(next / 16)) != 0;
         if (used) {
@@ -260,6 +260,14 @@ pub const Owner = struct {
         self.phase = .complete; return self.result;
     }
     pub fn pollWindow(self: *Owner) Error!?Result {
+        return self.pollWindowRecord(false);
+    }
+    /// NULL ISO can already be FINISHED by the first CPU observation. This
+    /// exception is restricted to a submitted detach, never a visible frame.
+    pub fn pollWindowDetached(self: *Owner) Error!?Result {
+        return self.pollWindowRecord(true);
+    }
+    fn pollWindowRecord(self: *Owner, detached: bool) Error!?Result {
         if (!self.valid() or self.phase != .submitted or self.channel == 0 or self.offset > 16) return error.State;
         const at = self.offset / 4;
         const first = self.word(at).*; fence();
@@ -267,11 +275,11 @@ pub const Owner = struct {
         if (status == 0) return null;
         // No other producer may replace this newly submitted image while
         // it is awaiting activation; a prematurely finished record is lost.
-        if (status != 1) return error.Completion;
+        if (status != 1 and !(detached and status == 2)) return error.Completion;
         const lo = self.word(at + 2).*; const hi = self.word(at + 3).*; fence();
         if (self.word(at).* != first) return null;
         self.result = .{ .word = first, .timestamp = (@as(u64, hi) << 32) | lo };
-        self.phase = .begun; return self.result;
+        self.phase = if (status == 2) .complete else .begun; return self.result;
     }
     pub fn quarantine(self: *Owner) void { self.failed = true; self.phase = .failed; self.backing.retained = true; }
     /// Only an unpublished table may abandon this allocation. There is no

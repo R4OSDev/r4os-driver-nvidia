@@ -47,6 +47,7 @@ pub const Work = struct {
     operation: Operation,
     sequence: u64,
     deadline: u64,
+    retiring: bool = false,
     pending: bool = false,
     request: [max_bytes]u8 = @splat(0),
     length: usize = 0,
