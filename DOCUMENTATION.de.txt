@@ -32,7 +32,8 @@ das alte, Rollback restauriert es vor Freigabe des Kandidaten. Der gemeinsame
 Besitzer steuert die Bestaetigungsfrist. Die Device-Pruefung deckt beide
 Entscheidungen, Ablehnung ohne Allokation und ausbleibenden GPU-Upload ab.
 Timeout meldet lost ohne Ruhenachweis und haelt noch erreichbare Ressourcen.
-Sichtbare Moduswahl, vollstaendiger Boot-Restore und Diagnose bleiben offen.
+Appearance0.1.8 bietet inzwischen Settings -> Display fuer Moduswahl und
+Bestaetigung. Vollstaendiger Boot-Restore und Diagnose bleiben offen.
 Standard bleibt passiv. Belege: Docs/Drivers/GrafikScanout07913.txt/.json,
 mode_product_checkpoint.
 Physische Abnahmen: ExFiles/Reports/OssiGPU.txt.
