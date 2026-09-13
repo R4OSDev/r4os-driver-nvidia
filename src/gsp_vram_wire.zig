@@ -1,3 +1,26 @@
+// ExFiles/Reference/GFX/Nvidia/OpenKernelModules-570.144/src/common/sdk/nvidia/inc/nvos.h
+// /*
+//  * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//  * SPDX-License-Identifier: MIT
+//  *
+//  * Permission is hereby granted, free of charge, to any person obtaining a
+//  * copy of this software and associated documentation files (the "Software"),
+//  * to deal in the Software without restriction, including without limitation
+//  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//  * and/or sell copies of the Software, and to permit persons to whom the
+//  * Software is furnished to do so, subject to the following conditions:
+//  *
+//  * The above copyright notice and this permission notice shall be included in
+//  * all copies or substantial portions of the Software.
+//  *
+//  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+//  * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+//  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+//  * DEALINGS IN THE SOFTWARE.
+//  */
 // src/common/sdk/nvidia/inc/nvos.h
 // /*
 //  * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
@@ -100,7 +123,7 @@ pub const Error = base.Error;
 pub const Binding = base.Binding;
 pub const Operation = enum { allocate_memory, allocate_virtual, map, unmap, free_virtual, free_memory };
 pub const alignment: u64 = 65536;
-pub const Layout = struct { blocklinear: bool = false, scanout: bool = false, contiguous: bool = false };
+pub const Layout = struct { blocklinear: bool = false, scanout: bool = false, contiguous: bool = false, granule: u64 = alignment, privileged: bool = false, readonly: bool = false };
 pub fn function(op: Operation) u32 { return switch (op) { .allocate_memory, .allocate_virtual => 103, .map => 14, .unmap => 15, .free_virtual, .free_memory => 10 }; }
 fn translated(op: Operation) base.Operation { return switch (op) { .allocate_memory, .allocate_virtual => .allocate, .map => .map, .unmap => .unmap, .free_virtual => .free_virtual, .free_memory => .free_memory }; }
 fn part(bytes: u64) base.Part { return .{ .total_bytes = bytes, .byte_length = bytes }; }
@@ -112,14 +135,14 @@ pub fn encode(binding: Binding, bytes: u64, op: Operation, address: u64, out: []
     return encodeLayout(binding, bytes, .{}, op, address, out);
 }
 pub fn encodeLayout(binding: Binding, bytes: u64, layout: Layout, op: Operation, address: u64, out: []u8) Error!base.Encoded {
-    if (bytes == 0 or bytes % alignment != 0) return error.Bounds;
+    if (bytes == 0 or bytes % alignment != 0 or layout.granule < alignment or layout.granule > (@as(u64, 1) << 30) or !std.math.isPowerOfTwo(layout.granule) or (layout.readonly and !layout.privileged)) return error.Bounds;
     const result = try base.encodePart(binding, part(bytes), translated(op), &.{}, address, out);
     if (op == .allocate_memory or op == .allocate_virtual) {
         const p = out[32..160];
         const format: u32 = if (layout.blocklinear) 2 << 16 else 0;
         put(p, 24, 0x00800000 | format); // 4K, VRAM, uncompressed generic kind.
         put(p, 28, 4); // Locally cached GPU memory, explicit YES.
-        wide(p, 72, alignment);
+        wide(p, 72, layout.granule);
         if (op == .allocate_memory) {
             put(out, 8, binding.memory);
             put(out, 12, 0x40); // NV01_MEMORY_LOCAL_USER.
@@ -128,13 +151,17 @@ pub fn encodeLayout(binding: Binding, bytes: u64, layout: Layout, op: Operation,
             put(p, 24, (if (layout.scanout or layout.contiguous) @as(u32, 0x10800000) else 0x08800000) | format);
             put(p, 108, 0);
         }
-    } else if (op == .map) put(out, 32, 0x100); // 4K, no CPU snoop; immediate TLB update.
+        if (layout.privileged) put(p, 8, word(p, 8) | 0x08000000); // NVOS32_ALLOC_FLAGS_ALLOCATE_KERNEL_PRIVILEGED.
+    } else if (op == .map) put(out, 32, 0x100 | @as(u32, @intFromBool(layout.readonly))); // 4K, no CPU snoop; immediate TLB update.
     return result;
 }
 pub fn decode(binding: Binding, bytes: u64, op: Operation, request: []const u8, record: exchange.message.Record, address: u64) Error!base.Reply {
     if (op != .allocate_memory) {
         const result = try base.decodePart(binding, part(bytes), translated(op), request, record, address);
-        if (op == .allocate_virtual and result == .ok and result.ok % alignment != 0) return error.Bounds;
+        if (op == .allocate_virtual and result == .ok) {
+            const granule = long(request, 104);
+            if (granule < alignment or !std.math.isPowerOfTwo(granule) or result.ok % granule != 0) return error.Bounds;
+        }
         return result;
     }
     try base.validatePart(binding, part(bytes));
@@ -162,6 +189,7 @@ pub fn decode(binding: Binding, bytes: u64, op: Operation, request: []const u8, 
         if ((i >= 24 and i < 28) or (i >= 80 and i < 96)) continue;
         if (v != request[32 + i]) return error.Payload;
     }
-    if (long(p, 64) != bytes or long(p, 88) != bytes - 1 or long(p, 80) % alignment != 0) return error.Bounds;
+    const granule = long(request, 104);
+    if (granule < alignment or !std.math.isPowerOfTwo(granule) or long(p, 64) != bytes or long(p, 88) != bytes - 1 or long(p, 80) % granule != 0) return error.Bounds;
     return .{ .ok = long(p, 80) }; // First physical page only, never CPU-accessible.
 }

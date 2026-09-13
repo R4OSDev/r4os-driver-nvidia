@@ -182,7 +182,8 @@ pub const Owner = struct {
     // Only the bound queue sender may ring queue0. This admission is separate
     // from CPU-sequencer register access and runs before TX and before MMIO.
     admit_command: ?*const fn (*anyopaque, *const Port, u64) anyerror!void = null,
-    admit_copy: ?*const fn (*anyopaque, *const Port, *@import("gsp_fifo.zig").Owner, @import("gsp_copy_ring.zig").Ticket, u64) anyerror!void = null,
+    admit_copy: ?*const fn (*anyopaque, *const Port, *@import("gsp_fifo.zig").Owner, @import("gsp_push_ring.zig").Ticket, u64) anyerror!void = null,
+    admit_graphics: ?*const fn (*anyopaque, *const Port, *@import("gsp_fifo.zig").Owner, @import("gsp_push_ring.zig").Ticket, u64) anyerror!void = null,
     admit_display_retirement: ?*const fn (*anyopaque, *const Port, *@import("gsp_display_channel.zig").Owner, u64) anyerror!void = null,
     admit_display_push: ?*const fn (*anyopaque, *const Port, *@import("gsp_display_channel.zig").Owner, u64, DisplayAccess) anyerror!void = null,
     wake_work: ?*const fn (*anyopaque) void = null,
@@ -612,18 +613,26 @@ pub const Port = struct {
         fence();
         if (try self.readFor(scope, 0) != self.boot0) return error.IdentityChanged;
     }
-    /// Separate CE producer gate. Sequencers retain their existing register
+    /// Separate engine producer gates. Sequencers retain their existing register
     /// policy and cannot write this doorbell, USERD or a caller-selected token.
-    pub fn submitCopy(self: *Port, fifo: *@import("gsp_fifo.zig").Owner, ticket: @import("gsp_copy_ring.zig").Ticket, deadline: u64) !void {
+    pub fn submitCopy(self: *Port, fifo: *@import("gsp_fifo.zig").Owner, ticket: @import("gsp_push_ring.zig").Ticket, deadline: u64) !void {
+        return self.submitEngine(fifo, ticket, deadline, .copy);
+    }
+    pub fn submitGraphics(self: *Port, fifo: *@import("gsp_fifo.zig").Owner, ticket: @import("gsp_push_ring.zig").Ticket, deadline: u64) !void {
+        return self.submitEngine(fifo, ticket, deadline, .graphics);
+    }
+    fn submitEngine(self: *Port, fifo: *@import("gsp_fifo.zig").Owner, ticket: @import("gsp_push_ring.zig").Ticket, deadline: u64, engine: @import("gsp_fifo_wire.zig").Engine) !void {
         const offset = @import("gsp_copy_wire.zig").notify;
         const scope: Scope = .{ .request = deadline };
         errdefer |err| self.recordFailure(err);
         try self.guardFor(scope);
         if (self.phase != .runtime or !self.retained or !self.supports(.write, offset)) return error.Phase;
-        const owner = self.owner.?; const admit_copy = owner.admit_copy orelse return error.Unsupported;
-        try admit_copy(owner.context, self, fifo, ticket, deadline);
+        const owner = self.owner.?;
+        const admit_engine = (switch (engine) { .copy => owner.admit_copy, .graphics => owner.admit_graphics, .none => null }) orelse return error.Unsupported;
+        if (fifo.config.engine != engine) return error.Binding;
+        try admit_engine(owner.context, self, fifo, ticket, deadline);
         if (try self.readFor(scope, 0) != self.boot0) return error.IdentityChanged;
-        try admit_copy(owner.context, self, fifo, ticket, deadline);
+        try admit_engine(owner.context, self, fifo, ticket, deadline);
         try fifo.ring.publish(ticket);
         // USERD is now reachable even if the subsequent MMIO/identity check
         // fails. The pending ticket and all job resources stay retained.

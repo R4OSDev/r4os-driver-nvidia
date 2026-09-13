@@ -135,6 +135,9 @@ pub const Plan = struct {
     allocation_bytes: u64,
     request: ?Request = null,
     caps: ?memory_caps.Info = null,
+    raw_alignment: u64 = alignment,
+    privileged: bool = false,
+    readonly: bool = false,
     log2_gobs: u8 = 0,
     plane_bytes: [4]u64 = @splat(0),
     padded_rows: [4]u64 = @splat(0),
@@ -143,7 +146,7 @@ pub const Plan = struct {
     pub fn scanout(self: Plan) bool { return self.descriptor.usage & 32 != 0; }
     pub fn validate(self: Plan, adapter: u32, space: vaspace.Info) Error!void {
         const expected = if (self.request) |request| try create(adapter, space, self.caps orelse return error.Descriptor, request)
-            else try raw(adapter, space, self.descriptor.byte_length);
+            else try rawPrivate(adapter, space, self.descriptor.byte_length, self.raw_alignment, self.privileged, self.readonly);
         if (!std.meta.eql(self, expected)) return error.Descriptor;
     }
 };
@@ -151,12 +154,16 @@ fn alignUp(value: u64, granule: u64) Error!u64 {
     return (std.math.add(u64, value, granule - 1) catch return error.Bounds) & ~(granule - 1);
 }
 pub fn raw(adapter: u32, space: vaspace.Info, bytes: u64) Error!Plan {
+    return rawPrivate(adapter, space, bytes, alignment, false, false);
+}
+pub fn rawPrivate(adapter: u32, space: vaspace.Info, bytes: u64, granule: u64, privileged: bool, readonly: bool) Error!Plan {
     if (adapter == 0 or space.epoch == 0) return error.Stale;
-    if (bytes == 0) return error.Bounds;
-    const rounded = try alignUp(bytes, alignment);
+    if (bytes == 0 or granule < alignment or granule > (@as(u64, 1) << 30) or !std.math.isPowerOfTwo(granule) or (readonly and !privileged)) return error.Bounds;
+    const rounded = try alignUp(bytes, granule);
     if (rounded > space.bytes) return error.Bounds;
-    return .{ .descriptor = .{ .byte_length = bytes, .alignment = alignment, .usage = 12,
-        .location = a.gfx_buffer_location_device_local, .adapter_id = adapter, .device_generation = space.epoch }, .allocation_bytes = rounded };
+    return .{ .descriptor = .{ .byte_length = bytes, .alignment = granule, .usage = 12,
+        .location = a.gfx_buffer_location_device_local, .adapter_id = adapter, .device_generation = space.epoch }, .allocation_bytes = rounded,
+        .raw_alignment = granule, .privileged = privileged, .readonly = readonly };
 }
 // Pinned NVKMS headsurface policy, evaluated with checked/widened arithmetic.
 pub fn automaticBlockHeight(height: u32) u8 {

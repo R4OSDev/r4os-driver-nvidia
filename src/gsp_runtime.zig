@@ -104,6 +104,15 @@ pub const vram = @import("gsp_vram.zig");
 pub const execution_fifo = @import("gsp_fifo.zig");
 pub const ChannelHandle = struct { epoch: u64, serial: u64, slot: u16 };
 pub const ChannelStatus = struct { state: execution_fifo.State, info: ?execution_fifo.Info, rejected: ?u32, host_rejected: ?anyerror };
+pub const GraphicsReceipt = struct { channel: ChannelHandle, point: u32, completed_ns: u64 };
+pub const GraphicsWork = struct {
+    channel_handle: ChannelHandle,
+    command: execution_fifo.copy.graphics.Command,
+    deadline: u64,
+    ticket: ?execution_fifo.copy.Ticket = null,
+    submitted: bool = false,
+    receipt: ?GraphicsReceipt = null,
+};
 const ChannelSlot = struct { owner: ?*execution_fifo.Owner = null, allocation: r4os.abi.DriverHeapAllocation = .{}, heap: ?r4os.r4dev.DriverHeapContext = null, serial: u64 = 0 };
 const CopyAddress = struct { address: u64, bytes: u64 };
 pub const present = @import("gsp_present.zig");
@@ -237,6 +246,7 @@ pub const Owner = struct {
     fifos: [64]ChannelSlot = @splat(.{}),
     fifo_active: ?u16 = null,
     copy_job: ?CopyJob = null,
+    graphics_work: ?GraphicsWork = null,
     copy_completed: u64 = 0,
     copy_bytes: u64 = 0,
     copy_row_jobs: u64 = 0,
@@ -1258,7 +1268,7 @@ pub const Owner = struct {
         };
         const nv = @import("r4nv_binding");
         const details: nv.R4NvDriverProfile = .{ .version = 1, .size = @sizeOf(nv.R4NvDriverProfile), .vendor_id = 0x10de,
-            .copy_class = fifo.config.copy_class, .rm_release = nv.rm_release, .command_abi = nv.command_abi, .reserved0 = 0, .reserved1 = 0 };
+            .copy_class = fifo.config.object_class, .rm_release = nv.rm_release, .command_abi = nv.command_abi, .reserved0 = 0, .reserved1 = 0 };
         var profile: r4os.abi.GfxBackendProfile = .{ .interface_id_lo = nv.backend_v1_header.interface_id_lo,
             .interface_id_hi = nv.backend_v1_header.interface_id_hi, .revision = 1, .data_bytes = @sizeOf(nv.R4NvDriverProfile) };
         @memcpy(profile.data[0..@sizeOf(nv.R4NvDriverProfile)], std.mem.asBytes(&details));
@@ -1417,7 +1427,7 @@ pub const Owner = struct {
         self.log("NVIDIA gsp-present-image: retired={d} shadow=unmapped,import-released scanout=retained", .{dma});
         return true;
     }
-    fn deviceWorkBusy(self: *const Owner) bool { return self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.display_flip != null or self.initial_image != null or self.mode_control_active or self.cursor_upload != null or self.audio_work != null; }
+    fn deviceWorkBusy(self: *const Owner) bool { return self.graphics_work != null or self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.display_flip != null or self.initial_image != null or self.mode_control_active or self.cursor_upload != null or self.audio_work != null; }
     fn copyBusy(self: *const Owner) bool { return self.deviceWorkBusy() or self.frame_ready != null; }
     fn overlapFlip(self: *const Owner) bool {
         const work = self.display_flip orelse return false;
@@ -1425,7 +1435,7 @@ pub const Owner = struct {
             (work.window.phase == .submitted or work.window.phase == .complete);
     }
     fn copyAdmissionBusy(self: *const Owner) bool {
-        return self.cursor_reserving or self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.initial_image != null or self.cursor_upload != null or self.audio_work != null or
+        return self.cursor_reserving or self.graphics_work != null or self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.initial_image != null or self.cursor_upload != null or self.audio_work != null or
             self.mode_control_active or self.frame_ready != null or (self.display_flip != null and !self.overlapFlip());
     }
     pub fn cursorWorkAvailable(self: *Owner) bool {
@@ -1615,6 +1625,7 @@ pub const Owner = struct {
     }
     fn createContext(self: *Owner, rm_engine: u32, deadline: u64) !ContextHandle {
         _ = try self.now();
+        if (rm_engine == 1 and self.static_info == null) return error.State;
         if (self.graph_closing or self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or self.sequence.self_address != 0 or self.outputs.active()) return error.Busy;
         const space = (self.nativeAddressSpace() orelse return error.State).*;
         const subdevice = self.graph.?.base.plan.handles.subdevice;
@@ -1640,9 +1651,13 @@ pub const Owner = struct {
         errdefer if (heap.release(allocation.handle) == r4os.abi.driver_heap_ok) { slot.* = .{}; } else self.stop(error.Retained);
         if (result != r4os.abi.driver_heap_ok) return error.Memory;
         var token = try self.channel.?.handoff(deadline);
-        const value = execution_context.Owner.init(&token, self.graph.?.reservation, space, subdevice, rm_engine, deadline) catch |err| {
+        var value = execution_context.Owner.init(&token, self.graph.?.reservation, space, subdevice, rm_engine, deadline) catch |err| {
             self.channel = exchange.Exchange.init(&token, deadline) catch |restore| { self.stop(restore); return restore; }; return err;
         };
+        if (rm_engine == 1) {
+            value.binding.internal_client = self.static_info.?.client;
+            value.binding.internal_subdevice = self.static_info.?.subdevice;
+        }
         const owner: *execution_context.Owner = @ptrFromInt(allocation.cpu_address);
         owner.* = value; slot.owner = owner; slot.serial = serial; self.buffer_serial = serial; self.context_active = index;
         return .{ .epoch = self.epoch, .serial = serial, .slot = index };
@@ -1668,6 +1683,25 @@ pub const Owner = struct {
         const owner = try self.findContext(context);
         try owner.attachMethods(runqueue, try self.findNativeBuffer(buffer));
     }
+    pub fn createRegularGraphicsContext(self: *Owner, golden: ContextHandle, deadline: u64) !ContextHandle {
+        const source = try self.findContext(golden);
+        if (!source.golden_complete or source.graphics_plan == null) return error.State;
+        const handle = try self.createExecutionContext(1, deadline);
+        const owner = try self.findContext(handle);
+        owner.graphics_golden = false; owner.graphics_plan = source.graphics_plan;
+        return handle;
+    }
+    pub fn graphicsContextRequirement(self: *Owner, context: ContextHandle, index: usize) !?execution_context.wire.graphics.Requirement {
+        return (try self.findContext(context)).graphicsRequirement(index);
+    }
+    pub fn attachGraphicsContextBuffer(self: *Owner, context: ContextHandle, index: usize, buffer: BufferHandle) !void {
+        if (self.copyAdmissionBusy() or self.context_active != null or self.native_active != null or self.fifo_active != null or self.graph_closing) return error.Busy;
+        try (try self.findContext(context)).attachGraphics(index, try self.findNativeBuffer(buffer));
+    }
+    pub fn shareGraphicsContextGlobals(self: *Owner, context: ContextHandle, golden: ContextHandle) !void {
+        if (self.copyAdmissionBusy() or self.context_active != null or self.native_active != null or self.fifo_active != null or self.graph_closing) return error.Busy;
+        try (try self.findContext(context)).shareGraphicsGlobals(try self.findContext(golden));
+    }
     pub fn retireExecutionContext(self: *Owner, handle: ContextHandle, deadline: u64) !void {
         const owner = try self.findContext(handle);
         if (self.copyBusy() or self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or
@@ -1688,17 +1722,22 @@ pub const Owner = struct {
     /// Attach an empty private GPFIFO to an existing context and native BOs.
     /// Only this driver API accepts storage owners; no physical app address.
     pub fn createExecutionChannel(self: *Owner, context_handle: ContextHandle, runqueue: u8, instance: BufferHandle, userd: BufferHandle, deadline: u64) !ChannelHandle {
-        return self.createChannel(context_handle, runqueue, instance, userd, deadline);
+        return self.createChannel(context_handle, runqueue, instance, userd, .none, deadline);
     }
     /// Explicit native worker path; creating it does not publish renderer or
     /// display capabilities. The CE class is queried and allocated by RM.
     pub fn createCopyChannel(self: *Owner, context_handle: ContextHandle, runqueue: u8, instance: BufferHandle, deadline: u64) !ChannelHandle {
-        return self.createChannel(context_handle, runqueue, instance, null, deadline);
+        return self.createChannel(context_handle, runqueue, instance, null, .copy, deadline);
     }
-    fn createChannel(self: *Owner, context_handle: ContextHandle, runqueue: u8, instance: BufferHandle, userd: ?BufferHandle, deadline: u64) !ChannelHandle {
-        return self.openChannel(context_handle, runqueue, instance, userd, deadline) catch |err| { self.hostRejection(.channel, err); return err; };
+    /// Pinned C797 graphics channel, separate from CE but using the same RM
+    /// ownership, private USERD and protected submission transport.
+    pub fn createGraphicsChannel(self: *Owner, context_handle: ContextHandle, runqueue: u8, instance: BufferHandle, deadline: u64) !ChannelHandle {
+        return self.createChannel(context_handle, runqueue, instance, null, .graphics, deadline);
     }
-    fn openChannel(self: *Owner, context_handle: ContextHandle, runqueue: u8, instance: BufferHandle, userd: ?BufferHandle, deadline: u64) !ChannelHandle {
+    fn createChannel(self: *Owner, context_handle: ContextHandle, runqueue: u8, instance: BufferHandle, userd: ?BufferHandle, engine: execution_fifo.wire.Engine, deadline: u64) !ChannelHandle {
+        return self.openChannel(context_handle, runqueue, instance, userd, engine, deadline) catch |err| { self.hostRejection(.channel, err); return err; };
+    }
+    fn openChannel(self: *Owner, context_handle: ContextHandle, runqueue: u8, instance: BufferHandle, userd: ?BufferHandle, engine: execution_fifo.wire.Engine, deadline: u64) !ChannelHandle {
         _ = try self.now();
         if (self.graph_closing or self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or self.sequence.self_address != 0 or self.outputs.active()) return error.Busy;
         _ = self.nativeAddressSpace() orelse return error.State;
@@ -1729,7 +1768,7 @@ pub const Owner = struct {
         if (result != r4os.abi.driver_heap_ok) return error.Memory;
         const owner: *execution_fifo.Owner = @ptrFromInt(allocation.cpu_address); owner.* = .{};
         var token = try self.channel.?.handoff(deadline);
-        owner.open(&token, &self.ctx.?, self.adapter_id, self.graph.?.reservation, parent, runqueue, inst, usr, deadline) catch |err| {
+        owner.open(&token, &self.ctx.?, self.adapter_id, self.graph.?.reservation, parent, runqueue, inst, usr, engine, deadline) catch |err| {
             if (owner.failure != null) {
                 retained = true; slot.owner = owner; slot.serial = serial; self.buffer_serial = serial;
                 self.stop(err); return err;
@@ -1747,6 +1786,47 @@ pub const Owner = struct {
     pub fn executionChannelStatus(self: *Owner, handle: ChannelHandle) !ChannelStatus {
         const owner = try self.findChannel(handle);
         return .{ .state = owner.state, .info = owner.info(), .rejected = owner.rejected, .host_rejected = owner.host_rejected };
+    }
+    /// Private graphics command, retained through physical completion or
+    /// quarantine. USERD publication never counts as an execution receipt.
+    pub fn beginGraphicsBarrier(self: *Owner, handle: ChannelHandle, deadline: u64) !void {
+        const current = try self.now();
+        if (deadline <= current or deadline == std.math.maxInt(u64)) return error.Deadline;
+        if (self.copyAdmissionBusy() or self.graph_closing) return error.Busy;
+        const fifo = try self.findChannel(handle);
+        const info = fifo.info() orelse return error.State;
+        if (info.config.engine != .graphics or info.config.object_class != 0xc797 or info.config.graphics == null or info.config.graphics.?.golden or fifo.state != .handed_off or !fifo.ring.idle()) return error.Unsupported;
+        try self.channel.?.guard(deadline);
+        self.graphics_work = .{ .channel_handle = handle, .command = .barrier, .deadline = deadline };
+    }
+    pub fn receiveGraphics(self: *Owner, handle: ChannelHandle) !?GraphicsReceipt {
+        _ = try self.findChannel(handle);
+        const work = if (self.graphics_work) |*value| value else return error.State;
+        if (!std.meta.eql(work.channel_handle, handle)) return error.Stale;
+        const receipt = work.receipt orelse return null;
+        self.graphics_work = null;
+        return receipt;
+    }
+    fn advanceGraphics(self: *Owner, current: u64) !bool {
+        const work = if (self.graphics_work) |*value| value else return false;
+        if (work.receipt != null) return false;
+        const fifo = try self.findChannel(work.channel_handle);
+        if (work.submitted) {
+            if (try fifo.ring.poll() >= work.ticket.?.point) {
+                work.receipt = .{ .channel = work.channel_handle, .point = work.ticket.?.point, .completed_ns = current };
+                return true;
+            }
+            if (current >= work.deadline) return error.Deadline;
+            return false;
+        }
+        if (current >= work.deadline) return error.Deadline;
+        if (self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or
+            self.display_engine_active or self.display_channel_active != null or self.mode_control_active or self.outputs.active() or
+            self.sequence.self_address != 0 or self.channel.?.phase != .idle or self.channel.?.pending != null) return false;
+        work.ticket = try fifo.prepareGraphics(work.command);
+        try self.device.?.submitGraphics(fifo, work.ticket.?, work.deadline);
+        work.submitted = true;
+        return true;
     }
     pub fn retireExecutionChannel(self: *Owner, handle: ChannelHandle, deadline: u64, quiesced: bool) !void {
         if (self.presentation) |entry| if (std.meta.eql(entry.channel_handle, handle)) return error.Busy;
@@ -2645,11 +2725,17 @@ pub const Owner = struct {
     /// Private instance/USERD/method backing: RM must guarantee initial
     /// clearing and confirm a contiguous extent. Ordinary BOs stay opaque.
     pub fn allocateNativeStorage(self: *Owner, bytes: u64, deadline: u64) !BufferHandle {
+        return self.allocatePrivateStorage(bytes, 65536, false, false, deadline);
+    }
+    pub fn allocateGraphicsContextStorage(self: *Owner, requirement: execution_context.wire.graphics.Requirement, deadline: u64) !BufferHandle {
+        return self.allocatePrivateStorage(requirement.bytes, requirement.alignment, true, requirement.readonly, deadline);
+    }
+    fn allocatePrivateStorage(self: *Owner, bytes: u64, alignment: u64, privileged: bool, readonly: bool, deadline: u64) !BufferHandle {
         const space = (self.nativeAddressSpace() orelse return error.State).*;
         const caps = self.nativeMemoryCapabilities() orelse return error.State;
         const memory_summary = self.nativeMemory() orelse return error.State;
         const policy: vram.storage.Policy = .{ .capabilities = caps, .physical_bytes = @min(memory_summary.physical_bytes, memory_summary.reported_bytes) };
-        const plan = try vram.surface.raw(self.adapter_id, space, bytes);
+        const plan = try vram.surface.rawPrivate(self.adapter_id, space, bytes, alignment, privileged, readonly);
         try policy.validate(space, plan.allocation_bytes);
         return self.allocateNativePlanStorage(plan, policy, deadline);
     }
@@ -2835,8 +2921,8 @@ pub const Owner = struct {
             const owner = self.fifos[index].owner orelse return error.State;
             if (owner.state == .ready or owner.state == .closed) {
                 if (owner.state == .ready) try self.rejection(.channel, owner.config.handle, owner.rejected, owner.host_rejected);
-                if (owner.info()) |fifo_info| self.log("NVIDIA gsp-fifo: channel={x} cid={d} engine={x} scheduled=yes copy-class={x}",
-                    .{fifo_info.config.handle,fifo_info.cid,fifo_info.config.rm_engine,fifo_info.config.copy_class});
+                if (owner.info()) |fifo_info| self.log("NVIDIA gsp-fifo: channel={x} cid={d} engine={x} scheduled=yes object-class={x}",
+                    .{fifo_info.config.handle,fifo_info.cid,fifo_info.config.rm_engine,fifo_info.config.object_class});
                 const deadline = owner.deadline; var token = try owner.handoff();
                 self.channel = try exchange.Exchange.init(&token, deadline);
                 if (owner.state == .finished) try self.freeChannelSlot(index);
@@ -2926,6 +3012,7 @@ pub const Owner = struct {
         if (try self.advanceDisplayFlip(current)) return .progress;
         if (try self.advanceCursorPoint(current)) return .progress;
         if (try self.advanceCopy(current)) return .progress;
+        if (try self.advanceGraphics(current)) return .progress;
         if (try self.advancePresentFrame(current)) return .progress;
         // A due receiver batch gets the idle RM channel before another
         // queued frame. A continuously repainting desktop must not starve HPD.

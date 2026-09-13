@@ -32,10 +32,10 @@ pub const Model = struct {
         return a.gfx_buffer_result_ok;
     }
     fn reserve(d: *const a.GfxBufferDescriptor, cookie: u64, out: *a.GfxOwnedBufferReservation) callconv(.c) i32 {
-        std.debug.assert(d.location == 1 and d.adapter_id == 0x01000000 and d.device_generation != 0 and d.driver_owner == 0 and d.usage & 3 == 0 and d.alignment == 65536);
+        std.debug.assert(d.location == 1 and d.adapter_id == 0x01000000 and d.device_generation != 0 and d.driver_owner == 0 and d.usage & 3 == 0 and d.alignment >= 65536 and std.math.isPowerOfTwo(d.alignment));
         if (is("vram_budget")) return a.gfx_buffer_error_budget;
         for (&slots, 0..) |*slot, i| if (!slot.live) {
-            const bytes = (d.byte_length + 65535) & ~@as(u64, 65535);
+            const bytes = std.mem.alignForward(u64, d.byte_length, d.alignment);
             out.* = .{ .buffer = .{ .id = @intCast(801+i), .generation = 601 }, .reference = .{ .id = @intCast(811+i), .generation = 701 },
                 .allocation_bytes = bytes, .cookie = cookie, .device_generation = d.device_generation, .driver_generation = 0x200000003,
                 .adapter_id = d.adapter_id, .driver_owner = 7 };

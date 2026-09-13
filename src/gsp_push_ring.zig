@@ -1,3 +1,26 @@
+// ExFiles/Reference/GFX/Nvidia/OpenKernelModules-570.144/src/common/sdk/nvidia/inc/class/clc56f.h
+// /*
+//  * SPDX-FileCopyrightText: Copyright (c) 2020-2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//  * SPDX-License-Identifier: MIT
+//  *
+//  * Permission is hereby granted, free of charge, to any person obtaining a
+//  * copy of this software and associated documentation files (the "Software"),
+//  * to deal in the Software without restriction, including without limitation
+//  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//  * and/or sell copies of the Software, and to permit persons to whom the
+//  * Software is furnished to do so, subject to the following conditions:
+//  *
+//  * The above copyright notice and this permission notice shall be included in
+//  * all copies or substantial portions of the Software.
+//  *
+//  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+//  * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+//  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+//  * DEALINGS IN THE SOFTWARE.
+//  */
 // NVIDIA570.144/src/common/sdk/nvidia/inc/class/clc6b5.h
 // /*******************************************************************************
 //     Copyright (c) 2020, NVIDIA CORPORATION. All rights reserved.
@@ -119,7 +142,16 @@ const r4os = @import("r4os");
 const a = r4os.abi;
 const storage = @import("gsp_control_storage.zig");
 pub const wire = @import("gsp_copy_wire.zig");
-pub const Error = wire.Error || storage.Error || error{ Stale, State, Exhausted, Completion, Retained };
+pub const graphics = @import("gsp_gr_wire.zig");
+pub const Error = wire.Error || graphics.Error || storage.Error || error{ Stale, State, Exhausted, Completion, Retained };
+pub const Kind = enum { copy, graphics };
+// C56F transport length is independent of the CE encoder's admitted packet
+// lengths. The private command page bounds both engine producers to 4 KB.
+fn entryWords(address: u64, count: u32) Error![2]u32 {
+    if (count == 0 or count > 1024 or address & 3 != 0) return error.Bounds;
+    try wire.extent(address, @as(u64, count) * 4, 40);
+    return .{ @truncate(address), @as(u32, @intCast(address >> 32)) | (count << 10) };
+}
 pub const Ticket = struct { owner: usize, epoch: u64, channel: u32, token: u32, point: u32, put: u32 };
 pub const Ring = struct {
     self_address: usize = 0,
@@ -133,12 +165,16 @@ pub const Ring = struct {
     pending: ?Ticket = null,
     published: bool = false,
     failed: bool = false,
+    kind: Kind = .copy,
 
     pub fn open(self: *Ring, backing: *storage.Storage, address: u64) Error!void {
+        return self.openKind(backing, address, .copy);
+    }
+    pub fn openKind(self: *Ring, backing: *storage.Storage, address: u64, kind: Kind) Error!void {
         if (self.self_address != 0 or !backing.gpuReady(address)) return error.State;
         try wire.extent(address, 12288, 40);
         try wire.extent(backing.pages[2], 4096, 40);
-        self.* = .{ .self_address = @intFromPtr(self), .backing = backing, .address = address };
+        self.* = .{ .self_address = @intFromPtr(self), .backing = backing, .address = address, .kind = kind };
         if (backing.memory.?.bufferMap(&backing.reference.reference, a.gfx_buffer_map_write, 0, 12288, &self.cpu) != a.gfx_buffer_result_ok) {
             if (self.cpu.lease.id != 0) { self.failed = true; return error.Descriptor; }
             self.* = .{}; return error.Map;
@@ -159,14 +195,31 @@ pub const Ring = struct {
     }
     fn word(self: *const Ring, offset: usize) *volatile u32 { return @ptrFromInt(self.cpu.cpu_address + offset); }
     pub fn fence() void { asm volatile ("mfence" ::: .{ .memory = true }); }
-    pub fn prepare(self: *Ring, class: u32, channel_handle: u32, token: u32, transfer: wire.Transfer) Error!Ticket {
+    fn capacity(self: *const Ring) u32 { return if (self.kind == .graphics) 1 else wire.capacity; }
+    fn slotBytes(self: *const Ring) u32 { return if (self.kind == .graphics) 4096 else wire.slot_bytes; }
+    fn pushOffset(self: *const Ring) usize { return wire.push_offset + (self.issued % self.capacity()) * self.slotBytes(); }
+    fn nextPoint(self: *const Ring) Error!u32 {
         if (!self.valid()) return error.Stale;
-        if (self.pending != null or self.issued - self.completed >= wire.capacity) return error.Busy;
-        const point = std.math.add(u32, self.issued, 1) catch return error.Exhausted;
-        const push = wire.push_offset + (self.issued % wire.capacity) * wire.slot_bytes;
+        if (self.pending != null or self.issued - self.completed >= self.capacity()) return error.Busy;
+        return std.math.add(u32, self.issued, 1) catch error.Exhausted;
+    }
+    pub fn prepare(self: *Ring, class: u32, channel_handle: u32, token: u32, transfer: wire.Transfer) Error!Ticket {
+        if (self.kind != .copy) return error.Unsupported;
+        const point = try self.nextPoint();
         const commands = try wire.encodeTransfer(class, transfer, self.address + wire.completion_offset, point);
-        const gp = try wire.entryWords(self.address + push, commands.count);
-        for (commands.slice(), 0..) |value, i| self.word(push + i * 4).* = value;
+        return self.prepareWords(channel_handle, token, point, commands.slice());
+    }
+    pub fn prepareGraphics(self: *Ring, class: u32, channel_handle: u32, token: u32, command: graphics.Command) Error!Ticket {
+        if (self.kind != .graphics) return error.Unsupported;
+        const point = try self.nextPoint();
+        const commands = try graphics.encode(class, command, self.address + wire.completion_offset, point);
+        return self.prepareWords(channel_handle, token, point, commands.slice());
+    }
+    fn prepareWords(self: *Ring, channel_handle: u32, token: u32, point: u32, commands: []const u32) Error!Ticket {
+        if (commands.len == 0 or commands.len > self.slotBytes() / 4) return error.Bounds;
+        const push = self.pushOffset();
+        const gp = try entryWords(self.address + push, @intCast(commands.len));
+        for (commands, 0..) |value, i| self.word(push + i * 4).* = value;
         self.word(self.put * 8).* = gp[0]; self.word(self.put * 8 + 4).* = gp[1];
         const ticket: Ticket = .{ .owner = @intFromPtr(self), .epoch = self.backing.?.epoch,
             .channel = channel_handle, .token = token, .point = point, .put = (self.put + 1) % 512 };
@@ -178,12 +231,20 @@ pub const Ring = struct {
     /// Check the actual private command bytes, including release destination.
     /// A matching ticket alone does not authenticate the transfer operands.
     pub fn matchesTransfer(self: *const Ring, ticket: Ticket, class: u32, transfer: wire.Transfer) bool {
-        if (!self.matches(ticket)) return false;
-        const push = wire.push_offset + (self.issued % wire.capacity) * wire.slot_bytes;
+        if (self.kind != .copy or !self.matches(ticket)) return false;
         const expected = wire.encodeTransfer(class, transfer, self.address + wire.completion_offset, ticket.point) catch return false;
-        const gp = wire.entryWords(self.address + push, expected.count) catch return false;
+        return self.matchesWords(expected.slice());
+    }
+    pub fn matchesGraphics(self: *const Ring, ticket: Ticket, class: u32, command: graphics.Command) bool {
+        if (self.kind != .graphics or !self.matches(ticket)) return false;
+        const expected = graphics.encode(class, command, self.address + wire.completion_offset, ticket.point) catch return false;
+        return self.matchesWords(expected.slice());
+    }
+    fn matchesWords(self: *const Ring, expected: []const u32) bool {
+        const push = self.pushOffset();
+        const gp = entryWords(self.address + push, @intCast(expected.len)) catch return false;
         fence();
-        for (expected.slice(), 0..) |value, i| if (self.word(push + i * 4).* != value) return false;
+        for (expected, 0..) |value, i| if (self.word(push + i * 4).* != value) return false;
         return self.word(self.put * 8).* == gp[0] and self.word(self.put * 8 + 4).* == gp[1];
     }
     pub fn publish(self: *Ring, ticket: Ticket) Error!void {

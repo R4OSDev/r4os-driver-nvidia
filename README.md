@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.105; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.106; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -20,6 +20,17 @@ the backing. Application expiry is separate from the finite five-second RM
 budget. Completion transfers a reference before closing the driver's initial
 reference. Public scanout creation and GR rendering remain unimplemented;
 physical allocation/copy validation remains open in OssiGPU.txt /19.
+
+Graphics channel (0.79.19 partial): native startup now queries GR0 context
+requirements, allocates private cleared/aligned buffers and promotes them to
+RM. A separate ADMIN golden channel initializes C797, then closes before the
+normal USER channel is created. Shared buffers retain their original context;
+MAIN/PATCH storage is fresh. Private completion requires a C797 WFI/flush and
+observed semaphore release through the common C56F transport. The existing
+Device worker owns admission, bounded steps, rejection cleanup and uncertain
+resource retention. GR drawing and public render completion remain open;
+this does not advertise accelerated rendering. See GrafikEngine07919.txt/.json
+and OssiGPU.txt /19 for the separate physical qualification.
 
 Copy Engine integration (0.79.18): canonical row jobs cover RAM-to-VRAM,
 VRAM-to-VRAM and readback, including pitched/blocklinear conversion. R4NV owns

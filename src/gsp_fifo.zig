@@ -262,10 +262,10 @@ const control = @import("gsp_control_buffer.zig");
 const vram = @import("gsp_vram.zig");
 const names = @import("gsp_rm_names.zig");
 pub const wire = @import("gsp_fifo_wire.zig");
-pub const copy = @import("gsp_copy_ring.zig");
+pub const copy = @import("gsp_push_ring.zig");
 pub const Error = context.Error || control.Error || copy.Error;
 pub const State = enum { command_creating, creating, unwinding, ready, handed_off, destroying, command_destroying, closed, finished, failed };
-pub const Info = struct { config: wire.Config, cid: u32, work_submit_token: u32 };
+pub const Info = struct { config: wire.Config, cid: u32, work_submit_token: u32, engine_caps: u32 };
 pub const Owner = struct {
     self_address: usize = 0,
     state: State = .command_creating,
@@ -281,7 +281,10 @@ pub const Owner = struct {
     instance: vram.storage.Use = .{},
     userd: vram.storage.Use = .{},
     ring: copy.Ring = .{},
-    copy_live: bool = false,
+    engine_live: bool = false,
+    engine_caps: u32 = 0,
+    graphics_promoted: bool = false,
+    graphics_initialized: bool = false,
     live: bool = false,
     bound: bool = false,
     enabled: bool = false,
@@ -298,9 +301,10 @@ pub const Owner = struct {
     unwind: bool = false,
 
     pub fn open(self: *Owner, token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext, adapter: u32, graph: names.Lease,
-        parent: *context.Owner, runqueue: u8, instance: *vram.Owner, userd: ?*vram.Owner, deadline: u64) Error!void
+        parent: *context.Owner, runqueue: u8, instance: *vram.Owner, userd: ?*vram.Owner, engine: wire.Engine, deadline: u64) Error!void
     {
         if (self.self_address != 0) return error.State;
+        if ((userd != null) != (engine == .none)) return error.Unsupported;
         const parent_info = parent.info() orelse return error.State;
         const methods = parent.methodStorage(runqueue) orelse return error.State;
         const inst = instance.info() orelse return error.State;
@@ -316,13 +320,18 @@ pub const Owner = struct {
             if (source.adapter != adapter or !std.meta.eql(instance.binding.space, source.binding.space)) return error.Stale;
             if (instance == source or usr.logical_bytes != 512) return error.Bounds;
             userd_address = (usr.physical orelse return error.State).base;
-        } else if (parent_info.rm_engine < 9) return error.Unsupported;
+        } else switch (engine) {
+            .none => return error.Unsupported,
+            .copy => if (parent_info.rm_engine < 9) return error.Unsupported,
+            .graphics => if (parent_info.rm_engine != 1) return error.Unsupported,
+        }
+        const graphics = if (engine == .graphics) try parent.graphicsPromotion() else null;
         try token.session.guard(deadline);
         const reservation = try token.session.rm_names.reserveChildren(graph, if (userd == null) 4 else 3);
         self.* = .{ .self_address = @intFromPtr(self), .session = token.session, .parent = parent, .reservation = reservation, .namespace_live = true, .deadline = deadline,
             .config = .{ .context = parent_info.binding, .handle = try reservation.object(2), .rm_engine = parent_info.rm_engine, .runqueue = runqueue,
                 .address = 4096, .instance = inst.physical.?.base, .userd = userd_address,
-                .system_userd = userd == null, .copy_handle = if (userd == null) try reservation.object(3) else 0,
+                .system_userd = userd == null, .engine = engine, .graphics = graphics, .object_handle = if (userd == null) try reservation.object(3) else 0,
                 .methods = methods.physical.base, .method_bytes = parent_info.method_bytes } };
         self.config_stamp = self.config;
         self.acquire(token, ctx, adapter, instance, userd) catch |err| {
@@ -360,12 +369,16 @@ pub const Owner = struct {
     }
     pub fn info(self: *const Owner) ?Info {
         self.stable() catch return null;
-        if ((self.state != .ready and self.state != .handed_off) or !self.live or !self.bound or !self.enabled or
+        if ((self.state != .ready and self.state != .handed_off) or !self.live or !self.bound or (!self.enabled and !self.golden()) or
             self.commands == null or self.commands.?.info() == null or self.instance.info() == null or self.parent.?.methodStorage(self.config.runqueue) == null) return null;
         if (self.config.system_userd) {
-            if (!self.ring.valid() or !self.copy_live or self.config.copy_class == 0) return null;
+            if (!self.ring.valid() or !self.engine_live or self.config.object_class == 0) return null;
+            if (self.config.engine == .graphics and !self.graphics_promoted) return null;
+            if (self.config.graphics) |graphics| {
+                if (!std.meta.eql(graphics, self.parent.?.graphicsPromotion() catch return null)) return null;
+            }
         } else if (self.userd.info() == null) return null;
-        return .{ .config = self.config, .cid = self.cid, .work_submit_token = self.work_submit_token orelse return null };
+        return .{ .config = self.config, .cid = self.cid, .work_submit_token = self.work_submit_token orelse return null, .engine_caps = self.engine_caps };
     }
     pub fn poll(self: *Owner) Error!?exchange.Dispatch {
         try self.stable();
@@ -399,14 +412,18 @@ pub const Owner = struct {
         if (rpc.pending != null) return error.Pending;
         if (self.operation == null) {
             const op: wire.Operation = if (self.state == .creating) blk: {
-                if (self.config.system_userd and self.config.copy_class == 0) break :blk .classes;
+                if (self.config.system_userd and self.config.object_class == 0) break :blk .classes;
                 if (!self.live) break :blk .allocate;
                 if (!self.bound) break :blk .bind;
                 if (self.work_submit_token == null) break :blk .token;
-                if (self.config.system_userd and !self.copy_live) break :blk .allocate_copy;
-                if (!self.enabled) break :blk .enable;
+                if (self.config.engine == .graphics and !self.graphics_promoted) break :blk .promote_graphics;
+                // RM's golden initializer needs a schedulable channel. It
+                // receives no host methods, and closes before normal work.
+                if (self.golden() and !self.enabled) break :blk .enable;
+                if (self.config.system_userd and !self.engine_live) break :blk if (self.config.engine == .graphics) .allocate_graphics else .allocate_copy;
+                if (!self.enabled and !self.golden()) break :blk .enable;
                 self.state = .ready; return null;
-            } else if (self.enabled) .disable else if (self.copy_live) .free_copy else if (self.live) .free else {
+            } else if (self.enabled) .disable else if (self.engine_live) .free_copy else if (self.live) .free else {
                 if (!self.ring.close()) return error.Retained;
                 var token = try rpc.handoff(self.deadline);
                 try self.commands.?.beginDestroy(&token, self.deadline); self.state = .command_destroying; return null;
@@ -426,40 +443,58 @@ pub const Owner = struct {
         } else switch (op) {
             .classes => {
                 if (reply.ok == 0) { self.host_rejected = error.Unsupported; self.unwind = true; self.state = .unwinding; }
-                else { self.config.copy_class = reply.ok; self.config_stamp = self.config; }
+                else { self.config.object_class = reply.ok; self.config_stamp = self.config; }
             },
             .allocate => { self.live = true; self.cid = reply.ok; },
             .bind => self.bound = true,
             .token => self.work_submit_token = reply.ok,
-            .allocate_copy => self.copy_live = true,
+            .allocate_copy => self.engine_live = true,
+            .promote_graphics => self.graphics_promoted = true,
+            .allocate_graphics => { self.engine_live = true; self.engine_caps = reply.ok; self.graphics_initialized = true; },
             .enable => self.enabled = true,
             .disable => self.enabled = false,
-            .free_copy => self.copy_live = false,
+            .free_copy => self.engine_live = false,
             .free => { self.live = false; self.bound = false; },
         }
         self.operation = null; return null;
     }
     fn prepareCommands(self: *Owner) Error!void {
         try wire.validate(self.config);
-        if (self.config.system_userd) try self.ring.open(&self.commands.?.backing, self.config.address);
+        if (self.config.system_userd) try self.ring.openKind(&self.commands.?.backing, self.config.address, if (self.config.engine == .graphics) .graphics else .copy);
     }
     pub fn prepareCopy(self: *Owner, transfer: copy.wire.Transfer) Error!copy.Ticket {
         const value = self.info() orelse return error.State;
-        if (!value.config.system_userd or self.state != .handed_off) return error.State;
-        return self.ring.prepare(value.config.copy_class, value.config.handle, value.work_submit_token, transfer);
+        if (value.config.engine != .copy or !value.config.system_userd or self.state != .handed_off) return error.State;
+        return self.ring.prepare(value.config.object_class, value.config.handle, value.work_submit_token, transfer);
     }
     pub fn matchesCopy(self: *const Owner, ticket: copy.Ticket) bool {
         const value = self.info() orelse return false;
-        return self.state == .handed_off and value.config.system_userd and value.config.handle == ticket.channel and
+        return self.state == .handed_off and value.config.engine == .copy and value.config.system_userd and value.config.handle == ticket.channel and
             value.config.context.epoch == ticket.epoch and value.work_submit_token == ticket.token and self.ring.matches(ticket);
+    }
+    pub fn prepareGraphics(self: *Owner, command: copy.graphics.Command) Error!copy.Ticket {
+        const value = self.info() orelse return error.State;
+        if (value.config.engine != .graphics or self.state != .handed_off or self.golden()) return error.State;
+        return self.ring.prepareGraphics(value.config.object_class, value.config.handle, value.work_submit_token, command);
+    }
+    pub fn matchesGraphics(self: *const Owner, ticket: copy.Ticket, command: copy.graphics.Command) bool {
+        const value = self.info() orelse return false;
+        return self.state == .handed_off and value.config.engine == .graphics and value.config.handle == ticket.channel and
+            value.config.context.epoch == ticket.epoch and value.work_submit_token == ticket.token and
+            self.ring.matchesGraphics(ticket, value.config.object_class, command);
     }
     fn releasePrivate(self: *Owner) bool {
         if (!self.userd.close(true) or !self.instance.close(true)) return false;
         if (self.child) |child| { self.parent.?.releaseChild(child, true) catch return false; self.child = null; self.parent = null; }
         return true;
     }
+    fn golden(self: *const Owner) bool {
+        return if (self.config.graphics) |graphics| graphics.golden else false;
+    }
     fn finish(self: *Owner) Error!void {
-        if (self.live or self.enabled or self.copy_live or self.ring.self_address != 0 or !self.releasePrivate()) return error.Retained;
+        const parent = self.parent;
+        if (self.live or self.enabled or self.engine_live or self.ring.self_address != 0 or !self.releasePrivate()) return error.Retained;
+        if (self.golden() and self.graphics_initialized and !self.unwind) (parent orelse return error.State).golden_complete = true;
         if (self.namespace_live) { try self.session.?.rm_names.retireChildren(self.reservation.?); self.namespace_live = false; }
         self.state = if (self.unwind) .ready else .closed;
     }

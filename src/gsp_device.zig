@@ -55,6 +55,7 @@ pub const Device = struct {
     running: runtime.Owner = .{},
     catalog: @import("gsp_catalog.zig").Owner = .{},
     native_output: @import("gsp_native_output.zig").Owner = .{},
+    native_graphics: @import("gsp_native_graphics.zig").Owner = .{},
     board: ?@import("vbios.zig").Result = null,
     interrupts: irq.Owner = .{},
     irq_wake: ?irq.Wake = null,
@@ -225,13 +226,15 @@ pub const Device = struct {
             }
             const output_progress = try self.native_output.step();
             const allocation_progress = try self.running.allocations.step(&self.running);
+            const graphics_progress = try self.native_graphics.step(&self.running,
+                self.native_output.phase == .active or self.native_output.phase == .detached);
             if (self.native_output.phase == .active and self.interrupts.display.epoch == 0) {
                 const root = (try self.running.displayEngineStatus(self.native_output.engine.?)).info orelse return error.State;
                 const head = self.native_output.mode.?.head;
                 if (head >= root.hardware.heads or head >= 8) return error.Binding;
                 self.interrupts.enableDisplay(self.running.post.snapshot() orelse return error.State,
                     self.epoch, @as(u32, 1) << @as(u5, @intCast(head))) catch |err| {
-                    if (err == error.Busy) return progress or output_progress;
+                    if (err == error.Busy) return progress or output_progress or allocation_progress or graphics_progress;
                     return err;
                 };
                 self.running.head_events = &self.interrupts.display;
@@ -248,7 +251,7 @@ pub const Device = struct {
                     "NVIDIA head-events: head={d} epoch={d} sequence={d} observed-ns={d} frame-counter={d} scanline={d}",
                     .{index,self.epoch,sample.sequence,sample.observed_ns,sample.frame_counter,sample.scanline});
             };
-            return progress or output_progress or allocation_progress;
+            return progress or output_progress or allocation_progress or graphics_progress;
         }
         if (try self.now() >= self.deadline) return error.Deadline;
         switch (self.phase) {
@@ -315,6 +318,7 @@ pub const Device = struct {
         self.running.reportIrq(&self.interrupts); // Worker-side snapshot; no allocation or BO mutation in the IRQ.
         self.running.stop(err);
         self.native_output.quarantine(err);
+        self.native_graphics.quarantine(if (self.ctx) |*ctx| ctx else null, err);
         if (!self.catalog.close()) self.ctx.?.logError("NVIDIA gsp-catalog: metadata close failed; cleanup retry required");
         self.logFailure(if (self.phase == .ready) "runtime" else "startup", err);
         if (self.interrupts.self_address != 0) {
@@ -336,6 +340,7 @@ pub const Device = struct {
     }
     pub fn stop(self: *Device) bool {
         self.native_output.quarantine(error.Stopped);
+        self.native_graphics.quarantine(if (self.ctx) |*ctx| ctx else null, error.Stopped);
         if (!self.catalog.close()) return false;
         self.running.stop(error.Stopped);
         self.native_output.statistics.publish(&self.native_output);
@@ -379,7 +384,7 @@ pub const Device = struct {
         return .{ .context = self, .generation = generation, .admit = admit, .access = access,
             .retain = retain, .quiesced = quiesced, .log_polling = polling,
             .admit_firmware = admitFirmware, .admit_cold = admitCold, .queue_memory = self.memory,
-            .admit_runtime = admitRuntime, .admit_command = admitCommand, .admit_copy = admitCopy,
+            .admit_runtime = admitRuntime, .admit_command = admitCommand, .admit_copy = admitCopy, .admit_graphics = admitGraphics,
             .admit_display_retirement = admitDisplayRetirement,
             .admit_display_push = admitDisplayPush,
             .wake_work = wakeWork,
@@ -512,13 +517,34 @@ pub const Device = struct {
         if (current != display_dma or !current.admitsRetirement(deadline) or self.running.activeChannel() != &current.exchange or
             current.exchange.session != &self.session.? or port.runtime_session != &self.session.? or self.session.?.pending != null) return error.Binding;
     }
-    fn admitCopy(raw: *anyopaque, port: *const native.Port, fifo: *@import("gsp_fifo.zig").Owner, ticket: @import("gsp_copy_ring.zig").Ticket, deadline: u64) !void {
+    fn admitGraphics(raw: *anyopaque, port: *const native.Port, fifo: *@import("gsp_fifo.zig").Owner, ticket: @import("gsp_push_ring.zig").Ticket, deadline: u64) !void {
+        const self = from(raw);
+        try self.checkLive(false);
+        const run = &self.running;
+        if (self.phase != .ready or port != &self.port or port.phase != .runtime or self.session == null or self.inLockdown() or
+            run.self_address != @intFromPtr(run) or run.failure != null or run.sequence.self_address != 0 or run.graph_closing or
+            run.fifo_active != null or run.context_active != null or run.native_active != null or run.buffer_active != null or
+            run.outputs.active() or run.display_engine_active or run.display_channel_active != null or run.mode_control_active or
+            run.copy_job != null or run.display_upload_job != null or run.initial_image != null or run.cursor_upload != null or
+            run.display_work != null or run.audio_work != null) return error.State;
+        const work = if (run.graphics_work) |*value| value else return error.Binding;
+        if (work.submitted or work.receipt != null or work.ticket == null or !std.meta.eql(work.ticket.?, ticket) or
+            work.deadline != deadline or !fifo.matchesGraphics(ticket, work.command)) return error.Binding;
+        const handle = work.channel_handle;
+        if (handle.epoch != self.epoch or handle.slot >= run.fifos.len or run.fifos[handle.slot].owner != fifo or
+            run.fifos[handle.slot].serial != handle.serial or ticket.epoch != self.epoch) return error.Binding;
+        const rpc = run.activeChannel() orelse return error.State;
+        if (rpc.session != &self.session.? or port.runtime_session != rpc.session or rpc.session.pending != null or
+            rpc.phase != .idle or rpc.pending != null or rpc.in_lockdown) return error.Binding;
+        try rpc.guard(deadline);
+    }
+    fn admitCopy(raw: *anyopaque, port: *const native.Port, fifo: *@import("gsp_fifo.zig").Owner, ticket: @import("gsp_push_ring.zig").Ticket, deadline: u64) !void {
         const self = from(raw);
         try self.checkLive(false);
         if (self.phase != .ready or port != &self.port or port.phase != .runtime or self.session == null or self.inLockdown() or
             self.running.self_address != @intFromPtr(&self.running) or self.running.failure != null or self.running.sequence.self_address != 0 or
             self.running.fifo_active != null or self.running.context_active != null or self.running.native_active != null or self.running.buffer_active != null or
-            self.running.outputs.active() or self.running.graph_closing or self.running.display_engine_active or self.running.display_channel_active != null or self.running.display_work != null or self.running.mode_control_active) return error.State;
+            self.running.outputs.active() or self.running.graph_closing or self.running.display_engine_active or self.running.display_channel_active != null or self.running.display_work != null or self.running.mode_control_active or self.running.graphics_work != null) return error.State;
         self.running.validateCopyOverlap() catch return error.Binding;
         const channel_handle = if (self.running.cursor_upload) |*work| blk: {
             if (self.native_output.phase != .active or !self.native_output.callback_confirmed or self.native_output.mode == null or
@@ -526,7 +552,7 @@ pub const Device = struct {
             try self.running.validateCursorUpload();
             const staging = work.operation.source.?;
             if (!work.operation.matches(ticket, deadline) or fifo.config.context.vaspace != staging.binding.space.handle or
-                !fifo.ring.matchesTransfer(ticket, fifo.config.copy_class, work.operation.transfer() catch return error.Binding)) return error.Binding;
+                !fifo.ring.matchesTransfer(ticket, fifo.config.object_class, work.operation.transfer() catch return error.Binding)) return error.Binding;
             break :blk work.channel;
         } else if (self.running.display_upload_job) |*work| blk: {
             const resources = self.running.display_resources_slot.owner orelse return error.Binding;
@@ -537,14 +563,14 @@ pub const Device = struct {
                 !resources.valid() or !std.meta.eql(resources.binding.?, root.binding) or resources.instance != &root.instance_storage or
                 work.operation.table != &resources.table or work.operation.source != staging or work.operation.target != &root.instance_storage or
                 !work.operation.matches(ticket, deadline) or fifo.config.context.vaspace != staging.binding.space.handle) return error.Binding;
-            if (!fifo.ring.matchesTransfer(ticket, fifo.config.copy_class, work.operation.transfer() catch return error.Binding)) return error.Binding;
+            if (!fifo.ring.matchesTransfer(ticket, fifo.config.object_class, work.operation.transfer() catch return error.Binding)) return error.Binding;
             try self.running.validateDisplayTableUpdate();
             break :blk work.channel_handle;
         } else if (self.running.initial_image) |*work| blk: {
             const entry = work.presentation;
             if (self.running.copy_job != null or !work.operation.matches(ticket, deadline)) return error.Binding;
             const transfer = self.running.initialImageTransfer() catch return error.Binding;
-            if (!fifo.ring.matchesTransfer(ticket, fifo.config.copy_class, transfer)) return error.Binding;
+            if (!fifo.ring.matchesTransfer(ticket, fifo.config.object_class, transfer)) return error.Binding;
             break :blk entry.channel_handle;
         } else blk: {
             const work = if (self.running.copy_job) |*value| value else return error.Binding;
@@ -552,7 +578,7 @@ pub const Device = struct {
                 work.deadline != deadline) return error.Binding;
             if (work.target_presentation != null and !work.render_read.matches(ticket, deadline)) return error.Binding;
             const transfer = self.running.copyTransfer() catch return error.Binding;
-            if (!std.meta.eql(work.transfer, transfer) or !fifo.ring.matchesTransfer(ticket, fifo.config.copy_class, transfer)) return error.Binding;
+            if (!std.meta.eql(work.transfer, transfer) or !fifo.ring.matchesTransfer(ticket, fifo.config.object_class, transfer)) return error.Binding;
             break :blk work.channel_handle;
         };
         if (channel_handle.epoch != self.epoch or channel_handle.slot >= self.running.fifos.len) return error.Binding;

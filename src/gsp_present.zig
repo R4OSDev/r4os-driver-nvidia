@@ -8,7 +8,7 @@ const backing = @import("gsp_native_backing.zig");
 const image = @import("gsp_display_image.zig");
 const copy = @import("gsp_copy_wire.zig");
 const mapping = @import("gsp_buffer_mapping.zig");
-const ring = @import("gsp_copy_ring.zig");
+const ring = @import("gsp_push_ring.zig");
 pub const Error = backing.Error || copy.Error || error{State, Overflow};
 pub const Rect = struct {
     x: u32, y: u32, width: u32, height: u32,

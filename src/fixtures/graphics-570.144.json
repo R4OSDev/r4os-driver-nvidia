@@ -1,0 +1,45 @@
+{
+  "schema": 1,
+  "purpose": "C797 GR allocation and full preceding-work completion barrier",
+  "pin": "NVIDIA 570.144",
+  "generator": "Temp/gfx-gr-engine-20260913/GraphicsReference.c",
+  "fixture_sha256": "94c615d9838395dd875fb582267657cb0140bb9088c12d60408e3dc1e099fbe1",
+  "sources": [
+    {
+      "sha256": "9e878195c522919f133c497aefbc3f4c076aae8bda25d4c7915e8981bb43563a",
+      "path": "src/common/sdk/nvidia/inc/nvos.h"
+    },
+    {
+      "sha256": "707e5a739d9b8781c05003188d6e64888303c84039e4f2ecc0810b8411669248",
+      "path": "src/common/sdk/nvidia/inc/nvmisc.h"
+    },
+    {
+      "sha256": "eb4ae1935e33df088d445278add2813decab13fd472f8dab3eeea4b4930bb2fd",
+      "path": "src/common/sdk/nvidia/inc/class/clc797.h"
+    },
+    {
+      "sha256": "8b7a6d6d5d5e3538f2f3e3b975d00c4aa94bd2480008c49aefcfc2566e3f658e",
+      "path": "src/common/sdk/nvidia/inc/class/clc56f.h"
+    },
+    {
+      "sha256": "f0211fbc8bf3f80841f699bf4ccb776d32517308782dfb3c8e99c7652986b5ab",
+      "path": "src/common/sdk/nvidia/inc/alloc/alloc_channel.h"
+    },
+    {
+      "sha256": "5e7b247d68713323f1110c61691d11bfe8bd1f31bbf67302fb7f98b3ef47fca1",
+      "path": "src/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080gpu.h"
+    },
+    {
+      "sha256": "0fd1d0f4fb88d63f41be533d8f0750e63b5938854085e1d1dbfe7272869ee0c0",
+      "path": "src/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080internal.h"
+    },
+    {
+      "sha256": "8c2b460e55ea2bd597393bb5662160361c004a98e0e8eed3f1278071eb60d701",
+      "path": "src/common/sdk/nvidia/inc/ctrl/ctrl0080/ctrl0080fifo.h"
+    },
+    {
+      "sha256": "13b89002722ec063bdd0a6047664a140f0aaf3f336a4a13118a5ea75b4171214",
+      "path": "src/nvidia/generated/g_kernel_channel_nvoc.h"
+    }
+  ]
+}

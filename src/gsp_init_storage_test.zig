@@ -1560,6 +1560,8 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         context_methods, context_methods_acquire, context_methods_free, context_methods_release,
         context_fifo_success, context_fifo_allocate, context_fifo_bind, context_fifo_token, context_fifo_enable,
         context_fifo_changed, context_fifo_ack, context_fifo_timeout, context_fifo_disable, context_fifo_free, context_fifo_dma,
+        context_graphics, context_graphics_missing, context_graphics_reject, context_graphics_timeout,
+        context_graphics_promote_reject, context_graphics_promote_changed,
         context_copy_success, context_copy_class, context_copy_allocate, context_copy_changed, context_copy_timeout, context_copy_completion,
         context_copy_rc, context_copy_rc_unmatched, context_copy_mmu, context_copy_xid, context_copy_fault_ack, context_copy_irq,
         context_copy_capacity, context_copy_oom, context_copy_invalid, context_copy_lost_idle, context_copy_fastpath,
@@ -4155,7 +4157,7 @@ fn pumpCursorUpload(target: *@import("gsp_device.zig").Device) !void {
             ((@as(usize, ticket.point) - 1) % wire.capacity) * wire.slot_bytes);
         const source = (@as(u64, command[3]) << 32) | command[4];
         const destination = (@as(u64, command[5]) << 32) | command[6];
-        try t.expect(command[0] == 0x20010000 and command[1] == fifo.config.copy_class and command[2] == 0x20040100 and
+        try t.expect(command[0] == 0x20010000 and command[1] == fifo.config.object_class and command[2] == 0x20040100 and
             source == 0x600000 and destination == gpu_address + work.target_offset + work.completed_bytes and
             command[8] == (if (parts == 0) @as(u32, 12288) else 4096) and command[10] == 0x04000182 and
             command[14] == ticket.point and command[16] == 0xc);
@@ -5008,7 +5010,7 @@ fn pumpLiveTable(target: *@import("gsp_device.zig").Device, gpu_table: *[@import
         try t.expect(target.phase == .ready and work.phase == .submitted and fifo.ring.issued == work.ticket.?.point);
         const command: [*]const u32 = @ptrFromInt(fifo.ring.cpu.cpu_address + wire.push_offset +
             ((@as(usize, work.ticket.?.point) - 1) % wire.capacity) * wire.slot_bytes);
-        try t.expect(command[0] == 0x20010000 and command[1] == fifo.config.copy_class and command[2] == 0x20040100 and
+        try t.expect(command[0] == 0x20010000 and command[1] == fifo.config.object_class and command[2] == 0x20040100 and
             ((@as(u64, command[3]) << 32) | command[4]) == transfer.source and
             ((@as(u64, command[5]) << 32) | command[6]) == transfer.target and command[8] == range.bytes and
             command[10] == 0x04000182 and command[14] == work.ticket.?.point and command[16] == 0xc);
@@ -5132,16 +5134,28 @@ fn replyNativeProduct(target: *@import("gsp_device.zig").Device) !void {
     if (run.context_active) |index| {
         const owner = run.contexts[index].owner.?;
         const op = owner.operation.?;
-        const vector: usize = switch (op) { .classes => 0, .engines => if (owner.base == 0) 1 else 2, .method_size => 3, .group => 4, .share => 5, .free_share => 6, .free_group => 7 };
+        if (op == .graphics_info) {
+            try t.expect(owner.rm_engine == 1 and @import("gsp_context_wire.zig").word(rpc.request, 0) == run.static_info.?.client and @import("gsp_context_wire.zig").word(rpc.request, 4) == run.static_info.?.subdevice);
+            @memcpy(response[24..1688], @embedFile("fixtures/gr-context-570.144.bin")[0..1664]);
+        } else {
+        const vector: usize = switch (op) { .classes => 0, .engines => if (owner.base == 0) 1 else 2, .method_size => 3, .group => 4, .share => 5, .free_share => 6, .free_group => 7, .graphics_info => unreachable };
         const bytes = @import("gsp_context_test.zig").response(vector);
         const header: usize = if (rpc.function == 76) 24 else if (rpc.function == 103) 32 else 16;
         @memcpy(response[header..rpc.request.len], bytes[header..]);
+        if (owner.rm_engine == 1) {
+            if (op == .engines and owner.base == 0) {
+                @memset(response[120..136], 0); @memcpy(response[120..123], "GR0");
+            }
+            if (op == .group or op == .share) @memcpy(response[32..rpc.request.len], rpc.request[32..]);
+        }
+        }
     } else if (run.native_active) |index| {
         const owner = run.native_buffers[index].owner.?;
         const slot = owner.reservation.buffer.id - 801;
         switch (owner.operation.?) {
             .allocate_memory, .allocate_virtual => {
-                std.mem.writeInt(u64, response[112..120], if (owner.operation.? == .allocate_memory) owner.storage_policy.?.physical_bytes / 2 + slot * 65536 else native.address(slot), .little);
+                const stride: u64 = if (target.native_graphics.self_address != 0) 8 * 1024 * 1024 else 65536;
+                std.mem.writeInt(u64, response[112..120], if (owner.operation.? == .allocate_memory) owner.storage_policy.?.physical_bytes / 2 + slot * stride else native.address(slot), .little);
                 std.mem.writeInt(u64, response[120..128], owner.bytes - 1, .little);
             },
             .map => std.mem.writeInt(u64, response[40..48], native.address(slot), .little),
@@ -5215,7 +5229,157 @@ fn replyNativeProduct(target: *@import("gsp_device.zig").Device) !void {
     try nativeReply(session, rpc.function, 0, response[0..rpc.request.len]);
 }
 
+fn checkDeviceGraphics(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, scenario: []const u8) !void {
+    const native = @import("gsp_vram_test_model.zig").Model;
+    const fifo_model = @import("gsp_fifo_test_model.zig").Model;
+    const run = &target.running;
+    native.install(table, scenario); defer native.dispose(table);
+    fifo_model.install(table, scenario);
+    // Use the existing completed receiver fixture; this case owns GR RPCs,
+    // not a second copy of the unrelated initial connector discovery.
+    run.outputs.self_address = @intFromPtr(&run.outputs); run.outputs.state = .returned; run.outputs.graph = &run.graph.?;
+    @import("gsp_display_commands_test.zig").outputFixture(&run.outputs.data, run.epoch, run.graph.?.reservation.client);
+    run.output_generation = run.outputs.data.generation; run.outputs.invalidated = false;
+    run.receiver_events = .{ .epoch = run.epoch, .not_before_ns = clock + 60 * std.time.ns_per_s };
+    try target.native_graphics.request();
+    var counts: FifoCounts = .{};
+    var stages: u32 = 0;
+    var steps: usize = 0;
+    errdefer |err| std.debug.print("graphics {s}: {s} phase={s} owner={s}/{?} failure={?} context={?} fifo={?} native={?} stage={d} context-op={?}\n",
+        .{scenario,@errorName(err),@tagName(target.phase),@tagName(target.native_graphics.phase),target.native_graphics.failed_phase,target.failure,
+        run.context_active,run.fifo_active,run.native_active,stages,
+        if (run.context_active) |index| if (run.contexts[index].owner) |owner| owner.operation else null else null});
+    while (target.phase == .ready and target.native_graphics.phase != .ready and target.native_graphics.phase != .unavailable and steps < 900) : (steps += 1) {
+        _ = target.step();
+        if (target.phase != .ready) break;
+        if (run.fifo_active != null) { try replyDeviceFifo(target, &counts, scenario); continue; }
+        const rpc = run.activeChannel().?;
+        if (rpc.phase == .waiting) { try replyNativeProduct(target); continue; }
+        if (run.graphics_work) |*work| if (work.submitted and work.receipt == null) {
+            if (native.is("context_graphics_timeout")) { clock = work.deadline; continue; }
+            try modelGraphicsStep(target, &stages);
+        };
+    }
+    try t.expect(steps < 900);
+    if (native.is("context_graphics_promote_changed")) {
+        const owner = run.fifos[run.fifo_active.?].owner.?;
+        try t.expect(target.phase == .recovering and owner.namespace_live and owner.live and !owner.engine_live and
+            owner.failure.? == error.Payload and native.charged != 0 and fifo_model.released == 0);
+        return;
+    }
+    if (native.is("context_graphics_timeout")) {
+        const owner = run.fifos[run.graphics_work.?.channel_handle.slot].owner.?;
+        try t.expect(target.phase == .recovering and target.failure.? == error.Deadline and run.graphics_work.?.submitted and
+            run.graphics_work.?.receipt == null and owner.namespace_live and owner.live and owner.engine_live and owner.ring.completed == 0 and
+            fifo_model.slots[0].active and fifo_model.slots[0].cpu and native.charged != 0);
+        return;
+    }
+    try t.expect(target.phase == .ready and run.failure == null and run.graphics_work == null);
+    if (native.is("context_graphics")) {
+        const receipt = target.native_graphics.receipt.?;
+        const handle = target.native_graphics.channel.?;
+        const owner = run.fifos[handle.slot].owner.?;
+        const info = owner.info().?;
+        try t.expect(target.native_graphics.phase == .ready and stages == 3 and receipt.point == 1 and
+            std.meta.eql(receipt.channel, handle) and info.config.object_class == 0xc797 and info.config.rm_engine == 1 and
+            info.engine_caps == 0x81234567 and info.config.system_userd and owner.ring.idle());
+        const golden_context = run.contexts[target.native_graphics.golden_context.?.slot].owner.?;
+        const regular_context = run.contexts[target.native_graphics.context.?.slot].owner.?;
+        try t.expect(golden_context.golden_complete and golden_context.held() and regular_context.graphics_shared == golden_context and
+            info.config.graphics.?.count == 8 and !info.config.graphics.?.golden and counts.allocations == 2 and counts.enables == 2 and counts.frees == 1);
+        try t.expectError(error.Retained, run.retireExecutionContext(target.native_graphics.golden_context.?, clock + std.time.ns_per_s));
+        // Exercise exact private operands before the second doorbell, then
+        // use the same production Port submission and Runtime receipt path.
+        const deadline = clock + std.time.ns_per_s;
+        try run.beginGraphicsBarrier(handle, deadline);
+        const ticket = try owner.prepareGraphics(.barrier);
+        run.graphics_work.?.ticket = ticket;
+        const port_owner = target.port.owner.?;
+        try port_owner.admit_graphics.?(port_owner.context, &target.port, owner, ticket, deadline);
+        fifo_model.slots[0].data[4096 + 9 * 4] ^= 1;
+        try t.expectError(error.Binding, port_owner.admit_graphics.?(port_owner.context, &target.port, owner, ticket, deadline));
+        fifo_model.slots[0].data[4096 + 9 * 4] ^= 1;
+        try t.expectError(error.State, port_owner.admit_copy.?(port_owner.context, &target.port, owner, ticket, deadline));
+        var stale = ticket; stale.epoch += 1;
+        try t.expectError(error.Binding, port_owner.admit_graphics.?(port_owner.context, &target.port, owner, stale, deadline));
+        try t.expectError(error.Busy, run.retireExecutionChannel(handle, deadline, true));
+        try target.port.submitGraphics(owner, ticket, deadline);
+        run.graphics_work.?.submitted = true;
+        stages = 0;
+        for (0..3) |_| { try modelGraphicsStep(target, &stages); _ = target.step(); }
+        const second = (try run.receiveGraphics(handle)).?;
+        try t.expect(second.point == 2 and run.graphics_work == null and owner.ring.idle());
+    } else {
+        try t.expect(target.native_graphics.phase == .unavailable and target.native_graphics.context == null and
+            target.native_graphics.channel == null and target.native_graphics.storage == null and target.native_graphics.receipt == null);
+        try t.expect(counts.allocations == if (native.is("context_graphics_missing")) @as(usize, 0) else 1);
+        try t.expect(counts.enables == if (native.is("context_graphics_reject")) @as(usize, 1) else 0);
+        try t.expect(counts.enables == counts.disables and counts.allocations == counts.frees);
+        for (&run.fifos) |*slot| try t.expect(slot.owner == null);
+    }
+    const deadline = clock + 5 * std.time.ns_per_s;
+    // Rejected setup may still be collecting released BO tickets. Let the
+    // existing worker finish that RPC before admitting graph destruction.
+    for (0..100) |_| {
+        if (run.native_active == null) break;
+        _ = target.step();
+        if (run.activeChannel()) |rpc| if (rpc.phase == .waiting) try replyNativeProduct(target);
+    }
+    try run.beginDestroyGraph(deadline, true);
+    try t.expect(run.graph_closing);
+    steps = 0;
+    while (target.phase == .ready and steps < 500) : (steps += 1) {
+        _ = target.step();
+        if (target.phase != .ready) break;
+        if (run.fifo_active != null) { try replyDeviceFifo(target, &counts, scenario); continue; }
+        const rpc = run.activeChannel().?;
+        if (rpc.phase != .waiting) continue;
+        var response: [4096]u8 = @splat(0); @memcpy(response[0..rpc.request.len], rpc.request);
+        const session = &target.session.?;
+        std.mem.writeInt(u32, backing.?[init.queues_offset + init.status_offset + 64..][0..4], session.tx_write, .little);
+        try nativeReply(session, rpc.function, 0, response[0..rpc.request.len]);
+    }
+    try t.expect(steps < 500 and target.phase == .recovering and target.failure.? == error.RmClosed and native.charged == 0 and fifo_model.released == if (native.is("context_graphics")) @as(usize, 2) else 1);
+    for (&run.fifos) |*slot| try t.expect(slot.owner == null);
+    for (&run.contexts) |*slot| try t.expect(slot.owner == null);
+}
+
+// Three distinct modeled observations: command fetch/GET, engine drain,
+// then the CPU-visible semaphore store. Neither earlier stage completes work.
+fn modelGraphicsStep(target: *@import("gsp_device.zig").Device, stage: *u32) !void {
+    const fifo_model = @import("gsp_fifo_test_model.zig").Model;
+    const work = &target.running.graphics_work.?;
+    const owner = target.running.fifos[work.channel_handle.slot].owner.?;
+    const bytes = &fifo_model.slots[0].data;
+    const ticket = work.ticket.?;
+    const load = @import("gsp_fifo_wire.zig").word;
+    try t.expect(work.submitted and work.receipt == null and owner.ring.issued == ticket.point and owner.ring.completed == ticket.point - 1);
+    try t.expect(load(bytes, 0x208c) == ticket.put);
+    const gp_index: usize = (ticket.put + 511) % 512;
+    try t.expect(load(bytes, gp_index * 8) == 0x50001000 and load(bytes, gp_index * 8 + 4) == 11 << 10);
+    const mmio: [*]volatile u32 = @ptrFromInt(target.port.window.cpu_address);
+    try t.expect(mmio[@import("gsp_copy_wire.zig").notify / 4] == ticket.token);
+    var expected = @embedFile("fixtures/graphics-570.144.bin")[16..60].*;
+    std.mem.writeInt(u32, expected[36..40], ticket.point, .little);
+    try t.expectEqualSlices(u8, &expected, bytes[4096..][0..44]);
+    try t.expect((try target.running.receiveGraphics(work.channel_handle)) == null);
+    if (stage.* == 0) {
+        std.mem.writeInt(u32, bytes[0x2088..][0..4], ticket.put, .little);
+        try t.expect(load(bytes, 0x2200) == ticket.point - 1);
+    } else if (stage.* == 1) {
+        // WAIT_FOR_IDLE and FLUSH_PENDING_WRITES have completed in GR.
+        try t.expect(load(bytes, 0x2200) == ticket.point - 1);
+    } else if (stage.* == 2) {
+        // Decode the one-word release address/payload from fetched commands.
+        const semaphore_address = (@as(u64, load(bytes, 4096 + 7 * 4)) << 32) | load(bytes, 4096 + 8 * 4);
+        try t.expect(semaphore_address == 0x50002200 and load(bytes, 4096 + 10 * 4) == 0x1000f010);
+        std.mem.writeInt(u32, bytes[@intCast(semaphore_address - 0x50000000)..][0..4], load(bytes, 4096 + 9 * 4), .little);
+    } else return error.Unexpected;
+    stage.* += 1;
+}
+
 fn checkDeviceContexts(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, scenario: []const u8) !void {
+    if (std.mem.startsWith(u8, scenario, "context_graphics")) return checkDeviceGraphics(target, table, scenario);
     if (std.mem.startsWith(u8, scenario, "context_native_")) return checkNativeProduct(target, table, scenario);
     const model = @import("gsp_vram_test_model.zig").Model;
     const runtime = @import("gsp_runtime.zig");
@@ -5251,7 +5415,7 @@ fn checkDeviceContexts(target: *@import("gsp_device.zig").Device, table: *a.Driv
             const channel = running.activeChannel().?;
             if (channel.phase != .waiting) continue;
             const op = owner.operation.?;
-            const vector_index: usize = switch (op) { .classes => 0, .engines => if (owner.base == 0) 1 else 2, .method_size => 3, .group => 4, .share => 5, .free_share => 6, .free_group => 7 };
+            const vector_index: usize = switch (op) { .classes => 0, .engines => if (owner.base == 0) 1 else 2, .method_size => 3, .group => 4, .share => 5, .free_share => 6, .free_group => 7, .graphics_info => unreachable };
             const cursor = (session.tx_write + 62) % 63;
             const record = try transport.message.decode(session.profile, backing.?[command + 4096 + cursor * 4096..][0..4096], session.tx_sequence - 1);
             try t.expectEqualSlices(u8, channel.request, record.payload);
@@ -6194,7 +6358,7 @@ fn checkDeviceCopies(target: *@import("gsp_device.zig").Device, table: *a.Driver
         return;
     }
     if (fifo_owner.info()) |value| {
-        try t.expect(value.config.copy_class == 0xc7b5 and value.config.system_userd and value.config.userd == fifo_owner.commands.?.backing.pages[2]);
+        try t.expect(value.config.object_class == 0xc7b5 and value.config.system_userd and value.config.userd == fifo_owner.commands.?.backing.pages[2]);
         if (std.mem.startsWith(u8, scenario, "context_upload") or std.mem.startsWith(u8, scenario, "context_display")) { try checkDeviceDisplayUpload(target, table, handle, deadline, scenario); return; }
         const data_handle = try allocateContextBuffer(target, 8191, deadline, false);
         const data_info = (try running.nativeBufferStatus(data_handle)).info.?;
@@ -6488,7 +6652,7 @@ fn replyDeviceFifo(target: *@import("gsp_device.zig").Device, counts: *FifoCount
     const original = channel.request; channel.request = record.payload;
     try t.expectError(error.Binding, target.port.owner.?.admit_command.?(target.port.owner.?.context, &target.port, deadline));
     channel.request = original; channel.phase = .waiting;
-    var response: [428]u8 = @splat(0); @memcpy(response[0..channel.request.len], channel.request);
+    var response: [@import("gsp_fifo_wire.zig").max_bytes]u8 = @splat(0); @memcpy(response[0..channel.request.len], channel.request);
     var fifo_operation: ?@import("gsp_fifo_wire.zig").Operation = null;
     if (owner.state == .command_creating or owner.state == .command_destroying) {
         const commands = &owner.commands.?;
@@ -6506,7 +6670,13 @@ fn replyDeviceFifo(target: *@import("gsp_device.zig").Device, counts: *FifoCount
         const op = owner.operation.?;
         fifo_operation = op;
         switch (op) {
-            .classes => { outputWord(&response, 24, if (model.is("context_copy_class")) 0 else 2); outputWord(&response, 28, 0xc6b5); outputWord(&response, 32, 0xc7b5); },
+            .classes => {
+                if (owner.config.engine == .graphics) {
+                    outputWord(&response, 24, 1); outputWord(&response, 28, if (model.is("context_graphics_missing")) 0xc697 else 0xc797);
+                } else {
+                    outputWord(&response, 24, if (model.is("context_copy_class")) 0 else 2); outputWord(&response, 28, 0xc6b5); outputWord(&response, 32, 0xc7b5);
+                }
+            },
             .allocate => {
                 counts.allocations += 1; outputWord(&response, 164, @intCast(37 + counts.allocations));
                 try t.expect(@import("gsp_fifo_wire.zig").word(response[0..], 4) == owner.config.context.group);
@@ -6515,10 +6685,30 @@ fn replyDeviceFifo(target: *@import("gsp_device.zig").Device, counts: *FifoCount
             },
             .bind => try t.expect(owner.live and !owner.bound and !owner.enabled),
             .token => { try t.expect(owner.bound and !owner.enabled); outputWord(&response, 24, 0x13572468); },
-            .allocate_copy => try t.expect(owner.bound and !owner.copy_live and !owner.enabled),
+            .allocate_copy => try t.expect(owner.bound and !owner.engine_live and !owner.enabled),
+            .promote_graphics => {
+                const promotion = owner.config.graphics.?;
+                try t.expect(owner.bound and !owner.graphics_promoted and !owner.engine_live and !owner.enabled and
+                    @import("gsp_fifo_wire.zig").word(channel.request, 8) == 0x2080012b and @import("gsp_fifo_wire.zig").word(channel.request, 64) == promotion.count);
+                const source = if (promotion.golden) owner.parent.? else owner.parent.?.graphics_shared.?;
+                try t.expect(promotion.golden or source.golden_complete);
+                for (promotion.entries[0..promotion.count]) |entry| {
+                    if (!promotion.golden and entry.id >= 3) try t.expect(!entry.initialize and !entry.nonmapped and entry.physical == 0);
+                    if (entry.id == 0 or entry.id == 2) try t.expect(entry.initialize and entry.physical != 0 and entry.address != 0);
+                }
+                if (model.is("context_graphics_promote_reject")) outputWord(&response, 12, 0x57);
+                if (model.is("context_graphics_promote_changed")) response[102] ^= 1;
+            },
+            .allocate_graphics => {
+                try t.expect(owner.bound and owner.graphics_promoted and !owner.engine_live and owner.enabled == owner.config.graphics.?.golden and owner.config.rm_engine == 1);
+                const gr_reference = @embedFile("fixtures/graphics-570.144.bin");
+                try t.expectEqualSlices(u8, gr_reference[0..16], channel.request[32..48]);
+                outputWord(&response, 44, 0x81234567);
+                if (model.is("context_graphics_reject")) outputWord(&response, 16, 0x57);
+            },
             .enable => { counts.enables += 1; try t.expect(owner.work_submit_token != null and !owner.enabled); },
             .disable => { counts.disables += 1; try t.expect(owner.enabled); },
-            .free_copy => try t.expect(owner.copy_live and !owner.enabled and owner.ring.idle()),
+            .free_copy => try t.expect(owner.engine_live and !owner.enabled and owner.ring.idle()),
             .free => { counts.frees += 1; try t.expect(owner.live and !owner.enabled); },
         }
         if ((op == .allocate and model.is("context_fifo_allocate")) or (op == .bind and model.is("context_fifo_bind")) or

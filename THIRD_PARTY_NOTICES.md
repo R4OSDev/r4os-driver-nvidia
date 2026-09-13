@@ -1,5 +1,14 @@
 ﻿# Third-Party Notices
 
+Graphics Engine (0.79.19 partial, NVIDIA 0.1.106): C797 methods, GR allocation,
+static context tables and PROMOTE_CTX follow NVIDIA 570.144 MIT SDK/RM sources.
+Context selection, golden initialization and shared/global buffer policy are
+adapted from Nouveau r535/gr.c (Copyright2023 Red Hat Inc., MIT). Full original
+notices remain beside derived code and in the packaged GSP runtime license.
+Original sources, C header fixtures and evidence are archived under
+Nvidia/0.79.19/graphics-engine-20260913. R4OS ownership, bounded orchestration
+and driver admission code retain the project's Apache-2.0 license.
+
 Copy layouts (0.79.18): C6B5/C7B5 methods use the already licensed NVIDIA570.144
 headers. The test-only TuringColor2D sector model follows Mesa26.2.2 nil/tiling.rs
 and nil/copy.rs (Copyright2024 Valve Corp. and Collabora, Ltd., MIT); its full

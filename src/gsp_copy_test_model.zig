@@ -408,7 +408,7 @@ pub const Model = struct {
         for (decoded[0..decoded_count], 0..) |*v, i| v.* = word(&command_view, offset + i * 4);
         blocks = .{ null, null };
         if (decoded_count != 17) {
-            try t.expect(decoded[0] == 0x20010000 and decoded[1] == owner.config.copy_class and decoded[2] == 0x20080100);
+            try t.expect(decoded[0] == 0x20010000 and decoded[1] == owner.config.object_class and decoded[2] == 0x20080100);
             var at: usize = 11;
             while (at + 9 < decoded_count and decoded[at] != 0x200100c0) : (at += 9) {
                 const i: usize = switch (decoded[at]) { 0x200501ca => 0, 0x200501c3 => 1, else => return error.BlockMethods };
@@ -419,7 +419,7 @@ pub const Model = struct {
                 try t.expect(block.log2_gobs <= 5 and block.width % 64 == 0 and block.x + decoded[9] <= block.width and block.y + decoded[10] <= block.height);
                 blocks[i] = block;
             }
-            const launch: u32 = 0x202 | @as(u32, if (owner.config.copy_class == 0xc7b5) 1 << 26 else 0) |
+            const launch: u32 = 0x202 | @as(u32, if (owner.config.object_class == 0xc7b5) 1 << 26 else 0) |
                 @as(u32, if (blocks[0] == null) 128 else 0) | @as(u32, if (blocks[1] == null) 256 else 0);
             try t.expect(at + 8 == decoded_count and decoded[at] == 0x200100c0 and decoded[at + 1] == launch and decoded[at + 2] == 0x20030090 and
                 decoded[at + 6] == 0x200100c0 and decoded[at + 7] == 12 and
@@ -427,7 +427,7 @@ pub const Model = struct {
         } else {
         const headers = [_]u32{0x20010000,0x20040100,0x20010106,0x200100c0,0x20030090,0x200100c0};
         for ([_]usize{0,2,7,9,11,15}, headers) |at, expected| try t.expect(decoded[at] == expected);
-        try t.expect(decoded[1] == owner.config.copy_class and decoded[10] == 0x04000182 and decoded[16] == 0xc);
+        try t.expect(decoded[1] == owner.config.object_class and decoded[10] == 0x04000182 and decoded[16] == 0xc);
         try t.expect(operand(decoded[12], decoded[13]) == owner.config.address + 8704 and decoded[14] == owner.ring.issued);
         }
         // GPGet means fetch only. It cannot authorize completion or reuse.

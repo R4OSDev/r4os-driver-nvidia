@@ -738,6 +738,10 @@ fn checkBoot(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Sna
             return false;
         };
         if (starting_native) native_device.native_output.frame_count = native_frame_count;
+        if (starting_native) native_device.native_graphics.request() catch |err| {
+            log("NVIDIA graphics-engine: rejected phase=owner reason={s}", .{@errorName(err)});
+            return false;
+        };
         if (starting_native) if (native_hda) |sibling| native_device.native_output.audio.attach(&native_device.catalog, sibling);
         native_work.start(ctx, &native_device) catch |err| {
             log("NVIDIA gsp-start: rejected phase=worker reason={s} firmware-execution=disabled", .{@errorName(err)});

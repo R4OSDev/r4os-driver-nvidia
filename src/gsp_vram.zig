@@ -187,7 +187,8 @@ pub const Owner = struct {
                 return null;
             };
             const encoded = try wire.encodeLayout(self.binding, self.bytes, .{ .blocklinear = self.layout.blocklinear(), .scanout = self.layout.scanout(),
-                .contiguous = self.storage_policy != null }, op, self.address, &self.request);
+                .contiguous = self.storage_policy != null, .granule = self.layout.descriptor.alignment,
+                .privileged = self.layout.privileged, .readonly = self.layout.readonly }, op, self.address, &self.request);
             try self.exchange.begin(encoded.function, encoded.bytes, self.deadline);
             self.operation = op; self.request_bytes = encoded.bytes.len;
         }

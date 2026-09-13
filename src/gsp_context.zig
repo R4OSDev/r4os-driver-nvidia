@@ -308,7 +308,7 @@ const vram = @import("gsp_vram.zig");
 pub const wire = @import("gsp_context_wire.zig");
 pub const Error = wire.Error || names.Error || vram.Error || error{Retained, Busy};
 pub const State = enum { creating, unwinding, ready, handed_off, destroying, closed, finished, failed };
-pub const Unavailable = enum { classes, engine };
+pub const Unavailable = enum { classes, engine, context_buffers };
 pub const Info = struct { binding: wire.Binding, rm_engine: u32, nv_engine: u32, engine: wire.Engine, method_bytes: u32, subcontext: u32 };
 pub const Child = struct { epoch: u64, group: u32, serial: u64 };
 pub const Owner = struct {
@@ -330,6 +330,12 @@ pub const Owner = struct {
     child_serial: u64 = 0,
     children: [64]u64 = @splat(0),
     methods: [2]vram.storage.Use = @splat(.{}),
+    graphics_plan: ?wire.graphics.Plan = null,
+    graphics_buffers: [wire.graphics.max_buffers]vram.storage.Use = @splat(.{}),
+    graphics_golden: bool = true,
+    golden_complete: bool = false,
+    graphics_shared: ?*Owner = null,
+    graphics_shared_child: ?Child = null,
     request: [wire.max_bytes]u8 = undefined,
     operation: ?wire.Operation = null,
     rejected: ?u32 = null,
@@ -369,6 +375,7 @@ pub const Owner = struct {
     }
     pub fn retainChild(self: *Owner) Error!Child {
         if (self.info() == null or self.state != .handed_off) return error.State;
+        if (self.rm_engine == 1 and self.held()) return error.Busy;
         for (&self.children) |*slot| if (slot.* == 0) {
             self.child_serial = std.math.add(u64, self.child_serial, 1) catch return error.Exhausted;
             slot.* = self.child_serial;
@@ -395,6 +402,53 @@ pub const Owner = struct {
         if (self.info() == null or runqueue >= self.methods.len) return null;
         return self.methods[runqueue].info();
     }
+    pub fn graphicsRequirement(self: *const Owner, index: usize) Error!?wire.graphics.Requirement {
+        if (self.info() == null or self.rm_engine != 1) return error.State;
+        const plan = self.graphics_plan orelse return error.State;
+        if (index >= plan.count) return null;
+        return plan.buffers[index];
+    }
+    pub fn attachGraphics(self: *Owner, index: usize, source: *vram.Owner) Error!void {
+        const requirement = (try self.graphicsRequirement(index)) orelse return error.Bounds;
+        if (self.held() or (!self.graphics_golden and requirement.global)) return error.Busy;
+        const source_info = source.info() orelse return error.State;
+        const space = source.binding.space;
+        if (space.epoch != self.binding.epoch or space.client != self.binding.client or space.device != self.binding.device or space.handle != self.binding.vaspace) return error.Stale;
+        if (source_info.logical_bytes != requirement.bytes or source_info.surface.descriptor.alignment != requirement.alignment or
+            !source_info.surface.privileged or source_info.surface.readonly != requirement.readonly or source_info.physical == null or
+            source_info.address % requirement.alignment != 0 or source_info.physical.?.base % requirement.alignment != 0) return error.Descriptor;
+        try source.retainStorage(&self.graphics_buffers[index]);
+    }
+    pub fn shareGraphicsGlobals(self: *Owner, source: *Owner) Error!void {
+        if (self.info() == null or source.info() == null or self.held() or !source.golden_complete or self.graphics_golden or
+            self.exchange.session != source.exchange.session or !std.meta.eql(self.graphics_plan, source.graphics_plan) or
+            self.binding.vaspace != source.binding.vaspace or self.graphics_shared != null) return error.State;
+        const plan = self.graphics_plan orelse return error.State;
+        for (plan.buffers[0..plan.count], 0..) |requirement, index| {
+            if (!requirement.global or requirement.id == 11) continue;
+            _ = source.graphics_buffers[index].info() orelse return error.State;
+        }
+        self.graphics_shared_child = try source.retainChild();
+        self.graphics_shared = source;
+    }
+    pub fn graphicsPromotion(self: *const Owner) Error!wire.graphics.Promotion {
+        if (self.info() == null or self.rm_engine != 1) return error.State;
+        const plan = self.graphics_plan orelse return error.State;
+        var result: wire.graphics.Promotion = .{ .golden = self.graphics_golden };
+        for (plan.buffers[0..plan.count], 0..) |requirement, index| {
+            if (!self.graphics_golden and requirement.id == 11) continue;
+            const owner = if (!self.graphics_golden and requirement.global) self.graphics_shared orelse return error.State else self;
+            const source = owner.graphics_buffers[index].info() orelse return error.State;
+            const initialize = requirement.initialize and (self.graphics_golden or !requirement.global);
+            const nonmapped = initialize and requirement.id == 10;
+            result.entries[result.count] = .{ .id = requirement.id, .initialize = initialize, .nonmapped = nonmapped,
+                .address = if (nonmapped) 0 else source.address, .physical = if (initialize) source.physical.base else 0,
+                .bytes = if (initialize) requirement.bytes else 0 };
+            result.count += 1;
+        }
+        try result.validate();
+        return result;
+    }
     pub fn releaseChild(self: *Owner, child: Child, quiesced: bool) Error!void {
         try self.stable();
         if (self.state != .handed_off or child.epoch != self.binding.epoch or child.group != self.binding.group or child.serial == 0) return error.Stale;
@@ -418,6 +472,7 @@ pub const Owner = struct {
                 if (!self.classes) break :blk .classes;
                 if (!self.engines) break :blk .engines;
                 if (self.method_bytes == 0) break :blk .method_size;
+                if (self.rm_engine == 1 and self.graphics_plan == null) break :blk .graphics_info;
                 if (!self.group_live) break :blk .group;
                 if (!self.share_live) break :blk .share;
                 self.state = .ready; return null;
@@ -425,6 +480,11 @@ pub const Owner = struct {
                 // GSP installs the fault-method descriptor in the group.
                 // It outlives individual channel objects and context shares.
                 for (&self.methods) |*storage| if (!storage.close(true)) return error.Retained;
+                for (&self.graphics_buffers) |*storage| if (!storage.close(true)) return error.Retained;
+                if (self.graphics_shared) |owner| {
+                    try owner.releaseChild(self.graphics_shared_child orelse return error.State, true);
+                    self.graphics_shared = null; self.graphics_shared_child = null;
+                }
                 if (self.namespace_live) { try self.exchange.session.rm_names.retireChildren(self.reservation); self.namespace_live = false; }
                 self.state = if (self.state == .unwinding) .ready else .closed; return null;
             };
@@ -435,6 +495,10 @@ pub const Owner = struct {
         if (!dispatch.response) return dispatch;
         const op = self.operation.?;
         const reply = try wire.decode(self.binding, self.rm_engine, self.base, op, self.request[0..wire.length(op)], dispatch.record);
+        const graphics_plan = if (op == .graphics_info and reply == .ok) wire.graphics.Plan.decode(reply.ok) catch |err| blk: {
+            if (err != error.Unsupported) return err;
+            break :blk null;
+        } else null;
         // Validate the selected engine before ACK, publish its copy after ACK.
         var candidate = self.selected;
         if (op == .engines and reply == .ok) for (0..wire.word(reply.ok, 4)) |index| {
@@ -468,6 +532,10 @@ pub const Owner = struct {
                 }
             },
             .method_size => self.method_bytes = value,
+            .graphics_info => {
+                if (graphics_plan == null) { self.unavailable = .context_buffers; self.state = .unwinding; }
+                else self.graphics_plan = graphics_plan;
+            },
             .group => self.group_live = true,
             .share => { self.share_live = true; self.subcontext = value; },
             .free_share => self.share_live = false,

@@ -14,7 +14,7 @@ pub fn check() !void {
     var config: fifo.Config = .{ .context = .{ .epoch = 7, .client = 0xc1d00000, .device = 0x10000000, .subdevice = 0x10000001,
         .vaspace = 0x10000006, .group = 0x10000009, .share = 0x1000000a }, .handle = 0x1000000d, .rm_engine = 19, .runqueue = 0,
         .address = 0x600000, .instance = 0x10000000, .userd = 0x8000004000, .methods = 0x30000000, .method_bytes = 0x6000,
-        .system_userd = true, .copy_handle = 0x1000000e, .copy_class = 0xc7b5 };
+        .system_userd = true, .engine = .copy, .object_handle = 0x1000000e, .object_class = 0xc7b5 };
     try t.expect(golden.len == 1196);
     for ([_]u32{8,512,0x8c,0x88,0x90}, 0..) |value, i| try t.expect(fifo.word(golden, i * 4) == value);
     var request: [fifo.max_bytes]u8 = undefined;
@@ -23,7 +23,7 @@ pub fn check() !void {
     try t.expectEqualSlices(u8, golden[offset..][0..400], sys); offset += 400;
     try t.expect((try fifo.decode(config, .allocate, sys, record(103, golden[offset..][0..400]))).ok == 37); offset += 400;
     for ([_]u32{0xc6b5,0xc7b5}, 0..) |class, i| {
-        config.copy_class = class;
+        config.object_class = class;
         const allocation = try fifo.encode(config, .allocate_copy, &request);
         try t.expectEqualSlices(u8, golden[offset..][0..40], allocation); offset += 40;
         try t.expect((try fifo.decode(config, .allocate_copy, allocation, record(103, golden[offset..][0..40]))) == .ok);
