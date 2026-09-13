@@ -32,6 +32,14 @@ const Use = struct {
     gpu: a.GfxDeviceLease = .{},
     gpu_stamp: a.GfxDeviceLease = .{},
     ready: bool = false,
+    fn borrowQueued(self: *Use, resource: Resource) !void {
+        const ref = resource.info.reference;
+        if (ref.version != 1 or ref.size < @sizeOf(a.GfxBufferReference) or ref.flags != a.gfx_buffer_reference_mapping_only or
+            ref.reserved0 != 0 or !valid(ref.reference) or !valid(ref.buffer)) return error.Descriptor;
+        // The canonical job owns execution. Its separate mapping-only
+        // reference is held by the queue-render owner through upload and GR.
+        self.reference = ref; self.reference_stamp = ref; self.ready = true;
+    }
     fn open(self: *Use, memory: r4os.driver_memory.Context, resource: Resource, write: bool) !void {
         const info = resource.info;
         const imported = memory.bufferImport(&info.reference.reference, &self.reference);
@@ -57,6 +65,11 @@ const Use = struct {
     fn stable(self: *const Use) bool { return std.meta.eql(self.reference,self.reference_stamp) and std.meta.eql(self.gpu,self.gpu_stamp); }
     fn close(self: *Use, memory: r4os.driver_memory.Context) bool {
         if (!self.stable()) return false;
+        if (self.reference.flags == a.gfx_buffer_reference_mapping_only) {
+            if (self.gpu.lease.id != 0) return false;
+            self.* = .{};
+            return true;
+        }
         if (self.gpu.lease.id != 0) {
             if (memory.deviceRelease(&self.gpu,1) != a.gfx_buffer_result_ok) return false;
             self.gpu = .{}; self.gpu_stamp = .{};
@@ -78,23 +91,34 @@ pub const Owner = struct {
     failed: bool = false,
     failure: ?anyerror = null,
     pub fn open(self: *Owner, memory: r4os.driver_memory.Context, programs: *cache.Owner, target: Resource, source: ?Resource) !void {
+        return self.openResources(memory, programs, target, source, false);
+    }
+    pub fn openQueued(self: *Owner, memory: r4os.driver_memory.Context, programs: *cache.Owner, target: Resource, source: ?Resource) !void {
+        return self.openResources(memory, programs, target, source, true);
+    }
+    fn openResources(self: *Owner, memory: r4os.driver_memory.Context, programs: *cache.Owner, target: Resource, source: ?Resource, queued: bool) !void {
         if (self.self_address != 0) return error.Busy;
         const binding = try programs.binding();
         if (!std.meta.eql(binding.draw.target, try image(target,true)) or (binding.draw.source != null) != (source != null) or
             target.info.epoch != programs.epoch or target.driver_owner != programs.programs.info().?.driver_owner) return error.Descriptor;
         if (source) |value| if (!std.meta.eql(binding.draw.source.?,try image(value,false)) or value.info.epoch != programs.epoch or value.driver_owner != target.driver_owner) return error.Descriptor;
         self.* = .{ .self_address = @intFromPtr(self), .memory = memory };
-        self.acquire(programs,target,source) catch |err| {
+        self.acquire(programs,target,source,queued) catch |err| {
             self.failure = err;
             if (err == error.Descriptor or !self.close(true)) { self.failed = true; return error.Retained; }
             return err;
         };
     }
-    fn acquire(self: *Owner, programs: *cache.Owner, target: Resource, source: ?Resource) !void {
+    fn acquire(self: *Owner, programs: *cache.Owner, target: Resource, source: ?Resource, queued: bool) !void {
         self.command = try programs.acquire();
         self.cache_owner = programs;
-        try self.target.open(self.memory.?,target,true);
-        if (source) |value| try self.source.open(self.memory.?,value,false);
+        if (queued) {
+            try self.target.borrowQueued(target);
+            if (source) |value| try self.source.borrowQueued(value);
+        } else {
+            try self.target.open(self.memory.?,target,true);
+            if (source) |value| try self.source.open(self.memory.?,value,false);
+        }
     }
     pub fn valid(self: *const Owner) bool {
         if (self.self_address != @intFromPtr(self) or self.failed or self.cache_owner == null or self.command == null or

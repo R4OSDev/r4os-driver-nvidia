@@ -61,6 +61,8 @@ pub const Model = struct {
     var decoded_count: u32 = 0;
     var present_mode = false;
     var product_mode = false;
+    var render_mode = false;
+    pub var render_operations: u64 = 13;
     pub var shadow_cpu = false;
     pub var shadow_creates: usize = 0;
     var shadow_descriptor: a.GfxBufferDescriptor = .{};
@@ -74,7 +76,7 @@ pub const Model = struct {
         table.gfx_memory_query = memory; table.gfx_queue_query = queue;
         references = @splat(.{}); dma = @splat(.{}); gpu = @splat(.{}); queued = false; active = false;
         completed = 0; result = 0; lost = false; unregisters = 0; reject_resource = false; native_index = index; fetched = false; executed = false; signaled = false;
-        present_mode = false; product_mode = false; shadow_cpu = false; shadow_creates = 0;
+        present_mode = false; product_mode = false; render_mode = false; render_operations = 13; shadow_cpu = false; shadow_creates = 0;
         shadow_live = false; registration = null; decoded_count = 0; presentation_wakes = 0;
         initial_read = .{}; reject_initial_read = false; reject_initial_release = false;
         replacement_native = null; replacement_descriptor = null; replacement_lent = false; borrowed_releases = 0; initial_index = 0;
@@ -97,6 +99,20 @@ pub const Model = struct {
         app_reference = false;
         present_mode = true; product_mode = true;
     }
+    pub fn installRender(table: *a.DriverApi, index: usize) void {
+        install(table, index); render_mode = true;
+        closeApp();
+    }
+    pub fn enqueueRender(target: usize, source: ?usize, command: a.GfxRenderCommand, deadline: u64) void {
+        enqueue(false);
+        job.operation = a.gfx_queue_operation_render; job.deadline_ns = deadline;
+        job.source_buffer = if (source) |i| native.slots[i].reservation.buffer else .{};
+        job.target_buffer = native.slots[target].reservation.buffer;
+        job.source_offset = 0; job.target_offset = 0; job.byte_length = 0;
+        job.render = command;
+    }
+    pub fn observeRenderExecution() void { std.debug.assert(render_mode and active); executed = true; }
+    pub fn observeRenderSemaphore() void { std.debug.assert(render_mode and active and executed); signaled = true; }
     pub fn shadowReference() a.GfxBufferHandle { return .{ .id = 1499, .generation = 951 }; }
     fn replacementReference() a.GfxBufferHandle { return .{ .id = 1497, .generation = 951 }; }
     pub fn lendReplacement(index: usize, width: u32, height: u32) a.GfxBufferReference {
@@ -172,9 +188,14 @@ pub const Model = struct {
         job.source_offset = source_offset; job.target_offset = target_offset; job.byte_length = bytes;
         job.row_count = rows; job.source_pitch = source_pitch; job.target_pitch = target_pitch;
     }
-    fn queue(out: *a.GfxDriverQueueApi) callconv(.c) i32 { out.* = .{ .size = if (product_mode) @sizeOf(a.GfxDriverQueueApi) else 64,
+    fn queue(out: *a.GfxDriverQueueApi) callconv(.c) i32 { out.* = .{ .size = if (product_mode or render_mode) @sizeOf(a.GfxDriverQueueApi) else 64,
         .register_backend = @intFromPtr(&register), .register_profile = if (product_mode) @intFromPtr(&registerProfile) else 0,
+        .update_operations = if (render_mode) @intFromPtr(&updateOperations) else 0,
         .unregister_backend = @intFromPtr(&unregister), .take = @intFromPtr(&take), .retain_resource = @intFromPtr(&retain), .complete = @intFromPtr(&complete) }; return a.gfx_queue_ok; }
+    fn updateOperations(input: *const a.GfxBackendBinding, operations: u64) callconv(.c) i32 {
+        std.debug.assert(render_mode and std.meta.eql(input.*, binding) and operations == 29);
+        render_operations = operations; return a.gfx_queue_ok;
+    }
     fn registerProfile(input: *const a.GfxBackendRegistration, profile: *const a.GfxBackendProfile, out: *a.GfxBackendBinding) callconv(.c) i32 {
         const nv = @import("r4nv_binding");
         std.debug.assert(product_mode and profile.version == 1 and profile.size == 96 and profile.data_bytes == 32 and

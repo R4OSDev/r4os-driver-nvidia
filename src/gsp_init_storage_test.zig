@@ -5310,7 +5310,7 @@ fn checkDeviceGraphics(target: *@import("gsp_device.zig").Device, table: *a.Driv
         for (0..3) |_| { try modelGraphicsStep(target, &stages); _ = target.step(); }
         const second = (try run.receiveGraphics(handle)).?;
         try t.expect(second.point == 2 and run.graphics_work == null and owner.ring.idle());
-        try checkGraphicsRendering(target,&counts,scenario);
+        try checkGraphicsRendering(target,table,&counts,scenario);
     } else {
         try t.expect(target.native_graphics.phase == .unavailable and target.native_graphics.context == null and
             target.native_graphics.channel == null and target.native_graphics.storage == null and target.native_graphics.receipt == null);
@@ -5357,7 +5357,7 @@ fn driveRenderSetup(target: *@import("gsp_device.zig").Device, counts: *FifoCoun
     }
     return error.SetupTimeout;
 }
-fn checkGraphicsRendering(target: *@import("gsp_device.zig").Device, counts: *FifoCounts, scenario: []const u8) !void {
+fn checkGraphicsRendering(target: *@import("gsp_device.zig").Device, table: *@import("r4os").abi.DriverApi, counts: *FifoCounts, scenario: []const u8) !void {
     const runtime = @import("gsp_runtime.zig");
     const render = @import("r4nv_render");
     const native = @import("gsp_vram_test_model.zig").Model;
@@ -5480,6 +5480,90 @@ fn checkGraphicsRendering(target: *@import("gsp_device.zig").Device, counts: *Fi
     const receipt = (try run.receiveGraphics(gr)).?;
     try t.expect(receipt.point == 3 and !run.graphics_cache.borrowed and !native.slots[target_native_index].imported and
         native.slots[target_native_index].gpu.lease.id == 0 and run.graphics_work == null and gr_owner.ring.idle());
+    try checkQueuedRendering(target,table,counts,scenario,ce);
+}
+fn checkQueuedRendering(target: *@import("gsp_device.zig").Device, table: *@import("r4os").abi.DriverApi, counts: *FifoCounts,
+    scenario: []const u8, ce: @import("gsp_runtime.zig").ChannelHandle) !void {
+    const native = @import("gsp_vram_test_model.zig").Model;
+    const fifo = @import("gsp_fifo_test_model.zig").Model;
+    const model = @import("gsp_copy_test_model.zig").Model;
+    const run = &target.running;
+    errdefer |err| std.debug.print("queued render: {s} phase={?} active={} completed={d} result={d} upload={} submitted={} native={?}\n", .{
+        @errorName(err), if (run.queued_render) |*value| value.phase else null, model.active, model.completed, model.result,
+        run.graphics_upload != null, if (run.graphics_upload) |*value| value.operation.submitted else false, run.native_active });
+    const deadline = clock + 5 * std.time.ns_per_s;
+    const buffer = try run.allocateNativeSurface(.{ .width = 16, .height = 16, .format = .argb8888, .usage = 28 },deadline);
+    try driveRenderSetup(target,counts,scenario);
+    const native_index = (try run.nativeBufferStatus(buffer)).info.?.reference.buffer.id - 801;
+    const old_memory = table.gfx_memory_query; const old_queue = table.gfx_queue_query;
+    defer { table.gfx_memory_query = old_memory; table.gfx_queue_query = old_queue; }
+    model.installRender(table,native_index);
+    try t.expect(!try run.beginCopyWork(ce,model.binding,deadline));
+    try run.enableGraphicsQueue(target.native_graphics.channel.?,ce);
+    try t.expect(model.render_operations == 29 and run.graphics_enabled);
+    model.enqueueRender(native_index,null,.{ .target_rect = .{ .x = -2, .y = 1, .width = 8, .height = 8 },
+        .scissor = .{ .x = 0, .y = 4, .width = 4, .height = 4 }, .color = 0x80402010, .opacity = 255 },deadline);
+    try t.expect(try run.beginCopyWork(ce,model.binding,deadline));
+    try t.expect(model.active and run.copy_job == null and run.queued_render != null);
+    try run.releaseNativeBuffer(buffer);
+    for (0..20) |_| {
+        try stepQueuedRendering(target);
+        if (target.phase != .ready) return error.RenderQueue;
+        if (run.graphics_upload != null and run.graphics_upload.?.operation.submitted) break;
+    }
+    try t.expect(run.graphics_upload != null and run.graphics_upload.?.operation.submitted and !native.slots[native_index].reference);
+    // No additional execution lease is acquired for the queue-owned image.
+    try t.expect(native.slots[native_index].gpu.lease.id == 0 and native.slots[native_index].imported);
+    const upload = &run.graphics_upload.?.operation;
+    const load = @import("gsp_fifo_wire.zig").word;
+    const ce_data = &fifo.slots[1].data;
+    const ce_ticket = upload.ticket.?;
+    const ce_gp = @as(usize,(ce_ticket.put+511)%512)*8;
+    const ce_command = @as(u64,load(ce_data,ce_gp))|(@as(u64,load(ce_data,ce_gp+4)&255)<<32);
+    const ce_offset: usize = @intCast(ce_command-fifo.address(1));
+    try t.expect(load(ce_data,ce_gp+4)>>10 == 17 and load(ce_data,ce_offset+32) == 1024);
+    var packet: [1024]u8 = undefined; @memcpy(&packet,ControlModel.data[0..1024]);
+    const point = load(ce_data,ce_offset+56);
+    try t.expect(point == ce_ticket.point and model.completed == 0);
+    std.mem.writeInt(u32,ce_data[0x2088..][0..4],ce_ticket.put,.little);
+    try stepQueuedRendering(target); try t.expect(run.graphics_upload != null and model.completed == 0);
+    std.mem.writeInt(u32,ce_data[0x2200..][0..4],point,.little);
+    for (0..20) |_| {
+        try stepQueuedRendering(target);
+        if (target.phase != .ready) return error.RenderQueue;
+        if (run.graphics_work != null and run.graphics_work.?.submitted) break;
+    }
+    try t.expect(run.graphics_work != null and run.graphics_work.?.submitted and run.graphics_work.?.queued);
+    const work = &run.graphics_work.?;
+    const gr_data = &fifo.slots[0].data; const ticket = work.ticket.?;
+    const gp = @as(usize,(ticket.put+511)%512)*8;
+    const count: usize = load(gr_data,gp+4)>>10;
+    const command_address = @as(u64,load(gr_data,gp))|(@as(u64,load(gr_data,gp+4)&255)<<32);
+    const offset: usize = @intCast(command_address-fifo.address(0));
+    const body = gr_data[offset..][0..count*4];
+    try t.expect(try renderMethod(body,0xe04) == 4<<16 and try renderMethod(body,0xe08) == 4|(8<<16));
+    const vertex: @import("r4nv_render").Vertex = @bitCast(packet[768..808].*);
+    try t.expectApproxEqAbs(@as(f32,128.0/255.0),vertex.tint[3],0.000001);
+    std.mem.writeInt(u32,gr_data[0x2088..][0..4],ticket.put,.little);
+    try stepQueuedRendering(target); try t.expect(model.completed == 0 and model.active);
+    model.observeRenderExecution();
+    try stepQueuedRendering(target); try t.expect(model.completed == 0 and run.graphics_cache.borrowed);
+    const tail = body[(count-11)*4..];
+    const semaphore = (@as(u64,load(tail,28))<<32)|load(tail,32);
+    try t.expect(semaphore == fifo.address(0)+0x2200 and load(tail,36) == ticket.point);
+    model.observeRenderSemaphore();
+    std.mem.writeInt(u32,gr_data[0x2200..][0..4],load(tail,36),.little);
+    for (0..20) |_| { try stepQueuedRendering(target); if (run.queued_render == null) break; }
+    try t.expect(target.phase == .ready and run.queued_render == null and run.graphics_work == null and
+        model.completed == 1 and model.result == a.gfx_queue_result_complete and !model.active and !native.slots[native_index].imported and
+        run.graphics_completed == 1 and !run.graphics_cache.borrowed);
+}
+fn stepQueuedRendering(target: *@import("gsp_device.zig").Device) !void {
+    _ = target.step();
+    // Ordinary reclamation can retire the preceding private draw's image
+    // while this queue waits for CE. Model those real RM replies as well.
+    if (target.phase == .ready and target.running.native_active != null and target.running.activeChannel().?.phase == .waiting)
+        try replyNativeProduct(target);
 }
 fn renderMethod(bytes: []const u8, method: u32) !u32 {
     const load = @import("gsp_fifo_wire.zig").word;

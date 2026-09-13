@@ -108,6 +108,7 @@ pub const GraphicsReceipt = struct { channel: ChannelHandle, point: u32, complet
 pub const render = @import("r4nv_render");
 pub const render_cache = @import("gsp_render_cache.zig");
 const render_job = @import("gsp_render_job.zig");
+const render_queue = @import("gsp_render_queue.zig");
 pub const GraphicsWork = struct {
     channel_handle: ChannelHandle,
     command: execution_fifo.copy.graphics.Command,
@@ -116,6 +117,7 @@ pub const GraphicsWork = struct {
     submitted: bool = false,
     receipt: ?GraphicsReceipt = null,
     resources: render_job.Owner = .{},
+    queued: bool = false,
 };
 const ChannelSlot = struct { owner: ?*execution_fifo.Owner = null, allocation: r4os.abi.DriverHeapAllocation = .{}, heap: ?r4os.r4dev.DriverHeapContext = null, serial: u64 = 0 };
 const CopyAddress = struct { address: u64, bytes: u64 };
@@ -252,6 +254,12 @@ pub const Owner = struct {
     copy_job: ?CopyJob = null,
     graphics_work: ?GraphicsWork = null,
     graphics_cache: render_cache.Owner = .{},
+    queued_render: ?render_queue.Owner = null,
+    graphics_channel: ?ChannelHandle = null,
+    graphics_copy_channel: ?ChannelHandle = null,
+    graphics_enabled: bool = false,
+    graphics_starting: bool = false,
+    graphics_completed: u64 = 0,
     graphics_upload: ?struct { channel: ChannelHandle, operation: @import("gsp_render_upload.zig").Owner = .{} } = null,
     copy_completed: u64 = 0,
     copy_bytes: u64 = 0,
@@ -1436,7 +1444,8 @@ pub const Owner = struct {
         self.log("NVIDIA gsp-present-image: retired={d} shadow=unmapped,import-released scanout=retained", .{dma});
         return true;
     }
-    fn deviceWorkBusy(self: *const Owner) bool { return self.graphics_upload != null or self.graphics_work != null or self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.display_flip != null or self.initial_image != null or self.mode_control_active or self.cursor_upload != null or self.audio_work != null; }
+    fn engineWorkBusy(self: *const Owner) bool { return self.graphics_upload != null or self.graphics_work != null or self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.display_flip != null or self.initial_image != null or self.mode_control_active or self.cursor_upload != null or self.audio_work != null; }
+    fn deviceWorkBusy(self: *const Owner) bool { return self.engineWorkBusy() or self.queued_render != null; }
     fn copyBusy(self: *const Owner) bool { return self.deviceWorkBusy() or self.frame_ready != null; }
     fn overlapFlip(self: *const Owner) bool {
         const work = self.display_flip orelse return false;
@@ -1444,6 +1453,9 @@ pub const Owner = struct {
             (work.window.phase == .submitted or work.window.phase == .complete);
     }
     fn copyAdmissionBusy(self: *const Owner) bool {
+        return self.executionAdmissionBusy() or self.queued_render != null;
+    }
+    fn executionAdmissionBusy(self: *const Owner) bool {
         return self.cursor_reserving or self.graphics_upload != null or self.graphics_work != null or self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.initial_image != null or self.cursor_upload != null or self.audio_work != null or
             self.mode_control_active or self.frame_ready != null or (self.display_flip != null and !self.overlapFlip());
     }
@@ -1809,9 +1821,12 @@ pub const Owner = struct {
         try self.retainNativeStorage(buffer,storage);
     }
     pub fn beginGraphicsUpload(self: *Owner, handle: ChannelHandle, kind: render_cache.Kind, draw: ?render.Draw, deadline: u64) !void {
+        return self.startGraphicsUpload(handle, kind, draw, deadline, false);
+    }
+    fn startGraphicsUpload(self: *Owner, handle: ChannelHandle, kind: render_cache.Kind, draw: ?render.Draw, deadline: u64, queued: bool) !void {
         const current = try self.now();
         if (deadline <= current or deadline == std.math.maxInt(u64)) return error.Deadline;
-        if (self.copyBusy() or self.cursor_reserving or self.graph_closing) return error.Busy;
+        if (self.engineWorkBusy() or self.frame_ready != null or (!queued and self.queued_render != null) or self.cursor_reserving or self.graph_closing) return error.Busy;
         const fifo = try self.findChannel(handle);
         const info = fifo.info() orelse return error.State;
         if (info.config.engine != .copy or !fifo.ring.idle() or !info.config.system_userd) return error.Unsupported;
@@ -1831,6 +1846,74 @@ pub const Owner = struct {
     pub fn graphicsImage(self: *Owner, handle: BufferHandle, target: bool) !render.image.Image {
         return render_job.image(try self.graphicsResource(handle),target);
     }
+    pub fn enableGraphicsQueue(self: *Owner, handle: ChannelHandle, copy_handle: ChannelHandle) !void {
+        if (self.copyBusy() or self.graph_closing or self.graphics_enabled) return error.Busy;
+        const fifo = try self.findChannel(handle);
+        const info = fifo.info() orelse return error.State;
+        if (info.config.engine != .graphics or info.config.graphics == null or info.config.graphics.?.golden or
+            !self.graphics_cache.valid() or self.graphics_cache.program_point == 0 or self.graphics_cache.packet.info() == null) return error.State;
+        const copy = (try self.findChannel(copy_handle)).info() orelse return error.State;
+        if (copy.config.engine != .copy or copy.config.context.vaspace != info.config.context.vaspace) return error.Binding;
+        const backend = self.copy_backend orelse return error.State;
+        const rc = backend.queue.updateOperations(&backend.binding, 29);
+        if (rc == r4os.abi.err_no_fn) return error.Unsupported;
+        if (rc != r4os.abi.gfx_queue_ok) return error.Queue;
+        self.graphics_channel = handle; self.graphics_copy_channel = copy_handle; self.graphics_enabled = true;
+    }
+    fn queuedRender(self: *Owner, input: *render_queue.Owner) !void {
+        const held = if (self.queued_render) |*value| value else return error.State;
+        if (input != held or !held.valid() or !self.graphics_enabled or self.graphics_channel == null or
+            self.copy_backend == null or !std.meta.eql(held.binding, self.copy_backend.?.binding)) return error.Stale;
+    }
+    fn queuedGraphicsResource(self: *Owner, reference: r4os.abi.GfxBufferReference) !render_job.Resource {
+        const space = self.nativeAddressSpace() orelse return error.State;
+        for (&self.native_buffers) |*slot| if (slot.owner) |owner| if (owner.queuedInfo(reference)) |value| {
+            if (value.epoch != self.epoch or owner.binding.space.handle != space.handle) return error.Stale;
+            return .{ .info = value, .driver_owner = owner.reservation.driver_owner };
+        };
+        return error.Unsupported;
+    }
+    pub fn queuedGraphicsDraw(self: *Owner, input: *render_queue.Owner) !render.Draw {
+        try self.queuedRender(input);
+        const state = input.job.render;
+        if (state.kind > r4os.abi.gfx_render_kind_sample or state.filter > 1 or state.blend > 1 or state.transfer > 2 or state.opacity > 255) return error.Bounds;
+        const sampled = state.kind == r4os.abi.gfx_render_kind_sample;
+        if (!sampled and (input.job.source_buffer.id != 0 or input.job.source_buffer.generation != 0 or
+            !std.meta.eql(state.source_rect, r4os.abi.GfxRenderRect{}) or state.filter != 0)) return error.Bounds;
+        const result: render.Draw = .{ .target = try render_job.image(try self.queuedGraphicsResource(input.references[1]), true),
+            .source = if (sampled) try render_job.image(try self.queuedGraphicsResource(input.references[0]), false) else null,
+            .destination = renderRect(state.target_rect), .source_rect = if (sampled) renderRect(state.source_rect) else .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+            .scissor = renderRect(state.scissor), .filter = if (state.filter == 0) .nearest else .bilinear,
+            .blend = if (state.blend == 0) .replace else .over,
+            .transfer = switch (state.transfer) { 0 => .identity, 1 => .decode_srgb, 2 => .encode_srgb, else => unreachable },
+            .color = state.color, .opacity = @intCast(state.opacity) };
+        try result.validate();
+        return result;
+    }
+    fn renderRect(value: r4os.abi.GfxRenderRect) render.Rect {
+        return .{ .x = value.x, .y = value.y, .width = value.width, .height = value.height };
+    }
+    pub fn beginQueuedGraphicsUpload(self: *Owner, input: *render_queue.Owner) !void {
+        try self.queuedRender(input);
+        if (input.phase != .upload or input.draw == null or !std.meta.eql(input.draw.?, try self.queuedGraphicsDraw(input))) return error.Binding;
+        const channel = self.graphics_copy_channel orelse return error.State;
+        return self.startGraphicsUpload(channel, .packet, input.draw, input.deadline, true);
+    }
+    pub fn beginQueuedGraphicsDraw(self: *Owner, input: *render_queue.Owner) !void {
+        try self.queuedRender(input);
+        if (input.phase != .draw or input.draw == null or !std.meta.eql(input.draw.?, try self.queuedGraphicsDraw(input))) return error.Binding;
+        const memory = self.ctx.?.memory() orelse return error.Api;
+        const target = try self.queuedGraphicsResource(input.references[1]);
+        const source = if (input.draw.?.source != null) try self.queuedGraphicsResource(input.references[0]) else null;
+        try self.startGraphicsBarrier(self.graphics_channel.?, input.deadline, true);
+        const work = &self.graphics_work.?;
+        work.queued = true;
+        work.resources.openQueued(memory, &self.graphics_cache, target, source) catch |err| {
+            if (work.resources.failed) self.stop(err) else self.graphics_work = null;
+            return err;
+        };
+        work.command = .{ .draw = work.resources.command.? };
+    }
     pub fn beginGraphicsDraw(self: *Owner, handle: ChannelHandle, target: BufferHandle, source: ?BufferHandle, deadline: u64) !void {
         const memory = self.ctx.?.memory() orelse return error.Api;
         const dst = try self.graphicsResource(target);
@@ -1845,6 +1928,11 @@ pub const Owner = struct {
     }
     pub fn validateGraphicsWork(self: *Owner) !void {
         const work = if (self.graphics_work) |*value| value else return error.State;
+        if (work.queued) {
+            const queued = if (self.queued_render) |*value| value else return error.State;
+            const binding = switch (work.command) { .draw => |value| value, else => return error.Binding };
+            if (queued.phase != .draw_wait or !std.meta.eql(try self.queuedGraphicsDraw(queued), binding.draw)) return error.Binding;
+        } else if (self.queued_render != null) return error.Binding;
         switch (work.command) {
             .barrier => if (work.resources.self_address != 0) return error.Binding,
             .draw => |binding| if (work.resources.cache_owner != &self.graphics_cache or !work.resources.valid() or
@@ -1854,9 +1942,12 @@ pub const Owner = struct {
     /// Private graphics command, retained through physical completion or
     /// quarantine. USERD publication never counts as an execution receipt.
     pub fn beginGraphicsBarrier(self: *Owner, handle: ChannelHandle, deadline: u64) !void {
+        return self.startGraphicsBarrier(handle, deadline, false);
+    }
+    fn startGraphicsBarrier(self: *Owner, handle: ChannelHandle, deadline: u64, queued: bool) !void {
         const current = try self.now();
         if (deadline <= current or deadline == std.math.maxInt(u64)) return error.Deadline;
-        if (self.copyAdmissionBusy() or self.graph_closing) return error.Busy;
+        if (self.executionAdmissionBusy() or (!queued and self.queued_render != null) or self.graph_closing) return error.Busy;
         const fifo = try self.findChannel(handle);
         const info = fifo.info() orelse return error.State;
         if (info.config.engine != .graphics or info.config.object_class != 0xc797 or info.config.graphics == null or info.config.graphics.?.golden or fifo.state != .handed_off or !fifo.ring.idle()) return error.Unsupported;
@@ -1939,7 +2030,7 @@ pub const Owner = struct {
     pub fn beginCopyWork(self: *Owner, handle: ChannelHandle, binding: r4os.abi.GfxBackendBinding, deadline: u64) !bool {
         const fifo = try self.findChannel(handle);
         const value = fifo.info() orelse return error.State;
-        if (!value.config.system_userd or !fifo.ring.idle() or self.copyAdmissionBusy() or self.graph_closing or self.display_engine_active or self.display_channel_active != null or
+        if (!value.config.system_userd or !fifo.ring.idle() or self.copyAdmissionBusy() or self.graphics_starting or self.graph_closing or self.display_engine_active or self.display_channel_active != null or
             self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or
             self.outputs.active() or self.sequence.self_address != 0 or self.channel.?.phase != .idle or self.channel.?.in_lockdown) return error.Busy;
         if (self.frame_setup != null) return error.Busy;
@@ -1962,6 +2053,11 @@ pub const Owner = struct {
         if (result != a.gfx_queue_ok and result != a.gfx_queue_error_busy and job.fence.timeline == 0) return error.Queue;
         if (self.copy_backend == null) self.copy_backend = .{ .queue = queue, .binding = binding };
         if (result == a.gfx_queue_error_busy and job.fence.timeline == 0) return false;
+        if (result == a.gfx_queue_ok and job.operation == a.gfx_queue_operation_render) {
+            self.queued_render = .{};
+            self.queued_render.?.open(queue, memory, binding, job, try self.now()) catch |err| { self.stop(err); return err; };
+            return true;
+        }
         self.copy_job = .{ .queue = queue, .memory = memory, .channel_handle = handle, .binding = binding,
             .job = job, .job_stamp = job, .deadline = deadline };
         if (result != a.gfx_queue_ok or job.version != 1 or job.size < @offsetOf(a.GfxDriverJob, "row_count") or job.reserved0 != 0 or job.reserved1 != 0 or
@@ -1971,7 +2067,7 @@ pub const Owner = struct {
         }
         // Older kernels return only the original prefix, leaving zeroed tails.
         const rows = job.operation == a.gfx_queue_operation_copy_rows;
-        if (rows and (job.size < @sizeOf(a.GfxDriverJob) or job.row_count == 0 or job.source_pitch < job.byte_length or
+        if (rows and (job.size < @offsetOf(a.GfxDriverJob, "render") or job.row_count == 0 or job.source_pitch < job.byte_length or
             job.target_pitch < job.byte_length or job.source_pitch > std.math.maxInt(u32) or job.target_pitch > std.math.maxInt(u32))) {
             try self.finishCopy(a.gfx_queue_result_failed); return true;
         }
@@ -3103,6 +3199,10 @@ pub const Owner = struct {
         if (try self.advanceCursorPoint(current)) return .progress;
         if (try self.advanceCopy(current)) return .progress;
         if (try self.advanceGraphics(current)) return .progress;
+        if (self.queued_render) |*queued| {
+            if (queued.phase == .done) { self.queued_render = null; return .progress; }
+            if (try queued.step(self, current)) return .progress;
+        }
         if (try self.advancePresentFrame(current)) return .progress;
         // A due receiver batch gets the idle RM channel before another
         // queued frame. A continuously repainting desktop must not starve HPD.
