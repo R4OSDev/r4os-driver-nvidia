@@ -1555,6 +1555,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         context_native_flip_irq_timeout, context_native_flip_notifier_timeout, context_native_flip_release_timeout,
         context_native_frame_timeout,
         context_native_cursor_timeout, context_native_cursor_reject,
+        context_native_cursor_image_timeout, context_native_cursor_upload_timeout, context_native_cursor_imp_fallback, context_native_cursor_common,
         context_native_receipt, context_native_timeout, context_native_link_reject, context_native_stale,
         context_native_mode_missing, context_native_mode_reject, context_native_mode_free_reject,
         context_native_mode_clock, context_native_mode_impossible, context_native_mode_timeout, context_native_mode_stale,
@@ -3055,6 +3056,11 @@ const NativeCommon = struct {
     var mode_completions: usize = 0;
     var statistics: ?a.DisplayPresentationStats = null;
     var statistics_busy = false;
+    var cursor_info: ?a.DisplayCursorInfo = null;
+    var cursor_job: ?a.GfxDriverCursorJob = null;
+    var cursor_taken = false;
+    var cursor_receipt: ?a.GfxDriverCursorCompletion = null;
+    var cursor_reply_busy = false;
     var scenario: []const u8 = "";
     fn is(name: []const u8) bool { return std.mem.eql(u8, scenario, name); }
     fn hasModes() bool { return is("context_native_jobs") or is("context_native_job_timeout"); }
@@ -3074,7 +3080,28 @@ const NativeCommon = struct {
         out.* = .{ .boot_info = @intFromPtr(&DeviceModel.bootInfo), .prepare_held = @intFromPtr(&prepare), .transition = @intFromPtr(&transition),
             .presentation_stats = @intFromPtr(&presentationStats) };
         if (is("context_native_connected")) { out.size = 64; out.presentation_stats = 0; }
+        if (is("context_native_cursor_common")) {
+            out.cursor_configure = @intFromPtr(&configureCursor); out.cursor_take = @intFromPtr(&takeCursor);
+            out.cursor_complete = @intFromPtr(&completeCursor);
+        }
         return a.gfx_output_ok;
+    }
+    fn configureCursor(input: *const a.DisplayCursorInfo) callconv(.c) i32 {
+        std.debug.assert(target.native_output.callback_confirmed and input.flags == 15 and input.max_width == 256 and
+            input.max_height == 256 and input.display_generation == target.native_output.receipt.generation);
+        cursor_info = input.*; return a.gfx_output_ok;
+    }
+    fn takeCursor(input: *const a.GfxBackendBinding, out: *a.GfxDriverCursorJob) callconv(.c) i32 {
+        std.debug.assert(cursor_info != null and std.meta.eql(input.*, target.native_output.backend));
+        if (cursor_job == null or cursor_taken) return 0;
+        cursor_taken = true; out.* = cursor_job.?; return a.gfx_output_ok;
+    }
+    fn completeCursor(input: *const a.GfxDriverCursorCompletion) callconv(.c) i32 {
+        std.debug.assert(cursor_taken and cursor_receipt == null and input.sequence == cursor_job.?.sequence and
+            input.display_generation == cursor_job.?.request.display_generation and input.outcome == a.gfx_output_outcome_applied and
+            target.running.cursor_upload == null and target.running.cursor_point == null and target.running.display_work == null);
+        if (!cursor_reply_busy) { cursor_reply_busy = true; return a.gfx_output_error_busy; }
+        cursor_receipt = input.*; return a.gfx_output_ok;
     }
     fn presentationStats(input: *const a.DisplayPresentationStats) callconv(.c) i32 {
         const product = &target.native_output; const run = &target.running;
@@ -3220,6 +3247,7 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
     const raw: [*]u32 = @ptrFromInt(target.port.window.cpu_address);
     display.install(table, scenario, raw[0..@intCast(target.port.window.byte_length / 4)]);
     copy.installProduct(table, 3);
+    @import("gsp_cursor_test_model.zig").Model.install(table);
     target.irq_wake = .{ .context = @intFromPtr(target), .signal = copy.wakePresentation };
     NativeCommon.target = target; NativeCommon.scenario = scenario;
     NativeCommon.prepares = 0; NativeCommon.commits = 0; NativeCommon.restores = 0; NativeCommon.published = false; NativeCommon.registration = .{};
@@ -3227,6 +3255,8 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
     NativeCommon.published_generation = 0; NativeCommon.modes_enabled = false; NativeCommon.mode_job = null;
     NativeCommon.mode_taken = false; NativeCommon.mode_receipt = null; NativeCommon.mode_completions = 0;
     NativeCommon.statistics = null; NativeCommon.statistics_busy = false;
+    NativeCommon.cursor_info = null; NativeCommon.cursor_job = null; NativeCommon.cursor_taken = false;
+    NativeCommon.cursor_receipt = null; NativeCommon.cursor_reply_busy = false;
     for (&NativeCommon.pixels, 0..) |*byte, i| byte.* = @truncate(i * 17 + 23);
     table.gfx_output_query = NativeCommon.outputs; table.gfx_display_query = NativeCommon.display;
     captured.boot.display = target.ctx.?.graphicsDisplay();
@@ -3385,8 +3415,9 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
         }
         if (NativeCommon.is("context_native_unknown") or NativeCommon.is("context_native_connected") or NativeCommon.cursorCase()) {
             checkpoint = "native PIO cursor";
-            try checkNativeCursor(target);
-            if (NativeCommon.is("context_native_cursor_timeout")) {
+            if (NativeCommon.is("context_native_cursor_common")) try checkCommonCursor(target) else try checkNativeCursor(target);
+            if (NativeCommon.is("context_native_cursor_timeout") or NativeCommon.is("context_native_cursor_image_timeout") or
+                NativeCommon.is("context_native_cursor_upload_timeout")) {
                 try t.expect(target.phase == .recovering and native.released == 0 and display.released == 0 and !NativeCommon.published);
                 _ = target.stop(); return;
             }
@@ -3454,6 +3485,81 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
     _ = target.stop();
     try t.expect(native.released == @as(u32, if (NativeCommon.is("context_native_connected")) 5 else if (NativeCommon.is("context_native_jobs")) 4 else 0) and display.released == 0 and !NativeCommon.published);
 }
+fn checkCommonCursor(target: *@import("gsp_device.zig").Device) !void {
+    const run = &target.running; const product = &target.native_output;
+    const input = @import("gsp_cursor_test_model.zig").Model;
+    const dm = @import("gsp_display_test_model.zig").Model;
+    var gpu_table = run.display_resources_slot.owner.?.table.image;
+    const copies = run.frames_rendered; const flips = run.flip_issued;
+    const statistics = NativeCommon.statistics;
+    const seen = run.flip_receipts[product.mode.?.head].?;
+    for (0..8) |_| { clock += 1000; _ = target.step(); if (NativeCommon.cursor_info != null) break; }
+    try t.expect(NativeCommon.cursor_info != null and product.cursor.phase == .idle);
+    input.producer = true;
+    for (0..5) |iteration| {
+        const op: u32 = @intCast(iteration);
+        var request: a.DisplayCursorRequest = .{ .operation = op, .display_generation = product.receipt.generation, .head_id = product.mode.?.head };
+        if (op == a.display_cursor_operation_prepare) {
+            request.reference = input.reference; request.width = 37; request.height = 43; request.pitch = 160;
+            request.byte_length = input.data.len; request.hotspot_x = 5; request.hotspot_y = 7;
+        } else if (op == a.display_cursor_operation_show or op == a.display_cursor_operation_move) {
+            request.image_sequence = 1; request.x = if (op == a.display_cursor_operation_show) -17 else 21; request.y = 29;
+        }
+        NativeCommon.cursor_job = .{ .backend = product.backend, .sequence = iteration + 1,
+            .deadline_ns = clock + std.time.ns_per_s, .request = request,
+            .barrier_timeline = if (op == a.display_cursor_operation_show) seen.source_timeline else 0,
+            .barrier_point = if (op == a.display_cursor_operation_show) seen.source_point else 0 };
+        NativeCommon.cursor_taken = false; NativeCommon.cursor_receipt = null; NativeCommon.cursor_reply_busy = false;
+        var barrier_blocked = false;
+        var point_pending = false;
+        for (0..180) |_| {
+            clock += 1000; _ = target.step();
+            if (target.phase != .ready) std.debug.print("common cursor failed op={} phase={s} failure={?} runtime={?}\n",
+                .{op,@tagName(product.cursor.phase),product.cursor.failure,run.failure});
+            try t.expect(target.phase == .ready);
+            if (NativeCommon.cursor_receipt != null) break;
+            if (run.activeChannel()) |channel| {
+                if (channel.phase == .waiting) { try replyNativeProduct(target); continue; }
+            }
+            if (run.display_upload_job != null) { try pumpLiveTable(target, &gpu_table, 2); continue; }
+            if (run.cursor_upload != null) {
+                input.producer = false; // The common borrowed reference is independent of its producer.
+                try pumpCursorUpload(target); continue;
+            }
+            if (product.cursor.phase == .barrier and !barrier_blocked) {
+                // Isolate the cursor consumer from statistics publication
+                // while modeling a not-yet-published visible receipt.
+                run.flip_receipts[product.mode.?.head] = null;
+                _ = try product.cursor.step(product);
+                try t.expect(product.cursor.phase == .barrier and run.cursor_point == null and run.cursor_storage.?.active == null);
+                run.flip_receipts[product.mode.?.head] = seen;
+                barrier_blocked = true;
+            }
+            if (run.cursor_point) |slot| {
+                const point = &run.display_channels[slot].?.point;
+                if (point.pending != null and point.pending.?.published) {
+                    clock += 1000; _ = target.step();
+                    try t.expect(run.cursor_point != null and NativeCommon.cursor_receipt == null);
+                    const user = try @import("gsp_cursor_pio.zig").base(product.mode.?.head);
+                    try t.expect(dm.words[(user + 0x208) / 4] == @import("gsp_cursor_pio.zig").value(.{.x=@intCast(request.x),.y=@intCast(request.y)},2));
+                    try deliverNativeHead(target, true); point_pending = true;
+                }
+            }
+            if (run.display_work != null) { try pumpCursorCommit(target); continue; }
+        }
+        const receipt = NativeCommon.cursor_receipt orelse return error.MissingCursorCompletion;
+        try t.expect(NativeCommon.cursor_reply_busy and !product.cursor.busy() and !run.cursor_reserving and
+            receipt.visibility == (if (op == a.display_cursor_operation_show or op == a.display_cursor_operation_move)
+                a.display_cursor_visibility_visible else a.display_cursor_visibility_hidden));
+        if (op == a.display_cursor_operation_prepare) try t.expect(product.cursor.image_sequence == 1 and !input.imported and !input.mapped);
+        if (op == a.display_cursor_operation_show) try t.expect(barrier_blocked and point_pending);
+        if (op == a.display_cursor_operation_move) try t.expect(point_pending and run.cursor_storage.?.completed == 1);
+        NativeCommon.cursor_job = null;
+    }
+    try t.expect(product.cursor.image_sequence == 0 and product.cursor.image_slot == null and run.cursor_storage.?.active == null and
+        run.frames_rendered == copies and run.flip_issued == flips);
+    try t.expectEqualDeep(statistics, NativeCommon.statistics);
+}
 fn checkNativeCursor(target: *@import("gsp_device.zig").Device) !void {
     const run = &target.running; const product = &target.native_output;
     const dm = @import("gsp_display_test_model.zig").Model;
@@ -3520,6 +3626,8 @@ fn checkNativeCursor(target: *@import("gsp_device.zig").Device) !void {
         owner.point.completed.?.point.y == 29 and run.frames_rendered == copies and run.flip_issued == flips and
         cm.shadow_creates == shadows and target.session.?.tx_sequence == rpc_sequence);
     try t.expectEqualDeep(statistics, NativeCommon.statistics);
+    try checkNativeCursorImages(target, handle);
+    if (target.phase != .ready) return;
     try run.retireDisplayChannel(handle, clock + std.time.ns_per_s);
     var ack = false;
     for (0..40) |_| {
@@ -3533,6 +3641,160 @@ fn checkNativeCursor(target: *@import("gsp_device.zig").Device) !void {
     }
     try t.expect(ack and run.display_channel_active == null and run.display_engine_owner.?.children[handle.slot] == 0);
     try t.expectError(error.Stale, run.displayChannelStatus(handle));
+}
+fn checkNativeCursorImages(target: *@import("gsp_device.zig").Device, position: @import("gsp_runtime.zig").DisplayChannelHandle) !void {
+    const run = &target.running; const product = &target.native_output;
+    const cursor = @import("gsp_cursor_image.zig");
+    const input = @import("gsp_cursor_test_model.zig").Model;
+    var checkpoint: []const u8 = "IMP";
+    errdefer |err| std.debug.print("cursor images: {s} at={s} run={?} imported={} mapped={} upload={} core={}\n",
+        .{@errorName(err),checkpoint,run.failure,input.imported,input.mapped,run.cursor_upload != null,run.display_work != null});
+    if (NativeCommon.is("context_native_cursor_imp_fallback")) {
+        try t.expect(product.mode.?.cursor_size == 0 and run.display_engine_owner.?.info().?.cursor_size == 0);
+        try t.expect(NativeCommon.mode_requests[@intFromEnum(@import("gsp_mode_control.zig").Operation.possible)] == 2);
+        return;
+    }
+    try t.expect(product.mode.?.cursor_size == 256);
+    const deadline = clock + std.time.ns_per_s;
+    const table_owner = run.display_resources_slot.owner.?;
+    var gpu_table = table_owner.table.image;
+    checkpoint = "allocate";
+    const buffer = try finishContextBuffer(target, try run.allocateNativeStorage(2 * cursor.max_bytes, deadline), deadline);
+    checkpoint = "bind";
+    const dma = try run.bindCursorStorage(product.engine.?, buffer, product.mode.?.head);
+    try run.releaseNativeBuffer(buffer);
+    checkpoint = "table";
+    try run.uploadDisplayTable(product.engine.?, product.copy.?, deadline);
+    try pumpLiveTable(target, &gpu_table, 2);
+    try t.expect(table_owner.publishedCursorStorage(dma) != null);
+    const copies = run.frames_rendered; const flips = run.flip_issued;
+    const statistics = NativeCommon.statistics;
+    const rpc_sequence = target.session.?.tx_sequence;
+    const plan = try cursor.make(37, 43, 5, 7, 160, input.data.len);
+    for (0..2) |iteration| {
+        const slot: u1 = @intCast(iteration);
+        const previous = run.cursor_storage.?.active;
+        input.producer = true;
+        if (iteration == 1) {
+            try t.expectError(error.Busy, run.uploadCursorImage(product.copy.?, input.reference, plan, 0, deadline));
+            input.reject_map = true;
+            try t.expectError(error.Map, run.uploadCursorImage(product.copy.?, input.reference, plan, slot, deadline));
+            try t.expect(!input.imported and !input.mapped and run.cursor_upload == null and run.cursor_storage.?.active == previous);
+            input.reject_map = false;
+        }
+        checkpoint = "source";
+        try run.uploadCursorImage(product.copy.?, input.reference, plan, slot, deadline);
+        try t.expect(input.imported and input.mapped and !ControlModel.reading);
+        input.producer = false; // The producer may close; the imported read map survives.
+        checkpoint = "CE";
+        try pumpCursorUpload(target);
+        if (target.phase != .ready) return;
+        try t.expect(!input.imported and !input.mapped and !ControlModel.reading and run.cursor_upload == null);
+        try t.expect(run.cursor_storage.?.active == previous and run.cursor_storage.?.uploaded[slot].?.point != 0);
+        const start: usize = @intCast(@as(u64, slot) * cursor.max_bytes);
+        for (0..64) |y| for (0..64) |x| {
+            const value = std.mem.readInt(u32, input.vram[start + (y * 64 + x) * 4..][0..4], .little);
+            try t.expectEqual(if (x < 37 and y < 43) std.mem.readInt(u32, input.data[y * 160 + x * 4..][0..4], .little) else @as(u32, 0), value);
+        };
+        for (input.vram[start + 64 * 64 * 4..start + cursor.max_bytes]) |byte| try t.expectEqual(@as(u8, 0xa5), byte);
+        checkpoint = "Core";
+        const sequence = try run.commitCursorImage(product.core.?, slot, deadline);
+        try pumpCursorCommit(target);
+        if (target.phase != .ready) return;
+        try t.expect(run.cursor_storage.?.active == slot and run.cursor_storage.?.completed == sequence);
+        try t.expectError(error.Busy, run.retireDisplayChannel(position, deadline));
+    }
+    const hidden = try run.commitCursorImage(product.core.?, null, deadline);
+    try pumpCursorCommit(target);
+    try t.expect(run.cursor_storage.?.active == null and run.cursor_storage.?.completed == hidden and
+        !run.cursor_storage.?.control.?.visible and run.frames_rendered == copies and run.flip_issued == flips and
+        target.session.?.tx_sequence == rpc_sequence);
+    try t.expectEqualDeep(statistics, NativeCommon.statistics);
+}
+fn pumpCursorUpload(target: *@import("gsp_device.zig").Device) !void {
+    const run = &target.running;
+    const input = @import("gsp_cursor_test_model.zig").Model;
+    const fifo = run.fifos[target.native_output.copy.?.slot].owner.?;
+    const wire = @import("gsp_copy_wire.zig");
+    const gpu_address = run.display_resources_slot.owner.?.publishedCursorStorage(run.cursor_storage.?.dma).?.info().?.address;
+    const get: *u32 = @ptrFromInt(fifo.ring.cpu.cpu_address + wire.userd_offset + 0x88);
+    const completion: *u32 = @ptrFromInt(fifo.ring.cpu.cpu_address + wire.completion_offset);
+    var parts: usize = 0;
+    for (0..40) |_| {
+        clock += 1000; _ = target.step();
+        try t.expect(target.phase == .ready);
+        const work = if (run.cursor_upload) |*entry| &entry.operation else break;
+        if (work.phase != .submitted) continue;
+        try t.expect(input.imported and input.mapped and ControlModel.reading and !input.producer);
+        const ticket = work.ticket.?;
+        const command: [*]const u32 = @ptrFromInt(fifo.ring.cpu.cpu_address + wire.push_offset +
+            ((@as(usize, ticket.point) - 1) % wire.capacity) * wire.slot_bytes);
+        const source = (@as(u64, command[3]) << 32) | command[4];
+        const destination = (@as(u64, command[5]) << 32) | command[6];
+        try t.expect(command[0] == 0x20010000 and command[1] == fifo.config.copy_class and command[2] == 0x20040100 and
+            source == 0x600000 and destination == gpu_address + work.target_offset + work.completed_bytes and
+            command[8] == (if (parts == 0) @as(u32, 12288) else 4096) and command[10] == 0x04000182 and
+            command[14] == ticket.point and command[16] == 0xc);
+        get.* = fifo.ring.put; clock += 1000; _ = target.step();
+        try t.expect(work.phase == .submitted and input.imported and input.mapped and ControlModel.reading);
+        if (NativeCommon.is("context_native_cursor_upload_timeout")) {
+            clock = work.deadline; _ = target.step();
+            try t.expect(target.phase == .recovering and run.cursor_upload != null and input.imported and input.mapped and
+                ControlModel.reading and tableLiveCursor(run));
+            return;
+        }
+        const offset: usize = @intCast(destination - gpu_address);
+        @memcpy(input.vram[offset..][0..command[8]], ControlModel.data[0..command[8]]);
+        completion.* = command[14]; parts += 1;
+        clock += 1000; _ = target.step();
+        try t.expect(target.phase == .ready);
+    }
+    try t.expect(parts == 2 and run.cursor_upload == null);
+}
+fn tableLiveCursor(run: *@import("gsp_runtime.zig").Owner) bool {
+    const table_owner = run.display_resources_slot.owner.?;
+    // Quarantine intentionally hides published descriptors. Their actual
+    // imported reference/device lease must still exist after a timeout.
+    const index = table_owner.table.indexOf(0, run.cursor_storage.?.dma) orelse return false;
+    return table_owner.storage[index].reference.reference.id != 0 and table_owner.storage[index].gpu.lease.id != 0;
+}
+fn pumpCursorCommit(target: *@import("gsp_device.zig").Device) !void {
+    const run = &target.running;
+    const display = @import("gsp_display_test_model.zig").Model;
+    const push = @import("gsp_display_push.zig");
+    const user = try push.userBase(.core, 0);
+    const prior = run.cursor_storage.?.active;
+    const sequence = run.cursor_storage.?.completed;
+    for (0..20) |_| {
+        clock += 1000; _ = target.step();
+        try t.expect(target.phase == .ready and run.display_work != null);
+        if (run.display_work.?.core.phase == .rewind) display.words[(user + 4) / 4] = display.words[user / 4];
+        if (run.display_work.?.core.phase == .submitted) break;
+    }
+    try t.expect(run.display_work.?.core.phase == .submitted);
+    display.words[(user + 4) / 4] = display.words[user / 4];
+    clock += 1000; _ = target.step();
+    try t.expect(run.display_work != null and run.cursor_storage.?.active == prior);
+    const note: *u32 = @ptrFromInt(run.display_work.?.core.notifier.cpu.cpu_address);
+    note.* = 2 << 30;
+    clock += 1000; _ = target.step();
+    try t.expect(run.display_work.?.cursor.?.baseline != null and run.cursor_storage.?.completed == sequence);
+    const wanted = run.display_work.?.cursor.?.control;
+    try deliverNativeHead(target, true);
+    clock += 1000; _ = target.step();
+    try t.expect(run.display_work != null and run.cursor_storage.?.completed == sequence);
+    if (NativeCommon.is("context_native_cursor_image_timeout")) {
+        clock = run.display_work.?.deadline; _ = target.step();
+        try t.expect(target.phase == .recovering and run.display_work != null and tableLiveCursor(run) and
+            run.cursor_storage.?.completed == sequence);
+        return;
+    }
+    const base = @import("boot_scanout.zig").armed_base + wanted.head * 0x400;
+    const methods = [_]u32{0x2088,0x208c,0x2090,0x2094,0x2098,0x209c,0x20a0};
+    const words = [_]u32{wanted.dma,0,@intCast(wanted.offset >> 8),0,0,try wanted.word(),0x75ff};
+    for (methods, words) |method, value| display.words[(base + method) / 4] = value;
+    clock += 1000; _ = target.step();
+    try t.expect(target.phase == .ready and run.display_work == null);
 }
 fn checkNativeFrames(target: *@import("gsp_device.zig").Device, extra: bool) !void {
     const run = &target.running; const product = &target.native_output;
@@ -4469,7 +4731,8 @@ fn replyNativeProduct(target: *@import("gsp_device.zig").Device) !void {
             .classes => { outputWord(&response, 24, 1); outputWord(&response, 28, if (NativeCommon.is("context_native_mode_missing")) 0 else 0xc372); },
             .pclk => { outputWord(&response, 32, 0); outputWord(&response, 36, if (NativeCommon.is("context_native_mode_clock")) 100000 else 600000); outputWord(&response, 40, 0); },
             .possible => {
-                response[24 + 1904] = if (NativeCommon.is("context_native_mode_impossible")) 0 else 1;
+                response[24 + 1904] = if (NativeCommon.is("context_native_mode_impossible") or
+                    (NativeCommon.is("context_native_cursor_imp_fallback") and run.mode_control_owner.?.mode.cursor_size != 0)) 0 else 1;
                 outputWord(&response, 24 + 1924, 123456); outputWord(&response, 24 + 1928, 90000);
                 outputWord(&response, 24 + 1932, 200000); outputWord(&response, 24 + 2004, 300000);
             },

@@ -307,7 +307,7 @@ const vram = @import("gsp_vram.zig");
 pub const wire = @import("gsp_display_engine_wire.zig");
 pub const Error = wire.Error || names.Error || vram.Error;
 pub const State = enum { creating, binding_instance, unwinding, ready, handed_off, destroying, closed, finished, failed };
-pub const Info = struct { binding: wire.Binding, hardware: wire.StaticInfo, core: bool, window: bool, immediate: bool, cursor: bool = false, instance_bound: bool };
+pub const Info = struct { binding: wire.Binding, hardware: wire.StaticInfo, core: bool, window: bool, immediate: bool, cursor: bool = false, cursor_size: u16 = 0, instance_bound: bool };
 pub const Owner = struct {
     self_address: usize = 0,
     exchange: exchange.Exchange,
@@ -321,6 +321,7 @@ pub const Owner = struct {
     window_supported: bool = false,
     immediate_supported: bool = false,
     cursor_supported: bool = false,
+    cursor_size: u16 = 0,
     instance_storage: vram.storage.Use = .{},
     instance_bound: bool = false,
     instance_possible: bool = false,
@@ -363,7 +364,7 @@ pub const Owner = struct {
             (self.state != .ready and self.state != .handed_off)) return null;
         if (self.instance_bound and self.instance_storage.info() == null) return null;
         return .{ .binding = self.binding, .hardware = self.hardware orelse return null, .core = self.core_supported,
-            .window = self.window_supported, .immediate = self.immediate_supported, .cursor = self.cursor_supported, .instance_bound = self.instance_bound };
+            .window = self.window_supported, .immediate = self.immediate_supported, .cursor = self.cursor_supported, .cursor_size = self.cursor_size, .instance_bound = self.instance_bound };
     }
     pub fn attachInstance(self: *Owner, source: *vram.Owner, token: *boot.Handoff, deadline: u64) Error!void {
         const root = self.info() orelse return error.State;

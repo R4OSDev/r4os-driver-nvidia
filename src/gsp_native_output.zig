@@ -70,6 +70,7 @@ pub const Owner = struct {
     callback_confirmed: bool = false,
     restore_requested: bool = false,
     modes: @import("gsp_native_modes.zig").Owner = .{},
+    cursor: @import("gsp_native_cursor.zig").Owner = .{},
     frame_count: u8 = 2,
     statistics: @import("gsp_frame_stats.zig").Owner = .{},
 
@@ -192,6 +193,10 @@ pub const Owner = struct {
                 const saved = try runtime.boot_mode.capture(&held.scanout_original.?, &boot, @ctz(mask));
                 const snapshot = run.nativeOutputs() orelse return error.Busy;
                 self.mode = try runtime.boot_mode.bind(saved, snapshot, run.epoch, held.boot.held_generation);
+                if (info.cursor) {
+                    try run.configureCursorUsage(self.engine.?, @import("gsp_cursor_image.zig").max_size);
+                    self.mode.?.cursor_size = @import("gsp_cursor_image.zig").max_size;
+                }
                 self.link = try runtime.hdmi_link.derive(self.mode.?, run.nativeObject() orelse return error.Busy, snapshot);
                 self.next(.mode_create);
             },
@@ -204,7 +209,16 @@ pub const Owner = struct {
                 if (status.state != .handed_off) return false;
                 if (status.rejected != null or status.unavailable) return error.Unsupported;
                 const admission = status.info orelse return error.State;
-                if (!admission.possible or admission.over_clock or admission.receipt == 0 or !std.meta.eql(admission.mode, self.mode.?)) return error.Unsupported;
+                if (admission.receipt == 0 or !std.meta.eql(admission.mode, self.mode.?)) return error.Unsupported;
+                if ((!admission.possible or admission.over_clock) and self.mode.?.cursor_size != 0) {
+                    try run.configureCursorUsage(self.engine.?, 0);
+                    self.mode = try run.bootDisplayPlan(self.engine.?, self.mode.?.window);
+                    self.link = try runtime.hdmi_link.derive(self.mode.?, run.nativeObject() orelse return error.Busy,
+                        run.nativeOutputs() orelse return error.Busy);
+                    try run.queryDisplayMode(self.mode_control.?, self.mode.?, self.phase_deadline);
+                    return true;
+                }
+                if (!admission.possible or admission.over_clock) return error.Unsupported;
                 self.mode_admission = admission;
                 self.next(.instance_allocate);
             },
@@ -378,6 +392,8 @@ pub const Owner = struct {
             .active => {
                 try self.validateRoute();
                 if (run.frame_setup != null) return run.prepareFramePool();
+                if (try self.cursor.step(self)) return true;
+                if (self.cursor.busy()) return false;
                 if (try self.modes.step(self)) return true;
                 if (self.modes.phase == .idle or self.modes.phase == .decision or self.modes.phase == .unavailable)
                     return run.prepareFramePool();
@@ -450,6 +466,7 @@ pub const Owner = struct {
     }
     pub fn quarantine(self: *Owner, err: anyerror) void {
         if (self.phase == .detached) return;
+        self.cursor.quarantine(self, err);
         self.modes.quarantine(self, err);
         if (self.failure == null) { self.failure = err; self.failed_phase = self.phase; }
         self.phase = .failed;

@@ -242,6 +242,7 @@ pub const image = @import("gsp_display_image.zig");
 pub const Error = image.Error || error{Bounds, Handle};
 pub const Kind = @import("gsp_display_channel_wire.zig").Kind;
 pub const boot_mode = @import("gsp_boot_mode.zig");
+pub const cursor_image = @import("gsp_cursor_image.zig");
 pub const Route = struct { window: u32, head: u32 };
 pub const Point = struct { x: i16 = 0, y: i16 = 0 };
 pub const Config = struct {
@@ -254,6 +255,8 @@ pub const Config = struct {
     position: ?Point = null,
     with_position: bool = false,
     with_core: bool = true,
+    cursor_usage: u16 = 0,
+    cursor_image: ?cursor_image.Control = null,
 };
 pub const max_words: usize = 192;
 pub const Program = struct {
@@ -269,6 +272,8 @@ pub const Program = struct {
 pub fn core(config: Config) Error!Program {
     if (config.kind != .core or config.scanout != null or config.notifier_offset != 0 or config.position != null or config.with_position or !config.with_core) return error.Descriptor;
     if (config.notifier == 0) return error.Handle;
+    const cursor_usage = try cursor_image.usageCode(config.cursor_usage);
+    if (config.signal == null and config.cursor_usage != 0) return error.Descriptor;
     if (config.windows == 0 or config.windows & ~@as(u32, 0xff) != 0) return error.Bounds;
     var out: Program = .{};
     if (config.initialize) {
@@ -302,7 +307,7 @@ pub fn core(config: Config) Error!Program {
         try out.method(base + 0x201c, &.{0});
         try out.method(base + 0x2020, &.{ signal.display_id, 0 });
         try out.method(base + 0x2028, &.{signal.clock});
-        try out.method(base + 0x2030, &.{0x1000}); // No cursor/LUT; two taps, no upscale.
+        try out.method(base + 0x2030, &.{0x1000 | cursor_usage}); // IMP-admitted cursor, no LUT/upscale.
         // Use individual raster writes, matching NVIDIA's EvoSetRasterParams3.
         try out.method(base + 0x2064, &.{signal.total});
         try out.method(base + 0x2068, &.{signal.sync_end});
@@ -327,6 +332,16 @@ pub fn core(config: Config) Error!Program {
         try out.method(base + 0x2000, &.{ 0, 0xfc000040 | signal.polarity });
         try out.method(0x300 + signal.sor * 0x20, &.{signal.sor_control});
     }
+    if (config.cursor_image) |cursor| {
+        if (config.initialize or config.route != null or config.signal != null) return error.Descriptor;
+        try cursor.validate();
+        const base = cursor.head * 0x400;
+        try out.method(base + 0x2098, &.{0}); // Mono; never borrow an old right-eye image.
+        try out.method(base + 0x2088, &.{ cursor.dma, 0 });
+        try out.method(base + 0x2090, &.{ @intCast(cursor.offset >> 8), 0 });
+        try out.method(base + 0x209c, &.{try cursor.word()});
+        if (cursor.visible) try out.method(base + 0x20a0, &.{0x75ff}); // Straight ARGB: src*alpha + dst*(1-alpha).
+    }
     // A private16-byte notifier at offset0; no interrupt callback is needed.
     // Its completion establishes method execution, not visible scanout.
     try out.method(0x20c, &.{0x1000});
@@ -336,6 +351,7 @@ pub fn core(config: Config) Error!Program {
     return out;
 }
 pub fn window(config: Config) Error!Program {
+    if (config.cursor_image != null or config.cursor_usage != 0) return error.Descriptor;
     if (config.kind != .window or config.notifier == 0 or config.notifier_offset > 16 or config.notifier_offset & 15 != 0 or config.signal != null or config.position != null) return error.Descriptor;
     if (!config.with_core and (config.initialize or config.with_position)) return error.Descriptor;
     const value = config.scanout orelse return error.Descriptor;
@@ -370,6 +386,7 @@ pub fn window(config: Config) Error!Program {
     return out;
 }
 pub fn immediate(config: Config) Error!Program {
+    if (config.cursor_image != null or config.cursor_usage != 0) return error.Descriptor;
     if (config.kind != .immediate or config.notifier != 0 or config.notifier_offset != 0 or config.scanout != null or
         config.signal != null or config.with_position or !config.with_core) return error.Descriptor;
     const point = config.position orelse return error.Descriptor;

@@ -60,6 +60,7 @@ pub const Plan = struct {
     receiver_mode_id: u32 = 0,
     cta_vic: u8 = 0,
     transport_hdmi: bool = false,
+    cursor_size: u16 = 0,
     signal: Signal,
 };
 

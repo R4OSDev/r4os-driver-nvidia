@@ -291,6 +291,7 @@ fn validate(binding: Binding, mode: modes.Plan) Error!void {
         for (handles[0..i]) |prior| if (handle == prior) return error.Handle;
     }
     try modes.validate(mode.signal, mode.head);
+    _ = @import("gsp_cursor_image.zig").usageCode(mode.cursor_size) catch return error.Descriptor;
     if (mode.window >= 8 or mode.width != mode.signal.viewport & 0xffff or mode.height != mode.signal.viewport >> 16) return error.Descriptor;
 }
 pub fn encode(binding: Binding, op: Operation, mode: modes.Plan, buffer: []u8) Error![]const u8 {
@@ -318,7 +319,8 @@ pub fn encode(binding: Binding, op: Operation, mode: modes.Plan, buffer: []u8) E
                 put(head, 44, 16); put(head, 52, 16); // NO_LOCK, PIN_UNSPECIFIED.
                 put(head, 56, 1024); put(head, 60, 1024); head[64] = 1;
                 put(head, 68, mode.signal.min_frame_idle);
-                // Cursor, LUTs, rotation, scaling, DSC, overfetch and YUV stay off.
+                head[73] = @intCast(mode.cursor_size / 32);
+                // LUTs, rotation, scaling, DSC, overfetch and YUV stay off.
                 const window = data[744..][0..36];
                 put(window, 0, mode.window); put(window, 4, mode.head); put(window, 8, 4);
                 put(window, 16, mode.width); put(window, 20, 1024); put(window, 24, 1024);

@@ -631,6 +631,33 @@ pub const Port = struct {
         if (try self.readFor(scope, 0) != self.boot0) return error.IdentityChanged;
         try fifo.ring.notified(ticket);
     }
+    pub fn readCursorImageArmed(self: *Port, channel: *@import("gsp_display_channel.zig").Owner,
+        wanted: @import("gsp_cursor_image.zig").Control, deadline: u64) !bool
+    {
+        const scope: Scope = .{ .request = deadline };
+        errdefer |err| self.recordFailure(err);
+        try wanted.validate();
+        if (self.phase != .runtime or !self.retained or channel.config.kind != .core) return error.State;
+        const binding = self.owner orelse return error.State;
+        const admit_image = binding.admit_display_push orelse return error.State;
+        const base = @import("boot_scanout.zig").armed_base + wanted.head * 0x400;
+        const methods = [_]u32{ 0x2088, 0x208c, 0x2090, 0x2094, 0x2098, 0x209c, 0x20a0 };
+        const expected = [_]u32{ wanted.dma, 0, @intCast(wanted.offset >> 8), 0, 0, try wanted.word(), 0x75ff };
+        const count: usize = if (wanted.visible) methods.len else methods.len - 1;
+        for (methods[0..count]) |method| if (!self.supports(.read, base + method)) return error.Register;
+        try self.guardFor(scope); try admit_image(binding.context, self, channel, deadline, .read);
+        if (try self.readFor(scope, 0) != self.boot0) return error.IdentityChanged;
+        var first: [methods.len]u32 = undefined;
+        for (0..2) |pass| for (methods[0..count], 0..) |method, i| {
+            try self.guardFor(scope); try admit_image(binding.context, self, channel, deadline, .read);
+            fence(); const observed = self.pointer(base + method).*; fence();
+            if (observed == 0xffffffff) return error.Completion;
+            if (pass == 0) first[i] = observed else if (observed != first[i]) return false;
+        };
+        try self.guardFor(scope); try admit_image(binding.context, self, channel, deadline, .read);
+        if (try self.readFor(scope, 0) != self.boot0) return error.IdentityChanged;
+        return std.mem.eql(u32, first[0..count], expected[0..count]);
+    }
     pub fn readCursorPoint(self: *Port, channel: *@import("gsp_display_channel.zig").Owner, deadline: u64) !?@import("gsp_cursor_pio.zig").Sample {
         const pio = @import("gsp_cursor_pio.zig");
         const wire = @import("gsp_display_channel_wire.zig");

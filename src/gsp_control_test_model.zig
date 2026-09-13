@@ -94,7 +94,7 @@ pub const Model = struct {
         std.debug.assert(active and synced and !cpu_mapped and std.meta.eql(input.*, reference) and
             request.byte_offset == 0 and request.adapter_id == 0x01000000 and request.device_generation != 0);
         if (request.access == 0) {
-            std.debug.assert(mapped and gpu_mapped and !reading and request.byte_length == @import("gsp_display_table.zig").image_bytes and
+            std.debug.assert(mapped and gpu_mapped and !reading and request.byte_length > 0 and request.byte_length <= wire.bytes and request.byte_length & 3 == 0 and
                 request.gpu_virtual_address == 0x600000 and request.address_space == 1 and request.dma_mask == std.math.maxInt(u64));
             if (is("context_upload_acquire")) return -1;
             reading = true;

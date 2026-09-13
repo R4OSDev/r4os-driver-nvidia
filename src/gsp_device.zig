@@ -516,7 +516,15 @@ pub const Device = struct {
             self.running.fifo_active != null or self.running.context_active != null or self.running.native_active != null or self.running.buffer_active != null or
             self.running.outputs.active() or self.running.graph_closing or self.running.display_engine_active or self.running.display_channel_active != null or self.running.display_work != null or self.running.mode_control_active) return error.State;
         self.running.validateCopyOverlap() catch return error.Binding;
-        const channel_handle = if (self.running.display_upload_job) |*work| blk: {
+        const channel_handle = if (self.running.cursor_upload) |*work| blk: {
+            if (self.native_output.phase != .active or !self.native_output.callback_confirmed or self.native_output.mode == null or
+                self.running.cursor_storage == null or self.native_output.mode.?.head != self.running.cursor_storage.?.head) return error.Binding;
+            try self.running.validateCursorUpload();
+            const staging = work.operation.source.?;
+            if (!work.operation.matches(ticket, deadline) or fifo.config.context.vaspace != staging.binding.space.handle or
+                !fifo.ring.matchesTransfer(ticket, fifo.config.copy_class, work.operation.transfer() catch return error.Binding)) return error.Binding;
+            break :blk work.channel;
+        } else if (self.running.display_upload_job) |*work| blk: {
             const resources = self.running.display_resources_slot.owner orelse return error.Binding;
             const root = if (self.running.display_engine_owner) |*value| value else return error.Binding;
             const graph = if (self.running.graph) |*value| value else return error.Binding;
@@ -574,7 +582,7 @@ pub const Device = struct {
             self.running.self_address != @intFromPtr(&self.running) or self.running.failure != null or self.running.sequence.self_address != 0 or
             self.running.fifo_active != null or self.running.context_active != null or self.running.native_active != null or self.running.buffer_active != null or
             self.running.outputs.active() or self.running.graph_closing or self.running.display_engine_active or self.running.display_channel_active != null or self.running.mode_control_active or
-            self.running.copy_job != null or self.running.display_upload_job != null or self.running.initial_image != null) return error.State;
+            self.running.copy_job != null or self.running.display_upload_job != null or self.running.cursor_upload != null or self.running.initial_image != null) return error.State;
         if (self.running.display_flip != null) return self.admitFlipPush(port, channel, deadline, access_kind);
         const work = if (self.running.display_work) |*value| value else return error.Binding;
         const resources = self.running.display_resources_slot.owner orelse return error.Binding;
@@ -584,6 +592,11 @@ pub const Device = struct {
         if (!work.core.config.with_core or (if (work.window) |value| !value.config.with_core else false) or
             (if (work.position) |value| !value.config.with_core else false)) return error.Binding;
         if (work.core.handle.slot != 0 or work.deadline != deadline) return error.Binding;
+        if (work.cursor) |cursor| {
+            if (self.native_output.phase != .active or !self.native_output.callback_confirmed or self.native_output.mode == null or
+                self.native_output.mode.?.head != cursor.control.head) return error.Binding;
+            self.running.validateCursorCommit() catch return error.Binding;
+        } else if (work.core.config.cursor_image != null) return error.Binding;
         const position_part: ?*runtime.PositionSubmission = if (channel.config.kind == .immediate)
             if (work.position) |*value| value else return error.Binding else null;
         const part: ?*runtime.DisplaySubmission = if (position_part != null) null else
@@ -607,6 +620,7 @@ pub const Device = struct {
                 self.running.validateDisplayLink() catch return error.Binding;
                 const expected = self.running.displayModePlan(.{ .epoch = self.epoch, .root = root.binding.root }, route.window, plan.receiver_mode_id) catch return error.Binding;
                 if (!std.meta.eql(plan, expected) or !std.meta.eql(work.core.config.signal, @as(?runtime.boot_mode.Signal, expected.signal)) or
+                    work.core.config.cursor_usage != expected.cursor_size or
                     plan.head != route.head or window_part.config.scanout == null or window_part.config.scanout.?.width != plan.width or
                     window_part.config.scanout.?.height != plan.height) return error.Binding;
             } else if (work.core.config.signal != null or work.link != null) return error.Binding;
@@ -650,7 +664,8 @@ pub const Device = struct {
             if (phase != .prepare or ticket == null or !channel.ring.matches(ticket.?, config.*)) return error.Binding;
             if (part) |value| if (ticket.?.kind == .frame and (value.notifier.phase != .armed or value.notifier.point != ticket.?.point or
                 value.notifier.deadline != deadline or value.notifier.offset != config.notifier_offset)) return error.Binding;
-        } else if (phase != .prepare and phase != .rewind and !(position_part != null and phase == .submitted)) return error.Binding;
+        } else if (phase != .prepare and phase != .rewind and !(position_part != null and phase == .submitted) and
+            !(work.cursor != null and phase == .complete)) return error.Binding;
         const rpc = self.running.activeChannel() orelse return error.State;
         const canonical = if (self.running.channel) |*value| value else return error.State;
         if (rpc != canonical or rpc.session != &self.session.? or port.runtime_session != rpc.session or rpc.session.pending != null or

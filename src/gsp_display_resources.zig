@@ -151,6 +151,12 @@ pub const Owner = struct {
         };
         return null;
     }
+    pub fn publishedCursorStorage(self: *Owner, handle: u32) ?*vram.storage.Use {
+        if (!self.valid() or !self.table.published(0, handle)) return null;
+        const index = self.table.indexOf(0, handle) orelse return null;
+        if (self.table.entries[index].?.target != .vram or self.surfaces[index] != null) return null;
+        return &self.storage[index];
+    }
     pub fn createNotifier(self: *Owner, ctx: *const r4os.r4dev.DriverContext, channel: u32) Error!u32 {
         if (!self.valid()) return error.Stale;
         if (channel >= self.notifiers.len) return error.Bounds;

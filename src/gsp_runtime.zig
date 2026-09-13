@@ -73,7 +73,13 @@ pub const DisplayPosition = struct { handle: DisplayChannelHandle, point: displa
 pub const boot_mode = @import("gsp_boot_mode.zig");
 pub const hdmi_link = @import("gsp_hdmi_link.zig");
 pub const DisplayLink = struct { plan: hdmi_link.Plan, acknowledged: u8, receipt: u64 };
-pub const DisplayWork = struct { core: DisplaySubmission, window: ?DisplaySubmission = null, position: ?PositionSubmission = null, deadline: u64, boot_mode: ?boot_mode.Plan = null, mode_receipt: u64 = 0, link: ?hdmi_link.Work = null };
+pub const DisplayWork = struct { core: DisplaySubmission, window: ?DisplaySubmission = null, position: ?PositionSubmission = null, deadline: u64, boot_mode: ?boot_mode.Plan = null, mode_receipt: u64 = 0, link: ?hdmi_link.Work = null, cursor: ?CursorCommit = null };
+pub const cursor_image = @import("gsp_cursor_image.zig");
+pub const CursorCommit = struct { control: cursor_image.Control, sequence: u64, baseline: ?@import("gsp_head_events.zig").Sample = null, completed_ns: u64 = 0 };
+pub const CursorReady = struct { plan: cursor_image.Plan, point: u32 };
+pub const CursorStorage = struct { dma: u32, head: u32, uploaded: [2]?CursorReady = @splat(null), active: ?u1 = null,
+    issued: u64 = 0, completed: u64 = 0, control: ?cursor_image.Control = null, upload_error: ?anyerror = null };
+pub const CursorUpload = struct { operation: @import("gsp_cursor_upload.zig").Upload = .{}, channel: ChannelHandle, slot: u1 };
 pub const ActiveDisplayImage = struct { image: display_resources.image.Image, head: u32, core_point: u64, window_point: u64, boot_mode: ?boot_mode.Plan = null, mode_receipt: u64 = 0, position: ?DisplayPosition = null, link: ?DisplayLink = null };
 pub const flip = @import("gsp_flip.zig");
 pub const DisplayFlip = struct {
@@ -201,6 +207,9 @@ pub const Owner = struct {
     frame_ready: ?struct { image: *Presentation, deadline: u64 } = null,
     require_mode_receipt: bool = false,
     initial_image: ?InitialImage = null,
+    cursor_storage: ?CursorStorage = null,
+    cursor_upload: ?CursorUpload = null,
+    cursor_reserving: bool = false,
     rm_rejection: ?u32 = null,
     outputs: outputs.Owner = .{},
     output_refresh: bool = false,
@@ -282,6 +291,10 @@ pub const Owner = struct {
         self.outputs.invalidate() catch {};
         self.memory_inventory.invalidate();
         if (self.display_upload_job) |*work| work.operation.quarantine(err);
+        if (self.cursor_upload) |*work| work.operation.quarantine(err);
+        if (self.cursor_upload != null or (if (self.display_work) |work| work.cursor != null else false))
+            self.log("NVIDIA cursor: failed reason={s} upload-held={} image-unconfirmed={} resources=retained",
+                .{@errorName(err), self.cursor_upload != null, if (self.display_work) |work| work.cursor != null else false});
         if (self.display_resources_slot.owner) |owner| owner.quarantine();
         self.failure = err;
         // unregister(false) terminalizes the common queue as device-lost but
@@ -439,7 +452,7 @@ pub const Owner = struct {
     }
     pub fn nativeObject(self: *Owner) ?display.Object {
         if (self.self_address != @intFromPtr(self) or self.failure != null or self.graph == null or
-            self.display_upload_job != null or self.display_work != null or self.display_flip != null or self.cursor_point != null or
+            self.display_upload_job != null or self.display_work != null or self.display_flip != null or self.cursor_point != null or self.cursor_upload != null or
             self.graph.?.self_address != @intFromPtr(&self.graph.?) or self.graph.?.state != .loaned or
             self.display_object == null or self.channel == null or self.activeChannel() != &self.channel.? or
             self.channel.?.session.state != .active) return null;
@@ -623,6 +636,9 @@ pub const Owner = struct {
     pub fn retireDisplayChannel(self: *Owner, handle: DisplayChannelHandle, deadline: u64) !void {
         const owner = try self.findDisplayChannel(handle);
         if (self.presentation != null and owner.config.kind != .cursor) return error.Busy;
+        if (owner.config.kind == .cursor) if (self.cursor_storage) |storage| {
+            if (storage.head == owner.config.index and storage.active != null) return error.Busy;
+        };
         if (self.copyBusy() or self.sequence.self_address != 0 or self.nativeObject() == null or self.channel.?.phase != .idle or
             self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         try self.channel.?.guard(deadline);
@@ -711,6 +727,9 @@ pub const Owner = struct {
         try self.displayTableChannelsIdle(parent);
         const change = resources.table.change orelse return error.Stale;
         const descriptor = resources.table.entries[change.index] orelse return error.Stale;
+        if (self.cursor_storage) |cursor| if (!change.remove and descriptor.channel == 0 and descriptor.handle == cursor.dma and
+            descriptor.target == .vram and descriptor.bytes == 2 * cursor_image.max_bytes and resources.surfaces[change.index] == null and
+            cursor.active == null and self.cursor_upload == null and self.cursor_point == null) return;
         if (resources.surfaces[change.index] == null or !self.displayImageUnused(descriptor)) return error.Busy;
         if (change.remove and !try resources.imageFinished(descriptor.channel, descriptor.handle)) return error.Busy;
     }
@@ -750,6 +769,103 @@ pub const Owner = struct {
         const owner = self.display_resources_slot.owner orelse return error.State;
         if (parent.info() == null or !owner.valid() or !std.meta.eql(owner.binding.?, parent.binding) or owner.instance != &parent.instance_storage) return error.Stale;
         return .{ .entries = owner.table.count, .revision = owner.table.revision, .published_revision = owner.table.uploaded_revision, .uploading = owner.table.uploading };
+    }
+    pub fn bindCursorStorage(self: *Owner, handle: DisplayEngineHandle, source: BufferHandle, head: u32) !u32 {
+        if (self.cursor_storage != null or self.cursor_upload != null or self.cursor_point != null) return error.Busy;
+        const parent = try self.mutableDisplayTable(handle);
+        const info = parent.info() orelse return error.State;
+        if (!info.cursor or info.cursor_size == 0 or head >= info.hardware.heads) return error.Unsupported;
+        _ = try self.headSource(head);
+        const storage = try self.findNativeBuffer(source);
+        const value = storage.info() orelse return error.State;
+        if (value.logical_bytes != 2 * cursor_image.max_bytes or value.surface.scanout()) return error.Bounds;
+        const table_owner = try self.ensureDisplayResources(parent);
+        const dma = try table_owner.bindNative(0, storage);
+        self.cursor_storage = .{ .dma = dma, .head = head };
+        return dma;
+    }
+    pub fn uploadCursorImage(self: *Owner, channel: ChannelHandle, source: r4os.abi.GfxBufferHandle,
+        plan: cursor_image.Plan, slot: u1, deadline: u64) !void
+    {
+        const storage = if (self.cursor_storage) |*value| value else return error.State;
+        if (self.copyBusy() or self.cursor_point != null or self.nativeObject() == null or self.graph_closing or
+            self.channel.?.phase != .idle or storage.active == slot) return error.Busy;
+        const table_owner = self.display_resources_slot.owner orelse return error.State;
+        const target = table_owner.publishedCursorStorage(storage.dma) orelse return error.State;
+        const root = self.display_engine_owner.?.info() orelse return error.State;
+        if (!plan.valid() or plan.size > root.cursor_size) return error.Bounds;
+        const fifo = try self.findChannel(channel);
+        const config = fifo.info() orelse return error.State;
+        if (!config.config.system_userd or !fifo.ring.idle()) return error.Busy;
+        const staging = if (self.graph.?.control_buffer) |*value| value else return error.State;
+        if (staging.binding.space.handle != fifo.config.context.vaspace or staging.binding.space.client != root.binding.client) return error.Stale;
+        try self.channel.?.guard(deadline);
+        const input_memory = self.ctx.?.memory() orelse return error.Api;
+        self.cursor_upload = .{ .channel = channel, .slot = slot };
+        self.cursor_upload.?.operation.open(input_memory, source, plan, staging, target, @as(u64, slot) * cursor_image.max_bytes, deadline) catch |err| {
+            if (self.cursor_upload.?.operation.failure != null) self.stop(err) else self.cursor_upload = null;
+            return err;
+        };
+        storage.uploaded[slot] = null;
+        storage.upload_error = null;
+    }
+    pub fn validateCursorUpload(self: *Owner) !void {
+        const work = if (self.cursor_upload) |*value| value else return error.State;
+        const storage = self.cursor_storage orelse return error.State;
+        const table_owner = self.display_resources_slot.owner orelse return error.State;
+        const root = if (self.display_engine_owner) |*value| value else return error.State;
+        const info = root.info() orelse return error.State;
+        const staging = if (self.graph.?.control_buffer) |*value| value else return error.State;
+        if (self.copy_job != null or self.display_upload_job != null or self.initial_image != null or self.display_work != null or
+            self.display_flip != null or self.cursor_point != null or self.graph_closing or !work.operation.valid() or
+            work.operation.target != table_owner.publishedCursorStorage(storage.dma) or work.operation.source != staging or
+            work.operation.target_offset != @as(u64, work.slot) * cursor_image.max_bytes or storage.active == work.slot or
+            work.operation.plan.size > info.cursor_size or !std.meta.eql(table_owner.binding.?, root.binding)) return error.Stale;
+        _ = try self.headSource(storage.head);
+    }
+    pub fn commitCursorImage(self: *Owner, core_handle: DisplayChannelHandle, slot: ?u1, deadline: u64) !u64 {
+        const storage = if (self.cursor_storage) |*value| value else return error.State;
+        if (self.cursor_point != null or self.cursor_upload != null) return error.Busy;
+        if (storage.issued == std.math.maxInt(u64)) return error.Exhausted;
+        var core = try self.prepareDisplayCore(core_handle, deadline);
+        if (core.config.initialize) return error.State;
+        const value: cursor_image.Control = if (slot) |index| blk: {
+            const ready = storage.uploaded[index] orelse return error.State;
+            if (ready.point == 0) return error.State;
+            break :blk .{ .head = storage.head, .dma = storage.dma, .offset = @as(u64, index) * cursor_image.max_bytes,
+                .storage_bytes = 2 * cursor_image.max_bytes, .size = ready.plan.size,
+                .hotspot_x = ready.plan.hotspot_x, .hotspot_y = ready.plan.hotspot_y, .visible = true };
+        } else .{ .head = storage.head };
+        try value.validate();
+        core.config.cursor_image = value;
+        storage.issued += 1;
+        self.display_work = .{ .core = core, .deadline = deadline, .cursor = .{ .control = value, .sequence = storage.issued } };
+        return storage.issued;
+    }
+    pub fn validateCursorCommit(self: *Owner) !void {
+        const work = self.display_work orelse return error.State;
+        const cursor = work.cursor orelse return error.State;
+        const storage = self.cursor_storage orelse return error.State;
+        const root = self.display_engine_owner.?.info() orelse return error.State;
+        const table_owner = self.display_resources_slot.owner orelse return error.State;
+        if (self.cursor_upload != null or self.cursor_point != null or work.window != null or work.position != null or work.boot_mode != null or
+            work.link != null or work.core.config.initialize or work.core.config.signal != null or work.core.config.route != null or
+            work.core.config.cursor_usage != 0 or !std.meta.eql(work.core.config.cursor_image, @as(?cursor_image.Control, cursor.control)) or
+            cursor.sequence != storage.issued or cursor.sequence <= storage.completed or cursor.control.head != storage.head or
+            !root.cursor or root.cursor_size == 0 or table_owner.publishedCursorStorage(storage.dma) == null) return error.Stale;
+        try cursor.control.validate();
+        _ = try self.headSource(storage.head);
+        if (cursor.control.visible) {
+            const position = if (self.display_channels[17 + cursor.control.head]) |*value| value else return error.Stale;
+            if (position.info() == null or position.point.pending != null or position.point.completed == null) return error.Stale;
+            if (cursor.control.dma != storage.dma or cursor.control.storage_bytes != 2 * cursor_image.max_bytes or
+                cursor.control.offset % cursor_image.max_bytes != 0 or cursor.control.size > root.cursor_size) return error.Stale;
+            const index = cursor.control.offset / cursor_image.max_bytes;
+            if (index >= 2) return error.Stale;
+            const ready = storage.uploaded[index] orelse return error.Stale;
+            if (ready.point == 0 or !ready.plan.valid() or cursor.control.size != ready.plan.size or
+                cursor.control.hotspot_x != ready.plan.hotspot_x or cursor.control.hotspot_y != ready.plan.hotspot_y) return error.Stale;
+        }
     }
     pub fn uploadDisplayTable(self: *Owner, root: DisplayEngineHandle, handle: ChannelHandle, deadline: u64) !void {
         const parent = try self.mutableDisplayTable(root);
@@ -792,6 +908,16 @@ pub const Owner = struct {
         return .{ .handle = handle, .notifier = note,
             .config = .{ .notifier = note.handle, .windows = root.hardware.windows, .initialize = !owner.ring.initialized } };
     }
+    /// Reserve cursor fetch bandwidth before channels can become active.
+    /// An IMP rejection can retry the boot mode once with a software cursor.
+    pub fn configureCursorUsage(self: *Owner, handle: DisplayEngineHandle, size: u16) !void {
+        const root = try self.findDisplayEngine(handle);
+        const info = root.info() orelse return error.State;
+        _ = try @import("gsp_cursor_image.zig").usageCode(size);
+        if (size != 0 and !info.cursor) return error.Unsupported;
+        if (root.channels_started or self.mode_control_active or self.display_work != null or self.graph_closing) return error.Busy;
+        root.cursor_size = size;
+    }
     /// Derive the candidate again from the actual retained Device capture and
     /// current coherent RM catalog; callers cannot submit arbitrary timings.
     pub fn bootDisplayPlan(self: *Owner, root_handle: DisplayEngineHandle, window: u32) !boot_mode.Plan {
@@ -816,7 +942,8 @@ pub const Owner = struct {
         if (self.graph == null or self.graph.?.state != .loaned or self.display_object == null or self.channel == null or
             channel.session.state != .active or self.failure != null) return error.Busy;
         const snapshot = self.outputs.snapshot() orelse return error.Busy;
-        const bound = try boot_mode.bind(plan, snapshot, self.epoch, saved.boot.held_generation);
+        var bound = try boot_mode.bind(plan, snapshot, self.epoch, saved.boot.held_generation);
+        bound.cursor_size = info.cursor_size;
         return if (receiver_mode_id == 0) bound else @import("gsp_receiver_mode.zig").select(bound, snapshot, receiver_mode_id);
     }
     /// Carry the exact boot signal and primary position in one interlocked
@@ -845,6 +972,7 @@ pub const Owner = struct {
         try self.commitPositionedDisplayImage(core_handle, window_handle,
             .{ .epoch = self.epoch, .handle = position.config.handle, .slot = @intCast(slot) }, image_handle, plan.head, .{}, deadline);
         self.display_work.?.core.config.signal = plan.signal;
+        self.display_work.?.core.config.cursor_usage = plan.cursor_size;
         self.display_work.?.boot_mode = plan;
         self.display_work.?.mode_receipt = receipt;
         self.display_work.?.link = .{ .plan = link };
@@ -959,7 +1087,7 @@ pub const Owner = struct {
         const owner = try self.findDisplayChannel(handle);
         if (self.cursor_point != null) return error.Busy;
         const current = try self.now();
-        if (owner.config.kind != .cursor or owner.info() == null or self.display_work != null or self.display_upload_job != null or
+        if (owner.config.kind != .cursor or owner.info() == null or self.display_work != null or self.display_upload_job != null or self.cursor_upload != null or
             self.initial_image != null or self.graph_closing or self.sequence.self_address != 0 or self.channel == null or
             self.activeChannel() != &self.channel.? or self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         _ = try self.headSource(owner.config.index);
@@ -972,7 +1100,7 @@ pub const Owner = struct {
         const slot = self.cursor_point orelse return error.State;
         if (slot >= self.display_channels.len or self.display_channels[slot] == null or &self.display_channels[slot].? != owner or
             owner.config.kind != .cursor or owner.config.root.epoch != self.epoch or owner.info() == null or
-            !owner.point.valid(deadline) or self.display_work != null or self.display_upload_job != null or self.initial_image != null or
+            !owner.point.valid(deadline) or self.display_work != null or self.display_upload_job != null or self.cursor_upload != null or self.initial_image != null or
             self.graph_closing or self.sequence.self_address != 0 or self.channel == null or self.activeChannel() != &self.channel.? or
             self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Stale;
         _ = try self.headSource(owner.config.index);
@@ -1185,7 +1313,7 @@ pub const Owner = struct {
         self.log("NVIDIA gsp-present-image: retired={d} shadow=unmapped,import-released scanout=retained", .{dma});
         return true;
     }
-    fn deviceWorkBusy(self: *const Owner) bool { return self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.display_flip != null or self.initial_image != null or self.mode_control_active; }
+    fn deviceWorkBusy(self: *const Owner) bool { return self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.display_flip != null or self.initial_image != null or self.mode_control_active or self.cursor_upload != null; }
     fn copyBusy(self: *const Owner) bool { return self.deviceWorkBusy() or self.frame_ready != null; }
     fn overlapFlip(self: *const Owner) bool {
         const work = self.display_flip orelse return false;
@@ -1193,8 +1321,11 @@ pub const Owner = struct {
             (work.window.phase == .submitted or work.window.phase == .complete);
     }
     fn copyAdmissionBusy(self: *const Owner) bool {
-        return self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.initial_image != null or
+        return self.cursor_reserving or self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.initial_image != null or self.cursor_upload != null or
             self.mode_control_active or self.frame_ready != null or (self.display_flip != null and !self.overlapFlip());
+    }
+    pub fn cursorWorkAvailable(self: *Owner) bool {
+        return !self.copyBusy() and self.cursor_point == null and self.nativeObject() != null and !self.graph_closing;
     }
     /// The third image may render while a submitted ordinary flip waits.
     /// Neither of that flip's two images may be touched by this CE job.
@@ -1656,6 +1787,39 @@ pub const Owner = struct {
         }
         return .{ .source = addresses[0], .target = addresses[1], .bytes = job.byte_length };
     }
+    fn advanceCursorUpload(self: *Owner, current: u64) !bool {
+        const work = if (self.cursor_upload) |*value| value else return false;
+        try self.validateCursorUpload();
+        const fifo = try self.findChannel(work.channel);
+        if (work.operation.phase == .submitted) {
+            const point = try fifo.ring.poll();
+            if (point >= work.operation.ticket.?.point) {
+                try work.operation.complete(point);
+                if (work.operation.phase == .complete) {
+                    self.cursor_storage.?.uploaded[work.slot] = .{ .plan = work.operation.plan, .point = work.operation.last_point };
+                    self.cursor_upload = null;
+                }
+                return true;
+            }
+            if (current >= work.operation.deadline) return error.Timeout;
+            return false;
+        }
+        if (current >= work.operation.deadline) {
+            try work.operation.cancel(); self.cursor_storage.?.upload_error = error.Timeout; self.cursor_upload = null; return true;
+        }
+        if (work.operation.phase == .preparing) {
+            work.operation.prepare() catch |err| {
+                if (err == error.Descriptor or err == error.Retained) return err;
+                try work.operation.cancel(); self.cursor_storage.?.upload_error = err; self.cursor_upload = null;
+            };
+            return true;
+        }
+        if (self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return false;
+        work.operation.ticket = try fifo.prepareCopy(try work.operation.transfer());
+        try self.device.?.submitCopy(fifo, work.operation.ticket.?, work.operation.deadline);
+        try work.operation.submitted(work.operation.ticket.?);
+        return true;
+    }
     fn advanceDisplayUpload(self: *Owner, current: u64) !bool {
         const work = if (self.display_upload_job) |*value| value else return false;
         const resources = self.display_resources_slot.owner orelse return error.State;
@@ -1828,6 +1992,17 @@ pub const Owner = struct {
             if (window.phase != .complete) return progressed;
         }
         if (work.core.phase != .complete) return progressed;
+        if (work.cursor) |*cursor| {
+            try self.validateCursorCommit();
+            const observed = self.headObservation(cursor.control.head) catch |err| { if (err == error.Busy) return false; return err; };
+            if (cursor.baseline == null) { cursor.baseline = observed; cursor.completed_ns = current; return true; }
+            if (observed.sequence <= cursor.baseline.?.sequence or observed.observed_ns < cursor.completed_ns) return progressed;
+            const core = try self.findDisplayChannel(work.core.handle);
+            if (!try self.device.?.readCursorImageArmed(core, cursor.control, work.deadline)) return progressed;
+            const storage = &self.cursor_storage.?;
+            storage.active = if (cursor.control.visible) @intCast(cursor.control.offset / cursor_image.max_bytes) else null;
+            storage.control = cursor.control; storage.completed = cursor.sequence;
+        }
         if (work.position) |*position| {
             progressed = try self.advanceDisplayPosition(position, work.deadline, current) or progressed;
             if (position.phase != .complete) return progressed;
@@ -2399,6 +2574,7 @@ pub const Owner = struct {
                 try self.notification(channel, dispatch, current); return .progress;
             }
         }
+        if (try self.advanceCursorUpload(current)) return .progress;
         if (try self.advanceDisplayUpload(current)) return .progress;
         if (try self.advanceInitialImage(current)) return .progress;
         if (try self.advanceDisplay(current)) return .progress;
