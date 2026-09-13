@@ -42,6 +42,7 @@ var boot_storage: gsp_boot_storage.Storage = .{};
 var init_storage: gsp_init_storage.Storage = .{};
 var run_memory: gsp_run_memory.Lease = .{};
 var native_device: @import("gsp_device.zig").Device = .{};
+var native_hda: ?identity.Pci = null;
 var native_work: @import("gsp_start_work.zig").Work = .{};
 var firmware_logs: @import("gsp_logs.zig").Reader = .{};
 var firmware_log_words: [@import("gsp_logs.zig").output_bytes]u8 = undefined;
@@ -161,12 +162,15 @@ pub export fn nvidia_init(api: *const a.DriverApi) callconv(.c) i32 {
         };
         log("NVIDIA pci={x:0>2}:{x:0>2}.{x} id=10de:{x:0>4} subsystem={x:0>4}:{x:0>4} revision={x:0>2} command={x:0>4}", .{ pci.bus, pci.device, pci.function, pci.device_id, snapshot.subsystem_vendor, snapshot.subsystem_device, snapshot.revision, snapshot.command });
         var sibling_count: usize = 0;
+        native_hda = null;
         for (audio[0..audio_count]) |sibling| {
             if (!identity.isHdaSibling(pci, sibling)) continue;
             sibling_count += 1;
+            native_hda = sibling;
             log("NVIDIA hda={x:0>2}:{x:0>2}.{x} id=10de:{x:0>4} role=sibling receiver=unmeasured", .{ sibling.bus, sibling.device, sibling.function, sibling.device_id });
         }
         if (sibling_count == 0) ctx.logInfo("NVIDIA hda=absent receiver=unmeasured");
+        if (sibling_count != 1) native_hda = null;
         for (snapshot.bars, 0..) |bar, index| {
             log("NVIDIA bar={d} kind={s} raw={x:0>8} base={x} bytes={d} extent={s} prefetch={}", .{ index, @tagName(bar.kind), bar.raw, bar.base, bar.bytes, if (bar.bytes == 0) @as([]const u8, "unmeasured") else "rebar-current", bar.prefetchable });
         }
@@ -734,6 +738,7 @@ fn checkBoot(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Sna
             return false;
         };
         if (starting_native) native_device.native_output.frame_count = native_frame_count;
+        if (starting_native) if (native_hda) |sibling| native_device.native_output.audio.attach(&native_device.catalog, sibling);
         native_work.start(ctx, &native_device) catch |err| {
             log("NVIDIA gsp-start: rejected phase=worker reason={s} firmware-execution=disabled", .{@errorName(err)});
             return false;

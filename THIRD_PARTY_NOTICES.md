@@ -831,3 +831,14 @@ and hashes are archived under ExFiles/Reference/GFX/Nvidia/0.79.14/head-events-2
 Their complete original notices are retained in gsp_head_events.zig, the
 module runtime license and the identical distribution copy. Original R4OS
 IRQ ownership, bounded snapshots and integration remain Apache-2.0.
+
+
+HDMI audio / ELD (NVIDIA 0.1.101, 0.79.15):
+The RM control layouts and HDMI device-entry/port convention follow the MIT
+NVIDIA 570.144 sources pinned at 8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f.
+Full ctrl0073dfp.h, ctrl0073specific.h and nvkms-hdmi.c notices are preserved
+in the embedded and identical distribution runtime license. No previous
+license byte was changed. Five originals, original-header C payloads and
+hashes are archived under 0.79.15/hdmi-audio-20260913 in the GFX references.
+The C generator is host-only; firmware is unchanged. R4OS sequencing,
+metadata ownership and the ELD protocol encoder are original Apache-2.0 code.

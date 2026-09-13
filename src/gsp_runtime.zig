@@ -72,6 +72,7 @@ pub const PositionSubmission = struct {
 pub const DisplayPosition = struct { handle: DisplayChannelHandle, point: display_channel.push.commands.Point, sequence: u64 };
 pub const boot_mode = @import("gsp_boot_mode.zig");
 pub const hdmi_link = @import("gsp_hdmi_link.zig");
+pub const hdmi_audio = @import("gsp_hdmi_audio.zig");
 pub const DisplayLink = struct { plan: hdmi_link.Plan, acknowledged: u8, receipt: u64 };
 pub const DisplayWork = struct { core: DisplaySubmission, window: ?DisplaySubmission = null, position: ?PositionSubmission = null, deadline: u64, boot_mode: ?boot_mode.Plan = null, mode_receipt: u64 = 0, link: ?hdmi_link.Work = null, cursor: ?CursorCommit = null };
 pub const cursor_image = @import("gsp_cursor_image.zig");
@@ -207,6 +208,9 @@ pub const Owner = struct {
     frame_ready: ?struct { image: *Presentation, deadline: u64 } = null,
     require_mode_receipt: bool = false,
     initial_image: ?InitialImage = null,
+    audio_work: ?hdmi_audio.Work = null,
+    audio_result: ?hdmi_audio.Result = null,
+    audio_sequence: u64 = 0,
     cursor_storage: ?CursorStorage = null,
     cursor_upload: ?CursorUpload = null,
     cursor_reserving: bool = false,
@@ -452,7 +456,7 @@ pub const Owner = struct {
     }
     pub fn nativeObject(self: *Owner) ?display.Object {
         if (self.self_address != @intFromPtr(self) or self.failure != null or self.graph == null or
-            self.display_upload_job != null or self.display_work != null or self.display_flip != null or self.cursor_point != null or self.cursor_upload != null or
+            self.display_upload_job != null or self.display_work != null or self.display_flip != null or self.cursor_point != null or self.cursor_upload != null or self.audio_work != null or
             self.graph.?.self_address != @intFromPtr(&self.graph.?) or self.graph.?.state != .loaned or
             self.display_object == null or self.channel == null or self.activeChannel() != &self.channel.? or
             self.channel.?.session.state != .active) return null;
@@ -1313,7 +1317,7 @@ pub const Owner = struct {
         self.log("NVIDIA gsp-present-image: retired={d} shadow=unmapped,import-released scanout=retained", .{dma});
         return true;
     }
-    fn deviceWorkBusy(self: *const Owner) bool { return self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.display_flip != null or self.initial_image != null or self.mode_control_active or self.cursor_upload != null; }
+    fn deviceWorkBusy(self: *const Owner) bool { return self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.display_flip != null or self.initial_image != null or self.mode_control_active or self.cursor_upload != null or self.audio_work != null; }
     fn copyBusy(self: *const Owner) bool { return self.deviceWorkBusy() or self.frame_ready != null; }
     fn overlapFlip(self: *const Owner) bool {
         const work = self.display_flip orelse return false;
@@ -1321,11 +1325,62 @@ pub const Owner = struct {
             (work.window.phase == .submitted or work.window.phase == .complete);
     }
     fn copyAdmissionBusy(self: *const Owner) bool {
-        return self.cursor_reserving or self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.initial_image != null or self.cursor_upload != null or
+        return self.cursor_reserving or self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.initial_image != null or self.cursor_upload != null or self.audio_work != null or
             self.mode_control_active or self.frame_ready != null or (self.display_flip != null and !self.overlapFlip());
     }
     pub fn cursorWorkAvailable(self: *Owner) bool {
         return !self.copyBusy() and self.cursor_point == null and self.nativeObject() != null and !self.graph_closing;
+    }
+    pub fn beginHdmiAudio(self: *Owner, plan: hdmi_audio.Plan, operation: hdmi_audio.Operation, deadline: u64) !u64 {
+        if (!self.cursorWorkAvailable() or self.channel.?.phase != .idle) return error.Busy;
+        if (deadline <= try self.now() or self.audio_sequence == std.math.maxInt(u64)) return error.Deadline;
+        const expected = try hdmi_audio.derive(plan.mode, self.display_object.?, self.outputs.snapshot() orelse return error.Stale);
+        if (!std.meta.eql(plan, expected)) return error.Stale;
+        var encoded: [hdmi_audio.max_bytes]u8 = undefined;
+        _ = try hdmi_audio.encode(plan, operation, &encoded);
+        self.audio_sequence += 1;
+        self.audio_work = .{ .plan = plan, .operation = operation, .sequence = self.audio_sequence, .deadline = deadline };
+        errdefer self.audio_work = null;
+        try self.validateHdmiAudio();
+        return self.audio_sequence;
+    }
+    pub fn validateHdmiAudio(self: *Owner) !void {
+        const work = self.audio_work orelse return error.State;
+        if (self.failure != null or self.graph_closing or self.display_object == null or !std.meta.eql(work.plan.object, self.display_object.?) or
+            work.plan.object.epoch != self.epoch or self.activeChannel() != &self.channel.? or self.display_work != null or
+            self.display_flip != null or self.cursor_point != null) return error.Stale;
+        // Invalidate/mute is also valid before the initial scanout. Enabling
+        // requires an actually completed video mode, including its HDMI ACKs.
+        if (work.operation == .publish or work.operation == .unmute) {
+            const engine = if (self.display_engine_owner) |*value| value else return error.State;
+            const image = try self.displayImageStatus(.{ .epoch = self.epoch, .root = engine.binding.root }, work.plan.mode.window) orelse return error.State;
+            if (image.boot_mode == null or !std.meta.eql(image.boot_mode.?, work.plan.mode) or image.core_point == 0 or
+                image.window_point == 0 or image.link == null or image.link.?.receipt == 0 or image.link.?.acknowledged != 7) return error.Stale;
+        }
+    }
+    fn advanceHdmiAudio(self: *Owner, current: u64) !Progress {
+        const work = &self.audio_work.?;
+        const channel = &self.channel.?;
+        try self.validateHdmiAudio();
+        if (current >= work.deadline) return error.Timeout;
+        if (!work.pending) {
+            work.length = try hdmi_audio.encode(work.plan, work.operation, &work.request);
+            try channel.begin(hdmi_audio.function, work.request[0..work.length], work.deadline);
+            work.pending = true;
+            return .progress;
+        }
+        if (try channel.poll(work.deadline)) |dispatch| {
+            if (!dispatch.response) { try self.notification(channel, dispatch, current); return .progress; }
+            const reply = try hdmi_audio.decode(work.plan, work.operation, dispatch.record);
+            try channel.complete(dispatch.ticket);
+            self.audio_result = .{ .sequence = work.sequence, .operation = work.operation, .receipt = dispatch.ticket.serial,
+                .status = reply.status, .rpc_error = reply.rpc_error };
+            if (reply.status != 0) self.log("NVIDIA HDMI audio: operation={s} status={x} rpc={} video=preserved",
+                .{@tagName(work.operation), reply.status, reply.rpc_error});
+            self.audio_work = null;
+            return .progress;
+        }
+        return if (channel.phase == .waiting) .idle else .progress;
     }
     /// The third image may render while a submitted ordinary flip waits.
     /// Neither of that flip's two images may be touched by this CE job.
@@ -2566,6 +2621,7 @@ pub const Owner = struct {
         if (self.display_work) |*work| if (work.link) |*link| {
             if (link.phase == .before_scanout or link.phase == .after_scanout) return self.advanceDisplayLink(current);
         };
+        if (self.audio_work != null) return self.advanceHdmiAudio(current);
         // Drain an already observable GSP fault before publishing CE success.
         // Active RPC owners above already receive before sending their work.
         if ((self.copyBusy() or self.cursor_point != null) and channel.phase == .idle) {

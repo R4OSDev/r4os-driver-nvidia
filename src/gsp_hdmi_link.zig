@@ -244,7 +244,7 @@ pub fn encode(plan: Plan, op: Operation, bytes: *[max_bytes]u8) !usize {
     switch (op) {
         .caps => put(params, 8, plan.caps),
         .enable => params[8] = @intFromBool(plan.mode.transport_hdmi),
-        .audio_mute => params[8] = 1, // Audio programming belongs to its later owner.
+        .audio_mute => params[8] = 1, // The audio owner enables PCM after this modeset completes.
         .hdr_disable => put(params, 8, 0x87),
         .vsi => if (plan.hdmi_vic == 0) { put(params, 8, 0x81); },
         .avi, .gcp => {},

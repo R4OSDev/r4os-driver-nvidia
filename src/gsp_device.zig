@@ -491,6 +491,9 @@ pub const Device = struct {
             const link = if (work.link) |*value| value else return error.Binding;
             if (channel != &self.running.channel.? or work.deadline != deadline or !link.matches(channel, deadline)) return error.Binding;
             self.running.validateDisplayLink() catch return error.Binding;
+        } else if (self.running.audio_work) |*work| {
+            if (channel != &self.running.channel.? or !work.matches(channel, deadline)) return error.Binding;
+            self.running.validateHdmiAudio() catch return error.Binding;
         } else if (self.running.graph) |*graph| {
             if (!graph.matches(channel, deadline)) return error.Binding;
         } else if (self.running.static_info == null) {

@@ -71,6 +71,7 @@ pub const Owner = struct {
     restore_requested: bool = false,
     modes: @import("gsp_native_modes.zig").Owner = .{},
     cursor: @import("gsp_native_cursor.zig").Owner = .{},
+    audio: @import("gsp_native_audio.zig").Owner = .{},
     frame_count: u8 = 2,
     statistics: @import("gsp_frame_stats.zig").Owner = .{},
 
@@ -363,6 +364,7 @@ pub const Owner = struct {
             },
             .scanout_commit => {
                 try self.validateRoute();
+                if (!try self.audio.beforeInitial(self)) return false;
                 try run.commitBootDisplayImage(self.core.?, self.window.?, self.dma, self.phase_deadline);
                 self.next(.scanout_wait);
             },
@@ -394,6 +396,8 @@ pub const Owner = struct {
                 if (run.frame_setup != null) return run.prepareFramePool();
                 if (try self.cursor.step(self)) return true;
                 if (self.cursor.busy()) return false;
+                if (try self.audio.step(self)) return true;
+                if (self.audio.busy()) return false;
                 if (try self.modes.step(self)) return true;
                 if (self.modes.phase == .idle or self.modes.phase == .decision or self.modes.phase == .unavailable)
                     return run.prepareFramePool();
@@ -467,6 +471,7 @@ pub const Owner = struct {
     pub fn quarantine(self: *Owner, err: anyerror) void {
         if (self.phase == .detached) return;
         self.cursor.quarantine(self, err);
+        self.audio.quarantine(self, err);
         self.modes.quarantine(self, err);
         if (self.failure == null) { self.failure = err; self.failed_phase = self.phase; }
         self.phase = .failed;

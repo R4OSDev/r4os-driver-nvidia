@@ -1412,14 +1412,21 @@ const CatalogModel = struct {
     var invalidations: usize = 0;
     var first: a.GfxReceiverInfo = .{};
     var last: a.GfxReceiverInfo = .{};
+    var audio: ?a.GfxAudioRoute = null;
+    var audio_busy: bool = true;
+    var audio_reject: bool = false;
+    var audio_muted: bool = true;
+    var audio_eld: [96]u8 = @splat(0);
     fn query(output: *a.GfxDriverOutputApi) callconv(.c) i32 {
         output.* = if (legacy) .{ .size = 24 } else .{ .register_source = @intFromPtr(&register),
-            .replace_receivers = @intFromPtr(&replace), .close_source = @intFromPtr(&close) };
+            .replace_receivers = @intFromPtr(&replace), .close_source = @intFromPtr(&close),
+            .audio_publish = @intFromPtr(&publishAudio), .audio_query = @intFromPtr(&queryAudio) };
         return a.gfx_output_ok;
     }
     fn register(adapter: u32, output: *a.GfxReceiverSource) callconv(.c) i32 {
         std.debug.assert(!active and adapter == 0x01000000);
         serial += 1; active = true; count = 0; sequence = 0; invalidations = 0;
+        audio = null; audio_busy = true; audio_reject = false; audio_muted = true; audio_eld = @splat(0);
         output.* = .{ .adapter_id = adapter, .generation = serial };
         return a.gfx_output_ok;
     }
@@ -1429,6 +1436,7 @@ const CatalogModel = struct {
         if (reject) return a.gfx_output_error_capacity;
         if (input.count == 0 and count != 0) invalidations += 1;
         sequence = input.sequence; count = input.count;
+        if (audio) |*route| { route.receiver_sequence = sequence; route.state = a.gfx_audio_route_pending; route.eld_bytes = 0; route.eld = @splat(0); }
         if (count != 0) {
             const records: [*]const a.GfxReceiverInfo = @ptrFromInt(input.receivers);
             first = records[0]; last = records[count - 1];
@@ -1440,7 +1448,21 @@ const CatalogModel = struct {
         if (!active and input.generation == serial) return a.gfx_output_error_stale;
         std.debug.assert(active and input.generation == serial);
         active = false; count = 0;
+        audio = null;
         return a.gfx_output_ok;
+    }
+    fn publishAudio(input: *const a.GfxAudioRoute) callconv(.c) i32 {
+        std.debug.assert(active and input.source.generation == serial and input.receiver_sequence == sequence);
+        if (audio_busy) { audio_busy = false; return a.gfx_output_error_busy; }
+        if (audio) |previous| std.debug.assert(input.revision > previous.revision);
+        if (input.state == a.gfx_audio_route_ready) std.debug.assert(!audio_muted and std.mem.eql(u8, &audio_eld, &input.eld));
+        audio = input.*;
+        return a.gfx_output_ok;
+    }
+    fn queryAudio(location: u32, device: u32, index: u32, output: *a.GfxAudioRoute) callconv(.c) i32 {
+        const route = audio orelse return 0;
+        if (index != 0 or route.hda_location != location or route.hda_device != device) return 0;
+        output.* = route; return 1;
     }
 };
 
@@ -3282,6 +3304,11 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
     run.output_next_ns = clock + std.time.ns_per_s; run.outputs.invalidated = false;
     if (NativeCommon.is("context_native_connected") or NativeCommon.hasModes()) try @import("gsp_receiver_mode_test.zig").install(&run.outputs.data.receivers[0]);
     try target.native_output.request(&target.ctx.?, run, captured);
+    if (NativeCommon.is("context_native_connected")) {
+        @import("gsp_hdmi_audio_test.zig").install(&run.outputs.data.receivers[0].report);
+        target.native_output.audio.attach(&target.catalog, .{ .bus_kind = 1, .bus = 0, .device = 0, .function = 1,
+            .vendor_id = 0x10de, .device_id = 0x228e, .class_code = 4, .subclass = 3, .prog_if = 0 });
+    }
     if (NativeCommon.is("context_native_unknown") or NativeCommon.is("context_native_frame_timeout"))
         target.native_output.frame_count = try @import("gsp_native_output.zig").frameCount("3");
     var counts: FifoCounts = .{};
@@ -3398,8 +3425,14 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
             _ = target.stop(); return;
         }
         if (NativeCommon.is("context_native_connected")) {
+            checkpoint = "initial HDMI audio";
+            try t.expect(CatalogModel.audio.?.state == a.gfx_audio_route_pending and CatalogModel.audio_muted);
+            try pumpNativeAudio(target);
+            try t.expect(CatalogModel.audio.?.state == a.gfx_audio_route_ready);
             checkpoint = "receiver mode switch";
             try checkReceiverModeSwitch(target);
+            checkpoint = "HDMI audio owner";
+            try checkNativeAudio(target);
             checkpoint = "live image table";
             try checkLiveDisplayTable(target);
             checkpoint = "native Window flip";
@@ -3559,6 +3592,48 @@ fn checkCommonCursor(target: *@import("gsp_device.zig").Device) !void {
     try t.expect(product.cursor.image_sequence == 0 and product.cursor.image_slot == null and run.cursor_storage.?.active == null and
         run.frames_rendered == copies and run.flip_issued == flips);
     try t.expectEqualDeep(statistics, NativeCommon.statistics);
+}
+fn checkNativeAudio(target: *@import("gsp_device.zig").Device) !void {
+    const run = &target.running; const product = &target.native_output;
+    const initial = run.display_images[product.mode.?.window].?;
+    try pumpNativeAudio(target);
+    const first = CatalogModel.audio.?;
+    try t.expect(first.state == a.gfx_audio_route_ready and first.eld_bytes == 96 and first.head_id == initial.head and
+        first.device_entry == 0 and first.port_id[0] == 4 and !CatalogModel.audio_muted);
+    try t.expect(first.source.generation == target.catalog.binding.generation and first.receiver_sequence == target.catalog.sequence);
+    const tx = target.session.?.tx_sequence;
+    clock += 1000; _ = target.step();
+    try t.expect(target.session.?.tx_sequence == tx and CatalogModel.audio.?.revision == first.revision);
+    // A mode-owner job is the producer input to this audio consumer. The
+    // actual mode-job consumer is separately exercised below in this group.
+    const saved_phase = product.modes.phase;
+    product.modes.phase = .unavailable;
+    product.modes.job = .{ .operation = a.gfx_mode_operation_apply };
+    try pumpNativeAudio(target);
+    try t.expect(CatalogModel.audio.?.state == a.gfx_audio_route_pending and CatalogModel.audio_muted and
+        std.mem.allEqual(u8, &CatalogModel.audio_eld, 0) and run.failure == null);
+    product.modes.job = null;
+    try pumpNativeAudio(target);
+    try t.expect(CatalogModel.audio.?.state == a.gfx_audio_route_ready and CatalogModel.audio.?.revision > first.revision);
+    // A known RM rejection is consumed once and leaves video operational.
+    CatalogModel.audio_reject = true;
+    product.audio.settled = false;
+    try pumpNativeAudio(target);
+    try t.expect(product.audio.phase == .failed and CatalogModel.audio.?.state == a.gfx_audio_route_failed and
+        CatalogModel.audio_muted and run.failure == null and target.phase == .ready);
+    try t.expect(std.meta.eql(initial, run.display_images[product.mode.?.window].?));
+    CatalogModel.audio_reject = false;
+    product.modes.phase = saved_phase;
+    product.audio = .{}; // This case continues with independent display ownership checks.
+}
+fn pumpNativeAudio(target: *@import("gsp_device.zig").Device) !void {
+    for (0..120) |_| {
+        clock += 1000; _ = target.step();
+        try t.expect(target.phase == .ready);
+        if (target.native_output.audio.settled) return;
+        if (target.running.activeChannel()) |channel| if (channel.phase == .waiting) try replyNativeProduct(target);
+    }
+    return error.AudioDeadline;
 }
 fn checkNativeCursor(target: *@import("gsp_device.zig").Device) !void {
     const run = &target.running; const product = &target.native_output;
@@ -4775,6 +4850,17 @@ fn replyNativeProduct(target: *@import("gsp_device.zig").Device) !void {
         const bytes = try @import("gsp_hdmi_link_test.zig").reference(link.operation, link.plan);
         @memcpy(response[24..rpc.request.len], bytes[24..]);
         if (link.operation == .gcp and NativeCommon.is("context_native_link_reject")) outputWord(&response, 12, 0x57);
+    } else if (run.audio_work) |*work| {
+        const expected = @import("gsp_hdmi_audio_test.zig").reference(work.operation);
+        try t.expectEqualSlices(u8, expected[24..], rpc.request[24..]);
+        if (work.operation == .publish and CatalogModel.audio_reject) {
+            outputWord(&response, 12, 0x57);
+        } else switch (work.operation) {
+            .mute => CatalogModel.audio_muted = true,
+            .clear => CatalogModel.audio_eld = @splat(0),
+            .publish => @memcpy(&CatalogModel.audio_eld, rpc.request[36..132]),
+            .unmute => CatalogModel.audio_muted = false,
+        }
     } else return error.Unexpected;
     std.mem.writeInt(u32, backing.?[init.queues_offset + init.status_offset + 64..][0..4], session.tx_write, .little);
     try nativeReply(session, rpc.function, 0, response[0..rpc.request.len]);

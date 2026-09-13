@@ -1,30 +1,15 @@
-﻿NVIDIA: passiver Besitzer fuer 0.79.9
-===================================
+﻿NVIDIA: nativer Grafik- und Displaybesitzer
+=========================================
 
-Stand: 13.09.2026, NVIDIA 0.1.96. 0.79.13 ist softwareseitig abgeschlossen.
-0.79.14 ist begonnen: Der vorhandene IRQ-Besitzer bindet nach nativer
-Uebernahme den gemeldeten Display-Stall-Vektor und LAST_DATA des aktiven
-Heads an. Monotone Beobachtungssequenz, IRQ-Zeitstempel und GPU-Frame-/
-Zeilenzaehler bleiben zusammenhaengend lesbar. Der Worker protokolliert
-das erste echte Ereignis; DISPLAYD /NVIDIA head-events liest es per SSH.
-Der IRQ veraendert keine BOs, verarbeitet keine RM-Queue und schreibt
-keine Logs. Gemeinsame GSP-/Displayzustellung weckt einmal. Unbekannte
-Ursachen bleiben unveraendert und sperren weitere Zustellung; der Abbau
-entfernt nur eigene Head-Enablebits und wartet auf den IRQ-Besitzer.
-Die bestehende Device-Pruefung deckt zwei Heads, leere Statusregister,
-Hardwarezaehler-Umlauf, gemeinsame Zustellung und Fehlerabbau ab.
-Ein eigener Window-Flip uebernimmt bereits CE-fertige, inaktive Bilder
-gleicher Geometrie ohne Core-/Takt-/HDMI-Neuprogrammierung. Window BEGUN und
-ein nach PUT beobachtetes Head-Ereignis bestaetigen den neuen Scanout;
-erst das alte FINISHED erlaubt Wiederverwendung. GPU- und CPU-Zeiten bleiben
-getrennt. Ein ausstehender Flip sperrt konkurrierende Arbeit. Fehlendes IRQ,
-BEGUN oder FINISHED fuehrt an der Deadline zum behaltenen Fehlerzustand.
-Die bestehende Device-Gruppe prueft Hin-/Rueckwechsel und diese Fehler.
-Der Einstieg ist noch an die normale Present-Pufferverwaltung anzubinden.
-Deren aktuelle Direktkopie/Fence bleibt erhalten; Zwei-/Dreifachpuffer,
-gemeinsame sichtbare Presentstatistik und Hardwarecursor bleiben offen.
-Beleg: Docs/Drivers/GrafikPraesentation07914.txt/.json.
-
+Stand: 13.09.2026, NVIDIA 0.1.101. 0.79.14 ist softwareseitig abgeschlossen:
+VBlank/Flips, zwei/drei Present-Puffer, sichtbare Statistik und Hardwarecursor
+sind an Kernel und Desktop angebunden. 0.79.15 ergaenzt generationstreue
+HDMI-ELD-/Audiofreigabe und HDA-Zuordnung. Stereo-PCM benoetigt vollstaendige
+CTA-Daten und bestaetigte Display-/ELD-/Audioquittungen. Physische GPU-/Ton-
+abnahme bleibt offen in ExFiles/Reports/OssiGPU.txt. Aktuelle Vertraege und
+Belege: Docs/Drivers/GrafikPraesentation07914.txt/.json und
+Docs/Drivers/GrafikAudio07915.txt/.json. Automatische Hotplug-Wiederkehr folgt
+in 0.79.16; bootfb bleibt der dauerhafte Fallback.
 OPTION NVIDIA mode=native verbindet Bootmodus, gesicherte
 RAM-Pixel, eigene CE-/Displayressourcen und den gemeinsamen Displaybesitz.
 Empfaengermodi werden aus echter EDID abgeleitet und mit frischen

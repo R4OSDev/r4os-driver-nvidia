@@ -27,6 +27,7 @@ pub fn check() !void {
     try checkBootMode();
     try @import("gsp_receiver_mode_test.zig").check();
     try @import("gsp_hdmi_link_test.zig").check();
+    try @import("gsp_hdmi_audio_test.zig").check();
     try checkPosition();
     try @import("gsp_cursor_image_test.zig").check();
 }

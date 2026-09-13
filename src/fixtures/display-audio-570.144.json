@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "source_pin": "8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f",
+  "source_headers": [
+    "src/common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073dfp.h",
+    "src/common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073specific.h"
+  ],
+  "generator": "ExFiles/Reference/GFX/Nvidia/0.79.15/hdmi-audio-20260913/Audio-Reference.c",
+  "operations": [
+    "mute",
+    "clear",
+    "publish",
+    "unmute"
+  ],
+  "eld_size": 96,
+  "eld_params_size": 120,
+  "mute_params_size": 12,
+  "device_entry": 0,
+  "bytes": 396,
+  "sha256": "e9a07c5bd7673f7d90382105b6cc60b39923957c901ebab202b6586e0d09edc2",
+  "license": "MIT NVIDIA headers; complete notices in NVIDIA-GSP-RUNTIME-LICENSE.txt"
+}
