@@ -5,6 +5,11 @@ const wire = @import("gsp_vram_wire.zig");
 const message = @import("gsp_message.zig");
 const backing = @import("gsp_native_backing.zig");
 pub fn check() !void {
+    const allocation = @import("gsp_allocation.zig");
+    // A near application timeout must not shorten an admitted RM operation.
+    try t.expectEqual(@as(u64, 5_000_000_010), try allocation.operationDeadline(10, 11));
+    try t.expectError(error.Timeout, allocation.operationDeadline(11, 11));
+    try t.expectError(error.Overflow, allocation.operationDeadline(std.math.maxInt(u64) - 1, std.math.maxInt(u64)));
     const binding: wire.Binding = .{ .space = .{ .epoch = 7, .client = 0xc1d00000, .device = 0x10000000,
         .handle = 0x10000006, .base = 0x200000, .bytes = 0x100000000, .big_page_bytes = 65536 }, .memory = 0x10000007, .virtual = 0x10000008 };
     var policy: backing.Policy = .{ .capabilities = .{ .binding = .{ .epoch = 7, .client = binding.space.client, .device = binding.space.device }, .raw = .{0,0,2} }, .physical_bytes = 0x100000000 };

@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.104; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.105; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -11,6 +11,15 @@ Starting with R4OS 0.79.9, `IMAGE_SCOPE=slim` includes the current module in
 Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
+
+Native allocation (0.79.19 partial): once the RM address space is ready, the
+existing worker registers a common native BO provider. Applications can request
+raw transfer storage or linear/blocklinear offscreen images; R4GFX exposes image creation. Copied requests bind
+the adapter and memory epoch; existing RM allocation and release tickets own
+the backing. Application expiry is separate from the finite five-second RM
+budget. Completion transfers a reference before closing the driver's initial
+reference. Public scanout creation and GR rendering remain unimplemented;
+physical allocation/copy validation remains open in OssiGPU.txt /19.
 
 Copy Engine integration (0.79.18): canonical row jobs cover RAM-to-VRAM,
 VRAM-to-VRAM and readback, including pitched/blocklinear conversion. R4NV owns

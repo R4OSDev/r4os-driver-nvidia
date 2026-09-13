@@ -233,6 +233,7 @@ pub const Owner = struct {
     mapping_evictions: u64 = 0,
     native_buffers: [256]NativeBufferSlot = @splat(.{}),
     native_active: ?u16 = null,
+    allocations: @import("gsp_allocation.zig").Owner = .{},
     fifos: [64]ChannelSlot = @splat(.{}),
     fifo_active: ?u16 = null,
     copy_job: ?CopyJob = null,
@@ -302,6 +303,7 @@ pub const Owner = struct {
     /// existing RM/session resources. It is not physical GPU quiescence.
     pub fn stop(self: *Owner, err: anyerror) void {
         if (self.self_address == 0 or self.self_address != @intFromPtr(self) or self.failure != null) return;
+        self.allocations.close();
         if (self.faults.first_fatal == null and err != error.Stopped and err != error.RmClosed)
             self.recordFault(diagnostics.host(.teardown, err, true)) catch {};
         self.outputs.invalidate() catch {};

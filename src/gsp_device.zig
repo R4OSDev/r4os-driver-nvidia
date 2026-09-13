@@ -224,6 +224,7 @@ pub const Device = struct {
                 } else try self.catalog.invalidate();
             }
             const output_progress = try self.native_output.step();
+            const allocation_progress = try self.running.allocations.step(&self.running);
             if (self.native_output.phase == .active and self.interrupts.display.epoch == 0) {
                 const root = (try self.running.displayEngineStatus(self.native_output.engine.?)).info orelse return error.State;
                 const head = self.native_output.mode.?.head;
@@ -247,7 +248,7 @@ pub const Device = struct {
                     "NVIDIA head-events: head={d} epoch={d} sequence={d} observed-ns={d} frame-counter={d} scanline={d}",
                     .{index,self.epoch,sample.sequence,sample.observed_ns,sample.frame_counter,sample.scanline});
             };
-            return progress or output_progress;
+            return progress or output_progress or allocation_progress;
         }
         if (try self.now() >= self.deadline) return error.Deadline;
         switch (self.phase) {
