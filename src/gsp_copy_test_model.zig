@@ -14,6 +14,12 @@ pub const Model = struct {
     pub var host: [2][length]u8 = undefined;
     var gpu_data: [2][length]u8 = undefined;
     pub var vram_data: [65536]u8 = undefined;
+    pub var replacement_vram: [65536]u8 = undefined;
+    var replacement_native: ?usize = null;
+    var replacement_descriptor: ?a.GfxBufferDescriptor = null;
+    pub var replacement_lent = false;
+    pub var borrowed_releases: usize = 0;
+    var initial_index: usize = 0;
     var command_view: [length]u8 = undefined;
     pub var dma: [2]a.GfxDeviceLease = @splat(.{});
     pub var gpu: [2]a.GfxDeviceLease = @splat(.{});
@@ -51,9 +57,11 @@ pub const Model = struct {
         present_mode = false; product_mode = false; shadow_cpu = false; shadow_creates = 0;
         shadow_live = false; registration = null; decoded_count = 0; presentation_wakes = 0;
         initial_read = .{}; reject_initial_read = false; reject_initial_release = false;
+        replacement_native = null; replacement_descriptor = null; replacement_lent = false; borrowed_releases = 0; initial_index = 0;
         app_reference = true; native.slots[index].imported = true; // Separate app alias, independent of the allocator's producer reference.
         for (0..2) |i| { @memset(&host[i], 0xa5); @memset(&gpu_data[i], 0x5a); }
         @memset(&vram_data, 0xcc);
+        @memset(&replacement_vram, 0xcc);
     }
     pub fn installPresentation(table: *a.DriverApi, index: usize, width: u32, height: u32) void {
         install(table, index); present_mode = true; shadow_live = true;
@@ -69,6 +77,24 @@ pub const Model = struct {
         present_mode = true; product_mode = true;
     }
     pub fn shadowReference() a.GfxBufferHandle { return .{ .id = 1499, .generation = 951 }; }
+    fn replacementReference() a.GfxBufferHandle { return .{ .id = 1497, .generation = 951 }; }
+    pub fn lendReplacement(index: usize, width: u32, height: u32) a.GfxBufferReference {
+        std.debug.assert(product_mode and !replacement_lent and index != native_index and
+            dma[1].lease.id == 0 and gpu[1].lease.id == 0 and @as(u64, width) * height * 4 <= length);
+        for (references) |entry| std.debug.assert(!entry.active or !std.meta.eql(entry.buffer, sys(1)));
+        replacement_native = index; replacement_lent = true;
+        replacement_descriptor = .{ .byte_length = @as(u64, width) * height * 4, .alignment = 4096,
+            .width = width, .height = height, .format = a.gfx_buffer_format_xrgb8888, .plane_count = 1,
+            .plane_pitches = .{ @as(u64, width) * 4, 0, 0, 0 }, .usage = 38 };
+        @memset(&replacement_vram, 0xcc);
+        return .{ .buffer = sys(1), .reference = replacementReference() };
+    }
+    fn descriptor(index: usize) a.GfxBufferDescriptor { return if (index == 0) shadow_descriptor else replacement_descriptor.?; }
+    pub fn replacementReferences() usize {
+        var n: usize = 0;
+        for (references) |entry| if (entry.active and std.meta.eql(entry.buffer, sys(1))) { n += 1; };
+        return n;
+    }
     pub fn closeShadow() void { shadow_live = false; }
     pub fn wakePresentation(raw: usize) i32 {
         const target: *@import("gsp_device.zig").Device = @ptrFromInt(raw);
@@ -76,9 +102,12 @@ pub const Model = struct {
         presentation_wakes += 1; return 0;
     }
     pub fn enqueuePresent(x: u32, y: u32, width: u32, height: u32) !void {
+        return enqueuePresentFrom(0, x, y, width, height);
+    }
+    pub fn enqueuePresentFrom(index: usize, x: u32, y: u32, width: u32, height: u32) !void {
         enqueue(false);
-        job.source_buffer = sys(0); job.target_buffer = .{}; job.target_offset = 0;
-        const pitch = shadow_descriptor.plane_pitches[0];
+        job.source_buffer = sys(index); job.target_buffer = .{}; job.target_offset = 0;
+        const pitch = descriptor(index).plane_pitches[0];
         job.source_offset = y * pitch + x * 4; job.byte_length = (height - 1) * pitch + width * 4;
         const registered = registration orelse return error.State;
         const callback: *const fn (usize) callconv(.c) i32 = @ptrFromInt(registered.notify_callback);
@@ -184,29 +213,37 @@ pub const Model = struct {
         std.debug.assert(shadow_live and shadow_cpu); shadow_cpu = false; return a.gfx_buffer_result_ok;
     }
     fn describe(input: *const a.GfxBufferHandle, out: *a.GfxBufferDescriptor) callconv(.c) i32 {
+        if (replacement_lent and std.meta.eql(input.*, replacementReference())) {
+            out.* = replacement_descriptor.?; return a.gfx_buffer_result_ok;
+        }
         if (present_mode and std.meta.eql(input.*, shadowReference())) {
             std.debug.assert(shadow_live); out.* = shadow_descriptor; return a.gfx_buffer_result_ok;
         }
         const index = select(input.*) orelse { const call: *const fn (*const a.GfxBufferHandle, *a.GfxBufferDescriptor) callconv(.c) i32 = @ptrFromInt(original.buffer_describe); return call(input, out); };
         const entry = references[index]; std.debug.assert(entry.active);
-        out.* = if (present_mode and system(entry.buffer) != null) shadow_descriptor else if (system(entry.buffer) != null) .{ .byte_length = length - 5, .alignment = 4096, .usage = 15 }
+        out.* = if (present_mode and system(entry.buffer) != null) descriptor(system(entry.buffer).?) else if (system(entry.buffer) != null) .{ .byte_length = length - 5, .alignment = 4096, .usage = 15 }
             else native.slots[native_index].descriptor;
         return a.gfx_buffer_result_ok;
     }
     fn importBuffer(input: *const a.GfxBufferHandle, out: *a.GfxBufferReference) callconv(.c) i32 {
         const own = if (select(input.*)) |index| references[index].active and !references[index].mapping_only and
-            std.meta.eql(references[index].buffer, sys(0)) else false;
-        if (!present_mode or (!std.meta.eql(input.*, shadowReference()) and !own)) {
+            system(references[index].buffer) != null else false;
+        const replacement = replacement_lent and std.meta.eql(input.*, replacementReference());
+        if (!present_mode or (!std.meta.eql(input.*, shadowReference()) and !own and !replacement)) {
             const call: *const fn (*const a.GfxBufferHandle, *a.GfxBufferReference) callconv(.c) i32 = @ptrFromInt(original.buffer_import); return call(input, out);
         }
-        std.debug.assert(shadow_live or own);
+        std.debug.assert(shadow_live or own or replacement);
+        const buffer = if (own) references[select(input.*).?].buffer else sys(@intFromBool(replacement));
         for (&references, 0..) |*entry, i| if (!entry.active) {
-            entry.* = .{ .active = true, .buffer = sys(0), .mapping_only = false };
+            entry.* = .{ .active = true, .buffer = buffer, .mapping_only = false };
             out.* = .{ .reference = ref(i), .buffer = entry.buffer }; return a.gfx_buffer_result_ok;
         };
         return a.gfx_buffer_error_capacity;
     }
     fn drop(input: *const a.GfxBufferHandle) callconv(.c) i32 {
+        if (std.meta.eql(input.*, replacementReference())) {
+            borrowed_releases += 1; return a.gfx_buffer_error_invalid;
+        }
         if (product_mode and std.meta.eql(input.*, shadowReference())) {
             std.debug.assert(shadow_live and !shadow_cpu); shadow_live = false; return a.gfx_buffer_result_ok;
         }
@@ -220,18 +257,18 @@ pub const Model = struct {
             return call(input, request, out);
         }; const entry = references[index]; const i = system(entry.buffer).?;
         if (request.access == 0) {
-            std.debug.assert(present_mode and !shadow_cpu and entry.active and !entry.mapping_only and i == 0 and initial_read.lease.id == 0 and
-                !active and !queued and request.byte_offset == 0 and request.byte_length == shadow_descriptor.byte_length and
-                dma[0].lease.id != 0 and request.gpu_virtual_address == address(0) and request.address_space == 1);
+            std.debug.assert(present_mode and !shadow_cpu and entry.active and !entry.mapping_only and initial_read.lease.id == 0 and
+                !active and !queued and request.byte_offset == 0 and request.byte_length == descriptor(i).byte_length and
+                dma[i].lease.id != 0 and request.gpu_virtual_address == address(i) and request.address_space == 1);
             if (reject_initial_read) return a.gfx_buffer_error_busy;
             out.* = .{ .lease = .{ .id = 1799, .generation = 991 }, .byte_length = request.byte_length,
                 .gpu_virtual_address = request.gpu_virtual_address, .device_generation = request.device_generation, .adapter_id = request.adapter_id,
                 .driver_owner = 7, .access = 0, .address_space = 1, .dma_mask = request.dma_mask };
-            initial_read = out.*; gpu_data[0] = host[0]; fetched = false; executed = false; signaled = false;
+            initial_read = out.*; initial_index = i; gpu_data[i] = host[i]; fetched = false; executed = false; signaled = false;
             return a.gfx_buffer_result_ok;
         }
         const mapped_bytes = if (present_mode)
-            (if (entry.mapping_only) (shadow_descriptor.byte_length + 4095) & ~@as(u64, 4095) else shadow_descriptor.byte_length) else length;
+            (if (entry.mapping_only) (descriptor(i).byte_length + 4095) & ~@as(u64, 4095) else descriptor(i).byte_length) else length;
         std.debug.assert(entry.active and request.byte_offset == 0 and request.byte_length == mapped_bytes);
         const virtual = request.access == 3;
         if (virtual) std.debug.assert(dma[i].lease.id != 0 and gpu[i].lease.id == 0 and request.gpu_virtual_address == address(i) and request.address_space == 1)
@@ -274,9 +311,17 @@ pub const Model = struct {
         for (0..2) |i| if (address_value >= address(i) and address_value - address(i) < length) {
             const offset: usize = @intCast(address_value - address(i));
             if (bytes > length - offset or (gpu[i].lease.id == 0 and
-                !(present_mode and i == 0 and dma[0].lease.id != 0 and (active or initial_read.lease.id != 0)))) return error.GpuAddress;
+                !(present_mode and dma[i].lease.id != 0 and (active or (initial_read.lease.id != 0 and initial_index == i))))) return error.GpuAddress;
             return gpu_data[i][offset..][0..bytes];
         };
+        if (replacement_native) |index| {
+            const start = native.address(index);
+            if (address_value >= start and address_value - start < replacement_vram.len) {
+                const offset: usize = @intCast(address_value - start);
+                if (bytes > replacement_vram.len - offset or !native.slots[index].live or native.slots[index].gpu.lease.id == 0) return error.GpuAddress;
+                return replacement_vram[offset..][0..bytes];
+            }
+        }
         const base = native.address(native_index);
         if (address_value < base or address_value - base > vram_data.len or bytes > vram_data.len - (address_value - base)) return error.GpuAddress;
         const offset: usize = @intCast(address_value - base); return vram_data[offset..][0..bytes];

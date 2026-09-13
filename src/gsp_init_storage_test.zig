@@ -3239,6 +3239,8 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
             try checkReceiverModeSwitch(target);
             checkpoint = "live image table";
             try checkLiveDisplayTable(target);
+            checkpoint = "replacement Present";
+            try checkPresentationReplacement(target);
         }
         checkpoint = "restore";
         const read = captured.boot.read;
@@ -3267,7 +3269,179 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
     }
     checkpoint = "stop";
     _ = target.stop();
-    try t.expect(native.released == @as(u32, if (NativeCommon.is("context_native_connected")) 2 else 0) and display.released == 0 and !NativeCommon.published);
+    try t.expect(native.released == @as(u32, if (NativeCommon.is("context_native_connected")) 4 else 0) and display.released == 0 and !NativeCommon.published);
+}
+fn checkPresentationReplacement(target: *@import("gsp_device.zig").Device) !void {
+    const run = &target.running; const product = &target.native_output;
+    const copy = @import("gsp_copy_test_model.zig").Model;
+    const native = @import("gsp_vram_test_model.zig").Model;
+    const table_owner = run.display_resources_slot.owner.?;
+    const old = run.presentation.?;
+    const old_pixels = copy.vram_data;
+    const note = table_owner.publishedNotifier(product.window.?.slot).?;
+    const words: [*]u32 = @ptrFromInt(note.cpu.cpu_address);
+    const raw: [*]const u8 = @ptrFromInt(target.port.window.cpu_address);
+    const mmio = raw[0..@intCast(target.port.window.byte_length)];
+    const fifo = run.fifos[product.copy.?.slot].owner.?;
+    var gpu_table = table_owner.table.image;
+    var checkpoint: []const u8 = "allocate";
+    var iteration: usize = 0;
+    errdefer |err| std.debug.print("replacement: {s} at={s} iteration={d} device={s} failure={?} mapping={?} refs={d}\n",
+        .{@errorName(err),checkpoint,iteration,@tagName(target.phase),target.failure,run.buffer_active,copy.replacementReferences()});
+    while (iteration < 2) : (iteration += 1) {
+        const deadline = clock + std.time.ns_per_s;
+        const buffer = try finishContextBuffer(target, try run.allocateDisplaySurface(.{ .width = 96, .height = 24, .usage = 40 }, deadline), deadline);
+        const source = (try run.nativeBufferStatus(buffer)).info.?;
+        const index = source.reference.buffer.id - 801;
+        const dma = try run.bindDisplayStorage(product.engine.?, .window, product.mode.?.window, buffer);
+        try run.releaseNativeBuffer(buffer);
+        try run.uploadDisplayTable(product.engine.?, product.copy.?, deadline);
+        try pumpLiveTable(target, &gpu_table, 2);
+        const borrowed = copy.lendReplacement(index, 96, 24);
+        for (&copy.host[1], 0..) |*byte, i| byte.* = @truncate(i * 31 + 49 + iteration);
+        checkpoint = "prepare";
+        var forged = borrowed; forged.buffer.id += 1;
+        try t.expectError(error.Stale, run.prepareDisplayPresentationImage(dma, forged, deadline));
+        try t.expect(copy.replacementReferences() == 0 and copy.borrowed_releases == 0);
+        try run.prepareDisplayPresentationImage(dma, borrowed, deadline);
+        const candidate = &run.presentation_slots[1].?;
+        try t.expect(candidate.surface.valid() and run.presentation == old and copy.replacementReferences() == 1);
+        try t.expectError(error.Busy, run.removeDisplayImage(product.engine.?, product.mode.?.window, dma));
+        try t.expectError(error.Stale, run.selectDisplayPresentationImage(dma));
+        checkpoint = "upload";
+        try run.uploadDisplayPresentationImage(dma, deadline);
+        var fetched = false;
+        for (0..100) |_| {
+            clock += 1000; _ = target.step();
+            try t.expect(target.phase == .ready and run.presentation == old);
+            if (run.buffer_active != null) { try replyCopyMapping(target); continue; }
+            if (run.initial_image) |work| {
+                try t.expect(work.presentation == candidate);
+                if (work.operation.submitted) {
+                    if (!fetched) {
+                        try copy.fetch(fifo, mmio); try copy.execute(); fetched = true;
+                        try t.expect((try run.presentationImageStatus(dma)).completed == 0 and copy.initial_read.lease.id != 0);
+                        try t.expectError(error.Busy, run.selectDisplayPresentationImage(dma));
+                    } else try copy.signal();
+                }
+            } else break;
+        }
+        try t.expect(run.initial_image == null and (try run.presentationImageStatus(dma)).completed != 0 and copy.initial_read.lease.id == 0);
+        const image = candidate.surface.scanout.?;
+        try t.expect(image.width == 96 and image.height == 24 and candidate.surface.descriptor.plane_pitches[0] == 384);
+        for (copy.replacement_vram, 0..) |byte, i| {
+            const y = i / image.pitch; const x = i % image.pitch;
+            try t.expectEqual(if (y < 24 and x < 384) copy.host[1][y * 384 + x] else @as(u8, 0xcc), byte);
+        }
+        try t.expectEqualSlices(u8, &old_pixels, &copy.vram_data);
+        try t.expectError(error.Stale, run.selectDisplayPresentationImage(dma)); // CE receipt alone cannot select scanout.
+        checkpoint = "switch";
+        // Reuse only the older notifier record after modeled GPU FINISHED.
+        // The current image's own record remains BEGUN for the retention check.
+        words[(note.offset ^ 16) / 4] = 2 << 30;
+        try beginReceiverImage(target, dma, 2, deadline);
+        try t.expectError(error.Busy, run.selectDisplayPresentationImage(dma));
+        try pumpReceiverImage(target);
+        try t.expect(run.presentation == old and !try table_owner.imageFinished(product.window.?.slot, product.dma));
+        try run.selectDisplayPresentationImage(dma);
+        try t.expect(run.presentation == candidate and old.surface.valid());
+        try t.expectError(error.Busy, run.retireDisplayPresentationImage(product.dma, deadline));
+        checkpoint = "present replacement";
+        const prior_completed = copy.completed;
+        @memset(copy.host[1][23 * 384..24 * 384], 0x72);
+        try copy.enqueuePresentFrom(1, 0, 23, 96, 1);
+        fetched = false;
+        for (0..80) |_| {
+            clock += 1000; _ = target.step();
+            try t.expect(target.phase == .ready);
+            if (run.buffer_active != null) { try replyCopyMapping(target); continue; }
+            if (run.copy_job) |job| if (job.submitted) {
+                if (!fetched) { try copy.fetch(fifo, mmio); try copy.execute(); fetched = true; } else try copy.signal();
+            };
+            if (copy.completed != prior_completed) break;
+        }
+        try t.expect(copy.completed == prior_completed + 1 and copy.result == a.gfx_queue_result_complete);
+        try t.expectEqualSlices(u8, copy.host[1][23 * 384..24 * 384], copy.replacement_vram[23 * image.pitch..][0..384]);
+        try t.expectEqualSlices(u8, &old_pixels, &copy.vram_data);
+        if (iteration == 1) {
+            checkpoint = "confirm replacement";
+            // Confirmation keeps the new image selected and retires the old
+            // slot, including both its initial-upload and Present mappings.
+            words[(note.offset ^ 16) / 4] = 2 << 30;
+            const old_native = old.surface.target.?.info().?.reference.buffer.id - 801;
+            var retired = false;
+            for (0..100) |_| {
+                retired = try run.retireDisplayPresentationImage(product.dma, deadline);
+                if (retired) break;
+                clock += 1000; _ = target.step();
+                try t.expect(target.phase == .ready and run.presentation == candidate);
+                if (run.buffer_active != null) try replyCopyMapping(target);
+            }
+            try t.expect(retired and run.presentation_slots[0] == null and run.presentation == candidate and candidate.surface.valid() and
+                copy.dma[0].lease.id == 0 and copy.gpu[0].lease.id == 0 and copy.replacementReferences() >= 2 and copy.borrowed_releases == 0);
+            try run.removeDisplayImage(product.engine.?, product.mode.?.window, product.dma);
+            try run.uploadDisplayTable(product.engine.?, product.copy.?, deadline);
+            try pumpLiveTable(target, &gpu_table, 1);
+            for (0..80) |_| {
+                clock += 1000; _ = target.step(); try t.expect(target.phase == .ready);
+                if (!native.slots[old_native].live and run.native_active == null) break;
+                if (run.activeChannel().?.phase == .waiting) try replyNativeProduct(target);
+            }
+            try t.expect(!native.slots[old_native].live and run.native_active == null and native.released == 4 and
+                native.slots[index].live and candidate.surface.valid() and copy.replacement_lent and copy.borrowed_releases == 0);
+            try t.expectError(error.Stale, run.selectDisplayPresentationImage(product.dma));
+            return;
+        }
+        checkpoint = "rollback";
+        words[(note.offset ^ 16) / 4] = 2 << 30;
+        try beginReceiverImage(target, product.dma, 1, deadline);
+        try pumpReceiverImage(target);
+        try run.selectDisplayPresentationImage(product.dma);
+        try t.expect(run.presentation == old and old.surface.valid() and candidate.surface.valid());
+        try t.expectEqualSlices(u8, &old_pixels, &copy.vram_data);
+        checkpoint = "retire inactive";
+        try t.expectError(error.Busy, run.retireDisplayPresentationImage(dma, deadline));
+        try t.expect(copy.replacementReferences() >= 2 and copy.replacement_lent and native.slots[index].gpu.lease.id != 0);
+        words[(note.offset ^ 16) / 4] = 2 << 30;
+        var retired = false;
+        for (0..100) |_| {
+            retired = try run.retireDisplayPresentationImage(dma, deadline);
+            if (retired) break;
+            clock += 1000; _ = target.step();
+            try t.expect(target.phase == .ready and run.presentation == old);
+            if (run.buffer_active != null) try replyCopyMapping(target);
+        }
+        try t.expect(retired and run.presentation_slots[1] == null and copy.replacementReferences() == 0 and
+            copy.borrowed_releases == 0 and copy.replacement_lent and copy.dma[1].lease.id == 0 and copy.gpu[1].lease.id == 0);
+        try t.expectError(error.Stale, run.selectDisplayPresentationImage(dma));
+        // Kernel may now release its borrowed reference; NVIDIA never did.
+        copy.replacement_lent = false;
+        try run.removeDisplayImage(product.engine.?, product.mode.?.window, dma);
+        try run.uploadDisplayTable(product.engine.?, product.copy.?, deadline);
+        try pumpLiveTable(target, &gpu_table, 1);
+        for (0..80) |_| {
+            clock += 1000; _ = target.step();
+            try t.expect(target.phase == .ready);
+            if (!native.slots[index].live and run.native_active == null) break;
+            if (run.activeChannel().?.phase == .waiting) try replyNativeProduct(target);
+        }
+        try t.expect(!native.slots[index].live and run.native_active == null and native.released == iteration + 3);
+        try t.expect(old.surface.valid() and run.presentation == old and copy.borrowed_releases == 0);
+    }
+}
+fn beginReceiverImage(target: *@import("gsp_device.zig").Device, dma: u32, mode_id: u32, deadline: u64) !void {
+    const run = &target.running; const product = &target.native_output;
+    const plan = try run.displayModePlan(product.engine.?, product.mode.?.window, mode_id);
+    try run.queryDisplayMode(product.mode_control.?, plan, deadline);
+    for (0..30) |_| {
+        clock += 1000; _ = target.step(); try t.expect(target.phase == .ready);
+        if (!run.mode_control_active) break;
+        if (run.activeChannel().?.phase == .waiting) try replyNativeProduct(target);
+    }
+    const checked = (try run.modeControlStatus(product.mode_control.?)).info.?;
+    try t.expect(!run.mode_control_active and checked.possible and !checked.over_clock and std.meta.eql(plan, checked.mode));
+    try run.commitModeDisplayImage(product.core.?, product.window.?, dma, mode_id, deadline);
+    try t.expect(run.display_work.?.mode_receipt == checked.receipt);
 }
 fn checkLiveDisplayTable(target: *@import("gsp_device.zig").Device) !void {
     errdefer if (@errorReturnTrace()) |trace| std.debug.dumpErrorReturnTrace(trace);
@@ -3383,8 +3557,6 @@ fn pumpLiveTable(target: *@import("gsp_device.zig").Device, gpu_table: *[@import
 fn checkReceiverModeSwitch(target: *@import("gsp_device.zig").Device) !void {
     const run = &target.running;
     const product = &target.native_output;
-    const display = @import("gsp_display_test_model.zig").Model;
-    const push = @import("gsp_display_push.zig");
     const root = product.engine.?;
     const handle = product.mode_control.?;
     const plan = try run.displayModePlan(root, product.mode.?.window, 1);
@@ -3424,6 +3596,22 @@ fn checkReceiverModeSwitch(target: *@import("gsp_device.zig").Device) !void {
     try t.expectError(error.Stale, run.validateDisplayLink());
     run.display_work.?.mode_receipt = receipt;
     try run.validateDisplayLink();
+    try pumpReceiverImage(target);
+    const current = (try run.displayImageStatus(root, plan.window)).?;
+    try t.expect(current.boot_mode != null and std.meta.eql(current.boot_mode.?, plan) and current.link.?.acknowledged == 7 and
+        current.link.?.receipt > previous.link.?.receipt and current.core_point > previous.core_point and current.window_point > previous.window_point and
+        current.position.?.sequence > previous.position.?.sequence);
+    try t.expect(current.mode_receipt == checked.receipt);
+    try t.expectError(error.Stale, run.commitModeDisplayImage(product.core.?, product.window.?, product.dma, 1, deadline));
+    try t.expect(run.display_work == null and std.meta.eql(current, (try run.displayImageStatus(root, plan.window)).?));
+    try t.expectEqualSlices(usize, &.{ 1, 1, 2, 2, 0 }, &NativeCommon.mode_requests);
+    try t.expect(NativeCommon.commits == 1); // Common geometry transition is separate work.
+}
+fn pumpReceiverImage(target: *@import("gsp_device.zig").Device) !void {
+    const run = &target.running;
+    const display = @import("gsp_display_test_model.zig").Model;
+    const push = @import("gsp_display_push.zig");
+    const plan = run.display_work.?.boot_mode.?;
     for (0..160) |_| {
         clock += 1000; _ = target.step();
         try t.expect(target.phase == .ready);
@@ -3431,8 +3619,8 @@ fn checkReceiverModeSwitch(target: *@import("gsp_device.zig").Device) !void {
         const channel = run.activeChannel().?;
         if (channel.phase == .waiting) { try replyNativeProduct(target); continue; }
         const work = &run.display_work.?;
-        // Publish the same real hardware observations used for adoption.
-        // The second frame has fresh notifier offsets and sequence points.
+        // Hardware-model observations only after actual command submission.
+        // GET, Window BEGUN, Core completion and HDMI remain separate receipts.
         if (work.position) |position| if (position.phase == .submitted) {
             const user = try push.userBase(.immediate, plan.window);
             display.words[(user + 4) / 4] = display.words[user / 4];
@@ -3452,15 +3640,6 @@ fn checkReceiverModeSwitch(target: *@import("gsp_device.zig").Device) !void {
         };
     }
     try t.expect(run.display_work == null);
-    const current = (try run.displayImageStatus(root, plan.window)).?;
-    try t.expect(current.boot_mode != null and std.meta.eql(current.boot_mode.?, plan) and current.link.?.acknowledged == 7 and
-        current.link.?.receipt > previous.link.?.receipt and current.core_point > previous.core_point and current.window_point > previous.window_point and
-        current.position.?.sequence > previous.position.?.sequence);
-    try t.expect(current.mode_receipt == checked.receipt);
-    try t.expectError(error.Stale, run.commitModeDisplayImage(product.core.?, product.window.?, product.dma, 1, deadline));
-    try t.expect(run.display_work == null and std.meta.eql(current, (try run.displayImageStatus(root, plan.window)).?));
-    try t.expectEqualSlices(usize, &.{ 1, 1, 2, 2, 0 }, &NativeCommon.mode_requests);
-    try t.expect(NativeCommon.commits == 1); // Common geometry transition is separate work.
 }
 fn replyNativeProduct(target: *@import("gsp_device.zig").Device) !void {
     const run = &target.running;

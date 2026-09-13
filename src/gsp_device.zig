@@ -500,7 +500,7 @@ pub const Device = struct {
             try self.running.validateDisplayTableUpdate();
             break :blk work.channel_handle;
         } else if (self.running.initial_image) |*work| blk: {
-            const entry = if (self.running.presentation) |*value| value else return error.Binding;
+            const entry = work.presentation;
             if (self.running.copy_job != null or !work.operation.matches(ticket, deadline)) return error.Binding;
             const transfer = self.running.initialImageTransfer() catch return error.Binding;
             if (!fifo.ring.matchesTransfer(ticket, fifo.config.copy_class, transfer)) return error.Binding;
@@ -583,10 +583,10 @@ pub const Device = struct {
                     } else if (work.core.phase != .prepare or window_part.phase != .prepare) return error.Binding;
                 } else if (position.phase != .submitted) return error.Binding;
             } else if (position_part != null or work.boot_mode != null) return error.Binding;
-            if (self.running.presentation) |*entry| {
-                const status = self.running.initialImageStatus() catch return error.Binding;
-                if (status.pending or status.completed == 0 or !std.meta.eql(entry.window, window_part.handle) or
-                    !std.meta.eql(entry.surface.scanout, window_part.config.scanout)) return error.Binding;
+            if (self.running.presentation != null) {
+                const scanout = window_part.config.scanout orelse return error.Binding;
+                const status = self.running.presentationImageStatus(scanout.dma) catch return error.Binding;
+                if (status.pending or status.completed == 0 or status.failure != null) return error.Binding;
             }
             if (route.window >= 8 or route.head >= root_info.hardware.heads or window_part.handle.slot != 1 + route.window or
                 work.core.config.kind != .core or window_part.config.kind != .window or

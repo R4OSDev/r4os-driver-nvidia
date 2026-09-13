@@ -1,7 +1,7 @@
 ﻿NVIDIA: passiver Besitzer fuer 0.79.9
 ===================================
 
-Stand: 13.09.2026, NVIDIA 0.1.91. 0.79.13 ist offen; T1 ist softwareseitig
+Stand: 13.09.2026, NVIDIA 0.1.92. 0.79.13 ist offen; T1/T2 sind softwareseitig
 abgeschlossen. OPTION NVIDIA mode=native verbindet Bootmodus, gesicherte
 RAM-Pixel, eigene CE-/Displayressourcen und den gemeinsamen Displaybesitz.
 Empfaengermodi werden aus echter EDID abgeleitet und mit frischen
@@ -15,13 +15,19 @@ aktuellen Verbraucher, FINISHED fuer die letzte Window-Nutzung des Bildes
 und danach die quittierte Tabellenentfernung. Erst dann folgen BO-/RM-Abbau.
 Tabellenplaetze sind wiederverwendbar; Drahtnamen werden nicht recycelt.
 
-51 bestehende Pruefgruppen und Modulbuild bestanden. Das Device-Modell
-prueft zwei unterschiedliche Bildressourcen, genaue CE-Bereiche, verzogerte
-Quittungen und vollstaendigen Abbau bis zur Rueckgabe des RPC-Kanals.
+Zwei feste Present-Plaetze halten aktuelle und vorbereitete SYSTEM-/VRAM-
+Puffer. Erst eigener CE-Upload und bestaetigter Display-Commit erlauben
+die Auswahl. Rueckkehr erhaelt die alten Pixel; nach Bestaetigung wird der
+inaktive Platz ueber seine RM-Mappings, eigenen Importe und RAMHT abgebaut.
+Die vom gemeinsamen Worker geliehene Referenz wird dabei nie freigegeben.
+
+51 bestehende Pruefgruppen und Modulbuild bestanden. Der vorhandene Device-
+Fall prueft 65x20/96x24, Present im neuen Bild, Rueckkehr, Wiederverwendung
+und Freigabe des alten Bildes. Verzoegerte Quittungen erhalten Ressourcen.
 Der gemeinsame Atomic-Worker ist separat mit Kernel53/EXAMPLE-SMP4 geprueft.
-NVIDIA-Present-Pufferwechsel, Modusqueue, Bestaetigung/Rueckkehr, sichtbare
+NVIDIA-Modusqueue und ihre Bestaetigungs-/Rueckkehrsteuerung, sichtbare
 Moduswahl und wirksamer Restore bleiben offen. Standard bleibt passiv.
-Belege: Docs/Drivers/GrafikScanout07913.txt/.json, live_table_checkpoint.
+Belege: Docs/Drivers/GrafikScanout07913.txt/.json, presentation_checkpoint.
 Physische Abnahmen: ExFiles/Reports/OssiGPU.txt.
 Die folgenden aelteren Abschnitte beschreiben ihren damaligen Stand.
 

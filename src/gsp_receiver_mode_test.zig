@@ -96,6 +96,10 @@ pub fn install(capture: *receiver.Capture) !void {
     d[0] = 100; // 1 MHz, exactly representable in EDID 10 kHz units.
     d[2] = 65; d[3] = 24; d[4] = 1; // 280 horizontal blanking pixels.
     d[5] = 20; d[6] = 45; d[8] = 88; d[9] = 44; d[10] = 0x45; d[17] = 0x1e;
+    // A second, differently sized real EDID timing drives replacement of
+    // the imported SYSTEM shadow and native VRAM scanout in the Device case.
+    @memcpy(base[72..90], d);
+    base[72] = 120; base[74] = 96; base[77] = 24;
     base[126] = 1;
     finish(base);
     const cta = capture.bytes[128..256];
@@ -103,6 +107,6 @@ pub fn install(capture: *receiver.Capture) !void {
     finish(cta);
     capture.connected = true; capture.status = .valid_edid; capture.edid_bytes = 256;
     try receiver.edid.parse(capture.bytes[0..256], &capture.report);
-    try t.expect(capture.report.complete() and capture.report.hdmi and capture.report.max_tmds_hz == 165_000_000 and capture.report.mode_count == 1);
+    try t.expect(capture.report.complete() and capture.report.hdmi and capture.report.max_tmds_hz == 165_000_000 and capture.report.mode_count == 2);
 }
 fn finish(bytes: []u8) void { var sum: u8 = 0; for (bytes[0..127]) |b| sum +%= b; bytes[127] = 0 -% sum; }

@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.91; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.92; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -12,7 +12,7 @@ Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
 
-Native output (NVIDIA 0.1.91):
+Native output (NVIDIA 0.1.92):
 Explicit `OPTION NVIDIA mode=native` now drives resource allocation and the
 common handoff from the serialized Device worker: actual CE engine/context,
 display masks, private VRAM/RAMHT, Core/Window/WIMM, SYSTEM shadow, output
@@ -43,8 +43,13 @@ active entries are preserved. Retiring an image requires completed display
 methods, no current consumer, its last Window use FINISHED, then completed
 RAMHT withdrawal. Native BO/RM release follows. Slots are reusable, while
 wire names remain fresh. Unknown effects retain the resources.
-The registered Present image still fixes geometry. Selecting another image,
-NVIDIA mode-job handling, confirmation and rollback remain to be integrated.
+Two stable Present slots now import independent SYSTEM shadows and share
+the existing queue/backend. A candidate's own CE completion prepares it;
+only acknowledged WIMM/Window/Core/HDMI output can select it for Present.
+The former image remains available for rollback. Retirement drains all
+inactive shadow mappings and owned imports before RAMHT/native storage;
+the common worker's borrowed reference is never released by NVIDIA.
+NVIDIA mode-job handling and its confirmation policy remain to be integrated.
 
 Receiver refresh cannot overwrite the owner's promoted native port.
 Unknown presence permits only authenticated held boot geometry, without
@@ -60,7 +65,11 @@ Current 51 NVIDIA groups, original-C raster/AVI vectors and module build pass.
 The existing Device case also checks two live image allocations/removals,
 exact CE ranges, delayed publication, reusable slots with fresh names and
 complete deferred RM retirement. Window use tracking covers BEGUN and
-FINISHED across notifier reuse. The common atomic worker is already
+FINISHED across notifier reuse. The same Device case also switches between
+65x20 and 96x24, uploads and draws in the replacement image, restores the
+old image, reuses its candidate slot and retires the old image on confirmation.
+It checks delayed receipts, preserved old pixels and borrowed ownership.
+The common atomic worker is already
 integrated and passed its separate Kernel53/EXAMPLE SMP4 checkpoint.
 NVIDIA mode changes, visible pattern/confirmation, its rollback and
 restoration remain open in 0.79.13. Evidence: GrafikScanout07913.json;
