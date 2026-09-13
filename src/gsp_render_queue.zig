@@ -82,6 +82,7 @@ pub const Owner = struct {
             .prepare => {
                 self.draw = run.queuedGraphicsDraw(self) catch |err| {
                     if (err == error.Empty or err == error.Unsupported or err == error.Bounds or err == error.Overflow) {
+                        if (err != error.Empty) try run.renderRejection(err);
                         try self.finish(if (err == error.Empty) a.gfx_queue_result_complete else a.gfx_queue_result_failed); return true;
                     }
                     return err;

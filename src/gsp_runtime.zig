@@ -432,6 +432,40 @@ pub const Owner = struct {
                 }
             }
         }
+        if (self.queued_render) |*work| {
+            record.active_fence = work.job.fence;
+            record.render_phase = switch (work.phase) {
+                .retain => .resources, .prepare => .admission,
+                .upload, .upload_wait => .packet_upload, .draw, .draw_wait => .execution, .done => .none,
+            };
+        }
+        if (self.graphics_upload) |*work| {
+            record.render_phase = if (work.operation.kind == .programs) .programs_upload else .packet_upload;
+            if (work.operation.ticket) |ticket| record.copy_point = ticket.point;
+        }
+        if (self.graphics_work) |*work| {
+            record.render_phase = .execution;
+            if (work.ticket) |ticket| record.graphics_point = ticket.point;
+            if (self.fifos[work.channel_handle.slot].owner) |owner| record.graphics_class = owner.config.object_class;
+            if (record.fault_address) |va| switch (work.command) {
+                .draw => |binding| {
+                    const dst = binding.draw.target;
+                    record.target_address_match = va >= dst.address and va-dst.address < dst.bytes;
+                    if (binding.draw.source) |src| record.source_address_match = va >= src.address and va-src.address < src.bytes;
+                },
+                else => {},
+            };
+        }
+        if (record.render_phase != .none) {
+            if (self.graphics_cache.programs.info()) |programs| {
+                record.programs_address = programs.address;
+                if (record.fault_address) |va| record.programs_address_match = va >= programs.address and va-programs.address < render.shader_bytes;
+            }
+            if (self.graphics_cache.packet.info()) |packet| {
+                record.packet_address = packet.address;
+                if (record.fault_address) |va| record.packet_address_match = va >= packet.address and va-packet.address < render.packet_bytes;
+            }
+        }
         if (self.display_upload_job) |*work| {
             if (work.operation.ticket) |ticket| record.copy_point = ticket.point;
             if (record.fault_address) |va| {
@@ -457,7 +491,18 @@ pub const Owner = struct {
             .{kept.hardware_channel,kept.runlist,kept.nv_engine,kept.candidate_channels,kept.candidate_rm_handle,kept.candidate_rm_cid});
         self.log("NVIDIA gsp-fault: address={?} type={x} source-span={} target-span={} fence={d}:{d} copy-point={d} callback={}",
             .{kept.fault_address,kept.fault_type,kept.source_address_match,kept.target_address_match,kept.active_fence.timeline,kept.active_fence.point,kept.copy_point,kept.callback_needed});
+        if (kept.render_phase != .none or kept.shader != .none) {
+            self.log("NVIDIA render-fault: phase={s} shader={s} class={x} gr-point={d} completed={d} resources-retained={}",
+                .{@tagName(kept.render_phase),@tagName(kept.shader),kept.graphics_class,kept.graphics_point,self.graphics_completed,self.graphics_cache.borrowed});
+            self.log("NVIDIA render-fault: programs={x} packet={x} programs-span={} packet-span={} attribution=candidate-only",
+                .{kept.programs_address,kept.packet_address,kept.programs_address_match,kept.packet_address_match});
+        }
         if (kept.text_bytes != 0) self.logBytes("fault-text", @truncate(kept.code), kept.text[0..kept.text_bytes]);
+    }
+    pub fn renderRejection(self: *Owner, err: anyerror) !void {
+        var record = diagnostics.host(.render,err,false);
+        record.kind = .graphics_command;
+        try self.recordFault(record);
     }
     fn rejection(self: *Owner, operation: diagnostics.Operation, handle: u32, status: ?u32, host: ?anyerror) !void {
         if (status) |code| try self.recordFault(.{ .source = .rm, .kind = diagnostics.rmKind(code), .operation = operation, .rm_handle = handle, .code = code })
@@ -1817,6 +1862,7 @@ pub const Owner = struct {
         if (storage.self_address != 0) return error.Busy;
         const info = (try self.findNativeBuffer(buffer)).info() orelse return error.State;
         if (info.surface.request != null or info.surface.privileged or info.surface.readonly) return error.Unsupported;
+        try self.graphics_cache.admitStorage(kind,info.allocation_bytes);
         try (render.Range{ .address = info.address, .bytes = info.logical_bytes }).validate(256, if (kind == .programs) render.shader_bytes else render.packet_bytes);
         try self.retainNativeStorage(buffer,storage);
     }
@@ -1896,6 +1942,11 @@ pub const Owner = struct {
     pub fn beginQueuedGraphicsUpload(self: *Owner, input: *render_queue.Owner) !void {
         try self.queuedRender(input);
         if (input.phase != .upload or input.draw == null or !std.meta.eql(input.draw.?, try self.queuedGraphicsDraw(input))) return error.Binding;
+        if (try self.graphics_cache.reusePacket(input.draw.?)) {
+            if (self.graphics_cache.packet_reuses == 1) self.log("NVIDIA render-cache: packet-reuse=1 program-uploads={d} uploaded-bytes={d} reserved-bytes={d} budget={d}",
+                .{self.graphics_cache.program_uploads,self.graphics_cache.uploaded_bytes,self.graphics_cache.reservedBytes(),render_cache.budget_bytes});
+            return;
+        }
         const channel = self.graphics_copy_channel orelse return error.State;
         return self.startGraphicsUpload(channel, .packet, input.draw, input.deadline, true);
     }
@@ -2034,9 +2085,10 @@ pub const Owner = struct {
             self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or
             self.outputs.active() or self.sequence.self_address != 0 or self.channel.?.phase != .idle or self.channel.?.in_lockdown) return error.Busy;
         if (self.frame_setup != null) return error.Busy;
+        // Cold frame-pool construction shares the native allocation worker.
+        // Once constructed, busy scanout images do not gate offscreen work.
         if (!self.display_paused and self.presentation_buffers != 0 and self.presentation != null and
             self.presentationGroupCount(self.presentation.?) < self.presentation_buffers) return error.Busy;
-        const next_frame = if (!self.display_paused and self.presentation_buffers != 0) (try self.acquireFrame()) orelse return error.Busy else null;
         try self.channel.?.guard(deadline);
         const a = r4os.abi;
         if (binding.version != 1 or binding.size < @sizeOf(a.GfxBackendBinding) or binding.adapter_id != self.adapter_id or
@@ -2094,8 +2146,8 @@ pub const Owner = struct {
                     if (!std.meta.eql(entry.surface.shadow.buffer, current.surface.shadow.buffer)) continue;
                     entry.damage = if (entry.damage) |prior| prior.merge(damage) else damage;
                 };
-                self.copy_job.?.target_presentation = next_frame orelse return error.State;
-                self.frames_acquired +|= 1;
+                // Selection waits inside the claimed presentation job.
+                // Generic copies/draws never acquire a scanout image.
             }
         }
         const resource_count: usize = if (self.copy_job.?.presentation) 1 else 2;
@@ -2169,6 +2221,12 @@ pub const Owner = struct {
         // queue copy can wait here with its ordinary deadline and references.
         if (self.display_flip != null and !work.presentation) return false;
         if (self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return false;
+        if (work.presentation and self.presentation_buffers != 0 and work.target_presentation == null) {
+            const current_image = self.presentation orelse return error.State;
+            if (self.presentationGroupCount(current_image) < self.presentation_buffers) return false;
+            work.target_presentation = (try self.acquireFrame()) orelse return false;
+            self.frames_acquired +|= 1;
+        }
         const resource_count: usize = if (work.presentation) 1 else 2;
         for (0..resource_count) |i| {
             if (work.addresses[i] != null) continue;

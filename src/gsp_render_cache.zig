@@ -4,6 +4,10 @@ const std = @import("std");
 const render = @import("r4nv_render");
 const storage = @import("gsp_native_backing.zig");
 pub const Kind = enum { programs, packet };
+// Six fixed programs and one reusable descriptor/vertex packet. Physical
+// allocation granularity is included; this cache cannot grow with frames.
+pub const budget_bytes: u64 = 128 * 1024;
+pub const slot_budget_bytes: u64 = budget_bytes / 2;
 pub const Owner = struct {
     self_address: usize = 0,
     programs: storage.Use = .{},
@@ -16,6 +20,10 @@ pub const Owner = struct {
     uploading: ?Kind = null,
     borrowed: bool = false,
     failed: bool = false,
+    program_uploads: u64 = 0,
+    packet_uploads: u64 = 0,
+    packet_reuses: u64 = 0,
+    uploaded_bytes: u64 = 0,
 
     pub fn initialize(self: *Owner, epoch: u64) !void {
         if (self.self_address != 0 or epoch == 0) return error.State;
@@ -26,6 +34,26 @@ pub const Owner = struct {
     }
     pub fn buffer(self: *Owner, kind: Kind) *storage.Use {
         return if (kind == .programs) &self.programs else &self.packet;
+    }
+    pub fn reservedBytes(self: *const Owner) u64 {
+        var bytes: u64 = 0;
+        // Retained/partially closed storage still consumes its reservation.
+        for ([_]*const storage.Use{&self.programs,&self.packet}) |use| if (use.source_stamp) |source| { bytes +|= source.physical.bytes; };
+        return bytes;
+    }
+    pub fn admitStorage(self: *Owner, kind: Kind, bytes: u64) !void {
+        if (!self.valid() or self.borrowed or self.uploading != null or self.buffer(kind).self_address != 0) return error.Busy;
+        if (bytes == 0 or bytes > slot_budget_bytes or self.reservedBytes() > budget_bytes-bytes) return error.Exhausted;
+    }
+    pub fn reusePacket(self: *Owner, draw: render.Draw) !bool {
+        if (!self.valid() or self.borrowed or self.uploading != null) return error.Busy;
+        if (self.program_point == 0 or self.packet_point == 0 or self.draw == null) return false;
+        // binding verifies generation, backing identity, adapter/owner and
+        // address/format bounds before any descriptor bytes can be reused.
+        const current = try self.binding();
+        if (!std.meta.eql(current.draw,draw)) return false;
+        self.packet_reuses +|= 1;
+        return true;
     }
     pub fn beginUpload(self: *Owner, kind: Kind, draw: ?render.Draw, bytes: []u8) !void {
         if (!self.valid() or self.borrowed or self.uploading != null) return error.Busy;
@@ -53,9 +81,12 @@ pub const Owner = struct {
     }
     pub fn completeUpload(self: *Owner, kind: Kind, point: u32) !void {
         if (!self.valid() or self.uploading != kind or point == 0) return error.State;
-        if (kind == .programs) self.program_point = point else {
+        if (kind == .programs) {
+            self.program_point = point; self.program_uploads +|= 1; self.uploaded_bytes +|= render.shader_bytes;
+        } else {
             self.draw = self.pending_draw orelse return error.State;
             self.pending_draw = null; self.packet_point = point;
+            self.packet_uploads +|= 1; self.uploaded_bytes +|= render.packet_bytes;
         }
         self.uploading = null;
     }

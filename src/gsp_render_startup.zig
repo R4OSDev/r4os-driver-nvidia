@@ -7,17 +7,18 @@ pub const Owner = struct {
     phase: Phase = .waiting,
     storage: ?runtime.BufferHandle = null,
     channel: ?runtime.ChannelHandle = null,
+    copy_channel: ?runtime.ChannelHandle = null,
     kind: runtime.render_cache.Kind = .programs,
     deadline: u64 = 0,
     epoch: u64 = 0,
 
-    pub fn step(self: *Owner, run: *runtime.Owner, channel: ?runtime.ChannelHandle) !bool {
+    pub fn step(self: *Owner, run: *runtime.Owner, channel: ?runtime.ChannelHandle, copy_channel: ?runtime.ChannelHandle) !bool {
         if (self.phase == .ready or self.phase == .unavailable) return false;
         const now = (run.ctx.?.resources() orelse return error.Api).nowNs();
         if (now == 0 or now == std.math.maxInt(u64)) return error.Clock;
         if (self.phase == .waiting) {
-            if (channel == null or run.copy_backend == null or run.presentation == null) return false;
-            self.channel = channel; self.epoch = run.epoch;
+            if (channel == null or copy_channel == null or run.copy_backend == null) return false;
+            self.channel = channel; self.copy_channel = copy_channel; self.epoch = run.epoch;
             self.deadline = try std.math.add(u64, now, 15 * std.time.ns_per_s);
             run.graphics_starting = true; self.phase = .allocate;
             return true;
@@ -54,7 +55,7 @@ pub const Owner = struct {
                 if (self.kind == .programs) { self.kind = .packet; self.phase = .allocate; } else self.phase = .upload;
             },
             .upload => {
-                try run.beginGraphicsUpload(run.presentation.?.channel_handle, .programs, null, self.deadline);
+                try run.beginGraphicsUpload(self.copy_channel.?, .programs, null, self.deadline);
                 self.phase = .uploaded;
             },
             .uploaded => {
@@ -63,7 +64,7 @@ pub const Owner = struct {
                 self.phase = .enable;
             },
             .enable => {
-                run.enableGraphicsQueue(self.channel.?, run.presentation.?.channel_handle) catch |err| {
+                run.enableGraphicsQueue(self.channel.?, self.copy_channel.?) catch |err| {
                     if (err != error.Unsupported) return err;
                     if (!run.graphics_cache.close(true)) return error.Retained;
                     run.graphics_starting = false; self.phase = .unavailable;
@@ -71,7 +72,7 @@ pub const Owner = struct {
                     return true;
                 };
                 run.graphics_starting = false; self.phase = .ready;
-                run.ctx.?.logInfo("NVIDIA render: ready engine=C797 shaders=6 cache=warm common-queue=yes pixels=unverified");
+                run.ctx.?.logInfo("NVIDIA render: ready engine=C797 shaders=6 cache=warm budget=131072 common-queue=yes pixels=unverified");
             },
             .unwind => {
                 if (self.storage) |handle| { try run.releaseNativeBuffer(handle); self.storage = null; }

@@ -230,7 +230,7 @@ pub const Device = struct {
             const graphics_progress = try self.native_graphics.step(&self.running,
                 self.native_output.phase == .active or self.native_output.phase == .detached);
             const render_progress = try self.render_startup.step(&self.running,
-                if (self.native_graphics.phase == .ready) self.native_graphics.channel else null);
+                if (self.native_graphics.phase == .ready) self.native_graphics.channel else null, self.native_output.copy);
             if (self.native_output.phase == .active and self.interrupts.display.epoch == 0) {
                 const root = (try self.running.displayEngineStatus(self.native_output.engine.?)).info orelse return error.State;
                 const head = self.native_output.mode.?.head;

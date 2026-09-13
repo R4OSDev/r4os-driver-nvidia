@@ -75,8 +75,10 @@ const std = @import("std");
 const a = @import("r4os").abi;
 const events = @import("gsp_runtime_events.zig");
 pub const Source = enum { xid, rc, mmu_queue, fecs, recovery, nocat, rm, host, irq };
-pub const Kind = enum { information, mmu, fifo, copy_engine, context, invalid_channel, resource, device, unknown };
-pub const Operation = enum { event, channel, context, mapping, native_buffer, submit, teardown, interrupt, display_engine, display_channel };
+pub const Kind = enum { information, mmu, fifo, copy_engine, context, invalid_channel, resource, device, unknown, graphics_command, graphics_exception, shader };
+pub const Operation = enum { event, channel, context, mapping, native_buffer, submit, teardown, interrupt, display_engine, display_channel, render };
+pub const Shader = enum { none, header, warp, global };
+pub const RenderPhase = enum { none, admission, resources, programs_upload, packet_upload, execution };
 pub const Record = struct {
     serial: u64 = 0,
     epoch: u64 = 0,
@@ -114,6 +116,14 @@ pub const Record = struct {
     irq_mask: u32 = 0,
     irq_received: u64 = 0,
     irq_messages: u64 = 0,
+    shader: Shader = .none,
+    render_phase: RenderPhase = .none,
+    graphics_class: u32 = 0,
+    graphics_point: u32 = 0,
+    programs_address: u64 = 0,
+    packet_address: u64 = 0,
+    programs_address_match: bool = false,
+    packet_address_match: bool = false,
 };
 pub fn xidKind(code: u32) Kind {
     return switch (code) {
@@ -121,10 +131,29 @@ pub fn xidKind(code: u32) Kind {
         31 => .mmu,
         32, 80 => .fifo,
         39, 40, 41, 70, 71, 72, 75, 76, 77, 85 => .copy_engine,
-        13, 43, 44, 45, 69 => .context,
+        13 => .graphics_exception,
+        69 => .graphics_command,
+        43, 44, 45 => .context,
         48, 58, 79 => .device,
         else => .unknown,
     };
+}
+// These exact report families occur in NVIDIA's pinned570.144 GA10x
+// firmware. Xid13 by itself includes several possible causes; only an
+// explicit shader report specializes it. Opaque RC journals stay opaque.
+fn shaderReport(text: []const u8) Shader {
+    const prefix = "Graphics Exception: Shader Program Header ";
+    if (std.mem.startsWith(u8,text,prefix) and std.mem.endsWith(u8,text," Error")) {
+        if (text.len <= prefix.len+6) return .none;
+        const number = text[prefix.len..text.len-6];
+        for (number) |byte| if (!std.ascii.isDigit(byte)) return .none;
+        const index = std.fmt.parseInt(u8,number,10) catch return .none;
+        return if (index <= 30) .header else .none;
+    }
+    if (std.mem.indexOf(u8,text,"): ") == null) return .none;
+    if (std.mem.startsWith(u8,text,"Graphics SM Warp Exception on (")) return .warp;
+    if (std.mem.startsWith(u8,text,"Graphics SM Global Exception on (")) return .global;
+    return .none;
 }
 pub fn rmKind(status: u32) Kind {
     return switch (status) { 0x1a, 0x51 => .resource, 0x21 => .invalid_channel, else => .unknown };
@@ -146,6 +175,10 @@ pub fn event(scope: events.Scope, value: events.Event, now: u64) ?Record {
         .os_error => |v| {
             record.source = .xid; record.kind = xidKind(v.xid); record.code = v.xid; record.previous_xid = v.previous_xid;
             record.hardware_channel = hardware(v.channel); record.runlist = hardware(v.runlist); retainText(&record, v.text);
+            if (v.xid == 13) {
+                record.shader = shaderReport(v.text);
+                if (record.shader != .none) record.kind = .shader;
+            }
             record.fatal = record.kind != .information;
         },
         .rc_triggered => |v| {

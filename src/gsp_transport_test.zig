@@ -1214,6 +1214,28 @@ fn checkRuntimeEvents(model: *Model) !void {
         original_rc.fault_address == 0x80000021 and original_rc.callback_needed and original_rc.fatal);
     const original_xid = diagnostics.event(scope, try runtimeEvent(model, 0x1006, golden[80..352]), 1234).?;
     try t.expect(original_xid.kind == .device and original_xid.hardware_channel == null and original_xid.runlist == null);
+    // Actual OS-error payloads: Xid13 alone is not a shader diagnosis.
+    const RenderFault = struct { xid: u32 = 13, text: []const u8, kind: diagnostics.Kind = .graphics_exception, shader: diagnostics.Shader = .none };
+    for ([_]RenderFault{
+        .{ .xid = 69, .text = "Class Error", .kind = .graphics_command },
+        .{ .text = "Graphics Exception" },
+        .{ .text = "Graphics Exception: Shader Program Header 0 Error", .kind = .shader, .shader = .header },
+        .{ .text = "Graphics Exception: Shader Program Header 30 Error", .kind = .shader, .shader = .header },
+        .{ .text = "Graphics Exception: Shader Program Header 31 Error" },
+        .{ .text = "Graphics Exception: Shader Program Header 1 Err" },
+        .{ .text = "prior Graphics Exception: Shader Program Header 1 Error" },
+        .{ .text = "Graphics SM Warp Exception on (GPC 0, TPC 1, SM 0): TEX FORMAT Errors", .kind = .shader, .shader = .warp },
+        .{ .text = "Graphics SM Global Exception on (GPC 0, TPC 1, SM 0): Multiple Warp Errors", .kind = .shader, .shader = .global },
+        .{ .text = "Graphics SM Warp Exception on (GPC 0" },
+        .{ .xid = 69, .text = "Graphics Exception: Shader Program Header 1 Error", .kind = .graphics_command },
+    }) |sample| {
+        var payload: [272]u8 = @splat(0);
+        put(&payload, 0, sample.xid); put(&payload, 4, 7); put(&payload, 8, 0xabc);
+        @memcpy(payload[12..][0..sample.text.len],sample.text);
+        const observed = diagnostics.event(scope,try runtimeEvent(model,0x1006,&payload),1234).?;
+        try t.expect(observed.kind == sample.kind and observed.shader == sample.shader and observed.fatal and
+            observed.hardware_channel == 0xabc and observed.runlist == 7 and observed.render_phase == .none);
+    }
     var journal: diagnostics.Journal = .{};
     _ = try journal.append(original_rc);
     for (0..20) |_| _ = try journal.append(.{ .source = .xid, .kind = .information });
