@@ -1,7 +1,21 @@
 ﻿NVIDIA: passiver Besitzer fuer 0.79.9
 ===================================
 
-Stand: 13.09.2026, NVIDIA 0.1.94. 0.79.13 ist softwareseitig abgeschlossen.
+Stand: 13.09.2026, NVIDIA 0.1.95. 0.79.13 ist softwareseitig abgeschlossen.
+0.79.14 ist begonnen: Der vorhandene IRQ-Besitzer bindet nach nativer
+Uebernahme den gemeldeten Display-Stall-Vektor und LAST_DATA des aktiven
+Heads an. Monotone Beobachtungssequenz, IRQ-Zeitstempel und GPU-Frame-/
+Zeilenzaehler bleiben zusammenhaengend lesbar. Der Worker protokolliert
+das erste echte Ereignis; DISPLAYD /NVIDIA head-events liest es per SSH.
+Der IRQ veraendert keine BOs, verarbeitet keine RM-Queue und schreibt
+keine Logs. Gemeinsame GSP-/Displayzustellung weckt einmal. Unbekannte
+Ursachen bleiben unveraendert und sperren weitere Zustellung; der Abbau
+entfernt nur eigene Head-Enablebits und wartet auf den IRQ-Besitzer.
+Die bestehende Device-Pruefung deckt zwei Heads, leere Statusregister,
+Hardwarezaehler-Umlauf, gemeinsame Zustellung und Fehlerabbau ab.
+Pageflips, sichtbare Presentstatistik und Hardwarecursor bleiben offen.
+Beleg: Docs/Drivers/GrafikPraesentation07914.txt/.json.
+
 OPTION NVIDIA mode=native verbindet Bootmodus, gesicherte
 RAM-Pixel, eigene CE-/Displayressourcen und den gemeinsamen Displaybesitz.
 Empfaengermodi werden aus echter EDID abgeleitet und mit frischen

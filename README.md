@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.94; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.95; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -12,7 +12,23 @@ Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
 
-Native output (NVIDIA 0.1.94):
+Display timing (NVIDIA 0.1.95, 0.79.14 in progress):
+After native handoff the existing IRQ endpoint enables the GSP-reported
+display stall vector and only the active head's LAST_DATA source. It shares
+MSI/INTx routing and the retirement gate with GSP delivery. An IRQ copies
+per-head observed sequence, monotonic observation time and hardware frame/line
+counters, then wakes the serialized worker. No RM call, resource mutation or
+logging runs inside the IRQ. Workers obtain consistent bounded snapshots;
+the first actual event is logged through `DISPLAYD /NVIDIA head-events`.
+Empty head status does not advance a sequence. Frame-counter wrap is separate
+from the software sequence. Unknown causes remain unacknowledged and lead
+to held-resource failure. Closing blocks delivery and disables owned head
+bits before releasing the callback and mapping. GSP-only paths are preserved.
+These observations do not yet constitute pageflip or buffer-release receipts.
+Flip queues, their common presentation statistics and hardware cursor remain
+open. Evidence: GrafikPraesentation07914.json; physical checks: OssiGPU.txt.
+
+Native output (0.79.13 software complete):
 Explicit `OPTION NVIDIA mode=native` now drives resource allocation and the
 common handoff from the serialized Device worker: actual CE engine/context,
 display masks, private VRAM/RAMHT, Core/Window/WIMM, SYSTEM shadow, output

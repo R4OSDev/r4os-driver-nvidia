@@ -2186,6 +2186,7 @@ fn checkDeviceIrq(target: *@import("gsp_device.zig").Device, words: []u32, frts:
             try t.expect(!endpoint.failed() and words[irqs.reg.clear / 4] == 0x40 and words[irqs.reg.rearm / 4] == 8);
             try t.expect(target.step() == .progress and target.running.snapshot.events == events + 1);
             try t.expect(target.session.?.pending == null and target.phase == .ready);
+            if (scenario == .irq_intx) try checkDisplayIrq(target, words);
             return;
         }
     }
@@ -2209,6 +2210,72 @@ fn checkDeviceIrq(target: *@import("gsp_device.zig").Device, words: []u32, frts:
         try t.expect(steps < 12000 and target.recovery.report != null and endpoint.closed and !endpoint.registered and !endpoint.msi);
     }
     try t.expect(target.memory.?.retained and target.display.?.firmware_owner == @intFromPtr(target));
+}
+fn checkDisplayIrq(target: *@import("gsp_device.zig").Device, words: []u32) !void {
+    const irqs = @import("gsp_irq.zig");
+    const heads = @import("gsp_head_events.zig");
+    const endpoint = &target.interrupts;
+    const inventory = target.running.post.snapshot().?;
+    var wrong = inventory.*;
+    wrong.entries[wrong.display_index.?].stall = 201; // Never alias the GSP source.
+    try t.expectError(error.Vector, endpoint.enableDisplay(&wrong, target.epoch, 10));
+    try t.expect(endpoint.display.epoch == 0);
+    words[(heads.reg.enable + 4) / 4] = 0x40;
+    words[(heads.reg.enable + 12) / 4] = 0x20;
+    try endpoint.enableDisplay(inventory, target.epoch, 10);
+    try t.expect(endpoint.display.leaf == 4 and endpoint.display.bit == 1 << 22 and endpoint.display.subtree == 4 and
+        words[irqs.reg.rearm / 4] == 12 and words[(heads.reg.enable + 4) / 4] == 0x42 and words[(heads.reg.enable + 12) / 4] == 0x22);
+    const tx = target.session.?.tx_sequence;
+    const rm_events = target.running.snapshot.events;
+    const mappings = range_calls;
+    const wakes = IrqModel.wakes;
+    words[irqs.reg.top / 4] = 4;
+    words[(irqs.reg.leaf + 24) / 4] = 0;
+    words[(irqs.reg.leaf + 16) / 4] = 1 << 22;
+    words[heads.reg.dispatch / 4] = 10;
+    words[(heads.reg.status + 4) / 4] = 2;
+    words[(heads.reg.status + 12) / 4] = 2;
+    words[(heads.reg.position + 0x800) / 4] = 0xffff0020;
+    words[(heads.reg.position + 0x1800) / 4] = 0x70030;
+    clock += 1000;
+    try t.expect(IrqModel.dispatch(IrqModel.irq) == a.irq_result_handled);
+    const one = endpoint.display.heads[1].snapshot().?;
+    const three = endpoint.display.heads[3].snapshot().?;
+    try t.expect(one.sequence == 1 and three.sequence == 1 and one.observed_ns == clock and three.observed_ns == clock and
+        one.frame_counter == 65535 and three.frame_counter == 7 and one.scanline == 32 and three.scanline == 48 and
+        endpoint.display.heads[0].snapshot().?.sequence == 0 and words[(heads.reg.clear + 4) / 4] == 2 and words[(heads.reg.clear + 12) / 4] == 2);
+    try t.expect(IrqModel.wakes == wakes + 1 and range_calls == mappings and target.session.?.tx_sequence == tx and target.running.snapshot.events == rm_events);
+    // Another delivery without a head cause cannot invent a VBlank.
+    words[(heads.reg.status + 4) / 4] = 0;
+    words[(heads.reg.status + 12) / 4] = 0;
+    clock += 1000;
+    try t.expect(IrqModel.dispatch(IrqModel.irq) == a.irq_result_handled and endpoint.display.heads[1].snapshot().?.sequence == 1);
+    // Hardware frame counter wrap is independent of our monotone observed sequence.
+    words[heads.reg.dispatch / 4] = 2;
+    words[(heads.reg.status + 4) / 4] = 2;
+    words[(heads.reg.position + 0x800) / 4] = 0x10;
+    words[irqs.reg.top / 4] = 12;
+    words[(irqs.reg.leaf + 24) / 4] = 512;
+    words[irqs.reg.status / 4] = 0x40;
+    const messages = endpoint.messages;
+    const combined_wakes = IrqModel.wakes;
+    clock += 1000;
+    try t.expect(IrqModel.dispatch(IrqModel.irq) == a.irq_result_handled);
+    try t.expect(endpoint.display.heads[1].snapshot().?.sequence == 2 and endpoint.display.heads[1].snapshot().?.frame_counter == 0 and
+        endpoint.display.heads[3].snapshot().?.sequence == 1);
+    try t.expect(endpoint.messages == messages + 1 and IrqModel.wakes == combined_wakes + 1 and words[irqs.reg.rearm / 4] == 12 and
+        target.session.?.tx_sequence == tx and target.running.snapshot.events == rm_events and range_calls == mappings);
+    // Preserve an unowned cause and retire before firmware recovery.
+    words[(heads.reg.status + 4) / 4] = 0x20;
+    words[(irqs.reg.leaf + 24) / 4] = 0;
+    words[(heads.reg.clear + 4) / 4] = 0;
+    words[irqs.reg.rearm / 4] = 0;
+    try t.expect(IrqModel.dispatch(IrqModel.irq) == a.irq_result_handled and endpoint.failed() and endpoint.gate == 0 and
+        words[(heads.reg.clear + 4) / 4] == 0 and words[irqs.reg.rearm / 4] == 0 and endpoint.display.heads[1].snapshot().?.sequence == 2);
+    try t.expect(endpoint.close() and words[(heads.reg.enable + 4) / 4] == 0x40 and words[(heads.reg.enable + 12) / 4] == 0x20 and
+        !endpoint.display.enabled and !endpoint.registered and !endpoint.lease.valid());
+    _ = target.step();
+    try t.expect(target.phase == .recovering and target.memory.?.retained);
 }
 
 fn devicePost(target: *@import("gsp_device.zig").Device, dp: bool, foreign: bool) !void {

@@ -308,8 +308,9 @@
 //  * Authors: Ben Skeggs
 //  */
 //! GA106 GSP interrupt endpoint. Register/close run in serialized DriverWork.
-//! IRQs use only an immutable borrowed MMIO view, atomics and one semaphore
-//! release. No task-owned lease validation, queue/DMA access or logging in IRQ.
+//! IRQs use an immutable borrowed MMIO view, atomics, a cached monotonic
+//! clock and one semaphore release. No task-owned lease validation,
+//! queue/DMA access, table lookup or logging in IRQ.
 const std = @import("std");
 const r4os = @import("r4os");
 const a = r4os.abi;
@@ -358,6 +359,8 @@ pub const Owner = struct {
     interrupts: u64 = 0,
     messages: u64 = 0,
     last_status: i32 = 0,
+    clock: ?r4os.r4dev.DriverResourceContext = null,
+    display: @import("gsp_head_events.zig").Owner = .{},
 
     pub fn open(self: *Owner, ctx: *const r4os.r4dev.DriverContext, mapping: *bar0.Owner,
         snapshot: *const identity.Snapshot, chip: identity.Chip, inventory: *const postinit.Data,
@@ -418,11 +421,11 @@ pub const Owner = struct {
         if (!self.flush()) { self.latch(1); return error.IdentityChanged; }
     }
 
-    fn read(self: *const Owner, offset: u32) u32 {
+    pub fn read(self: *const Owner, offset: u32) u32 {
         const word: *volatile u32 = @ptrFromInt(self.cpu + offset);
         return word.*;
     }
-    fn write(self: *const Owner, offset: u32, value: u32) void {
+    pub fn write(self: *const Owner, offset: u32, value: u32) void {
         const word: *volatile u32 = @ptrFromInt(self.cpu + offset);
         word.* = value;
     }
@@ -435,21 +438,41 @@ pub const Owner = struct {
     }
     pub fn failed(self: *const Owner) bool { return @atomicLoad(u32, &self.fault, .acquire) != 0; }
 
+    pub fn enableDisplay(self: *Owner, inventory: *const postinit.Data, epoch: u64, head_mask: u32) !void {
+        if (self.self_address != @intFromPtr(self) or !self.registered or self.closed or self.failed() or self.display.epoch != 0) return error.State;
+        const index = inventory.display_index orelse return error.Vector;
+        if (index >= inventory.entry_count or index >= inventory.entries.len or inventory.entries[index].engine != postinit.display_engine) return error.Vector;
+        const vector = inventory.entries[index].stall;
+        if (vector >= postinit.vector_count or vector == self.leaf * 32 + @ctz(self.bit)) return error.Vector;
+        const clock = self.ctx.?.resources() orelse return error.Api;
+        if (clock.nowNs() == std.math.maxInt(u64)) return error.Clock;
+        if (@cmpxchgStrong(u32, &self.gate, 1, 2, .acq_rel, .acquire) != null) return error.Busy;
+        defer self.leave();
+        self.write(reg.unarm, 15);
+        if (!self.flush()) { self.latch(1); return error.IdentityChanged; }
+        self.clock = clock;
+        try self.display.enable(self, epoch, vector, head_mask);
+        self.write(reg.leaf + self.display.leaf * 4, self.display.bit);
+        self.write(reg.allow + self.display.leaf * 4, self.display.bit);
+        if (!self.flush()) { self.latch(1); return error.IdentityChanged; }
+    }
+
+    fn leave(self: *Owner) void {
+        // close can request retirement while an IRQ or setup owns the gate.
+        if (!self.failed() and @atomicLoad(u32, &self.gate, .acquire) == 2) {
+            self.write(reg.rearm, self.subtree | if (self.display.enabled) self.display.subtree else @as(u32, 0));
+            if (!self.flush()) self.latch(1);
+        }
+        if (self.failed()) @atomicStore(u32, &self.gate, 0, .release) else
+            if (@cmpxchgStrong(u32, &self.gate, 2, 1, .release, .monotonic) != null)
+                @atomicStore(u32, &self.gate, 0, .release);
+    }
+
     fn interrupt(irq: u8, raw: usize) callconv(.c) u32 {
         const self: *Owner = @ptrFromInt(raw);
         if (self.self_address != raw or irq != self.irq or
             @cmpxchgStrong(u32, &self.gate, 1, 2, .acq_rel, .acquire) != null) return 0;
-        defer {
-            // close may change 2 -> 3 at any point. It waits for this complete
-            // sequence before unarming, so a late rearm cannot escape close.
-            if (!self.failed() and @atomicLoad(u32, &self.gate, .acquire) == 2) {
-                self.write(reg.rearm, self.subtree);
-                if (!self.flush()) self.latch(1);
-            }
-            if (self.failed()) @atomicStore(u32, &self.gate, 0, .release) else
-                if (@cmpxchgStrong(u32, &self.gate, 2, 1, .release, .monotonic) != null)
-                    @atomicStore(u32, &self.gate, 0, .release);
-        }
+        defer self.leave();
         self.write(reg.unarm, 15);
         if (self.msi) self.write(reg.msi, 0);
         if (!self.flush()) {
@@ -457,8 +480,20 @@ pub const Owner = struct {
             self.signal();
             return a.irq_result_handled;
         }
-        if (self.read(reg.top) & self.subtree == 0 or self.read(reg.leaf + self.leaf * 4) & self.bit == 0) return 0;
+        const top = self.read(reg.top);
+        const gsp_pending = top & self.subtree != 0 and self.read(reg.leaf + self.leaf * 4) & self.bit != 0;
+        const display_pending = self.display.enabled and top & self.display.subtree != 0 and self.read(reg.leaf + self.display.leaf * 4) & self.display.bit != 0;
+        if (!gsp_pending and !display_pending) return 0;
         _ = @atomicRmw(u64, &self.interrupts, .Add, 1, .monotonic);
+        if (display_pending) {
+            self.write(reg.leaf + self.display.leaf * 4, self.display.bit);
+            _ = self.display.interrupt(self, self.clock.?.nowNs()) catch blk: { self.latch(4); break :blk 0; };
+        }
+        if (!gsp_pending) {
+            if (!self.flush()) self.latch(1);
+            self.signal();
+            return a.irq_result_handled;
+        }
         self.write(reg.leaf + self.leaf * 4, self.bit);
         const status = self.read(reg.status);
         const mask = self.read(reg.mask);
@@ -504,6 +539,10 @@ pub const Owner = struct {
         if (!retired) return false;
         if (self.touched) {
             self.write(reg.unarm, 15);
+            if (self.display.epoch != 0) {
+                self.write(reg.block + self.display.leaf * 4, self.display.bit);
+                if (self.flush()) self.display.disable(self);
+            }
             self.write(reg.block + self.leaf * 4, self.bit);
             // A removed GPU need not answer, but its CPU callback must still
             // retire. The display/DMA graph is retained by the outer owner.

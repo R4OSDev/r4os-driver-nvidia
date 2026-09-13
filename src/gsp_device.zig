@@ -60,6 +60,7 @@ pub const Device = struct {
     irq_wake: ?irq.Wake = null,
     recovery_deadline: u64 = 0,
     recovery_started: bool = false,
+    heads_reported: u32 = 0,
     tx: [transport.message.max_bytes]u8 = undefined,
     rx: [transport.message.max_bytes]u8 = undefined,
 
@@ -222,6 +223,28 @@ pub const Device = struct {
                 } else try self.catalog.invalidate();
             }
             const output_progress = try self.native_output.step();
+            if (self.native_output.phase == .active and self.interrupts.display.epoch == 0) {
+                const root = (try self.running.displayEngineStatus(self.native_output.engine.?)).info orelse return error.State;
+                const head = self.native_output.mode.?.head;
+                if (head >= root.hardware.heads or head >= 8) return error.Binding;
+                self.interrupts.enableDisplay(self.running.post.snapshot() orelse return error.State,
+                    self.epoch, @as(u32, 1) << @as(u5, @intCast(head))) catch |err| {
+                    if (err == error.Busy) return progress or output_progress;
+                    return err;
+                };
+                self.ctx.?.logInfo("NVIDIA head-events: source=display-stall-LAST_DATA clock=IRQ-observation sequence=observed-events");
+                return true;
+            }
+            if (self.interrupts.display.enabled) for (&self.interrupts.display.heads, 0..) |*head, index| {
+                const bit = @as(u32, 1) << @as(u5, @intCast(index));
+                if (self.interrupts.display.head_mask & bit == 0 or self.heads_reported & bit != 0) continue;
+                const sample = head.snapshot() orelse continue;
+                if (sample.sequence == 0) continue;
+                self.heads_reported |= bit;
+                @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,
+                    "NVIDIA head-events: head={d} epoch={d} sequence={d} observed-ns={d} frame-counter={d} scanline={d}",
+                    .{index,self.epoch,sample.sequence,sample.observed_ns,sample.frame_counter,sample.scanline});
+            };
             return progress or output_progress;
         }
         if (try self.now() >= self.deadline) return error.Deadline;

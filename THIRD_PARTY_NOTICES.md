@@ -823,3 +823,11 @@ archived under ExFiles/Reference/GFX/Nvidia/0.79.11/fault-diagnosis-20260912.
 All original notices are retained in NVIDIA-GSP-RUNTIME-LICENSE.txt and the
 distribution copy. R4OS journal, candidate correlation and quarantine policy
 remain original Apache-2.0 code. No private GSP CHID/token encoding is inferred.
+
+NVIDIA 0.1.95 display timing: LAST_DATA register fields and GSP display-stall
+routing follow the original MIT NVIDIA570.144 display/head/interrupt sources
+and Red Hat 2023 Nouveau r535 display implementation. Seven complete sources
+and hashes are archived under ExFiles/Reference/GFX/Nvidia/0.79.14/head-events-20260913.
+Their complete original notices are retained in gsp_head_events.zig, the
+module runtime license and the identical distribution copy. Original R4OS
+IRQ ownership, bounded snapshots and integration remain Apache-2.0.
