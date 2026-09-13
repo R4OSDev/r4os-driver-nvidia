@@ -1350,6 +1350,9 @@ const DeviceModel = struct {
     var aperture_logs: usize = 0;
     var vaspace_logs: usize = 0;
     var control_logs: usize = 0;
+    var mode_result_logs: usize = 0;
+    var mode_overflow_logs: usize = 0;
+    var restore_logs: usize = 0;
     fn log(text: [*:0]const u8) callconv(.c) void {
         const line = std.mem.span(text);
         if (std.mem.startsWith(u8, line, "NVIDIA gsp-receiver:")) receiver_logs += 1;
@@ -1363,6 +1366,9 @@ const DeviceModel = struct {
         if (std.mem.startsWith(u8, line, "NVIDIA gsp-aperture:")) aperture_logs += 1;
         if (std.mem.startsWith(u8, line, "NVIDIA gsp-vaspace:")) vaspace_logs += 1;
         if (std.mem.startsWith(u8, line, "NVIDIA gsp-control:")) control_logs += 1;
+        if (std.mem.startsWith(u8, line, "NVIDIA mode-result:")) mode_result_logs += 1;
+        if (std.mem.startsWith(u8, line, "NVIDIA mode-diagnostic:")) mode_overflow_logs += 1;
+        if (std.mem.startsWith(u8, line, "NVIDIA native-restore:")) restore_logs += 1;
     }
     fn tick(words: []u32, frts: u64, bad_frts: bool) void {
         const core = @import("gsp_core.zig");
@@ -3303,9 +3309,11 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
         }
         checkpoint = "restore";
         const read = captured.boot.read;
+        const restore_logs = DeviceModel.restore_logs;
         try t.expect(!captured.boot.close() and NativeCommon.restores == 1 and std.meta.eql(read, captured.boot.read));
         try t.expect(!captured.boot.close() and NativeCommon.restores == 2 and std.meta.eql(read, captured.boot.read));
         try t.expect(captured.boot.native_adopted and target.native_output.restore_requested);
+        try t.expect(DeviceModel.restore_logs == restore_logs + 2 and DeviceModel.mode_overflow_logs == 0);
     } else {
         try t.expect(target.phase != .ready and target.native_output.failure != null and !NativeCommon.published);
         try t.expect(NativeCommon.commits == @as(usize, if (NativeCommon.is("context_native_receipt")) 1 else 0));
@@ -3332,6 +3340,7 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
 }
 fn checkNativeModeTimeout(target: *@import("gsp_device.zig").Device) !void {
     const run = &target.running; const product = &target.native_output;
+    errdefer std.debug.print("native mode timeout diagnostic: {any}\n", .{product.modes.diagnostic});
     const native = @import("gsp_vram_test_model.zig").Model;
     const copy = @import("gsp_copy_test_model.zig").Model;
     for (0..100) |_| {
@@ -3370,6 +3379,14 @@ fn checkNativeModeTimeout(target: *@import("gsp_device.zig").Device) !void {
     const receipt = NativeCommon.mode_receipt.?;
     try t.expect(receipt.ticket == 1 and receipt.sequence == 1 and receipt.operation == a.gfx_mode_operation_apply and
         receipt.outcome == a.gfx_output_outcome_lost and receipt.quiesced == 0 and receipt.error_code == a.gfx_output_error_timeout);
+    // A timed-out upload must never be reported as an acknowledged new image.
+    const diagnostic = product.modes.diagnostic;
+    try t.expect(diagnostic.requested.width == 96 and diagnostic.before.width == 65 and diagnostic.after.width == 65 and
+        std.meta.eql(diagnostic.before, diagnostic.after) and diagnostic.selected == old.surface.scanout.?.dma and
+        diagnostic.outcome == a.gfx_output_outcome_lost and diagnostic.quiesced == 0 and diagnostic.error_code == a.gfx_output_error_timeout and
+        diagnostic.pending & 1 != 0 and diagnostic.initial_read_lease != 0 and diagnostic.shadow_imports == 2 and diagnostic.native_owners == 5 and
+        diagnostic.failure != null and diagnostic.failure.? == error.Timeout and std.mem.eql(u8, diagnostic.phase, "image_wait") and
+        diagnostic.observed_valid and diagnostic.observed_ns >= diagnostic.deadline_ns and DeviceModel.mode_overflow_logs == 0);
 }
 fn checkNativeModeJobs(target: *@import("gsp_device.zig").Device) !void {
     const run = &target.running; const product = &target.native_output;
@@ -3377,9 +3394,11 @@ fn checkNativeModeJobs(target: *@import("gsp_device.zig").Device) !void {
     const copy = @import("gsp_copy_test_model.zig").Model;
     const old = run.presentation.?;
     const pixels = copy.vram_data;
+    const result_logs = DeviceModel.mode_result_logs;
     var checkpoint: []const u8 = "catalog";
     errdefer |err| std.debug.print("native mode jobs: {s} at={s} phase={s} failed-phase={?} fail={?} receipt={?} taken={}\n",
         .{@errorName(err),checkpoint,@tagName(product.modes.phase),product.modes.failed_phase,product.modes.failure,NativeCommon.mode_receipt,NativeCommon.mode_taken});
+    errdefer std.debug.print("native mode diagnostic: {any} device-hold={d}\n", .{product.modes.diagnostic,target.display_epoch});
     for (0..100) |_| {
         clock += 1000; _ = target.step(); try t.expect(target.phase == .ready);
         if (product.modes.phase == .idle) break;
@@ -3406,6 +3425,15 @@ fn checkNativeModeJobs(target: *@import("gsp_device.zig").Device) !void {
             product.modes.phase == .decision and run.presentation != old and old.surface.valid() and copy.replacement_lent and copy.borrowed_releases == 0);
         const image = run.presentation.?.surface.scanout.?;
         try t.expect(image.width == 96 and image.height == 24 and image.dma == product.modes.candidate);
+        const diagnostic = product.modes.diagnostic;
+        try t.expect(diagnostic.ticket == job.ticket and diagnostic.operation_sequence == 1 and diagnostic.operation == a.gfx_mode_operation_apply and
+            std.meta.eql(diagnostic.output, product.output) and diagnostic.epoch == run.epoch and diagnostic.hold == target.display_epoch and
+            std.meta.eql(diagnostic.requested, mode) and diagnostic.before.width == 65 and diagnostic.before.height == 20 and
+            diagnostic.after.width == 96 and diagnostic.after.height == 24 and diagnostic.after.mode == mode.mode_id and
+            diagnostic.after.dma == image.dma and diagnostic.selected == image.dma and diagnostic.after.pitch == image.pitch and
+            diagnostic.after.core_point != 0 and diagnostic.after.window_point != 0 and diagnostic.after.mode_receipt != 0 and diagnostic.after.link_receipt != 0 and
+            diagnostic.outcome == a.gfx_output_outcome_applied and diagnostic.quiesced == 1 and diagnostic.common_status == a.gfx_output_ok and
+            diagnostic.pending == 0 and diagnostic.initial_read_lease == 0 and diagnostic.shadow_imports == 2 and diagnostic.native_owners == 5);
         for (0..24) |y| try t.expectEqualSlices(u8, copy.host[1][y * 384..][0..384], copy.replacement_vram[y * image.pitch..][0..384]);
         try t.expectEqualSlices(u8, &pixels, &copy.vram_data);
         var duplicate: a.GfxDriverModeJob = .{};
@@ -3421,6 +3449,11 @@ fn checkNativeModeJobs(target: *@import("gsp_device.zig").Device) !void {
             try t.expect(completed.outcome == a.gfx_output_outcome_old_preserved and completed.quiesced == 2 and
                 run.presentation == old and old.surface.valid() and copy.replacementReferences() == 0 and !native.slots[index].live);
             try t.expectEqualSlices(u8, &pixels, &copy.vram_data);
+            const restored = product.modes.diagnostic;
+            try t.expect(restored.operation == a.gfx_mode_operation_rollback and restored.operation_sequence == 2 and restored.requested.width == 96 and
+                restored.before.width == 96 and restored.after.width == 65 and restored.after.height == 20 and restored.after.dma == old.surface.scanout.?.dma and
+                restored.outcome == a.gfx_output_outcome_old_preserved and restored.quiesced == 2 and restored.pending == 0 and
+                restored.shadow_imports == 1 and restored.native_owners == 4);
             // A known unsupported apply preserves the current image without
             // an allocation, hardware submit or release of the borrowed BO.
             checkpoint = "reject invalid timing";
@@ -3432,13 +3465,24 @@ fn checkNativeModeJobs(target: *@import("gsp_device.zig").Device) !void {
             try t.expect(NativeCommon.mode_receipt.?.outcome == a.gfx_output_outcome_old_preserved and
                 NativeCommon.mode_receipt.?.error_code == a.gfx_output_error_unsupported and target.session.?.tx_sequence == sequence and
                 run.presentation == old and native.released == 1 and copy.borrowed_releases == 0);
+            const rejected = product.modes.diagnostic;
+            try t.expect(rejected.ticket == 2 and rejected.error_code == a.gfx_output_error_unsupported and rejected.quiesced == 2 and
+                rejected.requested.pixel_clock_hz == mode.pixel_clock_hz + 1 and std.meta.eql(rejected.before, rejected.after) and rejected.pending == 0 and
+                rejected.failure != null and rejected.failure.? == error.Unsupported and std.mem.eql(u8, rejected.phase, "idle"));
             copy.replacement_lent = false; // Only the modeled common owner ends this loan.
-        } else try t.expect(completed.outcome == a.gfx_output_outcome_applied and completed.quiesced == 1 and
-            run.presentation_slots[0] == null and run.presentation.?.surface.scanout.?.dma == image.dma and
-            native.slots[index].live and copy.replacement_lent);
+        } else {
+            try t.expect(completed.outcome == a.gfx_output_outcome_applied and completed.quiesced == 1 and
+                run.presentation_slots[0] == null and run.presentation.?.surface.scanout.?.dma == image.dma and
+                native.slots[index].live and copy.replacement_lent);
+            const confirmed = product.modes.diagnostic;
+            try t.expect(confirmed.operation == a.gfx_mode_operation_confirm and confirmed.operation_sequence == 2 and
+                std.meta.eql(confirmed.before, confirmed.after) and confirmed.after.width == 96 and confirmed.selected == image.dma and
+                confirmed.pending == 0 and confirmed.shadow_imports == 1 and confirmed.native_owners == 4);
+        }
     }
     try t.expect(NativeCommon.mode_completions == 5 and product.modes.completed_ticket == 3 and
         NativeCommon.commits == 1 and product.callback_confirmed);
+    try t.expect(product.modes.diagnostic.sequence == 5 and DeviceModel.mode_result_logs == result_logs + 5 and DeviceModel.mode_overflow_logs == 0);
     NativeCommon.mode_job = null; NativeCommon.mode_taken = false; NativeCommon.mode_receipt = null;
 }
 fn pumpNativeModeJob(target: *@import("gsp_device.zig").Device) !void {

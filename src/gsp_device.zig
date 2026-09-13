@@ -186,6 +186,8 @@ pub const Device = struct {
             if (try self.recovery.step()) {
                 self.phase = .failed;
                 self.ctx.?.logWarn("NVIDIA gsp-start: teardown=complete memory=retained display=held poweroff-required=yes");
+                @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,
+                    "NVIDIA native-restore: firmware=complete epoch={d} boot-mapping=unrestored DMA-quiescence=unproved resources=held", .{self.epoch});
             }
             return true;
         }
@@ -648,6 +650,9 @@ pub const Device = struct {
         const text = std.fmt.bufPrintZ(&buffer, "NVIDIA gsp-start: failed={s} phase={s} reason={s} effects={} memory-retained={}",
             .{ phase, @tagName(self.failed_phase orelse self.phase), @errorName(err), self.port.effects_possible, self.memory.?.retained }) catch return;
         self.ctx.?.logError(text);
+        @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,
+            "NVIDIA native-restore: stage={s} reason={s} epoch={d} display-hold={d} effects={} memory-retained={} restore-proved=no",
+            .{phase,@errorName(err),self.epoch,self.display_epoch,self.port.effects_possible,self.memory.?.retained});
     }
     fn logBytes(self: *Device, engine: u32, bytes: []const u8) void {
         var escaped: [160]u8 = undefined;

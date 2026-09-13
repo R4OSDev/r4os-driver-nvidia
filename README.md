@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.93; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.94; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -12,7 +12,7 @@ Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
 
-Native output (NVIDIA 0.1.93):
+Native output (NVIDIA 0.1.94):
 Explicit `OPTION NVIDIA mode=native` now drives resource allocation and the
 common handoff from the serialized Device worker: actual CE engine/context,
 display masks, private VRAM/RAMHT, Core/Window/WIMM, SYSTEM shadow, output
@@ -66,8 +66,23 @@ to the saved mode and complete current receiver facts.
 
 Prepare rejection, timeout, stale route and bad receipts withdraw metadata
 and retain reachable resources. Native close follows actual recovery
-generations; physical restoration is still unimplemented and refuses to
-acknowledge quiescence. Passive bootfb remains the default.
+generations; original firmware scanout restoration remains implementation work
+in 0.79.30 and refuses to acknowledge unproved quiescence. Passive bootfb
+remains the default. Native mode rollback already restores the retained
+last usable image before releasing the candidate.
+
+Each completed or failed mode operation records the request and last
+acknowledged image before/after, routing, timing, image and GPU receipt IDs,
+first failure phase, common response, deadlines and retained owners.
+The image record is historical acknowledgement, not proof of a live signal.
+A failed upload therefore still shows the old acknowledged image and the
+new request, with lost/quiesced=0 and the held GPU read lease. The raw
+clock word is labeled separately from requested Hz and refresh units.
+Restore requests, firmware teardown and failed recovery explicitly distinguish
+unrestored boot mapping from unproved DMA quiescence. The existing SSH entry
+points are `DISPLAYD /STATE`, `DISPLAYD /NVIDIA mode-` and
+`DISPLAYD /NVIDIA native-restore`. The bounded boot log can overwrite older
+records; collect complete matching ticket/sequence groups promptly.
 
 Current 51 NVIDIA groups, original-C raster/AVI vectors and module build pass.
 The existing Device fixture also drives real common mode-job callbacks through
@@ -82,9 +97,11 @@ old image, reuses its candidate slot and retires the old image on confirmation.
 It checks delayed receipts, preserved old pixels and borrowed ownership.
 The common atomic worker is already
 integrated and passed its separate Kernel53/EXAMPLE SMP4 checkpoint.
-NVIDIA mode changes, visible pattern/confirmation, its rollback and
-restoration remain open in 0.79.13. Evidence: GrafikScanout07913.json;
-physical checks: OssiGPU.txt. Models do not prove a physical signal or image.
+Appearance0.1.8 /DISPLAY and Desktop0.1.45 provide SDR mode selection,
+test patterns, confirmation and return through the common transaction.
+0.79.13 is software complete; full GPU/firmware recovery belongs to 0.79.30.
+Evidence: GrafikScanout07913.json; physical checks remain OPEN in OssiGPU.txt.
+Models do not prove a physical signal or image.
 
 Fault diagnosis and quarantine (NVIDIA 0.1.77):
 Roadmap 0.79.11 is software complete, including its combined targeted

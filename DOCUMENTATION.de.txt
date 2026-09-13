@@ -1,8 +1,8 @@
 ﻿NVIDIA: passiver Besitzer fuer 0.79.9
 ===================================
 
-Stand: 13.09.2026, NVIDIA 0.1.93. 0.79.13 ist offen; T1/T2/T3 sind softwareseitig
-abgeschlossen. OPTION NVIDIA mode=native verbindet Bootmodus, gesicherte
+Stand: 13.09.2026, NVIDIA 0.1.94. 0.79.13 ist softwareseitig abgeschlossen.
+OPTION NVIDIA mode=native verbindet Bootmodus, gesicherte
 RAM-Pixel, eigene CE-/Displayressourcen und den gemeinsamen Displaybesitz.
 Empfaengermodi werden aus echter EDID abgeleitet und mit frischen
 Pixeltakt-/IMP-Quittungen an WIMM/Window/Core/HDMI gebunden.
@@ -33,9 +33,24 @@ Besitzer steuert die Bestaetigungsfrist. Die Device-Pruefung deckt beide
 Entscheidungen, Ablehnung ohne Allokation und ausbleibenden GPU-Upload ab.
 Timeout meldet lost ohne Ruhenachweis und haelt noch erreichbare Ressourcen.
 Appearance0.1.8 bietet inzwischen Settings -> Display fuer Moduswahl und
-Bestaetigung. Vollstaendiger Boot-Restore und Diagnose bleiben offen.
+Bestaetigung. Der vollstaendige GPU-/Firmware-Boot-Restore bleibt
+Implementierungsarbeit in 0.79.30; die Rueckkehr zum gehaltenen nativen Bild
+ist bereits integriert.
+
+DISPLAYD /STATE sowie /NVIDIA mode- und /NVIDIA native-restore liefern per
+SSH den gemeinsamen Zustand und begrenzte Treiberprotokolle. Pro Modusauftrag
+werden Anforderung, vorher/nachher zuletzt quittiertes Bild, Route, Timings,
+GPU-Quittungen, Fehlerphase, Fristen und gehaltene Owner erfasst. Bei fehlendem
+Uploadabschluss bleibt das alte Bild als letzte Quittung sichtbar;
+lost/quiesced=0 und die GPU-Leselease zeigen die ausstehende Arbeit.
+Das beweist kein aktuell sichtbares Signal. Der Roh-Taktwert ist als
+clock-word bezeichnet. Firmware-Abbau bestaetigt weder Boot-Abbildung noch
+GPU-Ruhe; verweigerter Restore bleibt sichtbar. Die bestehende Device-Gruppe
+prueft Wechsel, Rueckkehr, Ablehnung, Bestaetigung und Timeout samt Diagnose.
+Alte Zeilen koennen aus dem begrenzten Bootlog fallen; passende Ticket- und
+Operationssequenzen zeitnah sichern.
 Standard bleibt passiv. Belege: Docs/Drivers/GrafikScanout07913.txt/.json,
-mode_product_checkpoint.
+mode_product_checkpoint und mode_diagnostics_checkpoint.
 Physische Abnahmen: ExFiles/Reports/OssiGPU.txt.
 Die folgenden aelteren Abschnitte beschreiben ihren damaligen Stand.
 

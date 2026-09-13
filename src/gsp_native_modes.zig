@@ -34,6 +34,7 @@ pub const Owner = struct {
     outcome: u32 = 0,
     error_code: i32 = 0,
     completed_ticket: u64 = 0,
+    diagnostic: @import("gsp_mode_diagnostics.zig").Report = .{},
 
     pub fn step(self: *Owner, product: anytype) !bool {
         if (self.phase == .failed or self.phase == .unavailable) return false;
@@ -49,6 +50,7 @@ pub const Owner = struct {
                 (err == error.Unsupported or err == error.Descriptor or err == error.Memory or
                     err == error.Bounds or err == error.Exhausted or err == error.Deadline)) {
                 self.error_code = if (err == error.Deadline) a.gfx_output_error_timeout else a.gfx_output_error_unsupported;
+                self.diagnostic.failed(@tagName(self.phase), err);
                 self.outcome = a.gfx_output_outcome_old_preserved; self.phase = .reply;
                 return true;
             }
@@ -249,6 +251,7 @@ pub const Owner = struct {
                 const receipt: a.GfxDriverModeCompletion = .{ .ticket = job.ticket, .sequence = job.sequence, .operation = job.operation,
                     .outcome = self.outcome, .quiesced = if (self.outcome == a.gfx_output_outcome_applied) 1 else 2, .error_code = self.error_code };
                 self.last_status = product.outputs.?.completeMode(&receipt);
+                self.diagnostic.finish(product, @tagName(self.phase), receipt, self.last_status);
                 if (self.last_status != a.gfx_output_ok) return error.ModeApi;
                 self.log(product, "complete");
                 if (job.operation == a.gfx_mode_operation_apply and self.outcome == a.gfx_output_outcome_applied) {
@@ -269,6 +272,7 @@ pub const Owner = struct {
         if (status == 0) return false;
         if (status != a.gfx_output_ok) return error.ModeApi;
         self.job = job; self.deadline = job.deadline_ns; self.error_code = 0; self.outcome = 0;
+        self.diagnostic.begin(product, job);
         if (job.version != 1 or job.size < @sizeOf(a.GfxDriverModeJob) or job.reserved0 != 0 or job.ticket == 0 or job.sequence == 0 or
             !std.meta.eql(job.backend, product.backend) or !std.meta.eql(job.assignment.output, product.output)) return error.Stale;
         if (self.phase == .decision) {
@@ -351,9 +355,15 @@ pub const Owner = struct {
         if (self.phase == .detached or self.phase == .failed or self.phase == .unavailable) return;
         self.failed_phase = self.phase; self.failure = err;
         self.phase = .failed;
-        if (self.job) |job| self.last_status = product.outputs.?.completeMode(&.{ .ticket = job.ticket, .sequence = job.sequence,
-            .operation = job.operation, .outcome = a.gfx_output_outcome_lost, .quiesced = 0,
-            .error_code = if (err == error.Timeout or err == error.Deadline) a.gfx_output_error_timeout else a.gfx_output_error_unavailable });
+        if (self.job) |job| {
+            self.outcome = a.gfx_output_outcome_lost;
+            self.error_code = if (err == error.Timeout or err == error.Deadline) a.gfx_output_error_timeout else a.gfx_output_error_unavailable;
+            const receipt: a.GfxDriverModeCompletion = .{ .ticket = job.ticket, .sequence = job.sequence,
+                .operation = job.operation, .outcome = self.outcome, .quiesced = 0, .error_code = self.error_code };
+            self.last_status = product.outputs.?.completeMode(&receipt);
+            self.diagnostic.failed(@tagName(self.failed_phase.?), err);
+            self.diagnostic.finish(product, @tagName(self.failed_phase.?), receipt, self.last_status);
+        }
         self.log(product, "failed-held");
     }
     fn log(self: *Owner, product: anytype, event: []const u8) void {

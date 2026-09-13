@@ -403,8 +403,8 @@ pub const Owner = struct {
             .mode_count = 1, .preferred_mode_id = 1, .edid_bytes = self.receiver.edid_bytes,
             .possible_heads = head, .possible_planes = plane, .possible_plls = head,
             .limits = .{ .head_mask = head, .plane_mask = plane, .pll_mask = head, .max_width = mode.width, .max_height = mode.height } };
-        // Only the captured geometry is currently admitted by the common
-        // bridge. Receiver modes stay in the independent receiver catalog.
+        // Initial handoff admits only captured geometry. The mode worker
+        // promotes checked receiver timings after native ownership is active.
         self.publication.modes[0] = .{ .mode_id = 1, .flags = a.gfx_output_mode_geometry_only | a.gfx_output_mode_preferred,
             .width = mode.width, .height = mode.height };
         @memcpy(self.publication.edid[0..self.receiver.edid_bytes], self.receiver.edid[0..self.receiver.edid_bytes]);
@@ -469,6 +469,8 @@ pub const Owner = struct {
         if (self.display.?.bootInfo(&current) != a.gfx_output_ok or current.generation != generation or
             current.state != a.display_state_recovering) return 0;
         self.restore_requested = true;
+        @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,
+            "NVIDIA native-restore: requested generation={d} boot-mapping=unrestored DMA-quiescence=unproved resources=held", .{generation});
         // Acknowledge only after an implemented physical restore and complete
         // device quiescence. Firmware teardown alone is insufficient.
         return 0;
