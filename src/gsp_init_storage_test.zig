@@ -1554,6 +1554,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         context_native_unknown, context_native_connected, context_native_jobs, context_native_job_timeout, context_native_prepare_reject,
         context_native_flip_irq_timeout, context_native_flip_notifier_timeout, context_native_flip_release_timeout,
         context_native_frame_timeout,
+        context_native_cursor_timeout, context_native_cursor_reject,
         context_native_receipt, context_native_timeout, context_native_link_reject, context_native_stale,
         context_native_mode_missing, context_native_mode_reject, context_native_mode_free_reject,
         context_native_mode_clock, context_native_mode_impossible, context_native_mode_timeout, context_native_mode_stale,
@@ -3058,6 +3059,7 @@ const NativeCommon = struct {
     fn is(name: []const u8) bool { return std.mem.eql(u8, scenario, name); }
     fn hasModes() bool { return is("context_native_jobs") or is("context_native_job_timeout"); }
     fn flipFailure() bool { return std.mem.startsWith(u8, scenario, "context_native_flip_"); }
+    fn cursorCase() bool { return std.mem.startsWith(u8, scenario, "context_native_cursor_"); }
     fn outputs(out: *a.GfxDriverOutputApi) callconv(.c) i32 {
         _ = CatalogModel.query(out);
         out.publish = @intFromPtr(&publish); out.withdraw = @intFromPtr(&withdraw);
@@ -3346,7 +3348,7 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
         copy.shadow_creates == @as(usize, if (early_mode_failure) 0 else 1) and
         NativeCommon.prepares == @as(usize, if (early_mode_failure) 0 else 1));
     const success = NativeCommon.is("context_native_unknown") or NativeCommon.is("context_native_connected") or NativeCommon.hasModes() or
-        NativeCommon.flipFailure() or NativeCommon.is("context_native_frame_timeout");
+        NativeCommon.flipFailure() or NativeCommon.is("context_native_frame_timeout") or NativeCommon.cursorCase();
     if (success) {
         try t.expect(target.phase == .ready and target.native_output.phase == .active and NativeCommon.commits == 1 and captured.boot.native_adopted);
         try t.expect(target.native_output.ownsNative(DeviceModel.boot_info));
@@ -3355,7 +3357,7 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
         const flags = NativeCommon.publication.info.flags;
         try t.expect((flags & a.gfx_output_flag_connected != 0) == (NativeCommon.is("context_native_connected") or NativeCommon.hasModes()));
         try t.expect((flags & a.gfx_output_flag_connection_unknown != 0) ==
-            (NativeCommon.is("context_native_unknown") or NativeCommon.flipFailure() or NativeCommon.is("context_native_frame_timeout")));
+            (NativeCommon.is("context_native_unknown") or NativeCommon.flipFailure() or NativeCommon.is("context_native_frame_timeout") or NativeCommon.cursorCase()));
         try t.expect(NativeCommon.publication.info.limits.flags == 0 and NativeCommon.publication.info.mode_count == 1);
         try t.expect(target.step() != .stopped and target.failure == null);
         try NativeCommon.checkStatistics();
@@ -3380,6 +3382,14 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
         if (NativeCommon.is("context_native_frame_timeout")) {
             try t.expect(target.phase == .recovering and native.released == 0 and display.released == 0 and !NativeCommon.published);
             _ = target.stop(); return;
+        }
+        if (NativeCommon.is("context_native_unknown") or NativeCommon.is("context_native_connected") or NativeCommon.cursorCase()) {
+            checkpoint = "native PIO cursor";
+            try checkNativeCursor(target);
+            if (NativeCommon.is("context_native_cursor_timeout")) {
+                try t.expect(target.phase == .recovering and native.released == 0 and display.released == 0 and !NativeCommon.published);
+                _ = target.stop(); return;
+            }
         }
         if (NativeCommon.is("context_native_job_timeout")) {
             checkpoint = "common mode DMA timeout";
@@ -3443,6 +3453,86 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
     checkpoint = "stop";
     _ = target.stop();
     try t.expect(native.released == @as(u32, if (NativeCommon.is("context_native_connected")) 5 else if (NativeCommon.is("context_native_jobs")) 4 else 0) and display.released == 0 and !NativeCommon.published);
+}
+fn checkNativeCursor(target: *@import("gsp_device.zig").Device) !void {
+    const run = &target.running; const product = &target.native_output;
+    const dm = @import("gsp_display_test_model.zig").Model;
+    const cm = @import("gsp_copy_test_model.zig").Model;
+    const wire = @import("gsp_display_channel_wire.zig");
+    const pio = @import("gsp_cursor_pio.zig");
+    const deadline = clock + std.time.ns_per_s;
+    if (NativeCommon.is("context_native_connected")) {
+        try t.expectError(error.Unsupported, run.createDisplayChannel(product.engine.?, .cursor, product.mode.?.head, deadline));
+        try t.expect(run.cursor_point == null and target.phase == .ready);
+        return;
+    }
+    const head_id = product.mode.?.head;
+    const handle = try run.createDisplayChannel(product.engine.?, .cursor, head_id, deadline);
+    for (0..40) |_| {
+        clock += 1000; _ = target.step();
+        if (run.display_channel_active == null) break;
+        if (run.activeChannel().?.phase == .waiting) try replyNativeProduct(target);
+    }
+    try t.expect(target.phase == .ready and run.display_channel_active == null);
+    if (NativeCommon.is("context_native_cursor_reject")) {
+        const status = try run.displayChannelStatus(handle);
+        try t.expect(status.rejected.? == 0x57 and status.info == null and run.display_engine_owner.?.children[handle.slot] == 0);
+        try t.expect(run.presentation != null and run.cursor_point == null);
+        return;
+    }
+    const owner = &run.display_channels[handle.slot].?;
+    try t.expect((try run.displayChannelStatus(handle)).info != null and owner.backing.self_address == 0 and
+        owner.config.physical == 0 and owner.parent.children[handle.slot] != 0);
+    const user = try pio.base(head_id);
+    const control = try wire.controlRegister(.cursor, head_id);
+    const state = try wire.statusRegister(.cursor, head_id);
+    const copies = run.frames_rendered; const flips = run.flip_issued; const shadows = cm.shadow_creates;
+    const rpc_sequence = target.session.?.tx_sequence;
+    const statistics = NativeCommon.statistics;
+    try t.expectError(error.Bounds, run.moveCursor(handle, 32768, 0, deadline));
+    try t.expectEqual(@as(u64, 1), try run.moveCursor(handle, -17, 29, deadline));
+    try t.expectError(error.Busy, run.moveCursor(handle, 0, 0, deadline));
+    try t.expectError(error.Busy, run.retireDisplayChannel(handle, deadline));
+    dm.words[(user + 8) / 4] = 0;
+    clock += 1000; _ = target.step();
+    try t.expect(owner.point.pending != null and !owner.point.pending.?.published and owner.point.issued == 0);
+    dm.words[(user + 8) / 4] = 4;
+    clock += 1000; _ = target.step();
+    try t.expect(target.phase == .ready and owner.point.pending.?.published);
+    for (pio.methods, 0..) |method, i| try t.expectEqual(pio.value(.{ .x = -17, .y = 29 }, i), dm.words[(user + method) / 4]);
+    // Retrying the worker with no new IRQ must neither replay UPDATE nor
+    // manufacture visible/CE completion. Hardware state remains owned.
+    dm.words[(user + 0x200) / 4] = 0xabcdef01;
+    clock += 1000; _ = target.step();
+    try t.expect(owner.point.pending != null and owner.point.completed == null and dm.words[(user + 0x200) / 4] == 0xabcdef01);
+    if (NativeCommon.is("context_native_cursor_timeout")) {
+        clock = deadline; _ = target.step();
+        try t.expect(run.failure != null and run.cursor_point == handle.slot and owner.point.pending != null and owner.parent.children[handle.slot] != 0);
+        return;
+    }
+    dm.words[state / 4] = 0x50000;
+    try deliverNativeHead(target, true);
+    clock += 1000; _ = target.step();
+    try t.expect(owner.point.pending != null);
+    dm.words[state / 4] = 0x40000;
+    clock += 1000; _ = target.step();
+    try t.expect(target.phase == .ready and run.cursor_point == null and owner.point.completed.?.point.x == -17 and
+        owner.point.completed.?.point.y == 29 and run.frames_rendered == copies and run.flip_issued == flips and
+        cm.shadow_creates == shadows and target.session.?.tx_sequence == rpc_sequence);
+    try t.expectEqualDeep(statistics, NativeCommon.statistics);
+    try run.retireDisplayChannel(handle, clock + std.time.ns_per_s);
+    var ack = false;
+    for (0..40) |_| {
+        clock += 1000; _ = target.step();
+        if (run.display_channel_active == null) break;
+        if (owner.retirementPending()) {
+            try t.expect(!owner.live and owner.parent.children[handle.slot] != 0);
+            // RM Free acknowledgement alone did not prove PIO retirement.
+            dm.words[control / 4] = 0; dm.words[state / 4] = 0; ack = true;
+        } else if (run.activeChannel().?.phase == .waiting) try replyNativeProduct(target);
+    }
+    try t.expect(ack and run.display_channel_active == null and run.display_engine_owner.?.children[handle.slot] == 0);
+    try t.expectError(error.Stale, run.displayChannelStatus(handle));
 }
 fn checkNativeFrames(target: *@import("gsp_device.zig").Device, extra: bool) !void {
     const run = &target.running; const product = &target.native_output;
@@ -4394,12 +4484,24 @@ fn replyNativeProduct(target: *@import("gsp_device.zig").Device) !void {
             const header: usize = if (rpc.function == 103) 32 else 24;
             @memcpy(response[header..rpc.request.len], bytes[header..]);
         }
-        if (op == .classes) { outputWord(&response, 24, 4); outputWord(&response, 32, 0xc67d); outputWord(&response, 36, 0xc67e); outputWord(&response, 40, 0xc67b); }
+        if (op == .classes) {
+            const with_cursor = NativeCommon.is("context_native_unknown") or NativeCommon.cursorCase();
+            outputWord(&response, 24, if (with_cursor) 5 else 4); outputWord(&response, 32, 0xc67d);
+            outputWord(&response, 36, 0xc67e); outputWord(&response, 40, 0xc67b);
+            if (with_cursor) outputWord(&response, 44, 0xc67a);
+        }
         if (op == .static_info) outputWord(&response, 28, 8); // Only real modeled window 3, never an assumed index.
     } else if (run.display_channel_active) |index| {
         const owner = &run.display_channels[index].?;
         const wire = @import("gsp_display_channel_wire.zig");
-        if (owner.operation.? == .allocate) {
+        if (owner.operation.? == .allocate and owner.config.kind == .cursor) {
+            @memcpy(response[40..48], @import("gsp_display_channel_test.zig").response(.cursor, .allocate)[40..48]);
+            const rejected = NativeCommon.is("context_native_cursor_reject");
+            dm.words[(try wire.controlRegister(.cursor, owner.config.index)) / 4] = if (rejected) 0 else 1;
+            dm.words[(try wire.statusRegister(.cursor, owner.config.index)) / 4] = if (rejected) 0 else 0x40000;
+            dm.words[((try @import("gsp_cursor_pio.zig").base(owner.config.index)) + 8) / 4] = 4;
+            if (rejected) outputWord(&response, 16, 0x57);
+        } else if (owner.operation.? == .allocate) {
             @memcpy(response[48..56], @import("gsp_display_channel_test.zig").response(owner.config.kind, .allocate)[48..56]);
             const slot = &dm.slots[(owner.config.physical - dm.address(0)) / 0x100000];
             slot.hardware = true; slot.control = try wire.controlRegister(owner.config.kind, owner.config.index); slot.state = try wire.statusRegister(owner.config.kind, owner.config.index);

@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.98; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.99; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -12,7 +12,7 @@ Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
 
-Display timing (NVIDIA 0.1.98, 0.79.14 in progress):
+Display timing (NVIDIA 0.1.99, 0.79.14 in progress):
 After native handoff the existing IRQ endpoint enables the GSP-reported
 display stall vector and only the active head's LAST_DATA source. It shares
 MSI/INTx routing and the retirement gate with GSP delivery. An IRQ copies
@@ -50,8 +50,12 @@ latest visible receipt retains its source queue fence, raw GPU timestamp and
 CPU/IRQ observation times. Publication uses bounded metadata from the device
 worker, with no per-frame log; a missing or rejected statistics API preserves
 video. `DISPLAYD /STATS [head-id]` reads it through R4DRAW without submitting
-work. CPU-copy fences retain their meaning. Hardware/software cursor
-integration remains open.
+work. CPU-copy fences retain their meaning.
+The optional private C67A PIO cursor channel now owns signed positions,
+bounded queue pressure and physical retirement, without a DMA command buffer.
+Drained PIO methods and a fresh real head observation form a separate receipt;
+partial writes are never replayed. Cursor image/alpha/hotspot, common transport
+and Desktop software fallback integration remain open.
 Evidence: GrafikPraesentation07914.json; physical checks: OssiGPU.txt.
 
 Native output (0.79.13 software complete):

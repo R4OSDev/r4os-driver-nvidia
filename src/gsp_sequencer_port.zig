@@ -631,6 +631,49 @@ pub const Port = struct {
         if (try self.readFor(scope, 0) != self.boot0) return error.IdentityChanged;
         try fifo.ring.notified(ticket);
     }
+    pub fn readCursorPoint(self: *Port, channel: *@import("gsp_display_channel.zig").Owner, deadline: u64) !?@import("gsp_cursor_pio.zig").Sample {
+        const pio = @import("gsp_cursor_pio.zig");
+        const wire = @import("gsp_display_channel_wire.zig");
+        const scope: Scope = .{ .request = deadline };
+        errdefer |err| self.recordFailure(err);
+        try self.guardFor(scope);
+        if (self.phase != .runtime or !self.retained or channel.config.kind != .cursor) return error.Phase;
+        const endpoint = self.owner.?; const admit_push = endpoint.admit_display_push orelse return error.Unsupported;
+        try admit_push(endpoint.context, self, channel, deadline, .read);
+        const offsets = [_]u32{ (try pio.base(channel.config.index)) + 8, try wire.controlRegister(.cursor, channel.config.index), try wire.statusRegister(.cursor, channel.config.index) };
+        for (offsets) |offset| if (!self.supports(.read, offset)) return error.Register;
+        if (try self.readFor(scope, 0) != self.boot0) return error.IdentityChanged;
+        var samples: [2][3]u32 = undefined;
+        for (&samples) |*sample| for (offsets, 0..) |offset, i| {
+            try self.guardFor(scope); try admit_push(endpoint.context, self, channel, deadline, .read);
+            fence(); sample[i] = self.pointer(offset).*; fence();
+        };
+        if (try self.readFor(scope, 0) != self.boot0) return error.IdentityChanged;
+        try admit_push(endpoint.context, self, channel, deadline, .read);
+        if (!std.meta.eql(samples[0], samples[1])) return null;
+        return .{ .free = samples[1][0], .control = samples[1][1], .state = samples[1][2] };
+    }
+    pub fn submitCursorPoint(self: *Port, channel: *@import("gsp_display_channel.zig").Owner, deadline: u64) !void {
+        const pio = @import("gsp_cursor_pio.zig");
+        const scope: Scope = .{ .request = deadline };
+        errdefer |err| if (err != error.Busy) self.recordFailure(err);
+        try self.guardFor(scope);
+        if (self.phase != .runtime or !self.retained or channel.config.kind != .cursor or channel.point.pending == null or channel.point.pending.?.published) return error.Phase;
+        const endpoint = self.owner.?; const admit_push = endpoint.admit_display_push orelse return error.Unsupported;
+        try admit_push(endpoint.context, self, channel, deadline, .publish);
+        const base = try pio.base(channel.config.index);
+        for (pio.methods) |method| if (!self.supports(.write, base + method)) return error.Register;
+        const available = (try self.readCursorPoint(channel, deadline)) orelse return error.Busy;
+        if (!try pio.idle(available)) return error.Busy;
+        try admit_push(endpoint.context, self, channel, deadline, .publish);
+        try channel.point.publish(deadline);
+        const point = channel.point.pending.?.point;
+        for (pio.methods, 0..) |method, i| {
+            try self.guardFor(scope); try admit_push(endpoint.context, self, channel, deadline, .publish);
+            self.pointer(base + method).* = pio.value(point, i); fence();
+        }
+        if (try self.readFor(scope, 0) != self.boot0) return error.IdentityChanged;
+    }
     pub fn readDisplayCursor(self: *Port, channel: *@import("gsp_display_channel.zig").Owner, deadline: u64) !?struct { put: u16, get: u16 } {
         const push = @import("gsp_display_push.zig");
         const scope: Scope = .{ .request = deadline };

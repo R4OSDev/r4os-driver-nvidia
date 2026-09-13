@@ -274,6 +274,7 @@ pub const Owner = struct {
         return true;
     }
     fn take(self: *Owner, product: anytype) !bool {
+        if (product.running.?.cursor_point != null) return false;
         var job: a.GfxDriverModeJob = .{};
         const status = product.outputs.?.takeMode(&product.backend, &job);
         if (status == 0) return false;

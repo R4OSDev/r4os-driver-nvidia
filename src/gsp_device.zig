@@ -551,9 +551,25 @@ pub const Device = struct {
             rpc.phase != .idle or rpc.pending != null or rpc.in_lockdown or ticket.epoch != self.epoch) return error.Binding;
         try rpc.guard(deadline);
     }
+    fn admitCursorPoint(self: *Device, port: *const native.Port, channel: *@import("gsp_display_channel.zig").Owner, deadline: u64, access_kind: native.DisplayAccess) !void {
+        if (self.phase != .ready or port != &self.port or port.phase != .runtime or self.session == null or self.inLockdown() or
+            self.running.self_address != @intFromPtr(&self.running) or self.running.failure != null or self.native_output.phase != .active or
+            self.native_output.mode == null or self.native_output.modes.job != null or !self.native_output.callback_confirmed) return error.State;
+        const mode = self.native_output.mode.?;
+        if (mode.window >= self.running.display_images.len) return error.Binding;
+        const root = if (self.running.display_engine_owner) |*value| value else return error.Binding;
+        const info = root.info() orelse return error.Binding;
+        if (!info.cursor or !info.instance_bound or channel.parent != root or channel.config.index != mode.head or mode.head >= info.hardware.heads or
+            channel.config.root.epoch != self.epoch or channel.exchange.session != &self.session.? or port.runtime_session != &self.session.? or
+            self.session.?.pending != null) return error.Binding;
+        try self.running.validateCursorPoint(channel, deadline);
+        const active = self.running.display_images[mode.window] orelse return error.Binding;
+        if (active.head != mode.head or (access_kind == .publish and channel.point.pending.?.submitted_ns == 0)) return error.Binding;
+    }
     fn admitDisplayPush(raw: *anyopaque, port: *const native.Port, channel: *@import("gsp_display_channel.zig").Owner, deadline: u64, access_kind: native.DisplayAccess) !void {
         const self = from(raw);
         try self.checkLive(false);
+        if (channel.config.kind == .cursor) return self.admitCursorPoint(port, channel, deadline, access_kind);
         if (self.phase != .ready or port != &self.port or port.phase != .runtime or self.session == null or self.inLockdown() or
             self.running.self_address != @intFromPtr(&self.running) or self.running.failure != null or self.running.sequence.self_address != 0 or
             self.running.fifo_active != null or self.running.context_active != null or self.running.native_active != null or self.running.buffer_active != null or

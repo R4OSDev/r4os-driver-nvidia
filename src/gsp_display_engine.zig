@@ -307,7 +307,7 @@ const vram = @import("gsp_vram.zig");
 pub const wire = @import("gsp_display_engine_wire.zig");
 pub const Error = wire.Error || names.Error || vram.Error;
 pub const State = enum { creating, binding_instance, unwinding, ready, handed_off, destroying, closed, finished, failed };
-pub const Info = struct { binding: wire.Binding, hardware: wire.StaticInfo, core: bool, window: bool, immediate: bool, instance_bound: bool };
+pub const Info = struct { binding: wire.Binding, hardware: wire.StaticInfo, core: bool, window: bool, immediate: bool, cursor: bool = false, instance_bound: bool };
 pub const Owner = struct {
     self_address: usize = 0,
     exchange: exchange.Exchange,
@@ -320,10 +320,11 @@ pub const Owner = struct {
     core_supported: bool = false,
     window_supported: bool = false,
     immediate_supported: bool = false,
+    cursor_supported: bool = false,
     instance_storage: vram.storage.Use = .{},
     instance_bound: bool = false,
     instance_possible: bool = false,
-    children: [17]u32 = @splat(0),
+    children: [25]u32 = @splat(0),
     channels_started: bool = false, // Only individually fenced unused RAMHT entries may change now.
     live: bool = false,
     allocation_possible: bool = false,
@@ -362,7 +363,7 @@ pub const Owner = struct {
             (self.state != .ready and self.state != .handed_off)) return null;
         if (self.instance_bound and self.instance_storage.info() == null) return null;
         return .{ .binding = self.binding, .hardware = self.hardware orelse return null, .core = self.core_supported,
-            .window = self.window_supported, .immediate = self.immediate_supported, .instance_bound = self.instance_bound };
+            .window = self.window_supported, .immediate = self.immediate_supported, .cursor = self.cursor_supported, .instance_bound = self.instance_bound };
     }
     pub fn attachInstance(self: *Owner, source: *vram.Owner, token: *boot.Handoff, deadline: u64) Error!void {
         const root = self.info() orelse return error.State;
@@ -417,6 +418,7 @@ pub const Owner = struct {
         const core_supported = op == .classes and reply == .ok and wire.supportsClass(reply.ok, 0xc67d);
         const window_supported = op == .classes and reply == .ok and wire.supportsClass(reply.ok, 0xc67e);
         const immediate_supported = op == .classes and reply == .ok and wire.supportsClass(reply.ok, 0xc67b);
+        const cursor_supported = op == .classes and reply == .ok and wire.supportsClass(reply.ok, 0xc67a);
         self.last_status = if (reply == .rejected) reply.rejected else 0;
         // A reply never publishes ownership until its exact transport ACK.
         try self.exchange.complete(dispatch.ticket);
@@ -428,7 +430,7 @@ pub const Owner = struct {
             if (op == .allocate) self.allocation_possible = false;
             self.rejected = reply.rejected; self.state = .unwinding;
         } else switch (op) {
-            .classes => if (supported) { self.classes = true; self.core_supported = core_supported; self.window_supported = window_supported; self.immediate_supported = immediate_supported; }
+            .classes => if (supported) { self.classes = true; self.core_supported = core_supported; self.window_supported = window_supported; self.immediate_supported = immediate_supported; self.cursor_supported = cursor_supported; }
                 else { self.unavailable = true; self.state = .unwinding; },
             .static_info => if (hardware.?.windows != 0) { self.hardware = hardware; } else { self.unavailable = true; self.state = .unwinding; },
             .allocate => self.live = true,

@@ -264,6 +264,7 @@ pub const Owner = struct {
                     .core => { self.core = handle; self.next(.core_wait); },
                     .window => { self.window = handle; self.next(.window_wait); },
                     .immediate => { self.immediate = handle; self.next(.immediate_wait); },
+                    .cursor => unreachable,
                 }
             },
             .core_wait, .window_wait, .immediate_wait => {

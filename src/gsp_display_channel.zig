@@ -99,6 +99,7 @@ pub const Owner = struct {
     adapter: u32,
     backing: storage.Storage = .{},
     ring: push.Ring = .{},
+    point: @import("gsp_cursor_pio.zig").Owner = .{},
     state: State = .creating,
     pushbuffer: bool = false,
     live: bool = false,
@@ -124,6 +125,7 @@ pub const Owner = struct {
         if ((kind == .core and !root.core) or (kind == .window and (!root.window or parent.children[0] == 0 or root.hardware.windows & (@as(u32, 1) << @intCast(index)) == 0))) return error.Unsupported;
         if (kind == .immediate and (!root.immediate or !root.window or parent.children[0] == 0 or parent.children[1 + index] == 0 or
             root.hardware.windows & (@as(u32, 1) << @intCast(index)) == 0)) return error.Unsupported;
+        if (kind == .cursor and (!root.cursor or !root.core or parent.children[0] == 0 or index >= root.hardware.heads)) return error.Unsupported;
         try token.session.guard(deadline);
         const reservation = try token.session.rm_names.reserveChildren(parent.reservation.parent, 1);
         errdefer token.session.rm_names.retireChildren(reservation) catch {};
@@ -154,7 +156,7 @@ pub const Owner = struct {
     }
     pub fn info(self: *const Owner) ?Info {
         self.stable() catch return null;
-        if (self.self_address != @intFromPtr(self) or !self.live or self.backing.physical() == null or self.exchange.session.state != .active or
+        if (self.self_address != @intFromPtr(self) or !self.live or (self.config.kind != .cursor and self.backing.physical() == null) or self.exchange.session.state != .active or
             (self.state != .ready and self.state != .handed_off)) return null;
         return .{ .config = self.config, .rm_allocated = true };
     }
@@ -169,7 +171,10 @@ pub const Owner = struct {
         if (self.exchange.pending != null) return error.Pending;
         if (self.backing.ready and self.backing.physical() != self.config.physical) return error.Stale;
         if (self.operation == null) {
-            if (self.state == .creating and !self.backing.ready) {
+            if (self.state == .creating and self.config.kind == .cursor and self.config_stamp == null) {
+                try wire.validate(self.config); self.config_stamp = self.config;
+            }
+            if (self.state == .creating and self.config.kind != .cursor and !self.backing.ready) {
                 self.backing.prepare(&self.ctx, self.adapter, self.config.root.epoch) catch |err| {
                     if (err == error.Descriptor or err == error.Retained) return err;
                     self.host_rejected = err; self.state = .unwinding; return null;
@@ -194,13 +199,13 @@ pub const Owner = struct {
             };
             const data = try wire.encode(self.config, op, &self.request);
             try self.exchange.begin(wire.function(op), data, self.deadline); self.operation = op;
-            self.backing.retained = true;
+            if (self.config.kind != .cursor) self.backing.retained = true;
             if (op == .allocate) self.allocation_possible = true;
         }
         const dispatch = (try self.exchange.poll(self.deadline)) orelse return null;
         if (!dispatch.response) return dispatch;
         const op = self.operation.?;
-        const reply = try wire.decode(self.config, op, self.request[0..wire.length(op)], dispatch.record);
+        const reply = try wire.decode(self.config, op, self.request[0..wire.lengthFor(self.config.kind, op)], dispatch.record);
         self.last_status = if (reply == .rejected) reply.rejected else 0;
         try self.exchange.complete(dispatch.ticket);
         if (reply == .rejected) {
@@ -227,6 +232,7 @@ pub const Owner = struct {
     pub fn beginDestroy(self: *Owner, token: *boot.Handoff, deadline: u64) Error!void {
         try self.stable();
         if (self.state != .handed_off or token.session != self.exchange.session) return error.State;
+        if (self.point.pending != null) return error.Retained;
         // Core Free may purge satellites across RM clients. Our windows must
         // retire first, even if a caller claims that the GPU is quiescent.
         if (self.config.kind == .core) for (self.parent.children[1..]) |child| if (child != 0) return error.Retained;
@@ -245,9 +251,10 @@ pub const Owner = struct {
         var expected: [wire.max_bytes]u8 = undefined;
         const encoded = wire.encode(self.config, op, &expected) catch return false;
         return self.self_address == @intFromPtr(self) and current == &self.exchange and current.deadline == deadline and self.deadline == deadline and
-            current.request.ptr == self.request[0..].ptr and current.request.len == wire.length(op) and current.function == wire.function(op) and
+            current.request.ptr == self.request[0..].ptr and current.request.len == wire.lengthFor(self.config.kind, op) and current.function == wire.function(op) and
             std.mem.eql(u8, current.request, encoded) and
-            self.backing.physical() == self.config.physical and self.backing.retained and
+            (if (self.config.kind == .cursor) self.config.physical == 0 and self.backing.self_address == 0
+                else self.backing.physical() == self.config.physical and self.backing.retained) and
             (self.state == .creating or self.state == .unwinding or self.state == .destroying);
     }
     pub fn admitsRetirement(self: *const Owner, deadline: u64) bool {
@@ -256,6 +263,7 @@ pub const Owner = struct {
         // channel teardown deadline owns this separate hardware operation.
         return self.self_address == @intFromPtr(self) and self.deadline == deadline and self.exchange.deadline == null and self.exchange.request.len == 0 and
             self.exchange.phase == .idle and self.exchange.pending == null and self.retirementPending() and
-            self.backing.retained and self.backing.physical() == self.config.physical;
+            (if (self.config.kind == .cursor) self.config.physical == 0 and self.backing.self_address == 0
+                else self.backing.retained and self.backing.physical() == self.config.physical);
     }
 };

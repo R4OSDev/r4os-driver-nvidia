@@ -181,8 +181,9 @@ pub const Owner = struct {
     mode_control_owner: ?mode_control.Owner = null,
     mode_control_active: bool = false,
     mode_control_root: ?DisplayEngineHandle = null,
-    display_channels: [17]?display_channel.Owner = @splat(null),
+    display_channels: [25]?display_channel.Owner = @splat(null),
     display_channel_active: ?u8 = null,
+    cursor_point: ?u8 = null,
     display_resources_slot: DisplayResourcesSlot = .{},
     display_upload_job: ?struct { operation: display_upload.Upload = .{}, channel_handle: ChannelHandle } = null,
     display_work: ?DisplayWork = null,
@@ -438,7 +439,7 @@ pub const Owner = struct {
     }
     pub fn nativeObject(self: *Owner) ?display.Object {
         if (self.self_address != @intFromPtr(self) or self.failure != null or self.graph == null or
-            self.display_upload_job != null or self.display_work != null or self.display_flip != null or
+            self.display_upload_job != null or self.display_work != null or self.display_flip != null or self.cursor_point != null or
             self.graph.?.self_address != @intFromPtr(&self.graph.?) or self.graph.?.state != .loaned or
             self.display_object == null or self.channel == null or self.activeChannel() != &self.channel.? or
             self.channel.?.session.state != .active) return null;
@@ -620,8 +621,8 @@ pub const Owner = struct {
             .initialized = owner.ring.initialized, .completed = owner.ring.completed };
     }
     pub fn retireDisplayChannel(self: *Owner, handle: DisplayChannelHandle, deadline: u64) !void {
-        if (self.presentation != null) return error.Busy;
         const owner = try self.findDisplayChannel(handle);
+        if (self.presentation != null and owner.config.kind != .cursor) return error.Busy;
         if (self.copyBusy() or self.sequence.self_address != 0 or self.nativeObject() == null or self.channel.?.phase != .idle or
             self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         try self.channel.?.guard(deadline);
@@ -634,7 +635,7 @@ pub const Owner = struct {
     /// Initial population or a fresh live image entry. Live updates never
     /// rewrite an active DMA descriptor and require drained display methods.
     pub fn bindDisplayStorage(self: *Owner, handle: DisplayEngineHandle, kind: display_channel.wire.Kind, index: u32, source: BufferHandle) !u32 {
-        if (kind == .immediate) return error.Unsupported; // WIMM has no RAMHT DMA contexts.
+        if (kind == .immediate or kind == .cursor) return error.Unsupported; // Immediate channels have no RAMHT DMA contexts.
         const parent = try self.mutableDisplayTable(handle);
         const config = parent.info() orelse return error.State;
         const slot = try display_channel.wire.slot(kind, index);
@@ -953,6 +954,46 @@ pub const Owner = struct {
     }
     fn headObservation(self: *const Owner, head: u32) !@import("gsp_head_events.zig").Sample {
         return (try self.headSource(head)).snapshot() orelse error.Busy;
+    }
+    pub fn moveCursor(self: *Owner, handle: DisplayChannelHandle, x: i32, y: i32, deadline: u64) !u64 {
+        const owner = try self.findDisplayChannel(handle);
+        if (self.cursor_point != null) return error.Busy;
+        const current = try self.now();
+        if (owner.config.kind != .cursor or owner.info() == null or self.display_work != null or self.display_upload_job != null or
+            self.initial_image != null or self.graph_closing or self.sequence.self_address != 0 or self.channel == null or
+            self.activeChannel() != &self.channel.? or self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
+        _ = try self.headSource(owner.config.index);
+        try self.channel.?.guard(deadline);
+        const result = try owner.point.begin(x, y, current, deadline);
+        self.cursor_point = handle.slot;
+        return result;
+    }
+    pub fn validateCursorPoint(self: *Owner, owner: *display_channel.Owner, deadline: u64) !void {
+        const slot = self.cursor_point orelse return error.State;
+        if (slot >= self.display_channels.len or self.display_channels[slot] == null or &self.display_channels[slot].? != owner or
+            owner.config.kind != .cursor or owner.config.root.epoch != self.epoch or owner.info() == null or
+            !owner.point.valid(deadline) or self.display_work != null or self.display_upload_job != null or self.initial_image != null or
+            self.graph_closing or self.sequence.self_address != 0 or self.channel == null or self.activeChannel() != &self.channel.? or
+            self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Stale;
+        _ = try self.headSource(owner.config.index);
+        try self.channel.?.guard(deadline);
+    }
+    fn advanceCursorPoint(self: *Owner, current: u64) !bool {
+        const slot = self.cursor_point orelse return false;
+        const owner = if (self.display_channels[slot]) |*value| value else return error.Stale;
+        const job = owner.point.pending orelse return error.Stale;
+        try self.validateCursorPoint(owner, job.deadline);
+        if (current >= job.deadline) return error.Timeout;
+        const sample = (try self.device.?.readCursorPoint(owner, job.deadline)) orelse return false;
+        const observed = self.headObservation(owner.config.index) catch |err| { if (err == error.Busy) return false; return err; };
+        if (!job.published) {
+            if (!try @import("gsp_cursor_pio.zig").idle(sample)) return false;
+            try owner.point.prepare(current, observed);
+            self.device.?.submitCursorPoint(owner, job.deadline) catch |err| { if (err == error.Busy) return false; return err; };
+            return true;
+        }
+        if (!try owner.point.observe(sample, observed, current)) return false;
+        self.cursor_point = null; return true;
     }
     /// Repeated at the real PUT gate. No caller-selected buffer, timing,
     /// completed CE point, prior display or event generation is trusted.
@@ -2216,8 +2257,8 @@ pub const Owner = struct {
             const owner = if (self.display_channels[index]) |*value| value else return error.State;
             if (owner.state == .ready or owner.state == .closed) {
                 if (owner.state == .ready) try self.rejection(.display_channel, owner.config.handle, owner.rejected, owner.host_rejected);
-                if (owner.info()) |value| self.log("NVIDIA gsp-display-channel: handle={x} class={x} index={d} physical={x} bytes=4096 methods=empty",
-                    .{value.config.handle,display_channel.wire.class(value.config.kind),value.config.index,value.config.physical});
+                if (owner.info()) |value| self.log("NVIDIA gsp-display-channel: handle={x} class={x} index={d} physical={x} bytes={d} methods=empty",
+                    .{value.config.handle,display_channel.wire.class(value.config.kind),value.config.index,value.config.physical,@as(u32, if (value.config.kind == .cursor) 0 else 4096)});
                 const deadline = owner.deadline; var token = try owner.handoff(); const finished = owner.state == .finished;
                 self.channel = try exchange.Exchange.init(&token, deadline);
                 if (finished) self.display_channels[index] = null;
@@ -2352,7 +2393,7 @@ pub const Owner = struct {
         };
         // Drain an already observable GSP fault before publishing CE success.
         // Active RPC owners above already receive before sending their work.
-        if (self.copyBusy() and channel.phase == .idle) {
+        if ((self.copyBusy() or self.cursor_point != null) and channel.phase == .idle) {
             const end = channel.deadline orelse try std.math.add(u64, current, std.time.ns_per_s);
             if (try channel.poll(end)) |dispatch| {
                 try self.notification(channel, dispatch, current); return .progress;
@@ -2362,6 +2403,7 @@ pub const Owner = struct {
         if (try self.advanceInitialImage(current)) return .progress;
         if (try self.advanceDisplay(current)) return .progress;
         if (try self.advanceDisplayFlip(current)) return .progress;
+        if (try self.advanceCursorPoint(current)) return .progress;
         if (try self.advanceCopy(current)) return .progress;
         if (try self.advancePresentFrame(current)) return .progress;
         if (self.presentation) |entry| if (entry.pending and !self.copyAdmissionBusy() and self.presentationValid()) {

@@ -382,5 +382,5 @@ pub fn immediate(config: Config) Error!Program {
     try out.method(0x200, &.{3}); // RELEASE_ELV + INTERLOCK_WITH_WINDOW.
     return out;
 }
-pub fn encode(config: Config) Error!Program { return switch (config.kind) { .core => core(config), .window => window(config), .immediate => immediate(config) }; }
+pub fn encode(config: Config) Error!Program { return switch (config.kind) { .core => core(config), .window => window(config), .immediate => immediate(config), .cursor => error.Descriptor }; }
 pub fn same(a: Program, b: Program) bool { return a.count == b.count and std.mem.eql(u32, &a.words, &b.words); }
