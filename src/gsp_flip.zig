@@ -11,6 +11,8 @@ pub const Receipt = struct {
     previous_dma: u32,
     image_dma: u32,
     render_point: u32,
+    source_timeline: u64 = 0,
+    source_point: u64 = 0,
     window_point: u64 = 0,
     submitted_ns: u64 = 0,
     begun_gpu_timestamp: u64 = 0,

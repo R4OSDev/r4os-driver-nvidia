@@ -71,6 +71,7 @@ pub const Owner = struct {
     restore_requested: bool = false,
     modes: @import("gsp_native_modes.zig").Owner = .{},
     frame_count: u8 = 2,
+    statistics: @import("gsp_frame_stats.zig").Owner = .{},
 
     /// Explicit mode=native only. Check the common handoff API before the
     /// device worker can execute the already prepared firmware operations.
@@ -80,7 +81,7 @@ pub const Owner = struct {
         const outputs = ctx.graphicsOutputs() orelse return error.Api;
         const memory = ctx.memory() orelse return error.Api;
         const clock = ctx.resources() orelse return error.Api;
-        if (display.table.version != 1 or display.table.size < @sizeOf(a.GfxDriverDisplayApi) or
+        if (display.table.version != 1 or display.table.size < @offsetOf(a.GfxDriverDisplayApi, "prepare_held") + 8 or
             display.table.prepare_held == 0 or display.table.transition == 0 or display.table.boot_info == 0 or
             outputs.table.publish == 0 or outputs.table.withdraw == 0) return error.Api;
         if (!captured.ready or captured.scanout_original == null or captured.original_boot == null or

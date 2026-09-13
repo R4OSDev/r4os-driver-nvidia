@@ -103,6 +103,7 @@ pub const Presentation = struct {
     initial_failure: ?anyerror = null,
     retiring: bool = false,
     damage: ?present.Rect = null,
+    render_fence: r4os.abi.GfxFence = .{},
 };
 pub const InitialImage = struct { operation: present.Initial = .{}, mapping: ?BufferHandle = null, presentation: *Presentation, deadline: u64 };
 pub const InitialImageStatus = struct { pending: bool, completed: u32, failure: ?anyerror };
@@ -213,6 +214,9 @@ pub const Owner = struct {
     fifo_active: ?u16 = null,
     copy_job: ?CopyJob = null,
     copy_completed: u64 = 0,
+    frames_acquired: u64 = 0,
+    frames_rendered: u64 = 0,
+    frames_rejected: u64 = 0,
     copy_backend: ?struct { queue: r4os.driver_queue.Context, binding: r4os.abi.GfxBackendBinding } = null,
     quarantine_attempted: bool = false,
     quarantine_result: ?i32 = null,
@@ -938,7 +942,8 @@ pub const Owner = struct {
                 .notifier_offset = offset, .windows = root.hardware.windows, .initialize = false, .with_core = false,
                 .route = .{ .window = owner.config.index, .head = previous.head }, .scanout = image } },
             .receipt = .{ .epoch = self.epoch, .sequence = self.flip_issued, .head = previous.head, .window = owner.config.index,
-                .previous_dma = previous.image.dma, .image_dma = dma, .render_point = entry.initial_point } };
+                .previous_dma = previous.image.dma, .image_dma = dma, .render_point = entry.initial_point,
+                .source_timeline = entry.render_fence.timeline, .source_point = entry.render_fence.point } };
     }
     fn headSource(self: *const Owner, head: u32) !*const @import("gsp_head_events.zig").Head {
         const source = self.head_events orelse return error.Unsupported;
@@ -962,6 +967,7 @@ pub const Owner = struct {
             !std.meta.eql(config.scanout, @as(?display_resources.image.Image, image)) or route.window != entry.window.slot - 1 or route.head != work.previous.head or
             work.receipt.epoch != self.epoch or work.receipt.sequence != self.flip_issued or work.receipt.head != route.head or work.receipt.window != route.window or
             work.receipt.image_dma != image.dma or work.receipt.previous_dma != work.previous.image.dma or work.receipt.render_point != entry.initial_point or
+            work.receipt.source_timeline != entry.render_fence.timeline or work.receipt.source_point != entry.render_fence.point or
             entry.initial_point == 0 or entry.initial_failure != null or image.dma == work.previous.image.dma or
             image.width != work.previous.image.width or image.height != work.previous.image.height or image.pitch != work.previous.image.pitch or
             image.format != work.previous.image.format or work.previous.boot_mode == null or work.previous.link == null or work.previous.position == null or
@@ -1448,6 +1454,7 @@ pub const Owner = struct {
                     entry.damage = if (entry.damage) |prior| prior.merge(damage) else damage;
                 };
                 self.copy_job.?.target_presentation = next_frame orelse return error.State;
+                self.frames_acquired +|= 1;
             }
         }
         const resource_count: usize = if (self.copy_job.?.presentation) 1 else 2;
@@ -1483,7 +1490,8 @@ pub const Owner = struct {
             if (work.memory.bufferRelease(&reference.reference) != a.gfx_buffer_result_ok) return error.Retained;
             reference.* = .{};
         };
-        if (result == a.gfx_queue_result_complete) self.copy_completed +|= 1;
+        if (result == a.gfx_queue_result_complete) self.copy_completed +|= 1
+        else if (work.job.operation == a.gfx_queue_operation_upload and work.job.target_buffer.id == 0) self.frames_rejected +|= 1;
         self.copy_job = null;
     }
     fn advanceCopy(self: *Owner, current: u64) !bool {
@@ -1495,6 +1503,8 @@ pub const Owner = struct {
                 if (work.target_presentation) |entry| {
                     if (self.frame_ready != null) return error.State;
                     entry.initial_point = work.ticket.?.point; entry.damage = null;
+                    entry.render_fence = work.job.fence;
+                    self.frames_rendered +|= 1;
                     self.frame_ready = .{ .image = entry, .deadline = work.deadline };
                 }
                 try self.finishCopy(r4os.abi.gfx_queue_result_complete); return true;
@@ -1658,6 +1668,7 @@ pub const Owner = struct {
                 const completed = work.operation.ticket.?.point;
                 try work.operation.complete(point);
                 entry.initial_point = completed;
+                entry.render_fence = .{};
                 self.initial_image = null;
                 self.log("NVIDIA gsp-initial-image: complete point={d} source-read=released mapping=retained scanout=uncommitted", .{completed});
                 return true;

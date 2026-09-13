@@ -173,6 +173,7 @@ pub const Device = struct {
             } else self.fail(err);
             break :blk true;
         };
+        self.native_output.statistics.publish(&self.native_output);
         return if (self.phase == .failed) .stopped else if (progress) .progress else .idle;
     }
     fn advance(self: *Device) !bool {
@@ -336,6 +337,7 @@ pub const Device = struct {
         self.native_output.quarantine(error.Stopped);
         if (!self.catalog.close()) return false;
         self.running.stop(error.Stopped);
+        self.native_output.statistics.publish(&self.native_output);
         if (!self.interrupts.close()) return false;
         self.stopped = true;
         return true;

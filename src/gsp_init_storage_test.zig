@@ -3052,6 +3052,8 @@ const NativeCommon = struct {
     var mode_taken = false;
     var mode_receipt: ?a.GfxDriverModeCompletion = null;
     var mode_completions: usize = 0;
+    var statistics: ?a.DisplayPresentationStats = null;
+    var statistics_busy = false;
     var scenario: []const u8 = "";
     fn is(name: []const u8) bool { return std.mem.eql(u8, scenario, name); }
     fn hasModes() bool { return is("context_native_jobs") or is("context_native_job_timeout"); }
@@ -3067,8 +3069,42 @@ const NativeCommon = struct {
         return a.gfx_output_ok;
     }
     fn display(out: *a.GfxDriverDisplayApi) callconv(.c) i32 {
-        out.* = .{ .boot_info = @intFromPtr(&DeviceModel.bootInfo), .prepare_held = @intFromPtr(&prepare), .transition = @intFromPtr(&transition) };
+        out.* = .{ .boot_info = @intFromPtr(&DeviceModel.bootInfo), .prepare_held = @intFromPtr(&prepare), .transition = @intFromPtr(&transition),
+            .presentation_stats = @intFromPtr(&presentationStats) };
+        if (is("context_native_connected")) { out.size = 64; out.presentation_stats = 0; }
         return a.gfx_output_ok;
+    }
+    fn presentationStats(input: *const a.DisplayPresentationStats) callconv(.c) i32 {
+        const product = &target.native_output; const run = &target.running;
+        std.debug.assert(product.callback_confirmed and input.version == 1 and input.size == 208 and
+            std.meta.eql(input.backend, product.backend) and input.display_generation == product.receipt.generation and
+            input.head_id == product.mode.?.head and input.buffer_count == run.presentation_buffers and
+            input.acquired_count == run.frames_acquired and input.rendered_count == run.frames_rendered and
+            input.rejected_count == run.frames_rejected and input.submitted_count == run.flip_issued and
+            input.visible_count == run.flip_visible and input.released_count == run.flip_released);
+        if (statistics) |prior| std.debug.assert(input.sequence == prior.sequence + 1 and input.visible_count >= prior.visible_count and
+            input.released_count >= prior.released_count) else std.debug.assert(input.sequence == 1);
+        if (is("context_native_unknown") and !statistics_busy) { statistics_busy = true; return a.gfx_output_error_busy; }
+        if (run.flip_receipts[input.head_id]) |receipt| {
+            std.debug.assert(input.visible_sequence == receipt.sequence and input.source_timeline == receipt.source_timeline and
+                input.source_point == receipt.source_point and input.render_point == receipt.render_point and input.window_point == receipt.window_point and
+                input.visible_ns == receipt.begun_observed_ns and input.gpu_timestamp == receipt.begun_gpu_timestamp and
+                input.irq_sequence == receipt.head_observation.sequence and input.irq_observed_ns == receipt.head_observation.observed_ns and
+                input.released_ns == receipt.previous_released_ns);
+        } else std.debug.assert(input.visible_count == 0 and input.visible_sequence == 0 and input.visible_ns == 0 and input.irq_sequence == 0);
+        statistics = input.*; return a.gfx_output_ok;
+    }
+    fn checkStatistics() !void {
+        const product = &target.native_output; const run = &target.running;
+        try t.expect(!product.statistics.disabled);
+        if (is("context_native_connected")) { try t.expect(statistics == null and product.statistics.last == null); return; }
+        const value = statistics orelse return error.MissingPresentationStatistics;
+        try t.expectEqualDeep(product.statistics.last.?, value);
+        try t.expect(value.acquired_count == run.frames_acquired and value.rendered_count == run.frames_rendered and
+            value.submitted_count == run.flip_issued and value.visible_count == run.flip_visible and value.released_count == run.flip_released and
+            value.rejected_count == run.frames_rejected and value.rendered_count <= value.acquired_count and value.released_count <= value.visible_count);
+        if (target.failure != null) try t.expect(value.flags & a.display_presentation_flag_lost != 0);
+        if (is("context_native_unknown")) try t.expect(statistics_busy);
     }
     fn publish(input: *const a.GfxOutputPublication, out: *a.GfxOutputId) callconv(.c) i32 {
         std.debug.assert(input.info.identity.connector_id == 4 and std.meta.eql(input.backend, @import("gsp_copy_test_model.zig").Model.binding));
@@ -3188,6 +3224,7 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
     NativeCommon.mode_requests = @splat(0);
     NativeCommon.published_generation = 0; NativeCommon.modes_enabled = false; NativeCommon.mode_job = null;
     NativeCommon.mode_taken = false; NativeCommon.mode_receipt = null; NativeCommon.mode_completions = 0;
+    NativeCommon.statistics = null; NativeCommon.statistics_busy = false;
     for (&NativeCommon.pixels, 0..) |*byte, i| byte.* = @truncate(i * 17 + 23);
     table.gfx_output_query = NativeCommon.outputs; table.gfx_display_query = NativeCommon.display;
     captured.boot.display = target.ctx.?.graphicsDisplay();
@@ -3321,6 +3358,7 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
             (NativeCommon.is("context_native_unknown") or NativeCommon.flipFailure() or NativeCommon.is("context_native_frame_timeout")));
         try t.expect(NativeCommon.publication.info.limits.flags == 0 and NativeCommon.publication.info.mode_count == 1);
         try t.expect(target.step() != .stopped and target.failure == null);
+        try NativeCommon.checkStatistics();
         if (NativeCommon.flipFailure()) {
             checkpoint = "native flip deadline";
             try checkNativeFlip(target);
@@ -3472,6 +3510,7 @@ fn checkNativeFrames(target: *@import("gsp_device.zig").Device, extra: bool) !vo
                             copy.result == a.gfx_queue_result_device_lost and std.meta.eql(copy.initial_read, leases) and leases.lease.id != 0 and
                             run.flip_visible == visible and run.flip_released + 1 == run.flip_visible and run.frame_ready == null);
                         for (&run.presentation_slots) |*slot| if (slot.*) |*entry| try t.expect(entry.surface.target.?.gpu.lease.id != 0);
+                        try NativeCommon.checkStatistics();
                         return;
                     }
                 } else if (!signaled) { try copy.signal(); signaled = true; }
@@ -3482,6 +3521,9 @@ fn checkNativeFrames(target: *@import("gsp_device.zig").Device, extra: bool) !vo
             run.copy_job == null and run.frame_ready != null and run.flip_visible == visible and run.presentation == old and
             std.meta.eql(run.display_images[product.mode.?.window].?, prior) and run.presentationGroupCount(old) == count);
         const image = run.frame_ready.?.image;
+        try NativeCommon.checkStatistics();
+        if (NativeCommon.statistics) |value| try t.expect(value.pending & a.display_presentation_pending_ready != 0 and value.visible_count == visible);
+        try t.expectEqualDeep(copy.job.fence, image.render_fence);
         const native_index = image.surface.target.?.info().?.reference.buffer.id - 801;
         const pixels = copy.imageBytes(native_index);
         for (0..descriptor.height) |row| try t.expectEqualSlices(u8,
@@ -3510,6 +3552,7 @@ fn checkNativeFrames(target: *@import("gsp_device.zig").Device, extra: bool) !vo
             if (run.display_flip) |work| if (work.window.phase == .submitted) break;
         }
         try t.expect(run.display_flip != null and run.display_flip.?.window.phase == .submitted and run.flip_visible == visible);
+        try NativeCommon.checkStatistics();
         const user = try push.userBase(.window, product.mode.?.window);
         display.words[(user + 4) / 4] = display.words[user / 4];
         words[note.offset / 4 + 2] = @intCast(100 + frame); words[note.offset / 4 + 3] = 7;
@@ -3518,6 +3561,9 @@ fn checkNativeFrames(target: *@import("gsp_device.zig").Device, extra: bool) !vo
         for (0..10) |_| { clock += 1000; _ = target.step(); if (run.flip_visible != visible) break; }
         try t.expect(run.flip_visible == visible + 1 and run.display_flip != null and run.presentation == image and
             run.flip_receipts[prior.head].?.previous_released_ns == 0 and !try table_owner.imageFinished(product.window.?.slot, prior.image.dma));
+        try NativeCommon.checkStatistics();
+        if (NativeCommon.statistics) |value| try t.expect(value.visible_count == visible + 1 and value.released_ns == 0 and
+            value.source_timeline == image.render_fence.timeline and value.source_point == image.render_fence.point and value.source_point != 0);
         if (count == 3 and frame == 0) {
             held_offset = previous_offset;
             continue;
@@ -3528,6 +3574,7 @@ fn checkNativeFrames(target: *@import("gsp_device.zig").Device, extra: bool) !vo
         try t.expect(run.presentation == image and run.frame_ready == null and run.display_flip == null and
             run.flip_receipts[prior.head].?.previous_released_ns != 0 and core.ring.issued == core_point and
             display.words[(try push.userBase(.core, 0)) / 4] == core_put);
+        try NativeCommon.checkStatistics();
     }
     var used: usize = 0; for (seen) |value| if (value) { used += 1; };
     try t.expect(used == count and ((run.presentation == original) != extra));
@@ -3538,6 +3585,7 @@ fn checkNativeFrames(target: *@import("gsp_device.zig").Device, extra: bool) !vo
     for (0..12) |_| { clock += 1000; _ = target.step(); if (copy.completed != prior_completed) break; }
     try t.expect(target.phase == .ready and copy.completed == prior_completed + 1 and copy.result == a.gfx_queue_result_failed and
         copy.initial_read.lease.id == 0 and run.copy_job == null and run.frame_ready == null and run.display_flip == null and run.flip_visible == prior_visible);
+    try NativeCommon.checkStatistics();
 }
 fn checkNativeModeTimeout(target: *@import("gsp_device.zig").Device) !void {
     const run = &target.running; const product = &target.native_output;
