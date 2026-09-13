@@ -39,6 +39,7 @@ pub const Model = struct {
     pub var borrowed_releases: usize = 0;
     var initial_index: usize = 0;
     var command_view: [length]u8 = undefined;
+    var command_slot: usize = 0;
     pub var dma: [2]a.GfxDeviceLease = @splat(.{});
     pub var gpu: [2]a.GfxDeviceLease = @splat(.{});
     pub var job: a.GfxDriverJob = .{};
@@ -421,7 +422,10 @@ pub const Model = struct {
         try t.expect((active or initial_read.lease.id != 0) and !fetched and owner.ring.pending == null);
         try t.expect(word(mmio, 0xbb0090) == owner.work_submit_token.?);
         // The device observes commands only at the published doorbell boundary.
-        command_view = fifo.slots[0].data;
+        command_slot = for (&fifo.slots,0..) |_, i| {
+            if (fifo.address(i) == owner.config.address) break i;
+        } else return error.CommandStorage;
+        command_view = fifo.slots[command_slot].data;
         const put = word(&command_view, 8192 + 0x8c);
         try t.expect(put == owner.ring.put and put < 512);
         const index = (put + 511) % 512;
@@ -457,7 +461,7 @@ pub const Model = struct {
         try t.expect(operand(decoded[12], decoded[13]) == owner.config.address + 8704 and decoded[14] == owner.ring.issued);
         }
         // GPGet means fetch only. It cannot authorize completion or reuse.
-        std.mem.writeInt(u32, fifo.slots[0].data[8192 + 0x88..][0..4], put, .little);
+        std.mem.writeInt(u32, fifo.slots[command_slot].data[8192 + 0x88..][0..4], put, .little);
         fetched = true;
     }
     pub fn execute() !void {
@@ -483,7 +487,7 @@ pub const Model = struct {
         try t.expect((active or initial_read.lease.id != 0) and executed and !signaled);
         // SYS-scope release makes preceding CE data visible before the point.
         host[0] = gpu_data[0]; host[1] = gpu_data[1];
-        std.mem.writeInt(u32, fifo.slots[0].data[8704..8708], decoded[decoded_count - 3], .little);
+        std.mem.writeInt(u32, fifo.slots[command_slot].data[8704..8708], decoded[decoded_count - 3], .little);
         signaled = true;
     }
     pub fn heldReferences() usize { var n: usize = 0; for (references) |entry| if (entry.active) { n += 1; }; return n; }

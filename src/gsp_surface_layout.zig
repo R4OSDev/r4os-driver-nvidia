@@ -149,6 +149,14 @@ pub const Plan = struct {
             else try rawPrivate(adapter, space, self.descriptor.byte_length, self.raw_alignment, self.privileged, self.readonly);
         if (!std.meta.eql(self, expected)) return error.Descriptor;
     }
+    // Engine views retain the authenticated allocation's geometry. Rebuild
+    // it without inventing a VM binding or trusting its opaque modifier.
+    pub fn validateView(self: Plan, adapter: u32, epoch: u64) Error!void {
+        const caps = self.caps orelse return error.Descriptor;
+        if (adapter == 0 or epoch == 0 or caps.binding.epoch != epoch) return error.Stale;
+        const expected = try geometry(adapter, epoch, self.allocation_bytes, caps, self.request orelse return error.Descriptor);
+        if (!std.meta.eql(self, expected)) return error.Descriptor;
+    }
 };
 fn alignUp(value: u64, granule: u64) Error!u64 {
     return (std.math.add(u64, value, granule - 1) catch return error.Bounds) & ~(granule - 1);
@@ -189,6 +197,9 @@ pub fn modifier(caps: memory_caps.Info, log2: u8) Error!u64 {
 pub fn create(adapter: u32, space: vaspace.Info, caps: memory_caps.Info, request: Request) Error!Plan {
     if (adapter == 0 or space.epoch == 0 or caps.binding.epoch != space.epoch or
         caps.binding.client != space.client or caps.binding.device != space.device) return error.Stale;
+    return geometry(adapter, space.epoch, space.bytes, caps, request);
+}
+fn geometry(adapter: u32, epoch: u64, limit: u64, caps: memory_caps.Info, request: Request) Error!Plan {
     if (request.width == 0 or request.height == 0 or request.usage == 0 or request.usage & ~@as(u32, 60) != 0) return error.Descriptor;
     const multi = request.format == .nv12 or request.format == .p010;
     // NVKMS ISO surfaces require complete chroma blocks; offscreen buffers
@@ -200,7 +211,7 @@ pub fn create(adapter: u32, space: vaspace.Info, caps: memory_caps.Info, request
     const mod = if (request.layout == .blocklinear) try modifier(caps, log2) else 0;
     var plan: Plan = .{ .descriptor = .{ .alignment = alignment, .modifier = mod, .width = request.width, .height = request.height,
         .format = @intFromEnum(request.format), .plane_count = if (multi) 2 else 1, .usage = request.usage,
-        .location = a.gfx_buffer_location_device_local, .adapter_id = adapter, .device_generation = space.epoch },
+        .location = a.gfx_buffer_location_device_local, .adapter_id = adapter, .device_generation = epoch },
         .allocation_bytes = 0, .request = request, .caps = caps, .log2_gobs = log2 };
     const sample_bytes: u64 = switch (request.format) { .xrgb8888, .argb8888 => 4, .p010 => 2, else => 1 };
     var end: u64 = 0;
@@ -220,7 +231,7 @@ pub fn create(adapter: u32, space: vaspace.Info, caps: memory_caps.Info, request
         end = std.math.add(u64, offset, size) catch return error.Bounds;
     }
     plan.allocation_bytes = try alignUp(end, alignment);
-    if (plan.allocation_bytes > space.bytes) return error.Bounds;
+    if (plan.allocation_bytes > limit) return error.Bounds;
     plan.descriptor.byte_length = plan.allocation_bytes;
     return plan;
 }

@@ -11,6 +11,8 @@ pub fn image(resource: Resource, target: bool) !render.image.Image {
     const info = resource.info;
     const descriptor = info.surface.descriptor;
     const request = info.surface.request orelse return error.Unsupported;
+    try info.surface.validateView(descriptor.adapter_id, info.epoch);
+    if (info.allocation_bytes != info.surface.allocation_bytes) return error.Descriptor;
     // Direct rendering into a displayed image needs the presentation owner's
     // inactive-image lease. This initial job path accepts offscreen images.
     if (target and descriptor.usage & a.gfx_buffer_usage_scanout != 0) return error.Unsupported;

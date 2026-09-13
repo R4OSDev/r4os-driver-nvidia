@@ -5507,11 +5507,15 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
     const target_info = (try run.nativeBufferStatus(buffer)).info.?;
     const native_index = target_info.reference.buffer.id - 801;
     const target_image = try @import("gsp_render_job.zig").image(.{ .info = target_info, .driver_owner = native.slots[native_index].reservation.driver_owner },true);
+    var corrupt = target_info;
+    corrupt.surface.descriptor.modifier = 0x0300000000606010;
+    try t.expectError(error.Descriptor,@import("gsp_render_job.zig").image(.{ .info = corrupt,
+        .driver_owner = native.slots[native_index].reservation.driver_owner },true));
     var source_buffer: ?@import("gsp_runtime.zig").BufferHandle = null;
     var source_index: ?usize = null;
     var source_image: ?render.image.Image = null;
     if (!scene.solid) {
-        source_buffer = try run.allocateNativeSurface(.{ .width = 7, .height = 5, .format = .argb8888, .usage = 12 },deadline);
+        source_buffer = try run.allocateNativeSurface(.{ .width = 7, .height = 5, .format = .argb8888, .usage = 12, .layout = .blocklinear },deadline);
         try driveRenderSetup(target,counts,scenario);
         const info = (try run.nativeBufferStatus(source_buffer.?)).info.?;
         source_index = info.reference.buffer.id-801;
@@ -5526,14 +5530,40 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
     const target_data = model.imageBytes(native_index)[0..target_image.pitch*target_image.height];
     @memset(target_data,0xcc);
     for (0..24) |y| @memcpy(target_data[y*target_image.pitch..][0..128],target_pixels[y*128..][0..128]);
-    if (source_index) |index| for (0..5) |y| {
-        @memcpy(model.imageBytes(index)[y*source_image.?.pitch..][0..28],source_pixels[y*32..][0..28]);
-    };
     try t.expect(!try run.beginCopyWork(ce,model.binding,deadline));
     if (!run.graphics_enabled) try run.enableGraphicsQueue(target.native_graphics.channel.?,ce)
     // Reinstalling a fresh host memory view does not re-register the runtime.
     else model.render_operations = 29;
     try t.expect(model.render_operations == 29 and run.graphics_enabled);
+    if (source_index) |index| {
+        // The same copy_rows contract emitted by image_prepare. Its actual
+        // CE stream turns SYS rows into tiled texture storage; GPGet and
+        // pixel writes alone must not publish a completed dependency.
+        @memcpy(model.host[0][0..source_pixels.len],&source_pixels);
+        model.enqueueRows(null,index,0,0,28,5,32,source_image.?.pitch);
+        try t.expect(try run.beginCopyWork(ce,model.binding,deadline));
+        for (0..32) |_| {
+            try stepQueuedRendering(target);
+            if (run.copy_job != null and run.copy_job.?.submitted) break;
+        }
+        try t.expect(run.copy_job != null and run.copy_job.?.submitted and run.queued_render == null);
+        const ce_owner = run.fifos[ce.slot].owner.?;
+        const mmio: [*]const u8 = @ptrFromInt(target.port.window.cpu_address);
+        try model.fetch(ce_owner,mmio[0..@intCast(target.port.window.byte_length)]);
+        try stepQueuedRendering(target); try t.expect(model.completed == 0);
+        try model.execute(); try stepQueuedRendering(target); try t.expect(model.completed == 0);
+        try model.signal();
+        for (0..32) |_| { try stepQueuedRendering(target); if (run.copy_job == null) break; }
+        try t.expect(model.completed == 1 and model.result == a.gfx_queue_result_complete and run.copy_job == null);
+        // Retire the staging mapping before this scene's memory fixture is
+        // replaced. Production retains it under its ordinary cache budget.
+        try t.expect(try run.prepareCopyMappings(2,0,deadline));
+        for (0..64) |_| { try stepQueuedRendering(target); if (run.buffer_active == null) break; }
+        try t.expect(run.buffer_active == null and model.heldReferences() == 0);
+    }
+    const completed_copy = model.completed;
+    var source_snapshot: [65536]u8 = undefined;
+    if (source_index) |index| @memcpy(&source_snapshot,model.imageBytes(index));
     model.enqueueRender(native_index,source_index,.{ .kind = if (scene.solid) 0 else 1,
         .target_rect = .{ .x = scene.destination.x, .y = scene.destination.y, .width = scene.destination.width, .height = scene.destination.height },
         .source_rect = if (scene.solid) .{} else .{ .x = scene.source_rect.x, .y = scene.source_rect.y, .width = scene.source_rect.width, .height = scene.source_rect.height },
@@ -5563,9 +5593,9 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
     try t.expect(load(ce_data,ce_gp+4)>>10 == 17 and load(ce_data,ce_offset+32) == 1024);
     var packet: [1024]u8 = undefined; @memcpy(&packet,ControlModel.data[0..1024]);
     const point = load(ce_data,ce_offset+56);
-    try t.expect(point == ce_ticket.point and model.completed == 0);
+    try t.expect(point == ce_ticket.point and model.completed == completed_copy);
     std.mem.writeInt(u32,ce_data[0x2088..][0..4],ce_ticket.put,.little);
-    try stepQueuedRendering(target); try t.expect(run.graphics_upload != null and model.completed == 0);
+    try stepQueuedRendering(target); try t.expect(run.graphics_upload != null and model.completed == completed_copy);
     std.mem.writeInt(u32,ce_data[0x2200..][0..4],point,.little);
     for (0..20) |_| {
         try stepQueuedRendering(target);
@@ -5581,7 +5611,7 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
     const offset: usize = @intCast(command_address-fifo.address(0));
     const body = gr_data[offset..][0..count*4];
     std.mem.writeInt(u32,gr_data[0x2088..][0..4],ticket.put,.little);
-    try stepQueuedRendering(target); try t.expect(model.completed == 0 and model.active);
+    try stepQueuedRendering(target); try t.expect(model.completed == completed_copy and model.active);
     const binding = run.graphics_cache.binding() catch return error.RenderBinding;
     try reference.execute(body,&packet,binding.programs.address,binding.packet.address,reference.Surface.from(target_image,target_data),
         if (source_image) |value| reference.Surface.from(value,model.imageBytes(source_index.?)) else null);
@@ -5589,11 +5619,11 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
         @memcpy(target_pixels[y*128..][0..128],target_data[y*target_image.pitch..][0..128]);
         for (target_data[y*target_image.pitch+128..(y+1)*target_image.pitch]) |value| try t.expectEqual(@as(u8,0xcc),value);
     }
-    if (source_index) |index| for (0..5) |y| try t.expectEqualSlices(u8,source_pixels[y*32..][0..28],model.imageBytes(index)[y*source_image.?.pitch..][0..28]);
+    if (source_index) |index| try t.expectEqualSlices(u8,&source_snapshot,model.imageBytes(index));
     const difference = try reference.compare(scene_index,&target_pixels);
     std.debug.print("queued render reference {s}: max={d}/{d} LSB\n",.{scene.name,difference,scene.tolerance});
     model.observeRenderExecution();
-    try stepQueuedRendering(target); try t.expect(model.completed == 0 and run.graphics_cache.borrowed);
+    try stepQueuedRendering(target); try t.expect(model.completed == completed_copy and run.graphics_cache.borrowed);
     const tail = body[(count-11)*4..];
     const semaphore = (@as(u64,load(tail,28))<<32)|load(tail,32);
     try t.expect(semaphore == fifo.address(0)+0x2200 and load(tail,36) == ticket.point);
@@ -5601,12 +5631,13 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
     std.mem.writeInt(u32,gr_data[0x2200..][0..4],load(tail,36),.little);
     for (0..20) |_| { try stepQueuedRendering(target); if (run.queued_render == null) break; }
     try t.expect(target.phase == .ready and run.queued_render == null and run.graphics_work == null and
-        model.completed == 1 and model.result == a.gfx_queue_result_complete and !model.active and !native.slots[native_index].imported and
+        model.completed == completed_copy+1 and model.result == a.gfx_queue_result_complete and !model.active and !native.slots[native_index].imported and
         run.graphics_completed == before+1 and !run.graphics_cache.borrowed);
     if (source_index) |index| try t.expect(!native.slots[index].imported and native.slots[index].gpu.lease.id == 0);
 }
 fn stepQueuedRendering(target: *@import("gsp_device.zig").Device) !void {
     _ = target.step();
+    if (target.phase == .ready and target.running.buffer_active != null) try replyCopyMapping(target);
     // Ordinary reclamation can retire the preceding private draw's image
     // while this queue waits for CE. Model those real RM replies as well.
     if (target.phase == .ready and target.running.native_active != null and target.running.activeChannel().?.phase == .waiting)
