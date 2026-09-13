@@ -127,7 +127,7 @@ pub const Owner = struct {
     pub fn queuedInfo(self: *const Owner, reference: a.GfxBufferReference) ?Info {
         self.stable() catch return null;
         if (self.self_address != @intFromPtr(self) or !self.committed or !self.common_live or !self.mapped or self.state != .handed_off or
-            self.exchange.session.state != .active or self.storage_policy != null or self.layout.blocklinear() or
+            self.exchange.session.state != .active or self.storage_policy != null or
             reference.flags != a.gfx_buffer_reference_mapping_only or reference.reference.id == 0 or
             !std.meta.eql(reference.buffer, self.reservation.buffer)) return null;
         return .{ .reference = reference, .address = self.address, .logical_bytes = self.logical_bytes,

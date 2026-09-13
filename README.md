@@ -1,16 +1,29 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.102; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.104; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
-subsystem 1458:4074, VBIOS 94.06.2f.00.d6. Software implementation through 0.79.16 is documented; physical native qualification remains separate.
+subsystem 1458:4074, VBIOS 94.06.2f.00.d6. Software implementation through 0.79.18 is documented; physical native qualification remains separate.
 The default path inventories NVIDIA display functions once through
 the kernel PCI inventory. Explicit diagnostic/start modes are described below.
 Starting with R4OS 0.79.9, `IMAGE_SCOPE=slim` includes the current module in
 Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
+
+Copy Engine integration (0.79.18): canonical row jobs cover RAM-to-VRAM,
+VRAM-to-VRAM and readback, including pitched/blocklinear conversion. R4NV owns
+the shared C6B5/C7B5 encoder; this driver derives operands from retained RM
+allocations and exact queue leases. Queue instances and the RM memory epoch
+are registered separately. Operation mask13 advertises copy, private Present
+upload and row copy; a generic barrier is not advertised. Cached SYS mappings,
+persistent command slots and the existing asynchronous Present worker are reused.
+Only the system-scope semaphore release completes a copy. Counts use actual
+transfer row bytes, excluding stride gaps, without claiming bus/GPU timing.
+The existing model executes a three-stage RAM/tiled-VRAM/tiled-VRAM/RAM chain
+with different pitches/GOB heights and checks visibility, rejection and cleanup.
+See Docs/Drivers/GrafikCopy07918.txt/.json; OssiGPU.txt /18 stays physically open.
 
 Hotplug uses the serialized Device worker: bounded receiver debounce/retries,
 NULL-ISO/Core/ARM retirement, retained headless CPU drawing and fresh mode

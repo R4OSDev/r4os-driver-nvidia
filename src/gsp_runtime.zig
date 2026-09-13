@@ -237,6 +237,8 @@ pub const Owner = struct {
     fifo_active: ?u16 = null,
     copy_job: ?CopyJob = null,
     copy_completed: u64 = 0,
+    copy_bytes: u64 = 0,
+    copy_row_jobs: u64 = 0,
     frames_acquired: u64 = 0,
     frames_rendered: u64 = 0,
     frames_rejected: u64 = 0,
@@ -1256,9 +1258,9 @@ pub const Owner = struct {
         const details: nv.R4NvDriverProfile = .{ .version = 1, .size = @sizeOf(nv.R4NvDriverProfile), .vendor_id = 0x10de,
             .copy_class = fifo.config.copy_class, .rm_release = nv.rm_release, .command_abi = nv.command_abi, .reserved0 = 0, .reserved1 = 0 };
         var profile: r4os.abi.GfxBackendProfile = .{ .interface_id_lo = nv.backend_v1_header.interface_id_lo,
-            .interface_id_hi = nv.backend_v1_header.interface_id_hi, .revision = nv.backend_v1_revision, .data_bytes = @sizeOf(nv.R4NvDriverProfile) };
+            .interface_id_hi = nv.backend_v1_header.interface_id_hi, .revision = 1, .data_bytes = @sizeOf(nv.R4NvDriverProfile) };
         @memcpy(profile.data[0..@sizeOf(nv.R4NvDriverProfile)], std.mem.asBytes(&details));
-        const registration: r4os.abi.GfxBackendRegistration = .{ .adapter_id = self.adapter_id, .milestone = r4os.abi.gfx_queue_milestone_device_execution,
+        const registration: r4os.abi.GfxBackendRegistration = .{ .adapter_id = self.adapter_id, .milestone = r4os.abi.gfx_queue_milestone_device_execution, .operations = 13, .memory_generation = self.epoch,
             .notify_callback = @intFromPtr(&notifyPresentation), .context = @intFromPtr(self) };
         var result = queue.registerProfile(&registration, &profile, &entry.binding);
         if (result == r4os.abi.err_no_fn) result = queue.register(&registration, &entry.binding);
@@ -1791,13 +1793,21 @@ pub const Owner = struct {
         if (result == a.gfx_queue_error_busy and job.fence.timeline == 0) return false;
         self.copy_job = .{ .queue = queue, .memory = memory, .channel_handle = handle, .binding = binding,
             .job = job, .job_stamp = job, .deadline = deadline };
-        if (result != a.gfx_queue_ok or job.version != 1 or job.size < @sizeOf(a.GfxDriverJob) or job.reserved0 != 0 or
+        if (result != a.gfx_queue_ok or job.version != 1 or job.size < @offsetOf(a.GfxDriverJob, "row_count") or job.reserved0 != 0 or job.reserved1 != 0 or
             job.fence.adapter_id != binding.adapter_id or job.fence.timeline == 0 or job.fence.point == 0 or
             job.fence.device_generation != binding.device_generation or job.fence.reset_generation != binding.reset_generation) {
             self.stop(error.Descriptor); return error.Descriptor;
         }
-        if ((job.operation != a.gfx_queue_operation_copy and job.operation != a.gfx_queue_operation_upload) or
+        // Older kernels return only the original prefix, leaving zeroed tails.
+        const rows = job.operation == a.gfx_queue_operation_copy_rows;
+        if (rows and (job.size < @sizeOf(a.GfxDriverJob) or job.row_count == 0 or job.source_pitch < job.byte_length or
+            job.target_pitch < job.byte_length or job.source_pitch > std.math.maxInt(u32) or job.target_pitch > std.math.maxInt(u32))) {
+            try self.finishCopy(a.gfx_queue_result_failed); return true;
+        }
+        if (!rows and (job.row_count != 0 or job.source_pitch != 0 or job.target_pitch != 0)) { try self.finishCopy(a.gfx_queue_result_failed); return true; }
+        if ((job.operation != a.gfx_queue_operation_copy and job.operation != a.gfx_queue_operation_upload and !rows) or
             job.byte_length == 0 or job.byte_length > std.math.maxInt(u32)) { try self.finishCopy(a.gfx_queue_result_failed); return true; }
+        if (job.operation == a.gfx_queue_operation_upload and job.target_buffer.id != 0) { try self.finishCopy(a.gfx_queue_result_failed); return true; }
         if (job.operation == a.gfx_queue_operation_upload and job.target_buffer.id == 0) {
             // The desktop shadow remains a CPU-owned surface while headless.
             // Return this particular unsubmitted queue job without retaining
@@ -1854,7 +1864,12 @@ pub const Owner = struct {
             if (work.memory.bufferRelease(&reference.reference) != a.gfx_buffer_result_ok) return error.Retained;
             reference.* = .{};
         };
-        if (result == a.gfx_queue_result_complete) self.copy_completed +|= 1
+        if (result == a.gfx_queue_result_complete) {
+            self.copy_completed +|= 1;
+            const transfer = work.transfer orelse return error.State;
+            self.copy_bytes +|= transfer.bytes *| @as(u64, if (transfer.rows) |rows| rows.count else 1);
+            if (transfer.rows != null) self.copy_row_jobs +|= 1;
+        }
         else if (work.job.operation == a.gfx_queue_operation_upload and work.job.target_buffer.id == 0) self.frames_rejected +|= 1;
         self.copy_job = null;
     }
@@ -1973,15 +1988,28 @@ pub const Owner = struct {
             return self.presentation.?.surface.transfer(work.job, source.address, source.bytes);
         }
         const job = &work.job;
-        var addresses: [2]u64 = undefined;
+        const rows: ?execution_fifo.copy.wire.Rows = if (job.operation == r4os.abi.gfx_queue_operation_copy_rows)
+            .{ .count = job.row_count, .source_pitch = @intCast(job.source_pitch), .target_pitch = @intCast(job.target_pitch) } else null;
+        const fifo = try self.findChannel(work.channel_handle);
+        var operands: [2]@import("gsp_copy_layout.zig").Operand = undefined;
         for (work.addresses, [_]u64{job.source_offset,job.target_offset}, 0..) |source, offset, i| {
             const value = source orelse return error.State;
-            if (offset > value.bytes or job.byte_length > value.bytes - offset or value.address > std.math.maxInt(u64) - offset) {
-                return error.Bounds;
-            }
-            addresses[i] = value.address + offset;
+            var confirmed = false;
+            var plan: ?vram.surface.Plan = null;
+            for (&self.native_buffers) |*slot| if (slot.owner) |owner| if (owner.queuedInfo(work.references[i])) |info| {
+                if (info.epoch != self.epoch or owner.binding.space.handle != fifo.config.context.vaspace or info.address != value.address or info.logical_bytes != value.bytes) return error.Stale;
+                confirmed = true; plan = info.surface; break;
+            };
+            if (!confirmed) for (&self.buffers) |*slot| if (slot.owner) |owner| if (owner.info()) |info| {
+                if (std.meta.eql(info.buffer, work.references[i].buffer) and info.epoch == self.epoch and owner.space.handle == fifo.config.context.vaspace and info.address == value.address and info.logical_bytes == value.bytes) {
+                    confirmed = true; break;
+                }
+            };
+            if (!confirmed) return error.Stale;
+            operands[i] = try @import("gsp_copy_layout.zig").operand(value.address, value.bytes, offset, job.byte_length, rows, i == 1, plan);
         }
-        return .{ .source = addresses[0], .target = addresses[1], .bytes = job.byte_length };
+        return .{ .source = operands[0].address, .target = operands[1].address, .bytes = job.byte_length,
+            .rows = rows, .source_block = operands[0].block, .target_block = operands[1].block };
     }
     fn advanceCursorUpload(self: *Owner, current: u64) !bool {
         const work = if (self.cursor_upload) |*value| value else return false;

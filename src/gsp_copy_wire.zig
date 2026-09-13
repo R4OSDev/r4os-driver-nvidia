@@ -10,6 +10,7 @@ pub const capacity: usize = 16;
 pub const Error = encoder.Error;
 pub const words = encoder.words;
 pub const Rows = encoder.Rows;
+pub const Block = encoder.Block;
 pub const Transfer = encoder.Transfer;
 pub const Program = encoder.Program;
 pub const inc = encoder.inc;

@@ -6274,6 +6274,7 @@ fn checkDeviceCopies(target: *@import("gsp_device.zig").Device, table: *a.Driver
         }
         if (!capacity) try t.expect(fifo_owner.ring.put == 2 and fifo_owner.ring.issued == 514 and running.copy_completed == 514);
         if (vram_model.is("context_copy_success")) {
+            try checkCopyLayouts(target, table, handle, deadline, mmio);
             // Pressure uses the actual two retained SYS mappings. No fake
             // buffer slots or GPU completions are inserted to fill a cache.
             const before_put = fifo_owner.ring.put;
@@ -6346,6 +6347,65 @@ fn checkDeviceCopies(target: *@import("gsp_device.zig").Device, table: *a.Driver
     for (&running.fifos) |*slot| try t.expect(slot.owner == null);
     for (&running.buffers) |*slot| try t.expect(slot.owner == null);
     if (vram_model.is("context_copy_success")) try t.expect(model.heldReferences() == 0);
+}
+fn checkCopyLayouts(target: *@import("gsp_device.zig").Device, table: *a.DriverApi,
+    handle: @import("gsp_runtime.zig").ChannelHandle, deadline: u64, mmio: []const u8) !void
+{
+    _ = table;
+    const run = &target.running;
+    const model = @import("gsp_copy_test_model.zig").Model;
+    const fifo = run.fifos[handle.slot].owner.?;
+    const first = try finishContextBuffer(target, try run.allocateNativeSurface(.{ .width = 129, .height = 41, .format = .r8,
+        .layout = .blocklinear, .block_height = 1 }, deadline), deadline);
+    const second = try finishContextBuffer(target, try run.allocateNativeSurface(.{ .width = 193, .height = 41, .format = .r8,
+        .layout = .blocklinear, .block_height = 2 }, deadline), deadline);
+    const one = (try run.nativeBufferStatus(first)).info.?;
+    const two = (try run.nativeBufferStatus(second)).info.?;
+    const one_index = one.reference.buffer.id - 801; const two_index = two.reference.buffer.id - 801;
+    const one_pitch = one.surface.descriptor.plane_pitches[0]; const two_pitch = two.surface.descriptor.plane_pitches[0];
+    try t.expect(one.surface.caps.?.genericPageKind() == 6 and two.surface.caps.?.genericPageKind() == 6);
+    const one_offset = 3 * one_pitch + 57; const two_offset = 9 * two_pitch + 93;
+    const before_tx = target.session.?.tx_sequence; const before_bytes = run.copy_bytes;
+    const before_rows = run.copy_row_jobs; const before_refs = model.heldReferences();
+    @memset(&model.host[1], 0xa5);
+    for (0..3) |stage| {
+        switch (stage) {
+            0 => model.enqueueRows(null, one_index, 17, one_offset, 69, 19, 83, one_pitch),
+            1 => model.enqueueRows(one_index, two_index, one_offset, two_offset, 69, 19, one_pitch, two_pitch),
+            2 => model.enqueueRows(two_index, null, two_offset, 37, 69, 19, two_pitch, 79),
+            else => unreachable,
+        }
+        const before = model.completed;
+        try t.expect(try run.beginCopyWork(handle, model.binding, deadline));
+        var steps: usize = 0;
+        while (run.copy_job != null and !run.copy_job.?.submitted and steps < 32) : (steps += 1) { _ = target.step(); }
+        try t.expect(steps < 32 and target.phase == .ready and run.copy_job.?.submitted and target.session.?.tx_sequence == before_tx);
+        try model.fetch(fifo, mmio); _ = target.step();
+        try t.expect(model.completed == before and run.copy_job != null);
+        try model.execute(); _ = target.step();
+        try t.expect(model.completed == before and run.copy_job != null and std.mem.allEqual(u8, &model.host[1], 0xa5));
+        try model.signal(); _ = target.step();
+        try t.expect(model.completed == before + 1 and run.copy_job == null and model.result == a.gfx_queue_result_complete and
+            model.heldReferences() == before_refs and fifo.ring.idle());
+    }
+    for (model.host[1], 0..) |actual, i| {
+        const relative = i -| 37;
+        const expected: u8 = if (i >= 37 and relative / 79 < 19 and relative % 79 < 69) model.host[0][17 + (relative / 79) * 83 + relative % 79] else 0xa5;
+        try t.expectEqual(expected, actual);
+    }
+    try t.expect(run.copy_bytes == before_bytes + 3 * 69 * 19 and run.copy_row_jobs == before_rows + 3 and target.session.?.tx_sequence == before_tx);
+    // Pitched metadata cannot reinterpret opaque storage. Raw tiled copies
+    // and a forged plane pitch fail before publishing any methods.
+    for (0..2) |invalid| {
+        model.enqueueRows(one_index, two_index, one_offset, two_offset, 69, 19, one_pitch + invalid, two_pitch);
+        if (invalid == 0) { model.job.operation = a.gfx_queue_operation_copy; model.job.row_count = 0; model.job.source_pitch = 0; model.job.target_pitch = 0; }
+        const put = fifo.ring.put;
+        try t.expect(try run.beginCopyWork(handle, model.binding, deadline));
+        var steps: usize = 0;
+        while (run.copy_job != null and steps < 32) : (steps += 1) { _ = target.step(); }
+        try t.expect(steps < 32 and target.phase == .ready and model.result == a.gfx_queue_result_failed and fifo.ring.put == put and model.heldReferences() == before_refs);
+    }
+    try run.releaseNativeBuffer(first); try run.releaseNativeBuffer(second);
 }
 fn checkCopyFault(target: *@import("gsp_device.zig").Device, fifo_owner: *@import("gsp_fifo.zig").Owner,
     handle: @import("gsp_runtime.zig").ChannelHandle, deadline: u64, scenario: []const u8, held: usize) !bool

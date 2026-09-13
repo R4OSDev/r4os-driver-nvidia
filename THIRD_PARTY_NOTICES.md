@@ -1,5 +1,13 @@
 ﻿# Third-Party Notices
 
+Copy layouts (0.79.18): C6B5/C7B5 methods use the already licensed NVIDIA570.144
+headers. The test-only TuringColor2D sector model follows Mesa26.2.2 nil/tiling.rs
+and nil/copy.rs (Copyright2024 Valve Corp. and Collabora, Ltd., MIT); its full
+notice is retained in gsp_copy_test_model.zig. Complete originals and the
+independent C-vector generator are archived under Nvidia/0.79.18/copy-20260913
+in ExFiles/Reference/GFX. The model is not linked into the module; existing
+runtime firmware and license packages remain authoritative.
+
 Receiver mode selection (NVIDIA 0.1.90, 2026-09-13):
 Raster conversion and AVI fields follow MIT NVIDIA 570.144, source pin
 8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f. Twelve complete originals, four

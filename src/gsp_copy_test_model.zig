@@ -1,5 +1,22 @@
 // Host-only CE executor. Command fetch, GPU data and CPU visibility are separate
 // views; production submits the encoded methods and never calls this model.
+// GOB sector layout reference: Mesa nil/tiling.rs and nil/copy.rs.
+// Copyright (c) 2024 Valve Corp. and Collabora, Ltd.
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
 const std = @import("std");
 const a = @import("r4os").abi;
 const t = std.testing;
@@ -38,7 +55,9 @@ pub const Model = struct {
     pub var reject_resource = false;
     pub var native_index: usize = 0;
     var app_reference = false;
-    var decoded: [19]u32 = undefined;
+    var decoded: [37]u32 = undefined;
+    const Block = struct { width: u32, height: u32, x: u32, y: u32, log2_gobs: u5 };
+    var blocks: [2]?Block = .{ null, null };
     var decoded_count: u32 = 0;
     var present_mode = false;
     var product_mode = false;
@@ -108,6 +127,7 @@ pub const Model = struct {
     }
     pub fn enqueuePresentFrom(index: usize, x: u32, y: u32, width: u32, height: u32) !void {
         enqueue(false);
+        job.operation = a.gfx_queue_operation_upload;
         job.source_buffer = sys(index); job.target_buffer = .{}; job.target_offset = 0;
         const pitch = descriptor(index).plane_pitches[0];
         job.source_offset = y * pitch + x * 4; job.byte_length = (height - 1) * pitch + width * 4;
@@ -120,6 +140,13 @@ pub const Model = struct {
     fn ref(index: usize) a.GfxBufferHandle { return .{ .id = @intCast(1501 + index), .generation = 951 }; }
     fn select(input: a.GfxBufferHandle) ?usize { for (0..references.len) |i| if (std.meta.eql(input, ref(i))) return i; return null; }
     fn system(input: a.GfxBufferHandle) ?usize { for (0..2) |i| if (std.meta.eql(input, sys(i))) return i; return null; }
+    fn nativeSlot(buffer: a.GfxBufferHandle) ?usize {
+        for (&native.slots, 0..) |*slot, i| if (slot.live and std.meta.eql(buffer, slot.reservation.buffer)) return i;
+        return null;
+    }
+    fn queuedNative(index: usize) bool {
+        return active and (nativeSlot(job.source_buffer) == index or nativeSlot(job.target_buffer) == index);
+    }
     fn heldNative() bool {
         if (present_mode) return true; // The real display Use outlives queue jobs.
         if (active or app_reference) return true;
@@ -131,11 +158,19 @@ pub const Model = struct {
         const point = completed + 1;
         job = .{ .fence = .{ .slot = 1, .adapter_id = binding.adapter_id, .timeline = 19, .point = point,
                 .device_generation = binding.device_generation, .reset_generation = binding.reset_generation },
-            .operation = if (readback) a.gfx_queue_operation_copy else a.gfx_queue_operation_upload,
+            .operation = a.gfx_queue_operation_copy,
             .source_buffer = if (readback) native.slots[native_index].reservation.buffer else sys(0),
             .target_buffer = if (readback) sys(1) else native.slots[native_index].reservation.buffer,
             .source_offset = if (readback) 129 else 33, .target_offset = if (readback) 71 else 129, .byte_length = 4091 };
         queued = true; fetched = false; executed = false; signaled = false;
+    }
+    pub fn enqueueRows(source: ?usize, target: ?usize, source_offset: u64, target_offset: u64, bytes: u32, rows: u32, source_pitch: u64, target_pitch: u64) void {
+        enqueue(false);
+        job.operation = a.gfx_queue_operation_copy_rows;
+        job.source_buffer = if (source) |i| native.slots[i].reservation.buffer else sys(0);
+        job.target_buffer = if (target) |i| native.slots[i].reservation.buffer else sys(1);
+        job.source_offset = source_offset; job.target_offset = target_offset; job.byte_length = bytes;
+        job.row_count = rows; job.source_pitch = source_pitch; job.target_pitch = target_pitch;
     }
     fn queue(out: *a.GfxDriverQueueApi) callconv(.c) i32 { out.* = .{ .size = if (product_mode) @sizeOf(a.GfxDriverQueueApi) else 64,
         .register_backend = @intFromPtr(&register), .register_profile = if (product_mode) @intFromPtr(&registerProfile) else 0,
@@ -170,7 +205,8 @@ pub const Model = struct {
         queued = false; active = true; out.* = job;
         // Common queue acquisition is after the app's CPU store boundary.
         // In particular readback CPU bytes do not yet reflect device writes.
-        gpu_data[0] = host[0]; gpu_data[1] = host[1]; native.slots[native_index].imported = true;
+        gpu_data[0] = host[0]; gpu_data[1] = host[1];
+        for (&native.slots, 0..) |*slot, i| if (queuedNative(i)) { slot.imported = true; };
         return a.gfx_queue_ok;
     }
     fn retain(input: *const a.GfxFence, which: u32, out: *a.GfxBufferReference) callconv(.c) i32 {
@@ -187,7 +223,11 @@ pub const Model = struct {
         std.debug.assert(active and !lost and std.meta.eql(input.*, job.fence) and quiesced == 1);
         std.debug.assert(status == a.gfx_queue_result_complete or status == a.gfx_queue_result_failed or status == a.gfx_queue_result_cancelled);
         if (status == a.gfx_queue_result_complete) std.debug.assert(signaled and executed);
-        active = false; result = status; completed += 1; native.slots[native_index].imported = heldNative(); return a.gfx_queue_ok;
+        active = false; result = status; completed += 1;
+        for ([_]a.GfxBufferHandle{ job.source_buffer, job.target_buffer }) |buffer| if (nativeSlot(buffer)) |i| {
+            native.slots[i].imported = if (i == native_index) heldNative() else false;
+        };
+        return a.gfx_queue_ok;
     }
     fn memory(out: *a.GfxDriverMemoryApi) callconv(.c) i32 {
         out.* = original;
@@ -238,7 +278,7 @@ pub const Model = struct {
         const index = select(input.*) orelse { const call: *const fn (*const a.GfxBufferHandle, *a.GfxBufferDescriptor) callconv(.c) i32 = @ptrFromInt(original.buffer_describe); return call(input, out); };
         const entry = references[index]; std.debug.assert(entry.active);
         out.* = if (present_mode and system(entry.buffer) != null) descriptor(system(entry.buffer).?) else if (system(entry.buffer) != null) .{ .byte_length = length - 5, .alignment = 4096, .usage = 15 }
-            else native.slots[native_index].descriptor;
+            else native.slots[nativeSlot(entry.buffer).?].descriptor;
         return a.gfx_buffer_result_ok;
     }
     fn importBuffer(input: *const a.GfxBufferHandle, out: *a.GfxBufferReference) callconv(.c) i32 {
@@ -343,7 +383,7 @@ pub const Model = struct {
             if (address_value < start or address_value - start >= vram_data.len) continue;
             const offset: usize = @intCast(address_value - start);
             if (bytes > vram_data.len - offset or !native.slots[index].live or
-                (native.slots[index].gpu.lease.id == 0 and !(index == native_index and !present_mode and active))) return error.GpuAddress;
+                (native.slots[index].gpu.lease.id == 0 and !(!present_mode and queuedNative(index)))) return error.GpuAddress;
             return (if (index == native_index) &vram_data else &extra_vram[index])[offset..][0..bytes];
         }
         return error.GpuAddress;
@@ -361,16 +401,29 @@ pub const Model = struct {
         const index = (put + 511) % 512;
         const low = word(&command_view, index * 8); const high = word(&command_view, index * 8 + 4);
         decoded_count = high >> 10;
-        try t.expect(decoded_count == @as(u32, if (present_mode) 19 else 17) and high & 0x300 == 0 and low & 3 == 0);
+        try t.expect((decoded_count == 17 or decoded_count == 19 or decoded_count == 28 or decoded_count == 37) and high & 0x300 == 0 and low & 3 == 0);
         const command_address = operand(high & 255, low);
-        try t.expect(command_address >= owner.config.address + 4096 and command_address + 68 <= owner.config.address + 8192);
+        try t.expect(command_address >= owner.config.address + 4096 and command_address + decoded_count * 4 <= owner.config.address + 8192);
         const offset: usize = @intCast(command_address - owner.config.address);
         for (decoded[0..decoded_count], 0..) |*v, i| v.* = word(&command_view, offset + i * 4);
-        if (present_mode) {
-            try t.expect(decoded[0] == 0x20010000 and decoded[1] == owner.config.copy_class and decoded[2] == 0x20080100 and
-                decoded[11] == 0x200100c0 and decoded[12] == 0x04000382 and decoded[13] == 0x20030090 and
-                decoded[17] == 0x200100c0 and decoded[18] == 0xc and
-                operand(decoded[14], decoded[15]) == owner.config.address + 8704 and decoded[16] == owner.ring.issued);
+        blocks = .{ null, null };
+        if (decoded_count != 17) {
+            try t.expect(decoded[0] == 0x20010000 and decoded[1] == owner.config.copy_class and decoded[2] == 0x20080100);
+            var at: usize = 11;
+            while (at + 9 < decoded_count and decoded[at] != 0x200100c0) : (at += 9) {
+                const i: usize = switch (decoded[at]) { 0x200501ca => 0, 0x200501c3 => 1, else => return error.BlockMethods };
+                try t.expect(blocks[i] == null and decoded[at + 1] & ~@as(u32, 0x70) == 0x1000 and decoded[at + 4] == 1 and decoded[at + 5] == 0 and
+                    decoded[at + 6] == @as(u32, if (i == 0) 0x200201d1 else 0x200201d3));
+                const block: Block = .{ .width = decoded[at + 2], .height = decoded[at + 3], .log2_gobs = @intCast((decoded[at + 1] >> 4) & 7),
+                    .x = decoded[at + 7], .y = decoded[at + 8] };
+                try t.expect(block.log2_gobs <= 5 and block.width % 64 == 0 and block.x + decoded[9] <= block.width and block.y + decoded[10] <= block.height);
+                blocks[i] = block;
+            }
+            const launch: u32 = 0x202 | @as(u32, if (owner.config.copy_class == 0xc7b5) 1 << 26 else 0) |
+                @as(u32, if (blocks[0] == null) 128 else 0) | @as(u32, if (blocks[1] == null) 256 else 0);
+            try t.expect(at + 8 == decoded_count and decoded[at] == 0x200100c0 and decoded[at + 1] == launch and decoded[at + 2] == 0x20030090 and
+                decoded[at + 6] == 0x200100c0 and decoded[at + 7] == 12 and
+                operand(decoded[at + 3], decoded[at + 4]) == owner.config.address + 8704 and decoded[at + 5] == owner.ring.issued);
         } else {
         const headers = [_]u32{0x20010000,0x20040100,0x20010106,0x200100c0,0x20030090,0x200100c0};
         for ([_]usize{0,2,7,9,11,15}, headers) |at, expected| try t.expect(decoded[at] == expected);
@@ -383,11 +436,15 @@ pub const Model = struct {
     }
     pub fn execute() !void {
         try t.expect((active or initial_read.lease.id != 0) and fetched and !executed);
-        if (present_mode) {
+        if (decoded_count != 17) {
             for (0..decoded[10]) |y| {
-                const source = try data(operand(decoded[3], decoded[4]) + y * decoded[7], decoded[9]);
-                const target = try data(operand(decoded[5], decoded[6]) + y * decoded[8], decoded[9]);
-                @memcpy(target, source);
+                for (0..decoded[9]) |x| {
+                    const src = if (blocks[0]) |b| tileOffset(b, @intCast(x), @intCast(y)) else y * decoded[7] + x;
+                    const dst = if (blocks[1]) |b| tileOffset(b, @intCast(x), @intCast(y)) else y * decoded[8] + x;
+                    const source = try data(operand(decoded[3], decoded[4]) + src, 1);
+                    const target = try data(operand(decoded[5], decoded[6]) + dst, 1);
+                    target[0] = source[0];
+                }
             }
         } else {
             const source = try data(operand(decoded[3], decoded[4]), decoded[8]);
@@ -400,9 +457,18 @@ pub const Model = struct {
         try t.expect((active or initial_read.lease.id != 0) and executed and !signaled);
         // SYS-scope release makes preceding CE data visible before the point.
         host[0] = gpu_data[0]; host[1] = gpu_data[1];
-        std.mem.writeInt(u32, fifo.slots[0].data[8704..8708], decoded[if (present_mode) @as(usize, 16) else 14], .little);
+        std.mem.writeInt(u32, fifo.slots[0].data[8704..8708], decoded[decoded_count - 3], .little);
         signaled = true;
     }
     pub fn heldReferences() usize { var n: usize = 0; for (references) |entry| if (entry.active) { n += 1; }; return n; }
+    // TuringColor2D: the documented 4x4 sector grid, independent of the
+    // production CE encoder (which never interprets individual pixel bytes).
+    fn tileOffset(block: Block, column: u32, row: u32) u64 {
+        const x: u64 = block.x + column; const y: u64 = block.y + row;
+        const height = @as(u64, 8) << block.log2_gobs;
+        const sectors = [4][4]u16{ .{ 0, 2, 8, 10 }, .{ 1, 3, 9, 11 }, .{ 4, 6, 12, 14 }, .{ 5, 7, 13, 15 } };
+        return (y / height) * block.width * height + (x / 64) * 64 * height + ((y % height) / 8) * 512 +
+            sectors[(y % 8) / 2][(x % 64) / 16] * 32 + (y % 2) * 16 + x % 16;
+    }
     pub fn closeApp() void { std.debug.assert(!active); app_reference = false; native.slots[native_index].imported = heldNative(); }
 };
