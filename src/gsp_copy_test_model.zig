@@ -152,6 +152,23 @@ pub const Model = struct {
         const callback: *const fn (usize) callconv(.c) i32 = @ptrFromInt(registered.notify_callback);
         try t.expect(callback(@intCast(registered.context)) == 0);
     }
+    pub fn enqueueImage(index: usize, deadline: u64) !void {
+        enqueue(false);
+        const image = native.slots[index].descriptor;
+        job.operation = a.gfx_queue_operation_present;
+        job.source_buffer = native.slots[index].reservation.buffer; job.target_buffer = .{};
+        job.source_offset = 0; job.target_offset = 0; job.byte_length = @as(u64, image.width) * 4;
+        job.row_count = image.height; job.source_pitch = image.plane_pitches[0]; job.deadline_ns = deadline;
+        const registered = registration orelse return error.State;
+        const callback: *const fn (usize) callconv(.c) i32 = @ptrFromInt(registered.notify_callback);
+        try t.expect(callback(@intCast(registered.context)) == 0);
+    }
+    pub fn imagePixel(index: usize, x: u32, y: u32, log2_gobs: u5, pixel: u32) void {
+        const image = native.slots[index].descriptor;
+        const offset = if (image.modifier == 0) y * image.plane_pitches[0] + x * 4 else
+            tileOffset(.{ .width = @intCast(image.plane_pitches[0]), .height = image.height, .x = 0, .y = 0, .log2_gobs = log2_gobs }, x * 4, y);
+        std.mem.writeInt(u32, imageBytes(index)[offset..][0..4], pixel, .little);
+    }
     pub fn address(index: usize) u64 { return 0x80000000 + index * 0x100000; }
     fn sys(index: usize) a.GfxBufferHandle { return .{ .id = @intCast(1101 + index), .generation = 901 }; }
     fn ref(index: usize) a.GfxBufferHandle { return .{ .id = @intCast(1501 + index), .generation = 951 }; }
@@ -197,7 +214,7 @@ pub const Model = struct {
         .update_operations = if (render_mode) @intFromPtr(&updateOperations) else 0,
         .unregister_backend = @intFromPtr(&unregister), .take = @intFromPtr(&take), .retain_resource = @intFromPtr(&retain), .complete = @intFromPtr(&complete) }; return a.gfx_queue_ok; }
     fn updateOperations(input: *const a.GfxBackendBinding, operations: u64) callconv(.c) i32 {
-        std.debug.assert(render_mode and std.meta.eql(input.*, binding) and operations == 29);
+        std.debug.assert(render_mode and std.meta.eql(input.*, binding) and (operations == 29 or operations == 61));
         render_operations = operations; return a.gfx_queue_ok;
     }
     fn registerProfile(input: *const a.GfxBackendRegistration, profile: *const a.GfxBackendProfile, out: *a.GfxBackendBinding) callconv(.c) i32 {
@@ -410,7 +427,7 @@ pub const Model = struct {
             if (address_value < start or address_value - start >= vram_data.len) continue;
             const offset: usize = @intCast(address_value - start);
             if (bytes > vram_data.len - offset or !native.slots[index].live or
-                (native.slots[index].gpu.lease.id == 0 and !(!present_mode and queuedNative(index)))) return error.GpuAddress;
+                (native.slots[index].gpu.lease.id == 0 and !queuedNative(index))) return error.GpuAddress;
             return (if (index == native_index) &vram_data else &extra_vram[index])[offset..][0..bytes];
         }
         return error.GpuAddress;

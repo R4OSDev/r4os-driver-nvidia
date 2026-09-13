@@ -3505,6 +3505,10 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
             try t.expect(target.phase == .recovering and native.released == 0 and display.released == 0 and !NativeCommon.published);
             _ = target.stop(); return;
         }
+        if (NativeCommon.is("context_native_unknown")) {
+            checkpoint = "composed native image";
+            try checkComposedNativeImage(target);
+        }
         if (NativeCommon.is("context_native_unknown") or NativeCommon.is("context_native_connected") or NativeCommon.cursorCase()) {
             checkpoint = "native PIO cursor";
             if (NativeCommon.is("context_native_cursor_common")) try checkCommonCursor(target) else try checkNativeCursor(target);
@@ -3583,7 +3587,7 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
     }
     checkpoint = "stop";
     _ = target.stop();
-    try t.expect(native.released == @as(u32, if (NativeCommon.is("context_native_connected")) 5 else if (NativeCommon.is("context_native_jobs")) 6 else 0) and display.released == 0 and !NativeCommon.published);
+    try t.expect(native.released == @as(u32, if (NativeCommon.is("context_native_connected")) 5 else if (NativeCommon.is("context_native_jobs")) 6 else if (NativeCommon.is("context_native_unknown")) 2 else 0) and display.released == 0 and !NativeCommon.published);
 }
 fn checkNativeDetach(target: *@import("gsp_device.zig").Device) !void {
     const run = &target.running; const product = &target.native_output;
@@ -4365,6 +4369,103 @@ fn checkNativeFrames(target: *@import("gsp_device.zig").Device, extra: bool) !vo
     try t.expect(target.phase == .ready and copy.completed == prior_completed + 1 and copy.result == a.gfx_queue_result_failed and
         copy.initial_read.lease.id == 0 and run.copy_job == null and run.frame_ready == null and run.display_flip == null and run.flip_visible == prior_visible);
     try NativeCommon.checkStatistics();
+}
+fn checkComposedNativeImage(target: *@import("gsp_device.zig").Device) !void {
+    const run = &target.running; const product = &target.native_output;
+    const copy = @import("gsp_copy_test_model.zig").Model;
+    const native = @import("gsp_vram_test_model.zig").Model;
+    const display = @import("gsp_display_test_model.zig").Model;
+    const push = @import("gsp_display_push.zig");
+    const descriptor = run.presentation.?.surface.descriptor;
+    const before_cpu = copy.host;
+    var checkpoint: []const u8 = "allocate";
+    var current_pass: usize = 0;
+    errdefer std.debug.print("composed image: pass={d} checkpoint={s} native-active={?} fifo-active={?} context-active={?} failure={?}\n",
+        .{ current_pass, checkpoint, run.native_active, run.fifo_active, run.context_active, target.failure });
+    for ([_]@import("gsp_surface_layout.zig").Layout{ .linear, .blocklinear }, 0..) |layout, pass| {
+        current_pass = pass; checkpoint = "allocate";
+        const deadline = clock + 5 * std.time.ns_per_s;
+        const buffer = try run.allocateNativeSurface(.{ .width = descriptor.width, .height = descriptor.height,
+            .format = .xrgb8888, .usage = 28, .layout = layout }, deadline);
+        for (0..100) |_| {
+            checkpoint = "allocate step";
+            clock += 1000; _ = target.step(); try t.expect(target.phase == .ready);
+            checkpoint = "allocate RPC";
+            if (run.activeChannel().?.phase == .waiting) try replyNativeProduct(target);
+            checkpoint = "allocate status";
+            if ((try run.nativeBufferStatus(buffer)).state == .handed_off) break;
+        }
+        checkpoint = "allocate info";
+        const source = (try run.nativeBufferStatus(buffer)).info orelse {
+            const value = run.native_buffers[buffer.slot].owner.?;
+            std.debug.print("composed allocation: state={s} operation={?} rejected={?} host={?} rpc={s}\n",
+                .{ @tagName(value.state), value.operation, value.rejected, value.host_rejected, @tagName(value.exchange.phase) });
+            return error.State;
+        };
+        const source_index = source.reference.buffer.id - 801;
+        for (0..descriptor.height) |row| for (0..descriptor.width) |column| {
+            copy.imagePixel(source_index, @intCast(column), @intCast(row), @intCast(source.surface.log2_gobs),
+                0xff000000 | @as(u32, @intCast((row + 1) * 0x10000 + (column + 1) * 0x100 + pass + 1)));
+        };
+        const old = run.presentation.?; const visible = run.flip_visible; const completed = copy.completed;
+        checkpoint = "CE submit";
+        const fifo = run.fifos[product.copy.?.slot].owner.?;
+        const raw: [*]const u8 = @ptrFromInt(target.port.window.cpu_address);
+        try copy.enqueueImage(source_index, deadline);
+        for (0..100) |_| {
+            clock += 1000; _ = target.step(); try t.expect(target.phase == .ready);
+            if (run.copy_job != null and run.copy_job.?.submitted) break;
+        }
+        try t.expect(run.copy_job != null and run.copy_job.?.submitted and copy.initial_read.lease.id == 0);
+        try copy.fetch(fifo, raw[0..@intCast(target.port.window.byte_length)]);
+        try copy.execute();
+        checkpoint = "producer close";
+        try run.releaseNativeBuffer(buffer);
+        clock += 1000; _ = target.step();
+        try t.expect(copy.completed == completed and run.frame_ready == null and run.presentation == old and
+            run.flip_visible == visible and native.slots[source_index].live and native.slots[source_index].imported);
+        try copy.signal();
+        checkpoint = "CE completion";
+        for (0..10) |_| { clock += 1000; _ = target.step(); if (copy.completed != completed) break; }
+        try t.expect(copy.completed == completed + 1 and copy.result == a.gfx_queue_result_complete and run.frame_ready != null and
+            run.presentation == old and run.flip_visible == visible and copy.initial_read.lease.id == 0);
+        const image = run.frame_ready.?.image;
+        const pixels = copy.imageBytes(image.surface.target.?.info().?.reference.buffer.id - 801);
+        for (0..descriptor.height) |row| for (0..descriptor.width) |column| {
+            const expected: u32 = 0xff000000 | @as(u32, @intCast((row + 1) * 0x10000 + (column + 1) * 0x100 + pass + 1));
+            try t.expectEqual(expected, std.mem.readInt(u32, pixels[row * image.surface.scanout.?.pitch + column * 4..][0..4], .little));
+        };
+        // CE completion can release the source but cannot publish visibility.
+        const notes = run.display_resources_slot.owner.?.publishedNotifier(product.window.?.slot).?;
+        const words: [*]u32 = @ptrFromInt(notes.cpu.cpu_address);
+        const previous = notes.offset;
+        words[(previous ^ 16) / 4] = 2 << 30;
+        checkpoint = "flip submit";
+        for (0..50) |_| {
+            clock += 1000; _ = target.step(); try t.expect(target.phase == .ready);
+            if (run.activeChannel().?.phase == .waiting) try replyNativeProduct(target);
+            if (run.display_flip != null and run.display_flip.?.window.phase == .submitted) break;
+        }
+        try t.expect(run.display_flip != null and run.display_flip.?.window.phase == .submitted and run.flip_visible == visible);
+        const user = try push.userBase(.window, product.mode.?.window);
+        display.words[(user + 4) / 4] = display.words[user / 4];
+        words[notes.offset / 4 + 2] = @intCast(200 + pass); words[notes.offset / 4 + 3] = 7;
+        words[notes.offset / 4] = 1 << 30;
+        checkpoint = "flip head";
+        try deliverNativeHead(target, true);
+        for (0..10) |_| { clock += 1000; _ = target.step(); if (run.flip_visible != visible) break; }
+        try t.expect(run.flip_visible == visible + 1 and run.presentation == image and run.display_flip != null);
+        try NativeCommon.checkStatistics();
+        words[previous / 4] = 2 << 30;
+        checkpoint = "retire source";
+        for (0..50) |_| {
+            clock += 1000; _ = target.step(); try t.expect(target.phase == .ready);
+            if (run.activeChannel().?.phase == .waiting) try replyNativeProduct(target);
+            if (run.display_flip == null and !native.slots[source_index].live and run.native_active == null and run.native_buffers[buffer.slot].owner == null) break;
+        }
+        try t.expect(run.display_flip == null and !native.slots[source_index].live and run.native_active == null and run.native_buffers[buffer.slot].owner == null);
+    }
+    try t.expectEqualDeep(before_cpu, copy.host);
 }
 fn checkNativeModeTimeout(target: *@import("gsp_device.zig").Device) !void {
     const run = &target.running; const product = &target.native_output;
@@ -5474,7 +5575,7 @@ fn checkRenderWarmup(target: *@import("gsp_device.zig").Device, table: *a.Driver
     try t.expect(run.graphics_cache.reservedBytes() == cache.budget_bytes and run.graphics_cache.program_uploads == 0);
     try checkRenderUpload(target,ce,output);
     for (0..16) |_| { try stepQueuedRendering(target); if (target.render_startup.phase == .ready) break; }
-    try t.expect(target.render_startup.phase == .ready and !run.graphics_starting and run.graphics_enabled and model.render_operations == 29 and
+    try t.expect(target.render_startup.phase == .ready and !run.graphics_starting and run.graphics_enabled and model.render_operations == 61 and
         run.graphics_cache.program_uploads == 1 and run.graphics_cache.packet_uploads == 0 and run.graphics_cache.uploaded_bytes == output.len);
     var bounded: cache.Owner = .{}; try bounded.initialize(run.epoch);
     try t.expectError(error.Exhausted,bounded.admitStorage(.programs,cache.slot_budget_bytes+1));
@@ -5568,8 +5669,8 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
     try t.expect(!try run.beginCopyWork(ce,model.binding,deadline));
     if (!run.graphics_enabled) try run.enableGraphicsQueue(target.native_graphics.channel.?,ce)
     // Reinstalling a fresh host memory view does not re-register the runtime.
-    else model.render_operations = 29;
-    try t.expect(model.render_operations == 29 and run.graphics_enabled);
+    else model.render_operations = 61;
+    try t.expect(model.render_operations == 61 and run.graphics_enabled);
     if (source_index) |index| {
         // The same copy_rows contract emitted by image_prepare. Its actual
         // CE stream turns SYS rows into tiled texture storage; GPGet and

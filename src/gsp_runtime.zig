@@ -1901,7 +1901,10 @@ pub const Owner = struct {
         const copy = (try self.findChannel(copy_handle)).info() orelse return error.State;
         if (copy.config.engine != .copy or copy.config.context.vaspace != info.config.context.vaspace) return error.Binding;
         const backend = self.copy_backend orelse return error.State;
-        const rc = backend.queue.updateOperations(&backend.binding, 29);
+        var rc = backend.queue.updateOperations(&backend.binding, 61);
+        // Earlier common queues can still use offscreen rendering. They
+        // never receive the new image-to-output operation.
+        if (rc == r4os.abi.gfx_queue_error_invalid) rc = backend.queue.updateOperations(&backend.binding, 29);
         if (rc == r4os.abi.err_no_fn) return error.Unsupported;
         if (rc != r4os.abi.gfx_queue_ok) return error.Queue;
         self.graphics_channel = handle; self.graphics_copy_channel = copy_handle; self.graphics_enabled = true;
@@ -2118,27 +2121,34 @@ pub const Owner = struct {
             self.stop(error.Descriptor); return error.Descriptor;
         }
         // Older kernels return only the original prefix, leaving zeroed tails.
-        const rows = job.operation == a.gfx_queue_operation_copy_rows;
+        const image_present = job.operation == a.gfx_queue_operation_present;
+        const rows = job.operation == a.gfx_queue_operation_copy_rows or image_present;
         if (rows and (job.size < @offsetOf(a.GfxDriverJob, "render") or job.row_count == 0 or job.source_pitch < job.byte_length or
-            job.target_pitch < job.byte_length or job.source_pitch > std.math.maxInt(u32) or job.target_pitch > std.math.maxInt(u32))) {
+            (!image_present and job.target_pitch < job.byte_length) or job.source_pitch > std.math.maxInt(u32) or job.target_pitch > std.math.maxInt(u32))) {
             try self.finishCopy(a.gfx_queue_result_failed); return true;
         }
         if (!rows and (job.row_count != 0 or job.source_pitch != 0 or job.target_pitch != 0)) { try self.finishCopy(a.gfx_queue_result_failed); return true; }
         if ((job.operation != a.gfx_queue_operation_copy and job.operation != a.gfx_queue_operation_upload and !rows) or
             job.byte_length == 0 or job.byte_length > std.math.maxInt(u32)) { try self.finishCopy(a.gfx_queue_result_failed); return true; }
-        if (job.operation == a.gfx_queue_operation_upload and job.target_buffer.id != 0) { try self.finishCopy(a.gfx_queue_result_failed); return true; }
-        if (job.operation == a.gfx_queue_operation_upload and job.target_buffer.id == 0) {
+        if ((job.operation == a.gfx_queue_operation_upload or image_present) and
+            (!std.meta.eql(job.target_buffer, a.GfxBufferHandle{}) or job.target_offset != 0)) { try self.finishCopy(a.gfx_queue_result_failed); return true; }
+        if (job.operation == a.gfx_queue_operation_upload or image_present) {
             // The desktop shadow remains a CPU-owned surface while headless.
             // Return this particular unsubmitted queue job without retaining
             // resources or claiming GPU execution; future events can repaint.
             if (self.display_paused) { try self.finishCopy(a.gfx_queue_result_cancelled); return true; }
             if (!self.presentationValid() or !std.meta.eql(self.presentation.?.binding, binding) or
                 self.presentation.?.channel_handle.slot != handle.slot or self.presentation.?.channel_handle.serial != handle.serial or
-                !self.presentation.?.surface.matches(job)) { try self.finishCopy(a.gfx_queue_result_failed); return true; }
+                (!image_present and !self.presentation.?.surface.matches(job))) { try self.finishCopy(a.gfx_queue_result_failed); return true; }
+            if (image_present and (self.presentation_buffers < 2 or job.target_pitch != 0 or job.source_offset != 0 or
+                job.byte_length != @as(u64, self.presentation.?.surface.descriptor.width) * 4 or
+                job.row_count != self.presentation.?.surface.descriptor.height)) { try self.finishCopy(a.gfx_queue_result_failed); return true; }
             self.copy_job.?.presentation = true;
+            if (image_present and job.deadline_ns != 0) self.copy_job.?.deadline = @min(deadline, job.deadline_ns);
             if (self.presentation_buffers != 0) {
                 const current = self.presentation.?;
-                const damage = current.surface.damage(job) catch |err| {
+                const damage: present.Rect = if (image_present) .{ .x = 0, .y = 0,
+                    .width = current.surface.descriptor.width, .height = current.surface.descriptor.height } else current.surface.damage(job) catch |err| {
                     if (err == error.Bounds) { try self.finishCopy(a.gfx_queue_result_failed); return true; }
                     return err;
                 };
@@ -2189,7 +2199,7 @@ pub const Owner = struct {
             self.copy_bytes +|= transfer.bytes *| @as(u64, if (transfer.rows) |rows| rows.count else 1);
             if (transfer.rows != null) self.copy_row_jobs +|= 1;
         }
-        else if (work.job.operation == a.gfx_queue_operation_upload and work.job.target_buffer.id == 0) self.frames_rejected +|= 1;
+        else if (work.presentation) self.frames_rejected +|= 1;
         self.copy_job = null;
     }
     fn advanceCopy(self: *Owner, current: u64) !bool {
@@ -2260,7 +2270,7 @@ pub const Owner = struct {
             };
             return true;
         }
-        if (work.target_presentation) |entry| if (work.render_read.self_address == 0) {
+        if (work.target_presentation) |entry| if (work.job.operation != r4os.abi.gfx_queue_operation_present and work.render_read.self_address == 0) {
             const address = work.addresses[0] orelse return error.State;
             var source: ?*buffer_mapping.Owner = null;
             for (&self.buffers) |*slot| if (slot.owner) |owner| if (owner.info()) |mapped| {
@@ -2279,9 +2289,9 @@ pub const Owner = struct {
             if (err == error.Bounds or err == error.Unsupported or err == error.Exhausted) { try self.finishCopy(r4os.abi.gfx_queue_result_failed); return true; }
             return err;
         };
-        if (work.target_presentation != null) work.render_read.ticket = work.ticket;
+        if (work.render_read.self_address != 0) work.render_read.ticket = work.ticket;
         try self.device.?.submitCopy(fifo, work.ticket.?, work.deadline);
-        if (work.target_presentation != null) work.render_read.submitted = true;
+        if (work.render_read.self_address != 0) work.render_read.submitted = true;
         work.submitted = true; return true;
     }
     pub fn copyTransfer(self: *Owner) !execution_fifo.copy.wire.Transfer {
@@ -2292,6 +2302,7 @@ pub const Owner = struct {
             if (!self.presentationValid() or !std.meta.eql(work.references[0].buffer, work.job.source_buffer) or
                 work.references[0].flags != r4os.abi.gfx_buffer_reference_mapping_only or
                 !std.meta.eql(work.channel_handle, self.presentation.?.channel_handle)) return error.Stale;
+            if (work.job.operation == r4os.abi.gfx_queue_operation_present) return self.copyImageToOutput(work);
             const source = work.addresses[0] orelse return error.State;
             const fifo = try self.findChannel(work.channel_handle);
             var confirmed = false;
@@ -2335,6 +2346,33 @@ pub const Owner = struct {
         }
         return .{ .source = operands[0].address, .target = operands[1].address, .bytes = job.byte_length,
             .rows = rows, .source_block = operands[0].block, .target_block = operands[1].block };
+    }
+    fn copyImageToOutput(self: *Owner, work: *const CopyJob) !execution_fifo.copy.wire.Transfer {
+        const entry = work.target_presentation orelse return error.State;
+        const current = self.presentation orelse return error.State;
+        if (!self.preparedPresentation(entry) or entry == current or
+            !std.meta.eql(entry.surface.shadow.buffer, current.surface.shadow.buffer) or
+            !try self.display_resources_slot.owner.?.imageFinished(entry.window.slot, entry.surface.scanout.?.dma)) return error.Stale;
+        // Source mapping and layout derive from the queue's retained native
+        // reference. No CPU shadow alias or extra, unowned device lease.
+        const source = try self.queuedGraphicsResource(work.references[0]);
+        _ = try render_job.image(source, false);
+        const plan = source.info.surface;
+        const descriptor = plan.descriptor;
+        const image = entry.surface.scanout.?;
+        if (descriptor.format != r4os.abi.gfx_buffer_format_xrgb8888 or descriptor.width != image.width or
+            descriptor.height != image.height or descriptor.plane_count != 1 or descriptor.plane_offsets[0] != 0 or
+            work.job.byte_length != @as(u64, image.width) * 4 or work.job.row_count != image.height or
+            work.job.source_pitch != descriptor.plane_pitches[0] or work.job.target_pitch != 0 or
+            work.job.source_offset != 0 or work.job.target_offset != 0) return error.Unsupported;
+        const destination = entry.surface.target_stamp.?;
+        const rows: execution_fifo.copy.wire.Rows = .{ .count = image.height,
+            .source_pitch = @intCast(work.job.source_pitch), .target_pitch = image.pitch };
+        const layout = @import("gsp_copy_layout.zig");
+        const src = try layout.operand(source.info.address, source.info.logical_bytes, 0, work.job.byte_length, rows, false, plan);
+        const dst = try layout.operand(destination.address, destination.bytes, image.offset, work.job.byte_length, rows, true, null);
+        return .{ .source = src.address, .target = dst.address, .bytes = work.job.byte_length,
+            .rows = rows, .source_block = src.block };
     }
     fn advanceCursorUpload(self: *Owner, current: u64) !bool {
         const work = if (self.cursor_upload) |*value| value else return false;

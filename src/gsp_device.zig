@@ -589,7 +589,13 @@ pub const Device = struct {
             const work = if (self.running.copy_job) |*value| value else return error.Binding;
             if (work.submitted or work.ticket == null or !std.meta.eql(work.ticket.?, ticket) or !std.meta.eql(work.job, work.job_stamp) or
                 work.deadline != deadline) return error.Binding;
-            if (work.target_presentation != null and !work.render_read.matches(ticket, deadline)) return error.Binding;
+            if (work.target_presentation != null) {
+                // Native image jobs retain their source through the common
+                // queue. Only the CPU-shadow path owns an Initial read lease.
+                if (work.job.operation == r4os.abi.gfx_queue_operation_present) {
+                    if (work.render_read.self_address != 0) return error.Binding;
+                } else if (!work.render_read.matches(ticket, deadline)) return error.Binding;
+            }
             const transfer = self.running.copyTransfer() catch return error.Binding;
             if (!std.meta.eql(work.transfer, transfer) or !fifo.ring.matchesTransfer(ticket, fifo.config.object_class, transfer)) return error.Binding;
             break :blk work.channel_handle;
