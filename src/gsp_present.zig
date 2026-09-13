@@ -10,6 +10,14 @@ const copy = @import("gsp_copy_wire.zig");
 const mapping = @import("gsp_buffer_mapping.zig");
 const ring = @import("gsp_copy_ring.zig");
 pub const Error = backing.Error || copy.Error || error{State, Overflow};
+pub const Rect = struct {
+    x: u32, y: u32, width: u32, height: u32,
+    pub fn merge(first: Rect, second: Rect) Rect {
+        const x = @min(first.x, second.x); const y = @min(first.y, second.y);
+        return .{ .x = x, .y = y, .width = @max(first.x + first.width, second.x + second.width) - x,
+            .height = @max(first.y + first.height, second.y + second.height) - y };
+    }
+};
 pub const Owner = struct {
     self_address: usize = 0,
     memory: ?r4os.driver_memory.Context = null,
@@ -59,6 +67,11 @@ pub const Owner = struct {
     }
     pub fn transfer(self: *const Owner, job: a.GfxDriverJob, source_address: u64, source_bytes: u64) Error!copy.Transfer {
         if (!self.matches(job) or source_bytes != self.descriptor.byte_length) return error.Stale;
+        return self.regionTransfer(try self.damage(job), source_address, source_bytes);
+    }
+    pub fn damage(self: *const Owner, job: a.GfxDriverJob) Error!Rect {
+        if (!self.matches(job)) return error.Stale;
+        const source_bytes = self.descriptor.byte_length;
         const pitch = self.descriptor.plane_pitches[0];
         if (job.byte_length == 0 or job.source_offset >= source_bytes or job.byte_length > source_bytes - job.source_offset or
             job.source_offset & 3 != 0 or job.byte_length & 3 != 0) return error.Bounds;
@@ -68,7 +81,14 @@ pub const Owner = struct {
         const rows = (job.byte_length - 1) / pitch + 1;
         const line = (job.byte_length - 1) % pitch + 1;
         if (line > pitch - x_bytes or rows > self.descriptor.height - y) return error.Bounds;
-        return self.rectangle(source_address, x_bytes, y, line, rows);
+        if (x_bytes / 4 >= self.descriptor.width or line / 4 > self.descriptor.width - x_bytes / 4) return error.Bounds;
+        return .{ .x = @intCast(x_bytes / 4), .y = @intCast(y), .width = @intCast(line / 4), .height = @intCast(rows) };
+    }
+    pub fn regionTransfer(self: *const Owner, rect: Rect, source_address: u64, source_bytes: u64) Error!copy.Transfer {
+        if (!self.valid() or source_bytes != self.descriptor.byte_length) return error.Stale;
+        if (rect.width == 0 or rect.height == 0 or rect.x >= self.descriptor.width or rect.y >= self.descriptor.height or
+            rect.width > self.descriptor.width - rect.x or rect.height > self.descriptor.height - rect.y) return error.Bounds;
+        return self.rectangle(source_address, @as(u64, rect.x) * 4, rect.y, @as(u64, rect.width) * 4, rect.height);
     }
     pub fn fullTransfer(self: *const Owner, source_address: u64, source_bytes: u64) Error!copy.Transfer {
         if (!self.valid() or source_bytes != self.descriptor.byte_length) return error.Stale;
@@ -106,8 +126,13 @@ pub const Initial = struct {
     ticket: ?ring.Ticket = null,
     submitted: bool = false,
     failure: ?anyerror = null,
+    region: ?Rect = null,
+    region_stamp: ?Rect = null,
 
     pub fn open(self: *Initial, surface: *Owner, source: *mapping.Owner, deadline: u64) Error!void {
+        return self.openRegion(surface, source, deadline, null);
+    }
+    pub fn openRegion(self: *Initial, surface: *Owner, source: *mapping.Owner, deadline: u64, region: ?Rect) Error!void {
         if (self.self_address != 0) return error.Busy;
         if (!surface.valid() or deadline == 0 or deadline == std.math.maxInt(u64)) return error.Stale;
         const src = source.info() orelse return error.Stale;
@@ -115,8 +140,9 @@ pub const Initial = struct {
         if (!std.meta.eql(src.buffer, surface.shadow.buffer) or src.logical_bytes != surface.descriptor.byte_length or
             src.epoch != dst.epoch or source.adapter != dst.adapter or source.dma.driver_owner != dst.driver_owner or
             !std.meta.eql(source.memory.table, surface.memory.?.table)) return error.Stale;
-        _ = try surface.fullTransfer(src.address, src.logical_bytes);
-        self.* = .{ .self_address = @intFromPtr(self), .surface = surface, .source = source, .source_stamp = src, .deadline = deadline };
+        _ = if (region) |rect| try surface.regionTransfer(rect, src.address, src.logical_bytes) else try surface.fullTransfer(src.address, src.logical_bytes);
+        self.* = .{ .self_address = @intFromPtr(self), .surface = surface, .source = source, .source_stamp = src, .deadline = deadline,
+            .region = region, .region_stamp = region };
         const status = surface.memory.?.deviceAcquire(&surface.shadow.reference, &.{ .byte_length = src.logical_bytes,
             .gpu_virtual_address = src.address, .adapter_id = dst.adapter, .device_generation = src.epoch,
             .access = 0, .address_space = 1 }, &self.gpu);
@@ -134,10 +160,12 @@ pub const Initial = struct {
     pub fn valid(self: *const Initial) bool {
         return self.self_address == @intFromPtr(self) and self.failure == null and self.surface != null and self.surface.?.valid() and
             self.source != null and std.meta.eql(self.source.?.info(), self.source_stamp) and
+            std.meta.eql(self.region, self.region_stamp) and
             self.gpu.lease.id != 0 and std.meta.eql(self.gpu, self.gpu_stamp);
     }
     pub fn transfer(self: *const Initial) Error!copy.Transfer {
         if (!self.valid()) return error.Stale;
+        if (self.region) |rect| return self.surface.?.regionTransfer(rect, self.source_stamp.?.address, self.source_stamp.?.logical_bytes);
         return self.surface.?.fullTransfer(self.source_stamp.?.address, self.source_stamp.?.logical_bytes);
     }
     pub fn matches(self: *const Initial, ticket: ring.Ticket, deadline: u64) bool {

@@ -512,7 +512,8 @@ pub const Device = struct {
         if (self.phase != .ready or port != &self.port or port.phase != .runtime or self.session == null or self.inLockdown() or
             self.running.self_address != @intFromPtr(&self.running) or self.running.failure != null or self.running.sequence.self_address != 0 or
             self.running.fifo_active != null or self.running.context_active != null or self.running.native_active != null or self.running.buffer_active != null or
-            self.running.outputs.active() or self.running.graph_closing or self.running.display_engine_active or self.running.display_channel_active != null or self.running.display_work != null or self.running.display_flip != null or self.running.mode_control_active) return error.State;
+            self.running.outputs.active() or self.running.graph_closing or self.running.display_engine_active or self.running.display_channel_active != null or self.running.display_work != null or self.running.mode_control_active) return error.State;
+        self.running.validateCopyOverlap() catch return error.Binding;
         const channel_handle = if (self.running.display_upload_job) |*work| blk: {
             const resources = self.running.display_resources_slot.owner orelse return error.Binding;
             const root = if (self.running.display_engine_owner) |*value| value else return error.Binding;
@@ -535,6 +536,7 @@ pub const Device = struct {
             const work = if (self.running.copy_job) |*value| value else return error.Binding;
             if (work.submitted or work.ticket == null or !std.meta.eql(work.ticket.?, ticket) or !std.meta.eql(work.job, work.job_stamp) or
                 work.deadline != deadline) return error.Binding;
+            if (work.target_presentation != null and !work.render_read.matches(ticket, deadline)) return error.Binding;
             const transfer = self.running.copyTransfer() catch return error.Binding;
             if (!std.meta.eql(work.transfer, transfer) or !fifo.ring.matchesTransfer(ticket, fifo.config.copy_class, transfer)) return error.Binding;
             break :blk work.channel_handle;

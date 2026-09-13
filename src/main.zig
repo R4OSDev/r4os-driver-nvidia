@@ -55,6 +55,7 @@ var init_excluded: [gsp_init.max_excluded]gsp_init.Span = undefined;
 var checking_boot = false;
 var starting_gsp = false;
 var starting_native = false;
+var native_frame_count: u8 = 2;
 var boot_checked = false;
 var checking_runtime = false;
 var board_rom: vbios_probe.Capture = .{};
@@ -80,6 +81,13 @@ pub export fn nvidia_init(api: *const a.DriverApi) callconv(.c) i32 {
     const mode = std.mem.span(ctx.getOption("NVIDIA", "mode"));
     const check_firmware = std.ascii.eqlIgnoreCase(mode, "firmware-check");
     starting_native = std.ascii.eqlIgnoreCase(mode, "native");
+    if (starting_native) {
+        const buffers = std.mem.span(ctx.getOption("NVIDIA", "buffers"));
+        native_frame_count = @import("gsp_native_output.zig").frameCount(buffers) catch {
+            ctx.logError("NVIDIA native-output: rejected reason=buffers-must-be-2-or-3 firmware-execution=disabled");
+            return -2;
+        };
+    }
     starting_gsp = starting_native or std.ascii.eqlIgnoreCase(mode, "gsp-start");
     checking_boot = starting_gsp or std.ascii.eqlIgnoreCase(mode, "boot-check");
     boot_checked = false;
@@ -725,6 +733,7 @@ fn checkBoot(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Sna
             log("NVIDIA native-output: rejected phase=owner reason={s} firmware-execution=disabled", .{@errorName(err)});
             return false;
         };
+        if (starting_native) native_device.native_output.frame_count = native_frame_count;
         native_work.start(ctx, &native_device) catch |err| {
             log("NVIDIA gsp-start: rejected phase=worker reason={s} firmware-execution=disabled", .{@errorName(err)});
             return false;

@@ -5,7 +5,7 @@ const a = @import("r4os").abi;
 const heap_model = @import("gsp_buffer_test_model.zig").Model;
 pub const Model = struct {
     const Slot = struct { reservation: a.GfxOwnedBufferReservation = .{}, descriptor: a.GfxBufferDescriptor = .{}, live: bool = false, published: bool = false, reference: bool = false, imported: bool = false, claimed: bool = false, gpu: a.GfxDeviceLease = .{} };
-    pub var slots: [8]Slot = @splat(.{});
+    pub var slots: [16]Slot = @splat(.{});
     pub var charged: u64 = 0;
     pub var released: u32 = 0;
     pub var aborted: u32 = 0;

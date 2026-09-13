@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.96; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.97; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -12,7 +12,7 @@ Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
 
-Display timing (NVIDIA 0.1.96, 0.79.14 in progress):
+Display timing (NVIDIA 0.1.97, 0.79.14 in progress):
 After native handoff the existing IRQ endpoint enables the GSP-reported
 display stall vector and only the active head's LAST_DATA source. It shares
 MSI/INTx routing and the retirement gate with GSP delivery. An IRQ copies
@@ -29,11 +29,22 @@ same geometry and leaves Core, mode, position and HDMI unchanged. Window
 BEGUN plus a post-submission head observation publishes a separate visible
 receipt; old Window FINISHED makes the preceding image reusable. GPU notifier
 time and CPU observation time remain separate. One outstanding flip blocks
-conflicting work; missing IRQ, BEGUN or FINISHED reaches a deadline retaining
-both allocations. The actual Device test covers these stages and failures.
-This entry still needs the normal Present buffer-pool consumer. Ordinary
-Present currently retains its direct-copy behavior and fence meaning;
-double/triple buffering, shared visible statistics and cursor remain open.
+mode/table changes; missing IRQ, BEGUN or FINISHED reaches a deadline retaining
+its allocations. Ordinary Present now uses this entry with two private VRAM
+images by default; `OPTION NVIDIA buffers=3` selects three (`buffers=2` is
+also explicit). The images share the common SYSTEM shadow. Spare images
+are allocated through the existing RM/CE/RAMHT owners on first use. Each
+image accumulates damage since its last update; its first CE copy is full.
+A separate whole-shadow read lease protects accumulated copy regions and
+ends at CE SYS completion, independently of Window visibility and FINISHED.
+The common queue fence retains its device-execution meaning. A third image
+can render while a submitted flip still holds the other two. At most one
+CE job, one ready image and one Window flip are retained; a blocked producer
+uses the existing depth-one common queue and receives Busy/failed/lost results.
+No per-frame allocation, table update or selected-image log is needed after
+the group is populated. Confirmation/rollback retires every outgoing image,
+including owned shadow aliases, mappings, RAMHT and native storage.
+Shared visible statistics and hardware/software cursor integration remain open.
 Evidence: GrafikPraesentation07914.json; physical checks: OssiGPU.txt.
 
 Native output (0.79.13 software complete):
@@ -67,8 +78,9 @@ active entries are preserved. Retiring an image requires completed display
 methods, no current consumer, its last Window use FINISHED, then completed
 RAMHT withdrawal. Native BO/RM release follows. Slots are reusable, while
 wire names remain fresh. Unknown effects retain the resources.
-Two stable Present slots now import independent SYSTEM shadows and share
-the existing queue/backend. A candidate's own CE completion prepares it;
+Two bounded mode groups use up to six stable Present slots and share the
+existing queue/backend; each group imports aliases of its own SYSTEM shadow.
+A candidate's own CE completion prepares it;
 only acknowledged WIMM/Window/Core/HDMI output can select it for Present.
 The former image remains available for rollback. Retirement drains all
 inactive shadow mappings and owned imports before RAMHT/native storage;

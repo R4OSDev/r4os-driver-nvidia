@@ -83,6 +83,7 @@ pub const DisplayFlip = struct {
     deadline: u64,
     baseline: @import("gsp_head_events.zig").Sample = .{},
     receipt: flip.Receipt,
+    ordinary: bool = false,
 };
 const subscriptions = @import("gsp_event_objects.zig");
 const outputs = @import("gsp_outputs.zig");
@@ -101,6 +102,7 @@ pub const Presentation = struct {
     initial_point: u32 = 0,
     initial_failure: ?anyerror = null,
     retiring: bool = false,
+    damage: ?present.Rect = null,
 };
 pub const InitialImage = struct { operation: present.Initial = .{}, mapping: ?BufferHandle = null, presentation: *Presentation, deadline: u64 };
 pub const InitialImageStatus = struct { pending: bool, completed: u32, failure: ?anyerror };
@@ -119,6 +121,8 @@ pub const CopyJob = struct {
     submitted: bool = false,
     presentation: bool = false,
     transfer: ?execution_fifo.copy.wire.Transfer = null,
+    target_presentation: ?*Presentation = null,
+    render_read: present.Initial = .{},
 };
 pub const execution_context = @import("gsp_context.zig");
 pub const ContextHandle = struct { epoch: u64, serial: u64, slot: u16 };
@@ -188,8 +192,11 @@ pub const Owner = struct {
     flip_receipts: [8]?flip.Receipt = @splat(null),
     head_events: ?*const @import("gsp_head_events.zig").Owner = null,
     display_images: [8]?ActiveDisplayImage = @splat(null),
-    presentation_slots: [2]?Presentation = @splat(null),
+    presentation_slots: [6]?Presentation = @splat(null),
     presentation: ?*Presentation = null,
+    presentation_buffers: u8 = 0,
+    frame_setup: ?@import("gsp_frame_setup.zig").Work = null,
+    frame_ready: ?struct { image: *Presentation, deadline: u64 } = null,
     require_mode_receipt: bool = false,
     initial_image: ?InitialImage = null,
     rm_rejection: ?u32 = null,
@@ -435,6 +442,7 @@ pub const Owner = struct {
     }
     pub fn nativeOutputs(self: *Owner) ?*const outputs.Snapshot {
         _ = self.now() catch return null;
+        if (self.frame_ready != null or self.copy_job != null) return null;
         if (self.nativeObject() == null) return null;
         return self.outputs.snapshot();
     }
@@ -903,7 +911,8 @@ pub const Owner = struct {
     /// primary position. This emits only Window methods. It does not change
     /// the common shadow binding or reinterpret its CPU-copy queue fence.
     pub fn flipDisplayPresentationImage(self: *Owner, dma: u32, deadline: u64) !void {
-        if (self.copyBusy() or self.graph_closing or self.nativeObject() == null or !self.presentationValid()) return error.Busy;
+        if (self.deviceWorkBusy() or self.graph_closing or self.nativeObject() == null or !self.presentationValid()) return error.Busy;
+        if (self.frame_ready) |ready| if (ready.image.surface.scanout.?.dma != dma) return error.Busy;
         const entry = try self.findPresentationImage(dma);
         if (!self.preparedPresentation(entry) or entry.initial_point == 0 or entry.initial_failure != null) return error.Stale;
         const owner = try self.findDisplayChannel(entry.window);
@@ -987,7 +996,7 @@ pub const Owner = struct {
         const queue = self.ctx.?.graphicsQueue() orelse return error.Api;
         const memory = self.ctx.?.memory() orelse return error.Api;
         if (queue.table.unregister_backend == 0) return error.Api;
-        if (self.presentation_slots[0] != null or self.presentation_slots[1] != null) return error.Retained;
+        for (&self.presentation_slots) |*slot| if (slot.* != null) return error.Retained;
         self.presentation_slots[0] = .{ .channel_handle = handle, .root = root, .window = window };
         const entry = &self.presentation_slots[0].?;
         self.presentation = entry;
@@ -1055,18 +1064,30 @@ pub const Owner = struct {
     /// alias; ownership of the supplied reference never transfers to NVIDIA.
     /// Stable slots keep present.Owner and its GPU-use pointers immovable.
     pub fn prepareDisplayPresentationImage(self: *Owner, dma: u32, shadow: r4os.abi.GfxBufferReference, deadline: u64) !void {
+        return self.preparePresentationImage(dma, shadow, deadline, false);
+    }
+    pub fn prepareDisplayFrameImage(self: *Owner, dma: u32, deadline: u64) !void {
+        const current = self.presentation orelse return error.State;
+        return self.preparePresentationImage(dma, current.surface.shadow, deadline, true);
+    }
+    fn preparePresentationImage(self: *Owner, dma: u32, shadow: r4os.abi.GfxBufferReference, deadline: u64, frame: bool) !void {
         _ = try self.now();
         const current = self.presentation orelse return error.State;
         if (!self.presentationValid() or self.copyBusy() or self.nativeObject() == null or self.graph_closing) return error.Busy;
         if (shadow.version != 1 or shadow.size < @sizeOf(r4os.abi.GfxBufferReference) or shadow.flags != 0 or shadow.reserved0 != 0 or
             shadow.reference.id == 0 or shadow.reference.generation == 0 or shadow.reference.reserved0 != 0 or
             shadow.buffer.id == 0 or shadow.buffer.generation == 0 or shadow.buffer.reserved0 != 0 or
-            std.meta.eql(shadow.buffer, current.surface.shadow.buffer)) return error.Descriptor;
-        const index: usize = if (self.presentation_slots[0] == null) 0 else if (self.presentation_slots[1] == null) 1 else return error.Busy;
+            std.meta.eql(shadow.buffer, current.surface.shadow.buffer) != frame) return error.Descriptor;
+        const index: usize = blk: {
+            for (&self.presentation_slots, 0..) |*slot, i| if (slot.* == null) break :blk i;
+            return error.Busy;
+        };
         const resources = self.display_resources_slot.owner orelse return error.State;
         const image = resources.publishedImage(current.window.slot, dma) orelse return error.Stale;
         const target = resources.publishedStorage(current.window.slot, dma) orelse return error.Stale;
         if (dma == current.surface.scanout.?.dma) return error.Stale;
+        if (frame and (image.width != current.surface.descriptor.width or image.height != current.surface.descriptor.height or
+            image.format != current.surface.scanout.?.format or image.pitch != current.surface.scanout.?.pitch)) return error.Descriptor;
         try self.channel.?.guard(deadline);
         self.presentation_slots[index] = .{ .channel_handle = current.channel_handle, .root = current.root,
             .window = current.window, .binding = current.binding, .registered = true };
@@ -1117,7 +1138,73 @@ pub const Owner = struct {
         self.log("NVIDIA gsp-present-image: retired={d} shadow=unmapped,import-released scanout=retained", .{dma});
         return true;
     }
-    fn copyBusy(self: *const Owner) bool { return self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.display_flip != null or self.initial_image != null or self.mode_control_active; }
+    fn deviceWorkBusy(self: *const Owner) bool { return self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.display_flip != null or self.initial_image != null or self.mode_control_active; }
+    fn copyBusy(self: *const Owner) bool { return self.deviceWorkBusy() or self.frame_ready != null; }
+    fn overlapFlip(self: *const Owner) bool {
+        const work = self.display_flip orelse return false;
+        return self.presentation_buffers == 3 and work.ordinary and
+            (work.window.phase == .submitted or work.window.phase == .complete);
+    }
+    fn copyAdmissionBusy(self: *const Owner) bool {
+        return self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.initial_image != null or
+            self.mode_control_active or self.frame_ready != null or (self.display_flip != null and !self.overlapFlip());
+    }
+    /// The third image may render while a submitted ordinary flip waits.
+    /// Neither of that flip's two images may be touched by this CE job.
+    pub fn validateCopyOverlap(self: *Owner) !void {
+        const flip_work = self.display_flip orelse return;
+        const work = self.copy_job orelse return error.State;
+        const target = work.target_presentation orelse return error.Stale;
+        if (!self.overlapFlip() or target == flip_work.presentation or target.surface.scanout.?.dma == flip_work.previous.image.dma or
+            !std.meta.eql(target.surface.shadow.buffer, flip_work.presentation.surface.shadow.buffer)) return error.Stale;
+        try self.validateDisplayFlip();
+    }
+    pub fn presentationGroupCount(self: *Owner, entry: *Presentation) usize {
+        var count: usize = 0;
+        for (&self.presentation_slots) |*slot| if (slot.*) |*peer| {
+            if (!peer.retiring and std.meta.eql(peer.surface.shadow.buffer, entry.surface.shadow.buffer)) count += 1;
+        };
+        return count;
+    }
+    pub fn presentationPeer(self: *Owner, buffer: r4os.abi.GfxBufferHandle) ?u32 {
+        for (&self.presentation_slots) |*slot| if (slot.*) |*peer| {
+            if (!peer.retiring and std.meta.eql(peer.surface.shadow.buffer, buffer)) return peer.surface.scanout.?.dma;
+        };
+        return null;
+    }
+    pub fn presentationImageBuffer(self: *Owner, dma: u32) !r4os.abi.GfxBufferHandle {
+        return (try self.findPresentationImage(dma)).surface.shadow.buffer;
+    }
+    fn acquireFrame(self: *Owner) !?*Presentation {
+        const current = self.presentation orelse return error.State;
+        const resources = self.display_resources_slot.owner orelse return error.State;
+        const start = (self.presentationIndex(current) orelse return error.Stale) + 1;
+        // Rotate through the bounded group, including its third buffer.
+        // FINISHED is required even when an earlier frame used this image.
+        for (0..self.presentation_slots.len) |offset| {
+            const slot = &self.presentation_slots[(start + offset) % self.presentation_slots.len];
+            const entry = if (slot.*) |*value| value else continue;
+            if (entry == current or !self.preparedPresentation(entry) or
+                !std.meta.eql(entry.surface.shadow.buffer, current.surface.shadow.buffer)) continue;
+            if (self.display_flip) |work| if (entry == work.presentation or entry.surface.scanout.?.dma == work.previous.image.dma) continue;
+            if (try resources.imageFinished(entry.window.slot, entry.surface.scanout.?.dma)) return entry;
+        }
+        return null;
+    }
+    pub fn prepareFramePool(self: *Owner) !bool {
+        const current = self.presentation orelse return false;
+        if (self.presentation_buffers == 0 or !current.pending) return false;
+        if (self.frame_setup == null) {
+            if (self.presentationGroupCount(current) >= self.presentation_buffers) return false;
+            if (self.copyBusy() or !self.presentationValid() or self.nativeObject() == null) return false;
+            self.frame_setup = .{ .image = current, .deadline = (try self.now()) +| 3 * std.time.ns_per_s };
+        }
+        const work = &self.frame_setup.?;
+        if (work.image != current or !self.preparedPresentation(current)) return error.Stale;
+        const phase = work.phase;
+        if (try work.step(self)) { self.frame_setup = null; return true; }
+        return work.phase != phase;
+    }
     /// Called after the product owner populated and unmapped its CPU shadow
     /// from the same immutable capture used by common commit. This private
     /// operation does not invent a common queue fence.
@@ -1313,9 +1400,13 @@ pub const Owner = struct {
     pub fn beginCopyWork(self: *Owner, handle: ChannelHandle, binding: r4os.abi.GfxBackendBinding, deadline: u64) !bool {
         const fifo = try self.findChannel(handle);
         const value = fifo.info() orelse return error.State;
-        if (!value.config.system_userd or !fifo.ring.idle() or self.copyBusy() or self.graph_closing or self.display_engine_active or self.display_channel_active != null or
+        if (!value.config.system_userd or !fifo.ring.idle() or self.copyAdmissionBusy() or self.graph_closing or self.display_engine_active or self.display_channel_active != null or
             self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or
             self.outputs.active() or self.sequence.self_address != 0 or self.channel.?.phase != .idle or self.channel.?.in_lockdown) return error.Busy;
+        if (self.frame_setup != null) return error.Busy;
+        if (self.presentation_buffers != 0 and self.presentation != null and
+            self.presentationGroupCount(self.presentation.?) < self.presentation_buffers) return error.Busy;
+        const next_frame = if (self.presentation_buffers != 0) (try self.acquireFrame()) orelse return error.Busy else null;
         try self.channel.?.guard(deadline);
         const a = r4os.abi;
         if (binding.version != 1 or binding.size < @sizeOf(a.GfxBackendBinding) or binding.adapter_id != self.adapter_id or
@@ -1346,6 +1437,18 @@ pub const Owner = struct {
                 self.presentation.?.channel_handle.slot != handle.slot or self.presentation.?.channel_handle.serial != handle.serial or
                 !self.presentation.?.surface.matches(job)) { try self.finishCopy(a.gfx_queue_result_failed); return true; }
             self.copy_job.?.presentation = true;
+            if (self.presentation_buffers != 0) {
+                const current = self.presentation.?;
+                const damage = current.surface.damage(job) catch |err| {
+                    if (err == error.Bounds) { try self.finishCopy(a.gfx_queue_result_failed); return true; }
+                    return err;
+                };
+                for (&self.presentation_slots) |*slot| if (slot.*) |*entry| {
+                    if (!std.meta.eql(entry.surface.shadow.buffer, current.surface.shadow.buffer)) continue;
+                    entry.damage = if (entry.damage) |prior| prior.merge(damage) else damage;
+                };
+                self.copy_job.?.target_presentation = next_frame orelse return error.State;
+            }
         }
         const resource_count: usize = if (self.copy_job.?.presentation) 1 else 2;
         for (0..resource_count) |i| {
@@ -1371,6 +1474,10 @@ pub const Owner = struct {
     fn retireCopy(self: *Owner, result: u32) !void {
         const work = &self.copy_job.?;
         const a = r4os.abi;
+        if (work.render_read.self_address != 0) {
+            if (result == a.gfx_queue_result_complete) try work.render_read.complete(work.ticket.?.point)
+            else try work.render_read.cancel();
+        }
         if (work.queue.complete(&work.job.fence, result, 1) != a.gfx_queue_ok) return error.Retained;
         for (&work.references) |*reference| if (reference.reference.id != 0) {
             if (work.memory.bufferRelease(&reference.reference) != a.gfx_buffer_result_ok) return error.Retained;
@@ -1385,6 +1492,11 @@ pub const Owner = struct {
         const fifo = try self.findChannel(work.channel_handle);
         if (work.submitted) {
             if (try fifo.ring.poll() >= work.ticket.?.point) {
+                if (work.target_presentation) |entry| {
+                    if (self.frame_ready != null) return error.State;
+                    entry.initial_point = work.ticket.?.point; entry.damage = null;
+                    self.frame_ready = .{ .image = entry, .deadline = work.deadline };
+                }
                 try self.finishCopy(r4os.abi.gfx_queue_result_complete); return true;
             }
             if (current >= work.deadline) return error.Timeout; // Retain: a deadline is never quiescence.
@@ -1394,6 +1506,9 @@ pub const Owner = struct {
             try self.recordFault(diagnostics.host(.submit, error.Timeout, false));
             try self.finishCopy(r4os.abi.gfx_queue_result_failed); return true;
         }
+        // Only a private third Present image is an overlap target. A generic
+        // queue copy can wait here with its ordinary deadline and references.
+        if (self.display_flip != null and !work.presentation) return false;
         if (self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return false;
         const resource_count: usize = if (work.presentation) 1 else 2;
         for (0..resource_count) |i| {
@@ -1427,6 +1542,16 @@ pub const Owner = struct {
             };
             return true;
         }
+        if (work.target_presentation) |entry| if (work.render_read.self_address == 0) {
+            const address = work.addresses[0] orelse return error.State;
+            var source: ?*buffer_mapping.Owner = null;
+            for (&self.buffers) |*slot| if (slot.owner) |owner| if (owner.info()) |mapped| {
+                if (std.meta.eql(mapped.buffer, work.job.source_buffer) and mapped.address == address.address and
+                    mapped.logical_bytes == address.bytes and owner.space.handle == fifo.config.context.vaspace) { source = owner; break; }
+            };
+            try work.render_read.openRegion(&entry.surface, source orelse return error.Stale, work.deadline,
+                if (entry.initial_point == 0) null else entry.damage orelse return error.State);
+        };
         const transfer = self.copyTransfer() catch |err| {
             if (err == error.Bounds or err == error.Unsupported or err == error.Overflow) { try self.finishCopy(r4os.abi.gfx_queue_result_failed); return true; }
             return err;
@@ -1436,10 +1561,13 @@ pub const Owner = struct {
             if (err == error.Bounds or err == error.Unsupported or err == error.Exhausted) { try self.finishCopy(r4os.abi.gfx_queue_result_failed); return true; }
             return err;
         };
+        if (work.target_presentation != null) work.render_read.ticket = work.ticket;
         try self.device.?.submitCopy(fifo, work.ticket.?, work.deadline);
+        if (work.target_presentation != null) work.render_read.submitted = true;
         work.submitted = true; return true;
     }
     pub fn copyTransfer(self: *Owner) !execution_fifo.copy.wire.Transfer {
+        try self.validateCopyOverlap();
         const work = if (self.copy_job) |*value| value else return error.State;
         if (!std.meta.eql(work.job, work.job_stamp)) return error.Stale;
         if (work.presentation) {
@@ -1455,6 +1583,15 @@ pub const Owner = struct {
                     confirmed = true;
             };
             if (!confirmed) return error.Stale;
+            if (work.target_presentation) |entry| {
+                const current = self.presentation.?;
+                if (!self.preparedPresentation(entry) or entry == current or
+                    !std.meta.eql(entry.surface.shadow.buffer, current.surface.shadow.buffer) or !work.render_read.valid() or
+                    work.render_read.surface != &entry.surface or work.render_read.deadline != work.deadline or
+                    !std.meta.eql(work.render_read.region, if (entry.initial_point == 0) null else entry.damage) or
+                    !try self.display_resources_slot.owner.?.imageFinished(entry.window.slot, entry.surface.scanout.?.dma)) return error.Stale;
+                return work.render_read.transfer();
+            }
             return self.presentation.?.surface.transfer(work.job, source.address, source.bytes);
         }
         const job = &work.job;
@@ -1702,6 +1839,15 @@ pub const Owner = struct {
             var active = work.previous;
             active.image = window.config.scanout.?; active.window_point = window.ticket.?.point;
             self.display_images[work.receipt.window] = active;
+            if (work.ordinary) {
+                // The selected alias follows visibility. The old image is
+                // still held by this flip until its independent FINISHED.
+                const previous = self.presentation orelse return error.State;
+                if (!std.meta.eql(previous.surface.shadow.buffer, work.presentation.surface.shadow.buffer)) return error.Stale;
+                work.presentation.pending = work.presentation.pending or previous.pending;
+                previous.pending = false;
+                self.presentation = work.presentation;
+            }
             self.flip_receipts[work.receipt.head] = work.receipt;
             self.flip_visible += 1;
             return true;
@@ -1712,6 +1858,18 @@ pub const Owner = struct {
         self.flip_receipts[work.receipt.head] = work.receipt;
         self.flip_released += 1;
         self.display_flip = null;
+        return true;
+    }
+    fn advancePresentFrame(self: *Owner, current: u64) !bool {
+        const ready = self.frame_ready orelse return false;
+        if (current >= ready.deadline) return error.Timeout;
+        if (self.display_flip != null) return false;
+        const dma = ready.image.surface.scanout.?.dma;
+        self.flipDisplayPresentationImage(dma, ready.deadline) catch |err| {
+            if (err == error.Busy) return false; return err;
+        };
+        self.display_flip.?.ordinary = true;
+        self.frame_ready = null;
         return true;
     }
     fn advanceDisplayPosition(self: *Owner, work: *PositionSubmission, deadline: u64, current: u64) !bool {
@@ -2194,7 +2352,8 @@ pub const Owner = struct {
         if (try self.advanceDisplay(current)) return .progress;
         if (try self.advanceDisplayFlip(current)) return .progress;
         if (try self.advanceCopy(current)) return .progress;
-        if (self.presentation) |entry| if (entry.pending and !self.copyBusy() and self.presentationValid()) {
+        if (try self.advancePresentFrame(current)) return .progress;
+        if (self.presentation) |entry| if (entry.pending and !self.copyAdmissionBusy() and self.presentationValid()) {
             const taken: ?bool = self.beginCopyWork(entry.channel_handle, entry.binding, try std.math.add(u64, current, 3 * std.time.ns_per_s)) catch |err| blk: {
                 if (err == error.Busy) break :blk null; return err;
             };

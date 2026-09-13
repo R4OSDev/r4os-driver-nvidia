@@ -31,6 +31,7 @@ pub const Owner = struct {
     candidate_storage: ?runtime.BufferHandle = null,
     retire_dma: u32 = 0,
     retire_storage: ?runtime.BufferHandle = null,
+    retire_group: a.GfxBufferHandle = .{},
     outcome: u32 = 0,
     error_code: i32 = 0,
     completed_ticket: u64 = 0,
@@ -221,6 +222,7 @@ pub const Owner = struct {
                 }
             },
             .retire_shadow => {
+                if (self.retire_group.id == 0) self.retire_group = try run.presentationImageBuffer(self.retire_dma);
                 if (!try run.retireDisplayPresentationImage(self.retire_dma, self.deadline)) return false;
                 self.phase = .remove_image;
             },
@@ -242,6 +244,10 @@ pub const Owner = struct {
                 _ = run.nativeBufferStatus(self.retire_storage.?) catch |err| {
                     if (err != error.Stale) return err;
                     if (run.native_active != null) return false;
+                    if (run.presentationPeer(self.retire_group)) |dma| {
+                        self.retire_dma = dma; self.retire_storage = try imageStorage(run, dma);
+                        self.phase = .retire_shadow; return true;
+                    }
                     self.phase = .reply; return true;
                 };
                 return false;
@@ -259,6 +265,7 @@ pub const Owner = struct {
                 } else {
                     self.completed_ticket = job.ticket; self.applied = null; self.previous = null; self.previous_storage = null;
                     self.candidate = 0; self.candidate_storage = null; self.retire_dma = 0; self.retire_storage = null; self.phase = .idle;
+                    self.retire_group = .{};
                 }
                 self.job = null;
             },
@@ -280,7 +287,8 @@ pub const Owner = struct {
             if (job.ticket != previous.ticket or job.sequence != previous.sequence + 1 or
                 !std.meta.eql(job.assignment, previous.assignment) or !std.meta.eql(job.mode, previous.mode) or !std.meta.eql(job.reference, previous.reference)) return error.Stale;
             if (job.operation == a.gfx_mode_operation_confirm) {
-                if (product.running.?.presentation.?.surface.scanout.?.dma != self.candidate) return error.Stale;
+                if (!std.meta.eql(product.running.?.presentation.?.surface.shadow.buffer,
+                    try product.running.?.presentationImageBuffer(self.candidate))) return error.Stale;
                 self.retire_dma = self.previous.?.image.dma; self.retire_storage = self.previous_storage;
                 self.outcome = a.gfx_output_outcome_applied; self.phase = .retire_shadow;
             } else if (job.operation == a.gfx_mode_operation_rollback) {

@@ -15,6 +15,7 @@ pub const Model = struct {
     var gpu_data: [2][length]u8 = undefined;
     pub var vram_data: [65536]u8 = undefined;
     pub var replacement_vram: [65536]u8 = undefined;
+    var extra_vram: [16][65536]u8 = undefined;
     var replacement_native: ?usize = null;
     var replacement_descriptor: ?a.GfxBufferDescriptor = null;
     pub var replacement_lent = false;
@@ -62,6 +63,7 @@ pub const Model = struct {
         for (0..2) |i| { @memset(&host[i], 0xa5); @memset(&gpu_data[i], 0x5a); }
         @memset(&vram_data, 0xcc);
         @memset(&replacement_vram, 0xcc);
+        for (&extra_vram) |*bytes| @memset(bytes, 0xcc);
     }
     pub fn installPresentation(table: *a.DriverApi, index: usize, width: u32, height: u32) void {
         install(table, index); present_mode = true; shadow_live = true;
@@ -258,7 +260,7 @@ pub const Model = struct {
         }; const entry = references[index]; const i = system(entry.buffer).?;
         if (request.access == 0) {
             std.debug.assert(present_mode and !shadow_cpu and entry.active and !entry.mapping_only and initial_read.lease.id == 0 and
-                !active and !queued and request.byte_offset == 0 and request.byte_length == descriptor(i).byte_length and
+                (!queued or active) and request.byte_offset == 0 and request.byte_length == descriptor(i).byte_length and
                 dma[i].lease.id != 0 and request.gpu_virtual_address == address(i) and request.address_space == 1);
             if (reject_initial_read) return a.gfx_buffer_error_busy;
             out.* = .{ .lease = .{ .id = 1799, .generation = 991 }, .byte_length = request.byte_length,
@@ -296,7 +298,7 @@ pub const Model = struct {
             return call(input, quiesced);
         }
         if (input.access == 0) {
-            std.debug.assert(std.meta.eql(input.*, initial_read) and quiesced == 1 and !active and (!fetched or signaled));
+            std.debug.assert(std.meta.eql(input.*, initial_read) and quiesced == 1 and (!fetched or signaled));
             if (reject_initial_release) return a.gfx_buffer_error_busy;
             initial_read = .{}; return a.gfx_buffer_result_ok;
         }
@@ -322,9 +324,18 @@ pub const Model = struct {
                 return replacement_vram[offset..][0..bytes];
             }
         }
-        const base = native.address(native_index);
-        if (address_value < base or address_value - base > vram_data.len or bytes > vram_data.len - (address_value - base)) return error.GpuAddress;
-        const offset: usize = @intCast(address_value - base); return vram_data[offset..][0..bytes];
+        for (0..native.slots.len) |index| {
+            const start = native.address(index);
+            if (address_value < start or address_value - start >= vram_data.len) continue;
+            const offset: usize = @intCast(address_value - start);
+            if (bytes > vram_data.len - offset or !native.slots[index].live or
+                (native.slots[index].gpu.lease.id == 0 and !(index == native_index and !present_mode and active))) return error.GpuAddress;
+            return (if (index == native_index) &vram_data else &extra_vram[index])[offset..][0..bytes];
+        }
+        return error.GpuAddress;
+    }
+    pub fn imageBytes(index: usize) []const u8 {
+        return if (replacement_native == index) &replacement_vram else if (index == native_index) &vram_data else &extra_vram[index];
     }
     pub fn fetch(owner: *@import("gsp_fifo.zig").Owner, mmio: []const u8) !void {
         try t.expect((active or initial_read.lease.id != 0) and !fetched and owner.ring.pending == null);

@@ -9,6 +9,12 @@ const capture = @import("boot_vram.zig");
 const catalog = @import("gsp_catalog.zig");
 const Outputs = @TypeOf(@as(r4os.r4dev.DriverContext, undefined).graphicsOutputs().?);
 
+pub fn frameCount(option: []const u8) !u8 {
+    if (option.len == 0 or std.mem.eql(u8, option, "2")) return 2;
+    if (std.mem.eql(u8, option, "3")) return 3;
+    return error.Descriptor;
+}
+
 pub const Phase = enum {
     detached, waiting, context_start, context_wait, context_retire, context_retiring,
     methods_allocate, methods_attach, copy_allocate, copy_create, copy_wait,
@@ -64,6 +70,7 @@ pub const Owner = struct {
     callback_confirmed: bool = false,
     restore_requested: bool = false,
     modes: @import("gsp_native_modes.zig").Owner = .{},
+    frame_count: u8 = 2,
 
     /// Explicit mode=native only. Check the common handoff API before the
     /// device worker can execute the already prepared firmware operations.
@@ -361,12 +368,18 @@ pub const Owner = struct {
                 self.last_status = self.memory.?.bufferRelease(&self.shadow.reference);
                 if (self.last_status != a.gfx_buffer_result_ok) return error.Retained;
                 self.shadow = .{};
+                if (self.frame_count < 2 or self.frame_count > 3) return error.Descriptor;
+                run.presentation_buffers = self.frame_count;
                 self.next(.active);
                 self.ctx.?.logInfo("NVIDIA native-output: state=software-native boot-mode=retained shadow=system scanout=vram completion=CE,WIMM,Window,Core,HDMI common-handoff=confirmed");
             },
             .active => {
                 try self.validateRoute();
-                return self.modes.step(self);
+                if (run.frame_setup != null) return run.prepareFramePool();
+                if (try self.modes.step(self)) return true;
+                if (self.modes.phase == .idle or self.modes.phase == .decision or self.modes.phase == .unavailable)
+                    return run.prepareFramePool();
+                return false;
             },
             .detached, .failed => return error.State,
         }
