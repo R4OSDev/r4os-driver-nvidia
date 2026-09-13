@@ -5155,7 +5155,8 @@ fn replyNativeProduct(target: *@import("gsp_device.zig").Device) !void {
         switch (owner.operation.?) {
             .allocate_memory, .allocate_virtual => {
                 const stride: u64 = if (target.native_graphics.self_address != 0) 8 * 1024 * 1024 else 65536;
-                std.mem.writeInt(u64, response[112..120], if (owner.operation.? == .allocate_memory) owner.storage_policy.?.physical_bytes / 2 + slot * stride else native.address(slot), .little);
+                const physical_base: u64 = if (owner.storage_policy) |policy| policy.physical_bytes / 2 else 0x20000000;
+                std.mem.writeInt(u64, response[112..120], if (owner.operation.? == .allocate_memory) physical_base + slot * stride else native.address(slot), .little);
                 std.mem.writeInt(u64, response[120..128], owner.bytes - 1, .little);
             },
             .map => std.mem.writeInt(u64, response[40..48], native.address(slot), .little),
@@ -5309,6 +5310,7 @@ fn checkDeviceGraphics(target: *@import("gsp_device.zig").Device, table: *a.Driv
         for (0..3) |_| { try modelGraphicsStep(target, &stages); _ = target.step(); }
         const second = (try run.receiveGraphics(handle)).?;
         try t.expect(second.point == 2 and run.graphics_work == null and owner.ring.idle());
+        try checkGraphicsRendering(target,&counts,scenario);
     } else {
         try t.expect(target.native_graphics.phase == .unavailable and target.native_graphics.context == null and
             target.native_graphics.channel == null and target.native_graphics.storage == null and target.native_graphics.receipt == null);
@@ -5339,9 +5341,159 @@ fn checkDeviceGraphics(target: *@import("gsp_device.zig").Device, table: *a.Driv
         std.mem.writeInt(u32, backing.?[init.queues_offset + init.status_offset + 64..][0..4], session.tx_write, .little);
         try nativeReply(session, rpc.function, 0, response[0..rpc.request.len]);
     }
-    try t.expect(steps < 500 and target.phase == .recovering and target.failure.? == error.RmClosed and native.charged == 0 and fifo_model.released == if (native.is("context_graphics")) @as(usize, 2) else 1);
+    try t.expect(steps < 500 and target.phase == .recovering and target.failure.? == error.RmClosed and native.charged == 0 and fifo_model.released == if (native.is("context_graphics")) @as(usize, 3) else 1);
     for (&run.fifos) |*slot| try t.expect(slot.owner == null);
     for (&run.contexts) |*slot| try t.expect(slot.owner == null);
+}
+
+fn driveRenderSetup(target: *@import("gsp_device.zig").Device, counts: *FifoCounts, scenario: []const u8) !void {
+    const run = &target.running;
+    for (0..200) |_| {
+        if (run.fifo_active == null and run.context_active == null and run.native_active == null) return;
+        _ = target.step();
+        try t.expect(target.phase == .ready);
+        if (run.fifo_active != null) try replyDeviceFifo(target,counts,scenario)
+        else if (run.activeChannel().?.phase == .waiting) try replyNativeProduct(target);
+    }
+    return error.SetupTimeout;
+}
+fn checkGraphicsRendering(target: *@import("gsp_device.zig").Device, counts: *FifoCounts, scenario: []const u8) !void {
+    const runtime = @import("gsp_runtime.zig");
+    const render = @import("r4nv_render");
+    const native = @import("gsp_vram_test_model.zig").Model;
+    const fifo = @import("gsp_fifo_test_model.zig").Model;
+    const run = &target.running;
+    errdefer |err| std.debug.print("render: {s} runtime={?} upload={?} job={?} program-point={d} packet-point={d} borrowed={}\n", .{
+        @errorName(err),run.failure,if (run.graphics_upload) |*value| value.operation.failure else null,
+        if (run.graphics_work) |*value| value.resources.failure else null,run.graphics_cache.program_point,run.graphics_cache.packet_point,run.graphics_cache.borrowed});
+    const deadline = clock + 5 * std.time.ns_per_s;
+    const ce_context = try run.createExecutionContext(19,deadline);
+    try driveRenderSetup(target,counts,scenario);
+    const context_info = (try run.executionContextStatus(ce_context)).info.?;
+    const methods = try allocateContextStorage(target,context_info.method_bytes,deadline);
+    try run.attachContextMethods(ce_context,0,methods); try run.releaseNativeBuffer(methods);
+    const instance = try allocateContextStorage(target,4096,deadline);
+    const ce = try run.createCopyChannel(ce_context,0,instance,deadline);
+    try run.releaseNativeBuffer(instance);
+    try driveRenderSetup(target,counts,scenario);
+    const ce_owner = run.fifos[ce.slot].owner.?;
+    try t.expect(ce_owner.ring.kind == .copy and ce_owner.ring.idle());
+    const programs = try allocateContextStorage(target,render.shader_bytes,deadline);
+    try run.attachGraphicsCache(.programs,programs); try run.releaseNativeBuffer(programs);
+    const packet_buffer = try allocateContextStorage(target,render.packet_bytes,deadline);
+    try run.attachGraphicsCache(.packet,packet_buffer); try run.releaseNativeBuffer(packet_buffer);
+    const target_buffer = try run.allocateNativeSurface(.{ .width = 16, .height = 16, .format = .argb8888, .usage = 28 },deadline);
+    try driveRenderSetup(target,counts,scenario);
+    const target_image = try run.graphicsImage(target_buffer,true);
+    const target_native_index = (try run.nativeBufferStatus(target_buffer)).info.?.reference.buffer.id - 801;
+    const draw: render.Draw = .{ .target = target_image,
+        .destination = .{ .x = -2, .y = 1, .width = 8, .height = 8 },
+        .scissor = .{ .x = 0, .y = 4, .width = 4, .height = 4 }, .color = 0x80402010 };
+    var shader_device: [render.shader_bytes]u8 = @splat(0xa5);
+    var packet_device: [render.packet_bytes]u8 = @splat(0xa5);
+    for ([_]runtime.render_cache.Kind{.programs,.packet}) |kind| {
+        try run.beginGraphicsUpload(ce,kind,if (kind == .packet) draw else null,deadline);
+        try t.expect(ControlModel.reading and !ControlModel.cpu_mapped);
+        try t.expectError(error.Busy,run.beginGraphicsBarrier(target.native_graphics.channel.?,deadline));
+        for (0..20) |_| { _ = target.step(); if (run.graphics_upload.?.operation.submitted) break; }
+        const work = &run.graphics_upload.?.operation;
+        try t.expect(work.submitted and work.ticket != null);
+        const commands = &fifo.slots[1].data;
+        const ticket = work.ticket.?;
+        const load = @import("gsp_fifo_wire.zig").word;
+        const gp = @as(usize,(ticket.put + 511) % 512) * 8;
+        const command_address = @as(u64,load(commands,gp)) | (@as(u64,load(commands,gp+4) & 255) << 32);
+        const offset: usize = @intCast(command_address-fifo.address(1));
+        try t.expect(load(commands,gp+4) >> 10 == 17 and load(commands,offset) == 0x20010000 and load(commands,offset+8) == 0x20040100);
+        const source_address = (@as(u64,load(commands,offset+12))<<32)|load(commands,offset+16);
+        const destination = (@as(u64,load(commands,offset+20))<<32)|load(commands,offset+24);
+        const bytes = load(commands,offset+32);
+        try t.expect(source_address == 0x600000 and destination == work.target_stamp.?.address and bytes == work.bytes);
+        // Fetch and data copy are separate from the system-visible release.
+        std.mem.writeInt(u32,commands[0x2088..][0..4],ticket.put,.little);
+        _ = target.step(); try t.expect(run.graphics_upload != null and ControlModel.reading);
+        const output: []u8 = if (kind == .programs) &shader_device else &packet_device;
+        @memcpy(output,ControlModel.data[0..bytes]);
+        _ = target.step(); try t.expect(run.graphics_upload != null and ControlModel.reading);
+        const semaphore = (@as(u64,load(commands,offset+48))<<32)|load(commands,offset+52);
+        try t.expect(semaphore == fifo.address(1)+0x2200 and load(commands,offset+56) == ticket.point and load(commands,offset+64) == 12);
+        std.mem.writeInt(u32,commands[0x2200..][0..4],ticket.point,.little);
+        _ = target.step();
+        try t.expect(run.graphics_upload == null and !ControlModel.reading and ce_owner.ring.idle());
+    }
+    var expected_shaders: [render.shader_bytes]u8 = undefined;
+    try render.shaderUpload(&expected_shaders);
+    try t.expectEqualSlices(u8,&expected_shaders,&shader_device);
+    const gr = target.native_graphics.channel.?;
+    const gr_owner = run.fifos[gr.slot].owner.?;
+    try run.beginGraphicsDraw(gr,target_buffer,null,deadline);
+    try t.expect(run.graphics_cache.borrowed and native.slots[target_native_index].imported and native.slots[target_native_index].gpu.lease.id != 0);
+    try t.expect(!run.graphics_cache.close(true));
+    try run.releaseNativeBuffer(target_buffer);
+    try t.expect(!native.slots[target_native_index].reference and native.slots[target_native_index].imported);
+    // Confirm operand validation on the actual private draw before publication.
+    const ticket = try gr_owner.prepareGraphics(run.graphics_work.?.command);
+    run.graphics_work.?.ticket = ticket;
+    const port_owner = target.port.owner.?;
+    try port_owner.admit_graphics.?(port_owner.context,&target.port,gr_owner,ticket,deadline);
+    fifo.slots[0].data[4096+4] ^= 1;
+    try t.expectError(error.Binding,port_owner.admit_graphics.?(port_owner.context,&target.port,gr_owner,ticket,deadline));
+    fifo.slots[0].data[4096+4] ^= 1;
+    run.graphics_cache.draw.?.color ^= 1;
+    try t.expectError(error.Binding,port_owner.admit_graphics.?(port_owner.context,&target.port,gr_owner,ticket,deadline));
+    run.graphics_cache.draw.?.color ^= 1;
+    try target.port.submitGraphics(gr_owner,ticket,deadline); run.graphics_work.?.submitted = true;
+    const commands = &fifo.slots[0].data;
+    const load = @import("gsp_fifo_wire.zig").word;
+    const gp = @as(usize,(ticket.put + 511) % 512) * 8;
+    const count: usize = load(commands,gp+4) >> 10;
+    try t.expect(count > 100 and count < 1024);
+    const body = commands[4096..][0..count*4];
+    try t.expect(try renderMethod(body,0x800) == target_image.address>>32 and try renderMethod(body,0x804) == @as(u32,@truncate(target_image.address)));
+    try t.expect(try renderMethod(body,0x814) == 1<<12 and try renderMethod(body,0x808) == target_image.pitch);
+    try t.expect(try renderMethod(body,0x274) == 4 and try renderMethod(body,0x1c00) == 40|(1<<12));
+    const shader_address = (@as(u64,try renderMethod(body,0x2154))<<32)|try renderMethod(body,0x2158);
+    try t.expect(shader_address-run.graphics_cache.programs.info().?.address == render.shaderOffset(4));
+    try t.expect(load(&shader_device,render.shaderOffset(4)) == 0x00025482);
+    const vertex_address = (@as(u64,try renderMethod(body,0x1c04))<<32)|try renderMethod(body,0x1c08);
+    try t.expect(vertex_address == run.graphics_cache.packet.info().?.address+768);
+    const vertex: render.Vertex = @bitCast(packet_device[768..808].*);
+    try t.expectApproxEqAbs(@as(f32,-1.25),vertex.position[0],0.000001);
+    std.mem.writeInt(u32,commands[0x2088..][0..4],ticket.put,.little);
+    _ = target.step(); try t.expect(run.graphics_work.?.receipt == null and run.graphics_cache.borrowed);
+    // This host model evaluates the fixed solid shader's output from the
+    // fetched vertex packet. It does not execute SM86 or certify real pixels.
+    var pixels: [16*64]u32 = @splat(0x11223344);
+    const horizontal = try renderMethod(body,0xe04);
+    const vertical = try renderMethod(body,0xe08);
+    var color: u32 = 0;
+    for ([_]u5{16,8,0,24},0..) |shift,index| color |= @as(u32,@intFromFloat(@round(vertex.tint[index]*255.0))) << shift;
+    for (vertical&65535..vertical>>16) |y| for (horizontal&65535..horizontal>>16) |x| { pixels[y*64+x] = color; };
+    for (0..16) |y| for (0..64) |x| try t.expectEqual(@as(u32,if (x<4 and y>=4 and y<8) 0x80402010 else 0x11223344),pixels[y*64+x]);
+    _ = target.step(); try t.expect(run.graphics_work.?.receipt == null and native.slots[target_native_index].gpu.lease.id != 0);
+    const completion_words = body[(count-11)*4..];
+    try t.expect(load(completion_words,0) == 0x20010000 and load(completion_words,8) == 0x20010044 and load(completion_words,16) == 0x20010451);
+    const semaphore = (@as(u64,load(completion_words,28))<<32)|load(completion_words,32);
+    try t.expect(semaphore == fifo.address(0)+0x2200 and load(completion_words,40) == 0x1000f010);
+    std.mem.writeInt(u32,commands[0x2200..][0..4],load(completion_words,36),.little);
+    _ = target.step();
+    const receipt = (try run.receiveGraphics(gr)).?;
+    try t.expect(receipt.point == 3 and !run.graphics_cache.borrowed and !native.slots[target_native_index].imported and
+        native.slots[target_native_index].gpu.lease.id == 0 and run.graphics_work == null and gr_owner.ring.idle());
+}
+fn renderMethod(bytes: []const u8, method: u32) !u32 {
+    const load = @import("gsp_fifo_wire.zig").word;
+    var at: usize = 0; var result: ?u32 = null;
+    while (at < bytes.len) {
+        const header = load(bytes,at);
+        try t.expect(header & 0xe0000000 == 0x20000000);
+        const count: usize = (header>>16)&0x1fff;
+        try t.expect(count > 0 and at+(count+1)*4 <= bytes.len);
+        const start = (header&0x1fff)*4;
+        for (0..count) |index| if (start+index*4 == method) { result = load(bytes,at+(index+1)*4); };
+        at += (count+1)*4;
+    }
+    return result orelse error.MissingMethod;
 }
 
 // Three distinct modeled observations: command fetch/GET, engine drain,

@@ -870,3 +870,12 @@ Four original files, their hashes and the independent C command vectors
 are archived under 0.79.16/hotplug-20260913 in the GFX references.
 Receiver scheduling, common ownership and reconnect policy are original
 R4OS Apache-2.0 code. No additional firmware or Linux code is linked.
+
+## C797 render state (0.79.19 partial, NVIDIA0.1.107)
+
+The driver statically uses R4NV's MIT-attributed image/state encoder from
+pinned Mesa NVIDIA headers and NIL/NVK. Its complete NVIDIA, Collabora and
+Red Hat notices are included in `Licenses/NVIDIA-GSP-RUNTIME-LICENSE.txt`,
+also packaged into NVIDIA.R4D and the distribution. The reference archive
+is `Nvidia/0.79.19/render-state-20260913`. Original R4OS cache, job and upload
+ownership retains Apache-2.0. No new firmware or host compiler is embedded.

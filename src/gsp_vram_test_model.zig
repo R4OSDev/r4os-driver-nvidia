@@ -5,7 +5,7 @@ const a = @import("r4os").abi;
 const heap_model = @import("gsp_buffer_test_model.zig").Model;
 pub const Model = struct {
     const Slot = struct { reservation: a.GfxOwnedBufferReservation = .{}, descriptor: a.GfxBufferDescriptor = .{}, live: bool = false, published: bool = false, reference: bool = false, imported: bool = false, claimed: bool = false, gpu: a.GfxDeviceLease = .{} };
-    pub var slots: [16]Slot = @splat(.{});
+    pub var slots: [32]Slot = @splat(.{});
     pub var charged: u64 = 0;
     pub var released: u32 = 0;
     pub var aborted: u32 = 0;
@@ -20,7 +20,12 @@ pub const Model = struct {
     }
     pub fn dispose(table: *a.DriverApi) void { heap_model.dispose(table); }
     pub fn is(name: []const u8) bool { return heap_model.is(name); }
-    pub fn address(index: usize) u64 { return 0x10000000 + index * 0x10000000; }
+    pub fn address(index: usize) u64 {
+        // Golden + regular GR, CE and render buffers coexist in the same
+        // 4GB test VA space. Keep this larger scenario below the FIFO region.
+        const stride: u64 = if (std.mem.startsWith(u8, heap_model.scenario, "context_graphics")) 0x02000000 else 0x10000000;
+        return 0x10000000 + index * stride;
+    }
     fn memory(out: *a.GfxDriverMemoryApi) callconv(.c) i32 {
         if (query(out) != a.gfx_buffer_result_ok) return -1;
         fallback_release = out.buffer_release;
@@ -83,10 +88,10 @@ pub const Model = struct {
     fn acquire(input: *const a.GfxBufferHandle, request: *const a.GfxDeviceRequest, out: *a.GfxDeviceLease) callconv(.c) i32 {
         for (&slots, 0..) |*slot, i| if (slot.live and std.meta.eql(importedReference(i), input.*)) {
             std.debug.assert(slot.imported and slot.gpu.lease.id == 0 and request.byte_offset == 0 and request.byte_length == slot.descriptor.byte_length and
-                request.gpu_virtual_address == address(i) and request.adapter_id == slot.reservation.adapter_id and request.device_generation == slot.reservation.device_generation and request.access == 1 and request.address_space == 1);
+                request.gpu_virtual_address == address(i) and request.adapter_id == slot.reservation.adapter_id and request.device_generation == slot.reservation.device_generation and request.access <= 1 and request.address_space == 1);
             if (is("vram_storage_acquire") or is("context_methods_acquire")) return a.gfx_buffer_error_busy;
             out.* = .{ .lease = .{ .id = @intCast(831 + i), .generation = 703 }, .byte_length = request.byte_length, .gpu_virtual_address = request.gpu_virtual_address,
-                .adapter_id = request.adapter_id, .device_generation = request.device_generation, .driver_owner = 7, .access = 1, .address_space = 1, .dma_mask = request.dma_mask };
+                .adapter_id = request.adapter_id, .device_generation = request.device_generation, .driver_owner = 7, .access = request.access, .address_space = 1, .dma_mask = request.dma_mask };
             slot.gpu = out.*;
             if (is("vram_storage_descriptor")) out.driver_owner += 1;
             return a.gfx_buffer_result_ok;

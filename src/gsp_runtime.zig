@@ -105,6 +105,9 @@ pub const execution_fifo = @import("gsp_fifo.zig");
 pub const ChannelHandle = struct { epoch: u64, serial: u64, slot: u16 };
 pub const ChannelStatus = struct { state: execution_fifo.State, info: ?execution_fifo.Info, rejected: ?u32, host_rejected: ?anyerror };
 pub const GraphicsReceipt = struct { channel: ChannelHandle, point: u32, completed_ns: u64 };
+pub const render = @import("r4nv_render");
+pub const render_cache = @import("gsp_render_cache.zig");
+const render_job = @import("gsp_render_job.zig");
 pub const GraphicsWork = struct {
     channel_handle: ChannelHandle,
     command: execution_fifo.copy.graphics.Command,
@@ -112,6 +115,7 @@ pub const GraphicsWork = struct {
     ticket: ?execution_fifo.copy.Ticket = null,
     submitted: bool = false,
     receipt: ?GraphicsReceipt = null,
+    resources: render_job.Owner = .{},
 };
 const ChannelSlot = struct { owner: ?*execution_fifo.Owner = null, allocation: r4os.abi.DriverHeapAllocation = .{}, heap: ?r4os.r4dev.DriverHeapContext = null, serial: u64 = 0 };
 const CopyAddress = struct { address: u64, bytes: u64 };
@@ -247,6 +251,8 @@ pub const Owner = struct {
     fifo_active: ?u16 = null,
     copy_job: ?CopyJob = null,
     graphics_work: ?GraphicsWork = null,
+    graphics_cache: render_cache.Owner = .{},
+    graphics_upload: ?struct { channel: ChannelHandle, operation: @import("gsp_render_upload.zig").Owner = .{} } = null,
     copy_completed: u64 = 0,
     copy_bytes: u64 = 0,
     copy_row_jobs: u64 = 0,
@@ -318,6 +324,9 @@ pub const Owner = struct {
             self.recordFault(diagnostics.host(.teardown, err, true)) catch {};
         self.outputs.invalidate() catch {};
         self.memory_inventory.invalidate();
+        if (self.graphics_cache.self_address != 0) self.graphics_cache.failed = true;
+        if (self.graphics_upload) |*work| work.operation.failed = true;
+        if (self.graphics_work) |*work| if (work.resources.self_address != 0) { work.resources.failed = true; };
         if (self.display_upload_job) |*work| work.operation.quarantine(err);
         if (self.cursor_upload) |*work| work.operation.quarantine(err);
         if (self.cursor_upload != null or (if (self.display_work) |work| work.cursor != null else false))
@@ -1427,7 +1436,7 @@ pub const Owner = struct {
         self.log("NVIDIA gsp-present-image: retired={d} shadow=unmapped,import-released scanout=retained", .{dma});
         return true;
     }
-    fn deviceWorkBusy(self: *const Owner) bool { return self.graphics_work != null or self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.display_flip != null or self.initial_image != null or self.mode_control_active or self.cursor_upload != null or self.audio_work != null; }
+    fn deviceWorkBusy(self: *const Owner) bool { return self.graphics_upload != null or self.graphics_work != null or self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.display_flip != null or self.initial_image != null or self.mode_control_active or self.cursor_upload != null or self.audio_work != null; }
     fn copyBusy(self: *const Owner) bool { return self.deviceWorkBusy() or self.frame_ready != null; }
     fn overlapFlip(self: *const Owner) bool {
         const work = self.display_flip orelse return false;
@@ -1435,7 +1444,7 @@ pub const Owner = struct {
             (work.window.phase == .submitted or work.window.phase == .complete);
     }
     fn copyAdmissionBusy(self: *const Owner) bool {
-        return self.cursor_reserving or self.graphics_work != null or self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.initial_image != null or self.cursor_upload != null or self.audio_work != null or
+        return self.cursor_reserving or self.graphics_upload != null or self.graphics_work != null or self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.initial_image != null or self.cursor_upload != null or self.audio_work != null or
             self.mode_control_active or self.frame_ready != null or (self.display_flip != null and !self.overlapFlip());
     }
     pub fn cursorWorkAvailable(self: *Owner) bool {
@@ -1787,6 +1796,61 @@ pub const Owner = struct {
         const owner = try self.findChannel(handle);
         return .{ .state = owner.state, .info = owner.info(), .rejected = owner.rejected, .host_rejected = owner.host_rejected };
     }
+    pub fn attachGraphicsCache(self: *Owner, kind: render_cache.Kind, buffer: BufferHandle) !void {
+        _ = try self.now();
+        if (self.copyBusy() or self.graph_closing) return error.Busy;
+        if (self.graphics_cache.self_address == 0) try self.graphics_cache.initialize(self.epoch);
+        if (!self.graphics_cache.valid() or self.graphics_cache.epoch != self.epoch or self.graphics_cache.borrowed or self.graphics_cache.uploading != null) return error.Stale;
+        const storage = self.graphics_cache.buffer(kind);
+        if (storage.self_address != 0) return error.Busy;
+        const info = (try self.findNativeBuffer(buffer)).info() orelse return error.State;
+        if (info.surface.request != null or info.surface.privileged or info.surface.readonly) return error.Unsupported;
+        try (render.Range{ .address = info.address, .bytes = info.logical_bytes }).validate(256, if (kind == .programs) render.shader_bytes else render.packet_bytes);
+        try self.retainNativeStorage(buffer,storage);
+    }
+    pub fn beginGraphicsUpload(self: *Owner, handle: ChannelHandle, kind: render_cache.Kind, draw: ?render.Draw, deadline: u64) !void {
+        const current = try self.now();
+        if (deadline <= current or deadline == std.math.maxInt(u64)) return error.Deadline;
+        if (self.copyBusy() or self.cursor_reserving or self.graph_closing) return error.Busy;
+        const fifo = try self.findChannel(handle);
+        const info = fifo.info() orelse return error.State;
+        if (info.config.engine != .copy or !fifo.ring.idle() or !info.config.system_userd) return error.Unsupported;
+        const staging = if (self.graph.?.control_buffer) |*value| value else return error.State;
+        if (staging.binding.space.handle != info.config.context.vaspace or self.graphics_cache.epoch != self.epoch) return error.Stale;
+        try self.channel.?.guard(deadline);
+        self.graphics_upload = .{ .channel = handle };
+        self.graphics_upload.?.operation.open(&self.graphics_cache,staging,kind,draw,deadline) catch |err| {
+            if (self.graphics_upload.?.operation.failed) self.stop(err) else self.graphics_upload = null;
+            return err;
+        };
+    }
+    fn graphicsResource(self: *Owner, handle: BufferHandle) !render_job.Resource {
+        const owner = try self.findNativeBuffer(handle);
+        return .{ .info = owner.info() orelse return error.State, .driver_owner = owner.reservation.driver_owner };
+    }
+    pub fn graphicsImage(self: *Owner, handle: BufferHandle, target: bool) !render.image.Image {
+        return render_job.image(try self.graphicsResource(handle),target);
+    }
+    pub fn beginGraphicsDraw(self: *Owner, handle: ChannelHandle, target: BufferHandle, source: ?BufferHandle, deadline: u64) !void {
+        const memory = self.ctx.?.memory() orelse return error.Api;
+        const dst = try self.graphicsResource(target);
+        const src = if (source) |value| try self.graphicsResource(value) else null;
+        try self.beginGraphicsBarrier(handle,deadline);
+        const work = &self.graphics_work.?;
+        work.resources.open(memory,&self.graphics_cache,dst,src) catch |err| {
+            if (work.resources.failed) self.stop(err) else self.graphics_work = null;
+            return err;
+        };
+        work.command = .{ .draw = work.resources.command.? };
+    }
+    pub fn validateGraphicsWork(self: *Owner) !void {
+        const work = if (self.graphics_work) |*value| value else return error.State;
+        switch (work.command) {
+            .barrier => if (work.resources.self_address != 0) return error.Binding,
+            .draw => |binding| if (work.resources.cache_owner != &self.graphics_cache or !work.resources.valid() or
+                !std.meta.eql(work.resources.command.?,binding)) return error.Binding,
+        }
+    }
     /// Private graphics command, retained through physical completion or
     /// quarantine. USERD publication never counts as an execution receipt.
     pub fn beginGraphicsBarrier(self: *Owner, handle: ChannelHandle, deadline: u64) !void {
@@ -1810,9 +1874,11 @@ pub const Owner = struct {
     fn advanceGraphics(self: *Owner, current: u64) !bool {
         const work = if (self.graphics_work) |*value| value else return false;
         if (work.receipt != null) return false;
+        try self.validateGraphicsWork();
         const fifo = try self.findChannel(work.channel_handle);
         if (work.submitted) {
             if (try fifo.ring.poll() >= work.ticket.?.point) {
+                if (!work.resources.close(true)) return error.Retained;
                 work.receipt = .{ .channel = work.channel_handle, .point = work.ticket.?.point, .completed_ns = current };
                 return true;
             }
@@ -1826,6 +1892,29 @@ pub const Owner = struct {
         work.ticket = try fifo.prepareGraphics(work.command);
         try self.device.?.submitGraphics(fifo, work.ticket.?, work.deadline);
         work.submitted = true;
+        return true;
+    }
+    fn advanceGraphicsUpload(self: *Owner, current: u64) !bool {
+        const work = if (self.graphics_upload) |*value| value else return false;
+        if (!work.operation.validState() or work.operation.cache_owner != &self.graphics_cache) return error.Stale;
+        const fifo = try self.findChannel(work.channel);
+        if (work.operation.submitted) {
+            const point = try fifo.ring.poll();
+            if (point >= work.operation.ticket.?.point) {
+                try work.operation.complete(point); self.graphics_upload = null; return true;
+            }
+            if (current >= work.operation.deadline) return error.Deadline;
+            return false;
+        }
+        if (current >= work.operation.deadline) {
+            try work.operation.cancel(); self.graphics_upload = null; return true;
+        }
+        if (self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or
+            self.display_engine_active or self.display_channel_active != null or self.mode_control_active or self.outputs.active() or
+            self.sequence.self_address != 0 or self.channel.?.phase != .idle or self.channel.?.pending != null) return false;
+        work.operation.ticket = try fifo.prepareCopy(try work.operation.transfer());
+        try self.device.?.submitCopy(fifo,work.operation.ticket.?,work.operation.deadline);
+        work.operation.submitted = true;
         return true;
     }
     pub fn retireExecutionChannel(self: *Owner, handle: ChannelHandle, deadline: u64, quiesced: bool) !void {
@@ -3006,6 +3095,7 @@ pub const Owner = struct {
             }
         }
         if (try self.advanceCursorUpload(current)) return .progress;
+        if (try self.advanceGraphicsUpload(current)) return .progress;
         if (try self.advanceDisplayUpload(current)) return .progress;
         if (try self.advanceInitialImage(current)) return .progress;
         if (try self.advanceDisplay(current)) return .progress;
@@ -3050,6 +3140,7 @@ pub const Owner = struct {
                 }
             };
             for (&self.contexts) |*slot| if (slot.owner != null) break :graph_close;
+            if (!self.graphics_cache.close(true)) return error.Retained;
             for (&self.buffers, 0..) |*slot, index| if (slot.owner != null) {
                 try self.retireBuffer(.{ .epoch = self.epoch, .serial = slot.serial, .slot = @intCast(index) }, self.close_deadline, true);
                 return .progress;

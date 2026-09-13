@@ -526,8 +526,9 @@ pub const Device = struct {
             run.fifo_active != null or run.context_active != null or run.native_active != null or run.buffer_active != null or
             run.outputs.active() or run.display_engine_active or run.display_channel_active != null or run.mode_control_active or
             run.copy_job != null or run.display_upload_job != null or run.initial_image != null or run.cursor_upload != null or
-            run.display_work != null or run.audio_work != null) return error.State;
+            run.display_work != null or run.audio_work != null or run.graphics_upload != null) return error.State;
         const work = if (run.graphics_work) |*value| value else return error.Binding;
+        try run.validateGraphicsWork();
         if (work.submitted or work.receipt != null or work.ticket == null or !std.meta.eql(work.ticket.?, ticket) or
             work.deadline != deadline or !fifo.matchesGraphics(ticket, work.command)) return error.Binding;
         const handle = work.channel_handle;
@@ -546,7 +547,16 @@ pub const Device = struct {
             self.running.fifo_active != null or self.running.context_active != null or self.running.native_active != null or self.running.buffer_active != null or
             self.running.outputs.active() or self.running.graph_closing or self.running.display_engine_active or self.running.display_channel_active != null or self.running.display_work != null or self.running.mode_control_active or self.running.graphics_work != null) return error.State;
         self.running.validateCopyOverlap() catch return error.Binding;
-        const channel_handle = if (self.running.cursor_upload) |*work| blk: {
+        const channel_handle = if (self.running.graphics_upload) |*work| blk: {
+            const run = &self.running;
+            const graph = if (run.graph) |*value| value else return error.Binding;
+            const staging = if (graph.control_buffer) |*value| value else return error.Binding;
+            if (run.copy_job != null or run.display_upload_job != null or run.cursor_upload != null or run.initial_image != null or
+                work.operation.cache_owner != &run.graphics_cache or work.operation.source != staging or
+                !work.operation.matches(ticket,deadline) or fifo.config.context.vaspace != staging.binding.space.handle or
+                !fifo.ring.matchesTransfer(ticket,fifo.config.object_class,work.operation.transfer() catch return error.Binding)) return error.Binding;
+            break :blk work.channel;
+        } else if (self.running.cursor_upload) |*work| blk: {
             if (self.native_output.phase != .active or !self.native_output.callback_confirmed or self.native_output.mode == null or
                 self.running.cursor_storage == null or self.native_output.mode.?.head != self.running.cursor_storage.?.head) return error.Binding;
             try self.running.validateCursorUpload();

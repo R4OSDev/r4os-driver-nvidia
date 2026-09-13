@@ -47,23 +47,37 @@
 //! C797 graphics commands owned by the driver, never raw application words.
 //! Header constants: pinned NVIDIA 570.144 clc797.h and clc56f.h.
 pub const class: u32 = 0xc797;
-pub const Error = error{ Unsupported, Bounds, Busy };
-pub const Command = enum { barrier };
+pub const render = @import("r4nv_render");
+pub const Error = render.Error || error{Busy};
+pub const Command = union(enum) { barrier, draw: render.Binding };
 pub const Program = struct {
-    data: [11]u32,
-    pub fn slice(self: *const Program) []const u32 { return &self.data; }
+    data: [render.max_words + 11]u32 = undefined,
+    count: usize = 0,
+    pub fn slice(self: *const Program) []const u32 { return self.data[0..self.count]; }
 };
 fn inc(method: u32, count: u32) u32 { return 0x20000000 | (count << 16) | (method >> 2); }
 pub fn encode(object_class: u32, command: Command, completion: u64, point: u32) Error!Program {
     if (object_class != class) return error.Unsupported;
     if (completion == 0 or completion & 3 != 0 or completion > (@as(u64, 1) << 40) - 4 or point == 0) return error.Bounds;
-    _ = command;
+    var out: Program = .{};
+    switch (command) {
+        .barrier => {},
+        .draw => |binding| {
+            var body: render.Program = .{};
+            try render.encode(binding,&body);
+            @memcpy(out.data[0..body.count],body.slice());
+            out.count = body.count;
+        },
+    }
     // Wait includes preceding reads; the flushed, one-word release at ALL
     // includes writes. No render completion is inferred from USERD/GP_GET.
-    return .{ .data = .{
+    const release = [_]u32{
         inc(0x0000, 1), class,
         inc(0x0110, 1), 0,
         inc(0x1144, 1), 0,
         inc(0x1b00, 4), @intCast(completion >> 32), @truncate(completion), point, 0x1000f010,
-    } };
+    };
+    @memcpy(out.data[out.count..][0..release.len], &release);
+    out.count += release.len;
+    return out;
 }
