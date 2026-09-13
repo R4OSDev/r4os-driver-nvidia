@@ -137,7 +137,20 @@ pub const Model = struct {
             .source_offset = if (readback) 129 else 33, .target_offset = if (readback) 71 else 129, .byte_length = 4091 };
         queued = true; fetched = false; executed = false; signaled = false;
     }
-    fn queue(out: *a.GfxDriverQueueApi) callconv(.c) i32 { out.* = .{ .register_backend = @intFromPtr(&register), .unregister_backend = @intFromPtr(&unregister), .take = @intFromPtr(&take), .retain_resource = @intFromPtr(&retain), .complete = @intFromPtr(&complete) }; return a.gfx_queue_ok; }
+    fn queue(out: *a.GfxDriverQueueApi) callconv(.c) i32 { out.* = .{ .size = if (product_mode) @sizeOf(a.GfxDriverQueueApi) else 64,
+        .register_backend = @intFromPtr(&register), .register_profile = if (product_mode) @intFromPtr(&registerProfile) else 0,
+        .unregister_backend = @intFromPtr(&unregister), .take = @intFromPtr(&take), .retain_resource = @intFromPtr(&retain), .complete = @intFromPtr(&complete) }; return a.gfx_queue_ok; }
+    fn registerProfile(input: *const a.GfxBackendRegistration, profile: *const a.GfxBackendProfile, out: *a.GfxBackendBinding) callconv(.c) i32 {
+        const nv = @import("r4nv_binding");
+        std.debug.assert(product_mode and profile.version == 1 and profile.size == 96 and profile.data_bytes == 32 and
+            profile.interface_id_lo == nv.backend_v1_header.interface_id_lo and profile.interface_id_hi == nv.backend_v1_header.interface_id_hi and profile.revision == 1);
+        const details = std.mem.bytesToValue(nv.R4NvDriverProfile, profile.data[0..32]);
+        std.debug.assert(details.version == 1 and details.size == 32 and details.vendor_id == 0x10de and
+            (details.copy_class == 0xc6b5 or details.copy_class == 0xc7b5) and details.rm_release == nv.rm_release and details.command_abi == nv.command_abi and
+            details.reserved0 == 0 and details.reserved1 == 0);
+        for (profile.data[32..]) |byte| std.debug.assert(byte == 0);
+        return register(input, out);
+    }
     fn register(input: *const a.GfxBackendRegistration, out: *a.GfxBackendBinding) callconv(.c) i32 {
         std.debug.assert(present_mode and registration == null and input.adapter_id == binding.adapter_id and
             input.milestone == binding.milestone and input.notify_callback != 0 and input.context != 0);

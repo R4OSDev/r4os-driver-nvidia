@@ -6273,12 +6273,51 @@ fn checkDeviceCopies(target: *@import("gsp_device.zig").Device, table: *a.Driver
             else try t.expectEqualSlices(u8, model.host[0][33..][0..4091], model.vram_data[129..][0..4091]);
         }
         if (!capacity) try t.expect(fifo_owner.ring.put == 2 and fifo_owner.ring.issued == 514 and running.copy_completed == 514);
+        if (vram_model.is("context_copy_success")) {
+            // Pressure uses the actual two retained SYS mappings. No fake
+            // buffer slots or GPU completions are inserted to fill a cache.
+            const before_put = fifo_owner.ring.put;
+            const held_before = model.heldReferences();
+            try t.expect(held_before == 2 and running.mapping_evictions == 0);
+            try t.expect(try running.prepareCopyMappings(running.buffers.len - 1, 128 * 1024 * 1024, deadline));
+            const evicted = running.buffer_active.?;
+            const old_serial = running.buffers[evicted].serial;
+            try t.expect(running.buffers[evicted].owner.?.source.buffer.id == 1101 and model.heldReferences() == held_before and
+                running.mapping_evictions == 0 and fifo_owner.ring.put == before_put);
+            try t.expectError(error.Busy, running.prepareCopyMappings(running.buffers.len, 0, deadline));
+            var eviction_steps: usize = 0;
+            while (running.buffer_active != null and eviction_steps < 64) : (eviction_steps += 1) {
+                _ = target.step();
+                if (running.buffer_active != null) try replyCopyMapping(target);
+            }
+            try t.expect(eviction_steps < 64 and target.phase == .ready and running.mapping_evictions == 1 and
+                model.heldReferences() == held_before - 1 and running.buffers[evicted].owner == null and fifo_owner.ring.put == before_put);
+            try t.expectError(error.Stale, running.bufferStatus(.{ .epoch = running.epoch, .serial = old_serial, .slot = evicted }));
+            // Byte pressure also evicts with plenty of free metadata slots.
+            try t.expect(try running.prepareCopyMappings(2, 0, deadline));
+            eviction_steps = 0;
+            while (running.buffer_active != null and eviction_steps < 64) : (eviction_steps += 1) {
+                _ = target.step();
+                if (running.buffer_active != null) try replyCopyMapping(target);
+            }
+            try t.expect(eviction_steps < 64 and target.phase == .ready and running.mapping_evictions == 2 and
+                model.heldReferences() == 0 and fifo_owner.ring.put == before_put);
+        }
         // Bounds are rejected before a GPU put or doorbell can advance.
         if (!capacity) {
             model.enqueue(false); model.job.byte_length = 9000;
             const old_put = fifo_owner.ring.put;
-            try t.expect(try running.beginCopyWork(handle, model.binding, deadline)); _ = target.step();
-            try t.expect(running.copy_job == null and model.result == a.gfx_queue_result_failed and fifo_owner.ring.put == old_put);
+            try t.expect(try running.beginCopyWork(handle, model.binding, deadline));
+            var rejection_steps: usize = 0;
+            while (target.phase == .ready and running.copy_job != null and rejection_steps < 100) : (rejection_steps += 1) {
+                _ = target.step();
+                // Eviction makes this a cold mapping path. Its RM replies
+                // may advance, but an invalid extent never reaches GP PUT.
+                if (running.buffer_active != null) try replyCopyMapping(target);
+                try t.expect(fifo_owner.ring.put == old_put);
+            }
+            try t.expect(rejection_steps < 100 and target.phase == .ready and running.copy_job == null and
+                model.result == a.gfx_queue_result_failed and fifo_owner.ring.put == old_put);
         }
         model.closeApp();
     } else {

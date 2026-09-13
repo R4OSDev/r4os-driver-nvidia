@@ -7,9 +7,14 @@ pub fn build(b: *std.Build) void {
     const libraries = b.dependencyFromBuildZig(libraries_build, .{});
     const receiver_parser_path = libraries.namedLazyPath("r4gfx_edid");
     const receiver_bridge_path = libraries.namedLazyPath("r4gfx_outputs");
-    const module = sdk.addR4MFWithOptions(b.path("module.R4MF"), .{ .zig_module_roots = &.{ receiver_parser_path, receiver_bridge_path } });
+    const copy_encoder_path = libraries.namedLazyPath("r4nv_copy");
+    const nv_binding_path = libraries.namedLazyPath("r4nv_zig_binding");
+    const module = sdk.addR4MFWithOptions(b.path("module.R4MF"), .{ .zig_module_roots = &.{ receiver_parser_path, receiver_bridge_path, copy_encoder_path, nv_binding_path } });
     const receiver_parser = b.createModule(.{ .root_source_file = receiver_parser_path, .target = b.graph.host, .optimize = .ReleaseSafe });
     const host_sdk = sdk.createR4osModule(b.graph.host, .ReleaseSafe);
+    const nv_binding = b.createModule(.{ .root_source_file = nv_binding_path, .target = b.graph.host, .optimize = .ReleaseSafe });
+    nv_binding.addImport("r4os", host_sdk);
+    const copy_encoder = b.createModule(.{ .root_source_file = copy_encoder_path, .target = b.graph.host, .optimize = .ReleaseSafe });
     const receiver_bridge = b.createModule(.{ .root_source_file = receiver_bridge_path, .target = b.graph.host, .optimize = .ReleaseSafe });
     receiver_bridge.addImport("r4os", host_sdk);
     receiver_bridge.addImport("r4gfx_edid", receiver_parser);
@@ -53,11 +58,15 @@ pub fn build(b: *std.Build) void {
     unit.root_module.addImport("r4os", host_sdk);
     unit.root_module.addImport("r4gfx_edid", receiver_parser);
     unit.root_module.addImport("r4gfx_outputs", receiver_bridge);
+    unit.root_module.addImport("r4nv_copy", copy_encoder);
+    unit.root_module.addImport("r4nv_binding", nv_binding);
     unit_step.dependOn(&b.addRunArtifact(unit).step);
     const lifecycle = b.createModule(.{ .root_source_file = b.path("src/lifecycle_test.zig"), .target = b.graph.host, .optimize = .ReleaseSafe });
     lifecycle.addImport("r4os", host_sdk);
     lifecycle.addImport("r4gfx_edid", receiver_parser);
     lifecycle.addImport("r4gfx_outputs", receiver_bridge);
+    lifecycle.addImport("r4nv_copy", copy_encoder);
+    lifecycle.addImport("r4nv_binding", nv_binding);
     // Host lifecycle tests link the same C companions through the canonical
     // parser. They do not supply replacements for their private Zig providers.
     const manifest = sdk_build.build_api.module_manifest.parse(b.allocator, "module.R4MF", @embedFile("module.R4MF")) catch @panic("Invalid NVIDIA manifest");
@@ -87,6 +96,8 @@ pub fn build(b: *std.Build) void {
     storage.addImport("r4os", host_sdk);
     storage.addImport("r4gfx_edid", receiver_parser);
     storage.addImport("r4gfx_outputs", receiver_bridge);
+    storage.addImport("r4nv_copy", copy_encoder);
+    storage.addImport("r4nv_binding", nv_binding);
     // Existing owner step exercises the complete Booter resource/heap/DMA
     // path with the same pinned bytes as the module, never a fake hash bypass.
     const fixture_files = b.addWriteFiles();

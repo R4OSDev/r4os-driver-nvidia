@@ -142,7 +142,7 @@ pub const ContextStatus = struct { state: execution_context.State, info: ?execut
 const ContextSlot = struct { owner: ?*execution_context.Owner = null, allocation: r4os.abi.DriverHeapAllocation = .{}, heap: ?r4os.r4dev.DriverHeapContext = null, serial: u64 = 0 };
 pub const BufferHandle = struct { epoch: u64, serial: u64, slot: u16 };
 pub const BufferStatus = struct { state: buffer_mapping.State, info: ?buffer_mapping.Info, rejected: ?u32, host_rejected: ?buffer_mapping.Error };
-const BufferSlot = struct { owner: ?*buffer_mapping.Owner = null, allocation: r4os.abi.DriverHeapAllocation = .{}, heap: ?r4os.r4dev.DriverHeapContext = null, serial: u64 = 0, pending_source: r4os.abi.GfxBufferReference = .{} };
+const BufferSlot = struct { owner: ?*buffer_mapping.Owner = null, allocation: r4os.abi.DriverHeapAllocation = .{}, heap: ?r4os.r4dev.DriverHeapContext = null, serial: u64 = 0, pending_source: r4os.abi.GfxBufferReference = .{}, cacheable: bool = false, last_used: u64 = 0, evicting: bool = false };
 pub const NativeBufferStatus = struct { state: vram.State, info: ?vram.Info, rejected: ?u32, host_rejected: ?i32 };
 const NativeBufferSlot = struct { owner: ?*vram.Owner = null, allocation: r4os.abi.DriverHeapAllocation = .{}, heap: ?r4os.r4dev.DriverHeapContext = null, serial: u64 = 0 };
 pub const Progress = enum { idle, progress };
@@ -230,6 +230,7 @@ pub const Owner = struct {
     buffers: [256]BufferSlot = @splat(.{}),
     buffer_active: ?u16 = null,
     buffer_serial: u64 = 0,
+    mapping_evictions: u64 = 0,
     native_buffers: [256]NativeBufferSlot = @splat(.{}),
     native_active: ?u16 = null,
     fifos: [64]ChannelSlot = @splat(.{}),
@@ -1251,8 +1252,16 @@ pub const Owner = struct {
             if (entry.surface.failed) self.stop(err) else { self.presentation = null; self.presentation_slots[0] = null; }
             return err;
         };
-        const result = queue.register(&.{ .adapter_id = self.adapter_id, .milestone = r4os.abi.gfx_queue_milestone_device_execution,
-            .notify_callback = @intFromPtr(&notifyPresentation), .context = @intFromPtr(self) }, &entry.binding);
+        const nv = @import("r4nv_binding");
+        const details: nv.R4NvDriverProfile = .{ .version = 1, .size = @sizeOf(nv.R4NvDriverProfile), .vendor_id = 0x10de,
+            .copy_class = fifo.config.copy_class, .rm_release = nv.rm_release, .command_abi = nv.command_abi, .reserved0 = 0, .reserved1 = 0 };
+        var profile: r4os.abi.GfxBackendProfile = .{ .interface_id_lo = nv.backend_v1_header.interface_id_lo,
+            .interface_id_hi = nv.backend_v1_header.interface_id_hi, .revision = nv.backend_v1_revision, .data_bytes = @sizeOf(nv.R4NvDriverProfile) };
+        @memcpy(profile.data[0..@sizeOf(nv.R4NvDriverProfile)], std.mem.asBytes(&details));
+        const registration: r4os.abi.GfxBackendRegistration = .{ .adapter_id = self.adapter_id, .milestone = r4os.abi.gfx_queue_milestone_device_execution,
+            .notify_callback = @intFromPtr(&notifyPresentation), .context = @intFromPtr(self) };
+        var result = queue.registerProfile(&registration, &profile, &entry.binding);
+        if (result == r4os.abi.err_no_fn) result = queue.register(&registration, &entry.binding);
         if (result != r4os.abi.gfx_queue_ok and entry.binding.device_generation == 0) {
             if (!entry.surface.closeUnregistered()) { self.stop(error.Retained); return error.Retained; }
             self.presentation = null; self.presentation_slots[0] = null; return error.Queue;
@@ -1900,6 +1909,7 @@ pub const Owner = struct {
             // registration, heap allocation or RPC is needed for this case.
             for (&self.buffers) |*slot| if (slot.owner) |owner| {
                 if (owner.info()) |value| if (std.meta.eql(value.buffer, reference.buffer) and value.epoch == self.epoch and owner.space.handle == fifo.config.context.vaspace) {
+                    slot.last_used = self.copy_completed +| 1;
                     work.addresses[i] = .{ .address = value.address, .bytes = value.logical_bytes }; break;
                 };
             };
@@ -2516,6 +2526,8 @@ pub const Owner = struct {
         slot.owner = owner;
         source.* = .{};
         slot.serial = serial;
+        slot.cacheable = request == .queue;
+        slot.last_used = self.copy_completed +| 1;
         self.buffer_serial = serial;
         self.buffer_active = index;
         return .{ .epoch = self.epoch, .serial = serial, .slot = index };
@@ -2529,6 +2541,36 @@ pub const Owner = struct {
     pub fn bufferStatus(self: *Owner, handle: BufferHandle) !BufferStatus {
         const owner = try self.findBuffer(handle);
         return .{ .state = owner.state, .info = owner.info(), .rejected = owner.rejected, .host_rejected = owner.host_rejected };
+    }
+    /// Make room for future canonical copy resources. No queued job is taken
+    /// and no current copy/flip/cursor mapping may be touched. One idle cache
+    /// entry starts real RM retirement per call; completion frees its slot.
+    pub fn prepareCopyMappings(self: *Owner, needed: usize, byte_limit: u64, deadline: u64) !bool {
+        _ = try self.now();
+        if (needed > self.buffers.len) return error.Bounds;
+        if (self.copyBusy() or self.cursor_point != null or self.cursor_reserving or self.graph_closing or self.buffer_active != null or
+            self.fifo_active != null or self.native_active != null or self.context_active != null or self.outputs.active() or self.sequence.self_address != 0 or
+            self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
+        var available: usize = 0;
+        var cached_bytes: u64 = 0;
+        var oldest: ?usize = null;
+        next: for (&self.buffers, 0..) |*slot, index| {
+            if (slot.allocation.handle == 0) { available += 1; continue; }
+            const owner = slot.owner orelse continue;
+            if (!slot.cacheable or slot.evicting or owner.state != .handed_off or owner.info() == null or
+                owner.source.flags != r4os.abi.gfx_buffer_reference_mapping_only) continue;
+            for (&self.presentation_slots) |*presentation_slot| if (presentation_slot.*) |*entry| {
+                if (std.meta.eql(entry.surface.shadow.buffer, owner.source.buffer)) continue :next;
+            };
+            cached_bytes +|= owner.mapped_bytes;
+            if (oldest == null or slot.last_used < self.buffers[oldest.?].last_used) oldest = index;
+        }
+        if (available >= needed and cached_bytes <= byte_limit) return false;
+        const index = oldest orelse return false; // Existing mappings may still satisfy a queued copy.
+        const slot = &self.buffers[index];
+        try self.retireBuffer(.{ .epoch = self.epoch, .serial = slot.serial, .slot = @intCast(index) }, deadline, true);
+        slot.evicting = true;
+        return true;
     }
     pub fn retireBuffer(self: *Owner, handle: BufferHandle, deadline: u64, quiesced: bool) !void {
         const owner = try self.findBuffer(handle);
@@ -2821,6 +2863,7 @@ pub const Owner = struct {
                 if (owner.state == .finished) {
                     const heap = slot.heap orelse return error.Api;
                     if (heap.release(slot.allocation.handle) != r4os.abi.driver_heap_ok) return error.Retained;
+                    if (slot.evicting) self.mapping_evictions +|= 1;
                     slot.* = .{};
                 }
                 self.buffer_active = null;
@@ -2858,7 +2901,15 @@ pub const Owner = struct {
         // queued frame. A continuously repainting desktop must not starve HPD.
         if (self.outputs.state != .detached and try self.beginReceiverRefresh(current)) return .progress;
         if (self.presentation) |entry| if (entry.pending and !self.copyAdmissionBusy() and (self.display_paused or self.presentationValid())) {
-            const taken: ?bool = self.beginCopyWork(entry.channel_handle, entry.binding, try std.math.add(u64, current, 3 * std.time.ns_per_s)) catch |err| blk: {
+            const copy_deadline = try std.math.add(u64, current, 3 * std.time.ns_per_s);
+            if (!self.copyBusy() and self.cursor_point == null and self.buffer_active == null) {
+                // Keep room for the next source/target and bound idle mapping
+                // retention independently of the number of occupied slots.
+                if (self.prepareCopyMappings(2, 128 * 1024 * 1024, copy_deadline) catch |err| blk: {
+                    if (err == error.Busy) break :blk false; return err;
+                }) return .progress;
+            }
+            const taken: ?bool = self.beginCopyWork(entry.channel_handle, entry.binding, copy_deadline) catch |err| blk: {
                 if (err == error.Busy) break :blk null; return err;
             };
             if (taken) |claimed| {
