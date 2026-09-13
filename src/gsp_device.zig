@@ -232,6 +232,7 @@ pub const Device = struct {
                     if (err == error.Busy) return progress or output_progress;
                     return err;
                 };
+                self.running.head_events = &self.interrupts.display;
                 self.ctx.?.logInfo("NVIDIA head-events: source=display-stall-LAST_DATA clock=IRQ-observation sequence=observed-events");
                 return true;
             }
@@ -511,7 +512,7 @@ pub const Device = struct {
         if (self.phase != .ready or port != &self.port or port.phase != .runtime or self.session == null or self.inLockdown() or
             self.running.self_address != @intFromPtr(&self.running) or self.running.failure != null or self.running.sequence.self_address != 0 or
             self.running.fifo_active != null or self.running.context_active != null or self.running.native_active != null or self.running.buffer_active != null or
-            self.running.outputs.active() or self.running.graph_closing or self.running.display_engine_active or self.running.display_channel_active != null or self.running.display_work != null or self.running.mode_control_active) return error.State;
+            self.running.outputs.active() or self.running.graph_closing or self.running.display_engine_active or self.running.display_channel_active != null or self.running.display_work != null or self.running.display_flip != null or self.running.mode_control_active) return error.State;
         const channel_handle = if (self.running.display_upload_job) |*work| blk: {
             const resources = self.running.display_resources_slot.owner orelse return error.Binding;
             const root = if (self.running.display_engine_owner) |*value| value else return error.Binding;
@@ -554,11 +555,14 @@ pub const Device = struct {
             self.running.fifo_active != null or self.running.context_active != null or self.running.native_active != null or self.running.buffer_active != null or
             self.running.outputs.active() or self.running.graph_closing or self.running.display_engine_active or self.running.display_channel_active != null or self.running.mode_control_active or
             self.running.copy_job != null or self.running.display_upload_job != null or self.running.initial_image != null) return error.State;
+        if (self.running.display_flip != null) return self.admitFlipPush(port, channel, deadline, access_kind);
         const work = if (self.running.display_work) |*value| value else return error.Binding;
         const resources = self.running.display_resources_slot.owner orelse return error.Binding;
         const root = if (self.running.display_engine_owner) |*value| value else return error.Binding;
         const root_info = root.info() orelse return error.Binding;
         if (!resources.valid()) return error.Binding;
+        if (!work.core.config.with_core or (if (work.window) |value| !value.config.with_core else false) or
+            (if (work.position) |value| !value.config.with_core else false)) return error.Binding;
         if (work.core.handle.slot != 0 or work.deadline != deadline) return error.Binding;
         const position_part: ?*runtime.PositionSubmission = if (channel.config.kind == .immediate)
             if (work.position) |*value| value else return error.Binding else null;
@@ -627,6 +631,39 @@ pub const Device = struct {
             if (part) |value| if (ticket.?.kind == .frame and (value.notifier.phase != .armed or value.notifier.point != ticket.?.point or
                 value.notifier.deadline != deadline or value.notifier.offset != config.notifier_offset)) return error.Binding;
         } else if (phase != .prepare and phase != .rewind and !(position_part != null and phase == .submitted)) return error.Binding;
+        const rpc = self.running.activeChannel() orelse return error.State;
+        const canonical = if (self.running.channel) |*value| value else return error.State;
+        if (rpc != canonical or rpc.session != &self.session.? or port.runtime_session != rpc.session or rpc.session.pending != null or
+            rpc.phase != .idle or rpc.pending != null or rpc.in_lockdown or rpc.request.len != 0) return error.Binding;
+        try rpc.guard(deadline);
+    }
+    fn admitFlipPush(self: *Device, port: *const native.Port, channel: *@import("gsp_display_channel.zig").Owner,
+        deadline: u64, access_kind: native.DisplayAccess) !void
+    {
+        if (self.running.display_work != null or self.running.head_events != &self.interrupts.display or
+            !self.interrupts.display.enabled or self.interrupts.display.epoch != self.epoch) return error.Binding;
+        self.running.validateDisplayFlip() catch return error.Binding;
+        const work = &self.running.display_flip.?;
+        const part = &work.window;
+        const config = part.config;
+        const root = if (self.running.display_engine_owner) |*value| value else return error.Binding;
+        const info = root.info() orelse return error.Binding;
+        const resources = self.running.display_resources_slot.owner orelse return error.Binding;
+        const slot = part.handle.slot;
+        if (work.deadline != deadline or part.handle.epoch != self.epoch or slot == 0 or slot > 8 or
+            self.running.display_channels[slot] == null or &self.running.display_channels[slot].? != channel or
+            channel.config.handle != part.handle.handle or channel.config.kind != .window or channel.parent != root or
+            channel.info() == null or !channel.ring.valid() or !channel.ring.initialized or
+            config.windows != info.hardware.windows or config.route.?.head >= info.hardware.heads or
+            !resources.valid() or resources.instance != &root.instance_storage or !std.meta.eql(resources.binding.?, root.binding) or
+            resources.publishedNotifier(slot) != part.notifier or config.notifier != part.notifier.handle or
+            work.receipt.begun_observed_ns != 0) return error.Binding;
+        if (access_kind == .publish) {
+            const ticket = part.ticket orelse return error.Binding;
+            if (part.phase != .prepare or !channel.ring.matches(ticket, config)) return error.Binding;
+            if (ticket.kind == .frame and (part.notifier.phase != .armed or part.notifier.point != ticket.point or
+                part.notifier.deadline != deadline or part.notifier.offset != config.notifier_offset)) return error.Binding;
+        } else if (part.phase != .prepare and part.phase != .rewind) return error.Binding;
         const rpc = self.running.activeChannel() orelse return error.State;
         const canonical = if (self.running.channel) |*value| value else return error.State;
         if (rpc != canonical or rpc.session != &self.session.? or port.runtime_session != rpc.session or rpc.session.pending != null or

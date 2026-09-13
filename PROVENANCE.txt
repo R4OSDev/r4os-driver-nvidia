@@ -842,3 +842,12 @@ Seven complete originals and hashes are archived under
 identical module/image runtime licenses; the former361687-byte prefix is
 unchanged. IRQ owner policy and snapshots are original R4OS Apache-2.0.
 Clock reads timestamp actual interrupts; no CPU timer creates a VBlank.
+
+Window flip entry (NVIDIA 0.1.96, 2026-09-13):
+The existing MIT-derived C67E encoder can omit the Core interlock for a
+same-mode Window UPDATE. Original clc67e.h and Nouveau wndwc37e.c notices
+were already retained in that source and the unchanged runtime license.
+Complete originals and NVIDIA's VBlank/notifier-ordering explanation in
+nvkms-headsurface.c are archived under 0.79.14/window-flip-20260913.
+The resident flip receipts, serialization, deadlines and device tests are
+original R4OS Apache-2.0. GPU notifier and CPU IRQ clocks are never equated.

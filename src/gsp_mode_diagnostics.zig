@@ -78,6 +78,7 @@ pub const Report = struct {
         if (run.display_upload_job != null) self.pending |= 4;
         if (run.copy_job != null) self.pending |= 8;
         if (run.native_active != null) self.pending |= 16;
+        if (run.display_flip != null) self.pending |= 32;
         for (&run.native_buffers) |*slot| if (slot.owner != null) { self.native_owners += 1; };
         for (&run.presentation_slots) |*slot| if (slot.*) |*entry| {
             if (entry.surface.shadow.reference.id != 0) self.shadow_imports += 1;

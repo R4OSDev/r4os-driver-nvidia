@@ -75,6 +75,15 @@ pub const hdmi_link = @import("gsp_hdmi_link.zig");
 pub const DisplayLink = struct { plan: hdmi_link.Plan, acknowledged: u8, receipt: u64 };
 pub const DisplayWork = struct { core: DisplaySubmission, window: ?DisplaySubmission = null, position: ?PositionSubmission = null, deadline: u64, boot_mode: ?boot_mode.Plan = null, mode_receipt: u64 = 0, link: ?hdmi_link.Work = null };
 pub const ActiveDisplayImage = struct { image: display_resources.image.Image, head: u32, core_point: u64, window_point: u64, boot_mode: ?boot_mode.Plan = null, mode_receipt: u64 = 0, position: ?DisplayPosition = null, link: ?DisplayLink = null };
+pub const flip = @import("gsp_flip.zig");
+pub const DisplayFlip = struct {
+    window: DisplaySubmission,
+    presentation: *Presentation,
+    previous: ActiveDisplayImage,
+    deadline: u64,
+    baseline: @import("gsp_head_events.zig").Sample = .{},
+    receipt: flip.Receipt,
+};
 const subscriptions = @import("gsp_event_objects.zig");
 const outputs = @import("gsp_outputs.zig");
 const inventory = @import("gsp_memory_inventory.zig");
@@ -172,6 +181,12 @@ pub const Owner = struct {
     display_resources_slot: DisplayResourcesSlot = .{},
     display_upload_job: ?struct { operation: display_upload.Upload = .{}, channel_handle: ChannelHandle } = null,
     display_work: ?DisplayWork = null,
+    display_flip: ?DisplayFlip = null,
+    flip_issued: u64 = 0,
+    flip_visible: u64 = 0,
+    flip_released: u64 = 0,
+    flip_receipts: [8]?flip.Receipt = @splat(null),
+    head_events: ?*const @import("gsp_head_events.zig").Owner = null,
     display_images: [8]?ActiveDisplayImage = @splat(null),
     presentation_slots: [2]?Presentation = @splat(null),
     presentation: ?*Presentation = null,
@@ -300,6 +315,9 @@ pub const Owner = struct {
             .{@errorName(err),work.core.handle.handle,@tagName(work.core.phase),if(work.core.ticket)|ticket|ticket.point else 0,if(work.core.notifier.result)|result|result.word else 0});
         if (self.display_work) |*work| if (work.window) |*window| self.log("NVIDIA gsp-display-image: failed={s} window={d} phase={s} point={d} image={x} storage=retained",
             .{@errorName(err),window.config.route.?.window,@tagName(window.phase),if(window.ticket)|ticket|ticket.point else 0,window.config.scanout.?.dma});
+        if (self.display_flip) |*work| self.log("NVIDIA gsp-flip: failed={s} head={d} sequence={d} phase={s} render={d} window={d} visible={} old-released={} resources=retained",
+            .{@errorName(err),work.receipt.head,work.receipt.sequence,@tagName(work.window.phase),work.receipt.render_point,
+                if(work.window.ticket)|ticket|ticket.point else 0,work.receipt.begun_observed_ns != 0,work.receipt.previous_released_ns != 0});
         if (self.display_work) |*work| if (work.position) |*position| self.log("NVIDIA gsp-display-position: failed={s} channel={x} phase={s} point={d} storage=retained",
             .{@errorName(err),position.handle.handle,@tagName(position.phase),if(position.ticket)|ticket|ticket.point else 0});
         if (self.initial_image) |*work| self.log("NVIDIA gsp-initial-image: failed={s} submitted={} point={d} source-held={} storage=retained",
@@ -387,6 +405,7 @@ pub const Owner = struct {
     }
     pub fn reportIrq(self: *Owner, endpoint: *const @import("gsp_irq.zig").Owner) void {
         if (self.self_address != @intFromPtr(self) or self.failure != null) return;
+        if (endpoint.display.enabled and endpoint.display.epoch == self.epoch) self.head_events = &endpoint.display;
         const code = @atomicLoad(u32, &endpoint.fault, .acquire);
         if (code == 0) return;
         self.recordFault(.{ .source = .irq, .kind = .device, .operation = .interrupt, .fatal = true, .code = code,
@@ -408,7 +427,7 @@ pub const Owner = struct {
     }
     pub fn nativeObject(self: *Owner) ?display.Object {
         if (self.self_address != @intFromPtr(self) or self.failure != null or self.graph == null or
-            self.display_upload_job != null or self.display_work != null or
+            self.display_upload_job != null or self.display_work != null or self.display_flip != null or
             self.graph.?.self_address != @intFromPtr(&self.graph.?) or self.graph.?.state != .loaned or
             self.display_object == null or self.channel == null or self.activeChannel() != &self.channel.? or
             self.channel.?.session.state != .active) return null;
@@ -661,7 +680,7 @@ pub const Owner = struct {
         if (descriptor.target != .vram or descriptor.channel == 0 or descriptor.channel > 8) return false;
         for (&self.display_images) |entry| if (entry) |active| if (active.image.dma == descriptor.handle) return false;
         for (&self.presentation_slots) |*slot| if (slot.*) |*entry| if (entry.surface.scanout) |active| if (active.dma == descriptor.handle) return false;
-        if (self.display_work != null or self.initial_image != null or self.copy_job != null) return false;
+        if (self.display_work != null or self.display_flip != null or self.initial_image != null or self.copy_job != null) return false;
         return true;
     }
     /// Repeated at the actual Device CE admission boundary, not just at the
@@ -880,6 +899,72 @@ pub const Owner = struct {
         if (window >= self.display_images.len) return error.Bounds;
         return self.display_images[window];
     }
+    /// Flip an already CE-completed private image at unchanged mode and
+    /// primary position. This emits only Window methods. It does not change
+    /// the common shadow binding or reinterpret its CPU-copy queue fence.
+    pub fn flipDisplayPresentationImage(self: *Owner, dma: u32, deadline: u64) !void {
+        if (self.copyBusy() or self.graph_closing or self.nativeObject() == null or !self.presentationValid()) return error.Busy;
+        const entry = try self.findPresentationImage(dma);
+        if (!self.preparedPresentation(entry) or entry.initial_point == 0 or entry.initial_failure != null) return error.Stale;
+        const owner = try self.findDisplayChannel(entry.window);
+        const root = owner.parent.info() orelse return error.State;
+        const previous = self.display_images[owner.config.index] orelse return error.State;
+        const image = entry.surface.scanout.?;
+        if (image.dma == previous.image.dma or image.width != previous.image.width or image.height != previous.image.height or
+            image.format != previous.image.format or image.pitch != previous.image.pitch or previous.position == null or
+            previous.core_point == 0 or previous.window_point == 0 or previous.boot_mode == null or previous.link == null or
+            !std.meta.eql(entry.window, self.presentation.?.window)) return error.Unsupported;
+        _ = try self.headObservation(previous.head);
+        const resources = self.display_resources_slot.owner orelse return error.State;
+        const note = resources.publishedNotifier(entry.window.slot) orelse return error.State;
+        if (!try resources.imageFinished(entry.window.slot, dma)) return error.Busy;
+        const offset = try note.nextWindowOffset();
+        if (!owner.ring.valid() or !owner.ring.initialized or owner.ring.pending != null or owner.ring.issued != owner.ring.completed or
+            self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
+        if (self.flip_issued == std.math.maxInt(u64)) return error.Exhausted;
+        try self.channel.?.guard(deadline);
+        self.flip_issued += 1;
+        self.display_flip = .{ .presentation = entry, .previous = previous, .deadline = deadline,
+            .window = .{ .handle = entry.window, .notifier = note, .config = .{ .kind = .window, .notifier = note.handle,
+                .notifier_offset = offset, .windows = root.hardware.windows, .initialize = false, .with_core = false,
+                .route = .{ .window = owner.config.index, .head = previous.head }, .scanout = image } },
+            .receipt = .{ .epoch = self.epoch, .sequence = self.flip_issued, .head = previous.head, .window = owner.config.index,
+                .previous_dma = previous.image.dma, .image_dma = dma, .render_point = entry.initial_point } };
+    }
+    fn headSource(self: *const Owner, head: u32) !*const @import("gsp_head_events.zig").Head {
+        const source = self.head_events orelse return error.Unsupported;
+        if (!source.enabled or source.epoch != self.epoch or head >= source.heads.len or
+            source.head_mask & (@as(u32, 1) << @intCast(head)) == 0) return error.Stale;
+        return &source.heads[head];
+    }
+    fn headObservation(self: *const Owner, head: u32) !@import("gsp_head_events.zig").Sample {
+        return (try self.headSource(head)).snapshot() orelse error.Busy;
+    }
+    /// Repeated at the real PUT gate. No caller-selected buffer, timing,
+    /// completed CE point, prior display or event generation is trusted.
+    pub fn validateDisplayFlip(self: *Owner) !void {
+        const work = if (self.display_flip) |*value| value else return error.State;
+        const entry = work.presentation;
+        const config = work.window.config;
+        const image = entry.surface.scanout orelse return error.Stale;
+        const route = config.route orelse return error.Stale;
+        if (!self.preparedPresentation(entry) or !std.meta.eql(work.window.handle, entry.window) or
+            config.kind != .window or config.initialize or config.with_core or config.with_position or config.position != null or config.signal != null or
+            !std.meta.eql(config.scanout, @as(?display_resources.image.Image, image)) or route.window != entry.window.slot - 1 or route.head != work.previous.head or
+            work.receipt.epoch != self.epoch or work.receipt.sequence != self.flip_issued or work.receipt.head != route.head or work.receipt.window != route.window or
+            work.receipt.image_dma != image.dma or work.receipt.previous_dma != work.previous.image.dma or work.receipt.render_point != entry.initial_point or
+            entry.initial_point == 0 or entry.initial_failure != null or image.dma == work.previous.image.dma or
+            image.width != work.previous.image.width or image.height != work.previous.image.height or image.pitch != work.previous.image.pitch or
+            image.format != work.previous.image.format or work.previous.boot_mode == null or work.previous.link == null or work.previous.position == null or
+            work.previous.core_point == 0 or work.previous.window_point == 0) return error.Stale;
+        const current = self.display_images[route.window] orelse return error.Stale;
+        var expected = work.previous;
+        if (work.receipt.begun_observed_ns != 0) {
+            expected.image = image; expected.window_point = work.receipt.window_point;
+        }
+        if (!std.meta.eql(current, expected)) return error.Stale;
+        _ = try self.headSource(route.head);
+    }
     /// Register the common queue consumer for a prepared private image.
     /// The display transition owner supplies its real CPU shadow; queued
     /// uploads are admitted only while that exact image is active.
@@ -1032,7 +1117,7 @@ pub const Owner = struct {
         self.log("NVIDIA gsp-present-image: retired={d} shadow=unmapped,import-released scanout=retained", .{dma});
         return true;
     }
-    fn copyBusy(self: *const Owner) bool { return self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.initial_image != null or self.mode_control_active; }
+    fn copyBusy(self: *const Owner) bool { return self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.display_flip != null or self.initial_image != null or self.mode_control_active; }
     /// Called after the product owner populated and unmapped its CPU shadow
     /// from the same immutable capture used by common commit. This private
     /// operation does not invent a common queue fence.
@@ -1585,6 +1670,50 @@ pub const Owner = struct {
         }
         self.display_work = null; return true;
     }
+    fn advanceDisplayFlip(self: *Owner, current: u64) !bool {
+        const work = if (self.display_flip) |*value| value else return false;
+        try self.validateDisplayFlip();
+        if (current >= work.deadline) return error.Timeout; // Retain both scanout allocations.
+        const window = &work.window;
+        if (window.phase != .complete) {
+            const preparing = window.phase == .prepare;
+            if (preparing) {
+                work.baseline = self.headObservation(work.receipt.head) catch |err| {
+                    if (err == error.Busy) return false; return err;
+                };
+                work.receipt.submitted_ns = current;
+            }
+            const changed = try self.advanceDisplaySubmission(window, work.deadline, current);
+            if (window.phase != .complete) return changed;
+        }
+        if (work.receipt.begun_observed_ns == 0) {
+            const observed = self.headObservation(work.receipt.head) catch |err| {
+                if (err == error.Busy) return false; return err;
+            };
+            if (observed.sequence <= work.baseline.sequence or observed.observed_ns < work.receipt.submitted_ns) return false;
+            // A hardware Window BEGUN record proves activation. Head LAST_DATA
+            // proves an IRQ was observed, without identifying an exact GPU
+            // timestamp or deriving synthetic refresh ticks from CPU time.
+            const result = window.notifier.result orelse return error.Completion;
+            work.receipt.window_point = window.ticket.?.point;
+            work.receipt.begun_gpu_timestamp = result.timestamp;
+            work.receipt.begun_observed_ns = current;
+            work.receipt.head_observation = observed;
+            var active = work.previous;
+            active.image = window.config.scanout.?; active.window_point = window.ticket.?.point;
+            self.display_images[work.receipt.window] = active;
+            self.flip_receipts[work.receipt.head] = work.receipt;
+            self.flip_visible += 1;
+            return true;
+        }
+        const resources = self.display_resources_slot.owner orelse return error.State;
+        if (!try resources.imageFinished(window.handle.slot, work.previous.image.dma)) return false;
+        work.receipt.previous_released_ns = current;
+        self.flip_receipts[work.receipt.head] = work.receipt;
+        self.flip_released += 1;
+        self.display_flip = null;
+        return true;
+    }
     fn advanceDisplayPosition(self: *Owner, work: *PositionSubmission, deadline: u64, current: u64) !bool {
         if (work.phase == .complete) return false;
         if (current >= deadline) return error.Timeout;
@@ -2063,6 +2192,7 @@ pub const Owner = struct {
         if (try self.advanceDisplayUpload(current)) return .progress;
         if (try self.advanceInitialImage(current)) return .progress;
         if (try self.advanceDisplay(current)) return .progress;
+        if (try self.advanceDisplayFlip(current)) return .progress;
         if (try self.advanceCopy(current)) return .progress;
         if (self.presentation) |entry| if (entry.pending and !self.copyBusy() and self.presentationValid()) {
             const taken: ?bool = self.beginCopyWork(entry.channel_handle, entry.binding, try std.math.add(u64, current, 3 * std.time.ns_per_s)) catch |err| blk: {

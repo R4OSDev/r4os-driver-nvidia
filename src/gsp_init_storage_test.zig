@@ -1552,6 +1552,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         context_display_present_initial_timeout, context_display_present_initial_fault, context_display_present_initial_release,
         context_display_present_initial_acquire, context_display_present_initial_retry,
         context_native_unknown, context_native_connected, context_native_jobs, context_native_job_timeout, context_native_prepare_reject,
+        context_native_flip_irq_timeout, context_native_flip_notifier_timeout, context_native_flip_release_timeout,
         context_native_receipt, context_native_timeout, context_native_link_reject, context_native_stale,
         context_native_mode_missing, context_native_mode_reject, context_native_mode_free_reject,
         context_native_mode_clock, context_native_mode_impossible, context_native_mode_timeout, context_native_mode_stale,
@@ -3053,6 +3054,7 @@ const NativeCommon = struct {
     var scenario: []const u8 = "";
     fn is(name: []const u8) bool { return std.mem.eql(u8, scenario, name); }
     fn hasModes() bool { return is("context_native_jobs") or is("context_native_job_timeout"); }
+    fn flipFailure() bool { return std.mem.startsWith(u8, scenario, "context_native_flip_"); }
     fn outputs(out: *a.GfxDriverOutputApi) callconv(.c) i32 {
         _ = CatalogModel.query(out);
         out.publish = @intFromPtr(&publish); out.withdraw = @intFromPtr(&withdraw);
@@ -3302,7 +3304,7 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
     try t.expect(steps < 1200 and !copy.shadow_cpu and
         copy.shadow_creates == @as(usize, if (early_mode_failure) 0 else 1) and
         NativeCommon.prepares == @as(usize, if (early_mode_failure) 0 else 1));
-    const success = NativeCommon.is("context_native_unknown") or NativeCommon.is("context_native_connected") or NativeCommon.hasModes();
+    const success = NativeCommon.is("context_native_unknown") or NativeCommon.is("context_native_connected") or NativeCommon.hasModes() or NativeCommon.flipFailure();
     if (success) {
         try t.expect(target.phase == .ready and target.native_output.phase == .active and NativeCommon.commits == 1 and captured.boot.native_adopted);
         try t.expect(target.native_output.ownsNative(DeviceModel.boot_info));
@@ -3310,7 +3312,7 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
         try t.expect(!target.native_output.ownsNative(stale));
         const flags = NativeCommon.publication.info.flags;
         try t.expect((flags & a.gfx_output_flag_connected != 0) == (NativeCommon.is("context_native_connected") or NativeCommon.hasModes()));
-        try t.expect((flags & a.gfx_output_flag_connection_unknown != 0) == NativeCommon.is("context_native_unknown"));
+        try t.expect((flags & a.gfx_output_flag_connection_unknown != 0) == (NativeCommon.is("context_native_unknown") or NativeCommon.flipFailure()));
         try t.expect(NativeCommon.publication.info.limits.flags == 0 and NativeCommon.publication.info.mode_count == 1);
         try t.expect(target.step() != .stopped and target.failure == null);
         // The actual common queue consumer now drives the already adopted
@@ -3334,6 +3336,12 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
             if (copy.completed == 1) break;
         }
         try t.expect(copy.completed == 1 and copy.result == a.gfx_queue_result_complete and target.failure == null);
+        if (NativeCommon.flipFailure()) {
+            checkpoint = "native flip deadline";
+            try checkNativeFlip(target);
+            try t.expect(target.phase == .recovering and native.released == 0 and display.released == 0 and !NativeCommon.published);
+            _ = target.stop(); return;
+        }
         if (NativeCommon.is("context_native_job_timeout")) {
             checkpoint = "common mode DMA timeout";
             try checkNativeModeTimeout(target);
@@ -3371,6 +3379,8 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
             try checkReceiverModeSwitch(target);
             checkpoint = "live image table";
             try checkLiveDisplayTable(target);
+            checkpoint = "native Window flip";
+            try checkNativeFlip(target);
             checkpoint = "replacement Present";
             try checkPresentationReplacement(target);
         }
@@ -3403,7 +3413,7 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
     }
     checkpoint = "stop";
     _ = target.stop();
-    try t.expect(native.released == @as(u32, if (NativeCommon.is("context_native_connected")) 4 else if (NativeCommon.is("context_native_jobs")) 2 else 0) and display.released == 0 and !NativeCommon.published);
+    try t.expect(native.released == @as(u32, if (NativeCommon.is("context_native_connected")) 5 else if (NativeCommon.is("context_native_jobs")) 2 else 0) and display.released == 0 and !NativeCommon.published);
 }
 fn checkNativeModeTimeout(target: *@import("gsp_device.zig").Device) !void {
     const run = &target.running; const product = &target.native_output;
@@ -3594,10 +3604,216 @@ fn pumpNativeModeJob(target: *@import("gsp_device.zig").Device) !void {
     }
     return error.Timeout;
 }
+fn deliverNativeHead(target: *@import("gsp_device.zig").Device, caused: bool) !void {
+    const irqs = @import("gsp_irq.zig");
+    const heads = @import("gsp_head_events.zig");
+    const endpoint = &target.interrupts;
+    const head = target.native_output.mode.?.head;
+    const words: [*]u32 = @ptrFromInt(endpoint.cpu);
+    const sequence = endpoint.display.heads[head].snapshot().?.sequence;
+    words[irqs.reg.top / 4] = endpoint.display.subtree;
+    words[(irqs.reg.leaf + endpoint.leaf * 4) / 4] = 0;
+    words[(irqs.reg.leaf + endpoint.display.leaf * 4) / 4] = endpoint.display.bit;
+    words[heads.reg.dispatch / 4] = @as(u32, 1) << @intCast(head);
+    words[(heads.reg.status + head * 4) / 4] = if (caused) 2 else 0;
+    words[(heads.reg.position + head * 0x800) / 4] = (@as(u32, @truncate(sequence + 1)) << 16) | 17;
+    clock += 1000;
+    const wakes = IrqModel.wakes;
+    try t.expect(IrqModel.dispatch(IrqModel.irq) == a.irq_result_handled);
+    try t.expect(!endpoint.failed() and IrqModel.wakes == wakes + 1 and
+        endpoint.display.heads[head].snapshot().?.sequence == sequence + @intFromBool(caused));
+    // The MMIO model does not implement W1C side effects; clear the delivered
+    // cause before the next explicitly injected hardware event.
+    words[(irqs.reg.leaf + endpoint.display.leaf * 4) / 4] = 0;
+    words[(heads.reg.status + head * 4) / 4] = 0;
+    words[heads.reg.dispatch / 4] = 0;
+    words[irqs.reg.top / 4] = 0;
+}
+fn checkNativeFlip(target: *@import("gsp_device.zig").Device) !void {
+    const run = &target.running; const product = &target.native_output;
+    const copy = @import("gsp_copy_test_model.zig").Model;
+    const native = @import("gsp_vram_test_model.zig").Model;
+    const display = @import("gsp_display_test_model.zig").Model;
+    const push = @import("gsp_display_push.zig");
+    const table_owner = run.display_resources_slot.owner.?;
+    const old = run.presentation.?;
+    const original = run.display_images[product.mode.?.window].?;
+    const note = table_owner.publishedNotifier(product.window.?.slot).?;
+    const words: [*]u32 = @ptrFromInt(note.cpu.cpu_address);
+    const raw: [*]const u8 = @ptrFromInt(target.port.window.cpu_address);
+    const fifo = run.fifos[product.copy.?.slot].owner.?;
+    const core = &run.display_channels[product.core.?.slot].?;
+    const window = &run.display_channels[product.window.?.slot].?;
+    const before_released = native.released;
+    const deadline = clock + std.time.ns_per_s;
+    var checkpoint: []const u8 = "allocate";
+    errdefer |err| std.debug.print("native flip: {s} at={s} device={s} failure={?} work={} issued={d} visible={d} released={d}\n",
+        .{@errorName(err),checkpoint,@tagName(target.phase),target.failure,run.display_flip != null,run.flip_issued,run.flip_visible,run.flip_released});
+    try t.expect(run.head_events == &target.interrupts.display and target.interrupts.display.enabled);
+    const buffer = try finishContextBuffer(target, try run.allocateDisplaySurface(.{
+        .width = original.image.width, .height = original.image.height, .usage = 40 }, deadline), deadline);
+    const source = (try run.nativeBufferStatus(buffer)).info.?;
+    const index = source.reference.buffer.id - 801;
+    const dma = try run.bindDisplayStorage(product.engine.?, .window, product.mode.?.window, buffer);
+    try run.releaseNativeBuffer(buffer);
+    var gpu_table = table_owner.table.image;
+    try run.uploadDisplayTable(product.engine.?, product.copy.?, deadline);
+    try pumpLiveTable(target, &gpu_table, 2);
+    const borrowed = copy.lendReplacement(index, original.image.width, original.image.height);
+    @memset(&copy.host[1], 0x7d);
+    try run.prepareDisplayPresentationImage(dma, borrowed, deadline);
+    const candidate = &run.presentation_slots[1].?;
+    try t.expectError(error.Stale, run.flipDisplayPresentationImage(dma, deadline));
+    checkpoint = "render";
+    try run.uploadDisplayPresentationImage(dma, deadline);
+    var fetched = false;
+    for (0..100) |_| {
+        clock += 1000; _ = target.step();
+        try t.expect(target.phase == .ready and run.presentation == old);
+        if (run.buffer_active != null) { try replyCopyMapping(target); continue; }
+        if (run.initial_image) |work| {
+            if (work.operation.submitted) {
+                if (!fetched) {
+                    try copy.fetch(fifo, raw[0..@intCast(target.port.window.byte_length)]); try copy.execute(); fetched = true;
+                    try t.expect(candidate.initial_point == 0 and run.flip_visible == 0 and copy.initial_read.lease.id != 0);
+                } else try copy.signal();
+            }
+        } else break;
+    }
+    try t.expect(run.initial_image == null and candidate.initial_point != 0 and copy.initial_read.lease.id == 0 and
+        std.meta.eql(run.display_images[product.mode.?.window].?, original) and run.flip_visible == 0);
+    const core_point = core.ring.issued;
+    const core_put = display.words[(try push.userBase(.core, 0)) / 4];
+    const before_copies = run.copy_completed;
+    const before_queue = copy.completed;
+    const before_rpc = target.session.?.tx_sequence;
+    // Retire only an older modeled notifier use, keeping the active use BEGUN.
+    words[(note.offset ^ 16) / 4] = 2 << 30;
+    for (0..2) |iteration| {
+        const selected = if (iteration == 0) candidate else old;
+        const selected_dma = selected.surface.scanout.?.dma;
+        const prior = run.display_images[product.mode.?.window].?;
+        const prior_offset = note.offset;
+        checkpoint = "prepare flip";
+        try t.expectError(error.Unsupported, run.flipDisplayPresentationImage(prior.image.dma, deadline));
+        try run.flipDisplayPresentationImage(selected_dma, deadline);
+        const work = &run.display_flip.?;
+        const io = target.port.owner.?;
+        try io.admit_display_push.?(io.context, &target.port, window, deadline, .read);
+        work.window.config.with_core = true;
+        try t.expectError(error.Binding, io.admit_display_push.?(io.context, &target.port, window, deadline, .read));
+        work.window.config.with_core = false;
+        work.receipt.render_point += 1;
+        try t.expectError(error.Binding, io.admit_display_push.?(io.context, &target.port, window, deadline, .read));
+        work.receipt.render_point -= 1;
+        work.previous.window_point += 1;
+        try t.expectError(error.Binding, io.admit_display_push.?(io.context, &target.port, window, deadline, .read));
+        work.previous.window_point -= 1;
+        try t.expectError(error.Binding, io.admit_display_push.?(io.context, &target.port, core, deadline, .read));
+        try t.expectError(error.Busy, run.commitDisplayCore(product.core.?, deadline));
+        try t.expectError(error.Busy, run.beginCopyWork(product.copy.?, product.backend, deadline));
+        clock += 1000; _ = target.step();
+        try t.expect(target.phase == .ready and work.window.phase == .submitted and work.receipt.submitted_ns == clock);
+        const program = window.ring.program.?;
+        var at: usize = 0;
+        var interlock = false;
+        var present_control = false;
+        var target_image = false;
+        while (at < program.count) {
+            const method = program.words[at] & 0x3ffc;
+            const count = (program.words[at] >> 18) & 1023;
+            try t.expect(count != 0 and at + 1 + count <= program.count);
+            switch (method) {
+                0x370 => { try t.expect(count == 2 and program.words[at + 1] == 0 and program.words[at + 2] == 0); interlock = true; },
+                0x308 => { try t.expect(count == 1 and program.words[at + 1] == 1); present_control = true; },
+                0x240 => { try t.expect(program.words[at + 1] == selected_dma); target_image = true; },
+                else => {},
+            }
+            at += 1 + count;
+        }
+        try t.expect(interlock and present_control and target_image and core.ring.issued == core_point);
+        const user = try push.userBase(.window, product.mode.?.window);
+        display.words[(user + 4) / 4] = display.words[user / 4];
+        clock += 1000; _ = target.step();
+        try t.expect(work.window.phase == .submitted and run.flip_visible == iteration and std.meta.eql(run.display_images[prior.image.channel - 1].?, prior));
+        checkpoint = "independent hardware receipts";
+        try deliverNativeHead(target, false); _ = target.step();
+        try t.expect(run.flip_visible == iteration and work.window.phase == .submitted);
+        const missing_irq = NativeCommon.is("context_native_flip_irq_timeout");
+        const missing_notifier = NativeCommon.is("context_native_flip_notifier_timeout");
+        if (iteration == 0 and !missing_irq) { try deliverNativeHead(target, true); _ = target.step(); }
+        try t.expect(run.flip_visible == iteration and work.window.phase == .submitted);
+        const gpu_timestamp = (@as(u64, 7) << 32) + 123 + iteration;
+        if (!missing_notifier) {
+            words[note.offset / 4 + 2] = @truncate(gpu_timestamp);
+            words[note.offset / 4 + 3] = @truncate(gpu_timestamp >> 32);
+            words[note.offset / 4] = 1 << 30;
+            clock += 1000; _ = target.step();
+        }
+        if (iteration == 1) {
+            // Window has begun but no new head IRQ has arrived. Advancing
+            // CPU time, including a worker poll, does not create VBlank.
+            try t.expect(work.window.phase == .complete and run.flip_visible == iteration);
+            clock += 10 * std.time.ns_per_ms; _ = target.step();
+            try t.expect(run.flip_visible == iteration);
+            try deliverNativeHead(target, true); _ = target.step();
+        }
+        if (NativeCommon.flipFailure()) {
+            const visible: u64 = if (missing_irq or missing_notifier) 0 else 1;
+            try t.expect(run.flip_visible == visible and run.flip_released == 0 and run.display_flip != null);
+            clock = deadline; _ = target.step();
+            try t.expect(target.phase == .recovering and target.failure.? == error.Timeout and run.display_flip != null and
+                run.flip_visible == visible and run.flip_released == 0 and native.released == before_released and
+                old.surface.target.?.gpu.lease.id != 0 and candidate.surface.target.?.gpu.lease.id != 0 and
+                copy.borrowed_releases == 0 and run.copy_completed == before_copies and copy.completed == before_queue);
+            return;
+        }
+        checkpoint = "visible before release";
+        const visible = run.flip_receipts[prior.head].?;
+        try t.expect(run.flip_visible == iteration + 1 and run.flip_released == iteration and visible.sequence == iteration + 1 and
+            visible.previous_dma == prior.image.dma and visible.image_dma == selected_dma and visible.render_point == selected.initial_point and
+            visible.begun_gpu_timestamp == gpu_timestamp and visible.begun_observed_ns >= visible.submitted_ns and
+            visible.head_observation.sequence == iteration + 1 and visible.head_observation.observed_ns >= visible.submitted_ns and
+            visible.previous_released_ns == 0 and !try table_owner.imageFinished(product.window.?.slot, prior.image.dma));
+        try t.expect(run.display_images[product.mode.?.window].?.image.dma == selected_dma and core.ring.issued == core_point and
+            display.words[(try push.userBase(.core, 0)) / 4] == core_put and run.copy_completed == before_copies and copy.completed == before_queue);
+        try t.expectError(error.Busy, run.flipDisplayPresentationImage(prior.image.dma, deadline));
+        try t.expectError(error.Busy, run.selectDisplayPresentationImage(selected_dma));
+        words[prior_offset / 4] = 2 << 30;
+        clock += 1000; _ = target.step();
+        const released = run.flip_receipts[prior.head].?;
+        try t.expect(run.display_flip == null and run.flip_released == iteration + 1 and
+            released.previous_released_ns > released.begun_observed_ns and native.released == before_released and
+            old.surface.target.?.gpu.lease.id != 0 and candidate.surface.target.?.gpu.lease.id != 0);
+        try run.selectDisplayPresentationImage(selected_dma);
+    }
+    try t.expect(run.presentation == old and target.session.?.tx_sequence == before_rpc);
+    checkpoint = "retire inactive candidate";
+    var retired = false;
+    for (0..100) |_| {
+        retired = try run.retireDisplayPresentationImage(dma, deadline);
+        if (retired) break;
+        clock += 1000; _ = target.step(); try t.expect(target.phase == .ready);
+        if (run.buffer_active != null) try replyCopyMapping(target);
+    }
+    try t.expect(retired and run.presentation_slots[1] == null and copy.replacementReferences() == 0 and
+        copy.borrowed_releases == 0 and copy.dma[1].lease.id == 0);
+    copy.replacement_lent = false;
+    try run.removeDisplayImage(product.engine.?, product.mode.?.window, dma);
+    try run.uploadDisplayTable(product.engine.?, product.copy.?, deadline);
+    try pumpLiveTable(target, &gpu_table, 1);
+    for (0..80) |_| {
+        clock += 1000; _ = target.step(); try t.expect(target.phase == .ready);
+        if (!native.slots[index].live and run.native_active == null) break;
+        if (run.activeChannel().?.phase == .waiting) try replyNativeProduct(target);
+    }
+    try t.expect(!native.slots[index].live and run.native_active == null and native.released == before_released + 1);
+}
 fn checkPresentationReplacement(target: *@import("gsp_device.zig").Device) !void {
     const run = &target.running; const product = &target.native_output;
     const copy = @import("gsp_copy_test_model.zig").Model;
     const native = @import("gsp_vram_test_model.zig").Model;
+    const prior_released = native.released;
     const table_owner = run.display_resources_slot.owner.?;
     const old = run.presentation.?;
     const old_pixels = copy.vram_data;
@@ -3710,7 +3926,7 @@ fn checkPresentationReplacement(target: *@import("gsp_device.zig").Device) !void
                 if (!native.slots[old_native].live and run.native_active == null) break;
                 if (run.activeChannel().?.phase == .waiting) try replyNativeProduct(target);
             }
-            try t.expect(!native.slots[old_native].live and run.native_active == null and native.released == 4 and
+            try t.expect(!native.slots[old_native].live and run.native_active == null and native.released == prior_released + 2 and
                 native.slots[index].live and candidate.surface.valid() and copy.replacement_lent and copy.borrowed_releases == 0);
             try t.expectError(error.Stale, run.selectDisplayPresentationImage(product.dma));
             return;
@@ -3748,7 +3964,7 @@ fn checkPresentationReplacement(target: *@import("gsp_device.zig").Device) !void
             if (!native.slots[index].live and run.native_active == null) break;
             if (run.activeChannel().?.phase == .waiting) try replyNativeProduct(target);
         }
-        try t.expect(!native.slots[index].live and run.native_active == null and native.released == iteration + 3);
+        try t.expect(!native.slots[index].live and run.native_active == null and native.released == prior_released + iteration + 1);
         try t.expect(old.surface.valid() and run.presentation == old and copy.borrowed_releases == 0);
     }
 }

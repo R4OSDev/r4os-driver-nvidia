@@ -253,6 +253,7 @@ pub const Config = struct {
     signal: ?boot_mode.Signal = null,
     position: ?Point = null,
     with_position: bool = false,
+    with_core: bool = true,
 };
 pub const max_words: usize = 192;
 pub const Program = struct {
@@ -266,7 +267,7 @@ pub const Program = struct {
     }
 };
 pub fn core(config: Config) Error!Program {
-    if (config.kind != .core or config.scanout != null or config.notifier_offset != 0 or config.position != null or config.with_position) return error.Descriptor;
+    if (config.kind != .core or config.scanout != null or config.notifier_offset != 0 or config.position != null or config.with_position or !config.with_core) return error.Descriptor;
     if (config.notifier == 0) return error.Handle;
     if (config.windows == 0 or config.windows & ~@as(u32, 0xff) != 0) return error.Bounds;
     var out: Program = .{};
@@ -336,6 +337,7 @@ pub fn core(config: Config) Error!Program {
 }
 pub fn window(config: Config) Error!Program {
     if (config.kind != .window or config.notifier == 0 or config.notifier_offset > 16 or config.notifier_offset & 15 != 0 or config.signal != null or config.position != null) return error.Descriptor;
+    if (!config.with_core and (config.initialize or config.with_position)) return error.Descriptor;
     const value = config.scanout orelse return error.Descriptor;
     const route = config.route orelse return error.Descriptor;
     try image.validate(value);
@@ -363,13 +365,13 @@ pub fn window(config: Config) Error!Program {
         // 1-K1, color keys disabled; other composition inputs are explicit.
         try out.method(0x2ec, &.{ 0, 255, 0x4422, 0xffff0000, 0xffff0000, 0xffff0000, 0xffff0000 });
     }
-    try out.method(0x370, &.{ 1, 0 }); // Interlock with the corresponding core UPDATE.
+    try out.method(0x370, &.{ @intFromBool(config.with_core), 0 });
     try out.method(0x200, &.{if (config.with_position) @as(u32, 0x1001) else 1});
     return out;
 }
 pub fn immediate(config: Config) Error!Program {
     if (config.kind != .immediate or config.notifier != 0 or config.notifier_offset != 0 or config.scanout != null or
-        config.signal != null or config.with_position) return error.Descriptor;
+        config.signal != null or config.with_position or !config.with_core) return error.Descriptor;
     const point = config.position orelse return error.Descriptor;
     const route = config.route orelse return error.Descriptor;
     if (route.window >= 8 or route.head >= 8 or config.windows & (@as(u32, 1) << @intCast(route.window)) == 0 or
