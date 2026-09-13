@@ -32,7 +32,7 @@ pub const Model = struct {
     var gpu_data: [2][length]u8 = undefined;
     pub var vram_data: [65536]u8 = undefined;
     pub var replacement_vram: [65536]u8 = undefined;
-    var extra_vram: [16][65536]u8 = undefined;
+    var extra_vram: [native.slots.len][65536]u8 = undefined;
     var replacement_native: ?usize = null;
     var replacement_descriptor: ?a.GfxBufferDescriptor = null;
     pub var replacement_lent = false;
@@ -164,9 +164,12 @@ pub const Model = struct {
         return active and (nativeSlot(job.source_buffer) == index or nativeSlot(job.target_buffer) == index);
     }
     fn heldNative() bool {
-        if (present_mode) return true; // The real display Use outlives queue jobs.
-        if (active or app_reference) return true;
-        for (references) |entry| if (entry.active and std.meta.eql(entry.buffer, native.slots[native_index].reservation.buffer)) return true;
+        return heldNativeAt(native_index);
+    }
+    fn heldNativeAt(index: usize) bool {
+        if (index == native_index and present_mode) return true; // Display Use outlives queue jobs.
+        if (queuedNative(index) or (index == native_index and app_reference)) return true;
+        for (references) |entry| if (entry.active and std.meta.eql(entry.buffer, native.slots[index].reservation.buffer)) return true;
         return false;
     }
     pub fn enqueue(readback: bool) void {
@@ -246,7 +249,7 @@ pub const Model = struct {
         if (status == a.gfx_queue_result_complete) std.debug.assert(signaled and executed);
         active = false; result = status; completed += 1;
         for ([_]a.GfxBufferHandle{ job.source_buffer, job.target_buffer }) |buffer| if (nativeSlot(buffer)) |i| {
-            native.slots[i].imported = if (i == native_index) heldNative() else false;
+            native.slots[i].imported = heldNativeAt(i);
         };
         return a.gfx_queue_ok;
     }
@@ -325,8 +328,10 @@ pub const Model = struct {
             std.debug.assert(shadow_live and !shadow_cpu); shadow_live = false; return a.gfx_buffer_result_ok;
         }
         const index = select(input.*) orelse { const call: *const fn (*const a.GfxBufferHandle) callconv(.c) i32 = @ptrFromInt(original.buffer_release); return call(input); };
-        std.debug.assert(references[index].active); references[index].active = false;
-        native.slots[native_index].imported = heldNative(); return a.gfx_buffer_result_ok;
+        std.debug.assert(references[index].active);
+        const buffer = references[index].buffer; references[index].active = false;
+        if (nativeSlot(buffer)) |slot| native.slots[slot].imported = heldNativeAt(slot);
+        return a.gfx_buffer_result_ok;
     }
     fn acquire(input: *const a.GfxBufferHandle, request: *const a.GfxDeviceRequest, out: *a.GfxDeviceLease) callconv(.c) i32 {
         const index = select(input.*) orelse {
@@ -409,7 +414,7 @@ pub const Model = struct {
         }
         return error.GpuAddress;
     }
-    pub fn imageBytes(index: usize) []const u8 {
+    pub fn imageBytes(index: usize) []u8 {
         return if (replacement_native == index) &replacement_vram else if (index == native_index) &vram_data else &extra_vram[index];
     }
     pub fn fetch(owner: *@import("gsp_fifo.zig").Owner, mmio: []const u8) !void {
