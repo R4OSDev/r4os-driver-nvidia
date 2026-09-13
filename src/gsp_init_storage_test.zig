@@ -1545,7 +1545,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         context_display_present, context_display_present_timeout, context_display_present_fault,
         context_display_present_initial_timeout, context_display_present_initial_fault, context_display_present_initial_release,
         context_display_present_initial_acquire, context_display_present_initial_retry,
-        context_native_unknown, context_native_connected, context_native_prepare_reject,
+        context_native_unknown, context_native_connected, context_native_jobs, context_native_job_timeout, context_native_prepare_reject,
         context_native_receipt, context_native_timeout, context_native_link_reject, context_native_stale,
         context_native_mode_missing, context_native_mode_reject, context_native_mode_free_reject,
         context_native_mode_clock, context_native_mode_impossible, context_native_mode_timeout, context_native_mode_stale,
@@ -2971,11 +2971,23 @@ const NativeCommon = struct {
     var restores: usize = 0;
     var mode_requests: [5]usize = @splat(0);
     var published = false;
+    var published_generation: u64 = 0;
+    var modes_enabled = false;
+    var mode_job: ?a.GfxDriverModeJob = null;
+    var mode_taken = false;
+    var mode_receipt: ?a.GfxDriverModeCompletion = null;
+    var mode_completions: usize = 0;
     var scenario: []const u8 = "";
     fn is(name: []const u8) bool { return std.mem.eql(u8, scenario, name); }
+    fn hasModes() bool { return is("context_native_jobs") or is("context_native_job_timeout"); }
     fn outputs(out: *a.GfxDriverOutputApi) callconv(.c) i32 {
         _ = CatalogModel.query(out);
         out.publish = @intFromPtr(&publish); out.withdraw = @intFromPtr(&withdraw);
+        if (hasModes()) {
+            out.mode_enable = @intFromPtr(&enableModes);
+            out.mode_take = @intFromPtr(&takeMode);
+            out.mode_complete = @intFromPtr(&completeMode);
+        }
         return a.gfx_output_ok;
     }
     fn display(out: *a.GfxDriverDisplayApi) callconv(.c) i32 {
@@ -2983,16 +2995,48 @@ const NativeCommon = struct {
         return a.gfx_output_ok;
     }
     fn publish(input: *const a.GfxOutputPublication, out: *a.GfxOutputId) callconv(.c) i32 {
-        std.debug.assert(!published and input.info.identity.connector_id == 4 and input.info.mode_count == 1 and
-            input.info.limits.flags == 0 and input.modes[0].flags & a.gfx_output_mode_geometry_only != 0 and
-            std.meta.eql(input.backend, @import("gsp_copy_test_model.zig").Model.binding));
+        std.debug.assert(input.info.identity.connector_id == 4 and std.meta.eql(input.backend, @import("gsp_copy_test_model.zig").Model.binding));
+        if (input.info.limits.flags == a.gfx_output_limit_modeset) {
+            std.debug.assert(published and modes_enabled and hasModes() and input.info.mode_count == 2 and
+                input.modes[0].width == 65 and input.modes[1].width == 96 and input.info.limits.bandwidth_bytes_per_second > 0);
+            published_generation += 1;
+        } else {
+            std.debug.assert(!published and input.info.mode_count == 1 and input.info.limits.flags == 0 and
+                input.modes[0].flags & a.gfx_output_mode_geometry_only != 0);
+            published_generation = 15;
+        }
         publication = input.*; published = true;
-        out.* = input.info.identity; out.connection_generation = 15;
+        out.* = input.info.identity; out.connection_generation = published_generation;
         return a.gfx_output_ok;
     }
     fn withdraw(input: *const a.GfxOutputId) callconv(.c) i32 {
-        std.debug.assert(published and input.connector_id == 4 and input.connection_generation == 15);
+        std.debug.assert(published and input.connector_id == 4 and input.connection_generation == published_generation);
         published = false; return a.gfx_output_ok;
+    }
+    fn enableModes(input: *const a.GfxBackendBinding) callconv(.c) i32 {
+        std.debug.assert(hasModes() and !modes_enabled and commits == 1 and target.native_output.phase == .active and
+            std.meta.eql(input.*, @import("gsp_copy_test_model.zig").Model.binding));
+        modes_enabled = true; return a.gfx_output_ok;
+    }
+    fn takeMode(input: *const a.GfxBackendBinding, out: *a.GfxDriverModeJob) callconv(.c) i32 {
+        std.debug.assert(modes_enabled and std.meta.eql(input.*, @import("gsp_copy_test_model.zig").Model.binding));
+        if (mode_job == null or mode_taken) return 0;
+        mode_taken = true; out.* = mode_job.?; return a.gfx_output_ok;
+    }
+    fn completeMode(input: *const a.GfxDriverModeCompletion) callconv(.c) i32 {
+        std.debug.assert(mode_taken and mode_job != null and mode_receipt == null and input.ticket == mode_job.?.ticket and
+            input.sequence == mode_job.?.sequence and input.operation == mode_job.?.operation);
+        if (input.outcome != a.gfx_output_outcome_lost) {
+            const run = &target.running; const owner = &target.native_output.modes;
+            std.debug.assert(run.copy_job == null and run.initial_image == null and run.display_work == null and
+                run.presentation.?.surface.valid() and @import("gsp_copy_test_model.zig").Model.borrowed_releases == 0);
+            if (input.outcome == a.gfx_output_outcome_applied) {
+                std.debug.assert(input.quiesced == 1 and run.presentation.?.surface.scanout.?.dma == owner.candidate);
+            } else std.debug.assert(input.quiesced == 2 and run.presentation.?.surface.scanout.?.dma ==
+                (if (owner.previous) |previous| previous.image.dma else target.native_output.dma));
+            if (input.operation != a.gfx_mode_operation_apply) std.debug.assert(run.native_active == null and run.buffer_active == null);
+        }
+        mode_receipt = input.*; mode_completions += 1; return a.gfx_output_ok;
     }
     fn prepare(input: *const a.GfxNativeRegistration, generation: u64, out: *a.GfxNativeState) callconv(.c) i32 {
         std.debug.assert(published and prepares == 0 and generation == target.display_epoch and
@@ -3065,6 +3109,8 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
     NativeCommon.target = target; NativeCommon.scenario = scenario;
     NativeCommon.prepares = 0; NativeCommon.commits = 0; NativeCommon.restores = 0; NativeCommon.published = false; NativeCommon.registration = .{};
     NativeCommon.mode_requests = @splat(0);
+    NativeCommon.published_generation = 0; NativeCommon.modes_enabled = false; NativeCommon.mode_job = null;
+    NativeCommon.mode_taken = false; NativeCommon.mode_receipt = null; NativeCommon.mode_completions = 0;
     for (&NativeCommon.pixels, 0..) |*byte, i| byte.* = @truncate(i * 17 + 23);
     table.gfx_output_query = NativeCommon.outputs; table.gfx_display_query = NativeCommon.display;
     captured.boot.display = target.ctx.?.graphicsDisplay();
@@ -3088,7 +3134,7 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
     vectors.outputFixture(&run.outputs.data, run.epoch, run.graph.?.reservation.client);
     run.output_generation = run.outputs.data.generation; run.output_refresh = false;
     run.output_next_ns = clock + std.time.ns_per_s; run.outputs.invalidated = false;
-    if (NativeCommon.is("context_native_connected")) try @import("gsp_receiver_mode_test.zig").install(&run.outputs.data.receivers[0]);
+    if (NativeCommon.is("context_native_connected") or NativeCommon.hasModes()) try @import("gsp_receiver_mode_test.zig").install(&run.outputs.data.receivers[0]);
     try target.native_output.request(&target.ctx.?, run, captured);
     var counts: FifoCounts = .{};
     var steps: usize = 0;
@@ -3183,14 +3229,14 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
     try t.expect(steps < 1200 and !copy.shadow_cpu and
         copy.shadow_creates == @as(usize, if (early_mode_failure) 0 else 1) and
         NativeCommon.prepares == @as(usize, if (early_mode_failure) 0 else 1));
-    const success = NativeCommon.is("context_native_unknown") or NativeCommon.is("context_native_connected");
+    const success = NativeCommon.is("context_native_unknown") or NativeCommon.is("context_native_connected") or NativeCommon.hasModes();
     if (success) {
         try t.expect(target.phase == .ready and target.native_output.phase == .active and NativeCommon.commits == 1 and captured.boot.native_adopted);
         try t.expect(target.native_output.ownsNative(DeviceModel.boot_info));
         var stale = DeviceModel.boot_info; stale.generation += 1;
         try t.expect(!target.native_output.ownsNative(stale));
         const flags = NativeCommon.publication.info.flags;
-        try t.expect((flags & a.gfx_output_flag_connected != 0) == NativeCommon.is("context_native_connected"));
+        try t.expect((flags & a.gfx_output_flag_connected != 0) == (NativeCommon.is("context_native_connected") or NativeCommon.hasModes()));
         try t.expect((flags & a.gfx_output_flag_connection_unknown != 0) == NativeCommon.is("context_native_unknown"));
         try t.expect(NativeCommon.publication.info.limits.flags == 0 and NativeCommon.publication.info.mode_count == 1);
         try t.expect(target.step() != .stopped and target.failure == null);
@@ -3203,6 +3249,8 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
             clock += 1000;
             _ = target.step();
             if (run.buffer_active != null) try replyCopyMapping(target);
+            if (NativeCommon.hasModes() and run.activeChannel().?.phase == .waiting and run.buffer_active == null)
+                try replyNativeProduct(target);
             if (run.copy_job) |*job| if (job.submitted) {
                 const channel = run.fifos[target.native_output.copy.?.slot].owner.?;
                 if (!initial_fetched) {
@@ -3213,6 +3261,17 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
             if (copy.completed == 1) break;
         }
         try t.expect(copy.completed == 1 and copy.result == a.gfx_queue_result_complete and target.failure == null);
+        if (NativeCommon.is("context_native_job_timeout")) {
+            checkpoint = "common mode DMA timeout";
+            try checkNativeModeTimeout(target);
+            _ = target.stop();
+            try t.expect(native.released == 0 and display.released == 0 and !NativeCommon.published);
+            return;
+        }
+        if (NativeCommon.is("context_native_jobs")) {
+            checkpoint = "common native mode jobs";
+            try checkNativeModeJobs(target);
+        }
         if (NativeCommon.is("context_native_unknown")) {
             checkpoint = "fresh mode query";
             const handle = target.native_output.mode_control.?;
@@ -3269,7 +3328,160 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
     }
     checkpoint = "stop";
     _ = target.stop();
-    try t.expect(native.released == @as(u32, if (NativeCommon.is("context_native_connected")) 4 else 0) and display.released == 0 and !NativeCommon.published);
+    try t.expect(native.released == @as(u32, if (NativeCommon.is("context_native_connected")) 4 else if (NativeCommon.is("context_native_jobs")) 2 else 0) and display.released == 0 and !NativeCommon.published);
+}
+fn checkNativeModeTimeout(target: *@import("gsp_device.zig").Device) !void {
+    const run = &target.running; const product = &target.native_output;
+    const native = @import("gsp_vram_test_model.zig").Model;
+    const copy = @import("gsp_copy_test_model.zig").Model;
+    for (0..100) |_| {
+        clock += 1000; _ = target.step(); try t.expect(target.phase == .ready);
+        if (product.modes.phase == .idle) break;
+        if (run.activeChannel().?.phase == .waiting) try replyNativeProduct(target);
+    }
+    try t.expect(product.modes.phase == .idle);
+    const old = run.presentation.?;
+    const index: usize = blk: { for (native.slots, 0..) |slot, i| if (!slot.live) break :blk i; return error.Capacity; };
+    const borrowed = copy.lendReplacement(index, 96, 24);
+    const mode = product.publication.modes[1];
+    NativeCommon.mode_job = .{ .ticket = 1, .sequence = 1, .operation = a.gfx_mode_operation_apply,
+        .backend = product.backend, .assignment = .{ .output = product.output, .mode_id = mode.mode_id,
+            .head_id = product.mode.?.head, .plane_id = product.mode.?.window, .pll_id = product.mode.?.head,
+            .source_width = mode.width, .source_height = mode.height, .destination_width = mode.width, .destination_height = mode.height,
+            .buffer = borrowed.buffer }, .mode = mode, .reference = borrowed, .deadline_ns = clock + std.time.ns_per_s };
+    NativeCommon.mode_taken = false; NativeCommon.mode_receipt = null;
+    var gpu_table = run.display_resources_slot.owner.?.table.image;
+    var timed_out = false;
+    for (0..200) |_| {
+        clock += 1000; _ = target.step(); try t.expect(target.phase == .ready);
+        if (run.buffer_active != null) { try replyCopyMapping(target); continue; }
+        if (run.activeChannel().?.phase == .waiting) { try replyNativeProduct(target); continue; }
+        if (run.display_upload_job) |work| if (work.operation.phase == .prepared and work.operation.part == 0)
+            try pumpLiveTable(target, &gpu_table, 2);
+        if (run.initial_image) |work| if (work.operation.submitted) {
+            try t.expect(work.operation.gpu.lease.id != 0 and NativeCommon.mode_receipt == null and run.presentation == old);
+            clock = work.deadline; _ = target.step(); timed_out = true; break;
+        };
+    }
+    try t.expect(timed_out and target.phase == .recovering and product.modes.phase == .failed and
+        product.modes.failed_phase == .image_wait and run.initial_image != null and run.initial_image.?.operation.submitted and
+        copy.initial_read.lease.id != 0 and copy.dma[1].lease.id != 0 and copy.borrowed_releases == 0 and copy.replacement_lent and
+        native.slots[index].live and native.slots[index].gpu.lease.id != 0 and native.released == 0 and run.presentation == old);
+    const receipt = NativeCommon.mode_receipt.?;
+    try t.expect(receipt.ticket == 1 and receipt.sequence == 1 and receipt.operation == a.gfx_mode_operation_apply and
+        receipt.outcome == a.gfx_output_outcome_lost and receipt.quiesced == 0 and receipt.error_code == a.gfx_output_error_timeout);
+}
+fn checkNativeModeJobs(target: *@import("gsp_device.zig").Device) !void {
+    const run = &target.running; const product = &target.native_output;
+    const native = @import("gsp_vram_test_model.zig").Model;
+    const copy = @import("gsp_copy_test_model.zig").Model;
+    const old = run.presentation.?;
+    const pixels = copy.vram_data;
+    var checkpoint: []const u8 = "catalog";
+    errdefer |err| std.debug.print("native mode jobs: {s} at={s} phase={s} failed-phase={?} fail={?} receipt={?} taken={}\n",
+        .{@errorName(err),checkpoint,@tagName(product.modes.phase),product.modes.failed_phase,product.modes.failure,NativeCommon.mode_receipt,NativeCommon.mode_taken});
+    for (0..100) |_| {
+        clock += 1000; _ = target.step(); try t.expect(target.phase == .ready);
+        if (product.modes.phase == .idle) break;
+        if (run.activeChannel().?.phase == .waiting) try replyNativeProduct(target);
+    }
+    try t.expect(product.modes.phase == .idle and NativeCommon.modes_enabled and product.output.connection_generation == 16 and
+        product.publication.info.mode_count == 2 and product.publication.info.limits.flags == a.gfx_output_limit_modeset and
+        product.shadow.reference.id == 0 and run.require_mode_receipt);
+    for (0..2) |iteration| {
+        const index: usize = blk: { for (native.slots, 0..) |slot, i| if (!slot.live) break :blk i; return error.Capacity; };
+        const borrowed = copy.lendReplacement(index, 96, 24);
+        for (&copy.host[1], 0..) |*byte, i| byte.* = @truncate(i * 31 + 9 + iteration);
+        const mode = product.publication.modes[1];
+        var job: a.GfxDriverModeJob = .{ .ticket = 1 + iteration * 2, .sequence = 1, .operation = a.gfx_mode_operation_apply,
+            .backend = product.backend, .assignment = .{ .output = product.output, .mode_id = mode.mode_id,
+                .head_id = product.mode.?.head, .plane_id = product.mode.?.window, .pll_id = product.mode.?.head,
+                .source_width = mode.width, .source_height = mode.height, .destination_width = mode.width, .destination_height = mode.height,
+                .buffer = borrowed.buffer }, .mode = mode, .reference = borrowed, .deadline_ns = clock + std.time.ns_per_s };
+        checkpoint = "apply";
+        NativeCommon.mode_job = job; NativeCommon.mode_taken = false; NativeCommon.mode_receipt = null;
+        try pumpNativeModeJob(target);
+        const applied = NativeCommon.mode_receipt.?;
+        try t.expect(applied.outcome == a.gfx_output_outcome_applied and applied.quiesced == 1 and applied.error_code == 0 and
+            product.modes.phase == .decision and run.presentation != old and old.surface.valid() and copy.replacement_lent and copy.borrowed_releases == 0);
+        const image = run.presentation.?.surface.scanout.?;
+        try t.expect(image.width == 96 and image.height == 24 and image.dma == product.modes.candidate);
+        for (0..24) |y| try t.expectEqualSlices(u8, copy.host[1][y * 384..][0..384], copy.replacement_vram[y * image.pitch..][0..384]);
+        try t.expectEqualSlices(u8, &pixels, &copy.vram_data);
+        var duplicate: a.GfxDriverModeJob = .{};
+        try t.expect(product.outputs.?.takeMode(&product.backend, &duplicate) == 0);
+        job.sequence += 1; job.deadline_ns = clock + std.time.ns_per_s;
+        job.operation = if (iteration == 0) a.gfx_mode_operation_rollback else a.gfx_mode_operation_confirm;
+        checkpoint = if (iteration == 0) "rollback" else "confirm";
+        NativeCommon.mode_job = job; NativeCommon.mode_taken = false; NativeCommon.mode_receipt = null;
+        try pumpNativeModeJob(target);
+        try t.expect(product.modes.phase == .idle and native.released == iteration + 1 and copy.borrowed_releases == 0);
+        const completed = NativeCommon.mode_receipt.?;
+        if (iteration == 0) {
+            try t.expect(completed.outcome == a.gfx_output_outcome_old_preserved and completed.quiesced == 2 and
+                run.presentation == old and old.surface.valid() and copy.replacementReferences() == 0 and !native.slots[index].live);
+            try t.expectEqualSlices(u8, &pixels, &copy.vram_data);
+            // A known unsupported apply preserves the current image without
+            // an allocation, hardware submit or release of the borrowed BO.
+            checkpoint = "reject invalid timing";
+            job.ticket = 2; job.sequence = 1; job.operation = a.gfx_mode_operation_apply;
+            job.mode.pixel_clock_hz += 1; job.deadline_ns = clock + std.time.ns_per_s;
+            const sequence = target.session.?.tx_sequence;
+            NativeCommon.mode_job = job; NativeCommon.mode_taken = false; NativeCommon.mode_receipt = null;
+            try pumpNativeModeJob(target);
+            try t.expect(NativeCommon.mode_receipt.?.outcome == a.gfx_output_outcome_old_preserved and
+                NativeCommon.mode_receipt.?.error_code == a.gfx_output_error_unsupported and target.session.?.tx_sequence == sequence and
+                run.presentation == old and native.released == 1 and copy.borrowed_releases == 0);
+            copy.replacement_lent = false; // Only the modeled common owner ends this loan.
+        } else try t.expect(completed.outcome == a.gfx_output_outcome_applied and completed.quiesced == 1 and
+            run.presentation_slots[0] == null and run.presentation.?.surface.scanout.?.dma == image.dma and
+            native.slots[index].live and copy.replacement_lent);
+    }
+    try t.expect(NativeCommon.mode_completions == 5 and product.modes.completed_ticket == 3 and
+        NativeCommon.commits == 1 and product.callback_confirmed);
+    NativeCommon.mode_job = null; NativeCommon.mode_taken = false; NativeCommon.mode_receipt = null;
+}
+fn pumpNativeModeJob(target: *@import("gsp_device.zig").Device) !void {
+    const run = &target.running; const product = &target.native_output;
+    const copy = @import("gsp_copy_test_model.zig").Model;
+    const note = run.display_resources_slot.owner.?.publishedNotifier(product.window.?.slot).?;
+    const words: [*]u32 = @ptrFromInt(note.cpu.cpu_address);
+    const fifo = run.fifos[product.copy.?.slot].owner.?;
+    const raw: [*]const u8 = @ptrFromInt(target.port.window.cpu_address);
+    var gpu_table = run.display_resources_slot.owner.?.table.image;
+    var fetched = false;
+    var retirement_observed = false;
+    for (0..400) |_| {
+        if (product.modes.phase == .commit) {
+            // The currently inactive old record can now reach FINISHED.
+            // The new image's own BEGUN receipt remains independent.
+            if (note.window_used & (@as(u2, 1) << @intCast((note.offset ^ 16) / 16)) != 0) words[(note.offset ^ 16) / 4] = 2 << 30;
+        }
+        if (product.modes.phase == .retire_shadow) {
+            const table_owner = run.display_resources_slot.owner.?;
+            const index = table_owner.table.indexOf(product.window.?.slot, product.modes.retire_dma).?;
+            const use = table_owner.last_window_use[index].?;
+            if (!retirement_observed) {
+                try t.expect(NativeCommon.mode_receipt == null);
+                retirement_observed = true;
+            } else words[use.offset / 4] = 2 << 30;
+        }
+        clock += 1000; _ = target.step();
+        try t.expect(target.phase == .ready);
+        if (NativeCommon.mode_receipt != null) return;
+        if (run.buffer_active != null) { try replyCopyMapping(target); continue; }
+        if (run.activeChannel().?.phase == .waiting) { try replyNativeProduct(target); continue; }
+        if (run.display_upload_job) |work| {
+            if (work.operation.phase == .prepared and work.operation.part == 0)
+                try pumpLiveTable(target, &gpu_table, if (run.display_resources_slot.owner.?.table.change.?.remove) 1 else 2);
+        }
+        if (run.initial_image) |work| if (work.operation.submitted) {
+            if (!fetched) { try copy.fetch(fifo, raw[0..@intCast(target.port.window.byte_length)]); try copy.execute(); fetched = true; }
+            else try copy.signal();
+        };
+        if (run.display_work != null) try pumpReceiverImage(target);
+    }
+    return error.Timeout;
 }
 fn checkPresentationReplacement(target: *@import("gsp_device.zig").Device) !void {
     const run = &target.running; const product = &target.native_output;
@@ -3366,7 +3578,7 @@ fn checkPresentationReplacement(target: *@import("gsp_device.zig").Device) !void
         if (iteration == 1) {
             checkpoint = "confirm replacement";
             // Confirmation keeps the new image selected and retires the old
-            // slot, including both its initial-upload and Present mappings.
+            // slot, including the mapping reused by upload and Present.
             words[(note.offset ^ 16) / 4] = 2 << 30;
             const old_native = old.surface.target.?.info().?.reference.buffer.id - 801;
             var retired = false;

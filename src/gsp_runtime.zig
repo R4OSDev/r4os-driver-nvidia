@@ -175,6 +175,7 @@ pub const Owner = struct {
     display_images: [8]?ActiveDisplayImage = @splat(null),
     presentation_slots: [2]?Presentation = @splat(null),
     presentation: ?*Presentation = null,
+    require_mode_receipt: bool = false,
     initial_image: ?InitialImage = null,
     rm_rejection: ?u32 = null,
     outputs: outputs.Owner = .{},
@@ -817,7 +818,7 @@ pub const Owner = struct {
         self.display_work.?.link = .{ .plan = link };
     }
     fn modeAdmission(self: *Owner, root: DisplayEngineHandle, plan: boot_mode.Plan) !u64 {
-        if (plan.receiver_mode_id == 0) return 0;
+        if (plan.receiver_mode_id == 0 and !self.require_mode_receipt) return 0;
         if (self.mode_control_active) return error.Busy;
         const owner = if (self.mode_control_owner) |*value| value else return error.State;
         if (self.mode_control_root == null or !std.meta.eql(self.mode_control_root.?, root)) return error.Stale;

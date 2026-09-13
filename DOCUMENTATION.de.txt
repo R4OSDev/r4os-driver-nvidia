@@ -1,7 +1,7 @@
 ﻿NVIDIA: passiver Besitzer fuer 0.79.9
 ===================================
 
-Stand: 13.09.2026, NVIDIA 0.1.92. 0.79.13 ist offen; T1/T2 sind softwareseitig
+Stand: 13.09.2026, NVIDIA 0.1.93. 0.79.13 ist offen; T1/T2/T3 sind softwareseitig
 abgeschlossen. OPTION NVIDIA mode=native verbindet Bootmodus, gesicherte
 RAM-Pixel, eigene CE-/Displayressourcen und den gemeinsamen Displaybesitz.
 Empfaengermodi werden aus echter EDID abgeleitet und mit frischen
@@ -25,9 +25,16 @@ Die vom gemeinsamen Worker geliehene Referenz wird dabei nie freigegeben.
 Fall prueft 65x20/96x24, Present im neuen Bild, Rueckkehr, Wiederverwendung
 und Freigabe des alten Bildes. Verzoegerte Quittungen erhalten Ressourcen.
 Der gemeinsame Atomic-Worker ist separat mit Kernel53/EXAMPLE-SMP4 geprueft.
-NVIDIA-Modusqueue und ihre Bestaetigungs-/Rueckkehrsteuerung, sichtbare
-Moduswahl und wirksamer Restore bleiben offen. Standard bleibt passiv.
-Belege: Docs/Drivers/GrafikScanout07913.txt/.json, presentation_checkpoint.
+Der native Worker verarbeitet die gemeinsame Modusqueue. Er veroeffentlicht
+einzeln gepruefte EDID-Modi und verlangt vor Wechsel und Rueckkehr frische
+Pixeltakt-/IMP-Quittungen. Apply baut ein zweites Bild auf; Confirm entfernt
+das alte, Rollback restauriert es vor Freigabe des Kandidaten. Der gemeinsame
+Besitzer steuert die Bestaetigungsfrist. Die Device-Pruefung deckt beide
+Entscheidungen, Ablehnung ohne Allokation und ausbleibenden GPU-Upload ab.
+Timeout meldet lost ohne Ruhenachweis und haelt noch erreichbare Ressourcen.
+Sichtbare Moduswahl, vollstaendiger Boot-Restore und Diagnose bleiben offen.
+Standard bleibt passiv. Belege: Docs/Drivers/GrafikScanout07913.txt/.json,
+mode_product_checkpoint.
 Physische Abnahmen: ExFiles/Reports/OssiGPU.txt.
 Die folgenden aelteren Abschnitte beschreiben ihren damaligen Stand.
 

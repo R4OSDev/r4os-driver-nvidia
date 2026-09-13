@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.92; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.93; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -12,7 +12,7 @@ Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
 
-Native output (NVIDIA 0.1.92):
+Native output (NVIDIA 0.1.93):
 Explicit `OPTION NVIDIA mode=native` now drives resource allocation and the
 common handoff from the serialized Device worker: actual CE engine/context,
 display masks, private VRAM/RAMHT, Core/Window/WIMM, SYSTEM shadow, output
@@ -49,7 +49,15 @@ only acknowledged WIMM/Window/Core/HDMI output can select it for Present.
 The former image remains available for rollback. Retirement drains all
 inactive shadow mappings and owned imports before RAMHT/native storage;
 the common worker's borrowed reference is never released by NVIDIA.
-NVIDIA mode-job handling and its confirmation policy remain to be integrated.
+The native worker consumes the common apply/confirm/rollback jobs. It publishes
+only individually admitted EDID modes, with fresh source-clock/IMP checks again
+for each actual switch and rollback. Its limits describe that admitted catalog,
+not measured throughput. Apply allocates and uploads a separate image; confirm
+retires the former one, while rollback restores it before candidate retirement.
+The common owner controls the confirmation timer. Initial creator ownership is
+closed after handoff; retained display uses resolve the old storage thereafter.
+An unchanged-state rejection reports old-preserved. Unknown submitted effects
+report lost with no quiescence and retain the borrowed source and native owners.
 
 Receiver refresh cannot overwrite the owner's promoted native port.
 Unknown presence permits only authenticated held boot geometry, without
@@ -62,6 +70,9 @@ generations; physical restoration is still unimplemented and refuses to
 acknowledge quiescence. Passive bootfb remains the default.
 
 Current 51 NVIDIA groups, original-C raster/AVI vectors and module build pass.
+The existing Device fixture also drives real common mode-job callbacks through
+apply/rollback, rejection without allocation, apply/confirm and an unfinished
+GPU upload timeout. GPU/RM responses are modeled; physical output remains open.
 The existing Device case also checks two live image allocations/removals,
 exact CE ranges, delayed publication, reusable slots with fresh names and
 complete deferred RM retirement. Window use tracking covers BEGUN and

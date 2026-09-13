@@ -63,6 +63,7 @@ pub const Owner = struct {
     confirmed_image: ?runtime.ActiveDisplayImage = null,
     callback_confirmed: bool = false,
     restore_requested: bool = false,
+    modes: @import("gsp_native_modes.zig").Owner = .{},
 
     /// Explicit mode=native only. Check the common handoff API before the
     /// device worker can execute the already prepared firmware operations.
@@ -354,12 +355,18 @@ pub const Owner = struct {
                 self.last_status = self.display.?.transition(held.boot.held_generation, 0, &self.receipt);
                 if (self.last_status != a.gfx_output_ok or !self.callback_confirmed or
                     !validState(self.receipt, held.boot.held_generation, a.display_state_software_native, a.gfx_output_outcome_applied)) return error.Handoff;
+                // Present and the common bridge each imported their own alias.
+                // The boot creator must not leak after a later confirmation
+                // retires that image. Mode-job references remain borrowed.
+                self.last_status = self.memory.?.bufferRelease(&self.shadow.reference);
+                if (self.last_status != a.gfx_buffer_result_ok) return error.Retained;
+                self.shadow = .{};
                 self.next(.active);
                 self.ctx.?.logInfo("NVIDIA native-output: state=software-native boot-mode=retained shadow=system scanout=vram completion=CE,WIMM,Window,Core,HDMI common-handoff=confirmed");
             },
             .active => {
                 try self.validateRoute();
-                return false;
+                return self.modes.step(self);
             },
             .detached, .failed => return error.State,
         }
@@ -428,6 +435,7 @@ pub const Owner = struct {
     }
     pub fn quarantine(self: *Owner, err: anyerror) void {
         if (self.phase == .detached) return;
+        self.modes.quarantine(self, err);
         if (self.failure == null) { self.failure = err; self.failed_phase = self.phase; }
         self.phase = .failed;
         // Metadata withdrawal never proves physical display/DMA quiescence.
