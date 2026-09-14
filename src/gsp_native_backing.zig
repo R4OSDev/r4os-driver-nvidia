@@ -153,14 +153,22 @@ pub const Use = struct {
     gpu_stamp: a.GfxDeviceLease = .{},
     ready: bool = false,
     retained: bool = false,
+    access: u32 = 1,
 
     pub fn acquire(self: *Use, memory: r4os.driver_memory.Context, source: Source) Error!void {
+        return self.acquireAccess(memory, source, 1);
+    }
+    pub fn acquireScanout(self: *Use, memory: r4os.driver_memory.Context, source: Source) Error!void {
+        return self.acquireAccess(memory, source, 0);
+    }
+    fn acquireAccess(self: *Use, memory: r4os.driver_memory.Context, source: Source, access: u32) Error!void {
         if (self.self_address != 0) return error.Busy;
-        if (!valid(source.reference.buffer) or !valid(source.reference.reference) or source.reference.flags != 0 or
+        if (!valid(source.reference.buffer) or !valid(source.reference.reference) or
+            source.reference.flags != (if (access == 0) a.gfx_buffer_reference_immutable else @as(u32, 0)) or
             source.bytes == 0 or source.bytes > source.physical.bytes or source.physical.base == 0 or source.address == 0 or
             source.physical.base > std.math.maxInt(u64) - source.physical.bytes or source.address > std.math.maxInt(u64) - source.bytes or
             source.epoch == 0 or source.adapter == 0 or source.driver_owner == 0) return error.Descriptor;
-        self.self_address = @intFromPtr(self); self.memory = memory; self.source = source; self.source_stamp = source;
+        self.self_address = @intFromPtr(self); self.memory = memory; self.source = source; self.source_stamp = source; self.access = access;
         self.acquireInner() catch |err| {
             if (err == error.Descriptor) { self.retained = true; return err; }
             if (!self.close(true)) return error.Retained;
@@ -173,26 +181,28 @@ pub const Use = struct {
         self.reference_stamp = self.reference;
         if (imported != a.gfx_buffer_result_ok and self.reference.reference.id == 0 and self.reference.buffer.id == 0) return error.Memory;
         const ref = self.reference;
-        if (ref.version != 1 or ref.size < @sizeOf(a.GfxBufferReference) or ref.flags != 0 or ref.reserved0 != 0 or
+        if (ref.version != 1 or ref.size < @sizeOf(a.GfxBufferReference) or ref.flags != source.reference.flags or ref.reserved0 != 0 or
             !valid(ref.reference) or std.meta.eql(ref.reference, source.reference.reference) or !std.meta.eql(ref.buffer, source.reference.buffer)) return error.Descriptor;
         if (imported != a.gfx_buffer_result_ok) return error.Memory;
         // Access1 is real device use and covers the logical byte extent.
         // Access3 would only retain page-aligned mapping residency, which
         // the native backing already owns independently of this consumer.
         const acquired = memory.deviceAcquire(&ref.reference, &.{ .byte_length = source.bytes, .gpu_virtual_address = source.address,
-            .adapter_id = source.adapter, .device_generation = source.epoch, .access = 1, .address_space = 1 }, &self.gpu);
+            .adapter_id = source.adapter, .device_generation = source.epoch, .access = self.access, .address_space = 1 }, &self.gpu);
         self.gpu_stamp = self.gpu;
         if (acquired != a.gfx_buffer_result_ok and self.gpu.lease.id == 0) return error.Memory;
         const gpu = self.gpu;
         if (gpu.version != 1 or gpu.size < @sizeOf(a.GfxDeviceLease) or !valid(gpu.lease) or gpu.byte_offset != 0 or
             gpu.byte_length != source.bytes or gpu.gpu_virtual_address != source.address or gpu.device_generation != source.epoch or
-            gpu.adapter_id != source.adapter or gpu.driver_owner != source.driver_owner or gpu.access != 1 or gpu.address_space != 1 or
+            gpu.adapter_id != source.adapter or gpu.driver_owner != source.driver_owner or gpu.access != self.access or gpu.address_space != 1 or
             gpu.dma_mask != std.math.maxInt(u64)) return error.Descriptor;
         if (acquired != a.gfx_buffer_result_ok) return error.Memory;
         self.ready = true;
     }
     fn stable(self: *const Use) bool {
         return self.self_address == @intFromPtr(self) and self.memory != null and self.source != null and
+            self.access <= 1 and self.source.?.reference.flags == (if (self.access == 0) a.gfx_buffer_reference_immutable else @as(u32, 0)) and
+            (self.gpu.lease.id == 0 or self.gpu.access == self.access) and
             std.meta.eql(self.source, self.source_stamp) and std.meta.eql(self.reference, self.reference_stamp) and std.meta.eql(self.gpu, self.gpu_stamp);
     }
     pub fn info(self: *const Use) ?Source {

@@ -96,9 +96,10 @@ pub const Owner = struct {
         }
         const format = std.enums.fromInt(runtime.vram.surface.Format, request.format) orelse return error.Unsupported;
         const surface: runtime.vram.surface.Request = .{ .width = request.width, .height = request.height, .format = format, .usage = request.usage, .layout = if (request.layout == 0) .linear else .blocklinear };
-        // Scanout storage has a private contiguous/display owner. It cannot
-        // yet enter the ordinary imported CE path through queuedInfo.
-        if (request.usage & a.gfx_buffer_usage_scanout != 0) return error.Unsupported;
+        // The common descriptor remains renderable. Only the scanout role
+        // requests a verified contiguous physical extent from RM.
+        if (request.usage & a.gfx_buffer_usage_scanout != 0)
+            return running.allocateDisplaySurface(surface, deadline);
         return running.allocateNativeSurface(surface, deadline);
     }
     pub fn close(self: *Owner) void {

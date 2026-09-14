@@ -8,7 +8,7 @@ const runtime = @import("gsp_runtime.zig");
 
 pub const Phase = enum {
     detached, unavailable, catalog_next, catalog_query, catalog_wait, enable, publish,
-    idle, decision, query, query_wait, allocate, allocate_wait, bind, release_creator,
+    idle, decision, composition, query, query_wait, allocate, allocate_wait, bind, release_creator,
     table_upload, table_wait, prepare, image_upload, image_wait, commit, commit_wait,
     select, rollback_stop, rollback_wait, retire_shadow, remove_image, withdraw_upload, withdraw_wait, retire_native,
     reply, failed,
@@ -38,6 +38,7 @@ pub const Owner = struct {
     error_code: i32 = 0,
     completed_ticket: u64 = 0,
     stopping_cleanup: bool = false,
+    resume_phase: Phase = .idle,
     diagnostic: @import("gsp_mode_diagnostics.zig").Report = .{},
 
     /// Finish only partially constructed resource bindings. No new mode,
@@ -193,6 +194,11 @@ pub const Owner = struct {
                 product.ctx.?.logInfo("NVIDIA native-modes: ready source=EDID,OR-clock,IMP operation=apply,confirm,rollback");
             },
             .idle, .decision => return self.take(product),
+            .composition => {
+                if (!run.requirePrivatePresentation()) return false;
+                self.phase = self.resume_phase;
+                return self.accept(product);
+            },
             .query => {
                 try run.queryDisplayMode(product.mode_control.?, self.plan.?, self.deadline);
                 self.phase = .query_wait;
@@ -342,6 +348,14 @@ pub const Owner = struct {
         if (status != a.gfx_output_ok) return error.ModeApi;
         self.job = job; self.deadline = job.deadline_ns; self.error_code = 0; self.outcome = 0;
         self.diagnostic.begin(product, job);
+        if (!product.running.?.requirePrivatePresentation()) {
+            self.resume_phase = self.phase; self.phase = .composition;
+            return true;
+        }
+        return self.accept(product);
+    }
+    fn accept(self: *Owner, product: anytype) !bool {
+        const job = self.job orelse return error.State;
         if (job.version != 1 or job.size < @sizeOf(a.GfxDriverModeJob) or job.reserved0 != 0 or job.ticket == 0 or job.sequence == 0 or
             !std.meta.eql(job.backend, product.backend) or !std.meta.eql(job.assignment.output, product.output)) return error.Stale;
         if (self.phase == .decision) {

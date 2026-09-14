@@ -130,6 +130,7 @@ pub const Presentation = struct {
     retiring: bool = false,
     damage: ?present.Rect = null,
     render_fence: r4os.abi.GfxFence = .{},
+    direct: ?struct { job: r4os.abi.GfxDriverJob, handed_off: bool = false, retire_requested: bool = false } = null,
 };
 pub const InitialImage = struct { operation: present.Initial = .{}, mapping: ?BufferHandle = null, presentation: *Presentation, deadline: u64 };
 pub const InitialImageStatus = struct { pending: bool, completed: u32, failure: ?anyerror };
@@ -230,6 +231,9 @@ pub const Owner = struct {
     presentation_buffers: u8 = 0,
     frame_setup: ?@import("gsp_frame_setup.zig").Work = null,
     frame_ready: ?struct { image: *Presentation, deadline: u64 } = null,
+    direct_work: ?@import("gsp_direct_present.zig").Work = null,
+    direct_step: bool = false,
+    direct_enabled: bool = false,
     require_mode_receipt: bool = false,
     initial_image: ?InitialImage = null,
     audio_work: ?hdmi_audio.Work = null,
@@ -763,6 +767,17 @@ pub const Owner = struct {
             return err;
         };
     }
+    pub fn bindDirectImage(self: *Owner, root: DisplayEngineHandle, window: DisplayChannelHandle, reference: r4os.abi.GfxBufferReference) !u32 {
+        if (!self.direct_step or self.direct_work == null or self.presentation == null or !std.meta.eql(self.presentation.?.window, window)) return error.State;
+        const parent = try self.mutableDisplayTable(root);
+        const resources = try self.ensureDisplayResources(parent);
+        for (&self.native_buffers) |*slot| if (slot.owner) |source| if (source.scanoutInfo(reference)) |value| {
+            if (value.surface.descriptor.width != self.presentation.?.surface.descriptor.width or
+                value.surface.descriptor.height != self.presentation.?.surface.descriptor.height) return error.Unsupported;
+            return resources.bindScanout(window.slot, source, reference);
+        };
+        return error.Unsupported;
+    }
     pub fn createDisplayNotifier(self: *Owner, handle: DisplayEngineHandle, kind: display_channel.wire.Kind, index: u32) !u32 {
         if (kind == .immediate) return error.Unsupported; // Completion belongs to the coupled Window/Core.
         const parent = try self.idleDisplayTable(handle);
@@ -1184,16 +1199,16 @@ pub const Owner = struct {
     /// primary position. This emits only Window methods. It does not change
     /// the common shadow binding or reinterpret its CPU-copy queue fence.
     pub fn flipDisplayPresentationImage(self: *Owner, dma: u32, deadline: u64) !void {
-        if (self.display_paused or self.deviceWorkBusy() or self.graph_closing or self.nativeObject() == null or !self.presentationValid()) return error.Busy;
+        if (self.display_paused or self.deviceWorkBusy() or (self.direct_work != null and !self.direct_step) or self.graph_closing or self.nativeObject() == null or !self.presentationValid()) return error.Busy;
         if (self.frame_ready) |ready| if (ready.image.surface.scanout.?.dma != dma) return error.Busy;
         const entry = try self.findPresentationImage(dma);
-        if (!self.preparedPresentation(entry) or entry.initial_point == 0 or entry.initial_failure != null) return error.Stale;
+        if (!self.preparedPresentation(entry) or (entry.initial_point == 0 and entry.direct == null) or entry.initial_failure != null) return error.Stale;
         const owner = try self.findDisplayChannel(entry.window);
         const root = owner.parent.info() orelse return error.State;
         const previous = self.display_images[owner.config.index] orelse return error.State;
         const image = entry.surface.scanout.?;
         if (image.dma == previous.image.dma or image.width != previous.image.width or image.height != previous.image.height or
-            image.format != previous.image.format or image.pitch != previous.image.pitch or previous.position == null or
+            image.format != previous.image.format or previous.position == null or
             previous.core_point == 0 or previous.window_point == 0 or previous.boot_mode == null or previous.link == null or
             !std.meta.eql(entry.window, self.presentation.?.window)) return error.Unsupported;
         _ = try self.headObservation(previous.head);
@@ -1212,7 +1227,7 @@ pub const Owner = struct {
                 .route = .{ .window = owner.config.index, .head = previous.head }, .scanout = image } },
             .receipt = .{ .epoch = self.epoch, .sequence = self.flip_issued, .head = previous.head, .window = owner.config.index,
                 .previous_dma = previous.image.dma, .image_dma = dma, .render_point = entry.initial_point,
-                .source_timeline = entry.render_fence.timeline, .source_point = entry.render_fence.point } };
+                .source_timeline = entry.render_fence.timeline, .source_point = entry.render_fence.point, .direct = entry.direct != null } };
     }
     fn headSource(self: *const Owner, head: u32) !*const @import("gsp_head_events.zig").Head {
         const source = self.head_events orelse return error.Unsupported;
@@ -1285,8 +1300,8 @@ pub const Owner = struct {
             work.receipt.epoch != self.epoch or work.receipt.sequence != self.flip_issued or work.receipt.head != route.head or work.receipt.window != route.window or
             work.receipt.image_dma != image.dma or work.receipt.previous_dma != work.previous.image.dma or work.receipt.render_point != entry.initial_point or
             work.receipt.source_timeline != entry.render_fence.timeline or work.receipt.source_point != entry.render_fence.point or
-            entry.initial_point == 0 or entry.initial_failure != null or image.dma == work.previous.image.dma or
-            image.width != work.previous.image.width or image.height != work.previous.image.height or image.pitch != work.previous.image.pitch or
+            (entry.initial_point == 0 and entry.direct == null) or work.receipt.direct != (entry.direct != null) or entry.initial_failure != null or image.dma == work.previous.image.dma or
+            image.width != work.previous.image.width or image.height != work.previous.image.height or
             image.format != work.previous.image.format or work.previous.boot_mode == null or work.previous.link == null or work.previous.position == null or
             work.previous.core_point == 0 or work.previous.window_point == 0) return error.Stale;
         const current = self.display_images[route.window] orelse return error.Stale;
@@ -1365,7 +1380,7 @@ pub const Owner = struct {
         const entry = self.presentation.?;
         const channel = self.findDisplayChannel(entry.window) catch return false;
         const active = self.display_images[channel.config.index] orelse return false;
-        return entry.initial_point != 0 and std.meta.eql(active.image, entry.surface.scanout.?);
+        return (entry.initial_point != 0 or (if (entry.direct) |direct| direct.handed_off else false)) and std.meta.eql(active.image, entry.surface.scanout.?);
     }
     fn presentationPrepared(self: *Owner) bool {
         return self.preparedPresentation(self.presentation orelse return false);
@@ -1377,6 +1392,11 @@ pub const Owner = struct {
         const channel = self.findDisplayChannel(entry.window) catch return false;
         const root = self.findDisplayEngine(entry.root) catch return false;
         const value = entry.surface.scanout.?;
+        if (entry.direct) |direct| {
+            const storage = entry.surface.target orelse return false;
+            if (storage.access != 0 or !std.meta.eql(storage.info().?.reference.buffer, direct.job.source_buffer) or
+                direct.job.operation != r4os.abi.gfx_queue_operation_direct_present or !std.meta.eql(entry.render_fence, direct.job.fence)) return false;
+        }
         return channel.info() != null and channel.parent == root and
             std.meta.eql(resources.publishedImage(entry.window.slot, value.dma), value) and
             resources.publishedStorage(entry.window.slot, value.dma) == entry.surface.target;
@@ -1402,6 +1422,26 @@ pub const Owner = struct {
         const current = self.presentation orelse return error.State;
         return self.preparePresentationImage(dma, current.surface.shadow, deadline, true);
     }
+    pub fn prepareDirectImage(self: *Owner, dma: u32, job: r4os.abi.GfxDriverJob, deadline: u64) !void {
+        if (!self.direct_step or self.direct_work == null or job.operation != r4os.abi.gfx_queue_operation_direct_present) return error.State;
+        try self.prepareDisplayFrameImage(dma, deadline);
+        const entry = try self.findPresentationImage(dma);
+        entry.direct = .{ .job = job }; entry.render_fence = job.fence;
+        self.frames_acquired +|= 1; self.frames_rendered +|= 1;
+    }
+    pub fn directPresentation(self: *Owner, dma: u32) !*Presentation { return self.findPresentationImage(dma); }
+    pub fn unregisterDirectImage(self: *Owner, dma: u32) !void {
+        if (!self.direct_step or self.direct_work == null) return error.State;
+        const entry = try self.findPresentationImage(dma);
+        if (entry.direct == null or self.presentation == entry or self.display_flip != null or self.display_work != null) return error.Busy;
+        for (&self.display_images) |active| if (active) |value| if (value.image.dma == dma) return error.Busy;
+        if (!try self.display_resources_slot.owner.?.imageFinished(entry.window.slot, dma)) return error.Busy;
+        const index = self.presentationIndex(entry) orelse return error.Stale;
+        // Its SYSTEM shadow is shared with the private composition pool.
+        // Those mappings belong to that pool and survive this direct image.
+        if (!entry.surface.closeUnregistered()) return error.Retained;
+        self.presentation_slots[index] = null;
+    }
     fn preparePresentationImage(self: *Owner, dma: u32, shadow: r4os.abi.GfxBufferReference, deadline: u64, frame: bool) !void {
         _ = try self.now();
         const current = self.presentation orelse return error.State;
@@ -1422,7 +1462,7 @@ pub const Owner = struct {
         const target = resources.publishedStorage(current.window.slot, dma) orelse return error.Stale;
         if (dma == current.surface.scanout.?.dma) return error.Stale;
         if (frame and (image.width != current.surface.descriptor.width or image.height != current.surface.descriptor.height or
-            image.format != current.surface.scanout.?.format or image.pitch != current.surface.scanout.?.pitch)) return error.Descriptor;
+            image.format != current.surface.scanout.?.format)) return error.Descriptor;
         try self.channel.?.guard(deadline);
         self.presentation_slots[index] = .{ .channel_handle = current.channel_handle, .root = current.root,
             .window = current.window, .binding = current.binding, .registered = true };
@@ -1471,6 +1511,9 @@ pub const Owner = struct {
     /// RAMHT/native image then follows removeDisplayImage. No caller BO release.
     pub fn retireDisplayPresentationImage(self: *Owner, dma: u32, deadline: u64) !bool {
         const entry = try self.findPresentationImage(dma);
+        // Direct sources share their shadow with the composition pool. Only
+        // advanceDirect may remove their DMA context and retire their fence.
+        if (entry.direct != null) return error.Busy;
         if (self.presentation == entry or self.copyBusy() or self.graph_closing) return error.Busy;
         const resources = self.display_resources_slot.owner orelse return error.State;
         for (&self.display_images) |active| if (active) |image| if (image.image.dma == dma) return error.Busy;
@@ -1491,7 +1534,7 @@ pub const Owner = struct {
     }
     fn engineWorkBusy(self: *const Owner) bool { return self.graphics_upload != null or self.graphics_work != null or self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.display_flip != null or self.initial_image != null or self.mode_control_active or self.cursor_upload != null or self.audio_work != null; }
     fn deviceWorkBusy(self: *const Owner) bool { return self.engineWorkBusy() or self.queued_render != null; }
-    fn copyBusy(self: *const Owner) bool { return self.deviceWorkBusy() or self.frame_ready != null; }
+    fn copyBusy(self: *const Owner) bool { return self.deviceWorkBusy() or self.frame_ready != null or (self.direct_work != null and !self.direct_step); }
     fn overlapFlip(self: *const Owner) bool {
         const work = self.display_flip orelse return false;
         return self.presentation_buffers == 3 and work.ordinary and
@@ -1501,7 +1544,7 @@ pub const Owner = struct {
         return self.executionAdmissionBusy() or self.queued_render != null;
     }
     fn executionAdmissionBusy(self: *const Owner) bool {
-        return self.cursor_reserving or self.graphics_upload != null or self.graphics_work != null or self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.initial_image != null or self.cursor_upload != null or self.audio_work != null or
+        return self.direct_work != null or self.cursor_reserving or self.graphics_upload != null or self.graphics_work != null or self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.initial_image != null or self.cursor_upload != null or self.audio_work != null or
             self.mode_control_active or self.frame_ready != null or (self.display_flip != null and !self.overlapFlip());
     }
     pub fn cursorWorkAvailable(self: *Owner) bool {
@@ -1594,13 +1637,13 @@ pub const Owner = struct {
     pub fn presentationGroupCount(self: *Owner, entry: *Presentation) usize {
         var count: usize = 0;
         for (&self.presentation_slots) |*slot| if (slot.*) |*peer| {
-            if (!peer.retiring and std.meta.eql(peer.surface.shadow.buffer, entry.surface.shadow.buffer)) count += 1;
+            if (!peer.retiring and peer.direct == null and std.meta.eql(peer.surface.shadow.buffer, entry.surface.shadow.buffer)) count += 1;
         };
         return count;
     }
     pub fn presentationPeer(self: *Owner, buffer: r4os.abi.GfxBufferHandle) ?u32 {
         for (&self.presentation_slots) |*slot| if (slot.*) |*peer| {
-            if (!peer.retiring and std.meta.eql(peer.surface.shadow.buffer, buffer)) return peer.surface.scanout.?.dma;
+            if (!peer.retiring and peer.direct == null and std.meta.eql(peer.surface.shadow.buffer, buffer)) return peer.surface.scanout.?.dma;
         };
         return null;
     }
@@ -1616,7 +1659,7 @@ pub const Owner = struct {
         for (0..self.presentation_slots.len) |offset| {
             const slot = &self.presentation_slots[(start + offset) % self.presentation_slots.len];
             const entry = if (slot.*) |*value| value else continue;
-            if (entry == current or !self.preparedPresentation(entry) or
+            if (entry == current or entry.direct != null or !self.preparedPresentation(entry) or
                 !std.meta.eql(entry.surface.shadow.buffer, current.surface.shadow.buffer)) continue;
             if (self.display_flip) |work| if (entry == work.presentation or entry.surface.scanout.?.dma == work.previous.image.dma) continue;
             if (try resources.imageFinished(entry.window.slot, entry.surface.scanout.?.dma)) return entry;
@@ -1628,7 +1671,21 @@ pub const Owner = struct {
         if (self.display_paused and self.frame_setup == null) return false;
         if (self.frame_setup == null and (self.presentation_buffers == 0 or !current.pending)) return false;
         if (self.frame_setup == null) {
-            if (self.presentationGroupCount(current) >= self.presentation_buffers) return false;
+            if (self.presentationGroupCount(current) >= self.presentation_buffers) {
+                // Linear native images can be filled by CE without a GR
+                // context. Publish direct capability only once a private
+                // fallback pool exists and the common lifetime API accepts it.
+                if (!self.graphics_enabled and !self.direct_enabled and self.presentation_buffers >= 2) {
+                    const backend = self.copy_backend orelse return false;
+                    if (backend.queue.supportsScanout()) {
+                        const rc = backend.queue.updateOperations(&backend.binding, 13 | 32 | 128);
+                        if (rc == r4os.abi.gfx_queue_error_busy) return error.Busy;
+                        if (rc == r4os.abi.gfx_queue_ok) { self.direct_enabled = true; return true; }
+                        if (rc != r4os.abi.err_no_fn and rc != r4os.abi.gfx_queue_error_invalid) return error.Queue;
+                    }
+                }
+                return false;
+            }
             if (self.copyBusy() or !self.presentationValid() or self.nativeObject() == null) return false;
             self.frame_setup = .{ .image = current, .deadline = (try self.now()) +| 3 * std.time.ns_per_s };
         }
@@ -1902,7 +1959,11 @@ pub const Owner = struct {
         if (copy.config.engine != .copy or copy.config.context.vaspace != info.config.context.vaspace) return error.Binding;
         const backend = self.copy_backend orelse return error.State;
         const lists = backend.queue.supportsRenderList() and self.graphics_cache.packet.info().?.bytes >= render.packet_capacity_bytes;
-        var rc = backend.queue.updateOperations(&backend.binding, if (lists) 125 else 61);
+        const direct = backend.queue.supportsScanout() and self.presentation_buffers >= 2;
+        const ordinary: u64 = if (lists) 125 else 61;
+        var rc = backend.queue.updateOperations(&backend.binding, ordinary | @as(u64, if (direct) 128 else 0));
+        self.direct_enabled = direct and rc == r4os.abi.gfx_queue_ok;
+        if (direct and rc == r4os.abi.gfx_queue_error_invalid) rc = backend.queue.updateOperations(&backend.binding, ordinary);
         if (rc == r4os.abi.gfx_queue_error_invalid and lists) rc = backend.queue.updateOperations(&backend.binding, 61);
         // Earlier common queues can still use offscreen rendering. They
         // never receive the new image-to-output operation.
@@ -2130,6 +2191,29 @@ pub const Owner = struct {
         if (result != a.gfx_queue_ok and result != a.gfx_queue_error_busy and job.fence.timeline == 0) return error.Queue;
         if (self.copy_backend == null) self.copy_backend = .{ .queue = queue, .binding = binding };
         if (result == a.gfx_queue_error_busy and job.fence.timeline == 0) return false;
+        if (result == a.gfx_queue_ok and job.operation == a.gfx_queue_operation_direct_present) {
+            const current = self.presentation orelse return error.State;
+            if (!self.direct_enabled or !queue.supportsScanout() or !self.presentationValid() or self.display_paused or
+                job.version != 1 or job.size < @sizeOf(a.GfxDriverJob) or job.reserved0 != 0 or job.reserved1 != 0 or
+                job.fence.adapter_id != binding.adapter_id or job.fence.device_generation != binding.device_generation or
+                job.fence.reset_generation != binding.reset_generation or job.fence.timeline == 0 or job.fence.point == 0 or
+                job.source_offset != 0 or job.target_offset != 0 or job.target_pitch != 0 or !std.meta.eql(job.target_buffer, a.GfxBufferHandle{}) or
+                !std.meta.eql(job.render, a.GfxRenderCommand{}) or job.byte_length != @as(u64, current.surface.descriptor.width) * 4 or
+                job.row_count != current.surface.descriptor.height or job.source_pitch < job.byte_length or job.source_pitch & 63 != 0 or
+                job.deadline_ns <= try self.now()) {
+                if (queue.complete(&job.fence, a.gfx_queue_result_failed, 1) != a.gfx_queue_ok) return error.Retained;
+                return true;
+            }
+            var free = false;
+            for (&self.presentation_slots) |*slot| if (slot.* == null) { free = true; break; };
+            if (!free) {
+                if (queue.complete(&job.fence, a.gfx_queue_result_cancelled, 1) != a.gfx_queue_ok) return error.Retained;
+                return true;
+            }
+            self.direct_work = .{ .job = job, .queue = queue, .memory = memory, .root = current.root,
+                .channel = current.channel_handle, .window = current.window, .deadline = deadline };
+            return true;
+        }
         if (result == a.gfx_queue_ok and (job.operation == a.gfx_queue_operation_render or job.operation == a.gfx_queue_operation_render_list)) {
             self.queued_render = .{};
             self.queued_render.?.open(queue, memory, binding, job, try self.now()) catch |err| { self.stop(err); return err; };
@@ -2733,6 +2817,13 @@ pub const Owner = struct {
                 var active = work.previous;
                 active.image = window.config.scanout.?; active.window_point = window.ticket.?.point;
                 self.display_images[work.receipt.window] = active;
+                if (work.presentation.direct) |*direct| if (!direct.handed_off) {
+                    // BEGUN is a physical consumer even without a subsequent
+                    // head IRQ. Transfer its lifetime so detach can proceed;
+                    // no visible timestamp or statistics are manufactured.
+                    if (self.copy_backend.?.queue.beginScanout(&direct.job.fence) != r4os.abi.gfx_queue_ok) return error.Retained;
+                    direct.handed_off = true;
+                };
                 work.retiring_activation = true;
                 return true;
             }
@@ -2767,6 +2858,10 @@ pub const Owner = struct {
                 previous.pending = false;
                 self.presentation = work.presentation;
             }
+            if (work.presentation.direct) |*direct| if (!direct.handed_off) {
+                if (self.copy_backend.?.queue.beginScanout(&direct.job.fence) != r4os.abi.gfx_queue_ok) return error.Retained;
+                direct.handed_off = true;
+            };
             self.flip_receipts[work.receipt.head] = work.receipt;
             self.flip_visible += 1;
             return true;
@@ -2791,6 +2886,106 @@ pub const Owner = struct {
         self.display_flip.?.ordinary = true;
         self.frame_ready = null;
         return true;
+    }
+    fn advanceDirect(self: *Owner, current: u64) !bool {
+        if (self.direct_work) |*work| {
+            const phase = work.phase;
+            self.direct_step = true;
+            defer self.direct_step = false;
+            const done = work.step(self, current) catch |err| {
+                if (err == error.Busy) return false;
+                return err;
+            };
+            if (done) { self.direct_work = null; return true; }
+            return self.direct_work.?.phase != phase;
+        }
+        if (self.copyBusy() or self.cursor_point != null or self.nativeObject() == null or self.graph_closing or
+            self.display_channel_active != null or self.display_engine_active or self.buffer_active != null or self.native_active != null or
+            self.fifo_active != null or self.context_active != null or self.outputs.active() or self.sequence.self_address != 0 or
+            self.channel.?.phase != .idle or self.channel.?.pending != null) return false;
+        const backend = self.copy_backend orelse return false;
+        const memory = self.ctx.?.memory() orelse return error.Api;
+        const resources = self.display_resources_slot.owner orelse return false;
+        for (&self.presentation_slots) |*slot| if (slot.*) |*entry| if (entry.direct) |direct| {
+            const dma = entry.surface.scanout.?.dma;
+            const active = self.display_images[entry.window.slot - 1];
+            if (active == null or active.?.image.dma != dma) {
+                if (!try resources.imageFinished(entry.window.slot, dma)) continue;
+                if (self.presentation == entry) {
+                    // A detached head keeps a private shadow owner while the
+                    // former direct source retires without claiming visibility.
+                    if (!self.display_paused) return error.State;
+                    const private = (try self.acquireFrame()) orelse return false;
+                    private.pending = private.pending or entry.pending; entry.pending = false;
+                    self.presentation = private;
+                }
+                self.direct_work = .{ .job = direct.job, .queue = backend.queue, .memory = memory,
+                    .root = entry.root, .channel = entry.channel_handle, .window = entry.window,
+                    .deadline = current +| 3 * std.time.ns_per_s, .phase = .unregister, .dma = dma, .activated = direct.handed_off };
+                return true;
+            }
+            if (self.display_paused or self.presentation != entry) continue;
+            const requested = backend.queue.scanoutRetireRequested(&direct.job.fence);
+            if (requested < 0) return error.Queue;
+            if (requested == 0 and !direct.retire_requested) continue;
+            const target = (try self.acquireFrame()) orelse return false;
+            self.direct_work = .{ .queue = backend.queue, .memory = memory, .root = entry.root,
+                .channel = entry.channel_handle, .window = entry.window, .deadline = current +| 3 * std.time.ns_per_s,
+                .phase = .restore, .source = entry, .target = target };
+            self.frames_acquired +|= 1;
+            return true;
+        };
+        return false;
+    }
+    pub fn requirePrivatePresentation(self: *Owner) bool {
+        if (self.presentation) |entry| if (entry.direct) |*direct| { direct.retire_requested = true; return false; };
+        if (self.direct_work != null or self.display_flip != null) return false;
+        for (&self.presentation_slots) |*slot| if (slot.*) |entry| if (entry.direct != null) return false;
+        return true;
+    }
+    pub fn directRestoreTransfer(self: *Owner) !execution_fifo.copy.wire.Transfer {
+        const work = self.direct_work orelse return error.State;
+        if (work.phase != .restore or work.source == null or work.target == null or work.source == work.target or
+            self.copy_job != null or self.display_flip != null or self.display_work != null or self.initial_image != null or
+            self.cursor_upload != null or self.graphics_work != null or self.graphics_upload != null or self.display_upload_job != null) return error.State;
+        const source = work.source.?; const target = work.target.?;
+        if (self.presentation != source or source.direct == null or target.direct != null or
+            !self.preparedPresentation(source) or !self.preparedPresentation(target) or
+            !std.meta.eql(source.window, target.window) or !std.meta.eql(source.channel_handle, work.channel)) return error.Stale;
+        const active = self.display_images[source.window.slot - 1] orelse return error.Stale;
+        const src = source.surface.scanout.?; const dst = target.surface.scanout.?;
+        if (!std.meta.eql(active.image, src) or src.width != dst.width or src.height != dst.height or src.format != dst.format or
+            !try self.display_resources_slot.owner.?.imageFinished(target.window.slot, dst.dma)) return error.Stale;
+        const source_storage = source.surface.target.?.info() orelse return error.Stale;
+        const to = target.surface.target.?.info() orelse return error.Stale;
+        if (source.surface.target.?.access != 0 or target.surface.target.?.access != 1 or source_storage.epoch != self.epoch or to.epoch != self.epoch or
+            source_storage.adapter != to.adapter or source_storage.driver_owner != to.driver_owner or source_storage.driver_owner == 0) return error.Stale;
+        const transfer: execution_fifo.copy.wire.Transfer = .{ .source = try std.math.add(u64, source_storage.address, src.offset),
+            .target = try std.math.add(u64, to.address, dst.offset), .bytes = @as(u64, src.width) * 4,
+            .rows = .{ .count = src.height, .source_pitch = src.pitch, .target_pitch = dst.pitch } };
+        if (src.offset >= source_storage.bytes or dst.offset >= to.bytes or try transfer.span(false) > source_storage.bytes - src.offset or
+            try transfer.span(true) > to.bytes - dst.offset) return error.Bounds;
+        return transfer;
+    }
+    pub fn advanceDirectRestore(self: *Owner, work: *@import("gsp_direct_present.zig").Work, current: u64) !bool {
+        if (!self.direct_step or self.direct_work == null or work != &self.direct_work.?) return error.State;
+        const transfer = try self.directRestoreTransfer();
+        const fifo = try self.findChannel(work.channel);
+        if (work.submitted) {
+            if (try fifo.ring.poll() < work.ticket.?.point) return false;
+            const target = work.target.?;
+            target.initial_point = work.ticket.?.point; target.damage = null; target.render_fence = .{};
+            self.frames_rendered +|= 1; self.copy_completed +|= 1;
+            self.copy_bytes +|= transfer.bytes * transfer.rows.?.count;
+            if (!self.display_paused) self.frame_ready = .{ .image = target, .deadline = work.deadline };
+            return true;
+        }
+        if (current >= work.deadline) return error.Timeout;
+        if (self.display_paused) return true;
+        work.ticket = try fifo.prepareCopy(transfer);
+        try self.device.?.submitCopy(fifo, work.ticket.?, work.deadline);
+        work.submitted = true;
+        return false;
     }
     fn advanceDisplayPosition(self: *Owner, work: *PositionSubmission, deadline: u64, current: u64) !bool {
         if (work.phase == .complete) return false;
@@ -3322,6 +3517,7 @@ pub const Owner = struct {
             if (try queued.step(self, current)) return .progress;
         }
         if (try self.advancePresentFrame(current)) return .progress;
+        if (try self.advanceDirect(current)) return .progress;
         // A due receiver batch gets the idle RM channel before another
         // queued frame. A continuously repainting desktop must not starve HPD.
         if (self.outputs.state != .detached and try self.beginReceiverRefresh(current)) return .progress;

@@ -3083,6 +3083,7 @@ const NativeCommon = struct {
     var automatic: ?a.GfxModeStatus = null;
     var automatic_reference: a.GfxBufferReference = .{};
     var statistics: ?a.DisplayPresentationStats = null;
+    var presentation_info: ?a.DisplayPresentationInfo = null;
     var statistics_busy = false;
     var cursor_info: ?a.DisplayCursorInfo = null;
     var cursor_job: ?a.GfxDriverCursorJob = null;
@@ -3107,7 +3108,7 @@ const NativeCommon = struct {
     }
     fn display(out: *a.GfxDriverDisplayApi) callconv(.c) i32 {
         out.* = .{ .boot_info = @intFromPtr(&DeviceModel.bootInfo), .prepare_held = @intFromPtr(&prepare), .transition = @intFromPtr(&transition),
-            .presentation_stats = @intFromPtr(&presentationStats) };
+            .presentation_stats = @intFromPtr(&presentationStats), .presentation_info = @intFromPtr(&presentationInfo) };
         if (is("context_native_connected")) { out.size = 64; out.presentation_stats = 0; }
         if (is("context_native_cursor_common")) {
             out.cursor_configure = @intFromPtr(&configureCursor); out.cursor_take = @intFromPtr(&takeCursor);
@@ -3152,10 +3153,25 @@ const NativeCommon = struct {
         } else std.debug.assert(input.visible_count == 0 and input.visible_sequence == 0 and input.visible_ns == 0 and input.irq_sequence == 0);
         statistics = input.*; return a.gfx_output_ok;
     }
+    fn presentationInfo(input: *const a.DisplayPresentationInfo) callconv(.c) i32 {
+        const product = &target.native_output; const run = &target.running;
+        std.debug.assert(product.callback_confirmed and input.version == 1 and input.size == 120 and
+            std.meta.eql(input.backend, product.backend) and input.display_generation == product.receipt.generation and
+            input.head_id == product.mode.?.head and input.width == product.mode.?.width and input.height == product.mode.?.height and
+            input.buffer_count == run.presentation_buffers and input.policies == 3 and input.path == @as(u32, if (run.presentation.?.direct != null) 2 else 1) and
+            input.flags & (a.display_presentation_info_native | a.display_presentation_info_visibility | a.display_presentation_info_synchronized) ==
+                (a.display_presentation_info_native | a.display_presentation_info_visibility | a.display_presentation_info_synchronized) and
+            (input.flags & a.display_presentation_info_direct != 0) == run.direct_enabled and input.flags & a.display_presentation_info_overlay == 0);
+        if (presentation_info) |prior| std.debug.assert(input.sequence == prior.sequence + 1 and input.observed_sequence >= prior.observed_sequence)
+        else std.debug.assert(input.sequence == 1);
+        presentation_info = input.*; return a.gfx_output_ok;
+    }
     fn checkStatistics() !void {
         const product = &target.native_output; const run = &target.running;
         try t.expect(!product.statistics.disabled);
-        if (is("context_native_connected")) { try t.expect(statistics == null and product.statistics.last == null); return; }
+        if (is("context_native_connected")) { try t.expect(statistics == null and product.statistics.last == null and presentation_info == null); return; }
+        try t.expect(!product.statistics.info_disabled and presentation_info != null);
+        try t.expectEqualDeep(product.statistics.last_info.?, presentation_info.?);
         const value = statistics orelse return error.MissingPresentationStatistics;
         try t.expectEqualDeep(product.statistics.last.?, value);
         try t.expect(value.acquired_count == run.frames_acquired and value.rendered_count == run.frames_rendered and
@@ -3335,7 +3351,7 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
     NativeCommon.published_generation = 0; NativeCommon.modes_enabled = false; NativeCommon.mode_job = null;
     NativeCommon.mode_taken = false; NativeCommon.mode_receipt = null; NativeCommon.mode_completions = 0;
     NativeCommon.automatic = null; NativeCommon.automatic_reference = .{};
-    NativeCommon.statistics = null; NativeCommon.statistics_busy = false;
+    NativeCommon.statistics = null; NativeCommon.statistics_busy = false; NativeCommon.presentation_info = null;
     NativeCommon.cursor_info = null; NativeCommon.cursor_job = null; NativeCommon.cursor_taken = false;
     NativeCommon.cursor_receipt = null; NativeCommon.cursor_reply_busy = false;
     for (&NativeCommon.pixels, 0..) |*byte, i| byte.* = @truncate(i * 17 + 23);
@@ -3508,6 +3524,8 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
         if (NativeCommon.is("context_native_unknown")) {
             checkpoint = "composed native image";
             try checkComposedNativeImage(target);
+            checkpoint = "direct native image";
+            try @import("gsp_direct_present_test.zig").check(target, &clock, replyNativeProduct, deliverNativeHead, pumpLiveTable);
         }
         if (NativeCommon.is("context_native_unknown") or NativeCommon.is("context_native_connected") or NativeCommon.cursorCase()) {
             checkpoint = "native PIO cursor";
@@ -3587,7 +3605,7 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
     }
     checkpoint = "stop";
     _ = target.stop();
-    try t.expect(native.released == @as(u32, if (NativeCommon.is("context_native_connected")) 5 else if (NativeCommon.is("context_native_jobs")) 6 else if (NativeCommon.is("context_native_unknown")) 2 else 0) and display.released == 0 and !NativeCommon.published);
+    try t.expect(native.released == @as(u32, if (NativeCommon.is("context_native_connected")) 5 else if (NativeCommon.is("context_native_jobs")) 6 else if (NativeCommon.is("context_native_unknown")) 4 else 0) and display.released == 0 and !NativeCommon.published);
 }
 fn checkNativeDetach(target: *@import("gsp_device.zig").Device) !void {
     const run = &target.running; const product = &target.native_output;

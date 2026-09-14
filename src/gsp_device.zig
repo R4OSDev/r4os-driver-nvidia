@@ -579,6 +579,12 @@ pub const Device = struct {
             if (!fifo.ring.matchesTransfer(ticket, fifo.config.object_class, work.operation.transfer() catch return error.Binding)) return error.Binding;
             try self.running.validateDisplayTableUpdate();
             break :blk work.channel_handle;
+        } else if (self.running.direct_work != null and self.running.direct_work.?.phase == .restore) blk: {
+            const work = &self.running.direct_work.?;
+            if (work.submitted or work.ticket == null or !std.meta.eql(work.ticket.?, ticket) or work.deadline != deadline) return error.Binding;
+            const transfer = self.running.directRestoreTransfer() catch return error.Binding;
+            if (!fifo.ring.matchesTransfer(ticket, fifo.config.object_class, transfer)) return error.Binding;
+            break :blk work.channel;
         } else if (self.running.initial_image) |*work| blk: {
             const entry = work.presentation;
             if (self.running.copy_job != null or !work.operation.matches(ticket, deadline)) return error.Binding;

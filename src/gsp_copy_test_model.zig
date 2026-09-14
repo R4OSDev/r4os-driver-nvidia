@@ -25,7 +25,11 @@ const fifo = @import("gsp_fifo_test_model.zig").Model;
 pub const Model = struct {
     pub const length = 12288;
     pub const binding: a.GfxBackendBinding = .{ .adapter_id = 0x01000000, .milestone = 1, .device_generation = 7, .reset_generation = 11 };
-    const Reference = struct { active: bool = false, buffer: a.GfxBufferHandle = .{}, mapping_only: bool = true };
+    const Reference = struct { active: bool = false, buffer: a.GfxBufferHandle = .{}, mapping_only: bool = true, readonly: bool = false };
+    const Scanout = struct { job: a.GfxDriverJob, retire: bool = false };
+    pub var scanouts: [3]?Scanout = @splat(null);
+    var next_point: u64 = 0;
+    var direct_mode = false;
     var references: [16]Reference = @splat(.{});
     var original: a.GfxDriverMemoryApi = .{};
     pub var host: [2][length]u8 = undefined;
@@ -79,6 +83,7 @@ pub const Model = struct {
         references = @splat(.{}); dma = @splat(.{}); gpu = @splat(.{}); queued = false; active = false;
         completed = 0; result = 0; lost = false; unregisters = 0; reject_resource = false; native_index = index; fetched = false; executed = false; signaled = false;
         present_mode = false; product_mode = false; render_mode = false; render_operations = 13; shadow_cpu = false; shadow_creates = 0;
+        direct_mode = false; scanouts = @splat(null); next_point = 0;
         shadow_live = false; registration = null; decoded_count = 0; presentation_wakes = 0;
         initial_read = .{}; reject_initial_read = false; reject_initial_release = false;
         replacement_native = null; replacement_descriptor = null; replacement_lent = false; borrowed_releases = 0; initial_index = 0;
@@ -100,6 +105,7 @@ pub const Model = struct {
         native.slots[index].imported = previous;
         app_reference = false;
         present_mode = true; product_mode = true;
+        direct_mode = native.is("context_native_unknown");
     }
     pub fn installRender(table: *a.DriverApi, index: usize) void {
         install(table, index); render_mode = true;
@@ -172,13 +178,28 @@ pub const Model = struct {
         const callback: *const fn (usize) callconv(.c) i32 = @ptrFromInt(registered.notify_callback);
         try t.expect(callback(@intCast(registered.context)) == 0);
     }
+    pub fn enqueueDirect(index: usize, deadline: u64) !void {
+        try enqueueImage(index, deadline);
+        job.operation = a.gfx_queue_operation_direct_present;
+    }
+    pub fn requestRetire(fence: a.GfxFence) void {
+        for (&scanouts) |*slot| if (slot.*) |*value| if (std.meta.eql(value.job.fence, fence)) { value.retire = true; return; };
+        unreachable;
+    }
+    pub fn heldScanouts() usize { var n: usize = 0; for (&scanouts) |*slot| if (slot.* != null) { n += 1; }; return n; }
+    pub fn beginRestore() void {
+        std.debug.assert(!active and heldScanouts() != 0);
+        fetched = false; executed = false; signaled = false;
+    }
     pub fn imagePixel(index: usize, x: u32, y: u32, log2_gobs: u5, pixel: u32) void {
         const image = native.slots[index].descriptor;
         const offset = if (image.modifier == 0) y * image.plane_pitches[0] + x * 4 else
             tileOffset(.{ .width = @intCast(image.plane_pitches[0]), .height = image.height, .x = 0, .y = 0, .log2_gobs = log2_gobs }, x * 4, y);
         std.mem.writeInt(u32, imageBytes(index)[offset..][0..4], pixel, .little);
     }
-    pub fn address(index: usize) u64 { return 0x80000000 + index * 0x100000; }
+    // Keep SYSTEM mappings in a gap between native allocation VAs. Larger
+    // frame pools can use native slot 7 at 0x80000000 as a real CE operand.
+    pub fn address(index: usize) u64 { return @as(u64, if (direct_mode) 0xe8000000 else 0x80000000) + index * 0x100000; }
     fn sys(index: usize) a.GfxBufferHandle { return .{ .id = @intCast(1101 + index), .generation = 901 }; }
     fn ref(index: usize) a.GfxBufferHandle { return .{ .id = @intCast(1501 + index), .generation = 951 }; }
     fn select(input: a.GfxBufferHandle) ?usize { for (0..references.len) |i| if (std.meta.eql(input, ref(i))) return i; return null; }
@@ -196,12 +217,15 @@ pub const Model = struct {
     fn heldNativeAt(index: usize) bool {
         if (index == native_index and present_mode) return true; // Display Use outlives queue jobs.
         if (queuedNative(index) or (index == native_index and app_reference)) return true;
+        for (&scanouts) |*slot| if (slot.*) |value| if (nativeSlot(value.job.source_buffer) == index) return true;
+        if (native.slots[index].gpu.lease.id != 0) return true;
         for (references) |entry| if (entry.active and std.meta.eql(entry.buffer, native.slots[index].reservation.buffer)) return true;
         return false;
     }
     pub fn enqueue(readback: bool) void {
         std.debug.assert(!active and !queued and !lost);
-        const point = completed + 1;
+        next_point += 1;
+        const point = next_point;
         job = .{ .fence = .{ .slot = 1, .adapter_id = binding.adapter_id, .timeline = 19, .point = point,
                 .device_generation = binding.device_generation, .reset_generation = binding.reset_generation },
             .operation = a.gfx_queue_operation_copy,
@@ -220,11 +244,15 @@ pub const Model = struct {
     }
     fn queue(out: *a.GfxDriverQueueApi) callconv(.c) i32 { out.* = .{ .size = if (product_mode or render_mode) @sizeOf(a.GfxDriverQueueApi) else 64,
         .register_backend = @intFromPtr(&register), .register_profile = if (product_mode) @intFromPtr(&registerProfile) else 0,
-        .update_operations = if (render_mode) @intFromPtr(&updateOperations) else 0,
+        .update_operations = if (render_mode or direct_mode) @intFromPtr(&updateOperations) else 0,
         .read_render_list = if (render_mode) @intFromPtr(&readRenderList) else 0,
+        .retain_scanout = if (direct_mode) @intFromPtr(&retainScanout) else 0,
+        .begin_scanout = if (direct_mode) @intFromPtr(&beginScanout) else 0,
+        .scanout_retire_requested = if (direct_mode) @intFromPtr(&retireRequested) else 0,
         .unregister_backend = @intFromPtr(&unregister), .take = @intFromPtr(&take), .retain_resource = @intFromPtr(&retain), .complete = @intFromPtr(&complete) }; return a.gfx_queue_ok; }
     fn updateOperations(input: *const a.GfxBackendBinding, operations: u64) callconv(.c) i32 {
-        std.debug.assert(render_mode and std.meta.eql(input.*, binding) and (operations == 29 or operations == 61 or operations == 125));
+        std.debug.assert(std.meta.eql(input.*, binding) and ((direct_mode and operations == 173) or
+            (render_mode and (operations == 29 or operations == 61 or operations == 125))));
         render_operations = operations; return a.gfx_queue_ok;
     }
     fn readRenderList(input: *const a.GfxFence, out: *a.GfxRenderList) callconv(.c) i32 {
@@ -276,14 +304,43 @@ pub const Model = struct {
         return a.gfx_queue_error_capacity;
     }
     fn complete(input: *const a.GfxFence, status: u32, quiesced: u32) callconv(.c) i32 {
+        for (&scanouts) |*slot| if (slot.*) |value| if (std.meta.eql(value.job.fence, input.*)) {
+            std.debug.assert(quiesced == 1 and status == a.gfx_queue_result_complete);
+            const index = nativeSlot(value.job.source_buffer).?;
+            std.debug.assert(native.slots[index].gpu.lease.id == 0);
+            slot.* = null; completed += 1; result = status;
+            native.slots[index].imported = heldNativeAt(index);
+            return a.gfx_queue_ok;
+        };
         std.debug.assert(active and !lost and std.meta.eql(input.*, job.fence) and quiesced == 1);
         std.debug.assert(status == a.gfx_queue_result_complete or status == a.gfx_queue_result_failed or status == a.gfx_queue_result_cancelled);
-        if (status == a.gfx_queue_result_complete) std.debug.assert(signaled and executed);
+        if (status == a.gfx_queue_result_complete) std.debug.assert(job.operation != a.gfx_queue_operation_direct_present and signaled and executed);
         active = false; result = status; completed += 1;
         for ([_]a.GfxBufferHandle{ job.source_buffer, job.target_buffer }) |buffer| if (nativeSlot(buffer)) |i| {
             native.slots[i].imported = heldNativeAt(i);
         };
         return a.gfx_queue_ok;
+    }
+    fn retainScanout(input: *const a.GfxFence, out: *a.GfxBufferReference) callconv(.c) i32 {
+        if (!active or !std.meta.eql(input.*, job.fence) or job.operation != a.gfx_queue_operation_direct_present) return a.gfx_queue_error_invalid;
+        for (&references, 0..) |*entry, i| if (!entry.active) {
+            entry.* = .{ .active = true, .buffer = job.source_buffer, .mapping_only = false, .readonly = true };
+            out.* = .{ .reference = ref(i), .buffer = entry.buffer, .flags = a.gfx_buffer_reference_immutable };
+            return a.gfx_queue_ok;
+        };
+        return a.gfx_queue_error_capacity;
+    }
+    fn beginScanout(input: *const a.GfxFence) callconv(.c) i32 {
+        if (!active or !std.meta.eql(input.*, job.fence) or job.operation != a.gfx_queue_operation_direct_present) return a.gfx_queue_error_invalid;
+        const index = nativeSlot(job.source_buffer).?;
+        std.debug.assert(native.slots[index].gpu.lease.id != 0 and native.slots[index].gpu.access == 0);
+        for (&scanouts) |*slot| if (slot.* == null) { slot.* = .{ .job = job }; active = false; return a.gfx_queue_ok; };
+        return a.gfx_queue_error_capacity;
+    }
+    fn retireRequested(input: *const a.GfxFence) callconv(.c) i32 {
+        if (active and job.operation == a.gfx_queue_operation_direct_present and std.meta.eql(input.*, job.fence)) return 0;
+        for (&scanouts) |*slot| if (slot.*) |value| if (std.meta.eql(value.job.fence, input.*)) return @intFromBool(value.retire);
+        return a.gfx_queue_error_invalid;
     }
     fn memory(out: *a.GfxDriverMemoryApi) callconv(.c) i32 {
         out.* = original;
@@ -338,17 +395,17 @@ pub const Model = struct {
         return a.gfx_buffer_result_ok;
     }
     fn importBuffer(input: *const a.GfxBufferHandle, out: *a.GfxBufferReference) callconv(.c) i32 {
-        const own = if (select(input.*)) |index| references[index].active and !references[index].mapping_only and
-            system(references[index].buffer) != null else false;
+        const own = if (select(input.*)) |index| references[index].active and !references[index].mapping_only else false;
         const replacement = replacement_lent and std.meta.eql(input.*, replacementReference());
         if (!present_mode or (!std.meta.eql(input.*, shadowReference()) and !own and !replacement)) {
             const call: *const fn (*const a.GfxBufferHandle, *a.GfxBufferReference) callconv(.c) i32 = @ptrFromInt(original.buffer_import); return call(input, out);
         }
         std.debug.assert(shadow_live or own or replacement);
         const buffer = if (own) references[select(input.*).?].buffer else sys(@intFromBool(replacement));
+        const readonly = own and references[select(input.*).?].readonly;
         for (&references, 0..) |*entry, i| if (!entry.active) {
-            entry.* = .{ .active = true, .buffer = buffer, .mapping_only = false };
-            out.* = .{ .reference = ref(i), .buffer = entry.buffer }; return a.gfx_buffer_result_ok;
+            entry.* = .{ .active = true, .buffer = buffer, .mapping_only = false, .readonly = readonly };
+            out.* = .{ .reference = ref(i), .buffer = entry.buffer, .flags = if (readonly) a.gfx_buffer_reference_immutable else 0 }; return a.gfx_buffer_result_ok;
         };
         return a.gfx_buffer_error_capacity;
     }
@@ -369,7 +426,17 @@ pub const Model = struct {
         const index = select(input.*) orelse {
             const call: *const fn (*const a.GfxBufferHandle, *const a.GfxDeviceRequest, *a.GfxDeviceLease) callconv(.c) i32 = @ptrFromInt(original.device_acquire);
             return call(input, request, out);
-        }; const entry = references[index]; const i = system(entry.buffer).?;
+        }; const entry = references[index];
+        if (nativeSlot(entry.buffer)) |i| {
+            const slot = &native.slots[i];
+            std.debug.assert(entry.active and !entry.mapping_only and entry.readonly and request.access == 0 and slot.gpu.lease.id == 0 and
+                request.byte_offset == 0 and request.byte_length == slot.descriptor.byte_length and request.gpu_virtual_address == native.address(i));
+            out.* = .{ .lease = .{ .id = @intCast(831 + i), .generation = 703 }, .byte_length = request.byte_length,
+                .gpu_virtual_address = request.gpu_virtual_address, .adapter_id = request.adapter_id, .device_generation = request.device_generation,
+                .driver_owner = 7, .access = 0, .address_space = 1, .dma_mask = request.dma_mask };
+            slot.gpu = out.*; return a.gfx_buffer_result_ok;
+        }
+        const i = system(entry.buffer).?;
         if (request.access == 0) {
             std.debug.assert(present_mode and !shadow_cpu and entry.active and !entry.mapping_only and initial_read.lease.id == 0 and
                 (!queued or active) and request.byte_offset == 0 and request.byte_length == descriptor(i).byte_length and
@@ -450,7 +517,7 @@ pub const Model = struct {
         return if (replacement_native == index) &replacement_vram else if (index == native_index) &vram_data else &extra_vram[index];
     }
     pub fn fetch(owner: *@import("gsp_fifo.zig").Owner, mmio: []const u8) !void {
-        try t.expect((active or initial_read.lease.id != 0) and !fetched and owner.ring.pending == null);
+        try t.expect((active or initial_read.lease.id != 0 or heldScanouts() != 0) and !fetched and owner.ring.pending == null);
         try t.expect(word(mmio, 0xbb0090) == owner.work_submit_token.?);
         // The device observes commands only at the published doorbell boundary.
         command_slot = for (&fifo.slots,0..) |_, i| {
@@ -496,7 +563,7 @@ pub const Model = struct {
         fetched = true;
     }
     pub fn execute() !void {
-        try t.expect((active or initial_read.lease.id != 0) and fetched and !executed);
+        try t.expect((active or initial_read.lease.id != 0 or heldScanouts() != 0) and fetched and !executed);
         if (decoded_count != 17) {
             for (0..decoded[10]) |y| {
                 for (0..decoded[9]) |x| {
@@ -515,7 +582,7 @@ pub const Model = struct {
         executed = true;
     }
     pub fn signal() !void {
-        try t.expect((active or initial_read.lease.id != 0) and executed and !signaled);
+        try t.expect((active or initial_read.lease.id != 0 or heldScanouts() != 0) and executed and !signaled);
         // SYS-scope release makes preceding CE data visible before the point.
         host[0] = gpu_data[0]; host[1] = gpu_data[1];
         std.mem.writeInt(u32, fifo.slots[command_slot].data[8704..8708], decoded[decoded_count - 3], .little);

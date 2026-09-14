@@ -7,6 +7,7 @@ const transport = @import("gsp_transport.zig");
 const wire = @import("gsp_display_engine_wire.zig");
 pub const notifier = @import("gsp_display_notifier.zig");
 const r4os = @import("r4os");
+const a = r4os.abi;
 pub const layout = @import("gsp_display_table.zig");
 pub const image = @import("gsp_display_image.zig");
 pub const Error = layout.Error || vram.Error || names.Error || notifier.Error || error{State};
@@ -71,10 +72,15 @@ pub const Owner = struct {
         return true;
     }
     pub fn bindNative(self: *Owner, channel: u32, source: *vram.Owner) Error!u32 {
+        return self.bindSource(channel, source, source.info() orelse return error.Stale, false);
+    }
+    pub fn bindScanout(self: *Owner, channel: u32, source: *vram.Owner, reference: a.GfxBufferReference) Error!u32 {
+        return self.bindSource(channel, source, source.scanoutInfo(reference) orelse return error.Stale, true);
+    }
+    fn bindSource(self: *Owner, channel: u32, source: *vram.Owner, src: vram.Info, scanout: bool) Error!u32 {
         if (!self.valid()) return error.Stale;
         if (self.table.uploading or self.table.change != null) return error.Busy;
         if (self.table.count >= layout.capacity or self.table.revision == std.math.maxInt(u64)) return error.Exhausted;
-        const src = source.info() orelse return error.Stale;
         try src.surface.validate(source.adapter, source.binding.space);
         if (src.surface.scanout()) _ = try image.create(src.surface, 1, channel);
         const physical = src.physical orelse return error.Unsupported;
@@ -89,7 +95,10 @@ pub const Owner = struct {
         const handle = if (dynamic) |lease| try lease.object(0) else try self.reservation.?.object(@intCast(index));
         const entry: layout.Descriptor = .{ .channel = channel, .handle = handle, .target = .vram, .physical = physical.base, .bytes = src.logical_bytes };
         try layout.validate(entry);
-        try source.retainStorage(&self.storage[index]);
+        if (scanout) try self.storage[index].acquireScanout(source.memory, .{ .reference = src.reference,
+            .physical = physical, .address = src.address, .bytes = src.logical_bytes, .epoch = src.epoch,
+            .adapter = source.adapter, .driver_owner = source.reservation.driver_owner })
+        else try source.retainStorage(&self.storage[index]);
         self.table.add(entry) catch |err| {
             // No upload could start between the two worker-owned operations.
             if (!self.storage[index].close(true)) { self.quarantine(); return error.Retained; }

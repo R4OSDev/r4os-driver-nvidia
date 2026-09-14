@@ -127,11 +127,24 @@ pub const Owner = struct {
     pub fn queuedInfo(self: *const Owner, reference: a.GfxBufferReference) ?Info {
         self.stable() catch return null;
         if (self.self_address != @intFromPtr(self) or !self.committed or !self.common_live or !self.mapped or self.state != .handed_off or
-            self.exchange.session.state != .active or self.storage_policy != null or
+            self.exchange.session.state != .active or (if (self.storage_policy) |policy| policy.role != .scanout else false) or
             reference.flags != a.gfx_buffer_reference_mapping_only or reference.reference.id == 0 or
             !std.meta.eql(reference.buffer, self.reservation.buffer)) return null;
         return .{ .reference = reference, .address = self.address, .logical_bytes = self.logical_bytes,
             .allocation_bytes = self.bytes, .epoch = self.binding.space.epoch, .surface = self.layout };
+    }
+    /// A full reference issued for an admitted scanout job may outlive the
+    /// public producer. Private control storage can never enter this path.
+    pub fn scanoutInfo(self: *const Owner, reference: a.GfxBufferReference) ?Info {
+        self.stable() catch return null;
+        const policy = self.storage_policy orelse return null;
+        if (policy.role != .scanout or self.physical_extent == null or !self.layout.scanout() or
+            self.self_address != @intFromPtr(self) or !self.committed or !self.common_live or !self.mapped or self.state != .handed_off or
+            self.exchange.session.state != .active or reference.version != 1 or reference.size < @sizeOf(a.GfxBufferReference) or
+            reference.flags != a.gfx_buffer_reference_immutable or reference.reserved0 != 0 or !valid(reference.reference) or
+            !std.meta.eql(reference.buffer, self.reservation.buffer)) return null;
+        return .{ .reference = reference, .address = self.address, .logical_bytes = self.logical_bytes,
+            .allocation_bytes = self.bytes, .epoch = self.binding.space.epoch, .surface = self.layout, .physical = self.physical_extent };
     }
     fn reserve(self: *Owner) Error!void {
         const result = self.memory.bufferReserve(&self.layout.descriptor, self.binding.memory, &self.reservation);
