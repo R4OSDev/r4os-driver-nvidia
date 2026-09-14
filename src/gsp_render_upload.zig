@@ -28,24 +28,29 @@ pub const Owner = struct {
     failure: ?anyerror = null,
 
     pub fn open(self: *Owner, programs: *cache.Owner, source: *control.Owner, kind: cache.Kind, draw: ?render.Draw, deadline: u64) !void {
+        return self.openList(programs, source, kind, if (draw) |value| &.{value} else &.{}, deadline);
+    }
+    pub fn openList(self: *Owner, programs: *cache.Owner, source: *control.Owner, kind: cache.Kind, draws: []const render.Draw, deadline: u64) !void {
         if (self.self_address != 0 or !programs.valid() or programs.borrowed or programs.uploading != null) return error.Busy;
+        if ((kind == .programs and draws.len != 0) or
+            (kind == .packet and (draws.len == 0 or draws.len > render.batch_capacity))) return error.Descriptor;
         const src = source.info() orelse return error.Stale;
         const target = programs.buffer(kind);
         const dst = target.info() orelse return error.Stale;
-        const bytes: u64 = if (kind == .programs) render.shader_bytes else render.packet_bytes;
+        const bytes: u64 = if (kind == .programs) render.shader_bytes else render.packet_bytes * draws.len;
         if (src.epoch != programs.epoch or dst.epoch != programs.epoch or src.bytes < bytes or dst.bytes < bytes or
             source.adapter != dst.adapter or deadline == 0 or deadline == std.math.maxInt(u64) or
             render.Range.overlaps(.{ .address = src.address, .bytes = src.bytes }, .{ .address = dst.address, .bytes = dst.bytes })) return error.Bounds;
         self.* = .{ .self_address = @intFromPtr(self), .cache_owner = programs, .kind = kind, .source = source, .source_stamp = src,
             .target = target, .target_stamp = dst, .bytes = bytes, .deadline = deadline };
-        self.prepare(draw) catch |err| {
+        self.prepare(draws) catch |err| {
             self.failure = err;
             if (err == error.Descriptor or err == error.Retained or !self.release()) { self.failed = true; return error.Retained; }
             if (programs.uploading != null) try programs.cancelUpload();
             self.* = .{}; return err;
         };
     }
-    fn prepare(self: *Owner, draw: ?render.Draw) !void {
+    fn prepare(self: *Owner, draws: []const render.Draw) !void {
         const memory = self.source.?.backing.memory.?;
         const reference = self.source.?.backing.reference.reference;
         const mapped = memory.bufferMap(&reference, a.gfx_buffer_map_write, 0, self.source_stamp.?.bytes, &self.cpu);
@@ -57,7 +62,7 @@ pub const Owner = struct {
             cpu.cache_policy != a.gfx_buffer_cache_write_back or cpu.reserved0 != 0) return error.Descriptor;
         if (mapped != a.gfx_buffer_result_ok) return error.Map;
         const ptr: [*]u8 = @ptrFromInt(cpu.cpu_address);
-        try self.cache_owner.?.beginUpload(self.kind,draw,ptr[0..@intCast(self.bytes)]);
+        try self.cache_owner.?.beginUploadList(self.kind,draws,ptr[0..@intCast(self.bytes)]);
         if (memory.bufferUnmap(&cpu.lease) != a.gfx_buffer_result_ok) return error.Retained;
         self.cpu = .{}; self.cpu_stamp = .{};
         const acquired = memory.deviceAcquire(&reference, &.{ .byte_length = self.bytes, .gpu_virtual_address = self.source_stamp.?.address,

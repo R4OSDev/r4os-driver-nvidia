@@ -1,12 +1,12 @@
 // Host-only common BO callbacks for the existing actual-Device test. Its
-// three scattered pages model bus addresses, never physical GPU evidence.
+// four scattered pages model bus addresses, never physical GPU evidence.
 const std = @import("std");
 const r4os = @import("r4os");
 const a = r4os.abi;
-const wire = @import("gsp_buffer_wire.zig");
+const storage = @import("gsp_control_storage.zig");
 pub const Model = struct {
     pub var original: a.DriverApi = undefined;
-    pub var data: [wire.bytes]u8 align(4096) = undefined;
+    pub var data: [storage.bytes]u8 align(4096) = undefined;
     pub var active = false;
     pub var cpu_mapped = false;
     pub var mapped = false;
@@ -23,7 +23,7 @@ pub const Model = struct {
     const reference: a.GfxBufferHandle = .{ .id = 71, .generation = 131 };
     const buffer: a.GfxBufferHandle = .{ .id = 72, .generation = 132 };
     const cpu: a.GfxBufferHandle = .{ .id = 73, .generation = 133 };
-    pub const pages = [_]u64{ 0x6000000000, 0x7000000000, 0x6000004000 };
+    pub const pages = [_]u64{ 0x6000000000, 0x7000000000, 0x6000004000, 0x8000000000 };
     pub fn install(api: *a.DriverApi) void {
         original = api.*;
         api.gfx_memory_query = memory;
@@ -61,7 +61,7 @@ pub const Model = struct {
         return a.gfx_buffer_result_ok;
     }
     fn create(input: *const a.GfxBufferDescriptor, out: *a.GfxBufferReference) callconv(.c) i32 {
-        std.debug.assert(!active and input.byte_length == wire.bytes and input.alignment == 4096);
+        std.debug.assert(!active and input.byte_length == storage.bytes and input.alignment == 4096);
         active = true;
         descriptor = input.*;
         @memset(&data, 0xa5);
@@ -74,7 +74,7 @@ pub const Model = struct {
         return a.gfx_buffer_result_ok;
     }
     fn mapCpu(input: *const a.GfxBufferHandle, access: u32, offset: u64, bytes: u64, out: *a.GfxBufferMap) callconv(.c) i32 {
-        std.debug.assert(active and !cpu_mapped and !reading and std.meta.eql(input.*, reference) and access == 1 and offset == 0 and bytes == wire.bytes);
+        std.debug.assert(active and !cpu_mapped and !reading and std.meta.eql(input.*, reference) and access == 1 and offset == 0 and bytes == storage.bytes);
         cpu_mapped = true;
         out.* = .{ .lease = cpu, .cpu_address = @intFromPtr(&data), .byte_length = bytes, .cache_policy = if (is("control_cache")) a.gfx_buffer_cache_write_combining else a.gfx_buffer_cache_write_back };
         return a.gfx_buffer_result_ok;
@@ -94,7 +94,7 @@ pub const Model = struct {
         std.debug.assert(active and synced and !cpu_mapped and std.meta.eql(input.*, reference) and
             request.byte_offset == 0 and request.adapter_id == 0x01000000 and request.device_generation != 0);
         if (request.access == 0) {
-            std.debug.assert(mapped and gpu_mapped and !reading and request.byte_length > 0 and request.byte_length <= wire.bytes and request.byte_length & 3 == 0 and
+            std.debug.assert(mapped and gpu_mapped and !reading and request.byte_length > 0 and request.byte_length <= storage.bytes and request.byte_length & 3 == 0 and
                 request.gpu_virtual_address == 0x600000 and request.address_space == 1 and request.dma_mask == std.math.maxInt(u64));
             if (is("context_upload_acquire")) return -1;
             reading = true;
@@ -103,7 +103,7 @@ pub const Model = struct {
                 .driver_owner = 7, .access = request.access, .address_space = request.address_space, .dma_mask = request.dma_mask };
             read_lease = out.*; return a.gfx_buffer_result_ok;
         }
-        std.debug.assert(request.byte_length == wire.bytes);
+        std.debug.assert(request.byte_length == storage.bytes);
         const is_gpu = request.access == 3;
         if (is_gpu) {
             std.debug.assert(mapped and !gpu_mapped and request.gpu_virtual_address == 0x600000 and request.address_space == 1);
@@ -118,7 +118,7 @@ pub const Model = struct {
         return a.gfx_buffer_result_ok;
     }
     fn segment(input: *const a.GfxDeviceLease, offset: u64, out: *a.GfxDmaSegment) callconv(.c) i32 {
-        std.debug.assert(mapped and std.meta.eql(input.*, dma) and offset & 4095 == 0 and offset < wire.bytes);
+        std.debug.assert(mapped and std.meta.eql(input.*, dma) and offset & 4095 == 0 and offset < storage.bytes);
         const i = offset / 4096;
         out.* = .{ .dma_address = if (is("control_alias") and i == 2) pages[0] else pages[i], .byte_length = 4096, .next_offset = offset + 4096 };
         return a.gfx_buffer_result_ok;

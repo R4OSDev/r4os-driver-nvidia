@@ -2415,7 +2415,7 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
             var result_size = payload.len;
             switch (operation) {
                 .register => {
-                    try t.expect(function == 4 and payload.len == 80 and std.mem.readInt(u32, payload[12..16], .little) == 0x81);
+                    try t.expect(function == 4 and payload.len == 88 and std.mem.readInt(u32, payload[12..16], .little) == 0x81);
                     for (ControlModel.pages, 0..) |page, i| try t.expect(std.mem.readInt(u64, payload[56 + 8 * i ..][0..8], .little) == page >> 12);
                     if (scenario == .control_register_reject) rpc_result = 0x51;
                     if (scenario == .control_register_reject or scenario == .outputs_empty) result_size = 0;
@@ -2423,7 +2423,7 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
                 .allocate => {
                     try t.expect(function == 103 and payload.len == 160 and std.mem.readInt(u32, payload[12..16], .little) == 0x50a0);
                     std.mem.writeInt(u64, response[112..120], if (scenario == .control_bounds) 0x10000000000 else 0x600000, .little);
-                    std.mem.writeInt(u64, response[120..128], 12287, .little);
+                    std.mem.writeInt(u64, response[120..128], 16383, .little);
                     if (scenario == .control_virtual_reject) std.mem.writeInt(u32, response[16..20], 0x52, .little);
                     if (scenario == .control_short) result_size = 32;
                 },
@@ -2579,7 +2579,7 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
             try t.expect(address_space.handle == graph.base.plan.handles.vaspace and address_space.base == 0x200000);
             try t.expect(address_space.bytes == 0x100000000 and address_space.big_page_bytes == 65536);
             if (running.nativeControlBuffer()) |info| {
-                try t.expect(info.address == 0x600000 and info.bytes == 12288 and info.epoch == session.epoch and buffer_requests == 3);
+                try t.expect(info.address == 0x600000 and info.bytes == 16384 and info.epoch == session.epoch and buffer_requests == 3);
                 const caps = running.nativeMemoryCapabilities() orelse return error.MissingCapabilities;
                 try t.expect(caps_requests == 1 and caps.binding.epoch == session.epoch and caps.binding.device == graph.base.plan.handles.device);
                 const present = scenario != .memory_caps_none;
@@ -4164,7 +4164,7 @@ fn pumpCursorUpload(target: *@import("gsp_device.zig").Device) !void {
         const destination = (@as(u64, command[5]) << 32) | command[6];
         try t.expect(command[0] == 0x20010000 and command[1] == fifo.config.object_class and command[2] == 0x20040100 and
             source == 0x600000 and destination == gpu_address + work.target_offset + work.completed_bytes and
-            command[8] == (if (parts == 0) @as(u32, 12288) else 4096) and command[10] == 0x04000182 and
+            command[8] == 16384 and command[10] == 0x04000182 and
             command[14] == ticket.point and command[16] == 0xc);
         get.* = fifo.ring.put; clock += 1000; _ = target.step();
         try t.expect(work.phase == .submitted and input.imported and input.mapped and ControlModel.reading);
@@ -4180,7 +4180,7 @@ fn pumpCursorUpload(target: *@import("gsp_device.zig").Device) !void {
         clock += 1000; _ = target.step();
         try t.expect(target.phase == .ready);
     }
-    try t.expect(parts == 2 and run.cursor_upload == null);
+    try t.expect(parts == 1 and run.cursor_upload == null);
 }
 fn tableLiveCursor(run: *@import("gsp_runtime.zig").Owner) bool {
     const table_owner = run.display_resources_slot.owner.?;
@@ -5575,7 +5575,7 @@ fn checkRenderWarmup(target: *@import("gsp_device.zig").Device, table: *a.Driver
     try t.expect(run.graphics_cache.reservedBytes() == cache.budget_bytes and run.graphics_cache.program_uploads == 0);
     try checkRenderUpload(target,ce,output);
     for (0..16) |_| { try stepQueuedRendering(target); if (target.render_startup.phase == .ready) break; }
-    try t.expect(target.render_startup.phase == .ready and !run.graphics_starting and run.graphics_enabled and model.render_operations == 61 and
+    try t.expect(target.render_startup.phase == .ready and !run.graphics_starting and run.graphics_enabled and model.render_operations == 125 and
         run.graphics_cache.program_uploads == 1 and run.graphics_cache.packet_uploads == 0 and run.graphics_cache.uploaded_bytes == output.len);
     var bounded: cache.Owner = .{}; try bounded.initialize(run.epoch);
     try t.expectError(error.Exhausted,bounded.admitStorage(.programs,cache.slot_budget_bytes+1));
@@ -5669,8 +5669,8 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
     try t.expect(!try run.beginCopyWork(ce,model.binding,deadline));
     if (!run.graphics_enabled) try run.enableGraphicsQueue(target.native_graphics.channel.?,ce)
     // Reinstalling a fresh host memory view does not re-register the runtime.
-    else model.render_operations = 61;
-    try t.expect(model.render_operations == 61 and run.graphics_enabled);
+    else model.render_operations = 125;
+    try t.expect(model.render_operations == 125 and run.graphics_enabled);
     if (source_index) |index| {
         // The same copy_rows contract emitted by image_prepare. Its actual
         // CE stream turns SYS rows into tiled texture storage; GPGet and
@@ -5715,21 +5715,38 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
             !rejected.fatal and rejected.shader == .none and std.meta.eql(rejected.active_fence,model.job.fence));
     }
     const rounds: usize = if (scene.solid and !graphicsFaultScenario(scenario)) 2 else 1;
-    var packet: [1024]u8 = undefined;
+    const batched = scene_index == 3 or graphicsFaultScenario(scenario);
+    var packet_storage: [render.packet_capacity_bytes]u8 = undefined;
+    const packet = packet_storage[0..if (batched) render.packet_capacity_bytes else render.packet_bytes];
     for (0..rounds) |round| {
         const completed_copy = model.completed;
         const last = round+1 == rounds;
         const ce_put = run.fifos[ce.slot].owner.?.ring.put;
         const uploaded = run.graphics_cache.uploaded_bytes;
         const reused = run.graphics_cache.packet_reuses;
-        model.enqueueRender(native_index,source_index,.{ .kind = if (scene.solid) 0 else 1,
+        const command: a.GfxRenderCommand = .{ .kind = if (scene.solid) 0 else 1,
             .target_rect = .{ .x = scene.destination.x, .y = scene.destination.y, .width = scene.destination.width, .height = scene.destination.height },
             .source_rect = if (scene.solid) .{} else .{ .x = scene.source_rect.x, .y = scene.source_rect.y, .width = scene.source_rect.width, .height = scene.source_rect.height },
             .scissor = .{ .x = scene.scissor.x, .y = scene.scissor.y, .width = scene.scissor.width, .height = scene.scissor.height },
             .filter = @intFromEnum(scene.filter), .blend = @intFromEnum(scene.blend), .transfer = @intFromEnum(scene.transfer),
-            .color = if (scene.solid) 0x80402010 else 0, .opacity = scene.opacity },deadline);
+            .color = if (scene.solid) 0x80402010 else 0, .opacity = scene.opacity };
+        if (batched) {
+            // Sixteen disjoint scissors exactly partition the frozen scene,
+            // including bilinear alpha edges and a tiled source image.
+            var commands: [render.batch_capacity]a.GfxRenderCommand = @splat(command);
+            const clip = try scene.draw().clip();
+            for (&commands, 0..) |*value, index| {
+                const x = clip[0] + (clip[2] - clip[0]) * @as(u32, @intCast(index % 4)) / 4;
+                const y = clip[1] + (clip[3] - clip[1]) * @as(u32, @intCast(index / 4)) / 4;
+                value.scissor = .{ .x = @intCast(x), .y = @intCast(y),
+                    .width = clip[0] + (clip[2] - clip[0]) * @as(u32, @intCast(index % 4 + 1)) / 4 - x,
+                    .height = clip[1] + (clip[3] - clip[1]) * @as(u32, @intCast(index / 4 + 1)) / 4 - y };
+            }
+            model.enqueueRenderList(native_index, source_index, &commands, deadline);
+        } else model.enqueueRender(native_index, source_index, command, deadline);
         try t.expect(try run.beginCopyWork(ce,model.binding,deadline));
         try t.expect(model.active and run.copy_job == null and run.queued_render != null);
+        if (batched) model.render_list.commands[15].opacity ^= 1; // Driver owns its copied list.
         if (last) {
             try run.releaseNativeBuffer(buffer);
             if (source_buffer) |value| try run.releaseNativeBuffer(value);
@@ -5742,7 +5759,7 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
                 if (run.graphics_upload != null) break;
             }
             try t.expect(run.graphics_upload != null);
-            try checkRenderUpload(target,ce,&packet);
+            try checkRenderUpload(target,ce,packet);
         } else {
             for (0..20) |_| {
                 try stepQueuedRendering(target);
@@ -5772,7 +5789,8 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
         std.mem.writeInt(u32,gr_data[0x2088..][0..4],ticket.put,.little);
         try stepQueuedRendering(target); try t.expect(model.completed == completed_copy and model.active);
         const binding = run.graphics_cache.binding() catch return error.RenderBinding;
-        try reference.execute(body,&packet,binding.programs.address,binding.packet.address,reference.Surface.from(target_image,target_data),
+        try t.expect(binding.additional.len == (if (batched) @as(usize,15) else 0) and count <= 1024);
+        try reference.execute(body,packet,binding.programs.address,binding.packet.address,reference.Surface.from(target_image,target_data),
             if (source_image) |value| reference.Surface.from(value,model.imageBytes(source_index.?)) else null);
         for (0..24) |y| {
             @memcpy(target_pixels[y*128..][0..128],target_data[y*target_image.pitch..][0..128]);
@@ -5780,7 +5798,7 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
         }
         if (source_index) |index| try t.expectEqualSlices(u8,&source_snapshot,model.imageBytes(index));
         const difference = try reference.compare(scene_index,&target_pixels);
-        std.debug.print("queued render reference {s}: max={d}/{d} LSB\n",.{scene.name,difference,scene.tolerance});
+        std.debug.print("queued render reference {s}: draws={d} max={d}/{d} LSB one fence\n",.{scene.name,1+binding.additional.len,difference,scene.tolerance});
         model.observeRenderExecution();
         try stepQueuedRendering(target); try t.expect(model.completed == completed_copy and run.graphics_cache.borrowed);
         const tail = body[(count-11)*4..];
@@ -5801,7 +5819,7 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
     try t.expectError(error.Stale,run.graphics_cache.binding());
     run.graphics_cache.epoch -= 1;
     var altered = old_draw; altered.opacity ^= 1;
-    try run.graphics_cache.beginUpload(.packet,altered,&packet);
+    try run.graphics_cache.beginUpload(.packet,altered,packet[0..render.packet_bytes]);
     try run.graphics_cache.cancelUpload();
     try t.expect(!try run.graphics_cache.reusePacket(old_draw));
     try t.expectError(error.State,run.graphics_cache.binding());

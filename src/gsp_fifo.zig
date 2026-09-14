@@ -348,8 +348,8 @@ pub const Owner = struct {
         try instance.retainStorage(&self.instance);
         if (userd) |source| try source.retainStorage(&self.userd);
         const reservation = self.reservation.?;
-        self.commands = try control.Owner.init(token, ctx, adapter,
-            .{ .space = instance.binding.space, .memory = try reservation.object(0), .virtual = try reservation.object(1) }, self.deadline);
+        self.commands = try control.Owner.initSized(token, ctx, adapter,
+            .{ .space = instance.binding.space, .memory = try reservation.object(0), .virtual = try reservation.object(1) }, self.deadline, control.wire.bytes);
     }
     fn stable(self: *const Owner) Error!void {
         if (self.self_address != @intFromPtr(self) or self.session == null or self.config.context.epoch != self.session.?.epoch or

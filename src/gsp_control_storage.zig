@@ -5,6 +5,10 @@ const std = @import("std");
 const r4os = @import("r4os");
 const a = r4os.abi;
 const wire = @import("gsp_buffer_wire.zig");
+// One bounded CE upload can carry all 16 rectangle packets. FIFO storage
+// keeps the independent three-page wire default.
+pub const bytes: usize = 16 * 1024;
+pub const page_count = bytes / 4096;
 pub const Error = error{ Busy, Api, Memory, Descriptor, Map, Synchronization };
 const ok = a.gfx_buffer_result_ok;
 const dma_mask = (@as(u64, 1) << 47) - 1;
@@ -13,6 +17,7 @@ pub const Storage = struct {
     memory: ?r4os.driver_memory.Context = null,
     adapter: u32 = 0,
     epoch: u64 = 0,
+    byte_length: usize = 0,
     reference: a.GfxBufferReference = .{},
     cpu: a.GfxBufferMap = .{},
     dma: a.GfxDeviceLease = .{},
@@ -20,14 +25,14 @@ pub const Storage = struct {
     reference_stamp: a.GfxBufferReference = .{},
     dma_stamp: a.GfxDeviceLease = .{},
     gpu_stamp: a.GfxDeviceLease = .{},
-    pages_stamp: [wire.pages]u64 = @splat(0),
-    pages: [wire.pages]u64 = @splat(0),
+    pages_stamp: [page_count]u64 = @splat(0),
+    pages: [page_count]u64 = @splat(0),
     retained: bool = false,
     prepared: bool = false,
 
-    pub fn prepare(self: *Storage, ctx: *const r4os.r4dev.DriverContext, adapter: u32, epoch: u64) Error!void {
+    pub fn prepare(self: *Storage, ctx: *const r4os.r4dev.DriverContext, adapter: u32, epoch: u64, byte_length: usize) Error!void {
         if (self.self_address != 0) return error.Busy;
-        if (adapter == 0 or epoch == 0) return error.Descriptor;
+        if (adapter == 0 or epoch == 0 or (byte_length != bytes and byte_length != wire.bytes)) return error.Descriptor;
         // Older kernels reject a Work query: no private heap fallback can
         // silently claim the common BO lifetime or later app-buffer support.
         const memory = ctx.memory() orelse return error.Api;
@@ -35,8 +40,9 @@ pub const Storage = struct {
         self.memory = memory;
         self.adapter = adapter;
         self.epoch = epoch;
+        self.byte_length = byte_length;
         const request: a.GfxBufferDescriptor = .{
-            .byte_length = wire.bytes,
+            .byte_length = byte_length,
             .alignment = 4096,
             .usage = a.gfx_buffer_usage_cpu_read | a.gfx_buffer_usage_cpu_write |
                 a.gfx_buffer_usage_transfer_source | a.gfx_buffer_usage_transfer_target,
@@ -47,20 +53,20 @@ pub const Storage = struct {
             !handleValid(reference.buffer) or !handleValid(reference.reference) or reference.flags != 0 or reference.reserved0 != 0) return error.Descriptor;
         var described: a.GfxBufferDescriptor = .{};
         if (memory.bufferDescribe(&reference.reference, &described) != ok or !std.meta.eql(request, described)) return error.Descriptor;
-        if (memory.bufferMap(&reference.reference, a.gfx_buffer_map_write, 0, wire.bytes, &self.cpu) != ok) return error.Map;
+        if (memory.bufferMap(&reference.reference, a.gfx_buffer_map_write, 0, byte_length, &self.cpu) != ok) return error.Map;
         const cpu = self.cpu;
         if (cpu.version != 1 or cpu.size < @sizeOf(a.GfxBufferMap) or !handleValid(cpu.lease) or
-            cpu.cpu_address == 0 or cpu.cpu_address & 4095 != 0 or cpu.cpu_address > std.math.maxInt(u64) - wire.bytes or
-            cpu.byte_length != wire.bytes or cpu.cache_policy != a.gfx_buffer_cache_write_back or cpu.reserved0 != 0) return error.Descriptor;
+            cpu.cpu_address == 0 or cpu.cpu_address & 4095 != 0 or cpu.cpu_address > std.math.maxInt(u64) - byte_length or
+            cpu.byte_length != byte_length or cpu.cache_policy != a.gfx_buffer_cache_write_back or cpu.reserved0 != 0) return error.Descriptor;
         const pointer: [*]u8 = @ptrFromInt(cpu.cpu_address);
-        @memset(pointer[0..wire.bytes], 0);
+        @memset(pointer[0..byte_length], 0);
         // CPU Unmap publishes the WB visibility boundary before direct DMA
         // residency; neither the CPU pointer nor a bounce buffer is sent to RM.
         if (memory.bufferUnmap(&cpu.lease) != ok) return error.Synchronization;
         self.cpu = .{};
-        if (memory.deviceAcquire(&reference.reference, &.{ .byte_length = wire.bytes, .adapter_id = adapter, .device_generation = epoch, .access = 4, .dma_mask = dma_mask }, &self.dma) != ok) return error.Map;
+        if (memory.deviceAcquire(&reference.reference, &.{ .byte_length = byte_length, .adapter_id = adapter, .device_generation = epoch, .access = 4, .dma_mask = dma_mask }, &self.dma) != ok) return error.Map;
         if (!self.deviceValid(self.dma, 4, 0) or self.dma.dma_mask != dma_mask) return error.Descriptor;
-        for (&self.pages, 0..) |*page, i| {
+        for (self.pages[0..byte_length / 4096], 0..) |*page, i| {
             var segment: a.GfxDmaSegment = .{};
             const offset = i * 4096;
             if (memory.deviceSegment(&self.dma, offset, &segment) != ok) return error.Map;
@@ -78,19 +84,19 @@ pub const Storage = struct {
     // Invoked only after successful RM map response AND its queue ACK.
     pub fn retainGpu(self: *Storage, address: u64) Error!void {
         if (!self.valid() or !self.retained or self.gpu.lease.id != 0) return error.Busy;
-        if (self.memory.?.deviceAcquire(&self.reference.reference, &.{ .byte_length = wire.bytes, .gpu_virtual_address = address, .adapter_id = self.adapter, .device_generation = self.epoch, .access = 3, .address_space = 1 }, &self.gpu) != ok) return error.Map;
+        if (self.memory.?.deviceAcquire(&self.reference.reference, &.{ .byte_length = self.byte_length, .gpu_virtual_address = address, .adapter_id = self.adapter, .device_generation = self.epoch, .access = 3, .address_space = 1 }, &self.gpu) != ok) return error.Map;
         if (!self.deviceValid(self.gpu, 3, address) or self.gpu.driver_owner != self.dma.driver_owner) return error.Descriptor;
         self.gpu_stamp = self.gpu;
     }
     fn deviceValid(self: *const Storage, value: a.GfxDeviceLease, access: u32, address: u64) bool {
         return value.version == 1 and value.size >= @sizeOf(a.GfxDeviceLease) and handleValid(value.lease) and
-            value.byte_offset == 0 and value.byte_length == wire.bytes and value.gpu_virtual_address == address and
+            value.byte_offset == 0 and value.byte_length == self.byte_length and value.gpu_virtual_address == address and
             value.device_generation == self.epoch and value.adapter_id == self.adapter and value.driver_owner != 0 and
             value.access == access and value.address_space == @as(u32, if (access == 3) 1 else 0);
     }
     pub fn valid(self: *const Storage) bool {
         return self.self_address == @intFromPtr(self) and self.memory != null and self.prepared and self.cpu.lease.id == 0 and
-            self.adapter != 0 and self.epoch != 0 and self.dma.adapter_id == self.adapter and self.dma.device_generation == self.epoch and
+            self.adapter != 0 and self.epoch != 0 and self.byte_length == self.dma.byte_length and self.dma.adapter_id == self.adapter and self.dma.device_generation == self.epoch and
             std.meta.eql(self.reference, self.reference_stamp) and std.meta.eql(self.dma, self.dma_stamp) and
             std.meta.eql(self.gpu, self.gpu_stamp) and std.meta.eql(self.pages, self.pages_stamp);
     }

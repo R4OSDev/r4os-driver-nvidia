@@ -64,6 +64,7 @@ pub const Model = struct {
     var product_mode = false;
     var render_mode = false;
     pub var render_operations: u64 = 13;
+    pub var render_list: a.GfxRenderList = .{};
     pub var shadow_cpu = false;
     pub var shadow_creates: usize = 0;
     var shadow_descriptor: a.GfxBufferDescriptor = .{};
@@ -111,6 +112,14 @@ pub const Model = struct {
         job.target_buffer = native.slots[target].reservation.buffer;
         job.source_offset = 0; job.target_offset = 0; job.byte_length = 0;
         job.render = command;
+        render_list = .{};
+    }
+    pub fn enqueueRenderList(target: usize, source: ?usize, commands: []const a.GfxRenderCommand, deadline: u64) void {
+        std.debug.assert(commands.len > 0 and commands.len <= a.gfx_render_list_capacity);
+        enqueueRender(target, source, commands[0], deadline);
+        job.operation = a.gfx_queue_operation_render_list;
+        render_list.count = @intCast(commands.len);
+        @memcpy(render_list.commands[0..commands.len], commands);
     }
     pub fn observeRenderExecution() void { std.debug.assert(render_mode and active); executed = true; }
     pub fn observeRenderSemaphore() void { std.debug.assert(render_mode and active and executed); signaled = true; }
@@ -212,10 +221,15 @@ pub const Model = struct {
     fn queue(out: *a.GfxDriverQueueApi) callconv(.c) i32 { out.* = .{ .size = if (product_mode or render_mode) @sizeOf(a.GfxDriverQueueApi) else 64,
         .register_backend = @intFromPtr(&register), .register_profile = if (product_mode) @intFromPtr(&registerProfile) else 0,
         .update_operations = if (render_mode) @intFromPtr(&updateOperations) else 0,
+        .read_render_list = if (render_mode) @intFromPtr(&readRenderList) else 0,
         .unregister_backend = @intFromPtr(&unregister), .take = @intFromPtr(&take), .retain_resource = @intFromPtr(&retain), .complete = @intFromPtr(&complete) }; return a.gfx_queue_ok; }
     fn updateOperations(input: *const a.GfxBackendBinding, operations: u64) callconv(.c) i32 {
-        std.debug.assert(render_mode and std.meta.eql(input.*, binding) and (operations == 29 or operations == 61));
+        std.debug.assert(render_mode and std.meta.eql(input.*, binding) and (operations == 29 or operations == 61 or operations == 125));
         render_operations = operations; return a.gfx_queue_ok;
+    }
+    fn readRenderList(input: *const a.GfxFence, out: *a.GfxRenderList) callconv(.c) i32 {
+        if (!active or !std.meta.eql(input.*, job.fence) or job.operation != a.gfx_queue_operation_render_list) return a.gfx_queue_error_invalid;
+        out.* = render_list; return a.gfx_queue_ok;
     }
     fn registerProfile(input: *const a.GfxBackendRegistration, profile: *const a.GfxBackendProfile, out: *a.GfxBackendBinding) callconv(.c) i32 {
         const nv = @import("r4nv_binding");

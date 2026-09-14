@@ -15,7 +15,10 @@ pub const Owner = struct {
     stamp: a.GfxDriverJob = .{},
     references: [2]a.GfxBufferReference = @splat(.{}),
     reference_stamps: [2]a.GfxBufferReference = @splat(.{}),
-    draw: ?render.Draw = null,
+    list: a.GfxRenderList = .{},
+    list_stamp: a.GfxRenderList = .{},
+    draws: [render.batch_capacity]render.Draw = undefined,
+    draw_count: usize = 0,
     phase: Phase = .retain,
     deadline: u64 = 0,
     acknowledged: bool = false,
@@ -26,19 +29,35 @@ pub const Owner = struct {
         if (self.self_address != 0) return error.Busy;
         self.* = .{ .self_address = @intFromPtr(self), .queue = queue, .memory = memory,
             .binding = binding, .job = job, .stamp = job, .deadline = job.deadline_ns };
-        if (job.version != 1 or job.size < @sizeOf(a.GfxDriverJob) or job.operation != a.gfx_queue_operation_render or
+        if (job.version != 1 or job.size < @sizeOf(a.GfxDriverJob) or
+            (job.operation != a.gfx_queue_operation_render and job.operation != a.gfx_queue_operation_render_list) or
             job.reserved0 != 0 or job.reserved1 != 0 or job.source_offset != 0 or job.target_offset != 0 or job.byte_length != 0 or
             job.row_count != 0 or job.source_pitch != 0 or job.target_pitch != 0 or job.render.reserved0 != 0 or
             job.fence.timeline == 0 or job.fence.point == 0 or job.fence.adapter_id != binding.adapter_id or
             job.fence.device_generation != binding.device_generation or job.fence.reset_generation != binding.reset_generation) {
             self.failed = true; return error.Descriptor;
         }
+        if (job.operation == a.gfx_queue_operation_render_list) {
+            if (queue.readRenderList(&job.fence, &self.list) != a.gfx_queue_ok or
+                self.list.version != 1 or self.list.size < @sizeOf(a.GfxRenderList) or self.list.reserved0 != 0 or
+                self.list.count == 0 or self.list.count > render.batch_capacity or
+                !std.meta.eql(self.list.commands[0], job.render)) { self.failed = true; return error.Descriptor; }
+            for (self.list.commands, 0..) |command, index| {
+                if (index < self.list.count) {
+                    if (command.reserved0 != 0 or command.kind != job.render.kind or command.filter != job.render.filter or
+                        command.blend != job.render.blend or command.transfer != job.render.transfer) { self.failed = true; return error.Descriptor; }
+                } else if (!std.meta.eql(command, a.GfxRenderCommand{})) { self.failed = true; return error.Descriptor; }
+            }
+        } else { self.list.count = 1; self.list.commands[0] = job.render; }
+        self.list_stamp = self.list;
         if (job.deadline_ns <= now or job.deadline_ns == std.math.maxInt(u64)) try self.finish(a.gfx_queue_result_failed);
     }
     pub fn valid(self: *const Owner) bool {
         return self.self_address == @intFromPtr(self) and !self.failed and std.meta.eql(self.job, self.stamp) and
-            std.meta.eql(self.references, self.reference_stamps) and self.deadline == self.stamp.deadline_ns;
+            std.meta.eql(self.references, self.reference_stamps) and self.deadline == self.stamp.deadline_ns and
+            std.meta.eql(self.list, self.list_stamp) and self.draw_count <= render.batch_capacity;
     }
+    pub fn commands(self: *const Owner) []const render.Draw { return self.draws[0..self.draw_count]; }
     fn finish(self: *Owner, result: u32) !void {
         if (!self.valid() or self.acknowledged) return error.Retained;
         if (self.queue.complete(&self.job.fence, result, 1) != a.gfx_queue_ok) return error.Retained;
@@ -80,7 +99,7 @@ pub const Owner = struct {
                 self.phase = .prepare;
             },
             .prepare => {
-                self.draw = run.queuedGraphicsDraw(self) catch |err| {
+                run.prepareQueuedGraphics(self) catch |err| {
                     if (err == error.Empty or err == error.Unsupported or err == error.Bounds or err == error.Overflow) {
                         if (err != error.Empty) try run.renderRejection(err);
                         try self.finish(if (err == error.Empty) a.gfx_queue_result_complete else a.gfx_queue_result_failed); return true;
@@ -95,8 +114,7 @@ pub const Owner = struct {
             },
             .upload_wait => {
                 if (run.graphics_upload != null) return false;
-                if (run.graphics_cache.packet_point == 0 or run.graphics_cache.draw == null or
-                    !std.meta.eql(run.graphics_cache.draw.?, self.draw.?)) return error.Stale;
+                if (!(try run.graphics_cache.binding()).matches(self.commands())) return error.Stale;
                 self.phase = .draw;
             },
             .draw => {

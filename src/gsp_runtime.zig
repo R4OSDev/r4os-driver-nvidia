@@ -463,7 +463,7 @@ pub const Owner = struct {
             }
             if (self.graphics_cache.packet.info()) |packet| {
                 record.packet_address = packet.address;
-                if (record.fault_address) |va| record.packet_address_match = va >= packet.address and va-packet.address < render.packet_bytes;
+                if (record.fault_address) |va| record.packet_address_match = va >= packet.address and va-packet.address < packet.bytes;
             }
         }
         if (self.display_upload_job) |*work| {
@@ -1867,9 +1867,9 @@ pub const Owner = struct {
         try self.retainNativeStorage(buffer,storage);
     }
     pub fn beginGraphicsUpload(self: *Owner, handle: ChannelHandle, kind: render_cache.Kind, draw: ?render.Draw, deadline: u64) !void {
-        return self.startGraphicsUpload(handle, kind, draw, deadline, false);
+        return self.startGraphicsUpload(handle, kind, if (draw) |value| &.{value} else &.{}, deadline, false);
     }
-    fn startGraphicsUpload(self: *Owner, handle: ChannelHandle, kind: render_cache.Kind, draw: ?render.Draw, deadline: u64, queued: bool) !void {
+    fn startGraphicsUpload(self: *Owner, handle: ChannelHandle, kind: render_cache.Kind, draws: []const render.Draw, deadline: u64, queued: bool) !void {
         const current = try self.now();
         if (deadline <= current or deadline == std.math.maxInt(u64)) return error.Deadline;
         if (self.engineWorkBusy() or self.frame_ready != null or (!queued and self.queued_render != null) or self.cursor_reserving or self.graph_closing) return error.Busy;
@@ -1880,7 +1880,7 @@ pub const Owner = struct {
         if (staging.binding.space.handle != info.config.context.vaspace or self.graphics_cache.epoch != self.epoch) return error.Stale;
         try self.channel.?.guard(deadline);
         self.graphics_upload = .{ .channel = handle };
-        self.graphics_upload.?.operation.open(&self.graphics_cache,staging,kind,draw,deadline) catch |err| {
+        self.graphics_upload.?.operation.openList(&self.graphics_cache,staging,kind,draws,deadline) catch |err| {
             if (self.graphics_upload.?.operation.failed) self.stop(err) else self.graphics_upload = null;
             return err;
         };
@@ -1901,7 +1901,9 @@ pub const Owner = struct {
         const copy = (try self.findChannel(copy_handle)).info() orelse return error.State;
         if (copy.config.engine != .copy or copy.config.context.vaspace != info.config.context.vaspace) return error.Binding;
         const backend = self.copy_backend orelse return error.State;
-        var rc = backend.queue.updateOperations(&backend.binding, 61);
+        const lists = backend.queue.supportsRenderList() and self.graphics_cache.packet.info().?.bytes >= render.packet_capacity_bytes;
+        var rc = backend.queue.updateOperations(&backend.binding, if (lists) 125 else 61);
+        if (rc == r4os.abi.gfx_queue_error_invalid and lists) rc = backend.queue.updateOperations(&backend.binding, 61);
         // Earlier common queues can still use offscreen rendering. They
         // never receive the new image-to-output operation.
         if (rc == r4os.abi.gfx_queue_error_invalid) rc = backend.queue.updateOperations(&backend.binding, 29);
@@ -1922,9 +1924,28 @@ pub const Owner = struct {
         };
         return error.Unsupported;
     }
-    pub fn queuedGraphicsDraw(self: *Owner, input: *render_queue.Owner) !render.Draw {
+    pub fn prepareQueuedGraphics(self: *Owner, input: *render_queue.Owner) !void {
         try self.queuedRender(input);
-        const state = input.job.render;
+        if (input.phase != .prepare or input.draw_count != 0) return error.Binding;
+        for (input.list.commands[0..input.list.count]) |command| {
+            const draw = self.queuedGraphicsDraw(input, command) catch |err| { if (err == error.Empty) continue; return err; };
+            if (input.draw_count != 0 and !render.compatible(input.draws[0], draw)) return error.Binding;
+            input.draws[input.draw_count] = draw; input.draw_count += 1;
+        }
+        if (input.draw_count == 0) return error.Empty;
+    }
+    fn validateQueuedGraphics(self: *Owner, input: *render_queue.Owner) !void {
+        try self.queuedRender(input);
+        var count: usize = 0;
+        for (input.list.commands[0..input.list.count]) |command| {
+            const draw = self.queuedGraphicsDraw(input, command) catch |err| { if (err == error.Empty) continue; return err; };
+            if (count >= input.draw_count or !std.meta.eql(draw, input.draws[count])) return error.Binding;
+            count += 1;
+        }
+        if (count == 0 or count != input.draw_count) return error.Binding;
+    }
+    fn queuedGraphicsDraw(self: *Owner, input: *render_queue.Owner, state: r4os.abi.GfxRenderCommand) !render.Draw {
+        try self.queuedRender(input);
         if (state.kind > r4os.abi.gfx_render_kind_sample or state.filter > 1 or state.blend > 1 or state.transfer > 2 or state.opacity > 255) return error.Bounds;
         const sampled = state.kind == r4os.abi.gfx_render_kind_sample;
         if (!sampled and (input.job.source_buffer.id != 0 or input.job.source_buffer.generation != 0 or
@@ -1943,22 +1964,22 @@ pub const Owner = struct {
         return .{ .x = value.x, .y = value.y, .width = value.width, .height = value.height };
     }
     pub fn beginQueuedGraphicsUpload(self: *Owner, input: *render_queue.Owner) !void {
-        try self.queuedRender(input);
-        if (input.phase != .upload or input.draw == null or !std.meta.eql(input.draw.?, try self.queuedGraphicsDraw(input))) return error.Binding;
-        if (try self.graphics_cache.reusePacket(input.draw.?)) {
+        try self.validateQueuedGraphics(input);
+        if (input.phase != .upload) return error.Binding;
+        if (try self.graphics_cache.reusePacketList(input.commands())) {
             if (self.graphics_cache.packet_reuses == 1) self.log("NVIDIA render-cache: packet-reuse=1 program-uploads={d} uploaded-bytes={d} reserved-bytes={d} budget={d}",
                 .{self.graphics_cache.program_uploads,self.graphics_cache.uploaded_bytes,self.graphics_cache.reservedBytes(),render_cache.budget_bytes});
             return;
         }
         const channel = self.graphics_copy_channel orelse return error.State;
-        return self.startGraphicsUpload(channel, .packet, input.draw, input.deadline, true);
+        return self.startGraphicsUpload(channel, .packet, input.commands(), input.deadline, true);
     }
     pub fn beginQueuedGraphicsDraw(self: *Owner, input: *render_queue.Owner) !void {
-        try self.queuedRender(input);
-        if (input.phase != .draw or input.draw == null or !std.meta.eql(input.draw.?, try self.queuedGraphicsDraw(input))) return error.Binding;
+        try self.validateQueuedGraphics(input);
+        if (input.phase != .draw or !(try self.graphics_cache.binding()).matches(input.commands())) return error.Binding;
         const memory = self.ctx.?.memory() orelse return error.Api;
         const target = try self.queuedGraphicsResource(input.references[1]);
-        const source = if (input.draw.?.source != null) try self.queuedGraphicsResource(input.references[0]) else null;
+        const source = if (input.draws[0].source != null) try self.queuedGraphicsResource(input.references[0]) else null;
         try self.startGraphicsBarrier(self.graphics_channel.?, input.deadline, true);
         const work = &self.graphics_work.?;
         work.queued = true;
@@ -1985,7 +2006,8 @@ pub const Owner = struct {
         if (work.queued) {
             const queued = if (self.queued_render) |*value| value else return error.State;
             const binding = switch (work.command) { .draw => |value| value, else => return error.Binding };
-            if (queued.phase != .draw_wait or !std.meta.eql(try self.queuedGraphicsDraw(queued), binding.draw)) return error.Binding;
+            try self.validateQueuedGraphics(queued);
+            if (queued.phase != .draw_wait or !binding.matches(queued.commands())) return error.Binding;
         } else if (self.queued_render != null) return error.Binding;
         switch (work.command) {
             .barrier => if (work.resources.self_address != 0) return error.Binding,
@@ -2108,7 +2130,7 @@ pub const Owner = struct {
         if (result != a.gfx_queue_ok and result != a.gfx_queue_error_busy and job.fence.timeline == 0) return error.Queue;
         if (self.copy_backend == null) self.copy_backend = .{ .queue = queue, .binding = binding };
         if (result == a.gfx_queue_error_busy and job.fence.timeline == 0) return false;
-        if (result == a.gfx_queue_ok and job.operation == a.gfx_queue_operation_render) {
+        if (result == a.gfx_queue_ok and (job.operation == a.gfx_queue_operation_render or job.operation == a.gfx_queue_operation_render_list)) {
             self.queued_render = .{};
             self.queued_render.?.open(queue, memory, binding, job, try self.now()) catch |err| { self.stop(err); return err; };
             return true;

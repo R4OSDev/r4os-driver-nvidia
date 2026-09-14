@@ -16,6 +16,7 @@ pub const Owner = struct {
     ctx: r4os.r4dev.DriverContext,
     adapter: u32,
     binding: wire.Binding,
+    byte_length: usize = storage.bytes,
     backing: storage.Storage = .{},
     state: State = .creating,
     registered: bool = false,
@@ -35,13 +36,20 @@ pub const Owner = struct {
     deadline: u64,
 
     pub fn init(token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext, adapter: u32, binding: wire.Binding, deadline: u64) Error!Owner {
-        try wire.validate(binding);
-        if (adapter == 0 or token.session.epoch != binding.space.epoch) return error.Stale;
-        return .{ .ctx = ctx.*, .adapter = adapter, .binding = binding, .deadline = deadline, .exchange = try exchange.Exchange.init(token, deadline) };
+        return initSized(token, ctx, adapter, binding, deadline, storage.bytes);
     }
+    pub fn initSized(token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext, adapter: u32, binding: wire.Binding, deadline: u64, byte_length: usize) Error!Owner {
+        if (byte_length != storage.bytes and byte_length != wire.bytes) return error.Bounds;
+        try wire.validatePart(binding, .{ .total_bytes = byte_length, .byte_length = byte_length });
+        if (adapter == 0 or token.session.epoch != binding.space.epoch) return error.Stale;
+        return .{ .ctx = ctx.*, .adapter = adapter, .binding = binding, .byte_length = byte_length, .deadline = deadline, .exchange = try exchange.Exchange.init(token, deadline) };
+    }
+    fn part(self: *const Owner) wire.Part { return .{ .total_bytes = self.byte_length, .byte_length = self.byte_length }; }
     fn stable(self: *const Owner) Error!void {
         if ((self.self_address != 0 and self.self_address != @intFromPtr(self)) or
-            self.binding.space.epoch != self.exchange.session.epoch) return error.Stale;
+            self.binding.space.epoch != self.exchange.session.epoch or
+            (self.byte_length != storage.bytes and self.byte_length != wire.bytes) or
+            (self.backing.prepared and self.backing.byte_length != self.byte_length)) return error.Stale;
     }
     fn fail(self: *Owner, err: Error) Error {
         self.state = .failed;
@@ -53,7 +61,8 @@ pub const Owner = struct {
         if (self.self_address != @intFromPtr(self) or (self.state != .ready and self.state != .handed_off) or
             !self.mapped or !self.backing.gpuReady(self.address) or !self.backing.retained or self.exchange.session.state != .active) return null;
         _ = self.memoryCapabilities() orelse return null;
-        return .{ .epoch = self.binding.space.epoch, .memory = self.binding.memory, .virtual = self.binding.virtual, .address = self.address, .bytes = wire.bytes };
+        if (self.byte_length != self.backing.byte_length) return null;
+        return .{ .epoch = self.binding.space.epoch, .memory = self.binding.memory, .virtual = self.binding.virtual, .address = self.address, .bytes = self.byte_length };
     }
     pub fn memoryCapabilities(self: *const Owner) ?memory_caps.Info {
         if (self.self_address != @intFromPtr(self) or (self.state != .ready and self.state != .handed_off) or
@@ -109,7 +118,7 @@ pub const Owner = struct {
         if (self.state == .creating and !self.caps_checked) return self.pollCapabilities();
         if (self.operation == null) {
             if (self.state == .creating and !self.backing.prepared) {
-                self.backing.prepare(&self.ctx, self.adapter, self.binding.space.epoch) catch |err| {
+                self.backing.prepare(&self.ctx, self.adapter, self.binding.space.epoch, self.byte_length) catch |err| {
                     self.host_rejected = err;
                     self.state = .unwinding;
                     return null;
@@ -125,7 +134,7 @@ pub const Owner = struct {
                 self.state = if (self.state == .unwinding) .ready else .closed;
                 return null;
             };
-            const encoded = try wire.encode(self.binding, operation, &self.backing.pages, self.address, &self.request);
+            const encoded = try wire.encodePart(self.binding, self.part(), operation, self.backing.pages[0..self.byte_length / 4096], self.address, &self.request);
             try self.exchange.begin(encoded.function, encoded.bytes, self.deadline);
             // TX publication may be ambiguous even when send reports failure.
             if (operation == .register) self.backing.retained = true;
@@ -134,7 +143,7 @@ pub const Owner = struct {
         const dispatch = (try self.exchange.poll(self.deadline)) orelse return null;
         if (!dispatch.response) return dispatch;
         const operation = self.operation.?;
-        const reply = try wire.decode(self.binding, operation, self.request[0..wire.length(operation)], dispatch.record, self.address);
+        const reply = try wire.decodePart(self.binding, self.part(), operation, self.request[0..wire.partLength(operation, self.part())], dispatch.record, self.address);
         self.last_status = if (reply == .rejected) reply.rejected else 0;
         try self.exchange.complete(dispatch.ticket);
         if (reply == .rejected) {
@@ -190,7 +199,7 @@ pub const Owner = struct {
         if (self.caps_active) return common and self.state == .creating and !self.caps_checked and self.operation == null and
             current.function == memory_caps.function and current.request.len == memory_caps.bytes;
         const operation = self.operation orelse return false;
-        return common and current.request.len == wire.length(operation) and
+        return common and current.request.len == wire.partLength(operation, self.part()) and
             current.function == wire.function(operation) and self.backing.retained;
     }
 };
