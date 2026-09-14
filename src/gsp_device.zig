@@ -244,6 +244,21 @@ pub const Device = struct {
                 self.ctx.?.logInfo("NVIDIA head-events: source=display-stall-LAST_DATA clock=IRQ-observation sequence=observed-events");
                 return true;
             }
+            if (self.native_output.phase == .active and self.interrupts.display.enabled) {
+                var mask = self.interrupts.display.head_mask;
+                const root = (try self.running.displayEngineStatus(self.native_output.engine.?)).info orelse return error.State;
+                for (&self.running.display_images) |*slot| if (slot.*) |image| {
+                    if (image.head >= root.hardware.heads or image.head >= 8 or image.boot_mode == null) return error.Binding;
+                    mask |= @as(u32, 1) << @intCast(image.head);
+                };
+                if (mask != self.interrupts.display.head_mask) {
+                    self.interrupts.extendDisplay(self.running.post.snapshot() orelse return error.State, self.epoch, mask) catch |err| {
+                        if (err == error.Busy) return progress or output_progress or allocation_progress or graphics_progress or render_progress;
+                        return err;
+                    };
+                    return true;
+                }
+            }
             if (self.interrupts.display.enabled) for (&self.interrupts.display.heads, 0..) |*head, index| {
                 const bit = @as(u32, 1) << @as(u5, @intCast(index));
                 if (self.interrupts.display.head_mask & bit == 0 or self.heads_reported & bit != 0) continue;
@@ -473,7 +488,7 @@ pub const Device = struct {
             const mode = if (self.running.mode_control_owner) |*value| value else return error.Binding;
             const root = if (self.running.mode_control_root) |value| value else return error.Binding;
             const engine = if (self.running.display_engine_owner) |*value| value else return error.Binding;
-            self.running.validateModeQuery(root, mode.mode) catch return error.Binding;
+            self.running.validateModeTopology(root, mode.mode, mode.topology) catch return error.Binding;
             if (root.epoch != self.epoch or root.root != engine.binding.root or engine.info() == null or
                 !mode.matches(channel, deadline)) return error.Binding;
         } else if (self.running.display_channel_active) |index| {
@@ -496,6 +511,9 @@ pub const Device = struct {
             if (!mapping.matches(channel, deadline)) return error.Binding;
         } else if (self.running.outputs.active()) {
             if (!self.running.outputs.matches(channel, deadline)) return error.Binding;
+        } else if (self.running.sor_work) |*work| {
+            if (channel != &self.running.channel.? or !work.matches(channel, deadline)) return error.Binding;
+            self.running.validateSorAssignment() catch return error.Binding;
         } else if (self.running.display_work) |*work| {
             const link = if (work.link) |*value| value else return error.Binding;
             if (channel != &self.running.channel.? or work.deadline != deadline or !link.matches(channel, deadline)) return error.Binding;
@@ -638,7 +656,8 @@ pub const Device = struct {
             self.running.fifo_active != null or self.running.context_active != null or self.running.native_active != null or self.running.buffer_active != null or
             self.running.outputs.active() or self.running.graph_closing or self.running.display_engine_active or self.running.display_channel_active != null or self.running.mode_control_active or
             self.running.copy_job != null or self.running.display_upload_job != null or self.running.cursor_upload != null or self.running.initial_image != null) return error.State;
-        if (self.running.display_flip != null) return self.admitFlipPush(port, channel, deadline, access_kind);
+        if (channel.config.kind == .window and self.running.displayFlip(channel.config.index) != null)
+            return self.admitFlipPush(port, channel, deadline, access_kind);
         const work = if (self.running.display_work) |*value| value else return error.Binding;
         const resources = self.running.display_resources_slot.owner orelse return error.Binding;
         const root = if (self.running.display_engine_owner) |*value| value else return error.Binding;
@@ -743,8 +762,8 @@ pub const Device = struct {
     {
         if (self.running.display_work != null or self.running.head_events != &self.interrupts.display or
             !self.interrupts.display.enabled or self.interrupts.display.epoch != self.epoch) return error.Binding;
-        self.running.validateDisplayFlip() catch return error.Binding;
-        const work = &self.running.display_flip.?;
+        self.running.validateOutputFlip(channel.config.index) catch return error.Binding;
+        const work = self.running.displayFlip(channel.config.index) orelse return error.Binding;
         const part = &work.window;
         const config = part.config;
         const root = if (self.running.display_engine_owner) |*value| value else return error.Binding;

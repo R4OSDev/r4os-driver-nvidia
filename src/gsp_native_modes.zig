@@ -18,6 +18,7 @@ pub const Owner = struct {
     phase: Phase = .detached,
     failed_phase: ?Phase = null,
     failure: ?anyerror = null,
+    failed_reply_sent: bool = false,
     last_status: i32 = 0,
     deadline: u64 = 0,
     cursor: u32 = 0,
@@ -44,7 +45,7 @@ pub const Owner = struct {
     /// Finish only partially constructed resource bindings. No new mode,
     /// image upload or scanout is started after receiver invalidation.
     pub fn pause(self: *Owner, product: anytype) !bool {
-        if (!product.running.?.display_paused) return error.State;
+        if (!product.running.?.outputPaused(product.mode.?.window)) return error.State;
         return switch (self.phase) {
             .allocate_wait, .bind, .release_creator, .table_upload, .table_wait, .prepare => self.advance(product),
             else => false,
@@ -53,7 +54,7 @@ pub const Owner = struct {
     pub fn pending(self: *const Owner) bool { return self.job != null or self.applied != null; }
     pub fn stopped(self: *Owner, product: anytype) !bool {
         const run = product.running.?;
-        if (!run.display_paused or run.display_images[product.mode.?.window] != null or
+        if (!run.outputPaused(product.mode.?.window) or run.display_images[product.mode.?.window] != null or
             run.display_retired[product.mode.?.window] == null) return error.State;
         if (self.job == null) return if (self.phase == .idle or self.phase == .decision) self.take(product) else false;
         if (!self.stopping_cleanup) {
@@ -187,9 +188,10 @@ pub const Owner = struct {
                 self.last_status = product.outputs.?.publish(&self.publication, &identity);
                 if (self.last_status == a.gfx_output_error_busy) return false;
                 if (self.last_status != a.gfx_output_ok or identity.adapter_id != product.backend.adapter_id or
-                    identity.device_generation != product.backend.device_generation or identity.connector_id != product.output.connector_id or
+                    identity.device_generation != product.backend.device_generation or identity.connector_id != product.mode.?.signal.display_id or
                     identity.connection_generation == 0) return error.Catalog;
                 product.publication = self.publication; product.output = identity;
+                try product.syncPresentationTarget();
                 self.phase = .idle;
                 product.ctx.?.logInfo("NVIDIA native-modes: ready source=EDID,OR-clock,IMP operation=apply,confirm,rollback");
             },
@@ -241,7 +243,7 @@ pub const Owner = struct {
                 self.phase = .prepare;
             },
             .prepare => {
-                try run.prepareDisplayPresentationImage(self.candidate, self.job.?.reference, self.deadline);
+                try run.prepareOutputPresentationImage(product.mode.?.window, self.candidate, self.job.?.reference, self.deadline);
                 self.phase = .image_upload;
             },
             .image_upload => {
@@ -276,6 +278,12 @@ pub const Owner = struct {
                     self.retire_dma = self.candidate; self.retire_storage = self.candidate_storage;
                     self.outcome = a.gfx_output_outcome_old_preserved; self.phase = .retire_shadow;
                 }
+                if (run.display_images[product.mode.?.window]) |image| {
+                    product.mode = image.boot_mode orelse return error.Completion;
+                    product.link = image.link.?.plan;
+                    product.confirmed_image = image;
+                }
+                try product.syncPresentationTarget();
             },
             .rollback_stop => {
                 try run.detachDisplayImage(product.core.?, product.window.?, self.deadline);
@@ -342,10 +350,7 @@ pub const Owner = struct {
     }
     fn take(self: *Owner, product: anytype) !bool {
         if (product.running.?.cursor_point != null) return false;
-        var job: a.GfxDriverModeJob = .{};
-        const status = product.outputs.?.takeMode(&product.backend, &job);
-        if (status == 0) return false;
-        if (status != a.gfx_output_ok) return error.ModeApi;
+        const job = try product.running.?.takeOutputMode(product.outputs.?, product.backend, product.output) orelse return false;
         self.job = job; self.deadline = job.deadline_ns; self.error_code = 0; self.outcome = 0;
         self.diagnostic.begin(product, job);
         if (!product.running.?.requirePrivatePresentation()) {
@@ -363,12 +368,12 @@ pub const Owner = struct {
             if (job.ticket != previous.ticket or job.sequence != previous.sequence + 1 or
                 !std.meta.eql(job.assignment, previous.assignment) or !std.meta.eql(job.mode, previous.mode) or !std.meta.eql(job.reference, previous.reference)) return error.Stale;
             if (job.operation == a.gfx_mode_operation_confirm) {
-                if (!std.meta.eql(product.running.?.presentation.?.surface.shadow.buffer,
+                if (!std.meta.eql(product.running.?.currentPresentation(product.mode.?.window).?.surface.shadow.buffer,
                     try product.running.?.presentationImageBuffer(self.candidate))) return error.Stale;
                 self.retire_dma = self.previous_dma; self.retire_storage = self.previous_storage;
                 self.outcome = a.gfx_output_outcome_applied; self.phase = .retire_shadow;
             } else if (job.operation == a.gfx_mode_operation_rollback) {
-                if (product.running.?.display_paused and !product.running.?.display_restoring) { self.phase = .select; return true; }
+                if (product.running.?.outputPaused(product.mode.?.window) and !product.running.?.outputRestoring(product.mode.?.window)) { self.phase = .select; return true; }
                 if (self.previous_headless) { self.phase = .rollback_stop; return true; }
                 self.plan = try product.running.?.displayModePlan(product.engine.?, product.mode.?.window, self.previous.?.boot_mode.?.receiver_mode_id);
                 if (!std.meta.eql(self.plan.?, self.previous.?.boot_mode.?)) return error.Stale;
@@ -377,12 +382,12 @@ pub const Owner = struct {
         } else {
             if (job.operation != a.gfx_mode_operation_apply or job.ticket <= self.completed_ticket or job.sequence != 1) return error.Stale;
             try self.validateApply(product, job);
-            if (product.running.?.display_paused and !product.running.?.display_restoring) { self.phase = .query; return true; }
+            if (product.running.?.outputPaused(product.mode.?.window) and !product.running.?.outputRestoring(product.mode.?.window)) { self.phase = .query; return true; }
             self.previous = try product.running.?.displayImageStatus(product.engine.?, product.mode.?.window);
             self.previous_headless = self.previous == null;
-            if (self.previous_headless and (!product.running.?.display_restoring or
+            if (self.previous_headless and (!product.running.?.outputRestoring(product.mode.?.window) or
                 product.running.?.display_retired[product.mode.?.window] == null)) return error.State;
-            self.previous_dma = if (self.previous) |value| value.image.dma else product.running.?.presentation.?.surface.scanout.?.dma;
+            self.previous_dma = if (self.previous) |value| value.image.dma else product.running.?.currentPresentation(product.mode.?.window).?.surface.scanout.?.dma;
             self.previous_storage = try imageStorage(product.running.?, self.previous_dma);
             self.plan = try product.running.?.displayModePlan(product.engine.?, product.mode.?.window, job.mode.mode_id);
             self.phase = .query;
@@ -407,7 +412,7 @@ pub const Owner = struct {
         if (ref.version != 1 or ref.size < @sizeOf(a.GfxBufferReference) or ref.flags != 0 or ref.reserved0 != 0 or
             ref.reference.id == 0 or ref.reference.generation == 0 or ref.reference.reserved0 != 0 or
             ref.buffer.id == 0 or ref.buffer.generation == 0 or ref.buffer.reserved0 != 0 or
-            std.meta.eql(ref.buffer, product.running.?.presentation.?.surface.shadow.buffer)) return error.Descriptor;
+            std.meta.eql(ref.buffer, product.running.?.currentPresentation(product.mode.?.window).?.surface.shadow.buffer)) return error.Descriptor;
         var d: a.GfxBufferDescriptor = .{};
         if (product.memory.?.bufferDescribe(&ref.reference, &d) != a.gfx_buffer_result_ok) return error.Memory;
         const usage = a.gfx_buffer_usage_cpu_write | a.gfx_buffer_usage_transfer_source | a.gfx_buffer_usage_scanout;
@@ -427,8 +432,8 @@ pub const Owner = struct {
     }
     fn imageStorage(run: *runtime.Owner, dma: u32) !runtime.BufferHandle {
         const resources = run.display_resources_slot.owner orelse return error.State;
-        const entry = run.presentation orelse return error.State;
-        const source = (resources.publishedStorage(entry.window.slot, dma) orelse return error.Stale).info() orelse return error.Stale;
+        const window = try run.presentationImageWindow(dma);
+        const source = (resources.publishedStorage(window + 1, dma) orelse return error.Stale).info() orelse return error.Stale;
         // The creator reference was closed after the display Use imported it,
         // so Owner.info() deliberately no longer exports that closed alias.
         // Match the retained allocator against the live Use instead.
@@ -452,10 +457,30 @@ pub const Owner = struct {
             const receipt: a.GfxDriverModeCompletion = .{ .ticket = job.ticket, .sequence = job.sequence,
                 .operation = job.operation, .outcome = self.outcome, .quiesced = 0, .error_code = self.error_code };
             self.last_status = product.outputs.?.completeMode(&receipt);
+            self.failed_reply_sent = self.last_status == a.gfx_output_ok;
             self.diagnostic.failed(@tagName(self.failed_phase.?), err);
             self.diagnostic.finish(product, @tagName(self.failed_phase.?), receipt, self.last_status);
         }
         self.log(product, "failed-held");
+    }
+    /// A lost head still consumes its own common rollback/confirmation jobs.
+    /// Answering LOST does not start hardware work or claim quiescence, and
+    /// allows the other output owners to keep using the adapter's one queue.
+    pub fn failedJobs(self: *Owner, product: anytype, err: anyerror) !bool {
+        if (!product.outputs.?.supportsModes() or product.output.connection_generation == 0) return false;
+        if (self.phase != .failed) self.quarantine(product, err);
+        if (self.failed_reply_sent) { self.job = null; self.failed_reply_sent = false; }
+        if (self.job == null) self.job = try product.running.?.takeOutputMode(product.outputs.?, product.backend, product.output) orelse return false;
+        const job = self.job.?;
+        const receipt: a.GfxDriverModeCompletion = .{ .ticket = job.ticket, .sequence = job.sequence,
+            .operation = job.operation, .outcome = a.gfx_output_outcome_lost, .quiesced = 0,
+            .error_code = if (err == error.Timeout or err == error.Deadline) a.gfx_output_error_timeout else a.gfx_output_error_unavailable };
+        self.last_status = product.outputs.?.completeMode(&receipt);
+        if (self.last_status == a.gfx_output_error_busy) return false;
+        if (self.last_status != a.gfx_output_ok and self.last_status != a.gfx_output_error_stale) return error.ModeApi;
+        self.completed_ticket = @max(self.completed_ticket, job.ticket);
+        self.job = null;
+        return true;
     }
     fn log(self: *Owner, product: anytype, event: []const u8) void {
         var buffer: [240]u8 = undefined;

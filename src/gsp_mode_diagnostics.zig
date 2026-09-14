@@ -78,14 +78,14 @@ pub const Report = struct {
         if (run.display_upload_job != null) self.pending |= 4;
         if (run.copy_job != null) self.pending |= 8;
         if (run.native_active != null) self.pending |= 16;
-        if (run.display_flip != null) self.pending |= 32;
-        if (run.frame_ready != null) self.pending |= 64;
+        if (run.hasDisplayFlips()) self.pending |= 32;
+        if (run.readyImage(product.mode.?.window) != null) self.pending |= 64;
         if (run.frame_setup != null) self.pending |= 128;
         for (&run.native_buffers) |*slot| if (slot.owner != null) { self.native_owners += 1; };
         for (&run.presentation_slots) |*slot| if (slot.*) |*entry| {
             if (entry.surface.shadow.reference.id != 0) self.shadow_imports += 1;
         };
-        if (run.presentation) |entry| if (entry.surface.scanout) |image| { self.selected = image.dma; };
+        if (run.currentPresentation(product.mode.?.window)) |entry| if (entry.surface.scanout) |image| { self.selected = image.dma; };
         const ctx = &product.ctx.?;
         write(ctx, "NVIDIA mode-result: ticket={d} seq={d} op={d} phase={s} reason={s} outcome={d} quiesced={d} error={d} api={d}",
             .{self.ticket,self.operation_sequence,self.operation,self.phase,if(self.failure)|err|@errorName(err) else "none",self.outcome,self.quiesced,self.error_code,self.common_status});

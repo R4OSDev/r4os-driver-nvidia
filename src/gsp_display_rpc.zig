@@ -226,9 +226,9 @@ pub const header_bytes = 24;
 pub const max_edid_bytes = 2048;
 pub const max_request_bytes = header_bytes + 16 + max_edid_bytes;
 pub const max_heads = 32;
-pub const Command = enum(u32) { heads = 0x730102, active = 0x73010c, supported = 0x730107, connected = 0x730108, edid = 0x730245, connectors = 0x730250, resource = 0x73028b, buses = 0x730211, ports = 0x402c0101, ddc = ddc_wire.command, aux = aux_wire.command };
+pub const Command = enum(u32) { heads = 0x730102, active = 0x73010c, windows = 0x7302ad, supported = 0x730107, connected = 0x730108, edid = 0x730245, connectors = 0x730250, resource = 0x73028b, buses = 0x730211, ports = 0x402c0101, ddc = ddc_wire.command, aux = aux_wire.command };
 pub const Ddc = struct { display_id: u32, port: u8, block: u8 };
-pub const Query = union(Command) { heads: void, active: u32, supported: void, connected: u32, edid: u32, connectors: u32, resource: u32, buses: u32, ports: void, ddc: Ddc, aux: aux_wire.Request };
+pub const Query = union(Command) { heads: void, active: u32, windows: void, supported: void, connected: u32, edid: u32, connectors: u32, resource: u32, buses: u32, ports: void, ddc: Ddc, aux: aux_wire.Request };
 pub const Object = struct { epoch: u64, client: u32, display: u32, i2c: u32 = 0 };
 pub const Supported = struct { displays: u32, ddc: u32 };
 pub const Connector = struct { index: u32 = 0, kind: u32 = 0, location: u32 = 0 };
@@ -261,6 +261,7 @@ pub const Buses = struct { communication: u32, ddc: u32 }; // RM port IDs; zero 
 pub const Reply = union(enum) {
     heads: u32,
     active: u32,
+    windows: [32]u8,
     supported: Supported,
     connected: u32,
     connectors: Connectors,
@@ -293,6 +294,7 @@ fn put(bytes: []u8, offset: usize, value: u32) void {
 fn paramsSize(query: Query) usize {
     return switch (query) {
         .supported, .heads => 12,
+        .windows => 36, // NV0073: subDeviceInstance, 32 byte-sized head masks.
         .active => 16,
         .connected => 16,
         .edid => 16 + max_edid_bytes,
@@ -320,7 +322,7 @@ pub fn nativeDp(resource: Resource) bool { return resource.kind == 2 and (resour
 pub fn encode(object: Object, query: Query, output: []u8) Error![]const u8 {
     if (object.epoch == 0 or object.client == 0 or object.display == 0 or target(object, query) == 0) return error.Handle;
     switch (query) {
-        .supported, .heads, .ports => {},
+        .supported, .heads, .windows, .ports => {},
         .ddc => |request| if (!oneBit(request.display_id) or request.port >= 16 or request.block >= ddc_wire.max_blocks) return error.Query,
         .aux => |request| if (!oneBit(request.display_id)) return error.Query,
         .active => |head| if (head >= max_heads) return error.Query,
@@ -340,7 +342,7 @@ pub fn encode(object: Object, query: Query, output: []u8) Error![]const u8 {
     // with COPY_CACHE=NO and DISPMUX=DEFAULT. Display IDs are RM masks,
     // never VBIOS physical connector indices or GPIO numbers.
     switch (query) {
-        .supported, .heads, .ports => {},
+        .supported, .heads, .windows, .ports => {},
         .ddc => |request| { _ = try ddc_wire.encode(.{ .port = request.port, .block = request.block }, null, bytes[header_bytes..]); },
         .aux => |request| { _ = try aux_wire.encode(request, bytes[header_bytes..]); },
         .active => |head| put(bytes, header_bytes + 4, head),
@@ -382,6 +384,7 @@ pub fn decode(object: Object, query: Query, record: message.Record) Error!Reply 
     if (word(params, 0) != 0) return error.Unexpected;
     return switch (query) {
         .ports, .ddc, .aux => unreachable,
+        .windows => .{ .windows = params[4..36].* },
         .heads => blk: {
             if (word(params, 4) != 0 or word(params, 8) > max_heads) return error.Payload;
             break :blk .{ .heads = word(params, 8) };
@@ -489,7 +492,7 @@ pub const Channel = struct {
                     request.display_id & available.ddc == 0 or request.port >= 16 or request.block >= ddc_wire.max_blocks or
                     bus.display_id != request.display_id or bus.port != @as(u32, request.port) + 1 or ports[request.port] & 5 != 5) return error.Query;
             },
-            .heads => if (self.supported == null) return error.Query,
+            .heads, .windows => if (self.supported == null) return error.Query,
             .active => |head| {
                 const count = self.heads orelse return error.Query;
                 if (head >= count) return error.Query;

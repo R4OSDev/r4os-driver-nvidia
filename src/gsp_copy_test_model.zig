@@ -24,6 +24,7 @@ const native = @import("gsp_vram_test_model.zig").Model;
 const fifo = @import("gsp_fifo_test_model.zig").Model;
 pub const Model = struct {
     pub const length = 12288;
+    const system_count = 4; // Primary, retained replacement, additional head and its mode candidate.
     pub const binding: a.GfxBackendBinding = .{ .adapter_id = 0x01000000, .milestone = 1, .device_generation = 7, .reset_generation = 11 };
     const Reference = struct { active: bool = false, buffer: a.GfxBufferHandle = .{}, mapping_only: bool = true, readonly: bool = false };
     const Scanout = struct { job: a.GfxDriverJob, retire: bool = false };
@@ -32,20 +33,23 @@ pub const Model = struct {
     var direct_mode = false;
     var references: [16]Reference = @splat(.{});
     var original: a.GfxDriverMemoryApi = .{};
-    pub var host: [2][length]u8 = undefined;
-    var gpu_data: [2][length]u8 = undefined;
+    pub var host: [system_count][length]u8 = undefined;
+    var gpu_data: [system_count][length]u8 = undefined;
     pub var vram_data: [65536]u8 = undefined;
     pub var replacement_vram: [65536]u8 = undefined;
     var extra_vram: [native.slots.len][65536]u8 = undefined;
     var replacement_native: ?usize = null;
     var replacement_descriptor: ?a.GfxBufferDescriptor = null;
+    var additional_descriptor: ?a.GfxBufferDescriptor = null;
+    var mode_descriptor: ?a.GfxBufferDescriptor = null;
+    pub var mode_lent = false;
     pub var replacement_lent = false;
     pub var borrowed_releases: usize = 0;
     var initial_index: usize = 0;
     var command_view: [length]u8 = undefined;
     var command_slot: usize = 0;
-    pub var dma: [2]a.GfxDeviceLease = @splat(.{});
-    pub var gpu: [2]a.GfxDeviceLease = @splat(.{});
+    pub var dma: [system_count]a.GfxDeviceLease = @splat(.{});
+    pub var gpu: [system_count]a.GfxDeviceLease = @splat(.{});
     pub var job: a.GfxDriverJob = .{};
     pub var queued = false;
     pub var active = false;
@@ -69,10 +73,14 @@ pub const Model = struct {
     var render_mode = false;
     pub var render_operations: u64 = 13;
     pub var render_list: a.GfxRenderList = .{};
+    pub var render_grids: [a.gfx_render_list_capacity]a.GfxSampleGrid = @splat(.{});
     pub var shadow_cpu = false;
     pub var shadow_creates: usize = 0;
     var shadow_descriptor: a.GfxBufferDescriptor = .{};
     var shadow_live = false;
+    pub var additional_shadow = false;
+    var additional_shadow_live = false;
+    var additional_shadow_cpu = false;
     var registration: ?a.GfxBackendRegistration = null;
     var fetched = false;
     var executed = false;
@@ -85,10 +93,12 @@ pub const Model = struct {
         present_mode = false; product_mode = false; render_mode = false; render_operations = 13; shadow_cpu = false; shadow_creates = 0;
         direct_mode = false; scanouts = @splat(null); next_point = 0;
         shadow_live = false; registration = null; decoded_count = 0; presentation_wakes = 0;
+        additional_shadow = false; additional_shadow_live = false; additional_shadow_cpu = false; additional_descriptor = null;
+        mode_descriptor = null; mode_lent = false;
         initial_read = .{}; reject_initial_read = false; reject_initial_release = false;
         replacement_native = null; replacement_descriptor = null; replacement_lent = false; borrowed_releases = 0; initial_index = 0;
         app_reference = true; native.slots[index].imported = true; // Separate app alias, independent of the allocator's producer reference.
-        for (0..2) |i| { @memset(&host[i], 0xa5); @memset(&gpu_data[i], 0x5a); }
+        for (0..system_count) |i| { @memset(&host[i], 0xa5); @memset(&gpu_data[i], 0x5a); }
         @memset(&vram_data, 0xcc);
         @memset(&replacement_vram, 0xcc);
         for (&extra_vram) |*bytes| @memset(bytes, 0xcc);
@@ -119,6 +129,7 @@ pub const Model = struct {
         job.source_offset = 0; job.target_offset = 0; job.byte_length = 0;
         job.render = command;
         render_list = .{};
+        render_grids = @splat(.{});
     }
     pub fn enqueueRenderList(target: usize, source: ?usize, commands: []const a.GfxRenderCommand, deadline: u64) void {
         std.debug.assert(commands.len > 0 and commands.len <= a.gfx_render_list_capacity);
@@ -127,10 +138,33 @@ pub const Model = struct {
         render_list.count = @intCast(commands.len);
         @memcpy(render_list.commands[0..commands.len], commands);
     }
+    pub fn enqueueRenderGridList(target: usize, source: ?usize, commands: []const a.GfxRenderCommand,
+        grids: []const a.GfxSampleGrid, deadline: u64) void {
+        std.debug.assert(commands.len == grids.len);
+        enqueueRenderList(target, source, commands, deadline);
+        job.operation = a.gfx_queue_operation_render_grid_list;
+        @memcpy(render_grids[0..grids.len], grids);
+    }
     pub fn observeRenderExecution() void { std.debug.assert(render_mode and active); executed = true; }
     pub fn observeRenderSemaphore() void { std.debug.assert(render_mode and active and executed); signaled = true; }
     pub fn shadowReference() a.GfxBufferHandle { return .{ .id = 1499, .generation = 951 }; }
+    fn additionalReference() a.GfxBufferHandle { return .{ .id = 1496, .generation = 951 }; }
     fn replacementReference() a.GfxBufferHandle { return .{ .id = 1497, .generation = 951 }; }
+    fn modeReference() a.GfxBufferHandle { return .{ .id = 1494, .generation = 951 }; }
+    pub fn lendOutputMode(width: u32, height: u32) a.GfxBufferReference {
+        std.debug.assert(product_mode and !mode_lent and modeReferences() == 0 and dma[3].lease.id == 0 and gpu[3].lease.id == 0 and
+            @as(u64, width) * height * 4 <= length);
+        mode_descriptor = .{ .byte_length = @as(u64, width) * height * 4, .alignment = 4096,
+            .width = width, .height = height, .format = a.gfx_buffer_format_xrgb8888, .plane_count = 1,
+            .plane_pitches = .{ @as(u64, width) * 4, 0, 0, 0 }, .usage = 38 };
+        mode_lent = true;
+        return .{ .buffer = sys(3), .reference = modeReference() };
+    }
+    pub fn modeReferences() usize {
+        var count: usize = 0;
+        for (references) |entry| if (entry.active and std.meta.eql(entry.buffer, sys(3))) { count += 1; };
+        return count;
+    }
     pub fn lendReplacement(index: usize, width: u32, height: u32) a.GfxBufferReference {
         std.debug.assert(product_mode and !replacement_lent and index != native_index and
             dma[1].lease.id == 0 and gpu[1].lease.id == 0 and @as(u64, width) * height * 4 <= length);
@@ -142,7 +176,9 @@ pub const Model = struct {
         @memset(&replacement_vram, 0xcc);
         return .{ .buffer = sys(1), .reference = replacementReference() };
     }
-    fn descriptor(index: usize) a.GfxBufferDescriptor { return if (index == 0) shadow_descriptor else replacement_descriptor.?; }
+    fn descriptor(index: usize) a.GfxBufferDescriptor { return switch (index) {
+        0 => shadow_descriptor, 1 => replacement_descriptor.?, 2 => additional_descriptor.?, 3 => mode_descriptor.?, else => unreachable,
+    }; }
     pub fn replacementReferences() usize {
         var n: usize = 0;
         for (references) |entry| if (entry.active and std.meta.eql(entry.buffer, sys(1))) { n += 1; };
@@ -199,11 +235,11 @@ pub const Model = struct {
     }
     // Keep SYSTEM mappings in a gap between native allocation VAs. Larger
     // frame pools can use native slot 7 at 0x80000000 as a real CE operand.
-    pub fn address(index: usize) u64 { return @as(u64, if (direct_mode) 0xe8000000 else 0x80000000) + index * 0x100000; }
+    pub fn address(index: usize) u64 { return @as(u64, if (product_mode) 0xe8000000 else 0x80000000) + index * 0x100000; }
     fn sys(index: usize) a.GfxBufferHandle { return .{ .id = @intCast(1101 + index), .generation = 901 }; }
     fn ref(index: usize) a.GfxBufferHandle { return .{ .id = @intCast(1501 + index), .generation = 951 }; }
     fn select(input: a.GfxBufferHandle) ?usize { for (0..references.len) |i| if (std.meta.eql(input, ref(i))) return i; return null; }
-    fn system(input: a.GfxBufferHandle) ?usize { for (0..2) |i| if (std.meta.eql(input, sys(i))) return i; return null; }
+    fn system(input: a.GfxBufferHandle) ?usize { for (0..system_count) |i| if (std.meta.eql(input, sys(i))) return i; return null; }
     fn nativeSlot(buffer: a.GfxBufferHandle) ?usize {
         for (&native.slots, 0..) |*slot, i| if (slot.live and std.meta.eql(buffer, slot.reservation.buffer)) return i;
         return null;
@@ -246,18 +282,23 @@ pub const Model = struct {
         .register_backend = @intFromPtr(&register), .register_profile = if (product_mode) @intFromPtr(&registerProfile) else 0,
         .update_operations = if (render_mode or direct_mode) @intFromPtr(&updateOperations) else 0,
         .read_render_list = if (render_mode) @intFromPtr(&readRenderList) else 0,
+        .read_render_grid_list = if (render_mode) @intFromPtr(&readRenderGridList) else 0,
         .retain_scanout = if (direct_mode) @intFromPtr(&retainScanout) else 0,
         .begin_scanout = if (direct_mode) @intFromPtr(&beginScanout) else 0,
         .scanout_retire_requested = if (direct_mode) @intFromPtr(&retireRequested) else 0,
         .unregister_backend = @intFromPtr(&unregister), .take = @intFromPtr(&take), .retain_resource = @intFromPtr(&retain), .complete = @intFromPtr(&complete) }; return a.gfx_queue_ok; }
     fn updateOperations(input: *const a.GfxBackendBinding, operations: u64) callconv(.c) i32 {
         std.debug.assert(std.meta.eql(input.*, binding) and ((direct_mode and operations == 173) or
-            (render_mode and (operations == 29 or operations == 61 or operations == 125))));
+            (render_mode and (operations == 29 or operations == 61 or operations == 125 or operations == 381))));
         render_operations = operations; return a.gfx_queue_ok;
     }
     fn readRenderList(input: *const a.GfxFence, out: *a.GfxRenderList) callconv(.c) i32 {
         if (!active or !std.meta.eql(input.*, job.fence) or job.operation != a.gfx_queue_operation_render_list) return a.gfx_queue_error_invalid;
         out.* = render_list; return a.gfx_queue_ok;
+    }
+    fn readRenderGridList(input: *const a.GfxFence, out: *a.GfxRenderGridList) callconv(.c) i32 {
+        if (!active or !std.meta.eql(input.*, job.fence) or job.operation != a.gfx_queue_operation_render_grid_list) return a.gfx_queue_error_invalid;
+        out.* = .{ .count = render_list.count, .commands = render_list.commands, .grids = render_grids }; return a.gfx_queue_ok;
     }
     fn registerProfile(input: *const a.GfxBackendRegistration, profile: *const a.GfxBackendProfile, out: *a.GfxBackendBinding) callconv(.c) i32 {
         const nv = @import("r4nv_binding");
@@ -289,7 +330,7 @@ pub const Model = struct {
         queued = false; active = true; out.* = job;
         // Common queue acquisition is after the app's CPU store boundary.
         // In particular readback CPU bytes do not yet reflect device writes.
-        gpu_data[0] = host[0]; gpu_data[1] = host[1];
+        for (0..system_count) |i| gpu_data[i] = host[i];
         for (&native.slots, 0..) |*slot, i| if (queuedNative(i)) { slot.imported = true; };
         return a.gfx_queue_ok;
     }
@@ -358,6 +399,14 @@ pub const Model = struct {
             const call: *const fn (*const a.GfxBufferDescriptor, *a.GfxBufferReference) callconv(.c) i32 = @ptrFromInt(original.buffer_create);
             return call(d, out);
         }
+        if (additional_shadow) {
+            std.debug.assert(!additional_shadow_live and d.location == 0 and d.byte_length <= length and (d.usage == 7 or d.usage == 39) and d.plane_count == 1);
+            for (references) |entry| std.debug.assert(!entry.active or !std.meta.eql(entry.buffer, sys(2)));
+            additional_descriptor = d.*; additional_shadow_live = true;
+            shadow_creates += 1;
+            out.* = .{ .buffer = sys(2), .reference = additionalReference() };
+            return a.gfx_buffer_result_ok;
+        }
         std.debug.assert(!shadow_live and d.location == 0 and d.byte_length <= length and (d.usage == 7 or d.usage == 39) and d.plane_count == 1);
         for (references) |entry| std.debug.assert(!entry.active or !std.meta.eql(entry.buffer, sys(0)));
         shadow_descriptor = d.*; shadow_live = true; shadow_creates += 1;
@@ -365,6 +414,12 @@ pub const Model = struct {
         return a.gfx_buffer_result_ok;
     }
     fn mapShadow(input: *const a.GfxBufferHandle, access: u32, offset: u64, bytes: u64, out: *a.GfxBufferMap) callconv(.c) i32 {
+        if (std.meta.eql(input.*, additionalReference())) {
+            std.debug.assert(additional_shadow_live and !additional_shadow_cpu and access == 1 and offset == 0 and bytes == additional_descriptor.?.byte_length);
+            additional_shadow_cpu = true;
+            out.* = .{ .lease = .{ .id = 1495, .generation = 951 }, .cpu_address = @intFromPtr(&host[2]), .byte_length = bytes };
+            return a.gfx_buffer_result_ok;
+        }
         if (!std.meta.eql(input.*, shadowReference())) {
             const call: *const fn (*const a.GfxBufferHandle, u32, u64, u64, *a.GfxBufferMap) callconv(.c) i32 = @ptrFromInt(original.buffer_map);
             return call(input, access, offset, bytes, out);
@@ -375,6 +430,10 @@ pub const Model = struct {
         return a.gfx_buffer_result_ok;
     }
     fn unmapShadow(input: *const a.GfxBufferHandle) callconv(.c) i32 {
+        if (input.id == 1495 and input.generation == 951) {
+            std.debug.assert(additional_shadow_live and additional_shadow_cpu);
+            additional_shadow_cpu = false; return a.gfx_buffer_result_ok;
+        }
         if (input.id != 1498 or input.generation != 951) {
             const call: *const fn (*const a.GfxBufferHandle) callconv(.c) i32 = @ptrFromInt(original.buffer_unmap);
             return call(input);
@@ -382,6 +441,13 @@ pub const Model = struct {
         std.debug.assert(shadow_live and shadow_cpu); shadow_cpu = false; return a.gfx_buffer_result_ok;
     }
     fn describe(input: *const a.GfxBufferHandle, out: *a.GfxBufferDescriptor) callconv(.c) i32 {
+        if (mode_lent and std.meta.eql(input.*, modeReference())) {
+            out.* = mode_descriptor.?; return a.gfx_buffer_result_ok;
+        }
+        if (std.meta.eql(input.*, additionalReference())) {
+            std.debug.assert(additional_shadow_live);
+            out.* = additional_descriptor.?; return a.gfx_buffer_result_ok;
+        }
         if (replacement_lent and std.meta.eql(input.*, replacementReference())) {
             out.* = replacement_descriptor.?; return a.gfx_buffer_result_ok;
         }
@@ -397,11 +463,13 @@ pub const Model = struct {
     fn importBuffer(input: *const a.GfxBufferHandle, out: *a.GfxBufferReference) callconv(.c) i32 {
         const own = if (select(input.*)) |index| references[index].active and !references[index].mapping_only else false;
         const replacement = replacement_lent and std.meta.eql(input.*, replacementReference());
-        if (!present_mode or (!std.meta.eql(input.*, shadowReference()) and !own and !replacement)) {
+        const additional = additional_shadow_live and std.meta.eql(input.*, additionalReference());
+        const mode = mode_lent and std.meta.eql(input.*, modeReference());
+        if (!present_mode or (!std.meta.eql(input.*, shadowReference()) and !own and !replacement and !additional and !mode)) {
             const call: *const fn (*const a.GfxBufferHandle, *a.GfxBufferReference) callconv(.c) i32 = @ptrFromInt(original.buffer_import); return call(input, out);
         }
-        std.debug.assert(shadow_live or own or replacement);
-        const buffer = if (own) references[select(input.*).?].buffer else sys(@intFromBool(replacement));
+        std.debug.assert(shadow_live or own or replacement or additional or mode);
+        const buffer = if (own) references[select(input.*).?].buffer else sys(if (mode) @as(usize, 3) else if (additional) @as(usize, 2) else @intFromBool(replacement));
         const readonly = own and references[select(input.*).?].readonly;
         for (&references, 0..) |*entry, i| if (!entry.active) {
             entry.* = .{ .active = true, .buffer = buffer, .mapping_only = false, .readonly = readonly };
@@ -410,7 +478,11 @@ pub const Model = struct {
         return a.gfx_buffer_error_capacity;
     }
     fn drop(input: *const a.GfxBufferHandle) callconv(.c) i32 {
-        if (std.meta.eql(input.*, replacementReference())) {
+        if (std.meta.eql(input.*, additionalReference())) {
+            std.debug.assert(additional_shadow_live and !additional_shadow_cpu);
+            additional_shadow_live = false; return a.gfx_buffer_result_ok;
+        }
+        if (std.meta.eql(input.*, replacementReference()) or std.meta.eql(input.*, modeReference())) {
             borrowed_releases += 1; return a.gfx_buffer_error_invalid;
         }
         if (product_mode and std.meta.eql(input.*, shadowReference())) {
@@ -461,7 +533,7 @@ pub const Model = struct {
         return a.gfx_buffer_result_ok;
     }
     fn segment(input: *const a.GfxDeviceLease, offset: u64, out: *a.GfxDmaSegment) callconv(.c) i32 {
-        if (input.lease.id < 1701 or input.lease.id > 1704) {
+        if (input.lease.id < 1701 or input.lease.id >= 1701 + system_count * 2) {
             const call: *const fn (*const a.GfxDeviceLease, u64, *a.GfxDmaSegment) callconv(.c) i32 = @ptrFromInt(original.device_segment);
             return call(input, offset, out);
         }
@@ -472,7 +544,7 @@ pub const Model = struct {
         return a.gfx_buffer_result_ok;
     }
     fn releaseDevice(input: *const a.GfxDeviceLease, quiesced: u32) callconv(.c) i32 {
-        if (input.lease.id != 1799 and (input.lease.id < 1701 or input.lease.id > 1704)) {
+        if (input.lease.id != 1799 and (input.lease.id < 1701 or input.lease.id >= 1701 + system_count * 2)) {
             const call: *const fn (*const a.GfxDeviceLease, u32) callconv(.c) i32 = @ptrFromInt(original.device_release);
             return call(input, quiesced);
         }
@@ -489,7 +561,7 @@ pub const Model = struct {
     fn word(bytes: []const u8, at: usize) u32 { return std.mem.readInt(u32, bytes[at..][0..4], .little); }
     fn operand(hi: u32, lo: u32) u64 { return (@as(u64, hi) << 32) | lo; }
     fn data(address_value: u64, bytes: usize) ![]u8 {
-        for (0..2) |i| if (address_value >= address(i) and address_value - address(i) < length) {
+        for (0..system_count) |i| if (address_value >= address(i) and address_value - address(i) < length) {
             const offset: usize = @intCast(address_value - address(i));
             if (bytes > length - offset or (gpu[i].lease.id == 0 and
                 !(present_mode and dma[i].lease.id != 0 and (active or (initial_read.lease.id != 0 and initial_index == i))))) return error.GpuAddress;
@@ -584,7 +656,9 @@ pub const Model = struct {
     pub fn signal() !void {
         try t.expect((active or initial_read.lease.id != 0 or heldScanouts() != 0) and executed and !signaled);
         // SYS-scope release makes preceding CE data visible before the point.
-        host[0] = gpu_data[0]; host[1] = gpu_data[1];
+        // A CE read must not overwrite another head's newer CPU stores.
+        const destination = operand(decoded[5], decoded[6]);
+        for (0..system_count) |i| if (destination >= address(i) and destination - address(i) < length) { host[i] = gpu_data[i]; };
         std.mem.writeInt(u32, fifo.slots[command_slot].data[8704..8708], decoded[decoded_count - 3], .little);
         signaled = true;
     }

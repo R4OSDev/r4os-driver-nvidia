@@ -38,7 +38,7 @@ pub const Work = struct {
                 if (status.revision != status.published_revision) return error.Completion;
                 self.phase = .prepare;
             },
-            .prepare => { try run.prepareDisplayFrameImage(self.dma, self.deadline); return true; },
+            .prepare => { try run.prepareOutputFrameImage(self.image.window.slot - 1, self.dma, self.deadline); return true; },
         }
         return false;
     }

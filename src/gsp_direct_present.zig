@@ -66,14 +66,14 @@ pub const Work = struct {
             .flip => {
                 if (self.aborting) { self.phase = .unregister; return false; }
                 try run.flipDisplayPresentationImage(self.dma, self.deadline);
-                run.display_flip.?.ordinary = true;
+                run.primaryFlip().?.ordinary = true;
                 self.phase = .visible;
             },
             .visible => {
                 const entry = try run.directPresentation(self.dma);
                 const direct = entry.direct orelse return error.Stale;
                 if (!direct.handed_off) {
-                    if (run.display_flip == null and run.display_paused) self.phase = .unregister;
+                    if (run.primaryFlip() == null and run.display_paused) self.phase = .unregister;
                     return false;
                 }
                 // The display's independent Use and the common fence now

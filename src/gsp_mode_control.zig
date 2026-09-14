@@ -252,7 +252,7 @@
 //  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 //  * DEALINGS IN THE SOFTWARE.
 //  */
-//! RM mode feasibility for one progressive RGB8, unscaled pitch surface.
+//! RM mode feasibility for the candidate and every other active RGB8 head.
 //! Query results are observations, never a reservation, modeset or proof of
 //! display quiescence. The Device worker owns the real Exchange throughout.
 const std = @import("std");
@@ -267,6 +267,36 @@ pub const State = enum { querying, unwinding, ready, handed_off, destroying, clo
 pub const max_bytes = 2072;
 pub const control_class: u32 = 0xc372;
 pub const Binding = struct { epoch: u64, client: u32, device: u32, display: u32, control: u32 };
+pub const Topology = struct {
+    count: u8 = 0,
+    plans: [8]?modes.Plan = @splat(null),
+
+    pub fn single(candidate: modes.Plan) Topology {
+        var result: Topology = .{}; result.count = 1; result.plans[0] = candidate; return result;
+    }
+    pub fn append(self: *Topology, plan: modes.Plan) Error!void {
+        if (self.count == 0 or self.count >= self.plans.len) return error.Bounds;
+        // One independent Window per Head, with no shared physical SOR.
+        // Desktop clone mode supplies identical content to distinct routes.
+        for (self.plans[0..self.count]) |entry| {
+            const prior = entry orelse return error.Descriptor;
+            if (prior.head == plan.head or prior.window == plan.window or prior.signal.sor == plan.signal.sor or
+                prior.signal.display_id == plan.signal.display_id) return error.Routing;
+        }
+        self.plans[self.count] = plan; self.count += 1;
+    }
+    fn validate(self: Topology, binding: Binding, candidate: modes.Plan) Error!void {
+        if (self.count == 0 or self.count > self.plans.len or self.plans[0] == null or
+            !std.meta.eql(self.plans[0].?, candidate)) return error.Descriptor;
+        var checked = Topology.single(candidate);
+        for (self.plans, 0..) |entry, index| {
+            if (index >= self.count) { if (entry != null) return error.Descriptor; continue; }
+            const plan = entry orelse return error.Descriptor;
+            try validateMode(binding, plan);
+            if (index != 0) try checked.append(plan);
+        }
+    }
+};
 pub const Result = struct {
     mode: modes.Plan,
     source_clock_hz: u64,
@@ -282,7 +312,7 @@ pub fn function(op: Operation) u32 { return switch (op) { .allocate => 103, .fre
 pub fn length(op: Operation) usize { return switch (op) { .classes => 428, .allocate => 32, .pclk => 44, .possible => max_bytes, .free => 16 }; }
 pub fn word(data: []const u8, at: usize) u32 { return std.mem.readInt(u32, data[at..][0..4], .little); }
 fn put(data: []u8, at: usize, value: u32) void { std.mem.writeInt(u32, data[at..][0..4], value, .little); }
-fn validate(binding: Binding, mode: modes.Plan) Error!void {
+fn validateMode(binding: Binding, mode: modes.Plan) Error!void {
     if (binding.epoch == 0 or mode.epoch != binding.epoch or mode.held_generation == 0 or mode.boot_generation == 0 or
         mode.output_generation == 0 or mode.receipt_serial == 0) return error.Stale;
     const handles = [_]u32{ binding.client, binding.device, binding.display, binding.control };
@@ -295,7 +325,10 @@ fn validate(binding: Binding, mode: modes.Plan) Error!void {
     if (mode.window >= 8 or mode.width != mode.signal.viewport & 0xffff or mode.height != mode.signal.viewport >> 16) return error.Descriptor;
 }
 pub fn encode(binding: Binding, op: Operation, mode: modes.Plan, buffer: []u8) Error![]const u8 {
-    try validate(binding, mode);
+    return encodeTopology(binding, op, mode, Topology.single(mode), buffer);
+}
+pub fn encodeTopology(binding: Binding, op: Operation, mode: modes.Plan, topology: Topology, buffer: []u8) Error![]const u8 {
+    try topology.validate(binding, mode);
     if (buffer.len < length(op)) return error.Bounds;
     const out = buffer[0..length(op)]; @memset(out, 0); put(out, 0, binding.client);
     switch (op) {
@@ -308,23 +341,26 @@ pub fn encode(binding: Binding, op: Operation, mode: modes.Plan, buffer: []u8) E
             if (op == .pclk) put(out, 28, mode.signal.display_id);
             if (op == .possible) {
                 const data = out[24..];
-                data[4] = 1; data[5] = 1; // Dense arrays: one head, one window.
-                const head = data[8..][0..92];
-                head[0] = @intCast(mode.head);
+                data[4] = topology.count; data[5] = topology.count;
+                for (topology.plans[0..topology.count], 0..) |entry, index| {
+                const selected = entry.?;
+                const head = data[8 + index * 92..][0..92];
+                head[0] = @intCast(selected.head);
                 // IMP accepts integer kHz, so round the nominal clock upward.
                 // Keeping the unadjusted rate is conservative for 1000/1001.
-                put(head, 4, @intCast((@as(u64, mode.signal.clock & 0x7fffffff) + 999) / 1000));
-                const raster = [_]u32{ mode.signal.total, mode.signal.blank_start, mode.signal.blank_end };
+                put(head, 4, @intCast((@as(u64, selected.signal.clock & 0x7fffffff) + 999) / 1000));
+                const raster = [_]u32{ selected.signal.total, selected.signal.blank_start, selected.signal.blank_end };
                 for (raster, 0..) |pair, i| { put(head, 8 + i * 8, pair & 0xffff); put(head, 12 + i * 8, pair >> 16); }
                 put(head, 44, 16); put(head, 52, 16); // NO_LOCK, PIN_UNSPECIFIED.
                 put(head, 56, 1024); put(head, 60, 1024); head[64] = 1;
-                put(head, 68, mode.signal.min_frame_idle);
-                head[73] = @intCast(mode.cursor_size / 32);
+                put(head, 68, selected.signal.min_frame_idle);
+                head[73] = @intCast(selected.cursor_size / 32);
                 // LUTs, rotation, scaling, DSC, overfetch and YUV stay off.
-                const window = data[744..][0..36];
-                put(window, 0, mode.window); put(window, 4, mode.head); put(window, 8, 4);
-                put(window, 16, mode.width); put(window, 20, 1024); put(window, 24, 1024);
+                const window = data[744 + index * 36..][0..36];
+                put(window, 0, selected.window); put(window, 4, selected.head); put(window, 8, 4);
+                put(window, 16, selected.width); put(window, 20, 1024); put(window, 24, 1024);
                 window[28] = 1; window[33] = 1; // One tap, PITCH layout.
+                }
                 put(data, 1896, 3); // Fresh min-vpstate and margin query; no cached perf.
             }
         },
@@ -333,7 +369,7 @@ pub fn encode(binding: Binding, op: Operation, mode: modes.Plan, buffer: []u8) E
 }
 pub const Reply = union(enum) { rejected: u32, ok: []const u8 };
 pub fn decode(binding: Binding, op: Operation, mode: modes.Plan, request: []const u8, record: exchange.message.Record) Error!Reply {
-    try validate(binding, mode);
+    try validateMode(binding, mode);
     if (request.len != length(op) or record.rpc.function != function(op) or record.rpc.cpu_rm_gfid != 0) return error.Payload;
     if (record.rpc.result != 0) return error.FirmwareResult;
     const header: usize = if (op == .allocate) 32 else if (op == .free) 16 else 24;
@@ -366,6 +402,7 @@ pub const Owner = struct {
     binding: Binding,
     reservation: names.Children,
     mode: modes.Plan,
+    topology: Topology,
     state: State = .querying,
     namespace_live: bool = true,
     classes: bool = false,
@@ -383,13 +420,18 @@ pub const Owner = struct {
     request: [max_bytes]u8 = undefined,
     deadline: u64,
     pub fn init(token: *boot.Handoff, parent: names.Lease, device: u32, display: u32, mode: modes.Plan, deadline: u64) Error!Owner {
+        return initTopology(token, parent, device, display, mode, Topology.single(mode), deadline);
+    }
+    pub fn initTopology(token: *boot.Handoff, parent: names.Lease, device: u32, display: u32,
+        mode: modes.Plan, topology: Topology, deadline: u64) Error!Owner {
         if (token.claimed or token.session.state != .active or token.session.pending != null or parent.epoch != token.session.epoch) return error.Stale;
         try token.session.guard(deadline);
         const children = try token.session.rm_names.reserveChildren(parent, 1);
         errdefer token.session.rm_names.retireChildren(children) catch {};
         const binding: Binding = .{ .epoch = parent.epoch, .client = parent.client, .device = device, .display = display, .control = try children.object(0) };
-        try validate(binding, mode);
-        return .{ .exchange = try exchange.Exchange.init(token, deadline), .binding = binding, .reservation = children, .mode = mode, .deadline = deadline };
+        try topology.validate(binding, mode);
+        return .{ .exchange = try exchange.Exchange.init(token, deadline), .binding = binding, .reservation = children,
+            .mode = mode, .topology = topology, .deadline = deadline };
     }
     fn stable(self: *const Owner) Error!void {
         if ((self.self_address != 0 and self.self_address != @intFromPtr(self)) or self.binding.epoch != self.exchange.session.epoch) return error.Stale;
@@ -431,7 +473,7 @@ pub const Owner = struct {
                 if (self.namespace_live) { try self.exchange.session.rm_names.retireChildren(self.reservation); self.namespace_live = false; }
                 self.state = if (self.state == .unwinding) .ready else .closed; return null;
             };
-            const data = try encode(self.binding, op, self.mode, &self.request);
+            const data = try encodeTopology(self.binding, op, self.mode, self.topology, &self.request);
             try self.exchange.begin(function(op), data, self.deadline); self.operation = op;
             if (op == .allocate) self.allocation_possible = true;
         }
@@ -466,10 +508,13 @@ pub const Owner = struct {
         self.operation = null; return null;
     }
     pub fn beginQuery(self: *Owner, token: *boot.Handoff, mode: modes.Plan, deadline: u64) Error!void {
-        try self.stable(); try validate(self.binding, mode);
+        return self.beginQueryTopology(token, mode, Topology.single(mode), deadline);
+    }
+    pub fn beginQueryTopology(self: *Owner, token: *boot.Handoff, mode: modes.Plan, topology: Topology, deadline: u64) Error!void {
+        try self.stable(); try topology.validate(self.binding, mode);
         if (self.state != .handed_off or !self.live or token.session != self.exchange.session) return error.State;
         self.exchange = try exchange.Exchange.init(token, deadline); self.deadline = deadline;
-        self.mode = mode; self.source_clock_hz = 0; self.result = null; self.rejected = null; self.obsolete = false; self.state = .querying;
+        self.mode = mode; self.topology = topology; self.source_clock_hz = 0; self.result = null; self.rejected = null; self.obsolete = false; self.state = .querying;
     }
     pub fn beginDestroy(self: *Owner, token: *boot.Handoff, deadline: u64) Error!void {
         try self.stable();
@@ -486,7 +531,7 @@ pub const Owner = struct {
         self.stable() catch return false;
         const op = self.operation orelse return false;
         var expected: [max_bytes]u8 = undefined;
-        const encoded = encode(self.binding, op, self.mode, &expected) catch return false;
+        const encoded = encodeTopology(self.binding, op, self.mode, self.topology, &expected) catch return false;
         return self.self_address == @intFromPtr(self) and current == &self.exchange and current.deadline == deadline and self.deadline == deadline and
             current.request.ptr == self.request[0..].ptr and current.request.len == length(op) and current.function == function(op) and
             std.mem.eql(u8, current.request, encoded) and (self.state == .querying or self.state == .unwinding or self.state == .destroying);

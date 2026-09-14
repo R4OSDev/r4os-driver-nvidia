@@ -121,6 +121,8 @@ pub const Catalog = struct {
     head_count: ?u32 = null,
     heads_rejected: ?Rejection = null,
     heads: [display.max_heads]Head = @splat(.{}),
+    window_heads: ?[32]u8 = null,
+    windows_rejected: ?Rejection = null,
     count: usize = 0,
     routes: [max_routes]Route = @splat(.{}),
 
@@ -129,6 +131,7 @@ pub const Catalog = struct {
     pub fn activeHeads(self: *const Catalog, id: u32) ?u32 {
         if (id == 0 or id & (id - 1) != 0) return null;
         const count = self.head_count orelse return null;
+        if (count > self.heads.len) return null;
         var mask: u32 = 0;
         for (self.heads[0..count], 0..) |head, index| {
             const current = head.display_id orelse return null;
@@ -137,7 +140,7 @@ pub const Catalog = struct {
         return mask;
     }
 };
-pub const State = enum { supported, heads, active, connectors, resource, buses, verify_heads, verify_active, verify, drain, complete, obsolete, failed, released };
+pub const State = enum { supported, heads, active, windows, connectors, resource, buses, verify_heads, verify_active, verify_windows, verify, drain, complete, obsolete, failed, released };
 
 /// A relation to the validated passive VBIOS, not an active routing lease.
 /// RM's explicit dcb_index selects the original DCB slot, never log2(id).
@@ -302,6 +305,7 @@ pub const Discovery = struct {
             .supported, .verify => .supported,
             .heads, .verify_heads => .heads,
             .active, .verify_active => .{ .active = self.head_cursor },
+            .windows, .verify_windows => .windows,
             .connectors => .{ .connectors = self.catalog.routes[self.cursor].id },
             .resource => .{ .resource = self.catalog.routes[self.cursor].id },
             .buses => .{ .buses = self.catalog.routes[self.cursor].id },
@@ -327,7 +331,7 @@ pub const Discovery = struct {
     fn nextHead(self: *Discovery) void {
         self.head_cursor += 1;
         if (self.head_cursor == self.catalog.head_count.?)
-            self.state = if (self.state == .active) (if (self.catalog.count == 0) State.verify_heads else State.connectors) else .verify;
+            self.state = if (self.state == .active) .windows else .verify_windows;
     }
     fn takeHeads(self: *Discovery, count: ?u32, rejection: ?Rejection) void {
         const verifying = self.state == .verify_heads;
@@ -340,7 +344,17 @@ pub const Discovery = struct {
         self.head_cursor = 0;
         self.state = if (count != null and count.? != 0 and !self.invalidated)
             (if (verifying) State.verify_active else State.active)
-        else if (verifying) .verify else if (self.catalog.count == 0) .verify_heads else .connectors;
+        else if (verifying) .verify_windows else .windows;
+    }
+    fn takeWindows(self: *Discovery, masks: ?[32]u8, rejection: ?Rejection) void {
+        if (self.state == .verify_windows) {
+            if (!std.meta.eql(self.catalog.window_heads, masks)) self.invalidated = true;
+            self.state = .verify;
+        } else {
+            self.catalog.window_heads = masks;
+            self.catalog.windows_rejected = rejection;
+            self.state = if (self.catalog.count == 0) .verify_heads else .connectors;
+        }
     }
     fn takeActive(self: *Discovery, value: Head) void {
         if (value.display_id) |id| if (id & ~self.catalog.supported.?.displays != 0) { self.invalidated = true; };
@@ -360,6 +374,8 @@ pub const Discovery = struct {
                 self.takeHeads(null, rejection);
             } else if (self.state == .active or self.state == .verify_active) {
                 self.takeActive(.{ .rejected = rejection });
+            } else if (self.state == .windows or self.state == .verify_windows) {
+                self.takeWindows(null, rejection);
             } else if (self.state == .supported or self.state == .verify) {
                 // No successful final supported-mask comparison: no usable
                 // catalog, even if earlier per-display queries succeeded.
@@ -398,6 +414,10 @@ pub const Discovery = struct {
             .active, .verify_active => {
                 if (reply != .active) return error.Unexpected;
                 self.takeActive(.{ .display_id = reply.active });
+            },
+            .windows, .verify_windows => {
+                if (reply != .windows) return error.Unexpected;
+                self.takeWindows(reply.windows, null);
             },
             .verify => {
                 if (reply != .supported) return error.Unexpected;

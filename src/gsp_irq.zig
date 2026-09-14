@@ -439,7 +439,14 @@ pub const Owner = struct {
     pub fn failed(self: *const Owner) bool { return @atomicLoad(u32, &self.fault, .acquire) != 0; }
 
     pub fn enableDisplay(self: *Owner, inventory: *const postinit.Data, epoch: u64, head_mask: u32) !void {
-        if (self.self_address != @intFromPtr(self) or !self.registered or self.closed or self.failed() or self.display.epoch != 0) return error.State;
+        return self.configureDisplay(inventory, epoch, head_mask, false);
+    }
+    pub fn extendDisplay(self: *Owner, inventory: *const postinit.Data, epoch: u64, head_mask: u32) !void {
+        return self.configureDisplay(inventory, epoch, head_mask, true);
+    }
+    fn configureDisplay(self: *Owner, inventory: *const postinit.Data, epoch: u64, head_mask: u32, extend: bool) !void {
+        if (self.self_address != @intFromPtr(self) or !self.registered or self.closed or self.failed() or
+            (self.display.epoch != 0) != extend) return error.State;
         const index = inventory.display_index orelse return error.Vector;
         if (index >= inventory.entry_count or index >= inventory.entries.len or inventory.entries[index].engine != postinit.display_engine) return error.Vector;
         const vector = inventory.entries[index].stall;
@@ -451,7 +458,7 @@ pub const Owner = struct {
         self.write(reg.unarm, 15);
         if (!self.flush()) { self.latch(1); return error.IdentityChanged; }
         self.clock = clock;
-        try self.display.enable(self, epoch, vector, head_mask);
+        if (extend) try self.display.extend(self, epoch, vector, head_mask) else try self.display.enable(self, epoch, vector, head_mask);
         self.write(reg.leaf + self.display.leaf * 4, self.display.bit);
         self.write(reg.allow + self.display.leaf * 4, self.display.bit);
         if (!self.flush()) { self.latch(1); return error.IdentityChanged; }

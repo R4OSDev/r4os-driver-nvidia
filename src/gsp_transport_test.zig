@@ -679,7 +679,7 @@ fn displayReply(model: *Model, channel: *display_rpc.Channel, status: u32, value
                 byte.* = @truncate(i);
             };
         },
-        .heads, .active, .connectors, .resource, .buses, .ports, .ddc, .aux => unreachable, // Dedicated bounded topology/DDC fixtures below.
+        .heads, .active, .windows, .connectors, .resource, .buses, .ports, .ddc, .aux => unreachable, // Dedicated bounded topology/DDC fixtures below.
     }
     // The RPC sequence and private result deliberately do not echo the request.
     try model.replyRpc(channel.exchange.session, .{ .function = 76, .result = 0, .result_private = 0x19283746, .sequence = 0xdeadbeef }, encoded);
@@ -2160,6 +2160,7 @@ fn topologyReply(model: *Model, probe: *topology.Discovery, status: u32, mask: u
     put(&bytes, 12, status);
     switch (query) {
         .heads => put(&bytes, 32, head_count),
+        .windows => @memcpy(bytes[28..36], &[_]u8{ 1, 1, 2, 2, 4, 4, 8, 8 }),
         .active => |head| put(&bytes, 36, if (head_changed) 0 else if (head == 0) mask & 1 else if (head == head_count - 1) mask & 0x80000000 else 0),
         .connectors => {
             put(&bytes, 32, 1);
@@ -2231,9 +2232,23 @@ fn checkTopology(model: *Model) !void {
     put(&raw, 36, 0);
     try t.expect((try display_rpc.decode(display_object, .{ .active = 0 }, record)).active == 0);
 
+    // Original NV0073 C declarations: these are byte masks, not u32 slots.
+    const window_wire = @embedFile("fixtures/display-window-routes-570.144.bin");
+    const window_object: display_rpc.Object = .{ .epoch = 11, .client = 12, .display = 13 };
+    try t.expectEqualSlices(u8, window_wire[0..60], try display_rpc.encode(window_object, .windows, &raw));
+    @memcpy(raw[0..60], window_wire[60..120]);
+    record.payload = raw[0..60];
+    const windows = (try display_rpc.decode(window_object, .windows, record)).windows;
+    try t.expectEqualSlices(u8, &[_]u8{ 1, 4, 2, 2, 255, 0, 0, 8 }, windows[0..8]);
+    try t.expect(windows[31] == 128);
+    put(&raw, 24, 1);
+    try t.expectError(error.Unexpected, display_rpc.decode(window_object, .windows, record));
+    put(&raw, 24, 0); record.payload = raw[0..59];
+    try t.expectError(error.Payload, display_rpc.decode(window_object, .windows, record));
+
     const catalog = try t.allocator.create(topology.Catalog);
     defer t.allocator.destroy(catalog);
-    const Case = enum { valid, empty, full, changed, partial, verify_error, hpd, canceled, ack, expiry, release_expired, heads_rejected, active_rejected, head_changed, head_count_changed };
+    const Case = enum { valid, empty, full, changed, partial, verify_error, hpd, canceled, ack, expiry, release_expired, heads_rejected, active_rejected, head_changed, head_count_changed, windows_rejected, windows_changed };
     for (std.enums.values(Case)) |case| {
         var session: transport.Session = undefined;
         var boot = try startBoot(model, &session);
@@ -2246,6 +2261,7 @@ fn checkTopology(model: *Model) !void {
         var probe = try topology.Discovery.init(&owner, catalog, deadline);
         try t.expectError(error.Query, probe.channel.begin(.{ .connectors = 1 }, deadline));
         try t.expectError(error.Query, probe.channel.begin(.heads, deadline));
+        try t.expectError(error.Query, probe.channel.begin(.windows, deadline));
         try t.expectError(error.Query, probe.channel.begin(.{ .active = 0 }, deadline));
         try probe.release(deadline);
         try t.expect(owner.state == .ready and model.count == 0);
@@ -2285,6 +2301,8 @@ fn checkTopology(model: *Model) !void {
             }
             const status: u32 = if ((case == .partial and probe.state == .connectors) or (case == .verify_error and probe.state == .verify) or
                 (case == .heads_rejected and (probe.state == .heads or probe.state == .verify_heads)) or
+                (case == .windows_rejected and (probe.state == .windows or probe.state == .verify_windows)) or
+                (case == .windows_changed and probe.state == .verify_windows) or
                 (case == .active_rejected and (probe.state == .active or probe.state == .verify_active) and probe.head_cursor == 1)) 0x55 else 0;
             const count: u32 = if (case == .empty) 0 else if (case == .full) 32 else if (case == .head_count_changed and probe.state == .verify_heads) 3 else 4;
             try topologyReply(model, &probe, status, if (case == .changed and probe.state == .verify) 1 else mask, count,
@@ -2306,7 +2324,7 @@ fn checkTopology(model: *Model) !void {
             try t.expect((try probe.poll()) == null);
         }
         if (probe.state == .failed) continue;
-        if (case == .hpd or case == .changed or case == .canceled or case == .head_changed or case == .head_count_changed) {
+        if (case == .hpd or case == .changed or case == .canceled or case == .head_changed or case == .head_count_changed or case == .windows_changed) {
             try t.expect(probe.state == .obsolete and session.pending == null);
             try t.expectError(error.State, probe.borrow(deadline));
         } else {
@@ -2314,6 +2332,8 @@ fn checkTopology(model: *Model) !void {
             try t.expect(value.epoch == session.epoch and value.client == owner.reservation.client and value.receipt_serial != 0);
             try t.expectEqual(@as(usize, if (case == .verify_error) 0 else @popCount(mask)), value.count);
             if (case == .verify_error) try t.expect(value.rejected.?.control.? == 0x55 and value.supported == null);
+            if (case == .windows_rejected) try t.expect(value.window_heads == null and value.windows_rejected.?.control.? == 0x55)
+            else try t.expectEqualSlices(u8, &[_]u8{ 1, 1, 2, 2, 4, 4, 8, 8 }, value.window_heads.?[0..8]);
             if (case == .heads_rejected) try t.expect(value.head_count == null and value.heads_rejected.?.control.? == 0x55 and value.activeHeads(1) == null)
             else if (case == .active_rejected) try t.expect(value.heads[1].display_id == null and value.heads[1].rejected.?.control.? == 0x55 and value.activeHeads(1) == null)
             else if (case == .empty) try t.expect(value.head_count.? == 0 and value.activeHeads(1).? == 0)

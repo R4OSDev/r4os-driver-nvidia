@@ -252,6 +252,19 @@ pub const Owner = struct {
         };
         self.enabled = false;
     }
+    /// Add admitted heads under the same exclusive outer IRQ gate. Existing
+    /// samples and enable bits stay intact; no synthetic first event.
+    pub fn extend(self: *Owner, io: anytype, epoch: u64, vector: u32, mask: u32) !void {
+        if (!self.enabled or epoch != self.epoch or vector != self.leaf * 32 + @ctz(self.bit) or
+            mask == 0 or mask & ~@as(u32, 255) != 0 or mask & self.head_mask != self.head_mask) return error.Binding;
+        const added = mask & ~self.head_mask;
+        self.head_mask = mask; // A partial write still belongs to shutdown.
+        for (0..max_heads) |head| if (added & (@as(u32, 1) << @intCast(head)) != 0) {
+            const offset: u32 = @intCast(head * 4);
+            io.write(reg.clear + offset, reg.last_data);
+            io.write(reg.enable + offset, io.read(reg.enable + offset) | reg.last_data);
+        };
+    }
     /// Called only for this display leaf. Do not acknowledge other heads or
     /// supervisor/awaken causes. Those require their own implemented owner.
     pub fn interrupt(self: *Owner, io: anytype, now: u64) !u32 {

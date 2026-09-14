@@ -17,6 +17,8 @@ pub const Owner = struct {
     reference_stamps: [2]a.GfxBufferReference = @splat(.{}),
     list: a.GfxRenderList = .{},
     list_stamp: a.GfxRenderList = .{},
+    grids: [render.batch_capacity]a.GfxSampleGrid = @splat(.{}),
+    grid_stamps: [render.batch_capacity]a.GfxSampleGrid = @splat(.{}),
     draws: [render.batch_capacity]render.Draw = undefined,
     draw_count: usize = 0,
     phase: Phase = .retain,
@@ -30,32 +32,38 @@ pub const Owner = struct {
         self.* = .{ .self_address = @intFromPtr(self), .queue = queue, .memory = memory,
             .binding = binding, .job = job, .stamp = job, .deadline = job.deadline_ns };
         if (job.version != 1 or job.size < @sizeOf(a.GfxDriverJob) or
-            (job.operation != a.gfx_queue_operation_render and job.operation != a.gfx_queue_operation_render_list) or
+            (job.operation != a.gfx_queue_operation_render and job.operation != a.gfx_queue_operation_render_list and job.operation != a.gfx_queue_operation_render_grid_list) or
             job.reserved0 != 0 or job.reserved1 != 0 or job.source_offset != 0 or job.target_offset != 0 or job.byte_length != 0 or
             job.row_count != 0 or job.source_pitch != 0 or job.target_pitch != 0 or job.render.reserved0 != 0 or
             job.fence.timeline == 0 or job.fence.point == 0 or job.fence.adapter_id != binding.adapter_id or
             job.fence.device_generation != binding.device_generation or job.fence.reset_generation != binding.reset_generation) {
             self.failed = true; return error.Descriptor;
         }
-        if (job.operation == a.gfx_queue_operation_render_list) {
-            if (queue.readRenderList(&job.fence, &self.list) != a.gfx_queue_ok or
-                self.list.version != 1 or self.list.size < @sizeOf(a.GfxRenderList) or self.list.reserved0 != 0 or
+        if (job.operation == a.gfx_queue_operation_render_list or job.operation == a.gfx_queue_operation_render_grid_list) {
+            if (job.operation == a.gfx_queue_operation_render_grid_list) {
+                var mapped: a.GfxRenderGridList = .{};
+                if (queue.readRenderGridList(&job.fence, &mapped) != a.gfx_queue_ok or mapped.version != 1 or
+                    mapped.size != @sizeOf(a.GfxRenderGridList) or mapped.reserved0 != 0) { self.failed = true; return error.Descriptor; }
+                self.list = .{ .count = mapped.count, .commands = mapped.commands }; self.grids = mapped.grids;
+            } else if (queue.readRenderList(&job.fence, &self.list) != a.gfx_queue_ok) { self.failed = true; return error.Descriptor; }
+            if (self.list.version != 1 or self.list.size < @sizeOf(a.GfxRenderList) or self.list.reserved0 != 0 or
                 self.list.count == 0 or self.list.count > render.batch_capacity or
                 !std.meta.eql(self.list.commands[0], job.render)) { self.failed = true; return error.Descriptor; }
             for (self.list.commands, 0..) |command, index| {
                 if (index < self.list.count) {
                     if (command.reserved0 != 0 or command.kind != job.render.kind or command.filter != job.render.filter or
                         command.blend != job.render.blend or command.transfer != job.render.transfer) { self.failed = true; return error.Descriptor; }
-                } else if (!std.meta.eql(command, a.GfxRenderCommand{})) { self.failed = true; return error.Descriptor; }
+                } else if (!std.meta.eql(command, a.GfxRenderCommand{}) or !std.meta.eql(self.grids[index], a.GfxSampleGrid{})) { self.failed = true; return error.Descriptor; }
             }
         } else { self.list.count = 1; self.list.commands[0] = job.render; }
         self.list_stamp = self.list;
+        self.grid_stamps = self.grids;
         if (job.deadline_ns <= now or job.deadline_ns == std.math.maxInt(u64)) try self.finish(a.gfx_queue_result_failed);
     }
     pub fn valid(self: *const Owner) bool {
         return self.self_address == @intFromPtr(self) and !self.failed and std.meta.eql(self.job, self.stamp) and
             std.meta.eql(self.references, self.reference_stamps) and self.deadline == self.stamp.deadline_ns and
-            std.meta.eql(self.list, self.list_stamp) and self.draw_count <= render.batch_capacity;
+            std.meta.eql(self.list, self.list_stamp) and std.meta.eql(self.grids, self.grid_stamps) and self.draw_count <= render.batch_capacity;
     }
     pub fn commands(self: *const Owner) []const render.Draw { return self.draws[0..self.draw_count]; }
     fn finish(self: *Owner, result: u32) !void {

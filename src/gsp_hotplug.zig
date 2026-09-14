@@ -25,12 +25,26 @@ pub const Work = struct {
     retries: u8 = 0,
     scans: u64 = 0,
     exhausted: u64 = 0,
+    // Last invalidation of each RM display ID survives coalescing and scans.
+    // An unrelated connector notification cannot silently invalidate a head.
+    affected: [32]u64 = @splat(0),
 
     fn guard(self: *const Work, epoch: u64, now: u64) !void {
         if (epoch == 0 or self.epoch != epoch) return error.Stale;
         if (now == std.math.maxInt(u64) or now < self.last_clock) return error.Clock;
     }
     pub fn refresh(self: *Work, epoch: u64, now: u64) !void {
+        return self.refreshMask(epoch, now, std.math.maxInt(u32));
+    }
+    pub fn refreshOutput(self: *Work, epoch: u64, now: u64, id: u32) !void {
+        if (id == 0 or id & (id - 1) != 0) return error.Stale;
+        return self.refreshMask(epoch, now, id);
+    }
+    pub fn affects(self: *const Work, id: u32, since: u64) bool {
+        if (id == 0 or id & (id - 1) != 0) return true;
+        return self.affected[@ctz(id)] > since;
+    }
+    fn refreshMask(self: *Work, epoch: u64, now: u64, mask: u32) !void {
         try self.guard(epoch, now);
         const next = try std.math.add(u64, self.sequence, 1);
         if (!self.pending) {
@@ -38,16 +52,18 @@ pub const Work = struct {
             self.plug_mask = 0; self.unplug_mask = 0; self.dp_mask = 0;
         }
         self.sequence = next;
+        for (&self.affected, 0..) |*sequence, index| if (mask & (@as(u32, 1) << @intCast(index)) != 0) { sequence.* = next; };
         self.pending = true;
         self.last_ns = now;
         self.last_clock = now;
         self.retries = 0; // A real new event may start a new finite attempt set.
     }
     pub fn note(self: *Work, epoch: u64, now: u64, hint: events.Display) !void {
-        try self.refresh(epoch, now);
+        const mask = switch (hint) { .hotplug => |v| v.plug_mask | v.unplug_mask, .dp_irq => |value| value };
+        try self.refreshMask(epoch, now, if (mask == 0) std.math.maxInt(u32) else mask);
         switch (hint) {
             .hotplug => |v| { self.plug_mask |= v.plug_mask; self.unplug_mask |= v.unplug_mask; },
-            .dp_irq => |mask| self.dp_mask |= mask,
+            .dp_irq => |value| self.dp_mask |= value,
         }
     }
     pub fn dueNs(self: *const Work) u64 {

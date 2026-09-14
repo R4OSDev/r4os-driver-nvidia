@@ -73,8 +73,10 @@ pub const Owner = struct {
     cursor: @import("gsp_native_cursor.zig").Owner = .{},
     audio: @import("gsp_native_audio.zig").Owner = .{},
     hotplug: @import("gsp_native_hotplug.zig").Owner = .{},
+    additional: @import("gsp_additional_output.zig").Owner = .{},
     frame_count: u8 = 2,
     statistics: @import("gsp_frame_stats.zig").Owner = .{},
+    output_fault_reported: [8]bool = @splat(false),
 
     /// Explicit mode=native only. Check the common handoff API before the
     /// device worker can execute the already prepared firmware operations.
@@ -390,17 +392,35 @@ pub const Owner = struct {
                 if (self.frame_count < 2 or self.frame_count > 3) return error.Descriptor;
                 run.presentation_buffers = self.frame_count;
                 self.next(.active);
+                // The common receipt has completed takeover. The Device
+                // generation gate must see that ownership before rebinding
+                // this head's presentation through the ordinary runtime API.
+                try self.syncPresentationTarget();
                 self.ctx.?.logInfo("NVIDIA native-output: state=software-native boot-mode=retained shadow=system scanout=vram completion=CE,WIMM,Window,Core link=confirmed common-handoff=confirmed");
             },
             .active => {
+                if (self.reportOutputFault()) return true;
+                if (try self.additional.failedJobs(self)) return true;
+                if (run.output_faults[self.mode.?.window]) |err| {
+                    if (try self.modes.failedJobs(self, err)) return true;
+                    return self.additional.step(self);
+                }
                 const changed = try self.hotplug.step(self);
-                if (self.hotplug.phase != .online or changed) return changed;
+                if (changed) return true;
+                if (self.hotplug.phase != .online or self.hotplug.refreshing) return self.additional.step(self);
+                // The additional owner must consume its completed SOR work
+                // before an idle-only primary route query can succeed.
+                if (self.additional.hardwareBusy()) return self.additional.step(self);
                 try self.validateRoute();
                 if (run.frame_setup != null) return run.prepareFramePool();
                 if (try self.cursor.step(self)) return true;
                 if (self.cursor.busy()) return false;
                 if (try self.audio.step(self)) return true;
                 if (self.audio.busy()) return false;
+                if (self.modes.phase == .idle or self.modes.phase == .unavailable or self.modes.phase == .decision) {
+                    if (try self.additional.step(self)) return true;
+                    if (self.additional.hardwareBusy()) return false;
+                }
                 if (try self.modes.step(self)) return true;
                 if (self.modes.phase == .idle or self.modes.phase == .decision or self.modes.phase == .unavailable)
                     return run.prepareFramePool();
@@ -411,6 +431,51 @@ pub const Owner = struct {
         return true;
     }
 
+    fn reportOutputFault(self: *Owner) bool {
+        const run = self.running.?;
+        for (run.output_faults, 0..) |fault, window| {
+            if (fault == null or self.output_fault_reported[window]) continue;
+            var status: i32 = a.gfx_output_error_busy;
+            if (window == self.mode.?.window) status = self.outputs.?.pauseOutput(&self.output, true) else {
+                for (&self.additional.outputs) |*output| {
+                    if (output.mode == null or output.mode.?.window != window or output.target.display_generation == 0) continue;
+                    status = self.display.?.outputTransition(&output.target, 1, false);
+                    if (status == a.gfx_output_ok or status == a.gfx_output_error_stale) {
+                        output.failure = fault; output.phase = .failed;
+                    }
+                    break;
+                }
+            }
+            // Metadata removal can be retried without stopping healthy GPU
+            // engines. No response here proves physical Window retirement.
+            if (status == a.gfx_output_ok or status == a.gfx_output_error_stale) {
+                self.output_fault_reported[window] = true;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn syncPresentationTarget(self: *Owner) !void {
+        const mode = self.mode orelse return error.State;
+        const run = self.running.?;
+        if (run.display_images[mode.window] == null) {
+            if (!run.outputPaused(mode.window) or run.display_retired[mode.window] == null) return error.Stale;
+            // A catalog can be published before the headless resize job.
+            // That catalog alone must never authorize image presentation.
+            run.presentation_targets[mode.window] = null;
+            return;
+        }
+        try run.bindPresentationTarget(mode.window, .{ .adapter_id = self.backend.adapter_id,
+            .device_generation = self.backend.device_generation, .connector_id = self.output.connector_id,
+            .connection_generation = self.output.connection_generation, .display_generation = self.receipt.generation,
+            .head_id = mode.head });
+    }
+    pub fn primaryOutput(_: *Owner) bool { return true; }
+    pub fn pauseCommonOutput(self: *Owner, paused: bool) !i32 {
+        return self.outputs.?.pauseOutput(&self.output, paused);
+    }
+    pub fn quiesceCommonOutput(_: *Owner) !bool { return true; }
     fn validateRoute(self: *Owner) !void {
         const run = self.running.?;
         if (run.failure != null or run.outputs.invalidated) return error.Stale;
@@ -482,6 +547,7 @@ pub const Owner = struct {
     }
     pub fn quarantine(self: *Owner, err: anyerror) void {
         if (self.phase == .detached) return;
+        self.additional.quarantine(self);
         self.cursor.quarantine(self, err);
         self.audio.quarantine(self, err);
         self.modes.quarantine(self, err);

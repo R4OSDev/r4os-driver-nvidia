@@ -20,7 +20,7 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
-//! Native RGB8 timing selection on the retained single-head TMDS route.
+//! Native RGB8 timing selection on an exact retained or claimed SST route.
 //! R4GFX owns parsing and published mode IDs. This layer converts one exact
 //! current receiver timing; no synthesized modes, cached EDID or MMIO.
 const std = @import("std");
@@ -30,7 +30,7 @@ const catalog = @import("gsp_catalog.zig");
 const receiver = @import("gsp_receiver.zig");
 const timing = receiver.edid.timing;
 
-/// The caller supplies the freshly recaptured and bound boot route. A mode
+/// The caller supplies a freshly bound retained or claimed route. A mode
 /// ID is local to this exact output generation and final RM receipt.
 pub fn select(saved: boot.Plan, snapshot: *const outputs.Snapshot, id: u32) !boot.Plan {
     if (id == 0 or saved.receiver_mode_id != 0 or saved.cta_vic != 0) return error.Descriptor;

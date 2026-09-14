@@ -25,7 +25,7 @@ pub fn check(target: *Device, clock: *u64, reply: anytype, head: anytype, table:
     var checkpoint: []const u8 = "allocation";
     errdefer |err| std.debug.print("direct image: {s} at={s} device={s} failure={?} phase={?} flip={} held={d}\n",
         .{ @errorName(err), checkpoint, @tagName(target.phase), target.failure,
-            if (run.direct_work) |value| value.phase else null, run.display_flip != null, copy.heldScanouts() });
+            if (run.direct_work) |value| value.phase else null, run.primaryFlip() != null, copy.heldScanouts() });
     try t.expect(run.direct_enabled and copy.heldScanouts() == 0);
     for (0..2) |pass| {
         checkpoint = "allocation";
@@ -50,9 +50,9 @@ pub fn check(target: *Device, clock: *u64, reply: anytype, head: anytype, table:
         try copy.enqueueDirect(index, deadline); last_fence = copy.job.fence;
         for (0..160) |_| {
             try tick(target, clock, reply, table, &gpu_table);
-            if (run.display_flip != null and run.display_flip.?.window.phase == .submitted) break;
+            if (run.primaryFlip() != null and run.primaryFlip().?.window.phase == .submitted) break;
         }
-        try t.expect(run.display_flip != null and run.display_flip.?.window.phase == .submitted and copy.active and
+        try t.expect(run.primaryFlip() != null and run.primaryFlip().?.window.phase == .submitted and copy.active and
             run.presentation == current and run.flip_visible == visible and run.copy_bytes == before_bytes);
         try t.expect(native.slots[index].gpu.lease.id != 0 and native.slots[index].gpu.access == 0);
         checkpoint = "producer close before BEGUN";
@@ -77,10 +77,10 @@ pub fn check(target: *Device, clock: *u64, reply: anytype, head: anytype, table:
         words[previous / 4] = 2 << 30;
         for (0..160) |_| {
             try tick(target, clock, reply, table, &gpu_table);
-            if (run.display_flip == null and run.direct_work == null and run.native_active == null and
+            if (run.primaryFlip() == null and run.direct_work == null and run.native_active == null and
                 (if (previous_index) |old| !native.slots[old].live else true)) break;
         }
-        try t.expect(run.display_flip == null and run.direct_work == null and copy.heldScanouts() == 1 and
+        try t.expect(run.primaryFlip() == null and run.direct_work == null and copy.heldScanouts() == 1 and
             copy.completed == before_completed + pass and native.slots[index].live and native.slots[index].gpu.access == 0);
         previous_index = index;
     }
@@ -110,9 +110,9 @@ pub fn check(target: *Device, clock: *u64, reply: anytype, head: anytype, table:
     try copy.signal();
     for (0..40) |_| {
         try tick(target, clock, reply, table, &gpu_table);
-        if (run.display_flip != null and run.display_flip.?.window.phase == .submitted) break;
+        if (run.primaryFlip() != null and run.primaryFlip().?.window.phase == .submitted) break;
     }
-    try t.expect(run.display_flip != null and run.display_flip.?.window.phase == .submitted and copy.heldScanouts() == 1);
+    try t.expect(run.primaryFlip() != null and run.primaryFlip().?.window.phase == .submitted and copy.heldScanouts() == 1);
     checkpoint = "restore BEGUN";
     try activate(target, clock, head);
     for (0..20) |_| { try tick(target, clock, reply, table, &gpu_table); if (run.presentation == candidate) break; }
@@ -121,9 +121,9 @@ pub fn check(target: *Device, clock: *u64, reply: anytype, head: anytype, table:
     words[previous / 4] = 2 << 30;
     for (0..160) |_| {
         try tick(target, clock, reply, table, &gpu_table);
-        if (run.display_flip == null and run.direct_work == null and run.native_active == null and !native.slots[previous_index.?].live) break;
+        if (run.primaryFlip() == null and run.direct_work == null and run.native_active == null and !native.slots[previous_index.?].live) break;
     }
-    try t.expect(run.display_flip == null and run.direct_work == null and run.native_active == null and copy.heldScanouts() == 0 and
+    try t.expect(run.primaryFlip() == null and run.direct_work == null and run.native_active == null and copy.heldScanouts() == 0 and
         copy.completed == before_completed + 2 and native.released == before_released + 2 and
         copy.heldReferences() == before_references and run.copy_bytes == before_bytes + @as(u64, image.width) * image.height * 4);
     try t.expectEqualDeep(before_cpu, copy.host);

@@ -169,9 +169,13 @@ pub const Owner = struct {
     pub fn createNotifier(self: *Owner, ctx: *const r4os.r4dev.DriverContext, channel: u32) Error!u32 {
         if (!self.valid()) return error.Stale;
         if (channel >= self.notifiers.len) return error.Bounds;
-        if (self.table.uploading or self.notifiers[channel].self_address != 0) return error.Busy;
+        if (self.table.uploading or self.table.change != null or self.notifiers[channel].self_address != 0) return error.Busy;
         if (self.table.count >= layout.capacity or self.table.revision == std.math.maxInt(u64)) return error.Exhausted;
-        const handle = try self.reservation.?.object(@intCast(self.table.freeIndex() orelse return error.Exhausted));
+        const index = self.table.freeIndex() orelse return error.Exhausted;
+        const dynamic = if (self.table.uploaded_revision != 0)
+            try self.session.?.rm_names.reserveChildren(self.reservation.?.parent, 1) else null;
+        errdefer if (dynamic) |lease| self.session.?.rm_names.retireChildren(lease) catch {};
+        const handle = if (dynamic) |lease| try lease.object(0) else try self.reservation.?.object(@intCast(index));
         const note = &self.notifiers[channel];
         note.open(ctx, self.instance_stamp.?.adapter, self.table.epoch, channel, handle) catch |err| {
             if (note.failed) self.quarantine(); return err;
@@ -179,6 +183,7 @@ pub const Owner = struct {
         self.table.add(.{ .channel = channel, .handle = handle, .physical = note.physical_stamp, .bytes = 4096, .target = .coherent_system }) catch |err| {
             if (!note.closeUnpublished()) { self.quarantine(); return error.Retained; } return err;
         };
+        self.dynamic_names[index] = dynamic;
         note.backing.retained = true; return handle;
     }
     pub fn publishedNotifier(self: *Owner, channel: u32) ?*notifier.Owner {

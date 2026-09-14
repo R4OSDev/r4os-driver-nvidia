@@ -103,4 +103,42 @@ fn checkModeControl() !void {
     try t.expectError(error.Stale, mode.encode(binding, .possible, stale, &request));
     var alias = binding; alias.control = binding.device;
     try t.expectError(error.Handle, mode.encode(alias, .allocate, plan, &request));
+    // Two different physical timings in one actual original-header IMP
+    // request. The earlier single-head byte vectors remain unchanged.
+    var second = plan;
+    second.head = 0; second.window = 0; second.width = 1280; second.height = 720;
+    second.refresh_micro_hz = 100_000_000;
+    second.signal.sor = 2; second.signal.sor_control = 0x101; second.signal.display_id = 8;
+    second.signal.clock = 123_750_000; second.signal.total = 1650 | (750 << 16);
+    second.signal.sync_end = 39 | (4 << 16); second.signal.blank_end = 259 | (24 << 16);
+    second.signal.blank_start = 1539 | (744 << 16); second.signal.viewport = 1280 | (720 << 16);
+    second.signal.min_frame_idle = 25 | (5 << 16);
+    var topology = mode.Topology.single(plan); try topology.append(second);
+    const dual = try mode.encodeTopology(binding, .possible, plan, topology, &request);
+    try t.expectEqualSlices(u8, @embedFile("fixtures/display-topology-570.144.bin"), dual);
+    const accepted = request;
+    var duplicate = topology; duplicate.plans[1].?.head = plan.head;
+    duplicate.plans[1].?.signal.sor_control = 0x100 | (@as(u32, 1) << @intCast(plan.head));
+    try t.expectError(error.Routing, mode.encodeTopology(binding, .possible, plan, duplicate, &request));
+    try t.expectEqualSlices(u8, &accepted, &request);
+    duplicate = topology; duplicate.plans[1].?.epoch += 1;
+    try t.expectError(error.Stale, mode.encodeTopology(binding, .possible, plan, duplicate, &request));
+    try t.expectEqualSlices(u8, &accepted, &request);
+    duplicate = topology; duplicate.plans[7] = second;
+    try t.expectError(error.Descriptor, mode.encodeTopology(binding, .possible, plan, duplicate, &request));
+    try t.expectEqualSlices(u8, &accepted, &request);
+    // The product collects every other active Window, replacing only the
+    // candidate's own Head. DMA flips do not alter that timing snapshot.
+    const Runtime = @import("gsp_runtime.zig");
+    const running = try t.allocator.create(Runtime.Owner); defer t.allocator.destroy(running); running.* = .{};
+    var active = std.mem.zeroes(Runtime.ActiveDisplayImage);
+    active.boot_mode = second; active.head = second.head;
+    running.display_images[second.window] = active;
+    try t.expectEqualDeep(topology, try running.modeTopology(plan));
+    active.image.dma += 1; running.display_images[second.window] = active;
+    try t.expectEqualDeep(topology, try running.modeTopology(plan));
+    active.boot_mode.?.signal.clock += 1000; running.display_images[second.window] = active;
+    try t.expect(!std.meta.eql(topology, try running.modeTopology(plan)));
+    running.display_images[second.window] = null;
+    try t.expectEqualDeep(mode.Topology.single(plan), try running.modeTopology(plan));
 }
