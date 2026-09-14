@@ -68,7 +68,8 @@ pub const Owner = struct {
         var value: a.DisplayPresentationInfo = .{ .head_id = mode.head, .backend = product.backend,
             // Additional registration seeds the common metadata at sequence1.
             .display_generation = generation, .sequence = if (self.last_info) |last| last.sequence else @intFromBool(additional),
-            .width = mode.width, .height = mode.height, .format = a.gfx_buffer_format_xrgb8888,
+            .width = mode.width, .height = mode.height,
+            .format = if (mode.color) |color| if (color.format == .xr30) a.gfx_buffer_format_xrgb2101010 else a.gfx_buffer_format_xrgb8888 else a.gfx_buffer_format_xrgb8888,
             .policies = 3, .buffer_count = run.presentation_buffers, .plane_count = 1,
             .path = if (direct) 2 else 1,
             // Window SET_PRESENT_CONTROL uses non-tearing interval1. Latest

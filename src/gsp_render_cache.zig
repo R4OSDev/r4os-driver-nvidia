@@ -4,7 +4,7 @@ const std = @import("std");
 const render = @import("r4nv_render");
 const storage = @import("gsp_native_backing.zig");
 pub const Kind = enum { programs, packet };
-// Six fixed programs and one reusable descriptor/vertex packet. Physical
+// Fixed programs and one reusable descriptor/vertex/color packet. Physical
 // allocation granularity is included; this cache cannot grow with frames.
 pub const budget_bytes: u64 = 128 * 1024;
 pub const slot_budget_bytes: u64 = budget_bytes / 2;

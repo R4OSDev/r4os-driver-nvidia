@@ -1,5 +1,5 @@
 // Host-only common BO callbacks for the existing actual-Device test. Its
-// four scattered pages model bus addresses, never physical GPU evidence.
+// five scattered pages model bus addresses, never physical GPU evidence.
 const std = @import("std");
 const r4os = @import("r4os");
 const a = r4os.abi;
@@ -23,7 +23,7 @@ pub const Model = struct {
     const reference: a.GfxBufferHandle = .{ .id = 71, .generation = 131 };
     const buffer: a.GfxBufferHandle = .{ .id = 72, .generation = 132 };
     const cpu: a.GfxBufferHandle = .{ .id = 73, .generation = 133 };
-    pub const pages = [_]u64{ 0x6000000000, 0x7000000000, 0x6000004000, 0x8000000000 };
+    pub const pages = [_]u64{ 0x6000000000, 0x7000000000, 0x6000004000, 0x8000000000, 0x9000000000 };
     pub fn install(api: *a.DriverApi) void {
         original = api.*;
         api.gfx_memory_query = memory;

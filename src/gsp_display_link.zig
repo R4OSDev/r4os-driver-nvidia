@@ -61,7 +61,8 @@ pub const Work = struct {
         } else {
             const value = self.dp orelse return false;
             if (self.hdmi != null or self.plan.transport != .dp or !std.meta.eql(self.plan.transport.dp, value.plan) or
-                self.phase != .before_scanout or value.stage == .complete) return false;
+                value.stage == .complete or value.stage == .post_complete or
+                (self.phase == .after_scanout) != (value.stage == .vsc or value.stage == .hdr)) return false;
         }
         var expected: [max_bytes]u8 = undefined;
         const n = self.encode(&expected) catch return false;
@@ -82,6 +83,7 @@ pub const Work = struct {
             try value.consume(record, now);
             self.acknowledged += 1;
             if (value.stage == .complete) self.phase = .scanout;
+            if (value.stage == .post_complete) self.phase = .complete;
         } else return error.State;
     }
     pub fn readyScanout(self: *const Work) bool {
@@ -92,7 +94,8 @@ pub const Work = struct {
     pub fn scanoutComplete(self: *Work) !void {
         if (!self.readyScanout()) return error.State;
         if (self.hdmi) |*value| { try value.scanoutComplete(); self.phase = value.phase; }
-        else self.phase = .complete;
+        else if (self.dp) |*value| { try value.scanoutComplete(); self.phase = .after_scanout; }
+        else return error.State;
     }
     pub fn dpResult(self: *const Work) ?dp.Result { return if (self.dp) |value| value.result else null; }
 };

@@ -362,7 +362,7 @@ pub fn core(config: Config) Error!Program {
         try out.method(base + 0x2058, &.{ signal.viewport, 0 });
         try out.method(base + 0x2014, &.{0x11});
         try out.method(base + 0x2078, &.{ 0, 0, signal.hdmi });
-        // Establish RGB8 and identity colour state. Never replay captured
+        // Establish the admitted RGB depth and identity colour state. Never replay captured
         // cursor or OLUT DMA handles into the new instance's namespace.
         try out.method(base + 0x209c, &.{0xcf});
         try out.method(base + 0x2088, &.{ 0, 0 });
@@ -372,7 +372,11 @@ pub fn core(config: Config) Error!Program {
         try out.method(base + 0x2238, &.{ 0x0fff0000, 0x0fff0000 });
         try out.method(base + 0x2220, &.{ 0xff, 0 });
         try out.method(base + 0x2018, &.{0});
-        try out.method(base + 0x2000, &.{ 0, 0xfc000040 | signal.polarity });
+        // DP MISC1[6] selects VSC colorimetry via the C67D color override.
+        // The link transaction must acknowledge that packet before activation.
+        const depth: u32 = if (signal.bpc == 10) 0x50 else 0x40;
+        try out.method(base + 0x2000, &.{ 0, 0xfc000000 | depth | signal.polarity |
+            @as(u32, if (signal.dp_vsc) 0x01800000 else 0) });
         try out.method(0x300 + signal.sor * 0x20, &.{signal.sor_control});
     }
     if (config.cursor_image) |cursor| {
@@ -424,7 +428,7 @@ pub fn window(config: Config) Error!Program {
     // MEMORY_LAYOUT bit. The first implementation is mono, unscaled RGB.
     try out.method(0x308, &.{1}); // Non-tearing, minimum interval1, no timestamp.
     const size = value.width | (value.height << 16);
-    try out.method(0x224, &.{ size, 0, if (value.format == 0x34325258) @as(u32, 0xe6) else 0xcf, value.pitch >> 6, 0, 0 });
+    try out.method(0x224, &.{ size, 0, try image.formatWord(value.format), value.pitch >> 6, 0, 0 });
     try out.method(0x240, &.{ value.dma, 0, 0, 0, 0, 0 }); // Mono RGB: only plane0/left is live.
     try out.method(0x260, &.{ @as(u32, @intCast(value.offset >> 8)), 0, 0, 0, 0, 0 });
     try out.method(0x290, &.{0});

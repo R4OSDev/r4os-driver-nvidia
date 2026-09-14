@@ -8,6 +8,10 @@ const control = @import("gsp_control_buffer.zig");
 const storage = @import("gsp_native_backing.zig");
 const copy = @import("gsp_push_ring.zig");
 const render = @import("r4nv_render");
+comptime {
+    if (@max(render.shader_bytes,render.packet_capacity_bytes) > @import("gsp_control_storage.zig").bytes)
+        @compileError("graphics programs/packets exceed the shared staging owner");
+}
 pub const Owner = struct {
     self_address: usize = 0,
     cache_owner: ?*cache.Owner = null,

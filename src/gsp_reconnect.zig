@@ -16,7 +16,9 @@ const Selection = struct {
         const same_size = plan.width == self.previous.width and plan.height == self.previous.height;
         const rank: u8 = if (same_size and sameSignal(plan, self.previous)) 0 else if (same_size and preferred) 1 else
             if (same_size) 2 else if (preferred) 3 else 4;
-        if (rank < self.rank) { self.best = .{ .plan = plan, .resize = !same_size }; self.rank = rank; }
+        // Reconnection starts from a fresh SDR signal. A former HDR shadow
+        // must be replaced even when the receiver keeps the same geometry.
+        if (rank < self.rank) { self.best = .{ .plan = plan, .resize = !same_size or self.previous.color != null }; self.rank = rank; }
     }
 };
 

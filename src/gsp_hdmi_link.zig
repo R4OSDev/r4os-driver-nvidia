@@ -121,6 +121,7 @@ const mode = @import("gsp_boot_mode.zig");
 const outputs = @import("gsp_outputs.zig");
 const display = @import("gsp_display_rpc.zig");
 const exchange = @import("gsp_exchange.zig");
+const signal_color = @import("gsp_color_signal.zig");
 pub const function: u32 = 76;
 pub const max_bytes = 84;
 pub const Operation = enum { caps, enable, audio_mute, avi, vsi, hdr_disable, gcp };
@@ -132,6 +133,7 @@ pub const Plan = struct {
     max_tmds_hz: u64 = 0,
     receiver_known: bool = false,
     hdmi_vic: u8 = 0,
+    color: ?signal_color.color.Plan = null,
 };
 pub const Work = struct {
     plan: Plan,
@@ -182,6 +184,7 @@ pub const Work = struct {
 /// saved RGB8 clock is a rational TMDS character rate, including 1000/1001.
 pub fn derive(saved: mode.Plan, object: display.Object, snapshot: *const outputs.Snapshot) !Plan {
     try mode.validate(saved.signal, saved.head);
+    try signal_color.validate(saved);
     if (saved.displayPort()) return error.Unsupported;
     if (object.client == 0 or object.display == 0 or object.epoch != saved.epoch or snapshot.topology.client != object.client or
         !std.meta.eql(saved, try mode.bind(saved, snapshot, saved.epoch, saved.held_generation))) return error.Stale;
@@ -204,12 +207,14 @@ pub fn derive(saved: mode.Plan, object: display.Object, snapshot: *const outputs
                 if (report.scrambling_low_rates) result.caps |= 2;
                 if (result.caps & 3 != 0 and result.caps & 4 == 0) return error.Unsupported;
             }
+            result.color = try signal_color.admit(saved, report, if (saved.transport_hdmi)
+                .{ .hdmi = .{ .max_tmds_hz = 600_000_000, .scdc = true } } else .{ .dvi = 165_000_000 });
         }
         break;
     };
     const adjusted = saved.signal.clock & 0x80000000 != 0;
-    const numerator = @as(u64, saved.signal.clock & 0x7fffffff) * @as(u64, if (adjusted) 1000 else 1);
-    const denominator: u64 = if (adjusted) 1001 else 1;
+    const numerator = @as(u64, saved.signal.clock & 0x7fffffff) * @as(u64, if (adjusted) 1000 else 1) * saved.signal.bpc;
+    const denominator: u64 = @as(u64, if (adjusted) 1001 else 1) * 8;
     // An unspecified EDID maximum grants no higher TMDS rate for a new
     // mode. Keep the single-link 165 MHz ceiling until the receiver declares
     // a higher limit. Retained boot adoption keeps its separate policy.
@@ -217,12 +222,14 @@ pub fn derive(saved: mode.Plan, object: display.Object, snapshot: *const outputs
     if (numerator > limit * denominator or (result.max_tmds_hz != 0 and numerator > result.max_tmds_hz * denominator) or
         (numerator > 340_000_000 * denominator and result.caps & 5 != 5)) return error.Unsupported;
     if (saved.receiver_mode_id != 0 and !result.receiver_known) return error.Stale;
+    if (saved.color != null and result.color == null) return error.Stale;
     return result;
 }
 
 pub fn command(op: Operation, plan: Plan) u32 {
     return switch (op) { .caps => 0x730293, .enable => 0x730273, .audio_mute => 0x730275,
-        .avi, .gcp => 0x730288, .vsi => if (plan.hdmi_vic == 0) 0x730289 else 0x730288, .hdr_disable => 0x730289 };
+        .avi, .gcp => 0x730288, .vsi => if (plan.hdmi_vic == 0) 0x730289 else 0x730288,
+        .hdr_disable => if (plan.color != null and !plan.color.?.clear_hdr) 0x730288 else 0x730289 };
 }
 fn put(bytes: []u8, offset: usize, value: u32) void { std.mem.writeInt(u32, bytes[offset..][0..4], value, .little); }
 fn word(bytes: []const u8, offset: usize) u32 { return std.mem.readInt(u32, bytes[offset..][0..4], .little); }
@@ -232,6 +239,12 @@ fn checksum(packet: []u8) void {
     packet[3] = 0 -% sum;
 }
 pub fn encode(plan: Plan, op: Operation, bytes: *[max_bytes]u8) !usize {
+    try signal_color.validate(plan.mode);
+    if ((plan.mode.color != null) != (plan.color != null)) return error.Descriptor;
+    if (plan.color) |color| {
+        if (color.bpp != plan.mode.signal.bpc * 3 or color.clear_hdr != (plan.mode.color.?.transfer == .srgb) or
+            color.metadata_bytes != @as(u8, if (color.clear_hdr) 0 else 30)) return error.Descriptor;
+    }
     if (plan.mode.displayPort()) return error.Unsupported;
     if (plan.object.epoch == 0 or plan.object.client == 0 or plan.object.display == 0 or plan.object.epoch != plan.mode.epoch or
         plan.caps & ~@as(u32, 7) != 0 or (!plan.mode.transport_hdmi and op != .caps and op != .enable) or
@@ -247,7 +260,7 @@ pub fn encode(plan: Plan, op: Operation, bytes: *[max_bytes]u8) !usize {
         .caps => put(params, 8, plan.caps),
         .enable => params[8] = @intFromBool(plan.mode.transport_hdmi),
         .audio_mute => params[8] = 1, // The audio owner enables PCM after this modeset completes.
-        .hdr_disable => put(params, 8, 0x87),
+        .hdr_disable => if (cmd == 0x730289) { put(params, 8, 0x87); },
         .vsi => if (plan.hdmi_vic == 0) { put(params, 8, 0x81); },
         .avi, .gcp => {},
     }
@@ -257,10 +270,15 @@ pub fn encode(plan: Plan, op: Operation, bytes: *[max_bytes]u8) !usize {
         const length: u32 = switch (op) {
             .avi => blk: {
                 packet[0] = 0x82; packet[1] = 2; packet[2] = 13;
-                // RGB8 identity output: full range, no scaling/repetition.
+                // RGB output: declared quantization/colorimetry must agree
+                // with the actual encoded pixels, without scaling/repetition.
                 // Receiver modes retain their exact CTA VIC. A captured
                 // boot HDMI VIC remains in its separate legacy VSI.
                 packet[6] = 8;
+                if (plan.mode.color) |color| {
+                    packet[6] = if (color.range == .full) 8 else 4;
+                    if (color.primaries == .bt2020) { packet[5] = 0xc0; packet[6] |= 0x60; }
+                }
                 packet[7] = plan.mode.cta_vic;
                 checksum(packet[0..17]); break :blk 17;
             },
@@ -269,7 +287,16 @@ pub fn encode(plan: Plan, op: Operation, bytes: *[max_bytes]u8) !usize {
                 packet[4] = 3; packet[5] = 12; packet[7] = 0x20; packet[8] = plan.hdmi_vic;
                 checksum(packet[0..9]); break :blk 9;
             },
-            .gcp => blk: { packet[0] = 3; packet[3] = 0x10; break :blk 10; }, // Clear video AVMUTE, RGB8/default packing.
+            .hdr_disable => blk: {
+                const admitted = plan.color orelse return error.Descriptor;
+                @memcpy(packet[0..30], admitted.metadata[0..30]);
+                break :blk 30;
+            },
+            .gcp => blk: {
+                packet[0] = 3; packet[3] = 0x10;
+                if (plan.mode.signal.bpc == 10) packet[4] = 5; // GCP SB1 CD[3:0], 30 bits/pixel.
+                break :blk 10;
+            },
             else => return error.Descriptor,
         };
         put(params, 12, length);

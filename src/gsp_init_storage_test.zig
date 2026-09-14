@@ -2436,7 +2436,7 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
             var result_size = payload.len;
             switch (operation) {
                 .register => {
-                    try t.expect(function == 4 and payload.len == 88 and std.mem.readInt(u32, payload[12..16], .little) == 0x81);
+                    try t.expect(function == 4 and payload.len == 96 and std.mem.readInt(u32, payload[12..16], .little) == 0x81);
                     for (ControlModel.pages, 0..) |page, i| try t.expect(std.mem.readInt(u64, payload[56 + 8 * i ..][0..8], .little) == page >> 12);
                     if (scenario == .control_register_reject) rpc_result = 0x51;
                     if (scenario == .control_register_reject or scenario == .outputs_empty) result_size = 0;
@@ -2444,7 +2444,7 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
                 .allocate => {
                     try t.expect(function == 103 and payload.len == 160 and std.mem.readInt(u32, payload[12..16], .little) == 0x50a0);
                     std.mem.writeInt(u64, response[112..120], if (scenario == .control_bounds) 0x10000000000 else 0x600000, .little);
-                    std.mem.writeInt(u64, response[120..128], 16383, .little);
+                    std.mem.writeInt(u64, response[120..128], 20479, .little);
                     if (scenario == .control_virtual_reject) std.mem.writeInt(u32, response[16..20], 0x52, .little);
                     if (scenario == .control_short) result_size = 32;
                 },
@@ -2600,7 +2600,7 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
             try t.expect(address_space.handle == graph.base.plan.handles.vaspace and address_space.base == 0x200000);
             try t.expect(address_space.bytes == 0x100000000 and address_space.big_page_bytes == 65536);
             if (running.nativeControlBuffer()) |info| {
-                try t.expect(info.address == 0x600000 and info.bytes == 16384 and info.epoch == session.epoch and buffer_requests == 3);
+                try t.expect(info.address == 0x600000 and info.bytes == 20480 and info.epoch == session.epoch and buffer_requests == 3);
                 const caps = running.nativeMemoryCapabilities() orelse return error.MissingCapabilities;
                 try t.expect(caps_requests == 1 and caps.binding.epoch == session.epoch and caps.binding.device == graph.base.plan.handles.device);
                 const present = scenario != .memory_caps_none;
@@ -3110,6 +3110,7 @@ const NativeCommon = struct {
     var additional_released: u32 = 0;
     var modes_enabled = false;
     var mode_job: ?a.GfxDriverModeJob = null;
+    var mode_color: ?a.GfxDriverModeColor = null;
     var mode_taken = false;
     var mode_receipt: ?a.GfxDriverModeCompletion = null;
     var mode_completions: usize = 0;
@@ -3124,6 +3125,8 @@ const NativeCommon = struct {
     var cursor_taken = false;
     var cursor_receipt: ?a.GfxDriverCursorCompletion = null;
     var cursor_reply_busy = false;
+    var color_publications: u32 = 0;
+    var color_state: a.GfxOutputColorState = .{};
     var scenario: []const u8 = "";
     fn is(name: []const u8) bool {
         return std.mem.eql(u8, scenario, name) or (std.mem.eql(u8, name, "context_native_connected") and
@@ -3135,12 +3138,29 @@ const NativeCommon = struct {
     fn outputs(out: *a.GfxDriverOutputApi) callconv(.c) i32 {
         _ = CatalogModel.query(out);
         out.publish = @intFromPtr(&publish); out.withdraw = @intFromPtr(&withdraw);
+        out.color_publish = @intFromPtr(&publishColor);
         out.output_pause = @intFromPtr(&pauseOutput); out.mode_restore = @intFromPtr(&restoreMode); out.mode_status = @intFromPtr(&modeStatus);
         if (hasModes()) {
             out.mode_enable = @intFromPtr(&enableModes);
             out.mode_take = @intFromPtr(&takeMode);
             out.mode_complete = @intFromPtr(&completeMode);
+            out.mode_read_color = @intFromPtr(&readModeColor);
         }
+        return a.gfx_output_ok;
+    }
+    fn publishColor(input: *const a.GfxOutputColorState) callconv(.c) i32 {
+        std.debug.assert(input.version == 1 and input.size == 128 and input.revision == 0 and
+            input.identity.connection_generation != 0 and input.flags & 7 == 7 and input.flags & ~@as(u32, 127) == 0 and
+            (input.format == a.gfx_buffer_format_xrgb8888 or input.format == a.gfx_buffer_format_xrgb2101010) and
+            input.formats & (if (input.bpc == 10) @as(u32, 2) else 1) != 0 and input.depths == input.formats and
+            input.gamma_entries == 0 and input.degamma_entries == 0 and input.ctm_fraction_bits == 0);
+        color_publications += 1; color_state = input.*;
+        return a.gfx_output_ok;
+    }
+    fn readModeColor(ticket: u64, sequence: u64, out: *a.GfxDriverModeColor) callconv(.c) i32 {
+        std.debug.assert(mode_taken and mode_job != null and mode_job.?.ticket == ticket and mode_job.?.sequence == sequence);
+        out.* = mode_color orelse return 0;
+        out.ticket = ticket; out.sequence = sequence;
         return a.gfx_output_ok;
     }
     fn display(out: *a.GfxDriverDisplayApi) callconv(.c) i32 {
@@ -3390,7 +3410,8 @@ const NativeCommon = struct {
                 run.displayFlip(window) == null and run.readyImage(window) == null and run.frame_setup == null and
                 selected.surface.valid() and @import("gsp_copy_test_model.zig").Model.borrowed_releases == 0);
             if (input.outcome == a.gfx_output_outcome_applied) {
-                std.debug.assert(input.quiesced == 1 and std.meta.eql(selected.surface.shadow.buffer, mode_job.?.reference.buffer));
+                const source = if (mode_color) |color| color.reference.buffer else mode_job.?.reference.buffer;
+                std.debug.assert(input.quiesced == 1 and std.meta.eql(selected.surface.shadow.buffer, source));
             } else std.debug.assert(input.quiesced == 2 and selected.surface.scanout.?.dma ==
                 (if (owner.previous) |previous| previous.image.dma else if (additional) extra.dma else target.native_output.dma));
             if (input.operation != a.gfx_mode_operation_apply) std.debug.assert(run.native_active == null and run.buffer_active == null);
@@ -3482,6 +3503,7 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
     NativeCommon.statistics = null; NativeCommon.statistics_busy = false; NativeCommon.presentation_info = null;
     NativeCommon.cursor_info = null; NativeCommon.cursor_job = null; NativeCommon.cursor_taken = false;
     NativeCommon.cursor_receipt = null; NativeCommon.cursor_reply_busy = false;
+    NativeCommon.color_publications = 0; NativeCommon.color_state = .{};
     for (&NativeCommon.pixels, 0..) |*byte, i| byte.* = @truncate(i * 17 + 23);
     table.gfx_output_query = NativeCommon.outputs; table.gfx_display_query = NativeCommon.display;
     captured.boot.display = target.ctx.?.graphicsDisplay();
@@ -4398,6 +4420,15 @@ fn pumpCursorCommit(target: *@import("gsp_device.zig").Device) !void {
 }
 fn checkNativeFrames(target: *@import("gsp_device.zig").Device, extra: bool) !void {
     const run = &target.running; const product = &target.native_output;
+    _ = product.color.step(product);
+    try t.expect(NativeCommon.color_publications != 0 and std.meta.eql(NativeCommon.color_state.identity, product.output));
+    const active_link = run.display_images[product.mode.?.window].?.link.?;
+    if (active_link.dp) |dp| {
+        try t.expectEqual(@as(u64, dp.config.rate) * 27_000_000 * 8 * dp.config.lanes, NativeCommon.color_state.dp_payload_bits_per_second);
+        try t.expectEqual(@as(u64, 0), NativeCommon.color_state.max_tmds_clock_hz);
+    } else try t.expectEqual(@as(u64, if (active_link.plan.mode.transport_hdmi) 600_000_000 else 165_000_000), NativeCommon.color_state.max_tmds_clock_hz);
+    const publications = NativeCommon.color_publications;
+    try t.expect(!product.color.step(product) and NativeCommon.color_publications == publications);
     const copy = @import("gsp_copy_test_model.zig").Model;
     const display = @import("gsp_display_test_model.zig").Model;
     const push = @import("gsp_display_push.zig");
@@ -4748,6 +4779,17 @@ fn checkNativeModeJobs(target: *@import("gsp_device.zig").Device) !void {
                 .head_id = product.mode.?.head, .plane_id = product.mode.?.window, .pll_id = product.mode.?.head,
                 .source_width = mode.width, .source_height = mode.height, .destination_width = mode.width, .destination_height = mode.height,
                 .buffer = borrowed.buffer }, .mode = mode, .reference = borrowed, .deadline_ns = clock + std.time.ns_per_s };
+        const hdr = iteration == 0;
+        if (hdr) {
+            const report = &run.outputs.data.receivers[0].report;
+            report.hdmi_deep_color = 1; report.rgb_quantization_selectable = true; report.colorimetry = 0x80;
+            report.hdr_present = true; report.hdr_eotf = 12; report.hdr_static = 1;
+            const encoded = copy.lendEncodedMode(mode.width, mode.height);
+            for (&copy.host[3], 0..) |*byte, i| byte.* = @truncate(i * 13 + 7);
+            NativeCommon.mode_color = .{ .reference = encoded, .signal = .{ .format = a.gfx_buffer_format_xrgb2101010,
+                .bpc = 10, .primaries = 3, .transfer = 3, .range = 2, .pipeline = 7, .reference_white = 2030000,
+                .peak = 10000000, .metadata_valid = 1, .metadata = .{ .max_mastering = 1000, .max_cll = 1000, .max_fall = 400 } } };
+        } else NativeCommon.mode_color = null;
         checkpoint = "apply";
         NativeCommon.mode_job = job; NativeCommon.mode_taken = false; NativeCommon.mode_receipt = null;
         try pumpNativeModeJob(target);
@@ -4756,6 +4798,8 @@ fn checkNativeModeJobs(target: *@import("gsp_device.zig").Device) !void {
             product.modes.phase == .decision and run.presentation != old and old.surface.valid() and copy.replacement_lent and copy.borrowed_releases == 0);
         const image = run.presentation.?.surface.scanout.?;
         try t.expect(image.width == 96 and image.height == 24 and image.dma == product.modes.candidate);
+        try t.expectEqual(if (hdr) a.gfx_buffer_format_xrgb2101010 else a.gfx_buffer_format_xrgb8888, image.format);
+        try t.expect((product.mode.?.color != null) == hdr);
         const diagnostic = product.modes.diagnostic;
         try t.expect(diagnostic.ticket == job.ticket and diagnostic.operation_sequence == 1 and diagnostic.operation == a.gfx_mode_operation_apply and
             std.meta.eql(diagnostic.output, product.output) and diagnostic.epoch == run.epoch and diagnostic.hold == target.display_epoch and
@@ -4766,10 +4810,12 @@ fn checkNativeModeJobs(target: *@import("gsp_device.zig").Device) !void {
             diagnostic.outcome == a.gfx_output_outcome_applied and diagnostic.quiesced == 1 and diagnostic.common_status == a.gfx_output_ok and
             diagnostic.pending == 0 and diagnostic.initial_read_lease == 0 and
             diagnostic.shadow_imports == run.presentation_buffers + 1 and diagnostic.native_owners == run.presentation_buffers + 4);
-        for (0..24) |y| try t.expectEqualSlices(u8, copy.host[1][y * 384..][0..384], copy.replacement_vram[y * image.pitch..][0..384]);
+        for (0..24) |y| try t.expectEqualSlices(u8, copy.host[if (hdr) 3 else 1][y * 384..][0..384], copy.replacement_vram[y * image.pitch..][0..384]);
         try t.expectEqualSlices(u8, &pixels, &copy.vram_data);
         checkpoint = "candidate frame group";
         try checkNativeFrames(target, true);
+        if (hdr) try t.expect(NativeCommon.color_state.format == a.gfx_buffer_format_xrgb2101010 and NativeCommon.color_state.bpc == 10 and
+            NativeCommon.color_state.transfer == 3 and NativeCommon.color_state.range == 2 and NativeCommon.presentation_info.?.format == a.gfx_buffer_format_xrgb2101010);
         const selected = run.presentation.?.surface.scanout.?;
         var duplicate: a.GfxDriverModeJob = .{};
         try t.expect(product.outputs.?.takeMode(&product.backend, &duplicate) == 0);
@@ -4784,6 +4830,8 @@ fn checkNativeModeJobs(target: *@import("gsp_device.zig").Device) !void {
             try t.expect(completed.outcome == a.gfx_output_outcome_old_preserved and completed.quiesced == 2 and
                 run.presentation == old and old.surface.valid() and copy.replacementReferences() == 0 and !native.slots[index].live);
             try t.expectEqualSlices(u8, &pixels, &copy.vram_data);
+            try t.expect(product.mode.?.color == null and copy.modeReferences() == 0 and copy.dma[3].lease.id == 0 and copy.gpu[3].lease.id == 0);
+            NativeCommon.mode_color = null; copy.mode_lent = false;
             const restored = product.modes.diagnostic;
             try t.expect(restored.operation == a.gfx_mode_operation_rollback and restored.operation_sequence == 2 and restored.requested.width == 96 and
                 restored.before.width == 96 and restored.after.width == 65 and restored.after.height == 20 and restored.after.dma == old.surface.scanout.?.dma and
@@ -5527,11 +5575,19 @@ fn replyNativeProduct(target: *@import("gsp_device.zig").Device) !void {
     } else if (run.display_work) |*work| {
         const link = &work.link.?;
         if (link.dp) |*dp| {
-            try t.expect(!link.readyScanout() and work.core.phase == .prepare and work.window.?.phase == .prepare);
+            try t.expect(!link.readyScanout());
+            if (link.phase == .before_scanout) try t.expect(work.core.phase == .prepare and work.window.?.phase == .prepare);
+            if (link.phase == .after_scanout) try t.expect(work.core.phase == .complete and work.window.?.phase == .complete);
             @import("gsp_dp_link_test.zig").respond(dp, response[0..rpc.request.len], false);
         } else {
-            const bytes = try @import("gsp_hdmi_link_test.zig").reference(link.hdmi.?.operation, link.hdmi.?.plan);
-            @memcpy(response[24..rpc.request.len], bytes[24..]);
+            const hdmi = link.hdmi.?;
+            if (hdmi.plan.mode.color != null) {
+                try @import("gsp_hdmi_link_test.zig").checkColorRequest(hdmi.plan, hdmi.operation, rpc.request);
+                @memcpy(response[24..rpc.request.len], rpc.request[24..]);
+            } else {
+                const bytes = try @import("gsp_hdmi_link_test.zig").reference(hdmi.operation, hdmi.plan);
+                @memcpy(response[24..rpc.request.len], bytes[24..]);
+            }
             // The original C vectors use displayId4. All NV0073 HDMI
             // controls carry the selected displayId at params+4.
             outputWord(&response, 28, link.plan.mode.signal.display_id);
@@ -5814,7 +5870,7 @@ fn checkRenderWarmup(target: *@import("gsp_device.zig").Device, table: *a.Driver
     try t.expect(run.graphics_cache.reservedBytes() == cache.budget_bytes and run.graphics_cache.program_uploads == 0);
     try checkRenderUpload(target,ce,output);
     for (0..16) |_| { try stepQueuedRendering(target); if (target.render_startup.phase == .ready) break; }
-    try t.expect(target.render_startup.phase == .ready and !run.graphics_starting and run.graphics_enabled and model.render_operations == 381 and
+    try t.expect(target.render_startup.phase == .ready and !run.graphics_starting and run.graphics_enabled and model.render_operations == 893 and
         run.graphics_cache.program_uploads == 1 and run.graphics_cache.packet_uploads == 0 and run.graphics_cache.uploaded_bytes == output.len);
     var bounded: cache.Owner = .{}; try bounded.initialize(run.epoch);
     try t.expectError(error.Exhausted,bounded.admitStorage(.programs,cache.slot_budget_bytes+1));
@@ -5908,8 +5964,8 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
     try t.expect(!try run.beginCopyWork(ce,model.binding,deadline));
     if (!run.graphics_enabled) try run.enableGraphicsQueue(target.native_graphics.channel.?,ce)
     // Reinstalling a fresh host memory view does not re-register the runtime.
-    else model.render_operations = 381;
-    try t.expect(model.render_operations == 381 and run.graphics_enabled);
+    else model.render_operations = 893;
+    try t.expect(model.render_operations == 893 and run.graphics_enabled);
     if (source_index) |index| {
         // The same copy_rows contract emitted by image_prepare. Its actual
         // CE stream turns SYS rows into tiled texture storage; GPGet and
@@ -5955,7 +6011,8 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
     }
     const rounds: usize = if (scene.solid and !graphicsFaultScenario(scenario)) 2 else 1;
     const gridded = scene_index == 0 and !graphicsFaultScenario(scenario);
-    const batched = gridded or scene_index == 3 or graphicsFaultScenario(scenario);
+    const colored = scene_index == 8 and !graphicsFaultScenario(scenario);
+    const batched = gridded or colored or scene_index == 3 or graphicsFaultScenario(scenario);
     var packet_storage: [render.packet_capacity_bytes]u8 = undefined;
     const packet = packet_storage[0..if (batched) render.packet_capacity_bytes else render.packet_bytes];
     for (0..rounds) |round| {
@@ -5968,7 +6025,7 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
             .target_rect = .{ .x = scene.destination.x, .y = scene.destination.y, .width = scene.destination.width, .height = scene.destination.height },
             .source_rect = if (scene.solid) .{} else .{ .x = scene.source_rect.x, .y = scene.source_rect.y, .width = scene.source_rect.width, .height = scene.source_rect.height },
             .scissor = .{ .x = scene.scissor.x, .y = scene.scissor.y, .width = scene.scissor.width, .height = scene.scissor.height },
-            .filter = @intFromEnum(scene.filter), .blend = @intFromEnum(scene.blend), .transfer = @intFromEnum(scene.transfer),
+            .filter = @intFromEnum(scene.filter), .blend = @intFromEnum(scene.blend), .transfer = if (colored) a.gfx_render_transfer_color else @intFromEnum(scene.transfer),
             .color = if (scene.solid) 0x80402010 else 0, .opacity = scene.opacity };
         if (batched) {
             // Sixteen disjoint scissors exactly partition the frozen scene,
@@ -5982,7 +6039,9 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
                     .width = clip[0] + (clip[2] - clip[0]) * @as(u32, @intCast(index % 4 + 1)) / 4 - x,
                     .height = clip[1] + (clip[3] - clip[1]) * @as(u32, @intCast(index / 4 + 1)) / 4 - y };
             }
-            if (gridded) {
+            if (colored) {
+                model.enqueueRenderColorList(native_index,source_index.?,&commands,.{ .words = queuedSrgbProgram().words },deadline);
+            } else if (gridded) {
                 // At scale60 each native center is logical2*x+1. A doubled
                 // viewport reproduces the existing frozen nearest oracle,
                 // through the actual grid job, CE packet and GR receipt.
@@ -5999,6 +6058,7 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
         try t.expect(model.active and run.copy_job == null and run.queued_render != null);
         if (batched) model.render_list.commands[15].opacity ^= 1; // Driver owns its copied list.
         if (gridded) model.render_grids[15].scale = 0;
+        if (colored) model.render_color.words[32] = @bitCast(std.math.nan(f32)); // Retained copy must stay valid.
         if (last) {
             try run.releaseNativeBuffer(buffer);
             if (source_buffer) |value| try run.releaseNativeBuffer(value);
@@ -6046,8 +6106,9 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
         try stepQueuedRendering(target); try t.expect(model.completed == completed_copy and model.active);
         const binding = run.graphics_cache.binding() catch return error.RenderBinding;
         try t.expect(binding.additional.len == (if (batched) @as(usize,15) else 0) and count <= 1024);
-        try reference.execute(body,packet,binding.programs.address,binding.packet.address,reference.Surface.from(target_image,target_data),
-            if (source_image) |value| reference.Surface.from(value,model.imageBytes(source_index.?)) else null);
+        try reference.executeColor(body,packet,binding.programs.address,binding.packet.address,reference.Surface.from(target_image,target_data),
+            if (source_image) |value| reference.Surface.from(value,model.imageBytes(source_index.?)) else null,
+            if (colored) &queuedSrgbOracle else null);
         for (0..24) |y| {
             @memcpy(target_pixels[y*128..][0..128],target_data[y*target_image.pitch..][0..128]);
             for (target_data[y*target_image.pitch+128..(y+1)*target_image.pitch]) |value| try t.expectEqual(@as(u8,0xcc),value);
@@ -6079,6 +6140,22 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
     try run.graphics_cache.cancelUpload();
     try t.expect(!try run.graphics_cache.reusePacket(old_draw));
     try t.expectError(error.State,run.graphics_cache.binding());
+}
+fn queuedSrgbProgram() @import("r4nv_render").ColorProgram {
+    var program: @import("r4nv_render").ColorProgram = .{};
+    program.words[0..5].* = .{0,1,2,3,4};
+    for ([_]usize{32,80}) |base| for (0..3) |i| { program.words[(base+i*20)/4] = @bitCast(@as(f32,1)); };
+    const values = [_]f32{100,100,1,0, 100,100,1,0, 1,0,1,0, 1,100,75,0, 100,0};
+    for (values,32..) |value,i| program.words[i] = @bitCast(value);
+    return program;
+}
+fn queuedSrgbOracle(program: @import("r4nv_render").ColorProgram, rgba: [4]f32, opacity: f32, _: u32, _: u32) ![4]f32 {
+    try t.expectEqualDeep(queuedSrgbProgram(),program);
+    // Independent pre-existing sRGB oracle and frozen images. This numerical
+    // model verifies uploaded parameters and lifetime, not SM instruction execution.
+    var result = @import("r4nv_render").reference_model.transfer(rgba,false);
+    for (&result) |*value| value.* *= opacity;
+    return result;
 }
 fn checkGraphicsFault(target: *@import("gsp_device.zig").Device, ce: @import("gsp_runtime.zig").ChannelHandle,
     deadline: u64, scenario: []const u8, image_index: usize) !void {

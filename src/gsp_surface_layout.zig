@@ -120,7 +120,9 @@ const memory_caps = @import("gsp_memory_caps.zig");
 const vaspace = @import("gsp_vaspace.zig");
 pub const Error = error{ Bounds, Unsupported, Stale, Descriptor };
 pub const alignment: u64 = 65536;
-pub const Format = enum(u32) { xrgb8888 = 0x34325258, argb8888 = 0x34325241, r8 = 0x20203852, nv12 = 0x3231564e, p010 = 0x30313050 };
+pub const Format = enum(u32) { xrgb8888 = 0x34325258, argb8888 = 0x34325241,
+    xrgb2101010 = 0x30335258, argb2101010 = 0x30335241, abgr16161616f = 0x48344241,
+    r8 = 0x20203852, nv12 = 0x3231564e, p010 = 0x30313050 };
 pub const Layout = enum { linear, blocklinear };
 pub const Request = struct {
     width: u32,
@@ -205,6 +207,9 @@ fn geometry(adapter: u32, epoch: u64, limit: u64, caps: memory_caps.Info, reques
     // NVKMS ISO surfaces require complete chroma blocks; offscreen buffers
     // retain ceil-sized chroma planes for odd image dimensions.
     if (request.usage & 32 != 0 and ((multi and (request.width & 1 != 0 or request.height & 1 != 0)) or request.format == .r8)) return error.Unsupported;
+    // High-precision offscreen storage does not establish an output color
+    // mode. The display owner must admit its complete link/color transaction.
+    if (request.usage & 32 != 0 and request.format == .abgr16161616f) return error.Unsupported;
     if (request.layout == .linear and request.block_height != null) return error.Descriptor;
     const chroma_rows = (@as(u64, request.height) + 1) / 2;
     const log2 = if (request.layout == .blocklinear) request.block_height orelse automaticBlockHeight(@intCast(if (multi) chroma_rows else request.height)) else 0;
@@ -213,7 +218,10 @@ fn geometry(adapter: u32, epoch: u64, limit: u64, caps: memory_caps.Info, reques
         .format = @intFromEnum(request.format), .plane_count = if (multi) 2 else 1, .usage = request.usage,
         .location = a.gfx_buffer_location_device_local, .adapter_id = adapter, .device_generation = epoch },
         .allocation_bytes = 0, .request = request, .caps = caps, .log2_gobs = log2 };
-    const sample_bytes: u64 = switch (request.format) { .xrgb8888, .argb8888 => 4, .p010 => 2, else => 1 };
+    const sample_bytes: u64 = switch (request.format) {
+        .xrgb8888, .argb8888, .xrgb2101010, .argb2101010 => 4,
+        .abgr16161616f => 8, .p010 => 2, else => 1,
+    };
     var end: u64 = 0;
     for (0..plan.descriptor.plane_count) |index| {
         const columns = if (multi and index == 1) ((@as(u64, request.width) + 1) / 2) * 2 else request.width;

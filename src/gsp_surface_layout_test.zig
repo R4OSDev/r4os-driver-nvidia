@@ -37,6 +37,15 @@ pub fn check() !void {
     try t.expect(yuv.descriptor.plane_offsets[1] == 2228224 and yuv.allocation_bytes == 3473408);
     const p010 = try surface.create(1, space, caps, .{ .width = 5, .height = 3, .format = .p010, .layout = .blocklinear });
     try t.expect(p010.log2_gobs == 0 and p010.descriptor.plane_pitches[1] == 64 and p010.padded_rows[1] == 8 and p010.allocation_bytes == 131072);
+    const fp16 = try surface.create(1, space, caps, .{ .width = 1919, .height = 1079, .format = .abgr16161616f, .layout = .blocklinear, .usage = 28 });
+    try t.expect(fp16.descriptor.plane_pitches[0] == 15360 and fp16.padded_rows[0] == 1152 and fp16.plane_bytes[0] == 17694720);
+    try fp16.validate(1, space);
+    const ten = try surface.create(1, space, caps, .{ .width = 1919, .height = 1079, .format = .argb2101010, .usage = 28 });
+    try t.expect(ten.descriptor.plane_pitches[0] == 7680 and ten.descriptor.plane_count == 1);
+    const scanout_ten = try surface.create(1, space, caps, .{ .width = 1919, .height = 1079, .format = .xrgb2101010, .usage = 32 });
+    const image = try @import("gsp_display_image.zig").create(scanout_ten, 12, 1);
+    try t.expectEqual(@as(u32, 0xdf), try @import("gsp_display_image.zig").formatWord(image.format));
+    try t.expectError(error.Unsupported, surface.create(1, space, caps, .{ .width = 1920, .height = 1080, .format = .abgr16161616f, .usage = 32 }));
     for ([_]u8{0,1,2,3,4,5}) |h| {
         const plan = try surface.create(1, space, caps, .{ .width = 64, .height = 9, .layout = .blocklinear, .block_height = h });
         try t.expect(plan.log2_gobs == h and plan.padded_rows[0] % (@as(u64, 8) << @intCast(h)) == 0);

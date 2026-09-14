@@ -42,6 +42,8 @@ pub const Signal = struct {
     polarity: u32,
     hdmi: u32,
     min_frame_idle: u32,
+    bpc: u8 = 8,
+    dp_vsc: bool = false,
 };
 pub const Plan = struct {
     epoch: u64 = 0,
@@ -61,6 +63,9 @@ pub const Plan = struct {
     cta_vic: u8 = 0,
     transport_hdmi: bool = false,
     cursor_size: u16 = 0,
+    color: ?@import("gsp_color_signal.zig").color.Signal = null,
+    color_pipeline: @import("gsp_color_signal.zig").color.Pipeline = .{
+        .linear_composition = false, .output_transform = false, .opaque_output = false },
     signal: Signal,
     pub fn displayPort(self: Plan) bool { return isDisplayPort(self.signal); }
     pub fn hasAudio(self: Plan) bool { return self.transport_hdmi or self.displayPort(); }
@@ -158,6 +163,7 @@ pub fn bind(saved: Plan, snapshot: *const outputs.Snapshot, epoch: u64, held_gen
 }
 
 pub fn validate(signal: Signal, head: u32) Error!void {
+    if ((signal.bpc != 8 and signal.bpc != 10) or (signal.dp_vsc and !isDisplayPort(signal))) return error.Unsupported;
     if (head >= 8 or signal.sor >= 8 or signal.display_id == 0 or signal.display_id & (signal.display_id - 1) != 0 or
         signal.sor_control & 255 != @as(u32, 1) << @intCast(head) or signal.sor_control & ~@as(u32, 0x10fff) != 0 or
         signal.polarity & ~@as(u32, 12) != 0 or signal.hdmi & ~@as(u32, 0xff1) != 0) return error.Descriptor;

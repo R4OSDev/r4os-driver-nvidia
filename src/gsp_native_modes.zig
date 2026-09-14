@@ -26,6 +26,7 @@ pub const Owner = struct {
     plan: ?runtime.boot_mode.Plan = null,
     job: ?a.GfxDriverModeJob = null,
     applied: ?a.GfxDriverModeJob = null,
+    color: ?a.GfxDriverModeColor = null,
     previous: ?runtime.ActiveDisplayImage = null,
     previous_dma: u32 = 0,
     previous_headless: bool = false,
@@ -215,6 +216,7 @@ pub const Owner = struct {
             },
             .allocate => {
                 self.candidate_storage = try run.allocateDisplaySurface(.{ .width = self.plan.?.width, .height = self.plan.?.height,
+                    .format = if (self.color) |value| if (value.signal.format == a.gfx_buffer_format_xrgb2101010) .xrgb2101010 else .xrgb8888 else .xrgb8888,
                     .usage = a.gfx_buffer_usage_transfer_target | a.gfx_buffer_usage_scanout }, self.deadline);
                 self.phase = .allocate_wait;
             },
@@ -243,7 +245,8 @@ pub const Owner = struct {
                 self.phase = .prepare;
             },
             .prepare => {
-                try run.prepareOutputPresentationImage(product.mode.?.window, self.candidate, self.job.?.reference, self.deadline);
+                try run.prepareOutputPresentationImage(product.mode.?.window, self.candidate,
+                    if (self.color) |value| value.reference else self.job.?.reference, self.deadline);
                 self.phase = .image_upload;
             },
             .image_upload => {
@@ -258,7 +261,8 @@ pub const Owner = struct {
             },
             .commit => {
                 const dma = if (self.job.?.operation == a.gfx_mode_operation_apply) self.candidate else self.previous_dma;
-                try run.commitModeDisplayImage(product.core.?, product.window.?, dma, self.plan.?.receiver_mode_id, self.deadline);
+                try run.commitColorModeDisplayImage(product.core.?, product.window.?, dma, self.plan.?.receiver_mode_id,
+                    self.plan.?.color, self.plan.?.color_pipeline, self.deadline);
                 self.phase = .commit_wait;
             },
             .commit_wait => {
@@ -336,7 +340,7 @@ pub const Owner = struct {
                 if (job.operation == a.gfx_mode_operation_apply and self.outcome == a.gfx_output_outcome_applied) {
                     self.applied = job; self.phase = .decision;
                 } else {
-                    self.completed_ticket = job.ticket; self.applied = null; self.previous = null; self.previous_storage = null;
+                    self.completed_ticket = job.ticket; self.applied = null; self.color = null; self.previous = null; self.previous_storage = null;
                     self.previous_dma = 0; self.previous_headless = false;
                     self.candidate = 0; self.candidate_storage = null; self.retire_dma = 0; self.retire_storage = null; self.phase = .idle;
                     self.retire_group = .{};
@@ -363,10 +367,23 @@ pub const Owner = struct {
         const job = self.job orelse return error.State;
         if (job.version != 1 or job.size < @sizeOf(a.GfxDriverModeJob) or job.reserved0 != 0 or job.ticket == 0 or job.sequence == 0 or
             !std.meta.eql(job.backend, product.backend) or !std.meta.eql(job.assignment.output, product.output)) return error.Stale;
+        var color: ?a.GfxDriverModeColor = null;
+        if (product.outputs.?.supportsModeColor()) {
+            var value: a.GfxDriverModeColor = .{};
+            const rc = product.outputs.?.readModeColor(job.ticket, job.sequence, &value);
+            if (rc != 0 and rc != a.gfx_output_ok) return error.ModeApi;
+            if (rc == a.gfx_output_ok) {
+                if (value.version != 1 or value.size != @sizeOf(a.GfxDriverModeColor) or value.ticket != job.ticket or value.sequence != job.sequence) return error.Stale;
+                _ = @import("gsp_color_signal.zig").color.requestedSignal(value.signal) catch return error.Unsupported;
+                color = value;
+            }
+        }
         if (self.phase == .decision) {
             const previous = self.applied.?;
             if (job.ticket != previous.ticket or job.sequence != previous.sequence + 1 or
                 !std.meta.eql(job.assignment, previous.assignment) or !std.meta.eql(job.mode, previous.mode) or !std.meta.eql(job.reference, previous.reference)) return error.Stale;
+            if ((color == null) != (self.color == null)) return error.Stale;
+            if (color) |value| if (!std.meta.eql(value.signal, self.color.?.signal) or !std.meta.eql(value.reference, self.color.?.reference)) return error.Stale;
             if (job.operation == a.gfx_mode_operation_confirm) {
                 if (!std.meta.eql(product.running.?.currentPresentation(product.mode.?.window).?.surface.shadow.buffer,
                     try product.running.?.presentationImageBuffer(self.candidate))) return error.Stale;
@@ -375,12 +392,14 @@ pub const Owner = struct {
             } else if (job.operation == a.gfx_mode_operation_rollback) {
                 if (product.running.?.outputPaused(product.mode.?.window) and !product.running.?.outputRestoring(product.mode.?.window)) { self.phase = .select; return true; }
                 if (self.previous_headless) { self.phase = .rollback_stop; return true; }
-                self.plan = try product.running.?.displayModePlan(product.engine.?, product.mode.?.window, self.previous.?.boot_mode.?.receiver_mode_id);
+                const saved = self.previous.?.boot_mode.?;
+                self.plan = try product.running.?.displayColorModePlan(product.engine.?, product.mode.?.window, saved.receiver_mode_id, saved.color, saved.color_pipeline);
                 if (!std.meta.eql(self.plan.?, self.previous.?.boot_mode.?)) return error.Stale;
                 self.phase = .query;
             } else return error.State;
         } else {
             if (job.operation != a.gfx_mode_operation_apply or job.ticket <= self.completed_ticket or job.sequence != 1) return error.Stale;
+            self.color = color;
             try self.validateApply(product, job);
             if (product.running.?.outputPaused(product.mode.?.window) and !product.running.?.outputRestoring(product.mode.?.window)) { self.phase = .query; return true; }
             self.previous = try product.running.?.displayImageStatus(product.engine.?, product.mode.?.window);
@@ -389,14 +408,15 @@ pub const Owner = struct {
                 product.running.?.display_retired[product.mode.?.window] == null)) return error.State;
             self.previous_dma = if (self.previous) |value| value.image.dma else product.running.?.currentPresentation(product.mode.?.window).?.surface.scanout.?.dma;
             self.previous_storage = try imageStorage(product.running.?, self.previous_dma);
-            self.plan = try product.running.?.displayModePlan(product.engine.?, product.mode.?.window, job.mode.mode_id);
+            self.plan = try product.running.?.displayColorModePlan(product.engine.?, product.mode.?.window, job.mode.mode_id,
+                if (color) |value| try @import("gsp_color_signal.zig").color.requestedSignal(value.signal) else null,
+                .{ .linear_composition = color != null, .output_transform = color != null, .opaque_output = color != null });
             self.phase = .query;
         }
         self.log(product, "begin");
         return true;
     }
     fn validateApply(self: *Owner, product: anytype, job: a.GfxDriverModeJob) !void {
-        _ = self;
         const assignment = job.assignment;
         if (assignment.version != 1 or assignment.size < @sizeOf(a.GfxScanoutState) or assignment.reserved0 != 0 or
             assignment.mode_id != job.mode.mode_id or assignment.head_id != product.mode.?.head or
@@ -420,6 +440,19 @@ pub const Owner = struct {
             d.adapter_id != 0 or d.device_generation != 0 or d.modifier != 0 or d.format != a.gfx_buffer_format_xrgb8888 or
             d.width != job.mode.width or d.height != job.mode.height or d.plane_count != 1 or d.plane_offsets[0] != 0 or
             d.plane_pitches[0] != @as(u64, d.width) * 4 or d.byte_length != d.plane_pitches[0] * d.height or d.usage & usage != usage) return error.Descriptor;
+        if (self.color) |value| {
+            const encoded = value.reference;
+            if (encoded.version != 1 or encoded.size != @sizeOf(a.GfxBufferReference) or encoded.flags != 0 or encoded.reserved0 != 0 or
+                encoded.reference.id == 0 or encoded.reference.generation == 0 or encoded.reference.reserved0 != 0 or
+                encoded.buffer.id == 0 or encoded.buffer.generation == 0 or encoded.buffer.reserved0 != 0 or std.meta.eql(encoded.buffer, ref.buffer)) return error.Descriptor;
+            var image: a.GfxBufferDescriptor = .{};
+            if (product.memory.?.bufferDescribe(&encoded.reference, &image) != a.gfx_buffer_result_ok) return error.Memory;
+            if (image.version != 1 or image.size < @sizeOf(a.GfxBufferDescriptor) or image.location != a.gfx_buffer_location_system or
+                image.adapter_id != 0 or image.device_generation != 0 or image.modifier != 0 or image.format != value.signal.format or
+                image.width != job.mode.width or image.height != job.mode.height or image.plane_count != 1 or image.plane_offsets[0] != 0 or
+                image.plane_pitches[0] != @as(u64, image.width) * 4 or image.byte_length != image.plane_pitches[0] * image.height or
+                image.usage & (a.gfx_buffer_usage_cpu_write | a.gfx_buffer_usage_transfer_source) != a.gfx_buffer_usage_cpu_write | a.gfx_buffer_usage_transfer_source) return error.Descriptor;
+        }
     }
     fn checkSurface(_: *Owner, run: *runtime.Owner, width: u32, height: u32) !void {
         const space = (run.nativeAddressSpace() orelse return error.Busy).*;

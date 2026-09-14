@@ -74,6 +74,7 @@ pub const Model = struct {
     pub var render_operations: u64 = 13;
     pub var render_list: a.GfxRenderList = .{};
     pub var render_grids: [a.gfx_render_list_capacity]a.GfxSampleGrid = @splat(.{});
+    pub var render_color: a.GfxRenderColorProgram = .{};
     pub var shadow_cpu = false;
     pub var shadow_creates: usize = 0;
     var shadow_descriptor: a.GfxBufferDescriptor = .{};
@@ -130,6 +131,7 @@ pub const Model = struct {
         job.render = command;
         render_list = .{};
         render_grids = @splat(.{});
+        render_color = .{};
     }
     pub fn enqueueRenderList(target: usize, source: ?usize, commands: []const a.GfxRenderCommand, deadline: u64) void {
         std.debug.assert(commands.len > 0 and commands.len <= a.gfx_render_list_capacity);
@@ -146,6 +148,10 @@ pub const Model = struct {
         @memcpy(render_grids[0..grids.len], grids);
     }
     pub fn observeRenderExecution() void { std.debug.assert(render_mode and active); executed = true; }
+    pub fn enqueueRenderColorList(target: usize, source: usize, commands: []const a.GfxRenderCommand, color: a.GfxRenderColorProgram, deadline: u64) void {
+        enqueueRenderList(target,source,commands,deadline);
+        job.operation = a.gfx_queue_operation_render_color_list; render_color = color;
+    }
     pub fn observeRenderSemaphore() void { std.debug.assert(render_mode and active and executed); signaled = true; }
     pub fn shadowReference() a.GfxBufferHandle { return .{ .id = 1499, .generation = 951 }; }
     fn additionalReference() a.GfxBufferHandle { return .{ .id = 1496, .generation = 951 }; }
@@ -159,6 +165,11 @@ pub const Model = struct {
             .plane_pitches = .{ @as(u64, width) * 4, 0, 0, 0 }, .usage = 38 };
         mode_lent = true;
         return .{ .buffer = sys(3), .reference = modeReference() };
+    }
+    pub fn lendEncodedMode(width: u32, height: u32) a.GfxBufferReference {
+        const reference = lendOutputMode(width, height);
+        mode_descriptor.?.format = a.gfx_buffer_format_xrgb2101010;
+        return reference;
     }
     pub fn modeReferences() usize {
         var count: usize = 0;
@@ -283,13 +294,14 @@ pub const Model = struct {
         .update_operations = if (render_mode or direct_mode) @intFromPtr(&updateOperations) else 0,
         .read_render_list = if (render_mode) @intFromPtr(&readRenderList) else 0,
         .read_render_grid_list = if (render_mode) @intFromPtr(&readRenderGridList) else 0,
+        .read_render_color_list = if (render_mode) @intFromPtr(&readRenderColorList) else 0,
         .retain_scanout = if (direct_mode) @intFromPtr(&retainScanout) else 0,
         .begin_scanout = if (direct_mode) @intFromPtr(&beginScanout) else 0,
         .scanout_retire_requested = if (direct_mode) @intFromPtr(&retireRequested) else 0,
         .unregister_backend = @intFromPtr(&unregister), .take = @intFromPtr(&take), .retain_resource = @intFromPtr(&retain), .complete = @intFromPtr(&complete) }; return a.gfx_queue_ok; }
     fn updateOperations(input: *const a.GfxBackendBinding, operations: u64) callconv(.c) i32 {
         std.debug.assert(std.meta.eql(input.*, binding) and ((direct_mode and operations == 173) or
-            (render_mode and (operations == 29 or operations == 61 or operations == 125 or operations == 381))));
+            (render_mode and (operations == 29 or operations == 61 or operations == 125 or operations == 381 or operations == 893))));
         render_operations = operations; return a.gfx_queue_ok;
     }
     fn readRenderList(input: *const a.GfxFence, out: *a.GfxRenderList) callconv(.c) i32 {
@@ -299,6 +311,10 @@ pub const Model = struct {
     fn readRenderGridList(input: *const a.GfxFence, out: *a.GfxRenderGridList) callconv(.c) i32 {
         if (!active or !std.meta.eql(input.*, job.fence) or job.operation != a.gfx_queue_operation_render_grid_list) return a.gfx_queue_error_invalid;
         out.* = .{ .count = render_list.count, .commands = render_list.commands, .grids = render_grids }; return a.gfx_queue_ok;
+    }
+    fn readRenderColorList(input: *const a.GfxFence, out: *a.GfxRenderColorList) callconv(.c) i32 {
+        if (!active or !std.meta.eql(input.*,job.fence) or job.operation != a.gfx_queue_operation_render_color_list) return a.gfx_queue_error_invalid;
+        out.* = .{ .count = render_list.count, .commands = render_list.commands, .program = render_color }; return a.gfx_queue_ok;
     }
     fn registerProfile(input: *const a.GfxBackendRegistration, profile: *const a.GfxBackendProfile, out: *a.GfxBackendBinding) callconv(.c) i32 {
         const nv = @import("r4nv_binding");

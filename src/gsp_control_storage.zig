@@ -5,9 +5,9 @@ const std = @import("std");
 const r4os = @import("r4os");
 const a = r4os.abi;
 const wire = @import("gsp_buffer_wire.zig");
-// One bounded CE upload can carry all 16 rectangle packets. FIFO storage
+// One bounded CE upload can carry all16 descriptor/vertex/color packets. FIFO storage
 // keeps the independent three-page wire default.
-pub const bytes: usize = 16 * 1024;
+pub const bytes: usize = 20 * 1024;
 pub const page_count = bytes / 4096;
 pub const Error = error{ Busy, Api, Memory, Descriptor, Map, Synchronization };
 const ok = a.gfx_buffer_result_ok;

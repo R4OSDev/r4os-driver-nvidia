@@ -76,6 +76,7 @@ pub const Owner = struct {
     additional: @import("gsp_additional_output.zig").Owner = .{},
     frame_count: u8 = 2,
     statistics: @import("gsp_frame_stats.zig").Owner = .{},
+    color: @import("gsp_output_color.zig").Owner = .{},
     output_fault_reported: [8]bool = @splat(false),
 
     /// Explicit mode=native only. Check the common handoff API before the
@@ -408,6 +409,7 @@ pub const Owner = struct {
                 const changed = try self.hotplug.step(self);
                 if (changed) return true;
                 if (self.hotplug.phase != .online or self.hotplug.refreshing) return self.additional.step(self);
+                if (self.color.step(self)) return true;
                 // The additional owner must consume its completed SOR work
                 // before an idle-only primary route query can succeed.
                 if (self.additional.hardwareBusy()) return self.additional.step(self);

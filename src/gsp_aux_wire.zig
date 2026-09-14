@@ -33,6 +33,7 @@ pub const rpc_flags: u32 = 1; // COPYOUT_ON_ERROR, as exported method flags 0x84
 pub const Operation = union(enum) {
     caps: void,
     extended_caps: void,
+    color_caps: void,
     repeaters: void,
     link_config: void,
     link_status: void,
@@ -53,11 +54,12 @@ fn get(input: []const u8, offset: usize) u32 { return std.mem.readInt(u32, input
 pub fn length(op: Operation) u8 { return switch (op) { .caps, .extended_caps => 16, .repeaters, .link_status => 8,
     .link_config => 2, .read => |read| read.count, .stop => 0, else => 1 }; }
 fn cmd(op: Operation) u32 {
-    return switch (op) { .caps, .extended_caps, .repeaters, .link_config, .link_status, .power => 9,
+    return switch (op) { .caps, .extended_caps, .color_caps, .repeaters, .link_config, .link_status, .power => 9,
         .power_on => 8, .segment, .offset => 4, .segment_status, .offset_status => 6,
         .read => |read| if (read.last) 1 else 5, .stop => 0 };
 }
 fn address(op: Operation) u32 { return switch (op) { .caps => 0, .extended_caps => 0x2200, .repeaters => 0xf0000,
+    .color_caps => 0x2210,
     .link_config => 0x100, .link_status => 0x200, .power, .power_on => 0x600,
     .segment, .segment_status => 0x30, else => 0x50 }; }
 pub fn encode(request: Request, output: []u8) Error![]const u8 {

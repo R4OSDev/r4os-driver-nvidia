@@ -50,9 +50,19 @@ pub fn create(plan: surface.Plan, dma: u32, channel: u32) Error!Image {
 }
 pub fn validate(value: Image) Error!void {
     if (value.dma == 0 or value.channel < 1 or value.channel > 8) return error.Descriptor;
-    if (value.format != a.gfx_buffer_format_xrgb8888 and value.format != a.gfx_buffer_format_argb8888) return error.Unsupported;
+    _ = try formatWord(value.format);
     if (value.width == 0 or value.height == 0 or value.width > 0x7fff or value.height > 0xffff or
         value.pitch & 63 != 0 or value.pitch / 64 > 0x1fff or value.pitch < @as(u64, value.width) * 4 or
         value.offset & 255 != 0 or value.offset >> 8 > std.math.maxInt(u32) or value.offset >= value.bytes or
         @as(u64, value.pitch) * value.height > value.bytes - value.offset) return error.Bounds;
+}
+pub fn formatWord(format: u32) Error!u32 {
+    return switch (format) {
+        a.gfx_buffer_format_xrgb8888 => 0xe6,
+        a.gfx_buffer_format_argb8888 => 0xcf,
+        // C67E A2R10G10B10. The primary window is opaque; X bits do not
+        // participate in the head's blend. No FP16 scanout is implied.
+        a.gfx_buffer_format_xrgb2101010, a.gfx_buffer_format_argb2101010 => 0xdf,
+        else => error.Unsupported,
+    };
 }

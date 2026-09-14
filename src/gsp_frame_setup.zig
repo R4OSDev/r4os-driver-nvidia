@@ -14,7 +14,8 @@ pub const Work = struct {
         switch (self.phase) {
             .allocate => {
                 const source = self.image.surface.scanout.?;
-                self.storage = try run.allocateDisplaySurface(.{ .width = source.width, .height = source.height, .usage = 40 }, self.deadline);
+                self.storage = try run.allocateDisplaySurface(.{ .width = source.width, .height = source.height, .usage = 40,
+                    .format = switch (source.format) { 0x34325258 => .xrgb8888, 0x30335258 => .xrgb2101010, else => return error.Descriptor } }, self.deadline);
                 self.phase = .allocation;
             },
             .allocation => {

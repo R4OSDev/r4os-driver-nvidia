@@ -50,23 +50,31 @@ const display = @import("gsp_display_rpc.zig");
 const outputs = @import("gsp_outputs.zig");
 const exchange = @import("gsp_exchange.zig");
 const aux = @import("gsp_aux_wire.zig");
+const signal_color = @import("gsp_color_signal.zig");
 pub const max_bytes = 108;
-pub const Plan = struct { object: display.Object, mode: mode.Plan };
-pub const Stage = enum { source, caps, extended_caps, repeaters, power, power_on, train, link_config, link_status, stream, mute, complete };
+pub const Plan = struct { object: display.Object, mode: mode.Plan, receiver: ?signal_color.Receiver = null };
+pub const Stage = enum { source, caps, extended_caps, repeaters, power, power_on, train, link_config, link_status, stream, mute, complete,
+    color_caps, vsc, hdr, post_complete };
 pub const Config = struct { rate: u8, lanes: u8 };
-pub const Source = struct { rate: u8, increased_watermark: bool };
+pub const Source = struct { rate: u8, increased_watermark: bool, dp14: bool = false };
 pub const Sink = struct { revision: u8, rate: u8, lanes: u8, enhanced: bool, post_adjust: bool };
 pub const Stream = struct { watermark: u32, hblank: u32, vblank: u32, audio_48k: bool };
 pub const Result = struct { source: Source, sink: Sink, config: Config, stream: Stream, dpcd: [16]u8, lane_status: [8]u8, attempts: u8 };
 pub fn derive(saved: mode.Plan, object: display.Object, snapshot: *const outputs.Snapshot) !Plan {
     try mode.validate(saved.signal, saved.head);
+    try signal_color.validate(saved);
     if (!saved.displayPort() or saved.transport_hdmi or saved.cta_vic != 0) return error.Unsupported;
     if (object.client == 0 or object.display == 0 or object.epoch != saved.epoch or object.client != snapshot.topology.client or
         !std.meta.eql(saved, try mode.bind(saved, snapshot, saved.epoch, saved.held_generation))) return error.Stale;
     for (snapshot.receivers[0..snapshot.count]) |*receiver| if (receiver.display_id == saved.signal.display_id) {
         if (receiver.connected != true or receiver.status != .valid_edid or !receiver.report.complete()) return error.Stale;
         if (!receiver.report.digital or receiver.report.colors & 1 == 0) return error.Unsupported;
-        return .{ .object = object, .mode = saved };
+        // Preflight only against the implementation's HBR3x4 ceiling.
+        // No color plan is installed until source/DPCD capabilities and
+        // the actually trained configuration pass admission again.
+        _ = try signal_color.admit(saved, &receiver.report, .{ .displayport = .{
+            .payload_bits_per_second = 25_920_000_000, .vsc = true, .hdr_sdp = true } });
+        return .{ .object = object, .mode = saved, .receiver = if (saved.color != null) signal_color.Receiver.capture(receiver.report) else null };
     };
     return error.Stale;
 }
@@ -83,9 +91,7 @@ pub fn receiverCaps(bytes: [16]u8) !Sink {
 }
 fn validRate(rate: u8) bool { return rate == 6 or rate == 10 or rate == 20 or rate == 30; }
 fn clockHz(saved: mode.Plan) u64 {
-    const nominal: u64 = saved.signal.clock & 0x7fffffff;
-    // Round upward for conservative bandwidth and TU arithmetic.
-    return if (saved.signal.clock >> 31 != 0) (nominal * 1000 + 1000) / 1001 else nominal;
+    return signal_color.clockHz(saved);
 }
 pub fn stream(saved: mode.Plan, source: Source, sink: Sink, config: Config) !Stream {
     if (!validRate(config.rate) or config.rate > source.rate or config.rate > sink.rate or
@@ -95,16 +101,17 @@ pub fn stream(saved: mode.Plan, source: Source, sink: Sink, config: Config) !Str
     const raster: u64 = saved.signal.total & 0xffff;
     const lanes: u64 = config.lanes;
     const link: u64 = @as(u64, config.rate) * 27_000_000; // 8 payload bits per 10-bit symbol.
-    if (!saved.displayPort() or saved.transport_hdmi or pclk == 0 or width <= 60 or raster <= width or pclk * 24 >= 8 * link * lanes)
+    const bpp: u64 = @as(u64, saved.signal.bpc) * 3;
+    if ((saved.signal.bpc != 8 and saved.signal.bpc != 10) or !saved.displayPort() or saved.transport_hdmi or pclk == 0 or width <= 60 or raster <= width or pclk * bpp >= 8 * link * lanes)
         return error.Bandwidth;
     const precision = 100_000;
-    const ratio = pclk * 24 * precision / (8 * link * lanes);
+    const ratio = pclk * bpp * precision / (8 * link * lanes);
     const watermark_fraction = ratio * 64 * (precision - ratio) / precision;
     const adjust: u64 = if (source.increased_watermark) 8 else 2;
     const minimum: u64 = if (source.increased_watermark) 22 else 20;
-    const watermark = @max(minimum, adjust + (2 * (24 * precision / (8 * lanes)) + watermark_fraction) / precision);
-    if (watermark > 39 or watermark > width * 24 / (8 * lanes)) return error.Bandwidth;
-    const steering: u64 = if (width % lanes != 0) (lanes - width % lanes) * 24 else 0;
+    const watermark = @max(minimum, adjust + (2 * (bpp * precision / (8 * lanes)) + watermark_fraction) / precision);
+    if (watermark > 39 or watermark > width * bpp / (8 * lanes)) return error.Bandwidth;
+    const steering: u64 = if (width % lanes != 0) (lanes - width % lanes) * bpp else 0;
     const blank_bits = 24 * lanes * @as(u64, if (sink.enhanced) 2 else 1) + 96 + steering;
     const min_blank = (blank_bits * precision / (8 * lanes)) * pclk / link / precision + 12;
     if (min_blank > raster - width) return error.Bandwidth;
@@ -140,14 +147,20 @@ pub const Work = struct {
     dpcd: [16]u8 = @splat(0),
     status: [8]u8 = @splat(0),
     result: ?Result = null,
+    vsc_supported: bool = false,
+    color: ?signal_color.color.Plan = null,
     last_rm_status: u32 = 0,
     last_train_error: u32 = 0,
     last_aux_reply: ?aux.ReplyType = null,
 
-    pub fn ready(self: *const Work, now: u64) bool { return self.stage != .complete and now >= self.not_before; }
+    pub fn ready(self: *const Work, now: u64) bool { return self.stage != .complete and self.stage != .post_complete and now >= self.not_before; }
+    pub fn scanoutComplete(self: *Work) !void {
+        if (self.stage != .complete or self.result == null) return error.State;
+        self.stage = .vsc;
+    }
     fn request(self: *const Work) ?aux.Request {
         const operation: aux.Operation = switch (self.stage) {
-            .caps => .caps, .extended_caps => .extended_caps, .repeaters => .repeaters, .power => .power,
+            .caps => .caps, .extended_caps => .extended_caps, .color_caps => .color_caps, .repeaters => .repeaters, .power => .power,
             .power_on => .{ .power_on = self.power_value }, .link_config => .link_config, .link_status => .link_status,
             else => return null,
         };
@@ -180,6 +193,7 @@ pub const Work = struct {
             },
             .stream => {
                 const value = try stream(self.plan.mode, self.source.?, self.sink.?, self.candidates[self.index]);
+                if (self.plan.mode.color != null) _ = try self.admitColor(self.candidates[self.index]);
                 command = 0x731362; size = 84;
                 put(params, 4, self.plan.mode.head); put(params, 8, self.plan.mode.signal.sor);
                 put(params, 12, @intFromBool((self.plan.mode.signal.sor_control >> 8) & 15 == 9));
@@ -189,6 +203,28 @@ pub const Work = struct {
                 put(params, 72, 64); put(params, 76, value.watermark);
             },
             .mute => { command = 0x731359; size = 12; put(params, 4, self.plan.mode.signal.display_id); put(params, 8, 1); },
+            .vsc => {
+                if (self.result == null) return error.State;
+                put(params, 4, self.plan.mode.signal.display_id);
+                if (self.plan.mode.signal.dp_vsc) {
+                    if (!self.vsc_supported or self.color == null) return error.Unsupported;
+                    command = 0x730288; size = 60;
+                    put(params, 8, 1); put(params, 12, 23); // Generic0, every vblank.
+                    params[21..57].* = try signal_color.color.dpVsc(self.plan.mode.color.?);
+                } else {
+                    command = 0x730289; size = 16;
+                    put(params, 8, 7); // Disable inherited VSC/Generic0; MSA uses ordinary RGB.
+                }
+            },
+            .hdr => {
+                if (self.result == null) return error.State;
+                const enabled = self.color != null and !self.color.?.clear_hdr;
+                command = 0x730288; size = 60;
+                put(params, 4, self.plan.mode.signal.display_id);
+                put(params, 8, if (enabled) 0x101 else 0x105); // Generic1, HDR repeated / SDR once.
+                put(params, 12, 32); // HB4 + DB2 +26-byte static metadata, as NVIDIA's SDP sender.
+                params[21..57].* = if (enabled) self.color.?.metadata else signal_color.color.dpSdrMetadata();
+            },
             else => return error.State,
         }
         put(out, 8, command); put(out, 16, size);
@@ -209,10 +245,21 @@ pub const Work = struct {
         for ([_]u8{ 30, 20, 10, 6 }) |rate| for ([_]u8{ 4, 2, 1 }) |lanes| {
             const config: Config = .{ .rate = rate, .lanes = lanes };
             _ = stream(self.plan.mode, self.source.?, self.sink.?, config) catch continue;
+            if (self.plan.mode.color != null) _ = self.admitColor(config) catch continue;
             self.candidates[self.count] = config; self.count += 1;
         };
         if (self.count == 0) return error.Bandwidth;
         self.stage = if (self.sink.?.revision >= 0x11) .power else .train;
+    }
+    fn admitColor(self: *const Work, config: Config) !?signal_color.color.Plan {
+        const receiver = self.plan.receiver orelse return error.Stale;
+        const capabilities = self.source orelse return error.State;
+        return try signal_color.admit(self.plan.mode, receiver, .{ .displayport = .{
+            .payload_bits_per_second = @as(u64, config.rate) * 27_000_000 * 8 * config.lanes,
+            .vsc = self.vsc_supported and capabilities.dp14, .hdr_sdp = capabilities.dp14 } });
+    }
+    fn afterCaps(self: *Work) void {
+        self.stage = if (self.plan.mode.signal.dp_vsc) .color_caps else .repeaters;
     }
     pub fn consume(self: *Work, record: exchange.message.Record, now: u64) !void {
         var expected: [max_bytes]u8 = undefined;
@@ -240,9 +287,14 @@ pub const Work = struct {
                 .caps => {
                     self.sink = try receiverCaps(reply.data);
                     self.dpcd = reply.data;
-                    self.stage = if (reply.data[14] & 0x80 != 0) .extended_caps else .repeaters;
+                    if (reply.data[14] & 0x80 != 0) { self.stage = .extended_caps; } else self.afterCaps();
                 },
-                .extended_caps => { self.sink = try receiverCaps(reply.data); self.dpcd = reply.data; self.stage = .repeaters; },
+                .extended_caps => { self.sink = try receiverCaps(reply.data); self.dpcd = reply.data; self.afterCaps(); },
+                .color_caps => {
+                    self.vsc_supported = reply.data[0] & 8 != 0;
+                    if (!self.vsc_supported or !self.source.?.dp14) return error.Unsupported;
+                    self.stage = .repeaters;
+                },
                 .repeaters => {
                     // Non-transparent repeaters and tunnel/branch topology
                     // are not implied by a working AUX/EDID transaction.
@@ -271,7 +323,8 @@ pub const Work = struct {
                     if (!std.mem.eql(u8, data[0..8], expected[24..32]) or word(data, 8) < 1 or word(data, 8) > 4 or
                         data[26] > 1 or data[30] != 1) return error.Unsupported;
                     const rates = [_]u8{ 6, 10, 20, 30 };
-                    self.source = .{ .rate = rates[word(data, 8) - 1], .increased_watermark = data[26] == 1 };
+                    self.source = .{ .rate = rates[word(data, 8) - 1], .increased_watermark = data[26] == 1, .dp14 = word(data, 12) & 2 != 0 };
+                    if (self.plan.mode.signal.dp_vsc and !self.source.?.dp14) return error.Unsupported;
                     self.stage = .caps;
                 },
                 .train => {
@@ -283,10 +336,14 @@ pub const Work = struct {
                     if (self.last_train_error != 0) return self.fallback();
                     self.stage = .link_config;
                 },
-                .stream, .mute => {
+                .stream, .mute, .vsc, .hdr => {
                     if (status != 0) return error.RmRejected;
                     if (!std.mem.eql(u8, data, expected[24..length])) return error.Unexpected;
-                    if (self.stage == .stream) { self.stage = .mute; } else {
+                    if (self.stage == .stream) { self.stage = .mute; }
+                    else if (self.stage == .vsc) { self.stage = .hdr; }
+                    else if (self.stage == .hdr) { self.stage = .post_complete; }
+                    else {
+                        self.color = if (self.plan.mode.color != null) try self.admitColor(self.candidates[self.index]) else null;
                         self.result = .{ .source = self.source.?, .sink = self.sink.?, .config = self.candidates[self.index],
                             .stream = try stream(self.plan.mode, self.source.?, self.sink.?, self.candidates[self.index]),
                             .dpcd = self.dpcd, .lane_status = self.status, .attempts = self.attempts };

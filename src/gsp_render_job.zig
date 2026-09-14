@@ -20,7 +20,9 @@ pub fn image(resource: Resource, target: bool) !render.image.Image {
         descriptor.plane_count != 1 or descriptor.plane_offsets[0] != 0 or descriptor.plane_pitches[0] > std.math.maxInt(u32) or descriptor.byte_length != info.logical_bytes or
         descriptor.usage & (if (target) a.gfx_buffer_usage_render else (a.gfx_buffer_usage_transfer_source | a.gfx_buffer_usage_render)) == 0) return error.Unsupported;
     const format: render.image.Format = switch (descriptor.format) {
-        0x34325258 => .xrgb8888, 0x34325241 => .argb8888, 0x20203852 => .r8, else => return error.Unsupported,
+        0x34325258 => .xrgb8888, 0x34325241 => .argb8888, 0x20203852 => .r8,
+        0x30335258 => .xrgb2101010, 0x30335241 => .argb2101010, 0x48344241 => .abgr16161616f,
+        else => return error.Unsupported,
     };
     const result: render.image.Image = .{ .address = info.address, .bytes = info.logical_bytes, .width = descriptor.width,
         .height = descriptor.height, .pitch = @intCast(descriptor.plane_pitches[0]), .format = format,

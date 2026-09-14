@@ -669,7 +669,7 @@ pub const Owner = struct {
         self.display_engine_active = true;
     }
     pub fn validateModeQuery(self: *Owner, root: DisplayEngineHandle, plan: boot_mode.Plan) !void {
-        const expected = try self.displayModePlan(root, plan.window, plan.receiver_mode_id);
+        const expected = try self.displayColorModePlan(root, plan.window, plan.receiver_mode_id, plan.color, plan.color_pipeline);
         if (!std.meta.eql(expected, plan)) return error.Stale;
         _ = try display_link.derive(expected, self.display_object.?, self.outputs.snapshot().?);
     }
@@ -1164,6 +1164,18 @@ pub const Owner = struct {
         bound.cursor_size = info.cursor_size;
         return if (receiver_mode_id == 0) bound else @import("gsp_receiver_mode.zig").select(bound, snapshot, receiver_mode_id);
     }
+    pub fn displayColorModePlan(self: *Owner, root: DisplayEngineHandle, window: u32, receiver_mode_id: u32,
+        color: ?@import("gsp_color_signal.zig").color.Signal, pipeline: @import("gsp_color_signal.zig").color.Pipeline) !boot_mode.Plan
+    {
+        var plan = try self.displayModePlan(root, window, receiver_mode_id);
+        plan.color = color; plan.color_pipeline = pipeline;
+        if (color) |signal| {
+            plan.signal.bpc = signal.bpc;
+            plan.signal.dp_vsc = plan.displayPort() and @import("gsp_color_signal.zig").needsVsc(signal);
+        } else if (pipeline.linear_composition or pipeline.output_transform or pipeline.opaque_output) return error.Descriptor;
+        _ = try display_link.derive(plan, self.display_object.?, self.outputs.snapshot().?);
+        return plan;
+    }
     fn outputRouteClaims(self: *Owner, snapshot: *const outputs.Snapshot) ![8]?output_route.Claim {
         var occupied = self.output_claims;
         for (&self.display_images, 0..) |*slot, index| if (slot.*) |image| {
@@ -1357,16 +1369,27 @@ pub const Owner = struct {
     pub fn commitModeDisplayImage(self: *Owner, core_handle: DisplayChannelHandle, window_handle: DisplayChannelHandle,
         image_handle: u32, receiver_mode_id: u32, deadline: u64) !void
     {
+        return self.commitColorModeDisplayImage(core_handle, window_handle, image_handle, receiver_mode_id, null,
+            .{ .linear_composition = false, .output_transform = false, .opaque_output = false }, deadline);
+    }
+    pub fn commitColorModeDisplayImage(self: *Owner, core_handle: DisplayChannelHandle, window_handle: DisplayChannelHandle,
+        image_handle: u32, receiver_mode_id: u32, color: ?@import("gsp_color_signal.zig").color.Signal,
+        pipeline: @import("gsp_color_signal.zig").color.Pipeline, deadline: u64) !void
+    {
         const core = try self.findDisplayChannel(core_handle);
         const window = try self.findDisplayChannel(window_handle);
         if (core.parent != window.parent or window.config.kind != .window) return error.Stale;
         const root: DisplayEngineHandle = .{ .epoch = self.epoch, .root = core.parent.binding.root };
-        const plan = try self.displayModePlan(root, window.config.index, receiver_mode_id);
+        const plan = try self.displayColorModePlan(root, window.config.index, receiver_mode_id, color, pipeline);
         const link = try display_link.derive(plan, self.display_object.?, self.outputs.snapshot().?);
         const receipt = try self.modeAdmission(root, plan);
         const resources = self.display_resources_slot.owner orelse return error.State;
         const image = resources.publishedImage(window_handle.slot, image_handle) orelse return error.State;
-        if (image.width != plan.width or image.height != plan.height) return error.Descriptor;
+        const format = if (plan.color) |encoding| switch (encoding.format) {
+            .xr24 => r4os.abi.gfx_buffer_format_xrgb8888,
+            .xr30 => r4os.abi.gfx_buffer_format_xrgb2101010,
+        } else r4os.abi.gfx_buffer_format_xrgb8888;
+        if (image.width != plan.width or image.height != plan.height or image.format != format) return error.Descriptor;
         const slot = try display_channel.wire.slot(.immediate, window.config.index);
         const position = if (self.display_channels[slot]) |*value| value else return error.Unsupported;
         try self.commitPositionedDisplayImage(core_handle, window_handle,
@@ -2466,9 +2489,10 @@ pub const Owner = struct {
         const direct = backend.queue.supportsScanout() and self.presentation_buffers >= 2;
         const ordinary: u64 = if (lists) 125 else 61;
         const grid: u64 = if (lists and backend.queue.supportsRenderGridList()) 256 else 0;
-        var rc = backend.queue.updateOperations(&backend.binding, ordinary | @as(u64, if (direct) 128 else 0) | grid);
+        const color: u64 = if (lists and backend.queue.supportsRenderColorList()) 512 else 0;
+        var rc = backend.queue.updateOperations(&backend.binding, ordinary | @as(u64, if (direct) 128 else 0) | grid | color);
         self.direct_enabled = direct and rc == r4os.abi.gfx_queue_ok;
-        if ((direct or grid != 0) and rc == r4os.abi.gfx_queue_error_invalid) rc = backend.queue.updateOperations(&backend.binding, ordinary);
+        if ((direct or grid != 0 or color != 0) and rc == r4os.abi.gfx_queue_error_invalid) rc = backend.queue.updateOperations(&backend.binding, ordinary);
         if (rc == r4os.abi.gfx_queue_error_invalid and lists) rc = backend.queue.updateOperations(&backend.binding, 61);
         // Earlier common queues can still use offscreen rendering. They
         // never receive the new image-to-output operation.
@@ -2513,7 +2537,7 @@ pub const Owner = struct {
     }
     fn queuedGraphicsDraw(self: *Owner, input: *render_queue.Owner, state: r4os.abi.GfxRenderCommand, grid: r4os.abi.GfxSampleGrid) !render.Draw {
         try self.queuedRender(input);
-        if (state.kind > r4os.abi.gfx_render_kind_sample or state.filter > 1 or state.blend > 1 or state.transfer > 2 or state.opacity > 255) return error.Bounds;
+        if (state.kind > r4os.abi.gfx_render_kind_sample or state.filter > 1 or state.blend > 1 or state.transfer > 3 or state.opacity > 255) return error.Bounds;
         const sampled = state.kind == r4os.abi.gfx_render_kind_sample;
         if (!sampled and (input.job.source_buffer.id != 0 or input.job.source_buffer.generation != 0 or
             !std.meta.eql(state.source_rect, r4os.abi.GfxRenderRect{}) or state.filter != 0)) return error.Bounds;
@@ -2522,7 +2546,8 @@ pub const Owner = struct {
             .destination = renderRect(state.target_rect), .source_rect = if (sampled) renderRect(state.source_rect) else .{ .x = 0, .y = 0, .width = 1, .height = 1 },
             .scissor = renderRect(state.scissor), .filter = if (state.filter == 0) .nearest else .bilinear,
             .blend = if (state.blend == 0) .replace else .over,
-            .transfer = switch (state.transfer) { 0 => .identity, 1 => .decode_srgb, 2 => .encode_srgb, else => unreachable },
+            .transfer = switch (state.transfer) { 0 => .identity, 1 => .decode_srgb, 2 => .encode_srgb, 3 => .color, else => unreachable },
+            .color_program = input.color,
             .color = state.color, .opacity = @intCast(state.opacity), .grid = @bitCast(grid) };
         try result.validate();
         return result;
@@ -2764,7 +2789,7 @@ pub const Owner = struct {
                 .channel = current.channel_handle, .window = current.window, .deadline = work_deadline };
             return true;
         }
-        if (result == a.gfx_queue_ok and (job.operation == a.gfx_queue_operation_render or job.operation == a.gfx_queue_operation_render_list or job.operation == a.gfx_queue_operation_render_grid_list)) {
+        if (result == a.gfx_queue_ok and (job.operation == a.gfx_queue_operation_render or job.operation == a.gfx_queue_operation_render_list or job.operation == a.gfx_queue_operation_render_grid_list or job.operation == a.gfx_queue_operation_render_color_list)) {
             self.queued_render = .{};
             self.queued_render.?.open(queue, memory, binding, job, try self.now()) catch |err| { self.stop(err); return err; };
             return true;
@@ -3049,7 +3074,7 @@ pub const Owner = struct {
             if (!confirmed) return error.Stale;
         } else return error.Unsupported;
         const image = entry.surface.scanout.?;
-        if (descriptor.format != r4os.abi.gfx_buffer_format_xrgb8888 or descriptor.width != image.width or
+        if (descriptor.format != image.format or descriptor.width != image.width or
             descriptor.height != image.height or descriptor.plane_count != 1 or descriptor.plane_offsets[0] != 0 or descriptor.byte_length != source.bytes or
             work.job.byte_length != @as(u64, image.width) * 4 or work.job.row_count != image.height or
             work.job.source_pitch != descriptor.plane_pitches[0] or work.job.target_pitch != 0 or
@@ -3212,7 +3237,7 @@ pub const Owner = struct {
         _ = try self.findDisplayEngine(root);
         if (self.display_object == null or !std.meta.eql(admitted.link.object, self.display_object.?)) return error.Stale;
         if (self.displayWorkObsolete()) return admitted.mode;
-        const expected = try self.displayModePlan(root, window, admitted.mode.receiver_mode_id);
+        const expected = try self.displayColorModePlan(root, window, admitted.mode.receiver_mode_id, admitted.mode.color, admitted.mode.color_pipeline);
         if (!std.meta.eql(expected, admitted.mode) or admitted.receipt != try self.modeAdmission(root, expected)) return error.Stale;
         return expected;
     }

@@ -40,6 +40,7 @@ pub fn respond(work: *const dp.Work, bytes: []u8, bad_training: bool) void {
             if (work.stage == .caps) data[34] = 0x80;
         },
         .repeaters => { put(data, 36, 8); @memset(data[20..28], 0); },
+        .color_caps => { put(data, 36, 1); data[20] = 8; },
         .power => { put(data, 36, 1); data[20] = 2; },
         .power_on => put(data, 36, 1),
         .train => if (bad_training) { put(data, 16, 0x80000000); },
@@ -48,8 +49,8 @@ pub fn respond(work: *const dp.Work, bytes: []u8, bad_training: bool) void {
             data[21] = work.candidates[work.index].lanes | 0x80;
         },
         .link_status => { put(data, 36, 8); @memcpy(data[20..28], &[_]u8{1,0,0x77,0x77,1,0,0,0}); },
-        .stream, .mute => {},
-        .complete => unreachable,
+        .stream, .mute, .vsc, .hdr => {},
+        .complete, .post_complete => unreachable,
     }
 }
 fn record(bytes: []const u8) @import("gsp_message.zig").Record {
@@ -58,7 +59,7 @@ fn record(bytes: []const u8) @import("gsp_message.zig").Record {
 }
 fn tag(stage: dp.Stage) u32 { return switch (stage) {
     .source => 0, .caps => 1, .extended_caps => 2, .repeaters => 3, .power => 4, .power_on => 5,
-    .link_config => 6, .link_status => 7, .train => 8, .stream => 9, .mute => 10, .complete => unreachable,
+    .link_config => 6, .link_status => 7, .train => 8, .stream => 9, .mute => 10, else => unreachable,
 }; }
 pub fn check() !void {
     const snapshot = try t.allocator.create(@import("gsp_outputs.zig").Snapshot); defer t.allocator.destroy(snapshot);
@@ -86,9 +87,85 @@ pub fn check() !void {
         try work.consume(record(reply[0..work.length]), serial, serial * std.time.ns_per_ms);
     }
     try t.expect(serial < 20 and work.readyScanout() and work.dpResult().?.stream.audio_48k);
-    try work.scanoutComplete(); try t.expect(work.phase == .complete);
+    try work.scanoutComplete(); try t.expect(work.phase == .after_scanout);
+    for (0..2) |index| {
+        work.length = try work.encode(&work.request);
+        if (index == 0) {
+            try t.expectEqual(@as(usize, 40), work.length);
+            try t.expectEqual(@as(u32, 0x730289), std.mem.readInt(u32, work.request[8..12], .little));
+            try t.expectEqualSlices(u8, &.{7,0,0,0,0,0,0,0}, work.request[32..40]);
+        } else {
+            try t.expectEqual(@as(usize, 84), work.length);
+            try t.expectEqual(@as(u32, 0x105), std.mem.readInt(u32, work.request[32..36], .little));
+            try t.expectEqualSlices(u8, &.{0,0x87,29,0x4c,1,26,0,0}, work.request[45..53]);
+        }
+        work.pending = true; serial += 1;
+        try work.consume(record(work.request[0..work.length]), serial, serial * std.time.ns_per_ms);
+    }
+    try t.expect(work.phase == .complete);
     const completed = work.dpResult().?;
     try t.expect(completed.config.rate == 30 and completed.config.lanes == 4 and completed.attempts == 1);
+    // Actual extended DPCD read, 30-bpp training admission and both DP
+    // packets. The common transaction must wait for their acknowledgements.
+    var hdr = saved;
+    hdr.signal.bpc = 10; hdr.signal.dp_vsc = true;
+    hdr.color = .{ .format = .xr30, .bpc = 10, .transfer = .pq, .primaries = .bt2020,
+        .range = .limited, .reference_white = 2_030_000, .peak = 10_000_000,
+        .metadata = .{ .max_mastering = 1000, .max_cll = 1000, .max_fall = 400 } };
+    const monitor = &snapshot.receivers[0].report;
+    monitor.bits_per_color = 10; monitor.colorimetry = 0x80;
+    monitor.hdr_present = true; monitor.hdr_eotf = 12; monitor.hdr_static = 1;
+    try t.expectError(error.Incomplete, link.derive(hdr, object, snapshot));
+    hdr.color_pipeline = .{ .linear_composition = true, .output_transform = true, .opaque_output = true };
+    const hdr_plan = try link.derive(hdr, object, snapshot);
+    var colored = link.Work.init(hdr_plan);
+    var color_steps: u64 = 0;
+    var witnessed_vsc = false;
+    while (colored.phase != .complete and color_steps < 24) {
+        if (colored.phase == .scanout) { try colored.scanoutComplete(); continue; }
+        const stage = colored.dp.?.stage;
+        colored.length = try colored.encode(&colored.request);
+        if (stage == .color_caps) try t.expectEqual(@as(u32, 0x2210), std.mem.readInt(u32, colored.request[40..44], .little));
+        if (stage == .vsc) {
+            try t.expect(colored.phase == .after_scanout and colored.dp.?.color.?.bpp == 30);
+            try t.expectEqualSlices(u8, &.{0,7,5,19}, colored.request[45..49]);
+            try t.expectEqualSlices(u8, &.{6,0x82,1}, colored.request[65..68]);
+            witnessed_vsc = true;
+        }
+        if (stage == .hdr) {
+            try t.expect(witnessed_vsc and colored.phase == .after_scanout);
+            try t.expectEqual(@as(u32, 0x101), std.mem.readInt(u32, colored.request[32..36], .little));
+            try t.expectEqualSlices(u8, &.{0,0x87,29,0x4c,1,26,2,0}, colored.request[45..53]);
+            var rejected = colored.dp.?;
+            var failure = colored.request;
+            put(&failure, 12, 0x57);
+            try t.expectError(error.RmRejected, rejected.consume(record(failure[0..colored.length]), 0));
+            try t.expect(rejected.stage == .hdr);
+        }
+        colored.pending = true;
+        var reply = colored.request;
+        respond(&colored.dp.?, reply[0..colored.length], false);
+        color_steps += 1;
+        try colored.consume(record(reply[0..colored.length]), color_steps, color_steps * std.time.ns_per_ms);
+    }
+    try t.expect(witnessed_vsc and color_steps < 24 and colored.phase == .complete);
+    var missing_caps = colored.dp.?; missing_caps.stage = .color_caps;
+    var missing: [dp.max_bytes]u8 = undefined;
+    const missing_length = try missing_caps.encode(&missing);
+    respond(&missing_caps, missing[0..missing_length], false); missing[44] = 0;
+    try t.expectError(error.Unsupported, missing_caps.consume(record(missing[0..missing_length]), 0));
+    var bandwidth = hdr;
+    bandwidth.signal.clock = 180_000_000;
+    try t.expectError(error.Bandwidth, dp.stream(bandwidth, completed.source, completed.sink, .{ .rate = 6, .lanes = 4 }));
+    bandwidth.signal.bpc = 8;
+    _ = try dp.stream(bandwidth, completed.source, completed.sink, .{ .rate = 6, .lanes = 4 });
+    // Source support is independent of receiver HDR/VSC declarations.
+    missing_caps = colored.dp.?; missing_caps.stage = .source;
+    const source_length = try missing_caps.encode(&missing);
+    respond(&missing_caps, missing[0..source_length], false); put(&missing, 36, 1);
+    try t.expectError(error.Unsupported, missing_caps.consume(record(missing[0..source_length]), 0));
+    monitor.bits_per_color = 8;
+    try t.expectError(error.Unsupported, link.derive(hdr, object, snapshot));
     var status = completed.lane_status;
     status[2] &= ~@as(u8, 1); try t.expect(!dp.trained(status, 4)); // Clock recovery missing.
     status = completed.lane_status; status[3] &= ~@as(u8, 0x20); try t.expect(!dp.trained(status, 4)); // EQ missing.

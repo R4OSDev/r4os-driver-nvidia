@@ -39,7 +39,8 @@ pub const Owner = struct {
         if (memory.bufferDescribe(&source, &d) != a.gfx_buffer_result_ok) return error.Memory;
         if (d.version != 1 or d.size < @sizeOf(a.GfxBufferDescriptor) or d.location != a.gfx_buffer_location_system or
             d.adapter_id != 0 or d.device_generation != 0 or d.modifier != 0 or d.plane_count != 1 or
-            d.format != a.gfx_buffer_format_xrgb8888 or scanout.format != d.format or d.width != scanout.width or d.height != scanout.height or
+            (d.format != a.gfx_buffer_format_xrgb8888 and d.format != a.gfx_buffer_format_xrgb2101010) or
+            scanout.format != d.format or d.width != scanout.width or d.height != scanout.height or
             d.plane_offsets[0] != 0 or d.plane_pitches[0] != @as(u64, d.width) * 4 or
             d.byte_length != d.plane_pitches[0] * d.height or native_source.bytes != scanout.bytes or
             d.usage & (a.gfx_buffer_usage_cpu_write | a.gfx_buffer_usage_transfer_source) !=

@@ -63,6 +63,7 @@ pub const Output = struct {
     common_activation_pending: bool = false,
     failure: ?anyerror = null,
     statistics: @import("gsp_frame_stats.zig").Owner = .{},
+    color: @import("gsp_output_color.zig").Owner = .{},
 
     pub fn busy(self: *const Output) bool {
         if (self.phase == .active) return (self.hotplug.phase != .online and self.hotplug.phase != .receiver_wait) or
@@ -86,6 +87,7 @@ pub const Output = struct {
         if (self.phase == .active) {
             const changed = try self.hotplug.step(self);
             if (changed or self.hotplug.phase != .online or self.hotplug.refreshing) return changed;
+            if (self.color.step(self)) return true;
             if (try self.modes.step(self)) return true;
             if (self.modes.phase == .idle or self.modes.phase == .decision or self.modes.phase == .unavailable)
                 return run.prepareOutputFramePool(self.mode.?.window);
