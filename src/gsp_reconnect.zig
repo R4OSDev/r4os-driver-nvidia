@@ -5,7 +5,7 @@ const a = @import("r4os").abi;
 const boot = @import("gsp_boot_mode.zig");
 const outputs = @import("gsp_outputs.zig");
 const catalog = @import("gsp_catalog.zig");
-const link = @import("gsp_hdmi_link.zig");
+const link = @import("gsp_display_link.zig");
 pub const Choice = struct { plan: boot.Plan, resize: bool };
 
 pub fn choose(base: boot.Plan, snapshot: *const outputs.Snapshot, object: @import("gsp_display_rpc.zig").Object,

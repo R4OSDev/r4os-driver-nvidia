@@ -1,5 +1,16 @@
 ﻿# Third-Party Notices
 
+DisplayPort SST and audio (0.79.23, NVIDIA 0.1.115):
+The bounded link owner uses the MIT NVIDIA 570.144 control definitions and
+SST watermark arithmetic at source pin 8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f.
+GSP PHY training/audio sequencing follows MIT Nouveau r535 display code
+(Copyright 2023 Red Hat Inc.). Full original notices accompany derived code
+and the identical packaged/distribution runtime license. Existing license
+bytes are preserved. Original sources and an independent original-header C++
+fixture, including the original SST function body, are archived under
+GFX/Nvidia/0.79.23/displayport-20260914. The C++ reference is host-only.
+R4OS work scheduling, ownership and protocol integration remain Apache-2.0.
+
 Graphics Engine (0.79.19 partial, NVIDIA 0.1.106): C797 methods, GR allocation,
 static context tables and PROMOTE_CTX follow NVIDIA 570.144 MIT SDK/RM sources.
 Context selection, golden initialization and shared/global buffer policy are

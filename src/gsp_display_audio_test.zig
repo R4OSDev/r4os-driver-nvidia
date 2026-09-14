@@ -1,6 +1,6 @@
 const std = @import("std");
 const t = std.testing;
-const audio = @import("gsp_hdmi_audio.zig");
+const audio = @import("gsp_display_audio.zig");
 const vectors = @embedFile("fixtures/display-audio-570.144.bin");
 pub fn reference(operation: audio.Operation) []const u8 {
     var offset: usize = 4;

@@ -4,7 +4,7 @@ const std = @import("std");
 const r4os = @import("r4os");
 const a = r4os.abi;
 const runtime = @import("gsp_runtime.zig");
-const wire = runtime.hdmi_audio;
+const wire = runtime.display_audio;
 const Catalog = @import("gsp_catalog.zig").Owner;
 pub const Phase = enum { idle, pending, submit, wait, finish, failed };
 pub const Owner = struct {
@@ -36,7 +36,7 @@ pub const Owner = struct {
         self.* = .{ .catalog = old.catalog, .location = old.location, .device = old.device, .revision = old.revision };
     }
     pub fn beforeInitial(self: *Owner, product: anytype) !bool {
-        if (self.catalog == null or !product.mode.?.transport_hdmi or self.settled or self.phase == .failed) return true;
+        if (self.catalog == null or !product.mode.?.hasAudio() or self.settled or self.phase == .failed) return true;
         _ = try self.drive(product, product.mode.?, false);
         return !self.busy();
     }
@@ -44,7 +44,7 @@ pub const Owner = struct {
         if (self.catalog == null) return false;
         const image = try product.running.?.displayImageStatus(product.engine.?, product.mode.?.window) orelse return false;
         const mode = image.boot_mode orelse return false;
-        if (!mode.transport_hdmi) return false;
+        if (!mode.hasAudio()) return false;
         const enabling = product.modes.job == null or product.modes.job.?.operation == a.gfx_mode_operation_confirm;
         return self.drive(product, mode, enabling);
     }
@@ -77,7 +77,7 @@ pub const Owner = struct {
                 self.phase = .submit;
             },
             .submit => {
-                self.work_sequence = try run.beginHdmiAudio(self.plan.?, self.operation, self.deadline);
+                self.work_sequence = try run.beginDisplayAudio(self.plan.?, self.operation, self.deadline);
                 self.phase = .wait;
             },
             .wait => {
@@ -86,14 +86,16 @@ pub const Owner = struct {
                 if (result.sequence != self.work_sequence or result.operation != self.operation or result.receipt == 0) return error.Completion;
                 if (result.status != 0) return error.RmRejected;
                 switch (self.operation) {
-                    .mute => { self.operation = .clear; self.phase = .submit; },
+                    .mute => { self.operation = if (self.plan.?.mode.displayPort()) .disable else .clear; self.phase = .submit; },
+                    .disable => { self.operation = .clear; self.phase = .submit; },
                     .clear => if (self.enabled and self.plan.?.data != null) {
                         self.operation = .publish; self.phase = .submit;
                     } else { self.phase = .finish; },
                     .publish => if (self.plan.?.data.?.stereo_48k_s16) {
-                        self.operation = .unmute; self.phase = .submit;
+                        self.operation = if (self.plan.?.mode.displayPort()) .enable else .unmute; self.phase = .submit;
                     } else { self.phase = .finish; },
                     .unmute => self.phase = .finish,
+                    .enable => { self.operation = .unmute; self.phase = .submit; },
                 }
             },
             .finish => {
@@ -103,8 +105,8 @@ pub const Owner = struct {
                 try self.publish(state);
                 self.settled = true; self.phase = .idle;
                 var text: [192]u8 = undefined;
-                const line = try std.fmt.bufPrintZ(&text, "NVIDIA HDMI audio: connector={x} head={d} entry=0 revision={d} state={d} PCM=48000,stereo,S16 video=preserved",
-                    .{self.plan.?.mode.signal.display_id, self.plan.?.mode.head, self.revision, state});
+                const line = try std.fmt.bufPrintZ(&text, "NVIDIA {s} audio: connector={x} head={d} entry=0 revision={d} state={d} PCM=48000,stereo,S16 video=preserved",
+                    .{if (self.plan.?.mode.displayPort()) "DP" else "HDMI", self.plan.?.mode.signal.display_id, self.plan.?.mode.head, self.revision, state});
                 product.ctx.?.logInfo(line);
             },
             .idle, .failed => unreachable,
@@ -132,7 +134,7 @@ pub const Owner = struct {
         if (self.failure == null) {
             self.failure = err;
             self.publish(a.gfx_audio_route_failed) catch {};
-            product.ctx.?.logError("NVIDIA HDMI audio: unavailable, route invalidated; video resources retained");
+            product.ctx.?.logError("NVIDIA display audio: unavailable, route invalidated; video resources retained");
         }
         self.phase = .failed; self.settled = true;
     }

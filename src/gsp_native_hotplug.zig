@@ -5,7 +5,7 @@ const a = @import("r4os").abi;
 const runtime = @import("gsp_runtime.zig");
 const receiver = @import("gsp_hotplug.zig");
 const reconnect = @import("gsp_reconnect.zig");
-pub const Phase = enum { online, pause, drain, mute, mute_wait, clear, clear_wait, detach, detach_wait,
+pub const Phase = enum { online, pause, drain, mute, mute_wait, disable, disable_wait, clear, clear_wait, detach, detach_wait,
     settle, receiver_wait, query, query_wait, refresh, refresh_wait, commit, commit_wait, publish, unpause,
     resize, resize_publish, resize_catalog, source_create, source_map, source_clear, source_unmap, resize_submit, resize_wait, restore_unavailable };
 pub const Owner = struct {
@@ -76,19 +76,20 @@ pub const Owner = struct {
                 run.cursor_reserving = false;
                 if (run.display_images[window]) |image| {
                     self.previous = image.boot_mode orelse return error.State;
-                    self.phase = if (self.previous.?.transport_hdmi) .mute else .detach;
+                    self.phase = if (self.previous.?.hasAudio()) .mute else .detach;
                 } else if (run.display_retired[window] != null) self.phase = .settle else return error.State;
             },
-            .mute, .clear => {
-                self.audio_sequence = try run.beginHdmiDisconnect(window, if (self.phase == .mute) .mute else .clear, self.deadline);
-                self.phase = if (self.phase == .mute) .mute_wait else .clear_wait;
+            .mute, .disable, .clear => {
+                self.audio_sequence = try run.beginDisplayDisconnect(window, if (self.phase == .mute) .mute else if (self.phase == .disable) .disable else .clear, self.deadline);
+                self.phase = if (self.phase == .mute) .mute_wait else if (self.phase == .disable) .disable_wait else .clear_wait;
             },
-            .mute_wait, .clear_wait => {
+            .mute_wait, .disable_wait, .clear_wait => {
                 if (run.audio_work != null) return false;
                 const receipt = run.audio_result orelse return error.Completion;
                 if (receipt.sequence != self.audio_sequence or receipt.receipt == 0 or receipt.status != 0 or
-                    receipt.operation != @as(runtime.hdmi_audio.Operation, if (self.phase == .mute_wait) .mute else .clear)) return error.Completion;
-                self.phase = if (self.phase == .mute_wait) .clear else .detach;
+                    receipt.operation != @as(runtime.display_audio.Operation, if (self.phase == .mute_wait) .mute else if (self.phase == .disable_wait) .disable else .clear)) return error.Completion;
+                self.phase = if (self.phase == .mute_wait and self.previous.?.displayPort()) .disable else
+                    if (self.phase != .clear_wait) .clear else .detach;
             },
             .detach => { try run.detachDisplayImage(product.core.?, product.window.?, self.deadline); self.phase = .detach_wait; },
             .detach_wait => {
@@ -171,7 +172,7 @@ pub const Owner = struct {
                 if (run.display_work != null) return false;
                 const image = run.display_images[window] orelse return error.Completion;
                 if (image.boot_mode == null or !std.meta.eql(image.boot_mode.?, self.plan.?) or image.mode_receipt == 0 or
-                    image.link == null or image.link.?.receipt == 0 or image.link.?.acknowledged != @as(u8, if (self.plan.?.transport_hdmi) 7 else 2)) return error.Completion;
+                    image.link == null or !image.link.?.complete()) return error.Completion;
                 product.mode = self.plan; product.link = image.link.?.plan; product.confirmed_image = image;
                 try product.buildPublication();
                 self.phase = .publish;
@@ -195,7 +196,7 @@ pub const Owner = struct {
             },
             .resize => {
                 product.mode = self.plan;
-                product.link = try runtime.hdmi_link.derive(self.plan.?, run.nativeObject() orelse return error.Busy, run.nativeOutputs() orelse return error.Busy);
+                product.link = try runtime.display_link.derive(self.plan.?, run.nativeObject() orelse return error.Busy, run.nativeOutputs() orelse return error.Busy);
                 try product.buildPublication();
                 self.phase = .resize_publish;
             },

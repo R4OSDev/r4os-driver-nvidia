@@ -55,7 +55,7 @@ pub const Owner = struct {
     immediate: ?runtime.DisplayChannelHandle = null,
     dma: u32 = 0,
     mode: ?runtime.boot_mode.Plan = null,
-    link: ?runtime.hdmi_link.Plan = null,
+    link: ?runtime.display_link.Plan = null,
     shadow: a.GfxBufferReference = .{},
     shadow_map: a.GfxBufferMap = .{},
     shadow_descriptor: a.GfxBufferDescriptor = .{},
@@ -199,7 +199,7 @@ pub const Owner = struct {
                     try run.configureCursorUsage(self.engine.?, @import("gsp_cursor_image.zig").max_size);
                     self.mode.?.cursor_size = @import("gsp_cursor_image.zig").max_size;
                 }
-                self.link = try runtime.hdmi_link.derive(self.mode.?, run.nativeObject() orelse return error.Busy, snapshot);
+                self.link = try runtime.display_link.derive(self.mode.?, run.nativeObject() orelse return error.Busy, snapshot);
                 self.next(.mode_create);
             },
             .mode_create => {
@@ -215,7 +215,7 @@ pub const Owner = struct {
                 if ((!admission.possible or admission.over_clock) and self.mode.?.cursor_size != 0) {
                     try run.configureCursorUsage(self.engine.?, 0);
                     self.mode = try run.bootDisplayPlan(self.engine.?, self.mode.?.window);
-                    self.link = try runtime.hdmi_link.derive(self.mode.?, run.nativeObject() orelse return error.Busy,
+                    self.link = try runtime.display_link.derive(self.mode.?, run.nativeObject() orelse return error.Busy,
                         run.nativeOutputs() orelse return error.Busy);
                     try run.queryDisplayMode(self.mode_control.?, self.mode.?, self.phase_deadline);
                     return true;
@@ -390,7 +390,7 @@ pub const Owner = struct {
                 if (self.frame_count < 2 or self.frame_count > 3) return error.Descriptor;
                 run.presentation_buffers = self.frame_count;
                 self.next(.active);
-                self.ctx.?.logInfo("NVIDIA native-output: state=software-native boot-mode=retained shadow=system scanout=vram completion=CE,WIMM,Window,Core,HDMI common-handoff=confirmed");
+                self.ctx.?.logInfo("NVIDIA native-output: state=software-native boot-mode=retained shadow=system scanout=vram completion=CE,WIMM,Window,Core link=confirmed common-handoff=confirmed");
             },
             .active => {
                 const changed = try self.hotplug.step(self);
@@ -418,7 +418,7 @@ pub const Owner = struct {
         const bound = try runtime.boot_mode.bind(self.mode.?, snapshot, run.epoch, self.captured.?.boot.held_generation);
         if (!std.meta.eql(bound, self.mode.?)) return error.Stale;
         const object = run.nativeObject() orelse return error.Busy;
-        if (!std.meta.eql(try runtime.hdmi_link.derive(bound, object, snapshot), self.link.?)) return error.Stale;
+        if (!std.meta.eql(try runtime.display_link.derive(bound, object, snapshot), self.link.?)) return error.Stale;
     }
     pub fn buildPublication(self: *Owner) !void {
         try self.validateRoute();
@@ -468,7 +468,7 @@ pub const Owner = struct {
             !std.meta.eql(image.position.?.handle, self.immediate.?) or image.position.?.sequence == 0 or
             image.core_point == 0 or image.window_point == 0 or image.link == null or
             !std.meta.eql(image.link.?.plan, self.link.?) or image.link.?.receipt == 0 or
-            image.link.?.acknowledged != @as(u8, if (self.mode.?.transport_hdmi) 7 else 2) or
+            !image.link.?.complete() or
             self.confirmed_image == null or !std.meta.eql(image, self.confirmed_image.?)) return error.Completion;
     }
     fn validState(state: a.GfxNativeState, generation: u64, expected: u32, outcome: u32) bool {

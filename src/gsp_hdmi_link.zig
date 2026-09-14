@@ -182,6 +182,7 @@ pub const Work = struct {
 /// saved RGB8 clock is a rational TMDS character rate, including 1000/1001.
 pub fn derive(saved: mode.Plan, object: display.Object, snapshot: *const outputs.Snapshot) !Plan {
     try mode.validate(saved.signal, saved.head);
+    if (saved.displayPort()) return error.Unsupported;
     if (object.client == 0 or object.display == 0 or object.epoch != saved.epoch or snapshot.topology.client != object.client or
         !std.meta.eql(saved, try mode.bind(saved, snapshot, saved.epoch, saved.held_generation))) return error.Stale;
     var result: Plan = .{ .object = object, .mode = saved };
@@ -231,6 +232,7 @@ fn checksum(packet: []u8) void {
     packet[3] = 0 -% sum;
 }
 pub fn encode(plan: Plan, op: Operation, bytes: *[max_bytes]u8) !usize {
+    if (plan.mode.displayPort()) return error.Unsupported;
     if (plan.object.epoch == 0 or plan.object.client == 0 or plan.object.display == 0 or plan.object.epoch != plan.mode.epoch or
         plan.caps & ~@as(u32, 7) != 0 or (!plan.mode.transport_hdmi and op != .caps and op != .enable) or
         plan.mode.cta_vic > 127 or (plan.mode.cta_vic != 0 and (!plan.mode.transport_hdmi or plan.mode.receiver_mode_id == 0 or plan.hdmi_vic != 0))) return error.Descriptor;

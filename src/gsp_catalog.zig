@@ -161,6 +161,7 @@ fn kind(route: *const topology.Route) u32 {
         0x61, 0x63 => a.gfx_output_kind_hdmi,
         0x46, 0x48 => a.gfx_output_kind_displayport,
         0x47 => a.gfx_output_kind_edp,
+        0x30, 0x31 => a.gfx_output_kind_dvi,
         else => 0,
     };
 }

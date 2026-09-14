@@ -62,7 +62,13 @@ pub const Plan = struct {
     transport_hdmi: bool = false,
     cursor_size: u16 = 0,
     signal: Signal,
+    pub fn displayPort(self: Plan) bool { return isDisplayPort(self.signal); }
+    pub fn hasAudio(self: Plan) bool { return self.transport_hdmi or self.displayPort(); }
 };
+pub fn isDisplayPort(signal: Signal) bool {
+    const protocol = scanout.protocol(signal.sor_control);
+    return protocol == .dp_a or protocol == .dp_b;
+}
 
 /// Pure preflight: no allocation, state mutation, RPC or MMIO. In particular,
 /// unknown/cloned routes and stereo/YUV/FRL are not silently changed to RGB.
@@ -86,7 +92,8 @@ pub fn capture(raw: *const scanout.Raw, boot: *const a.GfxNativeBootInfo, window
     // One progressive RGB8 signal without repetition, scaling, frame lock,
     // pixel-clock hopping or colour-space override.
     const protocol = scanout.protocol(raw.sors[sor]);
-    if (protocol != .tmds_a and protocol != .tmds_b) return error.Unsupported;
+    if (protocol != .tmds_a and protocol != .tmds_b and protocol != .dp_a and protocol != .dp_b) return error.Unsupported;
+    if ((protocol == .dp_a or protocol == .dp_b) and timing.hdmi_enabled) return error.Unsupported;
     if (source.get(.control) != 0 or source.get(.clock_config) & ~@as(u32, 1) != 0 or
         timing.depth_code != 4 or source.get(.output) & 0x01000000 != 0 or
         raw.sors[sor] & ~@as(u32, 0x10fff) != 0 or
@@ -129,7 +136,16 @@ pub fn bind(saved: Plan, snapshot: *const outputs.Snapshot, epoch: u64, held_gen
         const active = snapshot.topology.activeHeads(route.id) orelse return error.Routing;
         if (active != 0 and active != head_mask) return error.Routing;
         const physical = route.connectors orelse return error.Routing;
-        if (!physical.present() or physical.count != 1 or (physical.data[0].kind != 0x61 and physical.data[0].kind != 0x63)) return error.Unsupported;
+        if (!physical.present() or physical.count != 1) return error.Unsupported;
+        const kind = physical.data[0].kind;
+        if (saved.displayPort()) {
+            // External SST only. eDP panel power/backlight, Type-C alt-mode
+            // and MST routes need their own capabilities and owners.
+            if (kind != 0x46 and kind != 0x48) return error.Unsupported;
+        } else switch (kind) {
+            0x61, 0x63, 0x46, 0x48, 0x30, 0x31 => {}, // Actual TMDS, including a passive DP++ adapter.
+            else => return error.Unsupported,
+        }
         if (id != 0) return error.Routing;
         id = route.id;
     }
@@ -145,7 +161,8 @@ pub fn validate(signal: Signal, head: u32) Error!void {
     if (head >= 8 or signal.sor >= 8 or signal.display_id == 0 or signal.display_id & (signal.display_id - 1) != 0 or
         signal.sor_control & 255 != @as(u32, 1) << @intCast(head) or signal.sor_control & ~@as(u32, 0x10fff) != 0 or
         signal.polarity & ~@as(u32, 12) != 0 or signal.hdmi & ~@as(u32, 0xff1) != 0) return error.Descriptor;
-    if (scanout.protocol(signal.sor_control) != .tmds_a and scanout.protocol(signal.sor_control) != .tmds_b) return error.Unsupported;
+    if (scanout.protocol(signal.sor_control) != .tmds_a and scanout.protocol(signal.sor_control) != .tmds_b and !isDisplayPort(signal)) return error.Unsupported;
+    if (isDisplayPort(signal) and signal.hdmi != 0) return error.Unsupported;
     var source: scanout.Head = .{};
     source.words = .{ 0x40 | signal.polarity, 0, signal.clock, 0, signal.viewport, signal.viewport,
         signal.total, signal.sync_end, signal.blank_end, signal.blank_start };

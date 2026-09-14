@@ -1,5 +1,6 @@
 // Wire controls from NVIDIA 570.144 ctrl0073dfp.h/ctrl0073specific.h.
 // SPDX-FileCopyrightText: Copyright (c) 2005-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-FileCopyrightText: Copyright (c) 2005-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: MIT
 //
@@ -23,7 +24,7 @@
 //! Independent finite audio controls on the existing serialized RM exchange.
 //! A rejected audio setter degrades audio without failing a video modeset.
 const std = @import("std");
-const link = @import("gsp_hdmi_link.zig");
+const link = @import("gsp_display_link.zig");
 const display = @import("gsp_display_rpc.zig");
 const mode = @import("gsp_boot_mode.zig");
 const outputs = @import("gsp_outputs.zig");
@@ -31,7 +32,7 @@ const exchange = @import("gsp_exchange.zig");
 const eld = @import("r4gfx_edid").eld;
 pub const function: u32 = 76;
 pub const max_bytes = 144;
-pub const Operation = enum { mute, clear, publish, unmute };
+pub const Operation = enum { mute, clear, publish, unmute, disable, enable };
 pub const Plan = struct {
     object: display.Object,
     mode: mode.Plan,
@@ -64,11 +65,11 @@ pub const Result = struct { sequence: u64, operation: Operation, receipt: u64, s
 
 pub fn derive(saved: mode.Plan, object: display.Object, snapshot: *const outputs.Snapshot) !Plan {
     _ = try link.derive(saved, object, snapshot);
-    if (!saved.transport_hdmi) return error.Unsupported;
+    if (!saved.hasAudio()) return error.Unsupported;
     var result: Plan = .{ .object = object, .mode = saved };
     for (snapshot.receivers[0..snapshot.count]) |*receiver| if (receiver.display_id == saved.signal.display_id) {
         if (receiver.connected == true and receiver.status == .valid_edid and receiver.report.complete()) {
-            result.data = eld.encode(&receiver.report, result.portId()) catch null;
+            result.data = eld.encodeTransport(&receiver.report, result.portId(), if (saved.displayPort()) .display_port else .hdmi) catch null;
         }
         return result;
     };
@@ -78,21 +79,23 @@ fn put(bytes: []u8, offset: usize, value: u32) void { std.mem.writeInt(u32, byte
 fn word(bytes: []const u8, offset: usize) u32 { return std.mem.readInt(u32, bytes[offset..][0..4], .little); }
 pub fn encode(plan: Plan, operation: Operation, bytes: *[max_bytes]u8) !usize {
     if (plan.object.client == 0 or plan.object.display == 0 or plan.object.epoch == 0 or plan.object.epoch != plan.mode.epoch or
-        !plan.mode.transport_hdmi) return error.Descriptor;
+        !plan.mode.hasAudio()) return error.Descriptor;
     try mode.validate(plan.mode.signal, plan.mode.head);
     if (operation == .publish and plan.data == null) return error.Unsupported;
-    if (operation == .unmute and (plan.data == null or !plan.data.?.stereo_48k_s16)) return error.Unsupported;
+    if ((operation == .unmute or operation == .enable) and (plan.data == null or !plan.data.?.stereo_48k_s16)) return error.Unsupported;
+    if ((operation == .enable or operation == .disable) and !plan.mode.displayPort()) return error.Unsupported;
     const eld_command = operation == .clear or operation == .publish;
     const size: u32 = if (eld_command) 120 else 12;
     @memset(bytes, 0);
     put(bytes, 0, plan.object.client); put(bytes, 4, plan.object.display);
-    put(bytes, 8, if (eld_command) 0x731144 else 0x730275); put(bytes, 16, size);
+    put(bytes, 8, if (eld_command) 0x731144 else if (operation == .enable or operation == .disable) 0x731150
+        else if (plan.mode.displayPort()) 0x731359 else 0x730275); put(bytes, 16, size);
     const params = bytes[24..];
     put(params, 4, plan.mode.signal.display_id);
     if (eld_command) {
         // HDMI and DP-SST use device entry 0 even when the display head is
         // nonzero. nvkms-hdmi.c:GetAudioDeviceEntry reserves head-indexed
-        // entries for MST. R4OS currently enables only HDMI here.
+        // entries for MST. Both supported SST transports keep entry zero.
         put(params, 116, 0);
         if (operation == .publish) {
             const data = plan.data.?;
@@ -103,7 +106,7 @@ pub fn encode(plan: Plan, operation: Operation, bytes: *[max_bytes]u8) !usize {
             put(params, 108, data.max_frequency);
             put(params, 112, 3); // PD/ELDV only after the complete ELD write.
         }
-    } else params[8] = @intFromBool(operation == .mute);
+    } else put(params, 8, @intFromBool(operation == .mute or operation == .enable));
     return 24 + size;
 }
 pub const Reply = struct { status: u32, rpc_error: bool = false };

@@ -502,7 +502,7 @@ pub const Device = struct {
             self.running.validateDisplayLink() catch return error.Binding;
         } else if (self.running.audio_work) |*work| {
             if (channel != &self.running.channel.? or !work.matches(channel, deadline)) return error.Binding;
-            self.running.validateHdmiAudio() catch return error.Binding;
+            self.running.validateDisplayAudio() catch return error.Binding;
         } else if (self.running.graph) |*graph| {
             if (!graph.matches(channel, deadline)) return error.Binding;
         } else if (self.running.static_info == null) {
@@ -682,7 +682,7 @@ pub const Device = struct {
             const route = work.core.config.route orelse return error.Binding;
             if (work.boot_mode) |plan| {
                 const link = if (work.link) |*value| value else return error.Binding;
-                if (link.phase != .scanout or link.pending or link.acknowledged != @as(u8, if (plan.transport_hdmi) 3 else 2) or link.last_receipt == 0) return error.Binding;
+                if (!link.readyScanout()) return error.Binding;
                 self.running.validateDisplayLink() catch return error.Binding;
                 const expected = self.running.displayWorkPlan(.{ .epoch = self.epoch, .root = root.binding.root }, route.window) catch return error.Binding;
                 if (!std.meta.eql(plan, expected) or !std.meta.eql(work.core.config.signal, @as(?runtime.boot_mode.Signal, expected.signal)) or

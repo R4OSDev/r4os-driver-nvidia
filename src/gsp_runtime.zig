@@ -72,11 +72,18 @@ pub const PositionSubmission = struct {
 };
 pub const DisplayPosition = struct { handle: DisplayChannelHandle, point: display_channel.push.commands.Point, sequence: u64 };
 pub const boot_mode = @import("gsp_boot_mode.zig");
-pub const hdmi_link = @import("gsp_hdmi_link.zig");
-pub const hdmi_audio = @import("gsp_hdmi_audio.zig");
-pub const DisplayLink = struct { plan: hdmi_link.Plan, acknowledged: u8, receipt: u64 };
-pub const DisplayAdmission = struct { mode: boot_mode.Plan, link: hdmi_link.Plan, receipt: u64, receiver_sequence: u64 };
-pub const DisplayWork = struct { core: DisplaySubmission, window: ?DisplaySubmission = null, position: ?PositionSubmission = null, deadline: u64, boot_mode: ?boot_mode.Plan = null, mode_receipt: u64 = 0, link: ?hdmi_link.Work = null, cursor: ?CursorCommit = null, detach: ?ActiveDisplayImage = null, admission: ?DisplayAdmission = null };
+pub const display_link = @import("gsp_display_link.zig");
+pub const display_audio = @import("gsp_display_audio.zig");
+pub const DisplayLink = struct {
+    plan: display_link.Plan, acknowledged: u8, receipt: u64, dp: ?display_link.dp.Result = null,
+    pub fn complete(self: DisplayLink) bool {
+        if (self.receipt == 0) return false;
+        if (self.plan.mode.displayPort()) return self.dp != null and self.acknowledged != 0;
+        return self.dp == null and self.acknowledged == @as(u8, if (self.plan.mode.transport_hdmi) 7 else 2);
+    }
+};
+pub const DisplayAdmission = struct { mode: boot_mode.Plan, link: display_link.Plan, receipt: u64, receiver_sequence: u64 };
+pub const DisplayWork = struct { core: DisplaySubmission, window: ?DisplaySubmission = null, position: ?PositionSubmission = null, deadline: u64, boot_mode: ?boot_mode.Plan = null, mode_receipt: u64 = 0, link: ?display_link.Work = null, cursor: ?CursorCommit = null, detach: ?ActiveDisplayImage = null, admission: ?DisplayAdmission = null };
 pub const DisplayRetirement = struct { epoch: u64, image: ActiveDisplayImage, core_point: u64, window_point: u64, observed_ns: u64 };
 pub const cursor_image = @import("gsp_cursor_image.zig");
 pub const CursorCommit = struct { control: cursor_image.Control, sequence: u64, baseline: ?@import("gsp_head_events.zig").Sample = null, completed_ns: u64 = 0 };
@@ -236,8 +243,8 @@ pub const Owner = struct {
     direct_enabled: bool = false,
     require_mode_receipt: bool = false,
     initial_image: ?InitialImage = null,
-    audio_work: ?hdmi_audio.Work = null,
-    audio_result: ?hdmi_audio.Result = null,
+    audio_work: ?display_audio.Work = null,
+    audio_result: ?display_audio.Result = null,
     audio_sequence: u64 = 0,
     cursor_storage: ?CursorStorage = null,
     cursor_upload: ?CursorUpload = null,
@@ -396,7 +403,7 @@ pub const Owner = struct {
             .{@errorName(err),position.handle.handle,@tagName(position.phase),if(position.ticket)|ticket|ticket.point else 0});
         if (self.initial_image) |*work| self.log("NVIDIA gsp-initial-image: failed={s} submitted={} point={d} source-held={} storage=retained",
             .{@errorName(err),work.operation.submitted,if(work.operation.ticket)|ticket|ticket.point else 0,work.operation.gpu.lease.id != 0});
-        if (self.display_work) |*work| if (work.link) |*link| self.log("NVIDIA gsp-hdmi: failed={s} display={x} phase={s} operation={s} replies={d} receipt={d} status={?} rpc={} storage=retained",
+        if (self.display_work) |*work| if (work.link) |*link| self.log("NVIDIA gsp-link: failed={s} display={x} phase={s} operation={s} replies={d} receipt={d} status={?} rpc={} storage=retained",
             .{@errorName(err),link.plan.mode.signal.display_id,@tagName(link.phase),@tagName(link.operation),link.acknowledged,link.last_receipt,link.last_status,link.rpc_error});
     }
     fn recordFault(self: *Owner, value: diagnostics.Record) !void {
@@ -627,7 +634,7 @@ pub const Owner = struct {
     pub fn validateModeQuery(self: *Owner, root: DisplayEngineHandle, plan: boot_mode.Plan) !void {
         const expected = try self.displayModePlan(root, plan.window, plan.receiver_mode_id);
         if (!std.meta.eql(expected, plan)) return error.Stale;
-        _ = try hdmi_link.derive(expected, self.display_object.?, self.outputs.snapshot().?);
+        _ = try display_link.derive(expected, self.display_object.?, self.outputs.snapshot().?);
     }
     pub fn createModeControl(self: *Owner, root: DisplayEngineHandle, plan: boot_mode.Plan, deadline: u64) !ModeControlHandle {
         _ = try self.now();
@@ -1076,7 +1083,7 @@ pub const Owner = struct {
         if (core.parent != window.parent or window.config.kind != .window) return error.Stale;
         const root: DisplayEngineHandle = .{ .epoch = self.epoch, .root = core.parent.binding.root };
         const plan = try self.displayModePlan(root, window.config.index, receiver_mode_id);
-        const link = try hdmi_link.derive(plan, self.display_object.?, self.outputs.snapshot().?);
+        const link = try display_link.derive(plan, self.display_object.?, self.outputs.snapshot().?);
         const receipt = try self.modeAdmission(root, plan);
         const resources = self.display_resources_slot.owner orelse return error.State;
         const image = resources.publishedImage(window_handle.slot, image_handle) orelse return error.State;
@@ -1089,7 +1096,7 @@ pub const Owner = struct {
         self.display_work.?.core.config.cursor_usage = plan.cursor_size;
         self.display_work.?.boot_mode = plan;
         self.display_work.?.mode_receipt = receipt;
-        self.display_work.?.link = .{ .plan = link };
+        self.display_work.?.link = display_link.Work.init(link);
         self.display_work.?.admission = .{ .mode = plan, .link = link, .receipt = receipt, .receiver_sequence = self.receiver_events.sequence };
     }
     fn modeAdmission(self: *Owner, root: DisplayEngineHandle, plan: boot_mode.Plan) !u64 {
@@ -1550,41 +1557,41 @@ pub const Owner = struct {
     pub fn cursorWorkAvailable(self: *Owner) bool {
         return !self.copyBusy() and self.cursor_point == null and self.nativeObject() != null and !self.graph_closing;
     }
-    pub fn beginHdmiAudio(self: *Owner, plan: hdmi_audio.Plan, operation: hdmi_audio.Operation, deadline: u64) !u64 {
+    pub fn beginDisplayAudio(self: *Owner, plan: display_audio.Plan, operation: display_audio.Operation, deadline: u64) !u64 {
         if (!self.cursorWorkAvailable() or self.channel.?.phase != .idle) return error.Busy;
         if (deadline <= try self.now() or self.audio_sequence == std.math.maxInt(u64)) return error.Deadline;
-        const expected = try hdmi_audio.derive(plan.mode, self.display_object.?, self.outputs.snapshot() orelse return error.Stale);
+        const expected = try display_audio.derive(plan.mode, self.display_object.?, self.outputs.snapshot() orelse return error.Stale);
         if (!std.meta.eql(plan, expected)) return error.Stale;
-        return self.startHdmiAudio(plan, operation, deadline, false);
+        return self.startDisplayAudio(plan, operation, deadline, false);
     }
     /// Disable only the previously acknowledged video route. Fresh receiver
     /// data cannot authorize enabling an old ELD, and is not needed to clear it.
-    pub fn beginHdmiDisconnect(self: *Owner, window: u32, operation: hdmi_audio.Operation, deadline: u64) !u64 {
-        if (!self.display_paused or window >= 8 or (operation != .mute and operation != .clear)) return error.State;
+    pub fn beginDisplayDisconnect(self: *Owner, window: u32, operation: display_audio.Operation, deadline: u64) !u64 {
+        if (!self.display_paused or window >= 8 or (operation != .mute and operation != .clear and operation != .disable)) return error.State;
         if (!self.cursorWorkAvailable() or self.channel.?.phase != .idle) return error.Busy;
         if (deadline <= try self.now() or self.audio_sequence == std.math.maxInt(u64)) return error.Deadline;
         const active = self.display_images[window] orelse return error.State;
         const mode = active.boot_mode orelse return error.State;
         const link = active.link orelse return error.State;
-        if (active.core_point == 0 or active.window_point == 0 or link.receipt == 0 or !mode.transport_hdmi) return error.State;
-        return self.startHdmiAudio(.{ .object = link.plan.object, .mode = mode }, operation, deadline, true);
+        if (active.core_point == 0 or active.window_point == 0 or !link.complete() or !mode.hasAudio()) return error.State;
+        return self.startDisplayAudio(.{ .object = link.plan.object, .mode = mode }, operation, deadline, true);
     }
-    fn startHdmiAudio(self: *Owner, plan: hdmi_audio.Plan, operation: hdmi_audio.Operation, deadline: u64, retiring: bool) !u64 {
-        var encoded: [hdmi_audio.max_bytes]u8 = undefined;
-        _ = try hdmi_audio.encode(plan, operation, &encoded);
+    fn startDisplayAudio(self: *Owner, plan: display_audio.Plan, operation: display_audio.Operation, deadline: u64, retiring: bool) !u64 {
+        var encoded: [display_audio.max_bytes]u8 = undefined;
+        _ = try display_audio.encode(plan, operation, &encoded);
         self.audio_sequence += 1;
         self.audio_work = .{ .plan = plan, .operation = operation, .sequence = self.audio_sequence, .deadline = deadline, .retiring = retiring };
         errdefer self.audio_work = null;
-        try self.validateHdmiAudio();
+        try self.validateDisplayAudio();
         return self.audio_sequence;
     }
-    pub fn validateHdmiAudio(self: *Owner) !void {
+    pub fn validateDisplayAudio(self: *Owner) !void {
         const work = self.audio_work orelse return error.State;
         if (self.failure != null or self.graph_closing or self.display_object == null or !std.meta.eql(work.plan.object, self.display_object.?) or
             work.plan.object.epoch != self.epoch or self.activeChannel() != &self.channel.? or self.display_work != null or
             self.display_flip != null or self.cursor_point != null) return error.Stale;
         if (work.retiring) {
-            if (!self.display_paused or (work.operation != .mute and work.operation != .clear) or work.plan.data != null or
+            if (!self.display_paused or (work.operation != .mute and work.operation != .clear and work.operation != .disable) or work.plan.data != null or
                 work.plan.mode.window >= 8) return error.Stale;
             const active = self.display_images[work.plan.mode.window] orelse return error.Stale;
             if (active.boot_mode == null or !std.meta.eql(active.boot_mode.?, work.plan.mode) or active.link == null or
@@ -1593,27 +1600,28 @@ pub const Owner = struct {
         }
         // Invalidate/mute is also valid before the initial scanout. Enabling
         // requires an actually completed video mode, including its HDMI ACKs.
-        if (work.operation == .publish or work.operation == .unmute) {
+        if (work.operation == .publish or work.operation == .unmute or work.operation == .enable) {
             const engine = if (self.display_engine_owner) |*value| value else return error.State;
             const image = try self.displayImageStatus(.{ .epoch = self.epoch, .root = engine.binding.root }, work.plan.mode.window) orelse return error.State;
             if (image.boot_mode == null or !std.meta.eql(image.boot_mode.?, work.plan.mode) or image.core_point == 0 or
-                image.window_point == 0 or image.link == null or image.link.?.receipt == 0 or image.link.?.acknowledged != 7) return error.Stale;
+                image.window_point == 0 or image.link == null or !image.link.?.complete()) return error.Stale;
+            if (work.plan.mode.displayPort() and !image.link.?.dp.?.stream.audio_48k) return error.Unsupported;
         }
     }
-    fn advanceHdmiAudio(self: *Owner, current: u64) !Progress {
+    fn advanceDisplayAudio(self: *Owner, current: u64) !Progress {
         const work = &self.audio_work.?;
         const channel = &self.channel.?;
-        try self.validateHdmiAudio();
+        try self.validateDisplayAudio();
         if (current >= work.deadline) return error.Timeout;
         if (!work.pending) {
-            work.length = try hdmi_audio.encode(work.plan, work.operation, &work.request);
-            try channel.begin(hdmi_audio.function, work.request[0..work.length], work.deadline);
+            work.length = try display_audio.encode(work.plan, work.operation, &work.request);
+            try channel.begin(display_audio.function, work.request[0..work.length], work.deadline);
             work.pending = true;
             return .progress;
         }
         if (try channel.poll(work.deadline)) |dispatch| {
             if (!dispatch.response) { try self.notification(channel, dispatch, current); return .progress; }
-            const reply = try hdmi_audio.decode(work.plan, work.operation, dispatch.record);
+            const reply = try display_audio.decode(work.plan, work.operation, dispatch.record);
             try channel.complete(dispatch.ticket);
             self.audio_result = .{ .sequence = work.sequence, .operation = work.operation, .receipt = dispatch.ticket.serial,
                 .status = reply.status, .rpc_error = reply.rpc_error };
@@ -2643,7 +2651,7 @@ pub const Owner = struct {
         if (actual.parent != core.parent or actual.config.kind != .window or work.boot_mode == null) return error.Stale;
         const root: DisplayEngineHandle = .{ .epoch = self.epoch, .root = core.parent.binding.root };
         const expected = try self.displayWorkPlan(root, actual.config.index);
-        const planned = if (self.displayWorkObsolete()) work.admission.?.link else try hdmi_link.derive(expected, self.display_object.?, self.outputs.snapshot().?);
+        const planned = if (self.displayWorkObsolete()) work.admission.?.link else try display_link.derive(expected, self.display_object.?, self.outputs.snapshot().?);
         if (!std.meta.eql(link.plan, planned) or !std.meta.eql(work.boot_mode.?, expected) or
             !std.meta.eql(work.core.config.signal, @as(?boot_mode.Signal, expected.signal)) or
             window.config.scanout == null or window.config.scanout.?.width != expected.width or window.config.scanout.?.height != expected.height or
@@ -2671,8 +2679,9 @@ pub const Owner = struct {
                 } else return error.State;
                 return .progress;
             }
-            link.length = try hdmi_link.encode(link.plan, link.operation, &link.request);
-            try channel.begin(hdmi_link.function, link.request[0..link.length], work.deadline);
+            if (!link.ready(current)) return .idle;
+            link.length = try link.encode(&link.request);
+            try channel.begin(display_link.function, link.request[0..link.length], work.deadline);
             link.pending = true;
             return .progress;
         }
@@ -2680,15 +2689,18 @@ pub const Owner = struct {
             if (!dispatch.response) {
                 try self.notification(channel, dispatch, current); return .progress;
             }
-            const reply = try hdmi_link.decode(link.plan, link.operation, dispatch.record);
-            link.last_status = reply.status; link.rpc_error = reply.rpc_error;
+            // Keep a bounded payload copy until the real ring ACK succeeds.
+            // An ACK failure must not advance link/scanout admission.
+            var payload: [display_link.max_bytes]u8 = undefined;
+            if (dispatch.record.payload.len > payload.len) return error.Payload;
+            @memcpy(payload[0..dispatch.record.payload.len], dispatch.record.payload);
+            var record = dispatch.record;
+            record.payload = payload[0..dispatch.record.payload.len];
             try channel.complete(dispatch.ticket);
-            if (reply.status != 0) {
-                link.pending = false;
-                self.rmFailure(.display_channel, link.plan.object.display, reply.status);
-                return error.RmRejected;
-            }
-            try link.afterAck(dispatch.ticket.serial);
+            link.consume(record, dispatch.ticket.serial, current) catch |err| {
+                if (link.last_status) |status| if (status != 0) self.rmFailure(.display_channel, link.plan.object.display, status);
+                return err;
+            };
             return .progress;
         }
         return if (channel.phase == .waiting) .idle else .progress;
@@ -2767,7 +2779,7 @@ pub const Owner = struct {
         if (work.window) |window| {
             const route = window.config.route.?;
             var mode = work.boot_mode;
-            var link: ?DisplayLink = if (work.link) |value| .{ .plan = value.plan, .acknowledged = value.acknowledged, .receipt = value.last_receipt } else null;
+            var link: ?DisplayLink = if (work.link) |value| .{ .plan = value.plan, .acknowledged = value.acknowledged, .receipt = value.last_receipt, .dp = value.dpResult() } else null;
             var position: ?DisplayPosition = if (work.position) |value| .{ .handle = value.handle,
                 .point = value.config.position.?, .sequence = value.ticket.?.point } else null;
             if (mode) |plan| {
@@ -2787,6 +2799,13 @@ pub const Owner = struct {
                 .position = position, .link = link };
             self.display_retired[route.window] = null;
         }
+        if (work.link) |*link| if (link.dpResult()) |proof| {
+            self.log("NVIDIA gsp-dp: display={x} head={d} lanes={d} rate={x} source-max={x} sink-max={x} enhanced={} attempts={d} TU=64 watermark={d} hblank={d} vblank={d} audio48k={} receipt={d}",
+                .{link.plan.mode.signal.display_id, link.plan.mode.head, proof.config.lanes, proof.config.rate, proof.source.rate, proof.sink.rate,
+                    proof.sink.enhanced, proof.attempts, proof.stream.watermark, proof.stream.hblank, proof.stream.vblank, proof.stream.audio_48k, link.last_receipt});
+            self.logBytes("dp-dpcd", link.plan.mode.signal.display_id, &proof.dpcd);
+            self.logBytes("dp-lanes", link.plan.mode.signal.display_id, &proof.lane_status);
+        };
         self.display_work = null; return true;
     }
     fn advanceDisplayFlip(self: *Owner, current: u64) !bool {
@@ -3494,7 +3513,7 @@ pub const Owner = struct {
         if (self.display_work) |*work| if (work.link) |*link| {
             if (link.phase == .before_scanout or link.phase == .after_scanout) return self.advanceDisplayLink(current);
         };
-        if (self.audio_work != null) return self.advanceHdmiAudio(current);
+        if (self.audio_work != null) return self.advanceDisplayAudio(current);
         // Drain an already observable GSP fault before publishing CE success.
         // Active RPC owners above already receive before sending their work.
         if ((self.copyBusy() or self.cursor_point != null) and channel.phase == .idle) {

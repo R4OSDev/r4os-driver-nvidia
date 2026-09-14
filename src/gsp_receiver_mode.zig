@@ -56,8 +56,8 @@ pub fn select(saved: boot.Plan, snapshot: *const outputs.Snapshot, id: u32) !boo
             if (h_sync >= h_end or v_sync >= v_end or v_end < 2) return error.Unsupported;
             var result = saved;
             result.receiver_mode_id = id;
-            result.cta_vic = if (report.hdmi) @intCast(value.vic) else 0;
-            result.transport_hdmi = report.hdmi;
+            result.transport_hdmi = !saved.displayPort() and report.hdmi;
+            result.cta_vic = if (result.transport_hdmi) @intCast(value.vic) else 0;
             result.width = value.width; result.height = value.height;
             result.refresh_micro_hz = value.clock_hz * 1_000_000 / (@as(u64, value.h_total) * value.v_total);
             result.signal.clock = @intCast(value.clock_hz);

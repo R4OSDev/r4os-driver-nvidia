@@ -1577,7 +1577,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         context_display_present, context_display_present_timeout, context_display_present_fault,
         context_display_present_initial_timeout, context_display_present_initial_fault, context_display_present_initial_release,
         context_display_present_initial_acquire, context_display_present_initial_retry,
-        context_native_unknown, context_native_connected, context_native_jobs, context_native_job_timeout, context_native_prepare_reject,
+        context_native_unknown, context_native_connected, context_native_dp, context_native_jobs, context_native_job_timeout, context_native_prepare_reject,
         context_native_flip_irq_timeout, context_native_flip_notifier_timeout, context_native_flip_release_timeout,
         context_native_frame_timeout,
         context_native_cursor_timeout, context_native_cursor_reject,
@@ -3364,6 +3364,7 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
     captured.original_boot = DeviceModel.boot_info;
     captured.boot.read = .{ .lease = .{ .id = 2991, .generation = 1 }, .cpu_address = @intFromPtr(&NativeCommon.pixels), .byte_length = NativeCommon.pixels.len };
     var scanout = vectors.bootFixture(65, 20);
+    if (NativeCommon.is("context_native_dp")) @import("gsp_dp_link_test.zig").scanout(&scanout);
     scanout.instance_control = original_scanout.?.instance_control; scanout.instance_address = original_scanout.?.instance_address;
     for (&scanout.windows) |*entry| entry.core[0] = 15;
     captured.scanout_original = scanout;
@@ -3377,10 +3378,11 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
     vectors.outputFixture(&run.outputs.data, run.epoch, run.graph.?.reservation.client);
     run.output_generation = run.outputs.data.generation;
     run.receiver_events = .{ .epoch = run.epoch, .not_before_ns = clock + std.time.ns_per_s }; run.outputs.invalidated = false;
-    if (NativeCommon.is("context_native_connected") or NativeCommon.hasModes()) try @import("gsp_receiver_mode_test.zig").install(&run.outputs.data.receivers[0]);
+    if (NativeCommon.is("context_native_connected") or NativeCommon.is("context_native_dp") or NativeCommon.hasModes()) try @import("gsp_receiver_mode_test.zig").install(&run.outputs.data.receivers[0]);
+    if (NativeCommon.is("context_native_dp")) @import("gsp_dp_link_test.zig").receiver(&run.outputs.data);
     try target.native_output.request(&target.ctx.?, run, captured);
-    if (NativeCommon.is("context_native_connected")) {
-        @import("gsp_hdmi_audio_test.zig").install(&run.outputs.data.receivers[0].report);
+    if (NativeCommon.is("context_native_connected") or NativeCommon.is("context_native_dp")) {
+        @import("gsp_display_audio_test.zig").install(&run.outputs.data.receivers[0].report);
         target.native_output.audio.attach(&target.catalog, .{ .bus_kind = 1, .bus = 0, .device = 0, .function = 1,
             .vendor_id = 0x10de, .device_id = 0x228e, .class_code = 4, .subclass = 3, .prog_if = 0 });
     }
@@ -3396,7 +3398,7 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
         .{ scenario, @errorName(err), checkpoint, steps, @tagName(target.phase), target.failure, @tagName(target.native_output.phase),
             target.native_output.failed_phase, target.native_output.last_status });
     while (target.phase == .ready and target.native_output.phase != .active and steps < 1200) : (steps += 1) {
-        clock += 1000;
+        clock += if (NativeCommon.is("context_native_dp")) 100_000 else 1000;
         _ = target.step();
         if (target.phase != .ready) break;
         if (NativeCommon.is("context_native_mode_retire") and target.native_output.phase == .instance_allocate) {
@@ -3479,7 +3481,7 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
     try t.expect(steps < 1200 and !copy.shadow_cpu and
         copy.shadow_creates == @as(usize, if (early_mode_failure) 0 else 1) and
         NativeCommon.prepares == @as(usize, if (early_mode_failure) 0 else 1));
-    const success = NativeCommon.is("context_native_unknown") or NativeCommon.is("context_native_connected") or NativeCommon.hasModes() or
+    const success = NativeCommon.is("context_native_unknown") or NativeCommon.is("context_native_connected") or NativeCommon.is("context_native_dp") or NativeCommon.hasModes() or
         NativeCommon.flipFailure() or NativeCommon.is("context_native_frame_timeout") or NativeCommon.cursorCase();
     if (success) {
         try t.expect(target.phase == .ready and target.native_output.phase == .active and NativeCommon.commits == 1 and captured.boot.native_adopted);
@@ -3487,7 +3489,7 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
         var stale = DeviceModel.boot_info; stale.generation += 1;
         try t.expect(!target.native_output.ownsNative(stale));
         const flags = NativeCommon.publication.info.flags;
-        try t.expect((flags & a.gfx_output_flag_connected != 0) == (NativeCommon.is("context_native_connected") or NativeCommon.hasModes()));
+        try t.expect((flags & a.gfx_output_flag_connected != 0) == (NativeCommon.is("context_native_connected") or NativeCommon.is("context_native_dp") or NativeCommon.hasModes()));
         try t.expect((flags & a.gfx_output_flag_connection_unknown != 0) ==
             (NativeCommon.is("context_native_unknown") or NativeCommon.flipFailure() or NativeCommon.is("context_native_frame_timeout") or NativeCommon.cursorCase()));
         try t.expect(NativeCommon.publication.info.limits.flags == 0 and NativeCommon.publication.info.mode_count == 1);
@@ -3514,6 +3516,17 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
             try checkNativeFlip(target);
             checkpoint = "replacement image";
             try checkPresentationReplacement(target);
+        }
+        if (NativeCommon.is("context_native_dp")) {
+            checkpoint = "DP-SST audio and scanout";
+            const completed = run.display_images[target.native_output.mode.?.window].?.link.?;
+            try t.expect(completed.complete() and completed.dp.?.config.lanes == 4 and completed.dp.?.config.rate == 30);
+            try t.expect(NativeCommon.publication.info.connector_kind == a.gfx_output_kind_displayport);
+            try pumpNativeAudio(target);
+            try t.expect(CatalogModel.audio.?.state == a.gfx_audio_route_ready and CatalogModel.audio.?.eld[5] & 15 == 4);
+            try checkReceiverModeSwitch(target);
+            try checkNativeAudio(target);
+            try checkNativeFlip(target);
         }
         checkpoint = "common Present framepool";
         try checkNativeFrames(target, false);
@@ -3570,7 +3583,7 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
                 current.source_clock_hz == 600000000 and current.min_bandwidth_kbps == 123456);
             try t.expectEqualSlices(usize, &.{ 1, 1, 2, 2, 0 }, &NativeCommon.mode_requests);
         }
-        if (NativeCommon.is("context_native_connected")) {
+        if (NativeCommon.is("context_native_connected") or NativeCommon.is("context_native_dp")) {
             checkpoint = "display detach receipts";
             try checkNativeDetach(target);
             checkpoint = "product hotplug lifecycle";
@@ -3604,8 +3617,9 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
         try t.expect(!target.native_output.ownsNative(DeviceModel.boot_info));
     }
     checkpoint = "stop";
+    const released_before_stop = native.released;
     _ = target.stop();
-    try t.expect(native.released == @as(u32, if (NativeCommon.is("context_native_connected")) 5 else if (NativeCommon.is("context_native_jobs")) 6 else if (NativeCommon.is("context_native_unknown")) 4 else 0) and display.released == 0 and !NativeCommon.published);
+    try t.expect(native.released == @as(u32, if (NativeCommon.is("context_native_dp")) released_before_stop else if (NativeCommon.is("context_native_connected")) 5 else if (NativeCommon.is("context_native_jobs")) 6 else if (NativeCommon.is("context_native_unknown")) 4 else 0) and display.released == 0 and !NativeCommon.published);
 }
 fn checkNativeDetach(target: *@import("gsp_device.zig").Device) !void {
     const run = &target.running; const product = &target.native_output;
@@ -3725,8 +3739,8 @@ fn checkNativeHotplug(target: *@import("gsp_device.zig").Device, resize: bool) !
         capture.bytes[127] = 0 -% sum;
         try @import("gsp_receiver.zig").edid.parse(capture.bytes[0..capture.edid_bytes], &capture.report);
         try t.expect(capture.report.complete() and capture.report.mode_count == 1);
-        @import("gsp_hdmi_audio_test.zig").install(&capture.report);
-        @import("gsp_hdmi_audio_test.zig").install(&run.outputs.data.receivers[0].report);
+        @import("gsp_display_audio_test.zig").install(&capture.report);
+        @import("gsp_display_audio_test.zig").install(&run.outputs.data.receivers[0].report);
     }
     const table_owner = run.display_resources_slot.owner.?;
     const count = table_owner.table.count; const released = vm.released;
@@ -3755,26 +3769,26 @@ fn checkNativeHotplug(target: *@import("gsp_device.zig").Device, resize: bool) !
     const old_offset = note.offset;
     try run.flipDisplayPresentationImage(spare, clock + std.time.ns_per_s);
     for (0..8) |_| {
-        clock += 1000; _ = target.step();
+        clock += if (NativeCommon.is("context_native_dp")) 100_000 else 1000; _ = target.step();
         if (run.display_flip.?.window.phase == .submitted) break;
     }
     try t.expect(run.display_flip.?.window.phase == .submitted);
     try copy.enqueuePresent(0, 0, 1, 1);
     const completed = copy.completed;
-    try devicePost(target, false, false);
-    clock += 1000; _ = target.step();
+    try devicePost(target, NativeCommon.is("context_native_dp"), false);
+    clock += if (NativeCommon.is("context_native_dp")) 100_000 else 1000; _ = target.step();
     try t.expect(target.phase == .ready and run.display_paused and product.hotplug.phase == .drain and
         CatalogModel.audio.?.state == a.gfx_audio_route_pending and CatalogModel.audio.?.eld_bytes == 0);
     const flip_user = try push.userBase(.window, mode.window);
     dm.words[(flip_user + 4) / 4] = dm.words[flip_user / 4];
     words[note.offset / 4] = 1 << 30; words[note.offset / 4 + 2] = 901;
-    clock += 1000; _ = target.step();
+    clock += if (NativeCommon.is("context_native_dp")) 100_000 else 1000; _ = target.step();
     try t.expect(run.display_flip != null and run.display_images[mode.window].?.image.dma == spare and run.flip_visible == visible);
     words[old_offset / 4] = 2 << 30;
     checkpoint = "detach";
     var held_stop = false;
     for (0..100) |_| {
-        clock += 1000; _ = target.step();
+        clock += if (NativeCommon.is("context_native_dp")) 100_000 else 1000; _ = target.step();
         try t.expect(target.phase == .ready and table_owner.table.count == count and vm.released == released);
         if (product.hotplug.phase == .receiver_wait) break;
         if (run.activeChannel()) |channel| if (channel.phase == .waiting) { try replyNativeProduct(target); continue; };
@@ -3828,10 +3842,10 @@ fn checkNativeHotplug(target: *@import("gsp_device.zig").Device, resize: bool) !
     for (0..500) |_| {
         if (!interrupted and resize and product.hotplug.phase == .source_clear) {
             try t.expect(product.hotplug.source_map.lease.id != 0 and product.hotplug.source.reference.id != 0);
-            try devicePost(target, false, false);
+            try devicePost(target, NativeCommon.is("context_native_dp"), false);
             interrupted = true;
         }
-        clock += 1000; _ = target.step();
+        clock += if (NativeCommon.is("context_native_dp")) 100_000 else 1000; _ = target.step();
         try t.expect(target.phase == .ready);
         if (!resize) try t.expect(table_owner.table.count == count and vm.released == released);
         if (interrupted and !restarted and product.hotplug.phase == .receiver_wait) {
@@ -3847,7 +3861,7 @@ fn checkNativeHotplug(target: *@import("gsp_device.zig").Device, resize: bool) !
             // Queue the HPD before the modeled RPC reply, with its own wire
             // sequence. Two unread fixture packets cannot share rx_sequence.
             if (!interrupted and !resize and product.hotplug.phase == .query_wait and run.mode_control_active) {
-                try devicePost(target, false, false); interrupted = true;
+                try devicePost(target, NativeCommon.is("context_native_dp"), false); interrupted = true;
             } else try replyNativeProduct(target);
             continue;
         };
@@ -5197,7 +5211,7 @@ fn checkReceiverModeSwitch(target: *@import("gsp_device.zig").Device) !void {
     try run.validateDisplayLink();
     try pumpReceiverImage(target);
     const current = (try run.displayImageStatus(root, plan.window)).?;
-    try t.expect(current.boot_mode != null and std.meta.eql(current.boot_mode.?, plan) and current.link.?.acknowledged == 7 and
+    try t.expect(current.boot_mode != null and std.meta.eql(current.boot_mode.?, plan) and current.link.?.complete() and
         current.link.?.receipt > previous.link.?.receipt and current.core_point > previous.core_point and current.window_point > previous.window_point and
         current.position.?.sequence > previous.position.?.sequence);
     try t.expect(current.mode_receipt == checked.receipt);
@@ -5212,7 +5226,7 @@ fn pumpReceiverImage(target: *@import("gsp_device.zig").Device) !void {
     const push = @import("gsp_display_push.zig");
     const plan = run.display_work.?.boot_mode.?;
     for (0..160) |_| {
-        clock += 1000; _ = target.step();
+        clock += if (NativeCommon.is("context_native_dp")) 100_000 else 1000; _ = target.step();
         try t.expect(target.phase == .ready);
         if (run.display_work == null) break;
         const channel = run.activeChannel().?;
@@ -5331,16 +5345,28 @@ fn replyNativeProduct(target: *@import("gsp_device.zig").Device) !void {
         }
     } else if (run.display_work) |*work| {
         const link = &work.link.?;
-        const bytes = try @import("gsp_hdmi_link_test.zig").reference(link.operation, link.plan);
-        @memcpy(response[24..rpc.request.len], bytes[24..]);
-        if (link.operation == .gcp and NativeCommon.is("context_native_link_reject")) outputWord(&response, 12, 0x57);
+        if (link.dp) |*dp| {
+            try t.expect(!link.readyScanout() and work.core.phase == .prepare and work.window.?.phase == .prepare);
+            @import("gsp_dp_link_test.zig").respond(dp, response[0..rpc.request.len], false);
+        } else {
+            const bytes = try @import("gsp_hdmi_link_test.zig").reference(link.hdmi.?.operation, link.hdmi.?.plan);
+            @memcpy(response[24..rpc.request.len], bytes[24..]);
+            if (link.hdmi.?.operation == .gcp and NativeCommon.is("context_native_link_reject")) outputWord(&response, 12, 0x57);
+        }
     } else if (run.audio_work) |*work| {
-        const expected = @import("gsp_hdmi_audio_test.zig").reference(work.operation);
-        try t.expectEqualSlices(u8, expected[24..], rpc.request[24..]);
+        if (!work.plan.mode.displayPort()) {
+            const expected = @import("gsp_display_audio_test.zig").reference(work.operation);
+            try t.expectEqualSlices(u8, expected[24..], rpc.request[24..]);
+        } else {
+            const tag: ?u32 = switch (work.operation) { .mute => 10, .unmute => 11, .disable => 12, .enable => 13, else => null };
+            if (tag) |id| try t.expectEqualSlices(u8, @import("gsp_dp_link_test.zig").reference(id)[24..], rpc.request[24..]);
+            if (work.operation == .publish) try t.expect(rpc.request[41] & 15 == 4);
+        }
         if (work.operation == .publish and CatalogModel.audio_reject) {
             outputWord(&response, 12, 0x57);
         } else switch (work.operation) {
             .mute => CatalogModel.audio_muted = true,
+            .disable, .enable => {},
             .clear => CatalogModel.audio_eld = @splat(0),
             .publish => @memcpy(&CatalogModel.audio_eld, rpc.request[36..132]),
             .unmute => CatalogModel.audio_muted = false,
@@ -6258,7 +6284,7 @@ fn pumpDisplayLink(target: *@import("gsp_device.zig").Device, deadline: u64, pha
         _ = target.step();
         if (target.phase != .ready or rpc.phase != .waiting) continue;
         var response: [link_api.max_bytes]u8 = undefined;
-        const reference = try @import("gsp_hdmi_link_test.zig").reference(link.operation, link.plan);
+        const reference = try @import("gsp_hdmi_link_test.zig").reference(link.hdmi.?.operation, link.hdmi.?.plan);
         @memcpy(response[0..reference.len], reference);
         outputWord(&response, 0, link.plan.object.client); outputWord(&response, 4, link.plan.object.display);
         try t.expectEqualSlices(u8, response[0..reference.len], rpc.request);
@@ -6279,11 +6305,11 @@ fn pumpDisplayLink(target: *@import("gsp_device.zig").Device, deadline: u64, pha
         if (phase == .before_scanout and model.is("context_display_image_link_stale")) {
             running.outputs.data.generation += 1; _ = target.step(); break;
         }
-        if ((link.operation == .enable and model.is("context_display_image_link_reject")) or
-            (link.operation == .gcp and model.is("context_display_image_link_late_reject"))) outputWord(&response, 12, 0x57);
+        if ((link.hdmi.?.operation == .enable and model.is("context_display_image_link_reject")) or
+            (link.hdmi.?.operation == .gcp and model.is("context_display_image_link_late_reject"))) outputWord(&response, 12, 0x57);
         std.mem.writeInt(u32, backing.?[init.queues_offset + init.status_offset + 64..][0..4], session.tx_write, .little);
         try nativeReply(session, link_api.function, 0, response[0..reference.len]);
-        if (link.operation == .gcp and model.is("context_display_image_link_ack")) range_failure_call = range_calls + 4;
+        if (link.hdmi.?.operation == .gcp and model.is("context_display_image_link_ack")) range_failure_call = range_calls + 4;
         _ = target.step();
         if (target.phase == .ready) try t.expect(link.acknowledged == prior + 1 and link.last_receipt != 0 and !link.pending);
         if (target.phase == .ready and link.phase == .complete and model.is("context_display_image_link_fault")) {
