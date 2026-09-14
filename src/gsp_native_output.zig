@@ -77,6 +77,7 @@ pub const Owner = struct {
     frame_count: u8 = 2,
     statistics: @import("gsp_frame_stats.zig").Owner = .{},
     color: @import("gsp_output_color.zig").Owner = .{},
+    refresh: @import("gsp_native_refresh.zig").Owner = .{},
     output_fault_reported: [8]bool = @splat(false),
 
     /// Explicit mode=native only. Check the common handoff API before the
@@ -400,6 +401,8 @@ pub const Owner = struct {
                 self.ctx.?.logInfo("NVIDIA native-output: state=software-native boot-mode=retained shadow=system scanout=vram completion=CE,WIMM,Window,Core link=confirmed common-handoff=confirmed");
             },
             .active => {
+                if (try self.refresh.step(self)) return true;
+                if (self.refresh.busy()) return false;
                 if (self.reportOutputFault()) return true;
                 if (try self.additional.failedJobs(self)) return true;
                 if (run.output_faults[self.mode.?.window]) |err| {
@@ -549,6 +552,7 @@ pub const Owner = struct {
     }
     pub fn quarantine(self: *Owner, err: anyerror) void {
         if (self.phase == .detached) return;
+        self.refresh.lost(self);
         self.additional.quarantine(self);
         self.cursor.quarantine(self, err);
         self.audio.quarantine(self, err);

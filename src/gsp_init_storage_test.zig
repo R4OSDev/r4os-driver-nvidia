@@ -3127,6 +3127,28 @@ const NativeCommon = struct {
     var cursor_reply_busy = false;
     var color_publications: u32 = 0;
     var color_state: a.GfxOutputColorState = .{};
+    var refresh_state: ?a.GfxOutputRefresh = null;
+    var refresh_intent: a.GfxRefreshRequest = .{};
+    var refresh_reject: ?@import("gsp_vrr_control.zig").Phase = null;
+    var refresh_stale = false;
+    fn publishRefresh(input: *const a.GfxOutputRefresh) callconv(.c) i32 {
+        std.debug.assert(input.version == 1 and input.size == 272 and input.target.display_generation != 0);
+        if (input.status.phase == a.gfx_refresh_phase_active)
+            std.debug.assert(input.status.core_point != 0 and input.status.receipt != 0 and input.capabilities.flags & a.gfx_refresh_cap_capable != 0);
+        refresh_state = input.*;
+        return a.gfx_output_ok;
+    }
+    fn readRefresh(input: *const a.GfxOutputTarget, output: *a.GfxRefreshRequest) callconv(.c) i32 {
+        std.debug.assert(output.version == 1 and output.size == 88);
+        if (!std.meta.eql(refresh_intent.target, input.*)) {
+            output.* = .{ .target = input.* }; return a.gfx_output_ok;
+        }
+        if (refresh_intent.deadline_ns != 0 and clock >= refresh_intent.deadline_ns) {
+            refresh_intent = .{ .target = input.*, .sequence = refresh_intent.sequence + 1 };
+        }
+        output.* = refresh_intent;
+        return a.gfx_output_ok;
+    }
     var scenario: []const u8 = "";
     fn is(name: []const u8) bool {
         return std.mem.eql(u8, scenario, name) or (std.mem.eql(u8, name, "context_native_connected") and
@@ -3504,6 +3526,8 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
     NativeCommon.cursor_info = null; NativeCommon.cursor_job = null; NativeCommon.cursor_taken = false;
     NativeCommon.cursor_receipt = null; NativeCommon.cursor_reply_busy = false;
     NativeCommon.color_publications = 0; NativeCommon.color_state = .{};
+    NativeCommon.refresh_state = null; NativeCommon.refresh_intent = .{};
+    NativeCommon.refresh_reject = null; NativeCommon.refresh_stale = false;
     for (&NativeCommon.pixels, 0..) |*byte, i| byte.* = @truncate(i * 17 + 23);
     table.gfx_output_query = NativeCommon.outputs; table.gfx_display_query = NativeCommon.display;
     captured.boot.display = target.ctx.?.graphicsDisplay();
@@ -3681,7 +3705,7 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
             try checkNativeFlip(target);
         }
         checkpoint = "common Present framepool";
-        try checkNativeFrames(target, false);
+        if (NativeCommon.is("context_native_connected")) try checkNativeVrr(target) else try checkNativeFrames(target, false);
         if (NativeCommon.is("context_native_frame_timeout")) {
             try t.expect(target.phase == .recovering and native.released == 0 and display.released == 0 and !NativeCommon.published);
             _ = target.stop(); return;
@@ -4418,6 +4442,165 @@ fn pumpCursorCommit(target: *@import("gsp_device.zig").Device) !void {
     clock += 1000; _ = target.step();
     try t.expect(target.phase == .ready and run.display_work == null);
 }
+fn checkNativeVrr(target: *@import("gsp_device.zig").Device) !void {
+    const run = &target.running;
+    const product = &target.native_output;
+    const control = @import("gsp_vrr_control.zig");
+    const display = @import("gsp_display_test_model.zig").Model;
+    const product_mode = product.mode.?;
+    const mode = run.display_images[product_mode.window].?.boot_mode.?;
+    const user = try @import("gsp_display_push.zig").userBase(.core, 0);
+    const receiver = &run.outputs.data.receivers[0];
+    const original = receiver.report.refresh;
+    defer receiver.report.refresh = original;
+    // Only this modeled receiver advertises VRR. Real EDID parsing is checked
+    // by the existing shared receiver group; ordinary fixtures stay unchanged.
+    const nominal = (try control.timing(mode)).millihz();
+    receiver.report.refresh.hdmi = .{ .refresh = .{ .min_millihz = nominal / 2, .max_millihz = nominal + 1000 } };
+    const plan = try run.adaptiveRefreshPlan(mode.window);
+    try t.expect(plan.refresh.max_vtotal > mode.signal.total >> 16 and !plan.refresh.lfc);
+    var checkpoint: []const u8 = "start";
+    errdefer |err| std.debug.print("native VRR: {s} at={s} device={s} failure={?} runtime={?} phase={?}\n",
+        .{@errorName(err),checkpoint,@tagName(target.phase),target.failure,run.failure,
+            if (run.display_work) |work| if (work.refresh) |refresh| @as(?control.Phase, refresh.control.phase) else null else null});
+    for ([_]bool{true, false}) |enabled| {
+        checkpoint = if (enabled) "enable" else "disable";
+        const image = run.display_images[mode.window].?;
+        const audio = CatalogModel.audio;
+        const sequence = try run.beginAdaptiveRefresh(product.core.?, mode.window, enabled, clock + std.time.ns_per_s);
+        try t.expect(run.anyAdaptiveRefresh() != enabled);
+        run.display_work.?.core.config.refresh_control.?.timeout_us ^= 1;
+        try t.expectError(error.Stale, run.validateAdaptiveRefresh());
+        run.display_work.?.core.config.refresh_control.?.timeout_us ^= 1;
+        var core_completed = false;
+        var rpc_count: usize = 0;
+        for (0..100) |_| {
+            clock += 1000; _ = target.step();
+            try t.expect(target.phase == .ready);
+            if (run.display_work == null) break;
+            try t.expect(run.anyAdaptiveRefresh() != enabled);
+            if (run.activeChannel().?.phase == .waiting) {
+                try replyNativeProduct(target); rpc_count += 1; continue;
+            }
+            const work = &run.display_work.?;
+            if (work.core.phase == .rewind or work.core.phase == .submitted) {
+                display.words[(user + 4) / 4] = display.words[user / 4];
+                if (work.core.phase == .submitted) {
+                    clock += 1000; _ = target.step();
+                    try t.expect(run.display_work != null and run.anyAdaptiveRefresh() != enabled);
+                    const note: *u32 = @ptrFromInt(work.core.notifier.cpu.cpu_address);
+                    note.* = 2 << 30; core_completed = true;
+                }
+            }
+        }
+        try t.expect(run.display_work == null and core_completed and rpc_count == (if (enabled) @as(usize, 6) else 7));
+        const result = run.refresh_results[mode.window].?;
+        try t.expect(result.sequence == sequence and result.enabled == enabled and result.core_point != 0 and result.receipt != 0 and
+            run.anyAdaptiveRefresh() == enabled and std.meta.eql(image, run.display_images[mode.window].?) and std.meta.eql(audio, CatalogModel.audio));
+        if (enabled) {
+            checkpoint = "fixed Core interlock";
+            try t.expectError(error.Busy, run.commitDisplayCore(product.core.?, clock + std.time.ns_per_s));
+            checkpoint = "ordinary adaptive frames";
+            try deliverNativeHead(target, true);
+            _ = try run.step();
+            try checkNativeFrames(target, false);
+            try t.expect(run.anyAdaptiveRefresh() and std.meta.eql(product_mode, product.mode.?));
+        }
+    }
+    try checkNativeVrrBridge(target);
+}
+fn checkNativeVrrBridge(target: *@import("gsp_device.zig").Device) !void {
+    const product = &target.native_output;
+    const run = &target.running;
+    const window = product.mode.?.window;
+    const output = run.presentation_targets[window].?;
+    const previous_table = product.outputs.?.table;
+    defer product.outputs.?.table = previous_table;
+    const previous_events = run.receiver_events;
+    const previous_hotplug = product.hotplug;
+    defer {
+        // The stale-reply case injects only a generation change, without a
+        // receiver discovery. Restore that isolated stimulus before the
+        // subsequent complete hotplug/audio lifecycle exercises discovery.
+        run.receiver_events = previous_events;
+        product.hotplug = previous_hotplug;
+    }
+    product.outputs.?.table.refresh_publish = @intFromPtr(&NativeCommon.publishRefresh);
+    product.outputs.?.table.refresh_read = @intFromPtr(&NativeCommon.readRefresh);
+    const cases = [_]struct { policy: u32 = 0, scene: u32 = 0, operation: u32 = 0, active: bool = false, phase: u32 = 0 }{
+        .{ .policy = 2, .scene = 2, .active = true, .phase = a.gfx_refresh_phase_active },
+        .{ .policy = 2, .scene = 6 },
+        .{ .policy = 2, .scene = 2, .active = true, .phase = a.gfx_refresh_phase_active },
+        .{ .operation = a.gfx_refresh_operation_flicker, .phase = a.gfx_refresh_phase_faulted },
+        .{ .operation = a.gfx_refresh_operation_clear_fault },
+        .{ .policy = 2, .scene = 2, .active = true, .phase = a.gfx_refresh_phase_active },
+        .{},
+        .{ .policy = 2, .scene = 2, .phase = a.gfx_refresh_phase_faulted },
+        .{ .operation = a.gfx_refresh_operation_clear_fault },
+        .{ .policy = 2, .scene = 2, .phase = a.gfx_refresh_phase_faulted },
+        .{ .operation = a.gfx_refresh_operation_clear_fault },
+        .{ .policy = 2, .scene = 2, .phase = a.gfx_refresh_phase_faulted },
+        .{ .operation = a.gfx_refresh_operation_clear_fault },
+    };
+    for (cases, 0..) |case, index| {
+        NativeCommon.refresh_intent = .{ .target = output, .sequence = index + 1, .policy = case.policy,
+            .scene = case.scene, .operation = case.operation, .deadline_ns = clock + std.time.ns_per_s };
+        if (index == 6) {
+            // Kernel intent expiry is copied as off. It does not forge the
+            // following disable's hardware/Core completion.
+            NativeCommon.refresh_intent.policy = 2; NativeCommon.refresh_intent.scene = 2;
+            NativeCommon.refresh_intent.deadline_ns = clock + 1000;
+        }
+        if (index == 7) NativeCommon.refresh_reject = .pstate_initial;
+        if (index == 9) NativeCommon.refresh_reject = .disarm;
+        if (index == 11) NativeCommon.refresh_stale = true;
+        const prior_image = run.display_images[window];
+        const prior_audio = CatalogModel.audio;
+        // Exercise a new callback delivery immediately; periodic renew and
+        // lease arithmetic are covered by the existing kernel lifetime test.
+        product.refresh.entries[window].read_after_ns = 0;
+        var completed = false;
+        var waiting_seen = false;
+        for (0..200) |_| {
+            clock += 1000; _ = target.step();
+            try t.expect(target.phase == .ready);
+            if (run.display_work) |*work| if (work.refresh != null) {
+                waiting_seen = true;
+                if (run.activeChannel().?.phase == .waiting) { try replyNativeProduct(target); continue; }
+                if (work.core.phase == .rewind or work.core.phase == .submitted) {
+                    const display = @import("gsp_display_test_model.zig").Model;
+                    const user = try @import("gsp_display_push.zig").userBase(.core, 0);
+                    display.words[(user + 4) / 4] = display.words[user / 4];
+                    if (work.core.phase == .submitted) {
+                        const note: *u32 = @ptrFromInt(work.core.notifier.cpu.cpu_address);
+                        note.* = 2 << 30;
+                    }
+                }
+            };
+            if (NativeCommon.refresh_state) |state| if (state.status.request_sequence == NativeCommon.refresh_intent.sequence and
+                state.status.phase == case.phase and run.anyAdaptiveRefresh() == case.active and !product.refresh.busy()) {
+                completed = true; break;
+            };
+        }
+        if (!completed) std.debug.print("native VRR bridge case={d} device={s} wanted-phase={d} state={?} pending={?} fault={s}\n",
+            .{index,@tagName(target.phase),case.phase,if (NativeCommon.refresh_state) |state| @as(?a.GfxRefreshStatus,state.status) else null,
+                product.refresh.pending,@tagName(run.refresh_clocks[window].scheduler.fault)});
+        try t.expect(completed and (case.operation == a.gfx_refresh_operation_clear_fault or waiting_seen));
+        const state = NativeCommon.refresh_state.?;
+        try t.expect(state.capabilities.flags & a.gfx_refresh_cap_capable != 0 and
+            state.capabilities.flags & (a.gfx_refresh_cap_independent_heads | a.gfx_refresh_cap_lfc) == 0);
+        if (index == 1) try t.expect(state.status.reason == a.gfx_refresh_reason_capture);
+        if (index == 3) try t.expect(state.status.reason == a.gfx_refresh_reason_user_flicker);
+        if (index == 7 or index == 9 or index == 11) {
+            const result = run.refresh_results[window].?;
+            try t.expect(!result.enabled and result.failure != null and result.core_point != 0 and result.receipt != 0 and
+                std.meta.eql(prior_image, run.display_images[window]) and std.meta.eql(prior_audio, CatalogModel.audio));
+            try t.expect(state.status.reason == (if (index == 11) a.gfx_refresh_reason_link_lost else a.gfx_refresh_reason_timing_fault));
+        }
+        if (case.active) { try deliverNativeHead(target, true); _ = try run.step(); }
+    }
+    try t.expect(!run.refresh_quiescing and !run.anyAdaptiveRefresh());
+}
 fn checkNativeFrames(target: *@import("gsp_device.zig").Device, extra: bool) !void {
     const run = &target.running; const product = &target.native_output;
     _ = product.color.step(product);
@@ -4545,6 +4728,11 @@ fn checkNativeFrames(target: *@import("gsp_device.zig").Device, extra: bool) !vo
         }
         checkpoint = "flip";
         const previous_offset = note.offset;
+        if (run.refresh_results[product.mode.?.window]) |refresh| if (refresh.enabled) {
+            const pacing = &run.refresh_clocks[product.mode.?.window];
+            try t.expect(pacing.scheduler.state == .active and pacing.scheduler.observed_ns != 0);
+            clock = @max(clock, pacing.scheduler.observed_ns + refresh.plan.refresh.min_period_ns);
+        };
         // After a mode apply the older mode's Window record can still be
         // BEGUN. Its real modeled FINISHED permits that notifier's reuse;
         // the current image remains BEGUN until the new flip below.
@@ -5573,6 +5761,23 @@ fn replyNativeProduct(target: *@import("gsp_device.zig").Device) !void {
             dm.words[slot.control / 4] = 0x13; dm.words[slot.state / 4] = if (owner.config.kind == .core) 11 << 16 else 4 << 16;
         }
     } else if (run.display_work) |*work| {
+        if (work.refresh) |*refresh| {
+            try t.expect(refresh.control.pending and rpc.deadline == work.deadline and
+                std.mem.eql(u8, refresh.control.request[0..refresh.control.length], rpc.request));
+            try t.expect(refresh.control.plan.mode.transport_hdmi and rpc.function == 76);
+            if (refresh.control.enabled and NativeCommon.refresh_reject != null and refresh.control.phase == NativeCommon.refresh_reject.?) {
+                outputWord(&response, 12, 0x56);
+                NativeCommon.refresh_reject = null;
+            }
+            if (refresh.control.enabled and NativeCommon.refresh_stale) {
+                // Receiver observation changes while its already-sent
+                // control is awaiting a reply; that reply still needs ACK.
+                run.receiver_events.sequence += 1;
+                NativeCommon.refresh_stale = false;
+            }
+            // An actual response traverses the modeled GSP ring and its ACK.
+            // The independent C fixtures check every request field separately.
+        } else {
         const link = &work.link.?;
         if (link.dp) |*dp| {
             try t.expect(!link.readyScanout());
@@ -5592,6 +5797,7 @@ fn replyNativeProduct(target: *@import("gsp_device.zig").Device) !void {
             // controls carry the selected displayId at params+4.
             outputWord(&response, 28, link.plan.mode.signal.display_id);
             if (link.hdmi.?.operation == .gcp and NativeCommon.is("context_native_link_reject")) outputWord(&response, 12, 0x57);
+        }
         }
     } else if (run.audio_work) |*work| {
         if (!work.plan.mode.displayPort()) {

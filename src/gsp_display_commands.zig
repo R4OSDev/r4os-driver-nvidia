@@ -269,6 +269,7 @@ pub const boot_mode = @import("gsp_boot_mode.zig");
 pub const cursor_image = @import("gsp_cursor_image.zig");
 pub const Route = struct { window: u32, head: u32 };
 pub const Point = struct { x: i16 = 0, y: i16 = 0 };
+pub const RefreshControl = struct { head: u32, enabled: bool, timeout_us: u32 };
 pub const Config = struct {
     notifier: u32, windows: u32, initialize: bool,
     kind: Kind = .core,
@@ -284,6 +285,7 @@ pub const Config = struct {
     // Explicit retirement of this route. No image/timing/cursor activation
     // may be mixed with the NULL ISO and SOR owner-mask transaction.
     detach_sor: ?u32 = null,
+    refresh_control: ?RefreshControl = null,
 };
 pub const max_words: usize = 192;
 pub const Program = struct {
@@ -296,7 +298,26 @@ pub const Program = struct {
         @memcpy(self.words[self.count..][0..values.len], values); self.count += @intCast(values.len);
     }
 };
+fn refresh(config: Config, control: RefreshControl) Error!Program {
+    // C67D lightweight update; its caller must arm RM's lightweight
+    // supervisor and serialize this with all other Core/Window mutations.
+    if (config.kind != .core or config.initialize or !config.with_core or config.notifier == 0 or config.notifier_offset != 0 or
+        config.windows == 0 or config.windows & ~@as(u32, 255) != 0 or config.signal != null or config.scanout != null or
+        config.route != null or config.position != null or config.with_position or config.cursor_usage != 0 or config.cursor_image != null or
+        config.detach_sor != null or control.head >= 8 or (control.enabled and (control.timeout_us == 0 or control.timeout_us > 0x3fffff)) or
+        (!control.enabled and control.timeout_us != 0)) return error.Descriptor;
+    var out: Program = .{};
+    const base = control.head * 0x400;
+    try out.method(base + 0x2034, &.{if (control.enabled) @as(u32, 0x1005) else 0x1000}); // LINE_LOCK, no external pin.
+    try out.method(base + 0x21a8, &.{if (control.enabled) (control.timeout_us << 4) | 5 else 0});
+    try out.method(0x20c, &.{0x1000});
+    try out.method(0x218, &.{ 0, 0 });
+    try out.method(0x200, &.{1}); // RELEASE_ELV, then the existing Core notifier.
+    try out.method(0x20c, &.{0});
+    return out;
+}
 pub fn core(config: Config) Error!Program {
+    if (config.refresh_control) |control| return refresh(config, control);
     if (config.kind != .core or config.scanout != null or config.notifier_offset != 0 or config.position != null or config.with_position or !config.with_core) return error.Descriptor;
     if (config.notifier == 0) return error.Handle;
     const cursor_usage = try cursor_image.usageCode(config.cursor_usage);
@@ -398,6 +419,7 @@ pub fn core(config: Config) Error!Program {
     return out;
 }
 pub fn window(config: Config) Error!Program {
+    if (config.refresh_control != null) return error.Descriptor;
     if (config.cursor_image != null or config.cursor_usage != 0) return error.Descriptor;
     if (config.kind != .window or config.notifier == 0 or config.notifier_offset > 16 or config.notifier_offset & 15 != 0 or config.signal != null or config.position != null) return error.Descriptor;
     if (!config.with_core and (config.initialize or config.with_position)) return error.Descriptor;
@@ -448,6 +470,7 @@ pub fn window(config: Config) Error!Program {
     return out;
 }
 pub fn immediate(config: Config) Error!Program {
+    if (config.refresh_control != null) return error.Descriptor;
     if (config.cursor_image != null or config.cursor_usage != 0 or config.detach_sor != null) return error.Descriptor;
     if (config.kind != .immediate or config.notifier != 0 or config.notifier_offset != 0 or config.scanout != null or
         config.signal != null or config.with_position or !config.with_core) return error.Descriptor;

@@ -890,3 +890,14 @@ Red Hat notices are included in `Licenses/NVIDIA-GSP-RUNTIME-LICENSE.txt`,
 also packaged into NVIDIA.R4D and the distribution. The reference archive
 is `Nvidia/0.79.19/render-state-20260913`. Original R4OS cache, job and upload
 ownership retains Apache-2.0. No new firmware or host compiler is embedded.
+
+## Variable refresh (0.79.26)
+
+The HDMI-Forum EMP, DP ignore-MSA, RM pstate/supervisor and C67D refresh
+definitions follow the original MIT NVIDIA570.144 sources at pin
+8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f. Complete original notices are
+retained in Licenses/NVIDIA-GSP-RUNTIME-LICENSE.txt, embedded in NVIDIA.R4D
+and copied byte-for-byte into the distribution. The independent C-generated
+wire fixture and original sources are archived in Nvidia/0.79.26 under the
+workspace GFX references. R4OS policy, ownership, copied metadata and bounded
+rollback remain original Apache-2.0 code; no new firmware is embedded.

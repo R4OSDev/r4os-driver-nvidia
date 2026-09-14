@@ -90,7 +90,10 @@ pub const DisplayLink = struct {
     }
 };
 pub const DisplayAdmission = struct { mode: boot_mode.Plan, link: display_link.Plan, receipt: u64, receiver_sequence: u64 };
-pub const DisplayWork = struct { core: DisplaySubmission, window: ?DisplaySubmission = null, position: ?PositionSubmission = null, deadline: u64, boot_mode: ?boot_mode.Plan = null, mode_receipt: u64 = 0, link: ?display_link.Work = null, cursor: ?CursorCommit = null, detach: ?ActiveDisplayImage = null, admission: ?DisplayAdmission = null };
+pub const refresh_control = @import("gsp_vrr_control.zig");
+pub const RefreshCommit = struct { sequence: u64, receiver_sequence: u64, control: refresh_control.Work, failure: ?anyerror = null };
+pub const RefreshResult = struct { sequence: u64, plan: refresh_control.Plan, enabled: bool, core_point: u64, receipt: u64, failure: ?anyerror = null };
+pub const DisplayWork = struct { core: DisplaySubmission, window: ?DisplaySubmission = null, position: ?PositionSubmission = null, deadline: u64, boot_mode: ?boot_mode.Plan = null, mode_receipt: u64 = 0, link: ?display_link.Work = null, cursor: ?CursorCommit = null, detach: ?ActiveDisplayImage = null, admission: ?DisplayAdmission = null, refresh: ?RefreshCommit = null };
 pub const DisplayRetirement = struct { epoch: u64, image: ActiveDisplayImage, core_point: u64, window_point: u64, observed_ns: u64 };
 pub const cursor_image = @import("gsp_cursor_image.zig");
 pub const CursorCommit = struct { control: cursor_image.Control, sequence: u64, baseline: ?@import("gsp_head_events.zig").Sample = null, completed_ns: u64 = 0 };
@@ -233,6 +236,10 @@ pub const Owner = struct {
     display_resources_slot: DisplayResourcesSlot = .{},
     display_upload_job: ?struct { operation: display_upload.Upload = .{}, channel_handle: ChannelHandle } = null,
     display_work: ?DisplayWork = null,
+    refresh_results: [8]?RefreshResult = @splat(null),
+    refresh_clocks: [8]@import("gsp_refresh_pacing.zig").State = @splat(.{}),
+    refresh_quiescing: bool = false,
+    refresh_sequence: u64 = 0,
     display_flips: [8]?DisplayFlip = @splat(null),
     flip_serials: [8]u64 = @splat(0),
     flip_cursor: u3 = 0,
@@ -1086,6 +1093,10 @@ pub const Owner = struct {
         self.display_work = .{ .core = core, .deadline = deadline };
     }
     fn prepareDisplayCore(self: *Owner, handle: DisplayChannelHandle, deadline: u64) !DisplaySubmission {
+        if (self.anyAdaptiveRefresh()) return error.Busy;
+        return self.prepareDisplayCoreInner(handle, deadline);
+    }
+    fn prepareDisplayCoreInner(self: *Owner, handle: DisplayChannelHandle, deadline: u64) !DisplaySubmission {
         const owner = try self.findDisplayChannel(handle);
         const value = owner.info() orelse return error.State;
         if (value.config.kind != .core) return error.Unsupported;
@@ -1102,6 +1113,123 @@ pub const Owner = struct {
         const root = owner.parent.info() orelse return error.State;
         return .{ .handle = handle, .notifier = note,
             .config = .{ .notifier = note.handle, .windows = root.hardware.windows, .initialize = !owner.ring.initialized } };
+    }
+    pub fn anyAdaptiveRefresh(self: *const Owner) bool {
+        for (&self.refresh_results) |*entry| if (entry.*) |value| if (value.enabled) return true;
+        return false;
+    }
+    pub fn adaptiveRefreshPlan(self: *Owner, window: u32) !refresh_control.Plan {
+        if (window >= 8 or self.outputPaused(window) or self.outputs.invalidated or self.receiver_events.pending or self.receiver_events.capturing) return error.Busy;
+        const active = self.display_images[window] orelse return error.State;
+        const mode = active.boot_mode orelse return error.State;
+        const link = active.link orelse return error.State;
+        _ = try self.headSource(mode.head);
+        const root = if (self.display_engine_owner) |*value| value else return error.State;
+        const info = root.info() orelse return error.State;
+        if (!info.core or !info.instance_bound) return error.Unsupported;
+        return refresh_control.derive(mode, self.display_object orelse return error.State,
+            self.outputs.snapshot() orelse return error.State, link, display_channel.wire.class(.core));
+    }
+    pub fn beginAdaptiveRefresh(self: *Owner, core_handle: DisplayChannelHandle, window: u32, enabled: bool, deadline: u64) !u64 {
+        if (window >= 8 or self.refresh_sequence == std.math.maxInt(u64)) return error.Descriptor;
+        const current = try self.now();
+        const plan = if (enabled) try self.adaptiveRefreshPlan(window) else blk: {
+            const previous = self.refresh_results[window] orelse return error.State;
+            if (!previous.enabled) return error.State;
+            break :blk previous.plan;
+        };
+        if (enabled) if (self.refresh_results[window]) |previous| if (previous.enabled) return error.State;
+        var core = try self.prepareDisplayCoreInner(core_handle, deadline);
+        if (core.config.initialize or core_handle.slot != 0) return error.State;
+        const control = try refresh_control.Work.init(plan, enabled, current, deadline);
+        const target = self.presentation_targets[window] orelse return error.State;
+        _ = try self.refresh_clocks[window].bindTarget(target);
+        try self.refresh_clocks[window].begin(target.display_generation, plan.refresh, enabled, current);
+        core.config.refresh_control = .{ .head = plan.mode.head, .enabled = enabled,
+            .timeout_us = if (enabled) plan.refresh.timeout_us else 0 };
+        self.refresh_sequence += 1;
+        self.display_work = .{ .core = core, .deadline = deadline,
+            .refresh = .{ .sequence = self.refresh_sequence, .receiver_sequence = self.receiver_events.sequence, .control = control } };
+        return self.refresh_sequence;
+    }
+    pub fn quiesceAdaptiveRefresh(self: *Owner) !void {
+        self.refresh_quiescing = true;
+        // Only unsubmitted, already-rendered frames are discarded. Current
+        // scanout, submitted Window uses and their BO owners remain retained.
+        for (0..8) |window| if (self.readyImage(@intCast(window)) != null) {
+            try self.setReadyImage(@intCast(window), null);
+            self.frames_rejected +|= 1; self.output_frames[window].rejected +|= 1;
+        };
+    }
+    fn observeAdaptiveRefresh(self: *Owner, current: u64) void {
+        for (&self.refresh_clocks, 0..) |*pacing, window| {
+            const target = self.presentation_targets[window] orelse continue;
+            const image = self.display_images[window] orelse continue;
+            if (image.boot_mode == null) continue;
+            const rebound = pacing.bindTarget(target) catch { pacing.fault(.timing_fault); continue; };
+            if (rebound) self.refresh_results[window] = null;
+            const source = self.headSource(image.head) catch continue;
+            if (source.snapshot()) |sample| pacing.observe(sample);
+            pacing.checkClock(current);
+        }
+    }
+    pub fn validateAdaptiveRefresh(self: *Owner) !void {
+        const work = if (self.display_work) |*value| value else return error.State;
+        const refresh = if (work.refresh) |*value| value else return error.State;
+        const control = &refresh.control;
+        if (work.window != null or work.position != null or work.link != null or work.cursor != null or work.detach != null or
+            work.boot_mode != null or work.admission != null or work.mode_receipt != 0 or work.deadline != control.deadline or
+            control.plan.object.epoch != self.epoch or control.plan.mode.window >= 8 or work.core.handle.slot != 0 or
+            !std.meta.eql(control.plan.object, self.display_object orelse return error.Stale)) return error.Stale;
+        const current = self.display_images[control.plan.mode.window] orelse return error.Stale;
+        if (!std.meta.eql(current.boot_mode, @as(?boot_mode.Plan, control.plan.mode)) or current.head != control.plan.mode.head) return error.Stale;
+        if (!control.enabled and refresh.failure == null) {
+            const previous = self.refresh_results[control.plan.mode.window] orelse return error.Stale;
+            if (!previous.enabled or !std.meta.eql(previous.plan, control.plan)) return error.Stale;
+        }
+        if (refresh.sequence == 0 or refresh.sequence != self.refresh_sequence or
+            (control.phase == .core and !control.supervisor_armed)) return error.Stale;
+        const expected: display_channel.push.commands.Config = .{ .notifier = work.core.notifier.handle,
+            .windows = work.core.config.windows, .initialize = false,
+            .refresh_control = .{ .head = control.plan.mode.head, .enabled = control.enabled,
+                .timeout_us = if (control.enabled) control.plan.refresh.timeout_us else 0 } };
+        if (!std.meta.eql(expected, work.core.config)) return error.Stale;
+        _ = try display_channel.push.commands.encode(expected);
+    }
+    pub fn adaptiveReceiverCurrent(self: *Owner) bool {
+        const work = if (self.display_work) |*value| value else return false;
+        const refresh = if (work.refresh) |*value| value else return false;
+        if (!refresh.control.enabled) return true;
+        if (refresh.receiver_sequence != self.receiver_events.sequence) return false;
+        const fresh = self.adaptiveRefreshPlan(refresh.control.plan.mode.window) catch return false;
+        return std.meta.eql(fresh, refresh.control.plan);
+    }
+    fn rollbackAdaptiveRefresh(self: *Owner, reason: anyerror, current: u64) !void {
+        try self.validateAdaptiveRefresh();
+        const work = &self.display_work.?;
+        const previous = work.refresh.?;
+        const channel = &self.channel.?;
+        if (!previous.control.enabled or previous.failure != null or channel.phase != .idle or channel.pending != null or
+            channel.in_lockdown or (work.core.phase != .prepare and work.core.phase != .complete)) return reason;
+        const deadline = try std.math.add(u64, current, 3 * std.time.ns_per_s);
+        try channel.guard(deadline);
+        var cleanup = try refresh_control.Work.init(previous.control.plan, false, current, deadline);
+        // Finish a possibly armed old supervisor before the independent
+        // disable sequence arms it again. At most one rollback is allowed.
+        if (previous.control.supervisor_armed or previous.control.phase == .arm) {
+            cleanup.cleanup_disarm = true; cleanup.phase = .disarm;
+        }
+        const core: DisplaySubmission = .{ .handle = work.core.handle, .notifier = work.core.notifier,
+            .config = .{ .notifier = work.core.notifier.handle, .windows = work.core.config.windows, .initialize = false,
+                .refresh_control = .{ .head = cleanup.plan.mode.head, .enabled = false, .timeout_us = 0 } } };
+        work.* = .{ .core = core, .deadline = deadline, .refresh = .{ .sequence = previous.sequence,
+            .receiver_sequence = previous.receiver_sequence, .control = cleanup, .failure = reason } };
+        const pacing = &self.refresh_clocks[cleanup.plan.mode.window];
+        pacing.scheduler.fault = if (reason == error.Stale) .link_lost else .timing_fault;
+        pacing.scheduler.reason = pacing.scheduler.fault;
+        pacing.scheduler.state = .disabling;
+        pacing.since_ns = current;
+        self.log("NVIDIA refresh: enable-failed={s} sequence={d} fixed-rollback=pending", .{@errorName(reason),previous.sequence});
     }
     /// Reserve cursor fetch bandwidth before channels can become active.
     /// An IMP rejection can retry the boot mode once with a software cursor.
@@ -1514,6 +1642,7 @@ pub const Owner = struct {
         const entry = try self.findPresentationImage(dma);
         const window_index = entry.window.slot - 1;
         const current = self.currentPresentation(window_index) orelse return error.State;
+        if (!self.refresh_clocks[window_index].allowFrame(try self.now())) return error.Busy;
         if (self.outputPaused(window_index) or self.displayFlip(window_index) != null or !self.validPresentation(current)) return error.Busy;
         if (self.readyImage(window_index)) |ready| if (ready.image.surface.scanout.?.dma != dma) return error.Busy;
         if (!self.preparedPresentation(entry) or (entry.initial_point == 0 and entry.direct == null) or entry.initial_failure != null) return error.Stale;
@@ -2723,6 +2852,7 @@ pub const Owner = struct {
     /// Take the canonical job directly from the common queue. No caller can
     /// supply source addresses, completion points or edited job extents.
     pub fn beginCopyWork(self: *Owner, handle: ChannelHandle, binding: r4os.abi.GfxBackendBinding, deadline: u64) !bool {
+        if (self.refresh_quiescing) return error.Busy;
         const fifo = try self.findChannel(handle);
         const value = fifo.info() orelse return error.State;
         if (!value.config.system_userd or !fifo.ring.idle() or self.copyAdmissionBusy() or self.graphics_starting or self.graph_closing or self.display_engine_active or self.display_channel_active != null or
@@ -3305,9 +3435,72 @@ pub const Owner = struct {
         }
         return if (channel.phase == .waiting) .idle else .progress;
     }
+    fn advanceAdaptiveControl(self: *Owner, current: u64) !Progress {
+        try self.validateAdaptiveRefresh();
+        const work = &self.display_work.?;
+        const refresh = &work.refresh.?;
+        const control = &refresh.control;
+        const channel = &self.channel.?;
+        if (current >= work.deadline) return error.Timeout;
+        const obsolete = control.enabled and !self.adaptiveReceiverCurrent();
+        if (obsolete and channel.phase == .prepared) {
+            try channel.cancelPrepared(); control.pending = false;
+        }
+        if (obsolete and channel.phase == .idle) {
+            try self.rollbackAdaptiveRefresh(error.Stale, current);
+            return .progress;
+        }
+        if (control.phase == .complete) {
+            if (!control.core_completed or control.core_point == 0 or control.last_receipt == 0 or
+                work.core.phase != .complete or control.core_point != work.core.ticket.?.point) return error.Completion;
+            self.refresh_results[control.plan.mode.window] = .{ .sequence = refresh.sequence, .plan = control.plan,
+                .enabled = control.enabled, .core_point = control.core_point, .receipt = control.last_receipt, .failure = refresh.failure };
+            try self.refresh_clocks[control.plan.mode.window].completed(control.enabled, current);
+            self.log("NVIDIA refresh: head={d} enabled={} range-mHz={d}-{d} sequence={d} proof=link,RM,Core,LWSV",
+                .{control.plan.mode.head, control.enabled, control.plan.refresh.range.min_millihz,
+                    control.plan.refresh.range.max_millihz, refresh.sequence});
+            self.display_work = null;
+            return .progress;
+        }
+        if (control.phase == .core) return error.State;
+        if (!control.pending) {
+            if (!control.ready(current)) return .idle;
+            control.length = try control.encode(&control.request);
+            try channel.begin(refresh_control.function, control.request[0..control.length], work.deadline);
+            control.pending = true;
+            return .progress;
+        }
+        if (try channel.poll(work.deadline)) |dispatch| {
+            if (!dispatch.response) { try self.notification(channel, dispatch, current); return .progress; }
+            var payload: [refresh_control.max_bytes]u8 = undefined;
+            if (dispatch.record.payload.len > payload.len) return error.Payload;
+            @memcpy(payload[0..dispatch.record.payload.len], dispatch.record.payload);
+            var record = dispatch.record; record.payload = payload[0..dispatch.record.payload.len];
+            try channel.complete(dispatch.ticket);
+            control.consume(record, dispatch.ticket.serial, current) catch |err| {
+                if (control.enabled and refresh.failure == null and (err == error.RmRejected or err == error.Aux)) {
+                    if (control.last_status != 0) try self.rejection(.display_channel, control.plan.object.display, control.last_status, null);
+                    try self.rollbackAdaptiveRefresh(err, current);
+                    return .progress;
+                }
+                if (control.last_status != 0) self.rmFailure(.display_channel, control.plan.object.display, control.last_status);
+                return err;
+            };
+            return .progress;
+        }
+        return if (channel.phase == .waiting) .idle else .progress;
+    }
     fn advanceDisplay(self: *Owner, current: u64) !bool {
         const work = if (self.display_work) |*value| value else return false;
         if (current >= work.deadline) return error.Timeout;
+        if (work.refresh) |*refresh| {
+            if (refresh.control.phase != .core) return error.State;
+            try self.validateAdaptiveRefresh();
+            if (refresh.control.enabled and !self.adaptiveReceiverCurrent() and work.core.phase == .prepare) {
+                try self.rollbackAdaptiveRefresh(error.Stale, current);
+                return true;
+            }
+        }
         if (work.detach != null) try self.validateDisplayDetach();
         if (work.link) |*link| {
             if (link.phase != .scanout and link.phase != .complete) return error.State;
@@ -3333,6 +3526,11 @@ pub const Owner = struct {
             if (window.phase != .complete) return progressed;
         }
         if (work.core.phase != .complete) return progressed;
+        if (work.refresh) |*refresh| {
+            try refresh.control.submitted(work.core.ticket.?.point);
+            try refresh.control.completed(work.core.ticket.?.point);
+            return true;
+        }
         if (work.detach) |previous| {
             const window = work.window.?;
             const mode = previous.boot_mode.?;
@@ -4005,6 +4203,7 @@ pub const Owner = struct {
     }
     fn advance(self: *Owner) !Progress {
         const current = try self.now();
+        self.observeAdaptiveRefresh(current);
         const channel = self.activeChannel() orelse return error.State;
         self.snapshot.polls +|= 1;
         self.snapshot.last_poll_ns = current;
@@ -4153,6 +4352,9 @@ pub const Owner = struct {
         }
         // The display transaction owns these setter replies. Do not let the
         // generic graph/query dispatcher consume or acknowledge them.
+        if (self.display_work) |*work| if (work.refresh) |*refresh| {
+            if (refresh.control.phase != .core) return self.advanceAdaptiveControl(current);
+        };
         if (self.display_work) |*work| if (work.link) |*link| {
             if (link.phase == .before_scanout or link.phase == .after_scanout) return self.advanceDisplayLink(current);
         };
@@ -4402,6 +4604,7 @@ pub const Owner = struct {
         return .idle;
     }
     fn beginReceiverRefresh(self: *Owner, current: u64) !bool {
+        if (self.anyAdaptiveRefresh() or self.refresh_quiescing) return false;
         const channel = if (self.channel) |*value| value else return false;
         if (self.graph_closing or self.graph == null or self.graph.?.state != .loaned or channel.phase != .idle or channel.in_lockdown or
             self.copyBusy() or self.cursor_point != null or

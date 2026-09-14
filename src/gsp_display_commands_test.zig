@@ -30,6 +30,7 @@ pub fn check() !void {
     try @import("gsp_hdmi_link_test.zig").check();
     try @import("gsp_dp_link_test.zig").check();
     try @import("gsp_display_audio_test.zig").check();
+    try @import("gsp_vrr_control_test.zig").check();
     try checkPosition();
     try @import("gsp_cursor_image_test.zig").check();
 }

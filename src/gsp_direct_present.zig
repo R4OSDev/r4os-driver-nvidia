@@ -29,7 +29,7 @@ pub const Work = struct {
         if (self.job.fence.timeline != 0 and !self.activated) {
             const requested = self.queue.scanoutRetireRequested(&self.job.fence);
             if (requested < 0) return error.Queue;
-            self.aborting = self.aborting or requested == 1 or run.display_paused;
+            self.aborting = self.aborting or requested == 1 or run.display_paused or run.refresh_quiescing;
         }
         switch (self.phase) {
             .retain => {

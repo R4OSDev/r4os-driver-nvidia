@@ -2520,3 +2520,16 @@ for existing DMA mappings, qualified by its kernel owner and the ordinary
 EXAMPLE fixture. The GSP runtime must still order payload/cursor publication,
 limit each transfer to exclusively owned bytes and prove quiescence before
 unmap. NVIDIA0.1.24 does not yet bind the message/ring layers to live DMA.
+
+
+Variable refresh (NVIDIA 0.1.118)
+-------------------------------
+C67D implements acknowledged HDMI-Forum EMP and direct DP-SST Adaptive-Sync
+transitions, RM pstate/supervisor control, One-Shot/Continuous Core updates
+and bounded rollback. The shared refresh callbacks publish source capability,
+confirmed state and real Head-IRQ measurements separately. Desktop intent
+expires; capture, display changes and faults request fixed refresh. Mixed
+fixed/VRR heads need additional RM flip traps and currently stay fixed.
+No LFC or physical panel behavior is inferred from the software model.
+Details and evidence: workspace Docs/Desktop/GrafikVRR07926.txt/.json;
+physical follow-up: ExFiles/Reports/OssiGPU.txt / 0.79.26.

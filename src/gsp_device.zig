@@ -515,9 +515,15 @@ pub const Device = struct {
             if (channel != &self.running.channel.? or !work.matches(channel, deadline)) return error.Binding;
             self.running.validateSorAssignment() catch return error.Binding;
         } else if (self.running.display_work) |*work| {
-            const link = if (work.link) |*value| value else return error.Binding;
-            if (channel != &self.running.channel.? or work.deadline != deadline or !link.matches(channel, deadline)) return error.Binding;
-            self.running.validateDisplayLink() catch return error.Binding;
+            if (work.refresh) |*refresh| {
+                if (channel != &self.running.channel.? or work.deadline != deadline or !refresh.control.matches(channel, deadline)) return error.Binding;
+                self.running.validateAdaptiveRefresh() catch return error.Binding;
+                if (!self.running.adaptiveReceiverCurrent()) return error.Binding;
+            } else {
+                const link = if (work.link) |*value| value else return error.Binding;
+                if (channel != &self.running.channel.? or work.deadline != deadline or !link.matches(channel, deadline)) return error.Binding;
+                self.running.validateDisplayLink() catch return error.Binding;
+            }
         } else if (self.running.audio_work) |*work| {
             if (channel != &self.running.channel.? or !work.matches(channel, deadline)) return error.Binding;
             self.running.validateDisplayAudio() catch return error.Binding;
@@ -666,6 +672,11 @@ pub const Device = struct {
         if (!work.core.config.with_core or (if (work.window) |value| !value.config.with_core else false) or
             (if (work.position) |value| !value.config.with_core else false)) return error.Binding;
         if (work.core.handle.slot != 0 or work.deadline != deadline) return error.Binding;
+        if (work.refresh) |*refresh| {
+            if (channel.config.kind != .core or refresh.control.phase != .core) return error.Binding;
+            self.running.validateAdaptiveRefresh() catch return error.Binding;
+            if (access_kind == .publish and !self.running.adaptiveReceiverCurrent()) return error.Binding;
+        } else if (work.core.config.refresh_control != null or self.running.anyAdaptiveRefresh()) return error.Binding;
         if (work.cursor) |cursor| {
             if (self.native_output.phase != .active or !self.native_output.callback_confirmed or self.native_output.mode == null or
                 self.native_output.mode.?.head != cursor.control.head) return error.Binding;
