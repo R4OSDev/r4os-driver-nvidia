@@ -926,3 +926,15 @@ original-header vector provenance are retained in
 Apache-2.0. No Linux GPL implementation or new firmware binary is imported.
 
 0.79.28: RM TSG scheduling uses NVIDIA570.144 ctrla06c.h (MIT), pin 8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f. The complete original notice is included in NVIDIA-GSP-RUNTIME-LICENSE.txt. R4OS scheduling/residency ownership code remains Apache-2.0. No new firmware binary.
+
+
+## Power and telemetry (0.79.29)
+
+The RUSD shared-data layout, controls, finite boost arbitration and GPU timer
+query follow seven MIT NVIDIA 570.144 originals at commit
+8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f. Exact source paths and hashes are
+recorded in ExFiles/Reference/GFX/0.79.29/Sources.json. Complete original
+notices accompany the derived codecs and the embedded/distributed
+Licenses/NVIDIA-GSP-RUNTIME-LICENSE.txt. R4OS resource ownership, bounded
+policy and common telemetry cache remain Apache-2.0. No additional firmware
+or Linux GPL implementation is imported.

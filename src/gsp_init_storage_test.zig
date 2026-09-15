@@ -1552,6 +1552,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         control_allocation, control_cache, control_alias, control_sync, control_register_reject, control_virtual_reject, control_map_reject,
         control_short, control_bounds, control_map_address, control_ack, control_timeout, control_unmap, control_free, control_dma_unmap, control_release, control_gpu_acquire, control_gpu_release,
         memory_caps_reject, memory_caps_none, memory_caps_rpc, memory_caps_short, memory_caps_wrong, memory_caps_ack, memory_caps_timeout,
+        power_success, power_attach_reject, power_poll_reject, power_detach_reject, power_ack_failure,
         mapping_success, mapping_reject, mapping_offset, mapping_ack, mapping_timeout, mapping_release, mapping_segment, mapping_gpu,
         vram_success, vram_budget, vram_physical_reject, vram_virtual_reject, vram_map_reject, vram_commit, vram_size, vram_ack, vram_timeout, vram_free, vram_finish,
         vram_surface_linear, vram_surface_tiled, vram_surface_changed, vram_surface_contiguity,
@@ -1740,12 +1741,13 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
             if (target.phase == .ready) try checkDevicePostInit(target, words, held.plan.?.frts.offset, case);
             if (target.phase == .ready) try checkDeviceIrq(target, words, held.plan.?.frts.offset, case);
             if (target.phase == .ready and !target.stopped) try checkDeviceRm(target, words, held.plan.?.frts.offset, case);
+            if (target.phase == .ready and std.mem.startsWith(u8, @tagName(case), "power_")) try checkDevicePower(target);
             if (target.phase == .ready and std.mem.startsWith(u8, @tagName(case), "mapping_")) try checkDeviceMappings(target, table, @tagName(case));
             if (target.phase == .ready and std.mem.startsWith(u8, @tagName(case), "vram_")) try checkDeviceVram(target, table, @tagName(case));
             if (target.phase == .ready and std.mem.startsWith(u8, @tagName(case), "context_")) try checkDeviceContexts(target, table, @tagName(case));
             if (target.phase == .ready and std.mem.startsWith(u8, @tagName(case), "display_root_")) try checkDeviceDisplayEngine(target, @tagName(case));
             if (target.phase == .ready and std.mem.startsWith(u8, @tagName(case), "display_dma_")) try checkDeviceDisplayChannels(target, table, words, @tagName(case));
-            if (target.phase == .ready and !target.stopped) try checkDeviceOutputs(target, words, held.plan.?.frts.offset, case);
+            if (target.phase == .ready and !target.stopped and !std.mem.startsWith(u8, @tagName(case), "power_")) try checkDeviceOutputs(target, words, held.plan.?.frts.offset, case);
             if (exercise_runtime) try checkDeviceRuntime(target, words, held.plan.?.frts.offset, case);
         } else {
             try t.expect(target.phase == .failed and target.failure != null);
@@ -3692,6 +3694,17 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
             (NativeCommon.is("context_native_unknown") or NativeCommon.flipFailure() or NativeCommon.is("context_native_frame_timeout") or NativeCommon.cursorCase()));
         try t.expect(NativeCommon.publication.info.limits.flags == 0 and NativeCommon.publication.info.mode_count == 1);
         try t.expect(target.step() != .stopped and target.failure == null);
+        // Initial publication may have queued an optional power RPC. Native
+        // allocation is retryable until its exact reply returns the channel.
+        for (0..12) |_| {
+            if (!run.power_active) break;
+            try t.expectError(error.Busy, run.allocateNativeBuffer(65536, clock + std.time.ns_per_s));
+            try t.expectError(error.Busy, run.allocateNativeSurface(.{ .width = 64, .height = 64, .usage = 40 }, clock + std.time.ns_per_s));
+            clock += 1000; _ = target.step();
+            try t.expect(target.phase == .ready);
+            if (run.power_active and run.activeChannel().?.phase == .waiting) try replyNativeProduct(target);
+        }
+        try t.expect(!run.power_active);
         try NativeCommon.checkStatistics();
         if (NativeCommon.flipFailure()) {
             checkpoint = "native flip deadline";
@@ -3701,7 +3714,10 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
         }
         if (NativeCommon.is("context_native_connected")) {
             checkpoint = "initial HDMI audio";
-            try t.expect(CatalogModel.audio.?.state == a.gfx_audio_route_pending and CatalogModel.audio_muted);
+            // A pending performance RPC may postpone the initial route
+            // publication. The receiver must remain muted until configured.
+            try t.expect(CatalogModel.audio_muted or
+                (CatalogModel.audio.?.state == a.gfx_audio_route_ready and target.native_output.audio.settled));
             try pumpNativeAudio(target);
             try t.expect(CatalogModel.audio.?.state == a.gfx_audio_route_ready);
             checkpoint = "additional output route";
@@ -4258,7 +4274,9 @@ fn pumpNativeAudio(target: *@import("gsp_device.zig").Device) !void {
     for (0..120) |_| {
         clock += 1000; _ = target.step();
         try t.expect(target.phase == .ready);
-        if (target.native_output.audio.settled) return;
+        const product = &target.native_output;
+        const enabling = product.modes.job == null or product.modes.job.?.operation == a.gfx_mode_operation_confirm;
+        if (product.audio.settled and (product.audio.phase == .failed or product.audio.enabled == enabling) and !target.running.power_active) return;
         if (target.running.activeChannel()) |channel| if (channel.phase == .waiting) try replyNativeProduct(target);
     }
     return error.AudioDeadline;
@@ -6175,7 +6193,11 @@ fn replyNativeProduct(target: *@import("gsp_device.zig").Device) !void {
     const cursor = (session.tx_write + 62) % 63;
     const record = try transport.message.decode(session.profile, backing.?[init.queues_offset + init.command_offset + 4096 + cursor * 4096..][0..4096], session.tx_sequence - 1);
     try t.expectEqualSlices(u8, rpc.request, record.payload);
-    if (run.context_active) |index| {
+    if (run.power_active) {
+        // Ordinary native graphics fixtures model an unsupported optional
+        // control. Dedicated RUSD cases below cover the positive DMA path.
+        outputWord(&response, 12, 0x56);
+    } else if (run.context_active) |index| {
         const owner = run.contexts[index].owner.?;
         const op = owner.operation.?;
         if (op == .graphics_info) {
@@ -6938,6 +6960,10 @@ fn checkQueuedSlices(target: *@import("gsp_device.zig").Device, ce: @import("gsp
         try stepQueuedRendering(target);
         try t.expect(target.phase == .ready);
         if (model.completed != completed) break;
+        if (run.power_active) {
+            try t.expect(!run.cursorWorkAvailable() and run.copy_job == null);
+            continue;
+        }
         if (run.copy_job) |work| {
             if (!work.submitted or model.sliceCompleted()) continue;
             checkpoint = "CE execution";
@@ -7102,7 +7128,7 @@ fn stepQueuedRendering(target: *@import("gsp_device.zig").Device) !void {
     if (target.phase == .ready and target.running.buffer_active != null) try replyCopyMapping(target);
     // Ordinary reclamation can retire the preceding private draw's image
     // while this queue waits for CE. Model those real RM replies as well.
-    if (target.phase == .ready and target.running.native_active != null and target.running.activeChannel().?.phase == .waiting)
+    if (target.phase == .ready and (target.running.native_active != null or target.running.power_active) and target.running.activeChannel().?.phase == .waiting)
         try replyNativeProduct(target);
 }
 fn renderMethod(bytes: []const u8, method: u32) !u32 {
@@ -7998,7 +8024,12 @@ fn checkDevicePresentation(target: *@import("gsp_device.zig").Device, handle: @i
         try t.expect(target.phase == .ready and running.copy_job == null and model.completed == frame + 1 and
             model.result == a.gfx_queue_result_complete and !model.active and running.presentation.?.surface.valid());
         checkpoint = "queue-empty";
-        _ = target.step(); try t.expect(!running.presentation.?.pending);
+        for (0..12) |_| {
+            _ = target.step();
+            if (running.power_active and running.activeChannel().?.phase == .waiting) try replyNativeProduct(target);
+            if (!running.presentation.?.pending) break;
+        }
+        try t.expect(!running.presentation.?.pending);
     }
     const issued = fifo.ring.issued;
     // The common span can describe an invalid row crossing; reject before PUT.
@@ -9001,6 +9032,163 @@ fn checkDeviceMappings(target: *@import("gsp_device.zig").Device, table: *a.Driv
         try t.expectError(error.Retained, session.rm_names.retire(running.graph.?.reservation));
         if (!model.is("mapping_release")) try t.expect(!freeing and unmaps == 0);
     }
+}
+
+fn checkDevicePower(target: *@import("gsp_device.zig").Device) !void {
+    const power = @import("gsp_power.zig");
+    const model = @import("gsp_power_memory_test.zig").Model;
+    const run = &target.running;
+    // Independent completed discovery is unnecessary for these graph-bound
+    // controls. Keep receiver refresh pending until this bounded check ends.
+    run.receiver_events.not_before_ns = clock + 60 * std.time.ns_per_s;
+    if (model.is("power_success")) {
+        model.wanted_mask = 0x1ff;
+        model.wanted_until = clock + power.demand_ns;
+    }
+    try run.demandPower(clock, if (model.is("power_success")) 0 else power.telemetry.poll_mask);
+    const owner = &run.power_owner.?;
+    var checkpoint: []const u8 = "initial collection";
+    errdefer |err| std.debug.print("power {s}: {s} at={s} status={s} mask={x} active={} phase={s} failure={?}\n",
+        .{model.scenario,@errorName(err),checkpoint,@tagName(owner.status),owner.active_mask,run.power_active,@tagName(target.phase),target.failure});
+    var iterations: usize = 0;
+    while (iterations < 30 and target.phase == .ready) : (iterations += 1) {
+        if (!run.power_active and (owner.active_mask != 0 or owner.rejection != null or owner.poll_rejection != null)) break;
+        try stepDevicePower(target);
+    }
+    try t.expect(iterations < 30);
+    if (model.is("power_ack_failure")) {
+        try t.expect(target.phase == .recovering and owner.possibly_attached and !owner.attached and
+            owner.backing.retained and !owner.backing.close() and model.active and model.mapped and model.releases == 0);
+        return;
+    }
+    try t.expect(target.phase == .ready and run.failure == null and !run.power_active);
+    if (model.is("power_attach_reject")) {
+        try t.expect(owner.status == .rejected and !owner.possibly_attached and !model.active and model.releases == 1);
+        try t.expect(try owner.stop(clock));
+        return;
+    }
+    try t.expect(owner.attached and model.attached and owner.backing.retained and !owner.backing.close());
+    try t.expect(ControlModel.active and ControlModel.mapped and ControlModel.gpu_mapped and ControlModel.releases == 0);
+    if (model.is("power_poll_reject")) {
+        try t.expect(owner.poll_rejection.? == 0x56 and owner.active_mask == 0 and !owner.snapshot.get(.clocks).usable());
+    } else {
+        try t.expect(owner.active_mask == power.telemetry.poll_mask and !owner.snapshot.get(.clocks).usable());
+        model.update(100);
+        clock += power.sample_period_ns;
+        try owner.sample(clock);
+        try t.expect(owner.snapshot.get(.clocks).targetClocksHz().?[0] == 1_500_000_000 and
+            owner.snapshot.get(.pstate).pstateIndex().? == 2 and owner.snapshot.get(.gpu_temperature).temperatureMilliCelsius().? == 55000);
+        try t.expect(!owner.snapshot.get(.memory_temperature).usable() and !model.cpu);
+        const published = owner.publicState(clock);
+        try t.expect(published.metrics[0].values[0] == 1_500_000_000 and published.metrics[5].values[0] == 55000 and
+            published.metrics[6].status == a.gfx_telemetry_unavailable and published.metrics[6].values[0] == 0);
+        if (model.is("power_success")) {
+            try owner.exchangeCommon(clock);
+            try t.expect(model.exchanges > 1 and model.published.metrics[5].values[0] == 55000 and
+                owner.demanded_until == model.wanted_until and owner.demanded_mask == power.telemetry.poll_mask);
+        }
+        // A stable old timestamp does not become a fresh reading on access.
+        clock += power.max_age_ns + 1;
+        try owner.sample(clock);
+        try t.expect(!owner.snapshot.get(.clocks).usable());
+        model.update(200);
+        clock += power.sample_period_ns;
+        try owner.sample(clock);
+        try t.expect(owner.snapshot.get(.clocks).usable());
+    }
+    if (model.is("power_success")) {
+        // Exercise accepted finite boost and clearing through the real
+        // retained channel, using the same activity observation as Work.
+        checkpoint = "accepted boost";
+        owner.observeActivity(clock, .{ .render = true, .outputs = 2 });
+        for (0..12) |_| {
+            try stepDevicePower(target);
+            if (!run.power_active and owner.performance.accepted_level == 2) break;
+        }
+        try t.expect(!run.power_active and owner.performance.accepted_level == 2 and
+            owner.publicState(clock).boost == 2 and owner.performance.accepted_until == clock + 2 * std.time.ns_per_s);
+        clock += power.policy.hold_ns + 1;
+        checkpoint = "idle clear";
+        for (0..12) |_| {
+            try stepDevicePower(target);
+            if (!run.power_active and owner.performance.accepted_level == 0) break;
+        }
+        try t.expect(!run.power_active and owner.performance.accepted_level == 0 and owner.performance.accepted_requests == 2);
+        model.wanted_mask |= 1 << 9;
+        model.wanted_until = clock + 3 * std.time.ns_per_s;
+        // The common cache is intentionally sampled at a bounded cadence.
+        clock += power.sample_period_ns;
+        checkpoint = "timer demand";
+        for (0..2) |i| {
+            const previous = owner.timer.received_ns;
+            if (i != 0) clock += std.time.ns_per_s;
+            for (0..12) |_| {
+                try stepDevicePower(target);
+                if (owner.timer.received_ns != previous and !run.power_active) break;
+            }
+            try t.expect(owner.timer.received_ns != previous and !run.power_active and owner.timer.metric.status == a.gfx_telemetry_fresh);
+        }
+        const timed = owner.publicState(clock).metrics[9];
+        try t.expect(timed.flags == 1 and timed.values[1] == std.time.ns_per_s and timed.values[3] >= timed.values[2]);
+        try t.expect(owner.timing_until == model.wanted_until);
+    }
+    // Parent destruction must wait for exact RUSD detach and queue ACK.
+    checkpoint = "detach";
+    const deadline = clock + 5 * std.time.ns_per_s;
+    try t.expectError(error.Busy, run.beginDestroyGraph(deadline, true));
+    try t.expect(!run.graph_closing and owner.stopping and model.releases == 0);
+    iterations = 0;
+    while (iterations < 30 and !owner.closed() and owner.detach_rejection == null) : (iterations += 1) try stepDevicePower(target);
+    try t.expect(iterations < 30 and target.phase == .ready);
+    if (model.is("power_detach_reject")) {
+        try t.expect(owner.attached and owner.possibly_attached and model.active and model.mapped and model.releases == 0);
+        try t.expect(!owner.backing.close());
+        const controls = owner.controls;
+        // A matched unsupported detach stays retained without an RPC loop.
+        for (0..3) |_| try t.expect((try owner.choose(clock, .{})) == null);
+        try t.expect(owner.controls == controls and !owner.closed());
+    } else {
+        try t.expect(owner.closed() and !model.active and !model.mapped and model.releases == 1);
+        try t.expect(ControlModel.active and ControlModel.releases == 0);
+    }
+}
+fn stepDevicePower(target: *@import("gsp_device.zig").Device) !void {
+    const model = @import("gsp_power_memory_test.zig").Model;
+    const run = &target.running;
+    _ = target.step();
+    if (target.phase != .ready or !run.power_active) return;
+    const owner = &run.power_owner.?;
+    const rpc = &owner.active.?;
+    if (rpc.phase != .waiting) return;
+    const operation = owner.operation.?;
+    const deadline = rpc.deadline.?;
+    rpc.phase = .prepared;
+    try target.port.owner.?.admit_command.?(target.port.owner.?.context, &target.port, deadline);
+    owner.shared_binding.client ^= 1;
+    try t.expectError(error.Binding, target.port.owner.?.admit_command.?(target.port.owner.?.context, &target.port, deadline));
+    owner.shared_binding.client ^= 1;
+    var moved = owner.*;
+    try t.expect(!moved.matches(rpc, deadline));
+    try t.expectError(error.Stale, moved.choose(clock, .{}));
+    rpc.phase = .waiting;
+    var response: [40]u8 = @splat(0);
+    @memcpy(response[0..rpc.request.len], rpc.request);
+    if (operation == .attach) {
+        try t.expect(std.mem.readInt(u64, response[24..32], .little) == model.address and owner.possibly_attached and owner.backing.retained);
+        if (model.is("power_attach_reject")) outputWord(&response, 12, 0x56) else model.attached = true;
+    } else if (operation == .poll) {
+        if (model.is("power_poll_reject")) outputWord(&response, 12, 0x56);
+    } else if (operation == .detach) {
+        try t.expect(owner.stopping and model.attached and !owner.backing.close());
+        if (model.is("power_detach_reject")) outputWord(&response, 12, 0x56) else model.attached = false;
+    } else if (operation == .timer) {
+        std.mem.writeInt(u64, response[24..32], 1_790_000_000_000_000_000 + clock, .little);
+    }
+    const session = &target.session.?;
+    std.mem.writeInt(u32, backing.?[init.queues_offset + init.status_offset + 64..][0..4], session.tx_write, .little);
+    try nativeReply(session, rpc.function, 0, response[0..rpc.request.len]);
+    if (operation == .attach and model.is("power_ack_failure")) range_failure_call = range_calls + 4;
+    _ = target.step(); range_failure_call = 0;
 }
 
 fn checkDeviceOutputs(target: *@import("gsp_device.zig").Device, words: []u32, frts: u64, scenario: anytype) !void {

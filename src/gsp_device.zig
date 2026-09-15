@@ -205,6 +205,7 @@ pub const Device = struct {
                         try self.interrupts.open(&self.ctx.?, &self.display.?.registers, &self.display.?.snapshot.?,
                             self.display.?.chip.?, inventory, self.irq_wake orelse return error.IrqWake, self.port.boot0);
                         self.running.rm_enabled = true;
+                        self.running.power_enabled = true;
                         self.ctx.?.logInfo("NVIDIA gsp-irq: configured=yes source=GSP wake=semaphore worker=serialized native-output=unavailable");
                         return true;
                     }
@@ -484,7 +485,15 @@ pub const Device = struct {
             channel.phase != .prepared or channel.pending != null or channel.session.pending != null or
             channel.deadline != deadline) return error.Binding;
         if (channel.in_lockdown) return error.Lockdown;
-        if (self.running.mode_control_active) {
+        if (self.running.power_active) {
+            const performance_owner = if (self.running.power_owner) |*value| value else return error.Binding;
+            const graph = if (self.running.graph) |*value| value else return error.Binding;
+            const internal = self.running.static_info orelse return error.Binding;
+            if (graph.state != .loaned or performance_owner.binding.epoch != self.epoch or
+                performance_owner.binding.client != graph.base.plan.handles.client or performance_owner.binding.subdevice != graph.base.plan.handles.subdevice or
+                performance_owner.shared_binding.client != internal.client or performance_owner.shared_binding.subdevice != internal.subdevice or
+                !performance_owner.matches(channel, deadline)) return error.Binding;
+        } else if (self.running.mode_control_active) {
             const mode = if (self.running.mode_control_owner) |*value| value else return error.Binding;
             const root = if (self.running.mode_control_root) |value| value else return error.Binding;
             const engine = if (self.running.display_engine_owner) |*value| value else return error.Binding;
@@ -549,7 +558,7 @@ pub const Device = struct {
         try self.checkLive(false);
         const run = &self.running;
         if (self.phase != .ready or port != &self.port or port.phase != .runtime or self.session == null or self.inLockdown() or
-            run.self_address != @intFromPtr(run) or run.failure != null or run.sequence.self_address != 0 or run.graph_closing or
+            run.self_address != @intFromPtr(run) or run.failure != null or run.sequence.self_address != 0 or run.graph_closing or run.power_active or
             run.fifo_active != null or run.context_active != null or run.native_active != null or run.buffer_active != null or
             run.outputs.active() or run.display_engine_active or run.display_channel_active != null or run.mode_control_active or
             run.copy_job != null or run.display_upload_job != null or run.initial_image != null or run.cursor_upload != null or
@@ -572,7 +581,7 @@ pub const Device = struct {
         if (self.phase != .ready or port != &self.port or port.phase != .runtime or self.session == null or self.inLockdown() or
             self.running.self_address != @intFromPtr(&self.running) or self.running.failure != null or self.running.sequence.self_address != 0 or
             self.running.fifo_active != null or self.running.context_active != null or self.running.native_active != null or self.running.buffer_active != null or
-            self.running.outputs.active() or self.running.graph_closing or self.running.display_engine_active or self.running.display_channel_active != null or self.running.display_work != null or self.running.mode_control_active or self.running.graphics_work != null) return error.State;
+            self.running.outputs.active() or self.running.graph_closing or self.running.power_active or self.running.display_engine_active or self.running.display_channel_active != null or self.running.display_work != null or self.running.mode_control_active or self.running.graphics_work != null) return error.State;
         self.running.validateCopyOverlap() catch return error.Binding;
         const channel_handle = if (self.running.graphics_upload) |*work| blk: {
             const run = &self.running;

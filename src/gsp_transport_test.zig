@@ -1652,6 +1652,7 @@ fn graphDestroy(model: *Model, owner: *rm_graph.Owner) !boot_events.Handoff {
     return owner.finish(deadline);
 }
 fn checkRmGraph(model: *Model) !void {
+    try @import("gsp_power_test.zig").check();
     try @import("gsp_surface_layout_test.zig").check();
     try @import("gsp_context_test.zig").check();
     try @import("gsp_native_backing_test.zig").check();

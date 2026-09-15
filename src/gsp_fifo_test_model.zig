@@ -26,6 +26,10 @@ pub const Model = struct {
     fn select(input: a.GfxBufferHandle) ?usize { for (0..slots.len) |i| if (std.meta.eql(input, ref(i))) return i; return null; }
     pub fn address(index: usize) u64 { return 0x50000000 + index * 0x100000; }
     fn create(d: *const a.GfxBufferDescriptor, out: *a.GfxBufferReference) callconv(.c) i32 {
+        if (d.byte_length != bytes) {
+            const call: *const fn (*const a.GfxBufferDescriptor, *a.GfxBufferReference) callconv(.c) i32 = @ptrFromInt(original.buffer_create);
+            return call(d, out);
+        }
         std.debug.assert(d.byte_length == bytes and d.alignment == 4096 and d.usage & 3 == 3);
         for (&slots, 0..) |*slot, i| if (!slot.active) {
             slot.* = .{ .active = true, .descriptor = d.* }; @memset(&slot.data, 0xa5);

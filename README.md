@@ -1,10 +1,10 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.106; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.121; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
-subsystem 1458:4074, VBIOS 94.06.2f.00.d6. Software implementation through 0.79.18 is documented; physical native qualification remains separate.
+subsystem 1458:4074, VBIOS 94.06.2f.00.d6. Software implementation through 0.79.29 is documented; physical native qualification remains separate.
 The default path inventories NVIDIA display functions once through
 the kernel PCI inventory. Explicit diagnostic/start modes are described below.
 Starting with R4OS 0.79.9, `IMAGE_SCOPE=slim` includes the current module in
@@ -12,13 +12,22 @@ Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
 
+Power and telemetry (0.79.29): the native worker uses documented 570.144
+RUSD, finite boost and GPU timer controls. Collection is demand driven;
+firmware retains clock/voltage arbitration and board limits. `DISPLAYD
+/POWER` and Device Manager show the common cache with explicit unknown or
+stale data. Clock values are firmware targets; timer deltas are sample
+intervals. Full ownership, ABI and evidence details are in
+`Docs/Drivers/GrafikLeistung07929.txt/.json`. Physical validation remains
+open in `ExFiles/Reports/OssiGPU.txt` /29. Passive mode does not collect.
+
 Native allocation (0.79.19 partial): once the RM address space is ready, the
 existing worker registers a common native BO provider. Applications can request
 raw transfer storage or linear/blocklinear offscreen images; R4GFX exposes image creation. Copied requests bind
 the adapter and memory epoch; existing RM allocation and release tickets own
 the backing. Application expiry is separate from the finite five-second RM
 budget. Completion transfers a reference before closing the driver's initial
-reference. Public scanout creation and GR rendering remain unimplemented;
+reference. Public scanout creation stays with the display owner. GR rendering is implemented in the later 0.79.19 checkpoint below;
 physical allocation/copy validation remains open in OssiGPU.txt /19.
 
 Graphics channel (0.79.19 partial): native startup now queries GR0 context

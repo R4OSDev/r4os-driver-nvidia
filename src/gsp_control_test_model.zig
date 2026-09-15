@@ -4,6 +4,7 @@ const std = @import("std");
 const r4os = @import("r4os");
 const a = r4os.abi;
 const storage = @import("gsp_control_storage.zig");
+const power = @import("gsp_power_memory_test.zig").Model;
 pub const Model = struct {
     pub var original: a.DriverApi = undefined;
     pub var data: [storage.bytes]u8 align(4096) = undefined;
@@ -43,6 +44,7 @@ pub const Model = struct {
         dma = .{};
         gpu = .{};
         read_lease = .{};
+        power.reset(name);
     }
     pub fn is(name: []const u8) bool {
         return std.mem.eql(u8, name, scenario);
@@ -58,9 +60,13 @@ pub const Model = struct {
         out.device_acquire = @intFromPtr(&acquire);
         out.device_segment = @intFromPtr(&segment);
         out.device_release = @intFromPtr(&releaseDevice);
+        if (power.is("power_success")) out.telemetry_exchange = @intFromPtr(&power.exchange);
         return a.gfx_buffer_result_ok;
     }
     fn create(input: *const a.GfxBufferDescriptor, out: *a.GfxBufferReference) callconv(.c) i32 {
+        // The ordinary control fixture owns its five-page allocation only.
+        // The dedicated power fixture supplies an independent DMA page.
+        if (input.byte_length == storage.shared_page_bytes) return power.create(input, out);
         std.debug.assert(!active and input.byte_length == storage.bytes and input.alignment == 4096);
         active = true;
         descriptor = input.*;
@@ -69,17 +75,20 @@ pub const Model = struct {
         return if (is("control_allocation")) -1 else a.gfx_buffer_result_ok;
     }
     fn describe(input: *const a.GfxBufferHandle, out: *a.GfxBufferDescriptor) callconv(.c) i32 {
+        if (power.owns(input.*)) return power.describe(input, out);
         std.debug.assert(active and std.meta.eql(input.*, reference));
         out.* = descriptor;
         return a.gfx_buffer_result_ok;
     }
     fn mapCpu(input: *const a.GfxBufferHandle, access: u32, offset: u64, bytes: u64, out: *a.GfxBufferMap) callconv(.c) i32 {
+        if (power.owns(input.*)) return power.mapCpu(input, access, offset, bytes, out);
         std.debug.assert(active and !cpu_mapped and !reading and std.meta.eql(input.*, reference) and access == 1 and offset == 0 and bytes == storage.bytes);
         cpu_mapped = true;
         out.* = .{ .lease = cpu, .cpu_address = @intFromPtr(&data), .byte_length = bytes, .cache_policy = if (is("control_cache")) a.gfx_buffer_cache_write_combining else a.gfx_buffer_cache_write_back };
         return a.gfx_buffer_result_ok;
     }
     fn unmapCpu(input: *const a.GfxBufferHandle) callconv(.c) i32 {
+        if (power.owns(input.*)) return power.unmapCpu(input);
         std.debug.assert(active and cpu_mapped and std.meta.eql(input.*, cpu));
         if (is("control_sync") and !sync_failed) {
             sync_failed = true;
@@ -91,6 +100,7 @@ pub const Model = struct {
         return a.gfx_buffer_result_ok;
     }
     fn acquire(input: *const a.GfxBufferHandle, request: *const a.GfxDeviceRequest, out: *a.GfxDeviceLease) callconv(.c) i32 {
+        if (power.owns(input.*)) return power.acquire(input, request, out);
         std.debug.assert(active and synced and !cpu_mapped and std.meta.eql(input.*, reference) and
             request.byte_offset == 0 and request.adapter_id == 0x01000000 and request.device_generation != 0);
         if (request.access == 0) {
@@ -118,12 +128,14 @@ pub const Model = struct {
         return a.gfx_buffer_result_ok;
     }
     fn segment(input: *const a.GfxDeviceLease, offset: u64, out: *a.GfxDmaSegment) callconv(.c) i32 {
+        if (power.owns(input.lease)) return power.segment(input, offset, out);
         std.debug.assert(mapped and std.meta.eql(input.*, dma) and offset & 4095 == 0 and offset < storage.bytes);
         const i = offset / 4096;
         out.* = .{ .dma_address = if (is("control_alias") and i == 2) pages[0] else pages[i], .byte_length = 4096, .next_offset = offset + 4096 };
         return a.gfx_buffer_result_ok;
     }
     fn releaseDevice(input: *const a.GfxDeviceLease, quiesced: u32) callconv(.c) i32 {
+        if (power.owns(input.lease)) return power.releaseDevice(input, quiesced);
         std.debug.assert(active and quiesced == 1);
         if (input.access == 0) {
             std.debug.assert(reading and gpu_mapped and mapped and std.meta.eql(input.*, read_lease));
@@ -143,6 +155,7 @@ pub const Model = struct {
         return a.gfx_buffer_result_ok;
     }
     fn release(input: *const a.GfxBufferHandle) callconv(.c) i32 {
+        if (power.owns(input.*)) return power.release(input);
         std.debug.assert(active and !cpu_mapped and !mapped and !gpu_mapped and !reading and std.meta.eql(input.*, reference));
         if (is("control_release")) return -1;
         active = false;

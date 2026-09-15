@@ -8,6 +8,7 @@ const wire = @import("gsp_buffer_wire.zig");
 // One bounded CE upload can carry all16 descriptor/vertex/color packets. FIFO storage
 // keeps the independent three-page wire default.
 pub const bytes: usize = 20 * 1024;
+pub const shared_page_bytes: usize = 4096;
 pub const page_count = bytes / 4096;
 pub const Error = error{ Busy, Api, Memory, Descriptor, Map, Synchronization };
 const ok = a.gfx_buffer_result_ok;
@@ -32,7 +33,7 @@ pub const Storage = struct {
 
     pub fn prepare(self: *Storage, ctx: *const r4os.r4dev.DriverContext, adapter: u32, epoch: u64, byte_length: usize) Error!void {
         if (self.self_address != 0) return error.Busy;
-        if (adapter == 0 or epoch == 0 or (byte_length != bytes and byte_length != wire.bytes)) return error.Descriptor;
+        if (adapter == 0 or epoch == 0 or (byte_length != shared_page_bytes and byte_length != bytes and byte_length != wire.bytes)) return error.Descriptor;
         // Older kernels reject a Work query: no private heap fallback can
         // silently claim the common BO lifetime or later app-buffer support.
         const memory = ctx.memory() orelse return error.Api;
@@ -45,7 +46,7 @@ pub const Storage = struct {
             .byte_length = byte_length,
             .alignment = 4096,
             .usage = a.gfx_buffer_usage_cpu_read | a.gfx_buffer_usage_cpu_write |
-                a.gfx_buffer_usage_transfer_source | a.gfx_buffer_usage_transfer_target,
+                (if (byte_length == shared_page_bytes) @as(u32, 0) else a.gfx_buffer_usage_transfer_source | a.gfx_buffer_usage_transfer_target),
         };
         if (memory.bufferCreate(&request, &self.reference) != ok) return error.Memory;
         const reference = self.reference;

@@ -162,6 +162,7 @@ pub const render_cache = @import("gsp_render_cache.zig");
 const render_job = @import("gsp_render_job.zig");
 const render_queue = @import("gsp_render_queue.zig");
 pub const scheduling = @import("gsp_work_scheduling.zig");
+pub const power = @import("gsp_power.zig");
 pub const GraphicsWork = struct {
     channel_handle: ChannelHandle,
     command: execution_fifo.copy.graphics.Command,
@@ -263,6 +264,9 @@ pub const Owner = struct {
     startup_deadline: u64 = 0,
     post: postinit.Owner = .{},
     rm_enabled: bool = false, // Set by the real device only after IRQ installation.
+    power_enabled: bool = false,
+    power_owner: ?power.Owner = null,
+    power_active: bool = false,
     graph: ?rm.Owner = null,
     display_object: ?display.Object = null,
     display_engine_owner: ?display_engine.Owner = null,
@@ -633,6 +637,7 @@ pub const Owner = struct {
             .irq_messages = @atomicLoad(u64, &endpoint.messages, .acquire) }) catch {};
     }
     pub fn activeChannel(self: *Owner) ?*exchange.Exchange {
+        if (self.power_active) if (self.power_owner) |*owner| if (owner.active) |*active| return active;
         if (self.mode_control_active) if (self.mode_control_owner) |*owner| return &owner.exchange;
         if (self.display_channel_active) |index| if (self.display_channels[index]) |*owner| return &owner.exchange;
         if (self.display_engine_active) if (self.display_engine_owner) |*owner| return &owner.exchange;
@@ -2331,7 +2336,7 @@ pub const Owner = struct {
         self.log("NVIDIA gsp-present-image: retired={d} shadow=unmapped,import-released scanout=retained", .{dma});
         return true;
     }
-    fn executionWorkBusy(self: *const Owner) bool { return self.graphics_upload != null or self.graphics_work != null or self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.initial_image != null or self.mode_control_active or self.cursor_upload != null or self.audio_work != null or self.sor_work != null; }
+    fn executionWorkBusy(self: *const Owner) bool { return self.power_active or self.graphics_upload != null or self.graphics_work != null or self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.initial_image != null or self.mode_control_active or self.cursor_upload != null or self.audio_work != null or self.sor_work != null; }
     fn engineWorkBusy(self: *const Owner) bool { return self.executionWorkBusy() or self.hasDisplayFlips(); }
     fn deviceWorkBusy(self: *const Owner) bool { return self.engineWorkBusy() or self.queued_render != null; }
     fn copyBusy(self: *const Owner) bool { return self.deviceWorkBusy() or self.frame_ready != null or (self.direct_work != null and !self.direct_step); }
@@ -2347,7 +2352,7 @@ pub const Owner = struct {
         return self.executionAdmissionBusy() or self.queued_render != null;
     }
     fn executionAdmissionBusy(self: *const Owner) bool {
-        return self.direct_work != null or self.cursor_reserving or self.graphics_upload != null or self.graphics_work != null or self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.initial_image != null or self.cursor_upload != null or self.audio_work != null or self.sor_work != null or
+        return self.power_active or self.powerStopping() or self.direct_work != null or self.cursor_reserving or self.graphics_upload != null or self.graphics_work != null or self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.initial_image != null or self.cursor_upload != null or self.audio_work != null or self.sor_work != null or
             self.mode_control_active or (self.hasDisplayFlips() and !self.overlapFlip());
     }
     pub fn cursorWorkAvailable(self: *Owner) bool {
@@ -4660,10 +4665,12 @@ pub const Owner = struct {
     /// borrowed driver reference only after RM allocation/map ACKs and common
     /// commit. Consumers import that reference through the common API.
     pub fn allocateNativeBuffer(self: *Owner, bytes: u64, deadline: u64) !BufferHandle {
+        if (self.power_active or self.powerStopping()) return error.Busy;
         const space = (self.nativeAddressSpace() orelse return error.State).*;
         return self.allocateNativePlan(try vram.surface.raw(self.adapter_id, space, bytes), deadline);
     }
     pub fn allocateNativeSurface(self: *Owner, request: vram.surface.Request, deadline: u64) !BufferHandle {
+        if (self.power_active or self.powerStopping()) return error.Busy;
         const space = (self.nativeAddressSpace() orelse return error.State).*;
         const caps = self.nativeMemoryCapabilities() orelse return error.State;
         return self.allocateNativePlan(try vram.surface.create(self.adapter_id, space, caps, request), deadline);
@@ -4671,6 +4678,7 @@ pub const Owner = struct {
     /// Own scanout requires a verified contiguous physical extent in the
     /// display DMA context, while retaining the common native BO descriptor.
     pub fn allocateDisplaySurface(self: *Owner, request: vram.surface.Request, deadline: u64) !BufferHandle {
+        if (self.power_active or self.powerStopping()) return error.Busy;
         const space = (self.nativeAddressSpace() orelse return error.State).*;
         const caps = self.nativeMemoryCapabilities() orelse return error.State;
         const summary = self.nativeMemory() orelse return error.State;
@@ -4689,6 +4697,7 @@ pub const Owner = struct {
         return self.allocatePrivateStorage(requirement.bytes, requirement.alignment, true, requirement.readonly, deadline);
     }
     fn allocatePrivateStorage(self: *Owner, bytes: u64, alignment: u64, privileged: bool, readonly: bool, deadline: u64) !BufferHandle {
+        if (self.power_active or self.powerStopping()) return error.Busy;
         const space = (self.nativeAddressSpace() orelse return error.State).*;
         const caps = self.nativeMemoryCapabilities() orelse return error.State;
         const memory_summary = self.nativeMemory() orelse return error.State;
@@ -4705,6 +4714,7 @@ pub const Owner = struct {
     }
     fn openNativeBuffer(self: *Owner, plan: vram.surface.Plan, policy: ?vram.storage.Policy, deadline: u64) !BufferHandle {
         _ = try self.now();
+        if (self.power_active or self.powerStopping()) return error.Busy;
         if (self.graph_closing or self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or self.sequence.self_address != 0 or self.outputs.active()) return error.Busy;
         const space = (self.nativeAddressSpace() orelse return error.State).*;
         if (self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
@@ -4786,11 +4796,12 @@ pub const Owner = struct {
     /// Requires all engine users independently quiesced. Each child mapping
     /// is drained before graph.beginDestroy may send any parent/event free.
     pub fn beginDestroyGraph(self: *Owner, deadline: u64, quiesced: bool) !void {
-        _ = try self.now();
+        const current = try self.now();
         if (self.copyBusy() or self.hasQueuedWork() or self.display_engine_owner != null or self.mode_control_owner != null) return error.Busy;
         if (!quiesced or self.graph_closing or self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or
             self.sequence.self_address != 0 or self.nativeObject() == null or self.channel.?.phase != .idle) return error.Busy;
         try self.channel.?.guard(deadline);
+        if (self.power_owner) |*owner| if (!try owner.stop(current)) return error.Busy;
         for (&self.native_buffers, 0..) |*slot, index| if (slot.owner != null) {
             try self.releaseNativeBuffer(.{ .epoch = self.epoch, .serial = slot.serial, .slot = @intCast(index) });
         };
@@ -4804,6 +4815,17 @@ pub const Owner = struct {
     }
     fn advance(self: *Owner) !Progress {
         const current = try self.now();
+        if (self.power_owner) |*owner| {
+            owner.observeActivity(current, self.powerActivity());
+            owner.sample(current) catch |err| {
+                if (owner.host_failure == null) self.log("NVIDIA telemetry: read-unavailable={s}", .{@errorName(err)});
+                owner.host_failure = err;
+            };
+            owner.exchangeCommon(current) catch |err| {
+                if (owner.host_failure == null) self.log("NVIDIA telemetry: common-unavailable={s}", .{@errorName(err)});
+                owner.host_failure = err;
+            };
+        }
         self.observeAdaptiveRefresh(current);
         const channel = self.activeChannel() orelse return error.State;
         self.snapshot.polls +|= 1;
@@ -4816,6 +4838,25 @@ pub const Owner = struct {
                 self.snapshot.last_event_ns = current;
             }
             return .progress;
+        }
+        if (self.power_active) {
+            const owner = if (self.power_owner) |*value| value else return error.State;
+            if (owner.completed) {
+                const deadline = owner.deadline;
+                const operation = owner.operation orelse return error.State;
+                self.log("NVIDIA power: control={x} status={?x} telemetry={s} poll-mask={x} policy={s} requested-level={d}",
+                    .{power.wire.command(operation),owner.last_status,@tagName(owner.status),owner.active_mask,
+                    @tagName(owner.performance.reason),owner.performance.accepted_level});
+                var token = try owner.handoff(deadline);
+                self.channel = try exchange.Exchange.init(&token, deadline);
+                self.power_active = false;
+                return .progress;
+            }
+            if (try owner.poll(current)) |dispatch| {
+                try self.notification(&owner.active.?, dispatch, current);
+                return .progress;
+            }
+            return if (owner.active.?.phase == .waiting) .idle else .progress;
         }
         if (self.display_channel_active) |index| {
             const owner = if (self.display_channels[index]) |*value| value else return error.State;
@@ -4988,6 +5029,7 @@ pub const Owner = struct {
         // A due receiver batch gets the idle RM channel before another
         // queued frame. A continuously repainting desktop must not starve HPD.
         if (self.outputs.state != .detached and try self.beginReceiverRefresh(current)) return .progress;
+        if (try self.beginPower(current)) return .progress;
         if (self.presentation) |entry| if (entry.pending and !self.copyAdmissionBusy() and (self.display_paused or self.presentationValid())) {
             const copy_deadline = try std.math.add(u64, current, 3 * std.time.ns_per_s);
             if (!self.copyBusy() and self.cursor_point == null and self.buffer_active == null) {
@@ -5237,6 +5279,60 @@ pub const Owner = struct {
         try self.receiver_events.started(self.epoch, current);
         self.log("NVIDIA gsp-outputs: acquiring generation={d} deadline-ns={d}", .{self.output_generation, end});
         return true;
+    }
+    fn powerStopping(self: *const Owner) bool {
+        return if (self.power_owner) |*owner| owner.stopping else false;
+    }
+    fn powerActivity(self: *const Owner) power.policy.Activity {
+        // Bootstrap/context construction stays under firmware defaults.
+        // Host policy follows accepted application jobs and published outputs.
+        var published = false;
+        for (&self.presentation_slots) |*slot| if (slot.*) |*image| if (image.registered) { published = true; };
+        var result: power.policy.Activity = .{
+            .copy = self.copy_job != null,
+            .render = self.queued_render != null or (if (self.graphics_work) |*work| work.queued else false),
+            .display_commit = published and (self.display_work != null or self.hasDisplayFlips()),
+            .cursor = published and (self.cursor_upload != null or self.cursor_point != null),
+            .fullscreen = self.direct_work != null,
+            .stopping = self.graph_closing,
+        };
+        for (&self.work_slots) |*slot| {
+            if (slot.* == .copy) result.copy = true;
+            if (slot.* == .render) result.render = true;
+        }
+        for (&self.display_images) |*image| if (image.* != null) { result.outputs += 1; };
+        return result;
+    }
+    fn beginPower(self: *Owner, current: u64) !bool {
+        if (!self.power_enabled or !self.rm_enabled or self.power_active or self.copyBusy() or self.cursor_point != null or
+            self.cursor_reserving or self.fifo_active != null or self.context_active != null or self.native_active != null or
+            self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or self.graph_closing or
+            self.nativeObject() == null or self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return false;
+        const owner = (try self.ensurePower()) orelse return false;
+        const operation = (try owner.choose(current, self.powerActivity())) orelse return false;
+        const deadline = current +| std.time.ns_per_s;
+        var token = try self.channel.?.handoff(deadline);
+        try owner.begin(&token, operation, current, deadline);
+        self.power_active = true;
+        return true;
+    }
+    /// Driver Work only; the common query merely queues bounded demand.
+    pub fn demandPower(self: *Owner, current: u64, mask: u64) !void {
+        if (self.graph_closing) return error.Busy;
+        const owner = (try self.ensurePower()) orelse return error.Unsupported;
+        try owner.demand(current, mask);
+    }
+    fn ensurePower(self: *Owner) !?*power.Owner {
+        if (!self.power_enabled or !self.rm_enabled or self.nativeObject() == null) return null;
+        if (self.power_owner == null) {
+            const ctx = self.ctx orelse return null;
+            const names = self.graph.?.base.plan.handles;
+            const internal = self.static_info orelse return error.State;
+            self.power_owner = try power.Owner.init(ctx, self.adapter_id,
+                .{ .epoch = self.epoch, .client = names.client, .subdevice = names.subdevice },
+                .{ .epoch = self.epoch, .client = internal.client, .subdevice = internal.subdevice });
+        }
+        return &self.power_owner.?;
     }
     fn logMemory(self: *Owner) void {
         const data = self.nativeMemory() orelse return;
