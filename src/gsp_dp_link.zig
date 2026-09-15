@@ -51,29 +51,45 @@ const outputs = @import("gsp_outputs.zig");
 const exchange = @import("gsp_exchange.zig");
 const aux = @import("gsp_aux_wire.zig");
 const signal_color = @import("gsp_color_signal.zig");
+pub const link_caps = @import("gsp_link_caps.zig");
+const dsc = @import("gsp_dsc.zig");
+const fec = @import("gsp_dp_watermark.zig");
 pub const max_bytes = 108;
 pub const Plan = struct { object: display.Object, mode: mode.Plan, receiver: ?signal_color.Receiver = null };
 pub const Stage = enum { source, caps, extended_caps, repeaters, power, power_on, train, link_config, link_status, stream, mute, complete,
-    color_caps, vsc, hdr, post_complete };
+    color_caps, vsc, hdr, post_complete, dsc_caps, fec_caps, mst_caps,
+    fec_clear, fec_enable, fec_status, dsc_enable, dsc_verify };
 pub const Config = struct { rate: u8, lanes: u8 };
-pub const Source = struct { rate: u8, increased_watermark: bool, dp14: bool = false };
+pub const Source = link_caps.DpSource;
 pub const Sink = struct { revision: u8, rate: u8, lanes: u8, enhanced: bool, post_adjust: bool };
 pub const Stream = struct { watermark: u32, hblank: u32, vblank: u32, audio_48k: bool };
-pub const Result = struct { source: Source, sink: Sink, config: Config, stream: Stream, dpcd: [16]u8, lane_status: [8]u8, attempts: u8 };
+pub const Result = struct { source: Source, sink: Sink, config: Config, stream: Stream, dpcd: [16]u8, lane_status: [8]u8, attempts: u8,
+    receiver_caps: link_caps.DpReceiver = .{}, compressed: ?dsc.DpPlan = null, fec_receipt: u64 = 0, decoder_receipt: u64 = 0,
+    pub fn complete(self: Result, saved: mode.Plan) bool {
+        if (!std.meta.eql(self.compressed, saved.signal.dp_dsc) or !trained(self.lane_status, self.config.lanes)) return false;
+        if (self.compressed) |value| return self.fec_receipt != 0 and self.decoder_receipt > self.fec_receipt and
+            value.rate == self.config.rate and value.lanes == self.config.lanes;
+        return self.fec_receipt == 0 and self.decoder_receipt == 0;
+    }
+};
 pub fn derive(saved: mode.Plan, object: display.Object, snapshot: *const outputs.Snapshot) !Plan {
     try mode.validate(saved.signal, saved.head);
     try signal_color.validate(saved);
-    if (!saved.displayPort() or saved.transport_hdmi or saved.cta_vic != 0) return error.Unsupported;
+    if (!saved.displayPort() or saved.signal.mst != null or saved.transport_hdmi or saved.cta_vic != 0) return error.Unsupported;
     if (object.client == 0 or object.display == 0 or object.epoch != saved.epoch or object.client != snapshot.topology.client or
         !std.meta.eql(saved, try mode.bind(saved, snapshot, saved.epoch, saved.held_generation))) return error.Stale;
     for (snapshot.receivers[0..snapshot.count]) |*receiver| if (receiver.display_id == saved.signal.display_id) {
         if (receiver.connected != true or receiver.status != .valid_edid or !receiver.report.complete()) return error.Stale;
         if (!receiver.report.digital or receiver.report.colors & 1 == 0) return error.Unsupported;
+        try @import("gsp_dp_mode.zig").validate(saved,receiver);
         // Preflight only against the implementation's HBR3x4 ceiling.
         // No color plan is installed until source/DPCD capabilities and
         // the actually trained configuration pass admission again.
+        const compressed=saved.signal.dp_dsc;
         _ = try signal_color.admit(saved, &receiver.report, .{ .displayport = .{
-            .payload_bits_per_second = 25_920_000_000, .vsc = true, .hdr_sdp = true } });
+            .payload_bits_per_second = if(compressed) |value| try @import("gsp_dp_watermark.zig").payload(value.rate,value.lanes) else 25_920_000_000,
+            .compressed_bpp_x16 = if (compressed) |value| value.params.bpp_x16 else 0,
+            .compressed_bpc = if (compressed != null) saved.signal.bpc else 0, .vsc = true, .hdr_sdp = true } });
         return .{ .object = object, .mode = saved, .receiver = if (saved.color != null) signal_color.Receiver.capture(receiver.report) else null };
     };
     return error.Stale;
@@ -96,13 +112,25 @@ fn clockHz(saved: mode.Plan) u64 {
 pub fn stream(saved: mode.Plan, source: Source, sink: Sink, config: Config) !Stream {
     if (!validRate(config.rate) or config.rate > source.rate or config.rate > sink.rate or
         (config.lanes != 1 and config.lanes != 2 and config.lanes != 4) or config.lanes > sink.lanes) return error.Unsupported;
+    if (saved.signal.dp_dsc) |value| {
+        if (!source.dp14 or !source.fec or !source.dsc.usable or config.rate != value.rate or config.lanes != value.lanes)
+            return error.Bandwidth;
+        const params = value.params;
+        const result = try fec.withFec(.{ .clock = signal_color.links.Clock.nvidia(saved.signal.clock),
+            .width = saved.width, .total = saved.signal.total & 0xffff, .bpp_x16 = params.bpp_x16,
+            .rate = config.rate, .lanes = config.lanes, .enhanced = sink.enhanced, .increased = source.increased_watermark,
+            .compression = .{ .count = params.slices, .width = params.slice_width, .chunk_bytes = params.chunk_bytes } });
+        return .{ .watermark = result.watermark, .hblank = result.hblank, .vblank = result.vblank, .audio_48k = result.audio_48k };
+    }
     const pclk = clockHz(saved);
     const width: u64 = saved.width;
     const raster: u64 = saved.signal.total & 0xffff;
     const lanes: u64 = config.lanes;
     const link: u64 = @as(u64, config.rate) * 27_000_000; // 8 payload bits per 10-bit symbol.
     const bpp: u64 = @as(u64, saved.signal.bpc) * 3;
-    if ((saved.signal.bpc != 8 and saved.signal.bpc != 10) or !saved.displayPort() or saved.transport_hdmi or pclk == 0 or width <= 60 or raster <= width or pclk * bpp >= 8 * link * lanes)
+    const demand = try signal_color.links.rgbDemand(signal_color.links.Clock.nvidia(saved.signal.clock), saved.signal.bpc);
+    if ((saved.signal.bpc != 8 and saved.signal.bpc != 10) or !saved.displayPort() or saved.transport_hdmi or pclk == 0 or width <= 60 or raster <= width or
+        !demand.fits(try signal_color.links.dp8b10bPayload(config.rate, config.lanes)))
         return error.Bandwidth;
     const precision = 100_000;
     const ratio = pclk * bpp * precision / (8 * link * lanes);
@@ -145,6 +173,7 @@ pub const Work = struct {
     not_before: u64 = 0,
     power_value: u8 = 1,
     dpcd: [16]u8 = @splat(0),
+    receiver_caps: link_caps.DpReceiver = .{},
     status: [8]u8 = @splat(0),
     result: ?Result = null,
     vsc_supported: bool = false,
@@ -152,6 +181,14 @@ pub const Work = struct {
     last_rm_status: u32 = 0,
     last_train_error: u32 = 0,
     last_aux_reply: ?aux.ReplyType = null,
+    fec_receipt: u64 = 0,
+    decoder_receipt: u64 = 0,
+    fec_polls: u8 = 0,
+
+    pub fn mutating(self: *const Work) bool {
+        return switch (self.stage) { .power_on, .train, .stream, .mute, .vsc, .hdr,
+            .fec_clear, .fec_enable, .dsc_enable => true, else => false };
+    }
 
     pub fn ready(self: *const Work, now: u64) bool { return self.stage != .complete and self.stage != .post_complete and now >= self.not_before; }
     pub fn scanoutComplete(self: *Work) !void {
@@ -160,8 +197,11 @@ pub const Work = struct {
     }
     fn request(self: *const Work) ?aux.Request {
         const operation: aux.Operation = switch (self.stage) {
-            .caps => .caps, .extended_caps => .extended_caps, .color_caps => .color_caps, .repeaters => .repeaters, .power => .power,
+            .caps => .caps, .extended_caps => .extended_caps, .color_caps => .color_caps,
+            .dsc_caps => .dsc_caps, .fec_caps => .fec_caps, .mst_caps => .mst_caps, .repeaters => .repeaters, .power => .power,
             .power_on => .{ .power_on = self.power_value }, .link_config => .link_config, .link_status => .link_status,
+            .fec_clear => .fec_clear, .fec_status => .fec_status,
+            .dsc_enable => .{ .dsc_enable = true }, .dsc_verify => .dsc_control,
             else => return null,
         };
         return .{ .display_id = self.plan.mode.signal.display_id, .operation = operation };
@@ -188,7 +228,8 @@ pub const Work = struct {
                 put(out, 20, 1); // COPYOUT_ON_ERROR: retryTimeMs is valid on BUSY/NOT_READY.
                 put(params, 4, self.plan.mode.signal.display_id);
                 put(params, 8, 3 | (1 << 13) | @as(u32, if (self.sink.?.enhanced) 128 else 0) |
-                    @as(u32, if (self.sink.?.post_adjust) 1 << 10 else 0));
+                    @as(u32, if (self.sink.?.post_adjust) 1 << 10 else 0) |
+                    @as(u32, if (self.plan.mode.signal.dp_dsc != null) 1 << 15 else 0));
                 put(params, 12, config.lanes | (@as(u32, config.rate) << 8)); // SST, sink target 0; never fake/skip training.
             },
             .stream => {
@@ -201,6 +242,10 @@ pub const Work = struct {
                 put(params, 24, value.hblank); put(params, 28, value.vblank);
                 params[68] = @intFromBool(self.sink.?.enhanced);
                 put(params, 72, 64); put(params, 76, value.watermark);
+            },
+            .fec_enable => {
+                if (self.plan.mode.signal.dp_dsc == null or !trained(self.status, self.candidates[self.index].lanes)) return error.State;
+                command = 0x73137a; size = 12; put(params, 4, self.plan.mode.signal.display_id); params[8] = 1;
             },
             .mute => { command = 0x731359; size = 12; put(params, 4, self.plan.mode.signal.display_id); put(params, 8, 1); },
             .vsc => {
@@ -242,6 +287,20 @@ pub const Work = struct {
     }
     fn select(self: *Work) !void {
         self.count = 0;
+        if (self.plan.mode.signal.dp_dsc) |value| {
+            // IMP admitted this exact PPS/rate/lane combination. A lower
+            // training fallback needs fresh mode admission, not a silent
+            // compression ratio change while the old Core is still live.
+            if (!self.source.?.fec or self.receiver_caps.fec_state != .complete or !self.receiver_caps.fec or
+                self.receiver_caps.dsc_state != .complete or !self.receiver_caps.dsc.usable) return error.Bandwidth;
+            const saved = self.plan.mode;
+            const fresh = try dsc.generate(.{ .clock = signal_color.links.Clock.nvidia(saved.signal.clock),
+                .width = saved.width, .height = saved.height, .bpc = saved.signal.bpc,
+                .hblank = (saved.signal.total & 0xffff) - saved.width, .source = self.source.?.dsc,
+                .sink = self.receiver_caps.dsc, .payload_bps = try fec.payload(value.rate, value.lanes),
+                .rate = value.rate, .lanes = value.lanes });
+            if (!std.meta.eql(fresh, value.params)) return error.Stale;
+        }
         for ([_]u8{ 30, 20, 10, 6 }) |rate| for ([_]u8{ 4, 2, 1 }) |lanes| {
             const config: Config = .{ .rate = rate, .lanes = lanes };
             _ = stream(self.plan.mode, self.source.?, self.sink.?, config) catch continue;
@@ -249,17 +308,42 @@ pub const Work = struct {
             self.candidates[self.count] = config; self.count += 1;
         };
         if (self.count == 0) return error.Bandwidth;
-        self.stage = if (self.sink.?.revision >= 0x11) .power else .train;
+        self.stage = if (self.sink.?.revision >= 0x11) .power else self.trainingStart();
     }
+    fn trainingStart(self: *const Work) Stage { return if (self.plan.mode.signal.dp_dsc != null) .fec_clear else .train; }
     fn admitColor(self: *const Work, config: Config) !?signal_color.color.Plan {
         const receiver = self.plan.receiver orelse return error.Stale;
         const capabilities = self.source orelse return error.State;
         return try signal_color.admit(self.plan.mode, receiver, .{ .displayport = .{
-            .payload_bits_per_second = @as(u64, config.rate) * 27_000_000 * 8 * config.lanes,
+            .payload_bits_per_second = if (self.plan.mode.signal.dp_dsc != null) try fec.payload(config.rate, config.lanes)
+                else @as(u64, config.rate) * 27_000_000 * 8 * config.lanes,
+            .compressed_bpp_x16 = if (self.plan.mode.signal.dp_dsc) |value| value.params.bpp_x16 else 0,
+            .compressed_bpc = if (self.plan.mode.signal.dp_dsc != null) self.plan.mode.signal.bpc else 0,
             .vsc = self.vsc_supported and capabilities.dp14, .hdr_sdp = capabilities.dp14 } });
     }
     fn afterCaps(self: *Work) void {
+        if (self.source.?.mst) { self.stage = .mst_caps; return; }
+        self.afterMst();
+    }
+    fn afterMst(self: *Work) void {
+        if (self.source.?.dp14 and self.source.?.dsc.advertised) { self.stage = .dsc_caps; return; }
+        self.afterDsc();
+    }
+    fn afterDsc(self: *Work) void {
+        if (self.source.?.dp14 and self.source.?.fec) { self.stage = .fec_caps; return; }
+        self.afterExtended();
+    }
+    fn afterExtended(self: *Work) void {
         self.stage = if (self.plan.mode.signal.dp_vsc) .color_caps else .repeaters;
+    }
+    fn optionalUnavailable(self: *Work) void {
+        switch (self.stage) {
+            .mst_caps => { self.receiver_caps.mst_state = .unavailable; self.afterMst(); },
+            .dsc_caps => { self.receiver_caps.dsc_state = .unavailable; self.afterDsc(); },
+            .fec_caps => { self.receiver_caps.fec_state = .unavailable; self.afterExtended(); },
+            else => unreachable,
+        }
+        self.retries = 0; self.not_before = 0;
     }
     pub fn consume(self: *Work, record: exchange.message.Record, now: u64) !void {
         var expected: [max_bytes]u8 = undefined;
@@ -275,6 +359,18 @@ pub const Work = struct {
         if (self.request()) |query| {
             const reply = try aux.decode(query, status, data);
             self.last_aux_reply = reply.kind;
+            if (self.stage == .mst_caps or self.stage == .dsc_caps or self.stage == .fec_caps) {
+                // Optional extended discovery cannot withdraw a sound SST
+                // mode. Failed reads remain explicitly unavailable, never
+                // a positive capability or a fabricated all-zero capture.
+                if (((status == 3 or status == 0x66) and reply.retry_ms != 0) or (status == 0 and reply.kind == .defer_reply)) {
+                    self.retry(now, if (status != 0) reply.retry_ms else 1) catch self.optionalUnavailable();
+                    return;
+                }
+                if (status != 0 or reply.kind != .ack or reply.count != aux.length(query.operation)) {
+                    self.optionalUnavailable(); return;
+                }
+            }
             if ((status == 3 or status == 0x66) and reply.retry_ms != 0) return self.retry(now, reply.retry_ms);
             if (status != 0) return error.RmRejected;
             if (reply.kind == .defer_reply) return self.retry(now, 1);
@@ -290,6 +386,19 @@ pub const Work = struct {
                     if (reply.data[14] & 0x80 != 0) { self.stage = .extended_caps; } else self.afterCaps();
                 },
                 .extended_caps => { self.sink = try receiverCaps(reply.data); self.dpcd = reply.data; self.afterCaps(); },
+                .mst_caps => {
+                    self.receiver_caps.mst_state = .complete; self.receiver_caps.mst = reply.data[0] & 1 != 0;
+                    self.afterMst();
+                },
+                .dsc_caps => {
+                    self.receiver_caps.dsc = link_caps.DscSink.decode(reply.data);
+                    self.receiver_caps.dsc_state = if (self.receiver_caps.dsc.advertised and !self.receiver_caps.dsc.usable) .invalid else .complete;
+                    self.afterDsc();
+                },
+                .fec_caps => {
+                    self.receiver_caps.fec_state = .complete; self.receiver_caps.fec = reply.data[0] & 1 != 0;
+                    self.afterExtended();
+                },
                 .color_caps => {
                     self.vsc_supported = reply.data[0] & 8 != 0;
                     if (!self.vsc_supported or !self.source.?.dp14) return error.Unsupported;
@@ -302,7 +411,20 @@ pub const Work = struct {
                     try self.select();
                 },
                 .power => { self.power_value = (reply.data[0] & ~@as(u8, 7)) | 1; self.stage = .power_on; },
-                .power_on => { self.stage = .train; self.not_before = now +| std.time.ns_per_ms; },
+                .power_on => { self.stage = self.trainingStart(); self.not_before = now +| std.time.ns_per_ms; },
+                .fec_clear => self.stage = .train,
+                .fec_status => {
+                    if (reply.data[0] & 1 == 0) {
+                        if (self.fec_polls >= 2) return error.LinkTraining;
+                        self.fec_polls += 1; self.not_before = now +| std.time.ns_per_ms; return;
+                    }
+                    self.stage = .dsc_enable;
+                },
+                .dsc_enable => self.stage = .dsc_verify,
+                .dsc_verify => {
+                    if (reply.data[0] & 3 != 1) return error.LinkTraining;
+                    self.stage = .stream;
+                },
                 .link_config => {
                     const config = self.candidates[self.index];
                     if (reply.data[0] != config.rate or reply.data[1] & 31 != config.lanes or
@@ -312,7 +434,7 @@ pub const Work = struct {
                 .link_status => {
                     @memcpy(&self.status, reply.data[0..8]);
                     if (!trained(self.status, self.candidates[self.index].lanes)) return self.fallback();
-                    self.stage = .stream;
+                    self.stage = if (self.plan.mode.signal.dp_dsc != null) .fec_enable else .stream;
                 },
                 else => return error.State,
             }
@@ -320,10 +442,8 @@ pub const Work = struct {
             switch (self.stage) {
                 .source => {
                     if (status != 0) return error.RmRejected;
-                    if (!std.mem.eql(u8, data[0..8], expected[24..32]) or word(data, 8) < 1 or word(data, 8) > 4 or
-                        data[26] > 1 or data[30] != 1) return error.Unsupported;
-                    const rates = [_]u8{ 6, 10, 20, 30 };
-                    self.source = .{ .rate = rates[word(data, 8) - 1], .increased_watermark = data[26] == 1, .dp14 = word(data, 12) & 2 != 0 };
+                    if (!std.mem.eql(u8, data[0..8], expected[24..32])) return error.Unexpected;
+                    self.source = try Source.decode(data);
                     if (self.plan.mode.signal.dp_vsc and !self.source.?.dp14) return error.Unsupported;
                     self.stage = .caps;
                 },
@@ -336,17 +456,19 @@ pub const Work = struct {
                     if (self.last_train_error != 0) return self.fallback();
                     self.stage = .link_config;
                 },
-                .stream, .mute, .vsc, .hdr => {
+                .fec_enable, .stream, .mute, .vsc, .hdr => {
                     if (status != 0) return error.RmRejected;
                     if (!std.mem.eql(u8, data, expected[24..length])) return error.Unexpected;
-                    if (self.stage == .stream) { self.stage = .mute; }
+                    if (self.stage == .fec_enable) { self.stage = .fec_status; }
+                    else if (self.stage == .stream) { self.stage = .mute; }
                     else if (self.stage == .vsc) { self.stage = .hdr; }
                     else if (self.stage == .hdr) { self.stage = .post_complete; }
                     else {
                         self.color = if (self.plan.mode.color != null) try self.admitColor(self.candidates[self.index]) else null;
                         self.result = .{ .source = self.source.?, .sink = self.sink.?, .config = self.candidates[self.index],
                             .stream = try stream(self.plan.mode, self.source.?, self.sink.?, self.candidates[self.index]),
-                            .dpcd = self.dpcd, .lane_status = self.status, .attempts = self.attempts };
+                            .dpcd = self.dpcd, .lane_status = self.status, .attempts = self.attempts, .receiver_caps = self.receiver_caps,
+                            .compressed = self.plan.mode.signal.dp_dsc, .fec_receipt = self.fec_receipt, .decoder_receipt = self.decoder_receipt };
                         self.stage = .complete;
                     }
                 },

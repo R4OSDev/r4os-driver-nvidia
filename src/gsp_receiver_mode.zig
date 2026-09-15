@@ -43,7 +43,7 @@ pub fn select(saved: boot.Plan, snapshot: *const outputs.Snapshot, id: u32) !boo
         while (modes.next()) |entry| if (entry.mode.mode_id == id) {
             const value = entry.timing;
             // The currently negotiated scanout path has no interlace,
-            // repetition, YUV, DSC, scaling or extended AVI VIC encoding.
+            // repetition, YUV, scaling or extended AVI VIC encoding.
             if (value.flags & (timing.interlaced | timing.y420_only | timing.incomplete) != 0 or
                 value.vic > 127 or value.clock_hz > 0x7fffffff or value.h_total > 0x7fff or value.v_total > 0x7fff)
                 return error.Unsupported;
@@ -71,7 +71,11 @@ pub fn select(saved: boot.Plan, snapshot: *const outputs.Snapshot, id: u32) !boo
             result.signal.hdmi = 0; // Normal 2D AVI; retire any boot HDMI-VIC VSI.
             result.signal.min_frame_idle = pair(v_end, value.v_start - value.height);
             try boot.validate(result.signal, result.head);
-            return result;
+            if (result.signal.mst != null) {
+                _ = try @import("gsp_mst_mode.zig").admit(result, snapshot);
+                return result;
+            }
+            return try @import("gsp_dp_mode.zig").select(try @import("gsp_frl_link.zig").select(result, report), capture);
         };
         return error.Unsupported;
     };

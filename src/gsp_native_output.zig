@@ -498,7 +498,7 @@ pub const Owner = struct {
         for (snapshot.topology.routes[0..snapshot.count], snapshot.receivers[0..snapshot.count]) |*route, *receiver| {
             if (route.id != mode.signal.display_id) continue;
             if (found) return error.Routing;
-            try catalog.encode(&self.receiver, route, receiver);
+            try catalog.encodeCaptured(&self.receiver, route, receiver, snapshot);
             found = true;
         }
         if (!found) return error.Routing;

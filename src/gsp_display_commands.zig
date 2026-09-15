@@ -285,9 +285,32 @@ pub const Config = struct {
     // Explicit retirement of this route. No image/timing/cursor activation
     // may be mixed with the NULL ISO and SOR owner-mask transaction.
     detach_sor: ?u32 = null,
+    // Resulting physical owner mask from Runtime's acknowledged MST images.
+    mst_sor_control: ?u32 = null,
+    // Completed peer images keep their Window->head routing on modesets.
+    preserve_windows: u8 = 0,
     refresh_control: ?RefreshControl = null,
+    clear_dsc: bool = false,
 };
 pub const max_words: usize = 192;
+pub fn validateSharedSor(config: Config) Error!void {
+    if (config.preserve_windows != 0 and (config.kind != .core or config.initialize or config.signal == null or config.route == null or
+        config.route.?.window >= 8 or config.preserve_windows & ~config.windows != 0 or
+        config.preserve_windows & (@as(u8, 1) << @intCast(config.route.?.window)) != 0)) return error.Descriptor;
+    const value = config.mst_sor_control orelse return;
+    const route = config.route orelse return error.Descriptor;
+    if (config.kind != .core or config.initialize or route.head >= 8 or config.refresh_control != null or
+        value & ~@as(u32, 0x10fff) != 0) return error.Descriptor;
+    const bit = @as(u32, 1) << @intCast(route.head);
+    if (config.signal) |signal| {
+        if (config.detach_sor != null or signal.mst == null or value & bit == 0 or
+            value & ~@as(u32, 255) != signal.sor_control & ~@as(u32, 255)) return error.Descriptor;
+    } else {
+        if (config.detach_sor == null or value & bit != 0 or (value != 0 and value & 255 == 0)) return error.Descriptor;
+        const protocol = (value >> 8) & 15;
+        if (value != 0 and protocol != 8 and protocol != 9) return error.Descriptor;
+    }
+}
 pub const Program = struct {
     words: [max_words]u32 = @splat(0),
     count: u16 = 0,
@@ -301,7 +324,7 @@ pub const Program = struct {
 fn refresh(config: Config, control: RefreshControl) Error!Program {
     // C67D lightweight update; its caller must arm RM's lightweight
     // supervisor and serialize this with all other Core/Window mutations.
-    if (config.kind != .core or config.initialize or !config.with_core or config.notifier == 0 or config.notifier_offset != 0 or
+    if (config.kind != .core or config.clear_dsc or config.initialize or !config.with_core or config.notifier == 0 or config.notifier_offset != 0 or
         config.windows == 0 or config.windows & ~@as(u32, 255) != 0 or config.signal != null or config.scanout != null or
         config.route != null or config.position != null or config.with_position or config.cursor_usage != 0 or config.cursor_image != null or
         config.detach_sor != null or control.head >= 8 or (control.enabled and (control.timeout_us == 0 or control.timeout_us > 0x3fffff)) or
@@ -317,12 +340,14 @@ fn refresh(config: Config, control: RefreshControl) Error!Program {
     return out;
 }
 pub fn core(config: Config) Error!Program {
+    try validateSharedSor(config);
     if (config.refresh_control) |control| return refresh(config, control);
     if (config.kind != .core or config.scanout != null or config.notifier_offset != 0 or config.position != null or config.with_position or !config.with_core) return error.Descriptor;
     if (config.notifier == 0) return error.Handle;
     const cursor_usage = try cursor_image.usageCode(config.cursor_usage);
     if (config.signal == null and config.cursor_usage != 0) return error.Descriptor;
     if (config.windows == 0 or config.windows & ~@as(u32, 0xff) != 0) return error.Bounds;
+    if (config.clear_dsc and (config.route == null or (config.signal == null and config.detach_sor == null))) return error.Descriptor;
     if (config.detach_sor) |sor| {
         if (sor >= 8 or config.route == null or config.initialize or config.signal != null or
             config.cursor_usage != 0 or config.cursor_image != null) return error.Descriptor;
@@ -346,6 +371,7 @@ pub fn core(config: Config) Error!Program {
     }
     if (config.detach_sor) |sor| {
         const base = config.route.?.head * 0x400;
+        if (config.clear_dsc) try out.method(base + 0x22d4, &.{ 0, 0 });
         // Blank the primary and cursor DMA before disconnecting its SOR.
         // A Core completion alone still does not release the previous ISO
         // image: Runtime independently requires its FINISHED notifier.
@@ -353,17 +379,36 @@ pub fn core(config: Config) Error!Program {
         try out.method(base + 0x2088, &.{ 0, 0 });
         try out.method(base + 0x2090, &.{ 0, 0, 0 });
         try out.method(base + 0x2288, &.{0});
-        try out.method(0x300 + sor * 0x20, &.{0});
+        try out.method(0x300 + sor * 0x20, &.{config.mst_sor_control orelse 0});
         try out.method(base + 0x2020, &.{ 0, 0 });
     }
     if (config.signal) |signal| {
         const route = config.route orelse return error.Descriptor;
         boot_mode.validate(signal, route.head) catch return error.Descriptor;
-        // Other boot windows must not retain old image/LUT handles in the
-        // replaced instance. This transaction establishes one opaque primary.
-        for (0..8) |i| if (i != route.window and config.windows & (@as(u32, 1) << @intCast(i)) != 0)
+        // Unused boot windows lose their old routes. Completed peer images
+        // keep theirs, including SST/HDMI peers outside an MST physical root.
+        for (0..8) |i| if (i != route.window and config.windows & (@as(u32, 1) << @intCast(i)) != 0 and
+            config.preserve_windows & (@as(u8, 1) << @intCast(i)) == 0)
             try out.method(0x1000 + @as(u32, @intCast(i)) * 0x80, &.{15});
         const base = route.head * 0x400;
+        if (signal.dp_dsc) |compressed| {
+            // C67D single-encoder RGB DSC. PPS is the admitted original
+            // generator output; the link owner proves FEC and decompression
+            // before this Core update can be submitted.
+            try out.method(base + 0x22d4, &.{1 | 0x30 | (@as(u32, compressed.params.flatnessThreshold()) << 6)});
+            try out.method(base + 0x22d8, &.{1 | (31 << 2)});
+            try out.method(base + 0x22dc, &.{0x007f1000});
+            try out.method(base + 0x22e0, &compressed.params.pps);
+        } else if (signal.hdmi_dsc) |compressed| {
+            // C67D HDMI CVTEM carries128 PPS bytes in a136-byte VBLANK
+            // packet every frame. The RM query supplies the HC raster.
+            try out.method(base + 0x22d4, &.{1 | 0x30 | (@as(u32, compressed.params.flatnessThreshold()) << 6)});
+            try out.method(base + 0x22d8, &.{1 | 2 | (0x21 << 2)});
+            try out.method(base + 0x22dc, &.{0x7f});
+            try out.method(base + 0x22e0, &compressed.params.pps);
+            try out.method(base + 0x2368, &.{@as(u32, compressed.hc_active_bytes) | (@as(u32, compressed.hc_active_tri_bytes) << 16)});
+            try out.method(base + 0x236c, &.{compressed.hc_blank_tri_bytes});
+        } else if (config.clear_dsc) try out.method(base + 0x22d4, &.{ 0, 0 });
         // Preserve the exact Hz + 1000/1001 encoding and raster coordinates.
         // Clock configuration transfers programming to RM, without hopping.
         try out.method(base + 0x2008, &.{0});
@@ -398,7 +443,8 @@ pub fn core(config: Config) Error!Program {
         const depth: u32 = if (signal.bpc == 10) 0x50 else 0x40;
         try out.method(base + 0x2000, &.{ 0, 0xfc000000 | depth | signal.polarity |
             @as(u32, if (signal.dp_vsc) 0x01800000 else 0) });
-        try out.method(0x300 + signal.sor * 0x20, &.{signal.sor_control});
+        const sor_control = if (signal.hdmi_frl) (signal.sor_control & ~@as(u32, 0xf00)) | 0xc00 else signal.sor_control;
+        try out.method(0x300 + signal.sor * 0x20, &.{config.mst_sor_control orelse sor_control});
     }
     if (config.cursor_image) |cursor| {
         if (config.initialize or config.route != null or config.signal != null) return error.Descriptor;
@@ -419,6 +465,7 @@ pub fn core(config: Config) Error!Program {
     return out;
 }
 pub fn window(config: Config) Error!Program {
+    if (config.clear_dsc) return error.Descriptor;
     if (config.refresh_control != null) return error.Descriptor;
     if (config.cursor_image != null or config.cursor_usage != 0) return error.Descriptor;
     if (config.kind != .window or config.notifier == 0 or config.notifier_offset > 16 or config.notifier_offset & 15 != 0 or config.signal != null or config.position != null) return error.Descriptor;
@@ -470,6 +517,7 @@ pub fn window(config: Config) Error!Program {
     return out;
 }
 pub fn immediate(config: Config) Error!Program {
+    if (config.clear_dsc) return error.Descriptor;
     if (config.refresh_control != null) return error.Descriptor;
     if (config.cursor_image != null or config.cursor_usage != 0 or config.detach_sor != null) return error.Descriptor;
     if (config.kind != .immediate or config.notifier != 0 or config.notifier_offset != 0 or config.scanout != null or
@@ -484,5 +532,8 @@ pub fn immediate(config: Config) Error!Program {
     try out.method(0x200, &.{3}); // RELEASE_ELV + INTERLOCK_WITH_WINDOW.
     return out;
 }
-pub fn encode(config: Config) Error!Program { return switch (config.kind) { .core => core(config), .window => window(config), .immediate => immediate(config), .cursor => error.Descriptor }; }
+pub fn encode(config: Config) Error!Program {
+    try validateSharedSor(config);
+    return switch (config.kind) { .core => core(config), .window => window(config), .immediate => immediate(config), .cursor => error.Descriptor };
+}
 pub fn same(a: Program, b: Program) bool { return a.count == b.count and std.mem.eql(u32, &a.words, &b.words); }

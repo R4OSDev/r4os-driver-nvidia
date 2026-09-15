@@ -1776,7 +1776,7 @@ fn checkBootVramOwner() !void {
     const unassigned_raw = try unassigned.readShared(&ctx, &snapshot, chip, &capture.registers,
         .{ .context = &capture, .epoch = capture.boot.held_generation, .generation = f.nativeGeneration });
     try t.expect(try scanout.windowHead(&unassigned_raw.windows[0]) == null);
-    try t.expect(unassigned.reads == 748 and unassigned.reads <= scanout.max_read_count);
+    try t.expect(unassigned.reads == 756 and unassigned.reads <= scanout.max_read_count);
     try t.expect(unassigned.close());
     f.put(scanout.armed_base + 0x1000, 0);
     const last_binding_address = scanout.window_armed_base + 7 * 0x1000 + 0x254;
@@ -1789,7 +1789,7 @@ fn checkBootVramOwner() !void {
         .{ .context = &capture, .epoch = capture.boot.held_generation, .generation = f.nativeGeneration });
     f.scanout_mutate_at = 0;
     try t.expectError(error.Unstable, changing_result);
-    try t.expect(changing.reads == 748 and capture.registers.borrowedCount() == 2);
+    try t.expect(changing.reads == 756 and capture.registers.borrowedCount() == 2);
     try t.expect(changing.close() and capture.registers.borrowedCount() == 1);
     f.put(scanout.window_armed_base + 7 * 0x1000 + 0x5cc, 0x2222);
     f.put(last_binding_address, 0x87654321);

@@ -1,4 +1,4 @@
-//! Additional external SST outputs. Capability masks and the current coherent
+//! Additional external outputs. Capability masks and the current coherent
 //! RM/EDID capture supply every route and timing; this code performs no I/O.
 //! Window/head compatibility is NV0073 GET_VALID_HEAD_WINDOW_ASSIGNMENT.
 const std = @import("std");
@@ -7,15 +7,40 @@ const scanout = @import("boot_scanout.zig");
 const outputs = @import("gsp_outputs.zig");
 const wire = @import("gsp_display_engine_wire.zig");
 const display = @import("gsp_display_rpc.zig");
+const mst = @import("gsp_mst_binding.zig");
 
 pub const Source = struct { epoch: u64, held_generation: u64, boot_generation: u64 };
 pub const Claim = struct {
     display_id: u32, connector: display.Connector, sor: u32, protocol: u32, head: u32, window: u32,
+    mst: ?mst.Stamp = null,
 };
 pub const Selection = struct { claim: Claim, plan: boot.Plan };
 pub const Assignment = struct { request: @import("gsp_sor_assignment.zig").Request, connector: display.Connector, fingerprint: [32]u8 };
 
-/// Preflight a new SST assignment without pretending its current SOR index
+/// A physical hub may have no EDID and no SOR yet. This fingerprint binds
+/// assignment to its freshly captured DPCD; it grants no encoder or mode.
+pub fn mstRootFingerprint(snapshot: *const outputs.Snapshot, id: u32) !?[32]u8 {
+    const current = try route(snapshot, id);
+    const resource = current.resource orelse return null;
+    const physical = current.connectors orelse return null;
+    if (!display.nativeDp(resource) or resource.location != 0 or !physical.present() or physical.count != 1 or
+        (physical.data[0].kind != 0x46 and physical.data[0].kind != 0x48)) return null;
+    for (snapshot.receivers[0..snapshot.count]) |*value| if (value.display_id == id) {
+        if (value.epoch != snapshot.topology.epoch or value.client != snapshot.topology.client or
+            value.receipt_serial == 0 or value.receipt_serial >= snapshot.final_receipt_serial or value.connected != true or
+            value.resource == null or !std.meta.eql(value.resource.?, resource) or value.dp.dpcd_state != .complete or
+            value.dp.receiver.mst_state != .complete or !value.dp.receiver.mst) return null;
+        const dpcd = value.dp.dpcd;
+        if (dpcd[0] < 0x12 or dpcd[6] & 1 == 0 or
+            (dpcd[1] != 6 and dpcd[1] != 10 and dpcd[1] != 20 and dpcd[1] != 30) or
+            (dpcd[2] & 31 != 1 and dpcd[2] & 31 != 2 and dpcd[2] & 31 != 4)) return null;
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("R4OS MST physical assignment"); hash.update(&dpcd);
+        var digest: [32]u8 = undefined; hash.final(&digest); return digest;
+    };
+    return null;
+}
+/// Preflight a new physical assignment without pretending its current SOR index
 /// is allocated. Firmware may report ffffffff until ASSIGN_SOR succeeds.
 pub fn assignment(object: display.Object, snapshot: *const outputs.Snapshot, occupied: []const ?Claim,
     id: u32) !Assignment
@@ -32,13 +57,18 @@ pub fn assignment(object: display.Object, snapshot: *const outputs.Snapshot, occ
     if (dp) {
         if (kind != 0x46 and kind != 0x48) return error.Unsupported;
     } else switch (kind) { 0x61, 0x63, 0x46, 0x48, 0x30, 0x31 => {}, else => return error.Unsupported }
-    const receiver = try @import("gsp_hotplug.zig").observe(snapshot, id);
-    if (receiver.state != .connected or receiver.fingerprint == null) return error.Stale;
+    const fingerprint = (try mstRootFingerprint(snapshot, id)) orelse blk: {
+        const receiver = try @import("gsp_hotplug.zig").observe(snapshot, id);
+        if (receiver.state != .connected or receiver.fingerprint == null) return error.Stale;
+        break :blk receiver.fingerprint.?;
+    };
     var result: @import("gsp_sor_assignment.zig").Request = .{ .object = object, .display_id = id };
     for (occupied) |slot| if (slot) |used| {
         if (used.display_id == id or used.connector.index == physical.data[0].index) return error.Busy;
-        if (used.sor >= result.protected.len or result.protected[used.sor] != 0) return error.Routing;
-        result.protected[used.sor] = used.display_id;
+        if (used.sor >= result.protected.len) return error.Routing;
+        const protected_id = if (used.mst) |branch| branch.root else used.display_id;
+        if (result.protected[used.sor] != 0 and result.protected[used.sor] != protected_id) return error.Routing;
+        result.protected[used.sor] = protected_id;
     };
     // An unowned firmware head is not ours to disturb, even when RM would
     // otherwise accept a new assignment next to it.
@@ -51,7 +81,7 @@ pub fn assignment(object: display.Object, snapshot: *const outputs.Snapshot, occ
         for (occupied) |slot| if (slot) |used| { owned = owned or (used.head == index and used.display_id == active); };
         if (!owned) return error.Routing;
     }
-    return .{ .request = result, .connector = physical.data[0], .fingerprint = receiver.fingerprint.? };
+    return .{ .request = result, .connector = physical.data[0], .fingerprint = fingerprint };
 }
 
 fn route(snapshot: *const outputs.Snapshot, id: u32) !*const @import("gsp_topology.zig").Route {
@@ -67,6 +97,13 @@ fn route(snapshot: *const outputs.Snapshot, id: u32) !*const @import("gsp_topolo
     return found orelse error.Routing;
 }
 pub fn identify(plan: boot.Plan, snapshot: *const outputs.Snapshot) !Claim {
+    if (plan.signal.mst) |stamp| {
+        const view = try mst.derive(snapshot, plan.signal.display_id);
+        if (!std.meta.eql(stamp, view.stamp) or plan.signal.sor != view.slot.sor or
+            (plan.signal.sor_control >> 8) & 15 != 8 + view.slot.link) return error.Stale;
+        return .{ .display_id = stamp.display_id, .connector = view.connector, .sor = view.slot.sor,
+            .protocol = 8 + view.slot.link, .head = plan.head, .window = plan.window, .mst = stamp };
+    }
     const current = try route(snapshot, plan.signal.display_id);
     const resource = current.resource orelse return error.Routing;
     const physical = current.connectors orelse return error.Routing;
@@ -107,6 +144,7 @@ pub fn derive(source: Source, raw: *const scanout.Raw, hardware: wire.StaticInfo
     const seed: boot.Plan = .{ .boot_generation = source.boot_generation, .head = claim.head, .window = claim.window,
         .width = 0, .height = 0, .refresh_micro_hz = 0,
         .signal = .{ .sor = claim.sor, .sor_control = (@as(u32, 1) << @intCast(claim.head)) | (claim.protocol << 8),
+            .display_id = claim.display_id, .mst = claim.mst,
             .clock = 0, .total = 0, .sync_end = 0, .blank_end = 0, .blank_start = 0,
             .viewport = 0, .polarity = 0, .hdmi = 0, .min_frame_idle = 0 } };
     const bound = try boot.bind(seed, snapshot, source.epoch, source.held_generation);
@@ -122,20 +160,33 @@ pub fn choose(source: Source, raw: *const scanout.Raw, hardware: wire.StaticInfo
     if (occupied.len > 8) return error.Bounds;
     const current = try route(snapshot, id);
     const resource = current.resource orelse return error.Routing;
-    const physical = current.connectors orelse return error.Routing;
-    if (!physical.present() or physical.count != 1 or resource.index >= 8 or resource.kind != 2 or
-        resource.dynamic or resource.location != 0) return error.Unsupported;
+    const virtual = if (resource.dynamic) try mst.derive(snapshot, id) else null;
+    const connector = if (virtual) |view| view.connector else blk: {
+        const physical = current.connectors orelse return error.Routing;
+        if (!physical.present() or physical.count != 1) return error.Unsupported;
+        break :blk physical.data[0];
+    };
+    if (resource.index >= 8 or resource.kind != 2 or resource.location != 0) return error.Unsupported;
     if (snapshot.topology.activeHeads(id) != 0) return error.Routing;
     for (occupied) |slot| if (slot) |used| {
-        if (used.display_id == id or used.sor == resource.index or used.connector.index == physical.data[0].index) return error.Busy;
+        if (used.display_id == id) return error.Busy;
+        if (used.sor == resource.index or used.connector.index == connector.index) {
+            const candidate = virtual orelse return error.Busy;
+            const previous = used.mst orelse return error.Busy;
+            if (previous.root != candidate.stamp.root or used.sor != resource.index or
+                used.protocol != resource.protocol or !std.meta.eql(used.connector, connector)) return error.Busy;
+            const current_previous = try mst.derive(snapshot, used.display_id);
+            if (!std.meta.eql(previous, current_previous.stamp)) return error.Stale;
+        }
     };
     for (0..8) |window| {
         for (0..8) |head| {
             var busy = false;
             for (occupied) |slot| if (slot) |used| { busy = busy or used.window == window or used.head == head; };
             if (busy) continue;
-            const claim: Claim = .{ .display_id = id, .connector = physical.data[0], .sor = resource.index,
-                .protocol = resource.protocol, .head = @intCast(head), .window = @intCast(window) };
+            const claim: Claim = .{ .display_id = id, .connector = connector, .sor = resource.index,
+                .protocol = resource.protocol, .head = @intCast(head), .window = @intCast(window),
+                .mst = if (virtual) |view| view.stamp else null };
             compatible(raw, hardware, snapshot, claim) catch continue;
             return .{ .claim = claim, .plan = try derive(source, raw, hardware, snapshot, claim, mode_id) };
         }

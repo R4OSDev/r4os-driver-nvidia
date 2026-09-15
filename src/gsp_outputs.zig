@@ -8,7 +8,9 @@ const topology = @import("gsp_topology.zig");
 const receiver = @import("gsp_receiver.zig");
 const display = @import("gsp_display_rpc.zig");
 const exchange = @import("gsp_exchange.zig");
-pub const State = enum { detached, topology, receivers, final_check, final_drain, complete, obsolete, failed, returned };
+pub const mst = @import("gsp_mst_discovery.zig");
+const mst_retire = @import("gsp_mst_retire.zig");
+pub const State = enum { detached, topology, receivers, mst, mst_retire, final_check, final_drain, complete, obsolete, failed, returned };
 pub const Snapshot = struct {
     generation: u64 = 0,
     captured_at_ns: u64 = 0,
@@ -18,6 +20,7 @@ pub const Snapshot = struct {
     topology: topology.Catalog = .{},
     count: usize = 0,
     receivers: [topology.max_routes]receiver.Capture = @splat(.{}),
+    mst: ?*const mst.Store = null,
 };
 pub const Owner = struct {
     self_address: usize = 0,
@@ -29,6 +32,12 @@ pub const Owner = struct {
     probe: ?topology.Discovery = null,
     refresh: ?receiver.Refresh = null,
     verification: ?display.Channel = null,
+    mst_store: mst.Store = .{},
+    mst_work: ?mst.Work = null,
+    mst_reaper: ?mst_retire.Work = null,
+    mst_cursor: usize = 0,
+    mst_scanned: bool = false,
+    mst_changed: bool = false,
     data: Snapshot = .{},
     failure: ?anyerror = null,
 
@@ -43,6 +52,13 @@ pub const Owner = struct {
         self.refresh = null;
         self.probe = null;
         self.verification = null;
+        self.mst_work = null;
+        self.mst_reaper = null;
+        self.mst_cursor = 0;
+        self.mst_scanned = false;
+        self.mst_changed = false;
+        self.data.mst = &self.mst_store;
+        for (&self.mst_store.roots) |*root| root.graph.coherent = false;
         self.data.generation = generation;
         self.data.captured_at_ns = 0;
         self.data.coherent = false;
@@ -58,6 +74,8 @@ pub const Owner = struct {
     }
     /// Include a failed child's retained receipt; never select an old loan.
     pub fn channel(self: *Owner) ?*display.Channel {
+        if (self.mst_reaper) |*work| if (work.channel.exchange.phase != .handed_off) return &work.channel;
+        if (self.mst_work) |*work| if (work.channel.exchange.phase != .handed_off) return &work.channel;
         if (self.verification) |*value| if (value.exchange.phase != .handed_off) return value;
         if (self.refresh) |*value| if (value.channel.exchange.phase != .handed_off) return &value.channel;
         if (self.probe) |*value| if (value.channel.exchange.phase != .handed_off) return &value.channel;
@@ -69,9 +87,16 @@ pub const Owner = struct {
         return switch (self.state) {
             .topology => if (self.probe) |*probe| probe.matches(current, deadline) else false,
             .receivers => if (self.refresh) |*refresh| refresh.matches(current, deadline) else false,
+            .mst => if (self.mst_work) |*work| work.matches(current, deadline) else false,
+            .mst_retire => if (self.mst_reaper) |*work| work.matches(current, deadline) else false,
             .final_check => if (self.verification) |*verify| verify.matches(current, .supported, deadline) else false,
             else => false,
         };
+    }
+    pub fn waiting(self: *const Owner) bool {
+        if (self.refresh) |*refresh| if (refresh.waiting()) return true;
+        if (self.mst_work) |*work| if (work.waiting()) return true;
+        return false;
     }
     /// Invalidate the whole generation, including previously completed
     /// receivers. Outstanding replies must still drain through their owner.
@@ -83,12 +108,14 @@ pub const Owner = struct {
         switch (self.state) {
             .topology => try self.probe.?.invalidate(),
             .receivers => if (self.refresh) |*refresh| try refresh.invalidate(),
+            .mst => if (self.mst_work) |*work| try work.invalidate(),
+            .mst_retire => if (self.mst_reaper) |*work| try work.invalidate(),
             else => {},
         }
     }
     pub fn poll(self: *Owner) !?display.Dispatch {
         if (self.self_address != @intFromPtr(self) or self.failure != null or
-            (self.state != .topology and self.state != .receivers and self.state != .final_check and self.state != .final_drain)) return error.State;
+            (self.state != .topology and self.state != .receivers and self.state != .mst and self.state != .mst_retire and self.state != .final_check and self.state != .final_drain)) return error.State;
         errdefer |err| {
             self.failure = err;
             self.data.coherent = false;
@@ -123,7 +150,7 @@ pub const Owner = struct {
                         self.state = .obsolete;
                     } else {
                         self.data.count += 1;
-                        if (self.data.count == self.data.topology.count) self.state = .final_check;
+                        if (self.data.count == self.data.topology.count) self.state = if (self.mst_scanned) .final_check else .mst;
                     }
                     self.refresh = null;
                 } else if (self.invalidated) {
@@ -131,9 +158,63 @@ pub const Owner = struct {
                 } else {
                     const index = self.data.count;
                     if (index >= self.data.topology.count or index >= self.data.receivers.len) return error.Bounds;
+                    if (self.mst_scanned and self.mst_store.capture(&self.data.topology.routes[index], &self.data.receivers[index],
+                        self.data.topology.epoch, self.data.topology.client, self.data.generation)) {
+                        self.data.count += 1;
+                        if (self.data.count == self.data.topology.count) self.state = .final_check;
+                        return null;
+                    }
                     self.refresh = try receiver.Refresh.init(self.graph.?, self.data.topology.routes[index].id,
                         &self.data.receivers[index], self.deadline);
+                    if (self.data.topology.routes[index].resource) |resource| {
+                        self.refresh.?.probe_dp = display.nativeDp(resource) and (resource.index < 8 or resource.index == 0xffffffff);
+                        self.refresh.?.probe_hdmi = display.nativeTmds(resource) and resource.index < 8;
+                    }
                 }
+            },
+            .mst => {
+                if (self.mst_work) |*work| {
+                    if (work.stage != .complete and work.stage != .obsolete) return try work.poll();
+                    self.mst_changed = true; // Requery the actual RM catalog after ID mutations.
+                    self.data.topology.supported = work.expected_mask;
+                    if (work.invalidated) self.invalidated = true;
+                    self.mst_work = null;
+                }
+                if (self.invalidated) { self.state = .obsolete; return null; }
+                while (self.mst_cursor < self.data.count) {
+                    const index = self.mst_cursor;
+                    self.mst_cursor += 1;
+                    const capture = &self.data.receivers[index];
+                    if (!mst.Work.capable(capture)) {
+                        self.mst_store.invalidate(capture.display_id);
+                        continue;
+                    }
+                    self.mst_work = mst.Work.init(self.graph.?, &self.mst_store, &self.data.topology, capture,
+                        self.data.generation, self.deadline) catch |err| {
+                        const root = self.mst_store.root(capture.display_id) catch continue;
+                        root.failure = err;
+                        self.mst_store.invalidate(capture.display_id);
+                        continue;
+                    };
+                    return null;
+                }
+                for (&self.mst_store.roots) |*root| if (root.id != 0 and !root.graph.coherent) self.mst_store.invalidate(root.id);
+                self.mst_scanned = true;
+                self.state = .mst_retire;
+            },
+            .mst_retire => {
+                if (self.mst_reaper) |*work| {
+                    if (work.stage != .complete and work.stage != .obsolete) return try work.poll();
+                    if (work.invalidated) self.invalidated = true;
+                    self.mst_reaper = null;
+                    self.mst_changed = true;
+                    try self.afterMst();
+                } else if (!self.invalidated and mst_retire.Work.needed(&self.mst_store.registry)) {
+                    self.mst_reaper = mst_retire.Work.init(self.graph.?, &self.mst_store.registry, &self.data.topology, self.deadline) catch {
+                        try self.afterMst();
+                        return null;
+                    };
+                } else try self.afterMst();
             },
             .final_check, .final_drain => {
                 if (self.verification == null) {
@@ -170,6 +251,14 @@ pub const Owner = struct {
             else => unreachable,
         }
         return null;
+    }
+    fn afterMst(self: *Owner) !void {
+        if (self.invalidated) self.state = .obsolete else if (self.mst_changed) {
+            self.data.count = 0;
+            for (&self.data.receivers) |*capture| capture.* = .{};
+            self.probe = try topology.Discovery.init(self.graph.?, &self.data.topology, self.deadline);
+            self.state = .topology;
+        } else self.state = .final_check;
     }
     /// Called only after the runtime has reclaimed the exact graph token.
     pub fn returned(self: *Owner, now: u64) !void {

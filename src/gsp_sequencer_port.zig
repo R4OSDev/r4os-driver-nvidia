@@ -667,26 +667,55 @@ pub const Port = struct {
         if (try self.readFor(scope, 0) != self.boot0) return error.IdentityChanged;
         return std.mem.eql(u32, first[0..count], expected[0..count]);
     }
-    /// Observe the acknowledged NULL ISO/disabled SOR in ARM, twice. This
+    /// A shared Core completion is followed by two equal observations of
+    /// the physical owner mask. No sibling's saved per-head plan is changed.
+    pub fn readDisplaySharedSor(self: *Port, channel: *@import("gsp_display_channel.zig").Owner,
+        plan: @import("gsp_boot_mode.zig").Plan, wanted: u32, deadline: u64) !bool
+    {
+        if (plan.signal.mst == null or plan.head >= 8 or plan.window >= 8 or plan.signal.sor >= 8) return error.Descriptor;
+        try @import("gsp_display_commands.zig").validateSharedSor(.{ .notifier = 0, .windows = 0, .initialize = false,
+            .route = .{ .head = plan.head, .window = plan.window }, .signal = plan.signal, .mst_sor_control = wanted });
+        const address = @import("boot_scanout.zig").armed_base + 0x300 + plan.signal.sor * 0x20;
+        const scope: Scope = .{ .request = deadline };
+        errdefer |err| self.recordFailure(err);
+        const binding = self.owner orelse return error.State;
+        const admit_image = binding.admit_display_push orelse return error.State;
+        if (!self.supports(.read, address)) return error.Register;
+        for (0..2) |_| {
+            try self.guardFor(scope); try admit_image(binding.context, self, channel, deadline, .read);
+            fence(); const observed = self.pointer(address).*; fence();
+            if (observed == 0xffffffff) return error.Completion;
+            if (observed != wanted) return false;
+        }
+        if (try self.readFor(scope, 0) != self.boot0) return error.IdentityChanged;
+        return true;
+    }
+    /// Observe the acknowledged NULL ISO/resulting SOR in ARM, twice. This
     /// is neither a raw-register API nor a timeout-based quiescence claim.
     pub fn readDisplayDetached(self: *Port, channel: *@import("gsp_display_channel.zig").Owner,
-        previous: @import("gsp_boot_mode.zig").Plan, deadline: u64) !bool
+        previous: @import("gsp_boot_mode.zig").Plan, shared_sor: ?u32, deadline: u64) !bool
     {
         if (previous.head >= 8 or previous.window >= 8 or previous.signal.sor >= 8) return error.Bounds;
+        if ((previous.signal.mst != null) != (shared_sor != null)) return error.Descriptor;
+        try @import("gsp_display_commands.zig").validateSharedSor(.{ .notifier = 0, .windows = 0, .initialize = false,
+            .route = .{ .head = previous.head, .window = previous.window }, .detach_sor = previous.signal.sor,
+            .mst_sor_control = shared_sor });
         if (!try self.readCursorImageArmed(channel, .{ .head = previous.head }, deadline)) return false;
         const scan = @import("boot_scanout.zig");
         const base = scan.window_armed_base + previous.window * 0x1000;
         const addresses = [_]u32{ scan.armed_base + 0x300 + previous.signal.sor * 0x20,
             scan.armed_base + 0x1000 + previous.window * 0x80,
             scan.armed_base + 0x2288 + previous.head * 0x400,
-            base + 0x240, base + 0x244, base + 0x248, base + 0x24c, base + 0x250, base + 0x254 };
-        const expected = [_]u32{ 0, 15, 0, 0, 0, 0, 0, 0, 0 };
+            base + 0x240, base + 0x244, base + 0x248, base + 0x24c, base + 0x250, base + 0x254,
+            scan.armed_base + 0x22d4 + previous.head * 0x400, scan.armed_base + 0x22d8 + previous.head * 0x400 };
+        const expected = [_]u32{ shared_sor orelse 0, 15, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+        const count: usize = if (previous.signal.dp_dsc != null or previous.signal.hdmi_dsc != null) addresses.len else addresses.len - 2;
         const scope: Scope = .{ .request = deadline };
         errdefer |err| self.recordFailure(err);
         const binding = self.owner orelse return error.State;
         const admit_image = binding.admit_display_push orelse return error.State;
-        for (addresses) |address| if (!self.supports(.read, address)) return error.Register;
-        for (0..2) |_| for (addresses, expected) |address, wanted| {
+        for (addresses[0..count]) |address| if (!self.supports(.read, address)) return error.Register;
+        for (0..2) |_| for (addresses[0..count], expected[0..count]) |address, wanted| {
             try self.guardFor(scope); try admit_image(binding.context, self, channel, deadline, .read);
             fence(); const observed = self.pointer(address).*; fence();
             if (observed == 0xffffffff) return error.Completion;

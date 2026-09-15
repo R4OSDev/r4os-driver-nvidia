@@ -28,6 +28,8 @@ pub fn build(b: *std.Build) void {
     headers.addFileArg(b.path("src/firmware-lock.json"));
     headers.addArg("-SourceCatalogPath");
     headers.addFileArg(b.path("Tools/Rm/Sources.json"));
+    headers.addArg("-DscCatalogPath");
+    headers.addFileArg(b.path("src/dsc/Sources.json"));
     module.code.generated.file.step.dependOn(&headers.step);
     const pin = @import("src/firmware.zig").lock;
     const verify = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-File" });
@@ -81,6 +83,12 @@ pub fn build(b: *std.Build) void {
     @memcpy(combined_flags[0..host_c_base.len], &host_c_base);
     @memcpy(combined_flags[host_c_base.len..], manifest.c_flags);
     for (manifest.sources[1..]) |path| lifecycle.addCSourceFile(.{ .file = b.path(path), .flags = combined_flags });
+    unit.step.dependOn(&headers.step);
+    for (manifest.c_includes) |path| unit.root_module.addIncludePath(b.path(path));
+    for (manifest.c_defines) |value| unit.root_module.addCMacro(value.name, value.value);
+    for (manifest.sources[1..]) |path| if (std.mem.startsWith(u8, path, "src/dsc/")) {
+        unit.root_module.addCSourceFile(.{ .file = b.path(path), .flags = combined_flags });
+    };
     const lifecycle_test = b.addTest(.{ .root_module = lifecycle, .filters = &.{"NVIDIA actual driver lifecycle"} });
     lifecycle_test.step.dependOn(&headers.step);
     unit_step.dependOn(&b.addRunArtifact(lifecycle_test).step);
@@ -103,6 +111,11 @@ pub fn build(b: *std.Build) void {
     storage.addImport("r4nv_copy", copy_encoder);
     storage.addImport("r4nv_render", render_encoder);
     storage.addImport("r4nv_binding", nv_binding);
+    for (manifest.c_includes) |path| storage.addIncludePath(b.path(path));
+    for (manifest.c_defines) |value| storage.addCMacro(value.name, value.value);
+    for (manifest.sources[1..]) |path| if (std.mem.startsWith(u8, path, "src/dsc/")) {
+        storage.addCSourceFile(.{ .file = b.path(path), .flags = combined_flags });
+    };
     // Existing owner step exercises the complete Booter resource/heap/DMA
     // path with the same pinned bytes as the module, never a fake hash bypass.
     const fixture_files = b.addWriteFiles();

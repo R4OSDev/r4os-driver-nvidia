@@ -901,3 +901,26 @@ and copied byte-for-byte into the distribution. The independent C-generated
 wire fixture and original sources are archived in Nvidia/0.79.26 under the
 workspace GFX references. R4OS policy, ownership, copied metadata and bounded
 rollback remain original Apache-2.0 code; no new firmware is embedded.
+
+## DSC PPS generator (0.79.27)
+
+`src/dsc/Original` contains the unmodified MIT NVIDIA 570.144 PPS generator
+and its timing/DisplayPort headers at commit
+8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f. The file catalog and hashes are
+in `src/dsc/Sources.json`; common SDK types use the existing, separately
+verified headers from the same commit. Full original notices remain in
+each source and `Licenses/NVIDIA-DISPLAY-DSC-LICENSE.txt`, embedded in
+NVIDIA.R4D. The bounded C companion, transport admission and ownership
+remain original R4OS Apache-2.0 code.
+
+## Extended display links (0.79.27)
+
+FRL capacity/control layouts and MST CRC, sideband, topology and payload
+references use NVIDIA 570.144 MIT originals at
+`8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f`. Complete original notices,
+including the DSC generator notices, are appended without changing the
+previous bytes of `Licenses/NVIDIA-GSP-RUNTIME-LICENSE.txt`. Distribution
+installs the identical file and the separate DSC notice. Source hashes and
+original-header vector provenance are retained in
+`ExFiles/Reference/GFX/Nvidia/0.79.27`; original R4OS ownership code remains
+Apache-2.0. No Linux GPL implementation or new firmware binary is imported.

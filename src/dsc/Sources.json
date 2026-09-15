@@ -1,0 +1,89 @@
+{
+  "schema": 1,
+  "source_commit": "8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f",
+  "upstream": "https://github.com/NVIDIA/open-gpu-kernel-modules",
+  "unmodified": true,
+  "files": [
+    {
+      "path": "src/dsc/Original/src/common/modeset/timing/nvt_dsc_pps.c",
+      "source_path": "src/common/modeset/timing/nvt_dsc_pps.c",
+      "sha256": "ef216c79597b83b88efe3472a3b328c286d7e3c766f13e810564db6cffa5285a",
+      "bytes": 113442,
+      "url": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f/src/common/modeset/timing/nvt_dsc_pps.c",
+      "license": "MIT"
+    },
+    {
+      "path": "src/dsc/Original/src/common/modeset/timing/nvt_dsc_pps.h",
+      "source_path": "src/common/modeset/timing/nvt_dsc_pps.h",
+      "sha256": "86102b42a6cc63a33c1739ac1c5d9dcc002bc5089c22103f8d8fad931d087b0f",
+      "bytes": 13625,
+      "url": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f/src/common/modeset/timing/nvt_dsc_pps.h",
+      "license": "MIT"
+    },
+    {
+      "path": "src/dsc/Original/src/common/modeset/timing/nvtiming.h",
+      "source_path": "src/common/modeset/timing/nvtiming.h",
+      "sha256": "4e2e3e0fa90026bd37678264023553787fc2c2b4bd8de5f8aeafc6d17fbaef0b",
+      "bytes": 267777,
+      "url": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f/src/common/modeset/timing/nvtiming.h",
+      "license": "MIT"
+    },
+    {
+      "path": "src/dsc/Original/src/common/inc/nvctassert.h",
+      "source_path": "src/common/inc/nvctassert.h",
+      "sha256": "d5ab688eb078b2bd2ad0ffaf21c851ce520450a4eb8bc758ae77cf330ad495ce",
+      "bytes": 9216,
+      "url": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f/src/common/inc/nvctassert.h",
+      "license": "MIT"
+    },
+    {
+      "path": "src/dsc/Original/src/common/inc/displayport/displayport.h",
+      "source_path": "src/common/inc/displayport/displayport.h",
+      "sha256": "bbf113812eb2cbb7ef30d71e38046aeb483f538aa3917d305d881c175e54c71a",
+      "bytes": 35528,
+      "url": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f/src/common/inc/displayport/displayport.h",
+      "license": "MIT"
+    },
+    {
+      "path": "src/dsc/Original/src/common/inc/displayport/displayport2x.h",
+      "source_path": "src/common/inc/displayport/displayport2x.h",
+      "sha256": "36bd8ffea3d8b80e73ab5f141a27ff6065e12a32bf28a6dba06f8d8b949f4d71",
+      "bytes": 8423,
+      "url": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f/src/common/inc/displayport/displayport2x.h",
+      "license": "MIT"
+    },
+    {
+      "path": "src/dsc/Original/src/common/inc/displayport/dpcd.h",
+      "source_path": "src/common/inc/displayport/dpcd.h",
+      "sha256": "f94998aacfb0bfe52ba3db89148658171c8b7256e05ad032b26bf22638c15321",
+      "bytes": 121462,
+      "url": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f/src/common/inc/displayport/dpcd.h",
+      "license": "MIT"
+    },
+    {
+      "path": "src/dsc/Original/src/common/inc/displayport/dpcd14.h",
+      "source_path": "src/common/inc/displayport/dpcd14.h",
+      "sha256": "1efd45233f5f943d8cf8067db94fae0e646bd443370113547f50eed09c476f9f",
+      "bytes": 69994,
+      "url": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f/src/common/inc/displayport/dpcd14.h",
+      "license": "MIT"
+    },
+    {
+      "path": "src/dsc/Original/src/common/inc/displayport/dpcd20.h",
+      "source_path": "src/common/inc/displayport/dpcd20.h",
+      "sha256": "40c11675fcf33dfa7ff7a72f5e4bd6f54cb08d0e039753649fdf5f21ef696202",
+      "bytes": 51844,
+      "url": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f/src/common/inc/displayport/dpcd20.h",
+      "license": "MIT"
+    },
+    {
+      "path": "src/dsc/Original/src/common/sdk/nvidia/inc/nvcfg_sdk.h",
+      "source_path": "src/common/sdk/nvidia/inc/nvcfg_sdk.h",
+      "sha256": "cb9b9ddf1d9d55527e182c1864fb45dcc7331e6de1498a71814cfc5bbe0c62c8",
+      "bytes": 1304,
+      "url": "https://github.com/NVIDIA/open-gpu-kernel-modules/blob/8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f/src/common/sdk/nvidia/inc/nvcfg_sdk.h",
+      "license": "MIT"
+    }
+  ],
+  "shared_headers": "ThirdParty/Nvidia570.144: nvtypes.h, nvmisc.h, cpuopsys.h (same verified source pin)"
+}

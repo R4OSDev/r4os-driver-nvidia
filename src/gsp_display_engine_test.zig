@@ -64,7 +64,9 @@ fn checkModeControl() !void {
     const binding: mode.Binding = .{ .epoch = 11, .client = 12, .device = 13, .display = 14, .control = 15 };
     var request: [mode.max_bytes]u8 = undefined; var bytes: [mode.max_bytes]u8 = undefined;
     var offset: usize = 0;
-    for (std.enums.values(mode.Operation)) |op| {
+    //This original fixture covers the five stateless mode-control requests.
+    //FRL capacity uses its own current source/rate state and C-wire vectors.
+    for ([_]mode.Operation{ .classes, .allocate, .pclk, .possible, .free }) |op| {
         const data = try mode.encode(binding, op, plan, &request);
         try t.expectEqualSlices(u8, fixture[offset..][0..data.len], data);
         const reply = fixture[offset + data.len..][0..data.len];
@@ -99,6 +101,8 @@ fn checkModeControl() !void {
         offset += data.len * 2;
     }
     try t.expectEqual(fixture.len, offset);
+    try t.expectError(error.State, mode.encode(binding, .frl_source, plan, &request));
+    try t.expectError(error.State, mode.encode(binding, .frl_capacity, plan, &request));
     var stale = plan; stale.output_generation = 0;
     try t.expectError(error.Stale, mode.encode(binding, .possible, stale, &request));
     var alias = binding; alias.control = binding.device;
@@ -127,6 +131,25 @@ fn checkModeControl() !void {
     duplicate = topology; duplicate.plans[7] = second;
     try t.expectError(error.Descriptor, mode.encodeTopology(binding, .possible, plan, duplicate, &request));
     try t.expectEqualSlices(u8, &accepted, &request);
+    // IMP must include each MST head, while the separate root budget owns
+    // their shared link. Ordinary SST routes still cannot alias one SOR.
+    var branch_first = plan; var branch_second = second;
+    branch_first.signal.sor_control = 0x800 | (@as(u32, 1) << @intCast(plan.head));
+    branch_first.signal.hdmi = 0; branch_first.transport_hdmi = false; branch_first.cta_vic = 0;
+    branch_first.signal.display_id = 16;
+    branch_first.signal.mst = .{ .root = 4, .display_id = 16, .handle = .{ .epoch = plan.epoch, .serial = 1, .slot = 0 } };
+    branch_second.signal.sor = plan.signal.sor; branch_second.signal.sor_control = 0x801;
+    branch_second.signal.hdmi = 0; branch_second.transport_hdmi = false; branch_second.cta_vic = 0;
+    branch_second.signal.display_id = 32;
+    branch_second.signal.mst = .{ .root = 4, .display_id = 32, .handle = .{ .epoch = plan.epoch, .serial = 2, .slot = 1 } };
+    var shared = mode.Topology.single(branch_first); try shared.append(branch_second);
+    _ = try mode.encodeTopology(binding, .possible, branch_first, shared, &request);
+    try t.expect(request[28] == 2 and request[29] == 2 and request[32] == plan.head and request[124] == second.head);
+    branch_second.signal.mst.?.root = 8;
+    shared = mode.Topology.single(branch_first);
+    try t.expectError(error.Routing, shared.append(branch_second));
+    branch_second.signal.mst = null;
+    try t.expectError(error.Routing, shared.append(branch_second));
     // The product collects every other active Window, replacing only the
     // candidate's own Head. DMA flips do not alter that timing snapshot.
     const Runtime = @import("gsp_runtime.zig");

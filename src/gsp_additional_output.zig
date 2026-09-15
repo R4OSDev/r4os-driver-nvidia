@@ -1,4 +1,4 @@
-//! Additional SST heads share Runtime's RM graph, CE, Core and mode control.
+//! Additional physical/MST heads share Runtime's RM graph, CE, Core and mode control.
 //! A common output is activated only after its own physical image receipt.
 const std = @import("std");
 const r4os = @import("r4os");
@@ -16,6 +16,7 @@ const SoftwareCursor = struct {
 const NoAudioPublisher = struct {
     pub fn busy(_: *const NoAudioPublisher) bool { return false; }
     pub fn afterStop(_: *NoAudioPublisher) void {}
+    pub fn afterLinkRestore(_: *NoAudioPublisher) void {}
 };
 
 pub const Phase = enum { unused, assign, assignment, refresh, query, queried, notifier, notifier_upload, notifier_wait,
@@ -47,6 +48,7 @@ pub const Output = struct {
     generation: u64 = 0,
     deadline: u64 = 0,
     assignment: u64 = 0,
+    root_probe: bool = false,
     mode: ?runtime.boot_mode.Plan = null,
     storage: ?runtime.BufferHandle = null,
     dma: u32 = 0,
@@ -97,6 +99,17 @@ pub const Output = struct {
         switch (self.phase) {
             .assign => {
                 if (!run.requirePrivatePresentation()) return false;
+                const snapshot = run.nativeOutputs() orelse return false;
+                var virtual = false;
+                for (snapshot.receivers[0..snapshot.count]) |*receiver| if (receiver.display_id == self.display_id) { virtual = receiver.source == .mst; };
+                if (virtual) {
+                    // RM already assigned the physical root/SOR and allocated
+                    // this verified leaf ID. A second physical ASSIGN_SOR
+                    // would incorrectly displace its active siblings.
+                    self.mode = try run.claimDisplayRoute(product.engine.?, self.display_id, self.receiver.preferred_mode_id);
+                    self.next(.query);
+                    return true;
+                }
                 self.assignment = try run.beginSorAssignment(product.engine.?, self.display_id, self.deadline);
                 self.next(.assignment);
             },
@@ -107,6 +120,12 @@ pub const Output = struct {
                 self.next(.refresh);
             },
             .refresh => {
+                if (self.root_probe) {
+                    try run.finishMstRootAssignment(product.engine.?, self.assignment);
+                    run.preparing_outputs &= ~self.display_id;
+                    self.* = .{}; // The root needs no BO, channel or common output.
+                    return true;
+                }
                 self.mode = try run.claimAssignedDisplayRoute(product.engine.?, self.assignment, self.receiver.preferred_mode_id);
                 self.next(.query);
             },
@@ -119,7 +138,8 @@ pub const Output = struct {
                 if (run.mode_control_active or status.state != .handed_off) return false;
                 const result = status.info orelse return error.Unsupported;
                 if (status.rejected != null or status.unavailable or !result.possible or result.over_clock or
-                    result.receipt == 0 or !std.meta.eql(result.mode, self.mode.?)) return error.Unsupported;
+                    result.receipt == 0 or !result.mode.sameIntent(self.mode.?)) return error.Unsupported;
+                self.mode = result.mode;
                 self.next(.notifier);
             },
             .notifier => {
@@ -229,6 +249,7 @@ pub const Output = struct {
                 if (status != a.gfx_output_ok or self.output.connector_id != self.display_id or
                     self.output.adapter_id != product.backend.adapter_id or self.output.device_generation != product.backend.device_generation or
                     self.output.connection_generation == 0) return error.Catalog;
+                try run.recordMstPublication(self.mode.?, self.output, true);
                 self.next(.register);
             },
             .register => {
@@ -265,7 +286,7 @@ pub const Output = struct {
         for (snapshot.topology.routes[0..snapshot.count], snapshot.receivers[0..snapshot.count]) |*route, *receiver| {
             if (route.id != self.display_id) continue;
             if (found) return error.Routing;
-            try catalog.encode(&self.receiver, route, receiver); found = true;
+            try catalog.encodeCaptured(&self.receiver, route, receiver, snapshot); found = true;
         }
         if (!found) return error.Routing;
         const head = @as(u32, 1) << @intCast(mode.head);
@@ -360,8 +381,10 @@ pub const Owner = struct {
         for (&self.outputs) |*output| {
             if (output.phase == .unused) continue;
             if (output.target.display_generation != 0) _ = product.display.?.outputTransition(&output.target, 1, false);
-            if (output.output.connection_generation != 0 and product.outputs.?.withdraw(&output.output) == a.gfx_output_ok)
+            if (output.output.connection_generation != 0 and product.outputs.?.withdraw(&output.output) == a.gfx_output_ok) {
+                if (output.mode) |mode| product.running.?.recordMstPublication(mode, output.output, false) catch {};
                 output.output = .{};
+            }
             if (output.mode) |mode| product.running.?.additional_paused[mode.window] = true;
             product.running.?.preparing_outputs &= ~output.display_id;
             output.modes.quarantine(output, error.DeviceLost);
@@ -379,11 +402,17 @@ pub const Owner = struct {
             !product.modes.pending() and !product.audio.busy() and !product.cursor.busy()) {
             if (run.nativeOutputs()) |snapshot| {
                 candidates: for (snapshot.topology.routes[0..snapshot.count], snapshot.receivers[0..snapshot.count]) |*route, *receiver| {
-                    if (route.id == product.mode.?.signal.display_id or receiver.connected != true or !receiver.report.complete()) continue;
+                    if (route.id == product.mode.?.signal.display_id or receiver.connected != true) continue;
+                    const root_probe = route.resource != null and route.resource.?.index == 0xffffffff and
+                        (runtime.output_route.mstRootFingerprint(snapshot, route.id) catch null) != null;
+                    if (!root_probe and !receiver.report.complete()) continue;
                     for (&self.outputs) |*output| if (output.display_id == route.id) continue :candidates;
                     for (&self.outputs) |*output| if (output.phase == .unused) {
-                        try catalog.encode(&output.receiver, route, receiver);
-                        if (output.receiver.preferred_mode_id == 0 or output.receiver.mode_count == 0) continue :candidates;
+                        if (!root_probe) {
+                            try catalog.encodeCaptured(&output.receiver, route, receiver, snapshot);
+                            if (output.receiver.preferred_mode_id == 0 or output.receiver.mode_count == 0) continue :candidates;
+                        }
+                        output.root_probe = root_probe;
                         output.display_id = route.id; output.generation = snapshot.generation;
                         output.deadline = product.last_clock +| 30 * std.time.ns_per_s;
                         output.phase = .assign;

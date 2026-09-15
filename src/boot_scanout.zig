@@ -243,11 +243,13 @@ pub fn windowHead(window: *const Window) !?u3 {
     if (owner >= max_heads) return error.Routing;
     return @intCast(owner);
 }
-pub const max_read_count = 2 * (16 + max_sors + max_heads * (head_methods.len + 1 + color.head_methods.len + color.cursor_methods.len) +
+pub const max_read_count = 2 * (16 + max_sors + max_heads * (head_methods.len + 3 + color.head_methods.len + color.cursor_methods.len) +
     max_windows * (1 + window_core_methods.len + window_methods.len + color.window_methods.len));
 pub const Head = struct {
     words: [head_methods.len]u32 = @splat(0),
     hdmi: u32 = 0,
+    dsc_control: u32 = 0,
+    dsc_pps_control: u32 = 0,
     color: color.Head = .{},
     pub fn get(self: *const Head, field: Field) u32 {
         return self.words[@intFromEnum(field)];
@@ -405,6 +407,7 @@ pub const Capture = struct {
         for (0..max_heads) |head| {
             const offset: u32 = @intCast(head * 0x400);
             for (head_methods) |method| if (address == armed_base + method + offset) return true;
+            if (address == armed_base + 0x22d4 + offset or address == armed_base + 0x22d8 + offset) return true;
             for (color.head_methods) |method| if (address == armed_base + method + offset) return true;
             for (color.cursor_methods) |method| if (address == color.cursor_armed_base + method + head * 0x1000) return true;
             if (address == 0x6165c0 + head * 0x800) return true;
@@ -462,6 +465,8 @@ pub const Capture = struct {
             const offset: u32 = @intCast(head * 0x400);
             for (head_methods, 0..) |method, index| out.heads[head].words[index] = try self.read(armed_base + method + offset);
             out.heads[head].hdmi = try self.read(0x6165c0 + @as(u32, @intCast(head)) * 0x800);
+            out.heads[head].dsc_control = try self.readOpaque(armed_base + 0x22d4 + offset);
+            out.heads[head].dsc_pps_control = try self.readOpaque(armed_base + 0x22d8 + offset);
             for (color.head_methods, 0..) |method, index| out.heads[head].color.words[index] = try self.readOpaque(armed_base + method + offset);
             for (color.cursor_methods, 0..) |method, index| out.heads[head].color.cursor_points[index] = try self.readOpaque(color.cursor_armed_base + method + @as(u32, @intCast(head)) * 0x1000);
         };

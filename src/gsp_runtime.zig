@@ -82,19 +82,54 @@ pub const output_route = @import("gsp_output_route.zig");
 pub const display_link = @import("gsp_display_link.zig");
 pub const display_audio = @import("gsp_display_audio.zig");
 pub const DisplayLink = struct {
-    plan: display_link.Plan, acknowledged: u8, receipt: u64, dp: ?display_link.dp.Result = null,
+    plan: display_link.Plan, acknowledged: u8, receipt: u64, dp: ?display_link.dp.Result = null, frl: ?display_link.frl.Result = null,
+    mst: ?display_link.mst.Result = null,
     pub fn complete(self: DisplayLink) bool {
         if (self.receipt == 0) return false;
-        if (self.plan.mode.displayPort()) return self.dp != null and self.acknowledged != 0;
+        if (self.plan.transport == .mst) return self.dp == null and self.frl == null and self.mst != null and
+            self.acknowledged == 2 and self.mst.?.rate_receipt == self.receipt and self.mst.?.complete(self.plan.transport.mst);
+        if (self.mst != null or self.plan.mode.signal.mst != null) return false;
+        if (self.plan.mode.signal.hdmi_frl != (self.frl != null)) return false;
+        if (self.frl) |proof| if (proof.rate == .none or proof.source_max == .none or proof.training_receipt == 0 or
+            !std.meta.eql(proof.compressed, self.plan.mode.signal.hdmi_dsc) or
+            (proof.compressed != null and proof.capacity_receipt <= proof.training_receipt)) return false;
+        if (self.plan.mode.displayPort()) return self.dp != null and self.acknowledged != 0 and self.dp.?.complete(self.plan.mode);
         return self.dp == null and self.acknowledged == @as(u8, if (self.plan.mode.transport_hdmi) 7 else 2);
+    }
+    pub fn audio48k(self: DisplayLink) bool {
+        if (!self.complete()) return false;
+        if (self.mst) |value| return value.demand.audio_48k and self.plan.mode.head < 4;
+        if (self.dp) |value| return value.stream.audio_48k;
+        return self.plan.mode.transport_hdmi;
     }
 };
 pub const DisplayAdmission = struct { mode: boot_mode.Plan, link: display_link.Plan, receipt: u64, receiver_sequence: u64 };
 pub const refresh_control = @import("gsp_vrr_control.zig");
 pub const RefreshCommit = struct { sequence: u64, receiver_sequence: u64, control: refresh_control.Work, failure: ?anyerror = null };
 pub const RefreshResult = struct { sequence: u64, plan: refresh_control.Plan, enabled: bool, core_point: u64, receipt: u64, failure: ?anyerror = null };
-pub const DisplayWork = struct { core: DisplaySubmission, window: ?DisplaySubmission = null, position: ?PositionSubmission = null, deadline: u64, boot_mode: ?boot_mode.Plan = null, mode_receipt: u64 = 0, link: ?display_link.Work = null, cursor: ?CursorCommit = null, detach: ?ActiveDisplayImage = null, admission: ?DisplayAdmission = null, refresh: ?RefreshCommit = null };
-pub const DisplayRetirement = struct { epoch: u64, image: ActiveDisplayImage, core_point: u64, window_point: u64, observed_ns: u64 };
+pub const DisplayLinkFailure = struct {
+    mode: boot_mode.Plan, candidate: u32, reason: anyerror, receipt: u64, restored_receipt: u64 = 0,
+    previous: ?ActiveDisplayImage, retired: ?DisplayRetirement,
+};
+pub const DisplayLinkRecovery = struct {
+    control: display_link.Work, failure: DisplayLinkFailure, abandoned: bool = false,
+    // Only MST may need to restore Core/Window after ACT/branch failure.
+    // Once replaced, the ordinary submissions below hold the actual repair.
+    scanout_replaced: bool = false,
+    repair_offset: ?u16 = null,
+};
+pub const DisplayWork = struct {
+    core: DisplaySubmission, window: ?DisplaySubmission = null, position: ?PositionSubmission = null, deadline: u64,
+    boot_mode: ?boot_mode.Plan = null, mode_receipt: u64 = 0, link: ?display_link.Work = null,
+    link_restore: ?DisplayLinkRecovery = null, link_stop: ?display_link.Work = null,
+    cursor: ?CursorCommit = null, detach: ?ActiveDisplayImage = null, admission: ?DisplayAdmission = null, refresh: ?RefreshCommit = null,
+    pub fn linkControl(self: *DisplayWork) ?*display_link.Work {
+        if (self.link_restore) |*restore| return &restore.control;
+        if (self.link_stop) |*stop| return stop;
+        return if (self.link) |*link| link else null;
+    }
+};
+pub const DisplayRetirement = struct { epoch: u64, image: ActiveDisplayImage, core_point: u64, window_point: u64, observed_ns: u64, link_stop_receipt: u64 = 0 };
 pub const cursor_image = @import("gsp_cursor_image.zig");
 pub const CursorCommit = struct { control: cursor_image.Control, sequence: u64, baseline: ?@import("gsp_head_events.zig").Sample = null, completed_ns: u64 = 0 };
 pub const CursorReady = struct { plan: cursor_image.Plan, point: u32 };
@@ -249,6 +284,7 @@ pub const Owner = struct {
     flip_receipts: [8]?flip.Receipt = @splat(null),
     head_events: ?*const @import("gsp_head_events.zig").Owner = null,
     display_images: [8]?ActiveDisplayImage = @splat(null),
+    display_link_failures: [8]?DisplayLinkFailure = @splat(null),
     display_retired: [8]?DisplayRetirement = @splat(null),
     output_claims: [8]?output_route.Claim = @splat(null),
     sor_work: ?sor_assignment.Work = null,
@@ -742,11 +778,12 @@ pub const Owner = struct {
         const owner = try self.findModeControl(handle);
         if (self.copyBusy() or self.sequence.self_address != 0 or self.nativeObject() == null or self.channel.?.phase != .idle or
             self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
-        try self.validateModeQuery(self.mode_control_root.?, plan);
-        const topology = try self.modeTopology(plan);
+        var intent = plan; intent.signal.hdmi_dsc = null;
+        try self.validateModeQuery(self.mode_control_root.?, intent);
+        const topology = try self.modeTopology(intent);
         try self.channel.?.guard(deadline);
         var token = try self.channel.?.handoff(deadline);
-        owner.beginQueryTopology(&token, plan, topology, deadline) catch |err| {
+        owner.beginQueryTopology(&token, intent, topology, deadline) catch |err| {
             self.channel = exchange.Exchange.init(&token, deadline) catch |restore| { self.stop(restore); return restore; }; return err;
         };
         self.mode_control_active = true;
@@ -1301,6 +1338,13 @@ pub const Owner = struct {
             plan.signal.bpc = signal.bpc;
             plan.signal.dp_vsc = plan.displayPort() and @import("gsp_color_signal.zig").needsVsc(signal);
         } else if (pipeline.linear_composition or pipeline.output_transform or pipeline.opaque_output) return error.Descriptor;
+        const current_outputs = self.outputs.snapshot() orelse return error.Stale;
+        if (plan.signal.mst != null) _ = try @import("gsp_mst_mode.zig").admit(plan, current_outputs);
+        for (current_outputs.receivers[0..current_outputs.count]) |*receiver| if (receiver.display_id == plan.signal.display_id) {
+            plan = try @import("gsp_frl_link.zig").select(plan, &receiver.report);
+            plan = try @import("gsp_dp_mode.zig").select(plan,receiver);
+            break;
+        };
         _ = try display_link.derive(plan, self.display_object.?, self.outputs.snapshot().?);
         return plan;
     }
@@ -1374,6 +1418,24 @@ pub const Owner = struct {
         for (&self.output_claims) |*slot| if (slot.*) |claim| if (claim.display_id == result.source.request.display_id) return error.Retained;
         self.sor_result = null;
     }
+    /// A physical MST port has no display mode to claim. Finish its SOR
+    /// reservation only after the new capture proves the assigned source,
+    /// branch graph and resource; virtual leaves claim their own heads later.
+    pub fn finishMstRootAssignment(self: *Owner, root_handle: DisplayEngineHandle, sequence: u64) !void {
+        const result = self.sor_result orelse return error.Stale;
+        if (result.sequence != sequence or !std.meta.eql(result.root, root_handle) or result.obsolete or
+            result.rejected != null or result.assignment == null or result.receipt == 0) return error.Stale;
+        const snapshot = self.nativeOutputs() orelse return error.Busy;
+        if (snapshot.generation <= result.generation) return error.Busy;
+        const occupied = try self.outputRouteClaims(snapshot);
+        const current = try output_route.assignment(self.display_object.?, snapshot, &occupied, result.source.request.display_id);
+        if (!std.meta.eql(current, result.source)) return error.Stale;
+        const root = try self.outputs.mst_store.root(result.source.request.display_id);
+        if (!root.graph.coherent or root.graph.epoch != self.epoch or root.graph.generation != snapshot.generation or
+            root.failure != null or root.payload_dirty or root.source == null or !root.source.?.mst or root.resource == null or
+            root.resource.?.index != result.assignment.?.sor or root.transaction.phase != .vacant) return error.Unsupported;
+        try self.abandonSorAssignment(sequence);
+    }
     pub fn claimAssignedDisplayRoute(self: *Owner, root: DisplayEngineHandle, sequence: u64, mode_id: u32) !boot_mode.Plan {
         const result = self.sor_result orelse return error.Stale;
         if (result.sequence != sequence or !std.meta.eql(result.root, root) or result.obsolete or result.rejected != null) return error.Stale;
@@ -1405,7 +1467,7 @@ pub const Owner = struct {
     }
     fn refreshLink(saved: display_link.Plan, mode: boot_mode.Plan, snapshot: *const outputs.Snapshot) !display_link.Plan {
         var expected = saved; expected.mode = mode;
-        switch (expected.transport) { .hdmi => |*value| value.mode = mode, .dp => |*value| value.mode = mode }
+        switch (expected.transport) { .hdmi => |*value| value.mode = mode, .dp => |*value| value.mode = mode, .mst => |*value| value.mode = mode }
         const value = try display_link.derive(mode, saved.object, snapshot);
         if (!std.meta.eql(expected, value)) return error.Stale;
         return value;
@@ -1475,6 +1537,8 @@ pub const Owner = struct {
         const slot = chosen.claim.window;
         if (self.display_images[slot] != null or self.display_channels[slot + 1] != null or self.display_channels[slot + 9] != null) return error.Busy;
         _ = try display_link.derive(chosen.plan, self.display_object.?, snapshot);
+        if (chosen.claim.mst) |stamp| try self.outputs.mst_store.registry.holdRoute(stamp.handle,
+            .{ .head = chosen.claim.head, .window = slot });
         self.output_claims[slot] = chosen.claim;
         return chosen.plan;
     }
@@ -1484,7 +1548,37 @@ pub const Owner = struct {
         if (self.display_images[window] != null or self.display_channels[window + 1] != null or
             self.display_channels[window + 9] != null or self.display_work != null or self.mode_control_active) return error.Busy;
         for (&self.presentation_slots) |*slot| if (slot.*) |*entry| if (entry.window.slot == window + 1) return error.Retained;
+        const claim = self.output_claims[window].?;
+        if (claim.mst) |stamp| try self.outputs.mst_store.registry.releaseRoute(stamp.handle, .{ .head = claim.head, .window = window });
         self.output_claims[window] = null;
+    }
+    /// Called only after the common output API returned success. Receiver
+    /// metadata publication alone never acquires a displayed leaf ID.
+    pub fn recordMstPublication(self: *Owner, mode: boot_mode.Plan, output: r4os.abi.GfxOutputId, published: bool) !void {
+        const stamp = mode.signal.mst orelse return;
+        const backend = self.copy_backend orelse return error.Stale;
+        if (stamp.handle.epoch != self.epoch or output.connector_id != stamp.display_id or output.adapter_id != self.adapter_id or
+            output.device_generation != backend.binding.device_generation or output.connection_generation == 0) return error.Stale;
+        if (published) {
+            if (mode.window >= 8) return error.Stale;
+            const active = self.display_images[mode.window] orelse return error.Stale;
+            if (active.boot_mode == null or !std.meta.eql(active.boot_mode.?.signal.mst, mode.signal.mst) or
+                active.link == null or !active.link.?.complete()) return error.Stale;
+            try self.outputs.mst_store.registry.publish(stamp.handle, active.boot_mode.?.output_generation);
+        } else try self.outputs.mst_store.registry.unpublish(stamp.handle);
+    }
+    fn retainMstImage(self: *Owner, active: ActiveDisplayImage) !void {
+        const mode = active.boot_mode orelse return;
+        const stamp = mode.signal.mst orelse return;
+        try self.outputs.mst_store.registry.activated(stamp.handle, active);
+    }
+    fn displayPeerWindows(self: *const Owner, window: u32) !u8 {
+        var mask: u8 = 0;
+        for (&self.display_images, 0..) |*slot, index| if (index != window) if (slot.*) |*active| {
+            if (active.core_point == 0 or active.window_point == 0 or active.image.dma == 0) return error.Stale;
+            mask |= @as(u8, 1) << @intCast(index);
+        };
+        return mask;
     }
     /// Carry the exact boot signal and primary position in one interlocked
     /// WIMM/Window/Core transaction. Common native adoption follows separately.
@@ -1508,9 +1602,21 @@ pub const Owner = struct {
         const window = try self.findDisplayChannel(window_handle);
         if (core.parent != window.parent or window.config.kind != .window) return error.Stale;
         const root: DisplayEngineHandle = .{ .epoch = self.epoch, .root = core.parent.binding.root };
-        const plan = try self.displayColorModePlan(root, window.config.index, receiver_mode_id, color, pipeline);
+        const plan = try self.admittedDisplayMode(root, try self.displayColorModePlan(root, window.config.index, receiver_mode_id, color, pipeline));
+        const shared_sor = try @import("gsp_mst_sor.zig").control(plan, &self.display_images, false);
+        const peer_windows = try self.displayPeerWindows(plan.window);
+        if (self.display_link_failures[plan.window] != null) return error.Busy;
         const link = try display_link.derive(plan, self.display_object.?, self.outputs.snapshot().?);
         const receipt = try self.modeAdmission(root, plan);
+        var link_work = display_link.Work.init(link);
+        var clear_dsc = false;
+        if (self.display_images[plan.window]) |prior| if (prior.link) |previous_link| {
+            clear_dsc = previous_link.plan.mode.signal.dp_dsc != null or previous_link.plan.mode.signal.hdmi_dsc != null;
+            if (clear_dsc or (!plan.signal.hdmi_frl and previous_link.plan.mode.signal.hdmi_frl)) {
+                if (!previous_link.complete()) return error.Stale;
+                try link_work.clearPrevious(previous_link.plan);
+            }
+        };
         const resources = self.display_resources_slot.owner orelse return error.State;
         const image = resources.publishedImage(window_handle.slot, image_handle) orelse return error.State;
         const format = if (plan.color) |encoding| switch (encoding.format) {
@@ -1522,11 +1628,16 @@ pub const Owner = struct {
         const position = if (self.display_channels[slot]) |*value| value else return error.Unsupported;
         try self.commitPositionedDisplayImage(core_handle, window_handle,
             .{ .epoch = self.epoch, .handle = position.config.handle, .slot = @intCast(slot) }, image_handle, plan.head, .{}, deadline);
+        errdefer self.display_work = null;
+        try link_work.reserveMst(self.outputs.snapshot().?, &self.outputs.mst_store, deadline);
         self.display_work.?.core.config.signal = plan.signal;
+        self.display_work.?.core.config.mst_sor_control = shared_sor;
+        self.display_work.?.core.config.preserve_windows = peer_windows;
+        self.display_work.?.core.config.clear_dsc = clear_dsc;
         self.display_work.?.core.config.cursor_usage = plan.cursor_size;
         self.display_work.?.boot_mode = plan;
         self.display_work.?.mode_receipt = receipt;
-        self.display_work.?.link = display_link.Work.init(link);
+        self.display_work.?.link = link_work;
         self.display_work.?.admission = .{ .mode = plan, .link = link, .receipt = receipt, .receiver_sequence = self.receiver_events.sequence };
     }
     fn modeAdmission(self: *Owner, root: DisplayEngineHandle, plan: boot_mode.Plan) !u64 {
@@ -1536,9 +1647,22 @@ pub const Owner = struct {
         if (self.mode_control_root == null or !std.meta.eql(self.mode_control_root.?, root)) return error.Stale;
         const result = owner.info() orelse return error.Busy;
         if (!std.meta.eql(result.mode, plan) or !result.possible or result.over_clock or result.receipt == 0) return error.Unsupported;
-        try self.validateModeTopology(root, plan, owner.topology);
+        if (plan.signal.hdmi_frl != (result.frl_capacity != null)) return error.Unsupported;
+        if (result.frl_capacity) |capacity| if (!std.meta.eql(capacity.compressed, plan.signal.hdmi_dsc) or
+            capacity.capacity_receipt == 0 or capacity.capacity_receipt >= result.receipt) return error.Stale;
+        if (!plan.sameIntent(owner.mode)) return error.Stale;
+        try self.validateModeTopology(root, owner.mode, owner.topology);
         if (self.display_images[plan.window]) |prior| if (result.receipt <= prior.mode_receipt) return error.Stale;
         return result.receipt;
+    }
+    fn admittedDisplayMode(self: *Owner, root: DisplayEngineHandle, intent: boot_mode.Plan) !boot_mode.Plan {
+        if (!intent.signal.hdmi_frl) return intent;
+        const owner = if (self.mode_control_owner) |*value| value else return error.State;
+        if (self.mode_control_active or self.mode_control_root == null or !std.meta.eql(self.mode_control_root.?, root)) return error.Busy;
+        const result = owner.info() orelse return error.Busy;
+        if (!intent.sameIntent(result.mode)) return error.Stale;
+        _ = try self.modeAdmission(root, result.mode);
+        return result.mode;
     }
     pub fn commitPositionedDisplayImage(self: *Owner, core_handle: DisplayChannelHandle, window_handle: DisplayChannelHandle,
         immediate_handle: DisplayChannelHandle, image_handle: u32, head: u32, point: display_channel.push.commands.Point, deadline: u64) !void
@@ -1593,6 +1717,17 @@ pub const Owner = struct {
         if (window >= self.display_images.len) return error.Bounds;
         return self.display_images[window];
     }
+    pub fn takeDisplayLinkFailure(self: *Owner, root: DisplayEngineHandle, window: u32, candidate: u32, plan: boot_mode.Plan) !?DisplayLinkFailure {
+        _ = try self.findDisplayEngine(root);
+        if (window >= 8 or plan.epoch != self.epoch or plan.window != window) return error.Stale;
+        if (self.display_work != null) return error.Busy;
+        const failed = self.display_link_failures[window] orelse return null;
+        if (failed.candidate != candidate or !std.meta.eql(failed.mode, plan) or failed.receipt == 0 or
+            !std.meta.eql(failed.previous, self.display_images[window]) or
+            (failed.previous == null and !std.meta.eql(failed.retired, self.display_retired[window]))) return error.Stale;
+        self.display_link_failures[window] = null;
+        return failed;
+    }
     /// Stop the last acknowledged route using NULL ISO and Core interlocks.
     /// Current receiver data is deliberately irrelevant to disabling that
     /// exact old route. Storage remains bound until hardware proves retirement.
@@ -1611,6 +1746,8 @@ pub const Owner = struct {
         const offset = try note.nextWindowOffset();
         const route: display_channel.push.commands.Route = .{ .window = window.config.index, .head = previous.head };
         core.config.route = route; core.config.detach_sor = mode.signal.sor;
+        core.config.mst_sor_control = try @import("gsp_mst_sor.zig").control(mode, &self.display_images, true);
+        core.config.clear_dsc = mode.signal.dp_dsc != null or mode.signal.hdmi_dsc != null;
         self.display_work = .{ .core = core, .deadline = deadline, .detach = previous, .window = .{
             .handle = window_handle, .notifier = note, .config = .{ .kind = .window, .notifier = note.handle,
                 .notifier_offset = offset, .windows = core.config.windows, .initialize = !window.ring.initialized,
@@ -1623,12 +1760,15 @@ pub const Owner = struct {
         const window = work.window orelse return error.Stale;
         const mode = previous.boot_mode orelse return error.Stale;
         const route: display_channel.push.commands.Route = .{ .window = mode.window, .head = previous.head };
+        if (work.core.config.mst_sor_control != try @import("gsp_mst_sor.zig").control(mode, &self.display_images, true) or
+            window.config.mst_sor_control != null) return error.Stale;
         if (!self.outputPaused(mode.window) or mode.epoch != self.epoch or mode.window >= 8 or mode.signal.sor >= 8 or
             self.display_images[mode.window] == null or !std.meta.eql(previous, self.display_images[mode.window].?) or
             work.boot_mode != null or work.link != null or work.cursor != null or work.position != null or work.mode_receipt != 0 or
             !std.meta.eql(work.core.config.route, @as(?display_channel.push.commands.Route, route)) or
             !std.meta.eql(window.config.route, work.core.config.route) or window.handle.slot != mode.window + 1 or
             work.core.config.detach_sor != mode.signal.sor or window.config.detach_sor != mode.signal.sor or
+            work.core.config.clear_dsc != (mode.signal.dp_dsc != null or mode.signal.hdmi_dsc != null) or window.config.clear_dsc or
             work.core.config.signal != null or window.config.signal != null or window.config.scanout != null or
             work.core.config.cursor_image != null or window.config.cursor_image != null or work.core.config.cursor_usage != 0 or
             work.core.config.initialize or window.config.initialize or window.config.with_position) return error.Stale;
@@ -2223,7 +2363,7 @@ pub const Owner = struct {
             const image = try self.displayImageStatus(.{ .epoch = self.epoch, .root = engine.binding.root }, work.plan.mode.window) orelse return error.State;
             if (image.boot_mode == null or !std.meta.eql(image.boot_mode.?, work.plan.mode) or image.core_point == 0 or
                 image.window_point == 0 or image.link == null or !image.link.?.complete()) return error.Stale;
-            if (work.plan.mode.displayPort() and !image.link.?.dp.?.stream.audio_48k) return error.Unsupported;
+            if (work.plan.mode.displayPort() and !image.link.?.audio48k()) return error.Unsupported;
         }
     }
     fn advanceDisplayAudio(self: *Owner, current: u64) !Progress {
@@ -3367,12 +3507,21 @@ pub const Owner = struct {
         _ = try self.findDisplayEngine(root);
         if (self.display_object == null or !std.meta.eql(admitted.link.object, self.display_object.?)) return error.Stale;
         if (self.displayWorkObsolete()) return admitted.mode;
-        const expected = try self.displayColorModePlan(root, window, admitted.mode.receiver_mode_id, admitted.mode.color, admitted.mode.color_pipeline);
+        const expected = try self.admittedDisplayMode(root, try self.displayColorModePlan(root, window, admitted.mode.receiver_mode_id, admitted.mode.color, admitted.mode.color_pipeline));
         if (!std.meta.eql(expected, admitted.mode) or admitted.receipt != try self.modeAdmission(root, expected)) return error.Stale;
         return expected;
     }
     pub fn validateDisplayLink(self: *Owner) !void {
         const work = if (self.display_work) |*value| value else return error.State;
+        if (work.link_restore) |*restore| if (restore.control.mst_rebuild != null) return self.validateMstLinkRecovery();
+        if (work.link_stop) |*cleanup| {
+            try self.validateDisplayDetach();
+            const previous = work.detach.?;
+            if (work.link_restore != null or !cleanup.stop_only or previous.link == null or
+                !std.meta.eql(cleanup.plan, previous.link.?.plan) or work.core.phase != .complete or
+                work.window.?.phase != .complete) return error.Stale;
+            return;
+        }
         const link = if (work.link) |*value| value else return error.State;
         const window = if (work.window) |*value| value else return error.State;
         const position = if (work.position) |*value| value else return error.State;
@@ -3382,27 +3531,331 @@ pub const Owner = struct {
         const root: DisplayEngineHandle = .{ .epoch = self.epoch, .root = core.parent.binding.root };
         const expected = try self.displayWorkPlan(root, actual.config.index);
         const planned = if (self.displayWorkObsolete()) work.admission.?.link else try display_link.derive(expected, self.display_object.?, self.outputs.snapshot().?);
+        const previous_dsc = if (self.display_images[expected.window]) |previous| if (previous.boot_mode) |mode|
+            mode.signal.dp_dsc != null or mode.signal.hdmi_dsc != null else false else false;
+        if (work.core.config.clear_dsc != previous_dsc or window.config.clear_dsc or position.config.clear_dsc) return error.Stale;
+        if (work.core.config.mst_sor_control != try @import("gsp_mst_sor.zig").control(expected, &self.display_images, false) or
+            window.config.mst_sor_control != null or position.config.mst_sor_control != null) return error.Stale;
+        if (work.core.config.preserve_windows != try self.displayPeerWindows(expected.window) or
+            window.config.preserve_windows != 0 or position.config.preserve_windows != 0) return error.Stale;
         if (!std.meta.eql(link.plan, planned) or !std.meta.eql(work.boot_mode.?, expected) or
             !std.meta.eql(work.core.config.signal, @as(?boot_mode.Signal, expected.signal)) or
             window.config.scanout == null or window.config.scanout.?.width != expected.width or window.config.scanout.?.height != expected.height or
             !std.meta.eql(work.core.config.route, @as(?display_channel.push.commands.Route, .{ .head = expected.head, .window = expected.window }))) return error.Stale;
+        if (work.link_restore) |*restore| {
+            if (link.pending or work.core.phase != .prepare or window.phase != .prepare or position.phase != .prepare or
+                work.core.ticket != null or window.ticket != null or position.ticket != null or
+                restore.failure.receipt != link.last_receipt or !std.meta.eql(restore.failure.mode, expected) or
+                restore.failure.candidate != window.config.scanout.?.dma or
+                !std.meta.eql(restore.failure.previous, self.display_images[expected.window]) or
+                (restore.failure.previous == null and !std.meta.eql(restore.failure.retired, self.display_retired[expected.window]))) return error.Stale;
+            if (restore.control.stop_only) {
+                const cleanup = if (link.plan.extended()) link.plan else if (restore.failure.previous) |previous| previous.link.?.plan else return error.Stale;
+                if (!std.meta.eql(cleanup, restore.control.plan)) return error.Stale;
+            } else {
+                const previous = restore.failure.previous orelse return error.Stale;
+                if (previous.link == null or !previous.link.?.complete() or !std.meta.eql(previous.link.?.plan, restore.control.plan)) return error.Stale;
+            }
+            return;
+        }
         switch (link.phase) {
             .before_scanout => if (work.core.phase != .prepare or window.phase != .prepare or position.phase != .prepare) return error.State,
             .after_scanout, .complete => if (work.core.phase != .complete or window.phase != .complete or position.phase != .complete) return error.State,
             .scanout => {},
         }
     }
-    fn advanceDisplayLink(self: *Owner, current: u64) !Progress {
+    fn finishDisplayLinkFailure(self: *Owner, failed: DisplayLinkFailure) !void {
+        if (self.display_link_failures[failed.mode.window] != null) return error.State;
+        self.display_link_failures[failed.mode.window] = failed;
+        self.display_work = null;
+        self.log("NVIDIA link: candidate={d} rejected={s} old-image=retained reply={d} restored={d}",
+            .{failed.candidate,@errorName(failed.reason),failed.receipt,failed.restored_receipt});
+    }
+    fn rollbackMstDisplayLink(self: *Owner, reason: anyerror) anyerror!void {
         const work = &self.display_work.?;
         const link = &work.link.?;
+        const value = if (link.mst) |*item| item else return reason;
+        const mode = work.boot_mode orelse return reason;
+        if (work.link_restore != null or work.link_stop != null or link.pending or link.rpc_error or value.result != null or
+            self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown or
+            value.request != null or value.sideband != null or value.root.mailbox_pending) return reason;
+        if (value.core_point == 0) {
+            if (work.core.phase != .prepare or work.window.?.phase != .prepare or work.position.?.phase != .prepare or
+                work.core.ticket != null or work.window.?.ticket != null or work.position.?.ticket != null) return reason;
+        } else if (work.core.phase != .complete or work.window.?.phase != .complete or work.position.?.phase != .complete or
+            work.core.ticket.?.point != value.core_point or work.window.?.ticket.?.point != value.window_point) return reason;
+        const failed: DisplayLinkFailure = .{ .mode = mode, .candidate = work.window.?.config.scanout.?.dma,
+            .reason = reason, .receipt = link.last_receipt, .previous = self.display_images[mode.window], .retired = self.display_retired[mode.window] };
+        if (failed.previous) |previous| {
+            const old = previous.link orelse return reason;
+            if (!old.complete() or old.mst == null or previous.boot_mode == null or previous.position == null or
+                previous.head != mode.head or !std.meta.eql(old.plan.mode.signal.mst, mode.signal.mst) or
+                !std.meta.eql(old.plan.object, link.plan.object)) return error.Stale;
+        }
+        if (!link.mutated) {
+            try link.cancelUnsubmitted();
+            if (self.displayWorkObsolete()) { self.display_work = null; self.display_cancelled +|= 1; }
+            else try self.finishDisplayLinkFailure(failed);
+            return;
+        }
+        value.failure = reason;
+        work.link_restore = .{ .control = try display_link.Work.restoreMst(link, work.deadline), .failure = failed };
+        self.log("NVIDIA MST: candidate={d} rejected={s} restore=pending core={d} window={d}",
+            .{ failed.candidate, @errorName(reason), value.core_point, value.window_point });
+    }
+    const MstRepair = struct {
+        core: display_channel.push.commands.Config,
+        window: display_channel.push.commands.Config,
+        position: ?display_channel.push.commands.Config,
+    };
+    fn mstRepair(self: *Owner, offset: u16) !MstRepair {
+        const work = &self.display_work.?;
+        const restore = &work.link_restore.?;
+        const mode = restore.failure.mode;
+        const core = try self.findDisplayChannel(work.core.handle);
+        const window = try self.findDisplayChannel(work.window.?.handle);
+        const info = core.parent.info() orelse return error.State;
+        if (core.config.kind != .core or core.config.index != 0 or window.config.kind != .window or window.config.index != mode.window or
+            core.parent != window.parent or !core.ring.initialized or !window.ring.initialized) return error.Stale;
+        const route: display_channel.push.commands.Route = .{ .head = mode.head, .window = mode.window };
+        const previous = restore.failure.previous;
+        const mask = if (previous) |image| try @import("gsp_mst_sor.zig").control(image.boot_mode.?, &self.display_images, false)
+            else try @import("gsp_mst_sor.zig").withoutCandidate(mode, &self.display_images);
+        return .{
+            .core = .{ .kind = .core, .notifier = work.core.notifier.handle, .windows = info.hardware.windows, .initialize = false,
+                .route = route, .signal = if (previous) |image| image.boot_mode.?.signal else null,
+                .cursor_usage = if (previous) |image| image.boot_mode.?.cursor_size else 0,
+                .detach_sor = if (previous == null) mode.signal.sor else null, .mst_sor_control = mask,
+                .preserve_windows = if (previous != null) try self.displayPeerWindows(mode.window) else 0 },
+            .window = .{ .kind = .window, .notifier = work.window.?.notifier.handle, .notifier_offset = offset,
+                .windows = info.hardware.windows, .initialize = false, .route = route,
+                .scanout = if (previous) |image| image.image else null, .with_position = previous != null,
+                .detach_sor = if (previous == null) mode.signal.sor else null },
+            .position = if (previous) |image| .{ .kind = .immediate, .notifier = 0, .windows = info.hardware.windows,
+                .initialize = false, .route = route, .position = image.position.?.point } else null,
+        };
+    }
+    /// Recovery keeps the original admission/failure immutable while the
+    /// ordinary submissions may now contain the replacement Core/Window.
+    pub fn validateMstLinkRecovery(self: *Owner) !void {
+        const work = if (self.display_work) |*value| value else return error.State;
+        const restore = if (work.link_restore) |*value| value else return error.State;
+        const rebuild = if (restore.control.mst_rebuild) |*value| value else return error.State;
+        const failed = restore.failure;
+        const link = if (work.link) |*value| value else return error.Stale;
+        const original = if (link.mst) |*value| value else return error.Stale;
+        if (work.detach != null or work.link_stop != null or work.cursor != null or work.refresh != null or restore.abandoned or
+            work.admission == null or work.boot_mode == null or work.window == null or link.pending or original.failure == null or
+            failed.receipt != link.last_receipt or failed.receipt == 0 or !std.meta.eql(failed.mode, work.boot_mode.?) or
+            !std.meta.eql(work.admission.?.mode, failed.mode) or !std.meta.eql(work.admission.?.link, link.plan) or
+            !std.meta.eql(restore.control.plan, link.plan) or !std.meta.eql(rebuild.plan, original.plan) or
+            rebuild.root != original.root or rebuild.ids != &self.outputs.mst_store.registry or rebuild.deadline != work.deadline or
+            rebuild.candidate_core != original.core_point or rebuild.candidate_window != original.window_point or
+            !std.meta.eql(failed.previous, self.display_images[failed.mode.window]) or
+            (failed.previous == null and !std.meta.eql(failed.retired, self.display_retired[failed.mode.window]))) return error.Stale;
+        const resources = self.display_resources_slot.owner orelse return error.State;
+        if (work.core.handle.slot != 0 or work.window.?.handle.slot != failed.mode.window + 1 or
+            resources.publishedNotifier(0) != work.core.notifier or resources.publishedNotifier(work.window.?.handle.slot) != work.window.?.notifier or
+            resources.publishedImage(work.window.?.handle.slot, failed.candidate) == null) return error.Stale;
+        if (failed.previous) |image| if (!std.meta.eql(resources.publishedImage(work.window.?.handle.slot, image.image.dma), image.image)) return error.Stale;
+        if (rebuild.stage != .complete) try rebuild.root.transaction.validate(rebuild.token, &rebuild.root.live);
+        if (!restore.scanout_replaced) {
+            const phase: DisplayPhase = if (original.core_point == 0) .prepare else .complete;
+            if (restore.repair_offset != null or work.core.phase != phase or work.window.?.phase != phase or work.position == null or
+                work.position.?.phase != phase or work.window.?.config.scanout == null or work.window.?.config.scanout.?.dma != failed.candidate or
+                !std.meta.eql(work.core.config.signal, @as(?boot_mode.Signal, failed.mode.signal))) return error.Stale;
+            return;
+        }
+        if (original.core_point == 0 or original.window_point == 0 or restore.repair_offset == null) return error.Stale;
+        const expected = try self.mstRepair(restore.repair_offset.?);
+        if (!std.meta.eql(expected.core, work.core.config) or !std.meta.eql(expected.window, work.window.?.config) or
+            !std.meta.eql(expected.position, if (work.position) |part| @as(?display_channel.push.commands.Config, part.config) else null)) return error.Stale;
+        if (work.position) |part| if (failed.previous == null or !std.meta.eql(part.handle, failed.previous.?.position.?.handle)) return error.Stale;
+        if (restore.control.phase != .scanout and (work.core.phase != .complete or work.window.?.phase != .complete or
+            (if (work.position) |part| part.phase != .complete else false))) return error.Stale;
+    }
+    fn advanceMstLinkRecovery(self: *Owner, current: u64) !Progress {
+        const work = &self.display_work.?;
+        const restore = &work.link_restore.?;
+        const link = &restore.control;
+        const rebuild = &link.mst_rebuild.?;
+        if (link.phase == .scanout) {
+            if (rebuild.candidate_core == 0) {
+                const previous = restore.failure.previous;
+                try link.rebuildScanout(.{ .attached = previous != null,
+                    .core_point = if (previous) |image| image.core_point else 0,
+                    .window_point = if (previous) |image| image.window_point else 0 });
+                return .progress;
+            }
+            if (!restore.scanout_replaced) {
+                const offset = try work.window.?.notifier.nextWindowOffset();
+                const config = try self.mstRepair(offset);
+                work.core.config = config.core; work.core.phase = .prepare; work.core.ticket = null;
+                work.window.?.config = config.window; work.window.?.phase = .prepare; work.window.?.ticket = null;
+                if (config.position) |value| work.position = .{ .handle = restore.failure.previous.?.position.?.handle, .config = value }
+                else work.position = null;
+                restore.repair_offset = offset; restore.scanout_replaced = true;
+                return .progress;
+            }
+            if (work.position) |*part| if (part.phase == .prepare or part.phase == .rewind)
+                return if (try self.advanceDisplayPosition(part, work.deadline, current)) .progress else .idle;
+            if (work.window.?.phase == .prepare or work.window.?.phase == .rewind)
+                return if (try self.advanceDisplaySubmission(&work.window.?, work.deadline, current)) .progress else .idle;
+            var advanced = try self.advanceDisplaySubmission(&work.core, work.deadline, current);
+            if (work.core.phase != .complete) return if (advanced) .progress else .idle;
+            advanced = try self.advanceDisplaySubmission(&work.window.?, work.deadline, current) or advanced;
+            if (work.window.?.phase != .complete) return if (advanced) .progress else .idle;
+            if (work.position) |*part| {
+                advanced = try self.advanceDisplayPosition(part, work.deadline, current) or advanced;
+                if (part.phase != .complete) return if (advanced) .progress else .idle;
+            }
+            const resources = self.display_resources_slot.owner.?;
+            if (!try resources.imageFinished(work.window.?.handle.slot, restore.failure.candidate)) return .idle;
+            const core = try self.findDisplayChannel(work.core.handle);
+            const armed = if (restore.failure.previous) |image|
+                try self.device.?.readDisplaySharedSor(core, image.boot_mode.?, work.core.config.mst_sor_control.?, work.deadline) else
+                try self.device.?.readDisplayDetached(core, restore.failure.mode, work.core.config.mst_sor_control, work.deadline);
+            if (!armed) return .idle;
+            try link.rebuildScanout(.{ .attached = restore.failure.previous != null,
+                .core_point = work.core.ticket.?.point, .window_point = work.window.?.ticket.?.point });
+            return .progress;
+        }
+        if (link.phase != .complete or rebuild.stage != .complete) return error.State;
+        var failed = restore.failure;
+        for (&self.display_images, 0..) |*slot, index| if (slot.*) |*image| {
+            if (image.link == null or image.link.?.mst == null or image.link.?.plan.transport.mst.root() != rebuild.token.root) continue;
+            var updated = image.*;
+            if (index == failed.mode.window and restore.scanout_replaced) {
+                updated.core_point = work.core.ticket.?.point; updated.window_point = work.window.?.ticket.?.point;
+                updated.position.?.sequence = work.position.?.ticket.?.point;
+            }
+            updated.link.?.mst = try rebuild.restoredImage(updated.link.?.plan.transport.mst, updated.core_point, updated.window_point);
+            updated.link.?.receipt = rebuild.completion_receipt;
+            if (!updated.link.?.complete()) return error.Completion;
+            if (updated.window_point != image.window_point) try self.retainMstImage(updated);
+            image.* = updated;
+        };
+        failed.previous = self.display_images[failed.mode.window];
+        failed.restored_receipt = rebuild.completion_receipt;
+        try self.finishDisplayLinkFailure(failed);
+        return .progress;
+    }
+    /// A known reply before any channel submission may unwind its link
+    /// setters. Transport uncertainty and failed restoration remain faults.
+    fn rollbackDisplayLink(self: *Owner, reason: anyerror) anyerror!void {
+        const work = &self.display_work.?;
+        const link = &work.link.?;
+        if (link.operation == .mst) return self.rollbackMstDisplayLink(reason);
+        const mode = work.boot_mode.?;
+        if (work.link_restore != null or work.link_stop != null or link.pending or link.rpc_error or
+            (link.phase != .before_scanout and !(link.phase == .scanout and self.displayWorkObsolete())) or !link.extended() or
+            work.core.phase != .prepare or work.window.?.phase != .prepare or work.position.?.phase != .prepare or
+            work.core.ticket != null or work.window.?.ticket != null or work.position.?.ticket != null or
+            self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown or
+            (reason != error.Unsupported and reason != error.Bandwidth and reason != error.LinkTraining and reason != error.RmRejected and
+                reason != error.Aux and reason != error.RetryExhausted and reason != error.Stale and reason != error.Pps)) return reason;
+        const failed: DisplayLinkFailure = .{ .mode = mode, .candidate = work.window.?.config.scanout.?.dma,
+            .reason = reason, .receipt = link.last_receipt, .previous = self.display_images[mode.window], .retired = self.display_retired[mode.window] };
+        if (failed.previous) |previous| {
+            const old = previous.link orelse return reason;
+            if (!old.complete() or previous.core_point == 0 or previous.window_point == 0 or previous.boot_mode == null or
+                previous.boot_mode.?.epoch != self.epoch or std.meta.activeTag(old.plan.transport) != std.meta.activeTag(link.plan.transport) or
+                old.plan.mode.output_generation != mode.output_generation or old.plan.mode.head != mode.head or old.plan.mode.window != mode.window or
+                old.plan.mode.signal.sor != mode.signal.sor or old.plan.mode.signal.display_id != mode.signal.display_id or
+                !std.meta.eql(old.plan.object, link.plan.object)) return reason;
+            if (!self.displayWorkObsolete() and !std.meta.eql(old.plan,
+                try display_link.derive(previous.boot_mode.?, self.display_object.?, self.outputs.snapshot().?))) return error.Stale;
+        } else if (failed.retired) |retired| {
+            if (retired.epoch != self.epoch or retired.core_point == 0 or retired.window_point == 0) return reason;
+        } else return reason;
+        if (!link.mutated) {
+            if (self.displayWorkObsolete()) { self.display_work = null; self.display_cancelled +|= 1; }
+            else try self.finishDisplayLinkFailure(failed);
+            return;
+        }
+        const clear = if (link.plan.extended()) link.plan else failed.previous.?.link.?.plan;
+        const abandoned = self.displayWorkObsolete();
+        var control = if (!abandoned and failed.previous != null) display_link.Work.init(failed.previous.?.link.?.plan)
+            else try display_link.Work.stopExtended(clear, !abandoned);
+        if (!control.stop_only) try control.clearPrevious(clear);
+        work.link_restore = .{ .control = control, .failure = failed, .abandoned = abandoned };
+        self.log("NVIDIA link: candidate={d} rejected={s} restore=pending channels=unsubmitted", .{failed.candidate,@errorName(reason)});
+    }
+    fn advanceDisplayLinkRecovery(self: *Owner) !Progress {
+        try self.validateDisplayLink();
+        const work = &self.display_work.?;
+        const restore = &work.link_restore.?;
+        const link = &restore.control;
+        if (link.mst_rebuild != null) return self.advanceMstLinkRecovery(try self.now());
+        if (link.phase == .scanout) {
+            // The old Core/Window never received a candidate command. The
+            // retained image proves this scanout; only link packets resume.
+            if (restore.failure.previous == null or restore.abandoned) return error.State;
+            try link.scanoutComplete();
+            return .progress;
+        }
+        if (link.phase != .complete) return error.State;
+        if (restore.abandoned) { self.display_work = null; self.display_cancelled +|= 1; return .progress; }
+        var failed = restore.failure;
+        if (failed.previous) |*previous| {
+            const proof: DisplayLink = .{ .plan = link.plan, .acknowledged = link.acknowledged, .receipt = link.last_receipt,
+                .dp = link.dpResult(), .frl = link.frlResult() };
+            if (!proof.complete()) return error.Completion;
+            previous.link = proof;
+            self.display_images[failed.mode.window] = previous.*;
+        } else if (!link.stop_only or !link.cleared()) return error.Completion;
+        failed.restored_receipt = link.last_receipt;
+        try self.finishDisplayLinkFailure(failed);
+        return .progress;
+    }
+    fn advanceDisplayLink(self: *Owner, current: u64) anyerror!Progress {
+        return self.advanceDisplayLinkInner(current) catch |err| {
+            if (self.display_work) |*active| if (active.linkControl()) |value| value.retainAmbiguous(err);
+            return err;
+        };
+    }
+    fn advanceDisplayLinkInner(self: *Owner, current: u64) anyerror!Progress {
+        const work = &self.display_work.?;
+        var link = work.linkControl() orelse return error.State;
         const channel = &self.channel.?;
         try self.validateDisplayLink();
         if (current >= work.deadline) return error.Timeout;
+        if (work.link_restore == null and work.link_stop == null and self.displayWorkObsolete() and
+            link.pending and channel.phase == .prepared) {
+            try channel.cancelPrepared(); link.pending = false;
+        }
+        if (work.link_restore) |*restore| if (restore.control.operation != .mst and self.displayWorkObsolete() and !restore.abandoned) {
+            if (link.pending and channel.phase == .prepared) { try channel.cancelPrepared(); link.pending = false; }
+            if (!link.pending) {
+                const clear = if (work.link.?.plan.extended()) work.link.?.plan else restore.failure.previous.?.link.?.plan;
+                restore.control = try display_link.Work.stopExtended(clear, false);
+                restore.abandoned = true; link = &restore.control;
+            }
+        };
+        if (work.link_stop) |*cleanup| if (cleanup.clear_dp) |*prior| {
+            if (prior.receiver_present and (self.outputs.invalidated or self.receiver_events.pending or self.receiver_events.capturing)) {
+                if (cleanup.pending and channel.phase == .prepared) { try channel.cancelPrepared(); cleanup.pending = false; }
+                if (!cleanup.pending) {
+                    cleanup.* = try display_link.Work.stopExtended(cleanup.plan, false);
+                    link = cleanup;
+                }
+            }
+        };
+        if (work.link_restore != null and (link.phase == .scanout or link.phase == .complete)) return self.advanceDisplayLinkRecovery();
+        if (work.link_stop != null and link.operation == .mst and link.phase == .scanout) {
+            try link.rebuildScanout(.{ .attached = false, .core_point = work.core.ticket.?.point, .window_point = work.window.?.ticket.?.point });
+            return .progress;
+        }
         if (!link.pending) {
-            if (self.displayWorkObsolete()) {
+            if (work.link_restore == null and work.link_stop == null and self.displayWorkObsolete()) {
                 if (link.phase == .before_scanout) {
-                    self.display_work = null; self.display_cancelled +|= 1;
+                    if (link.mutated and link.extended()) try self.rollbackDisplayLink(error.LinkTraining)
+                    else { try link.cancelUnsubmitted(); self.display_work = null; self.display_cancelled +|= 1; }
                 } else if (link.phase == .after_scanout) {
+                    if (link.operation == .mst) {
+                        try self.rollbackDisplayLink(error.Stale);
+                        return .progress;
+                    }
                     // The interlocked image is now known but must be stopped;
                     // do not enable additional packets or clear AVMUTE.
                     link.phase = .complete;
@@ -3410,12 +3863,15 @@ pub const Owner = struct {
                 return .progress;
             }
             if (!link.ready(current)) return .idle;
+            if (!try link.prepare(current)) return .idle;
             link.length = try link.encode(&link.request);
             try channel.begin(display_link.function, link.request[0..link.length], work.deadline);
             link.pending = true;
             return .progress;
         }
-        if (try channel.poll(work.deadline)) |dispatch| {
+        const received = try channel.poll(work.deadline);
+        if (channel.phase == .waiting) try link.submitted();
+        if (received) |dispatch| {
             if (!dispatch.response) {
                 try self.notification(channel, dispatch, current); return .progress;
             }
@@ -3428,6 +3884,13 @@ pub const Owner = struct {
             record.payload = payload[0..dispatch.record.payload.len];
             try channel.complete(dispatch.ticket);
             link.consume(record, dispatch.ticket.serial, current) catch |err| {
+                if (work.link_restore == null and work.link_stop == null) {
+                    self.rollbackDisplayLink(err) catch |failure| {
+                        if (link.last_status) |status| if (status != 0) self.rmFailure(.display_channel, link.plan.object.display, status);
+                        return failure;
+                    };
+                    return .progress;
+                }
                 if (link.last_status) |status| if (status != 0) self.rmFailure(.display_channel, link.plan.object.display, status);
                 return err;
             };
@@ -3507,7 +3970,8 @@ pub const Owner = struct {
             try self.validateDisplayLink();
             if (self.displayWorkObsolete() and link.phase == .scanout and work.core.phase == .prepare and
                 work.window.?.phase == .prepare and work.position.?.phase == .prepare) {
-                self.display_work = null; self.display_cancelled +|= 1;
+                if (link.mutated and link.extended()) try self.rollbackDisplayLink(error.LinkTraining)
+                else { try link.cancelUnsubmitted(); self.display_work = null; self.display_cancelled +|= 1; }
                 return true;
             }
         }
@@ -3537,7 +4001,30 @@ pub const Owner = struct {
             const resources = self.display_resources_slot.owner.?;
             if (!try resources.imageFinished(window.handle.slot, previous.image.dma)) return progressed;
             const core = try self.findDisplayChannel(work.core.handle);
-            if (!try self.device.?.readDisplayDetached(core, mode, work.deadline)) return progressed;
+            if (!try self.device.?.readDisplayDetached(core, mode, work.core.config.mst_sor_control, work.deadline)) return progressed;
+            if (previous.link.?.plan.extended()) {
+                if (work.link_stop == null) {
+                    // An HPD notification invalidates receiver identity. The
+                    // stopped Core and source FEC-off ACK still retire the
+                    // old route; its DSC setter must not touch a new sink.
+                    if (previous.link.?.mst) |proof| {
+                        work.link_stop = try display_link.Work.stopMst(previous.link.?.plan, proof,
+                            .{ .head = mode.head, .window = mode.window, .dma = previous.image.dma,
+                                .core_point = previous.core_point, .window_point = previous.window_point }, &self.outputs.mst_store, work.deadline);
+                    } else work.link_stop = try display_link.Work.stopExtended(previous.link.?.plan,
+                        !self.outputs.invalidated and !self.receiver_events.pending and !self.receiver_events.capturing);
+                    return true;
+                }
+                const cleanup = &work.link_stop.?;
+                if (!cleanup.stop_only or cleanup.phase != .complete or cleanup.pending or !cleanup.cleared()) return error.Completion;
+                if (cleanup.mst_rebuild) |*rebuilt| if (!rebuilt.disconnected) { for (&self.display_images, 0..) |*slot, index| if (slot.*) |*image| {
+                    if (index == mode.window or image.link == null or image.link.?.mst == null or
+                        image.link.?.plan.transport.mst.root() != rebuilt.token.root) continue;
+                    image.link.?.mst = try rebuilt.restoredImage(image.link.?.plan.transport.mst, image.core_point, image.window_point);
+                    image.link.?.receipt = rebuilt.completion_receipt;
+                    if (!image.link.?.complete()) return error.Completion;
+                }; };
+            }
             if (self.cursor_storage) |*storage| {
                 if (storage.head == previous.head) {
                     storage.active = null;
@@ -3545,8 +4032,11 @@ pub const Owner = struct {
                 }
             }
             self.display_retired[mode.window] = .{ .epoch = self.epoch, .image = previous,
-                .core_point = work.core.ticket.?.point, .window_point = window.ticket.?.point, .observed_ns = current };
+                .core_point = work.core.ticket.?.point, .window_point = window.ticket.?.point, .observed_ns = current,
+                .link_stop_receipt = if (work.link_stop) |cleanup| cleanup.clear_receipt else 0 };
+            if (mode.signal.mst) |stamp| try self.outputs.mst_store.registry.detached(stamp.handle, self.display_retired[mode.window].?);
             self.display_images[mode.window] = null;
+            self.display_link_failures[mode.window] = null;
             self.display_work = null;
             self.log("NVIDIA output-detach: head={d} window={d} previous={d} proof=Core,Window-FINISHED,ARM shadow=retained", .{previous.head,mode.window,previous.image.dma});
             return true;
@@ -3573,12 +4063,17 @@ pub const Owner = struct {
             if (position.phase != .complete) return progressed;
         }
         if (work.link) |*link| if (link.phase == .scanout) {
-            try link.scanoutComplete(); return true;
+            if (work.core.config.mst_sor_control) |wanted| {
+                const core = try self.findDisplayChannel(work.core.handle);
+                if (!try self.device.?.readDisplaySharedSor(core, work.boot_mode.?, wanted, work.deadline)) return progressed;
+            }
+            try link.scanoutCompleted(work.core.ticket.?.point, work.window.?.ticket.?.point); return true;
         };
         if (work.window) |window| {
             const route = window.config.route.?;
             var mode = work.boot_mode;
-            var link: ?DisplayLink = if (work.link) |value| .{ .plan = value.plan, .acknowledged = value.acknowledged, .receipt = value.last_receipt, .dp = value.dpResult() } else null;
+            var link: ?DisplayLink = if (work.link) |value| .{ .plan = value.plan, .acknowledged = value.acknowledged, .receipt = value.last_receipt,
+                .dp = value.dpResult(), .frl = value.frlResult(), .mst = value.mstResult() } else null;
             var position: ?DisplayPosition = if (work.position) |value| .{ .handle = value.handle,
                 .point = value.config.position.?, .sequence = value.ticket.?.point } else null;
             if (mode) |plan| {
@@ -3596,6 +4091,7 @@ pub const Owner = struct {
                 .core_point = work.core.ticket.?.point, .window_point = window.ticket.?.point, .boot_mode = mode,
                 .mode_receipt = if (work.mode_receipt != 0) work.mode_receipt else if (self.display_images[route.window]) |prior| prior.mode_receipt else 0,
                 .position = position, .link = link };
+            try self.retainMstImage(self.display_images[route.window].?);
             self.display_retired[route.window] = null;
         }
         if (work.link) |*link| if (link.dpResult()) |proof| {
@@ -3657,6 +4153,7 @@ pub const Owner = struct {
                 var active = work.previous;
                 active.image = window.config.scanout.?; active.window_point = window.ticket.?.point;
                 self.display_images[work.receipt.window] = active;
+                try self.retainMstImage(active);
                 if (work.presentation.direct) |*direct| if (!direct.handed_off) {
                     // BEGUN is a physical consumer even without a subsequent
                     // head IRQ. Transfer its lifetime so detach can proceed;
@@ -3689,6 +4186,7 @@ pub const Owner = struct {
             var active = work.previous;
             active.image = window.config.scanout.?; active.window_point = window.ticket.?.point;
             self.display_images[work.receipt.window] = active;
+            try self.retainMstImage(active);
             if (work.ordinary) {
                 // The selected alias follows visibility. The old image is
                 // still held by this flip until its independent FINISHED.
@@ -4355,8 +4853,9 @@ pub const Owner = struct {
         if (self.display_work) |*work| if (work.refresh) |*refresh| {
             if (refresh.control.phase != .core) return self.advanceAdaptiveControl(current);
         };
-        if (self.display_work) |*work| if (work.link) |*link| {
-            if (link.phase == .before_scanout or link.phase == .after_scanout) return self.advanceDisplayLink(current);
+        if (self.display_work) |*work| if (work.linkControl()) |link| {
+            if (work.link_restore != null or link.phase == .before_scanout or link.phase == .after_scanout or
+                (link.mst_rebuild != null and link.phase == .scanout)) return self.advanceDisplayLink(current);
         };
         if (self.audio_work != null) return self.advanceDisplayAudio(current);
         if (self.sor_work != null) return self.advanceSorAssignment(current);
@@ -4491,7 +4990,7 @@ pub const Owner = struct {
                             capture.aux_rpc_status, capture.aux_control_status,
                             if (capture.aux_reply) |reply| @as(?u32, @intFromEnum(reply)) else null});
             }
-            if (self.outputs.refresh) |*refresh| if (refresh.waiting()) return .idle;
+            if (self.outputs.waiting()) return .idle;
             return if ((self.activeChannel() orelse return error.State).phase == .waiting) .idle else .progress;
         }
         if (self.graph) |*graph| {
@@ -4611,6 +5110,16 @@ pub const Owner = struct {
             (self.outputs.state != .detached and !try self.receiver_events.due(self.epoch, current))) return false;
         const end = try std.math.add(u64, current, 10 * std.time.ns_per_s);
         self.output_generation = try std.math.add(u64, self.output_generation, 1);
+        if (std.mem.allEqual(u8, &self.outputs.mst_store.seed, 0)) {
+            var bytes: [32]u8 = @splat(0);
+            std.mem.writeInt(u64, bytes[0..8], self.epoch, .little);
+            std.mem.writeInt(u64, bytes[8..16], self.startup_deadline, .little);
+            std.mem.writeInt(u64, bytes[16..24], current, .little);
+            std.mem.writeInt(u32, bytes[24..28], self.adapter_id, .little);
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(&bytes, &digest, .{});
+            self.outputs.mst_store.seed = digest[0..16].*;
+        }
         var token = try channel.handoff(end);
         try self.graph.?.reclaim(&token, end);
         try self.outputs.begin(&self.graph.?, self.output_generation, end);

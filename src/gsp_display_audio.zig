@@ -93,10 +93,9 @@ pub fn encode(plan: Plan, operation: Operation, bytes: *[max_bytes]u8) !usize {
     const params = bytes[24..];
     put(params, 4, plan.mode.signal.display_id);
     if (eld_command) {
-        // HDMI and DP-SST use device entry 0 even when the display head is
-        // nonzero. nvkms-hdmi.c:GetAudioDeviceEntry reserves head-indexed
-        // entries for MST. Both supported SST transports keep entry zero.
-        put(params, 116, 0);
+        // nvkms-hdmi.c:GetAudioDeviceEntry assigns MST entries by head;
+        // HDMI and DP-SST keep entry0 regardless of their physical head.
+        put(params, 116, if (plan.mode.signal.mst != null) plan.mode.head else 0);
         if (operation == .publish) {
             const data = plan.data.?;
             if (data.max_frequency == 0 or data.max_frequency > 7 or data.baselineBytes() > 80 or

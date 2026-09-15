@@ -122,6 +122,7 @@ const outputs = @import("gsp_outputs.zig");
 const display = @import("gsp_display_rpc.zig");
 const exchange = @import("gsp_exchange.zig");
 const signal_color = @import("gsp_color_signal.zig");
+const frl = @import("gsp_frl_link.zig");
 pub const function: u32 = 76;
 pub const max_bytes = 84;
 pub const Operation = enum { caps, enable, audio_mute, avi, vsi, hdr_disable, gcp };
@@ -134,6 +135,7 @@ pub const Plan = struct {
     receiver_known: bool = false,
     hdmi_vic: u8 = 0,
     color: ?signal_color.color.Plan = null,
+    deferred_dsc: bool = false,
 };
 pub const Work = struct {
     plan: Plan,
@@ -207,7 +209,35 @@ pub fn derive(saved: mode.Plan, object: display.Object, snapshot: *const outputs
                 if (report.scrambling_low_rates) result.caps |= 2;
                 if (result.caps & 3 != 0 and result.caps & 4 == 0) return error.Unsupported;
             }
-            result.color = try signal_color.admit(saved, report, if (saved.transport_hdmi)
+            if (saved.signal.hdmi_frl) {
+                if (!std.meta.eql(saved, try frl.select(saved, report))) return error.Stale;
+                const link = try frl.derive(saved, object);
+                //Only a native physical HDMI connector, never passive DP++.
+                var direct_hdmi = false;
+                for (snapshot.topology.routes[0..snapshot.count]) |route| if (route.id == saved.signal.display_id) {
+                    const connectors = route.connectors orelse return error.Routing;
+                    direct_hdmi = connectors.present() and connectors.count == 1 and
+                        (connectors.data[0].kind == 0x61 or connectors.data[0].kind == 0x63);
+                };
+                if (!direct_hdmi) return error.Unsupported;
+                result.caps |= @as(u32, saved.frl_max_rate) << 3;
+                result.color = signal_color.admit(saved, report, .{ .hdmi_frl = .{
+                    .payload_bits_per_second = (if (saved.signal.hdmi_dsc) |compressed| compressed.rate else link.sink_max).codingCeiling(),
+                    .h_total = saved.signal.total & 0xffff, .h_active = saved.width,
+                    .compressed_bpp_x16 = if (saved.signal.hdmi_dsc) |compressed| compressed.params.bpp_x16 else 0,
+                    .compressed_bpc = if (saved.signal.hdmi_dsc != null) saved.signal.bpc else 0 } }) catch |err| blk: {
+                    if ((err != error.Bandwidth and err != error.Unsupported) or saved.signal.hdmi_dsc != null or saved.color == null or
+                        !saved.hdmi_dsc_sink.advertised or !saved.hdmi_dsc_sink.supported_fields) return err;
+                    const packets = try signal_color.color.hdmiDscCandidate(report, saved.color.?, signal_color.source(.hdmi),
+                        saved.color_pipeline, signal_color.clockHz(saved), saved.cta_vic);
+                    result.deferred_dsc = true; break :blk packets;
+                };
+                if (saved.signal.hdmi_dsc) |compressed| {
+                    if (!std.meta.eql(saved.hdmi_dsc_sink, report.hdmi_links.?.dsc) or
+                        @intFromEnum(compressed.rate) > @intFromEnum(report.hdmi_links.?.dsc.max_frl)) return error.Stale;
+                    result.caps |= (1 << 6) | (@as(u32, @intFromEnum(saved.hdmi_dsc_sink.max_frl)) << 7);
+                }
+            } else result.color = try signal_color.admit(saved, report, if (saved.transport_hdmi)
                 .{ .hdmi = .{ .max_tmds_hz = 600_000_000, .scdc = true } } else .{ .dvi = 165_000_000 });
         }
         break;
@@ -219,8 +249,8 @@ pub fn derive(saved: mode.Plan, object: display.Object, snapshot: *const outputs
     // mode. Keep the single-link 165 MHz ceiling until the receiver declares
     // a higher limit. Retained boot adoption keeps its separate policy.
     const limit: u64 = if (!saved.transport_hdmi or (saved.receiver_mode_id != 0 and result.max_tmds_hz == 0)) 165_000_000 else 600_000_000;
-    if (numerator > limit * denominator or (result.max_tmds_hz != 0 and numerator > result.max_tmds_hz * denominator) or
-        (numerator > 340_000_000 * denominator and result.caps & 5 != 5)) return error.Unsupported;
+    if (!saved.signal.hdmi_frl and (numerator > limit * denominator or (result.max_tmds_hz != 0 and numerator > result.max_tmds_hz * denominator) or
+        (numerator > 340_000_000 * denominator and result.caps & 5 != 5))) return error.Unsupported;
     if (saved.receiver_mode_id != 0 and !result.receiver_known) return error.Stale;
     if (saved.color != null and result.color == null) return error.Stale;
     return result;
@@ -239,6 +269,7 @@ fn checksum(packet: []u8) void {
     packet[3] = 0 -% sum;
 }
 pub fn encode(plan: Plan, op: Operation, bytes: *[max_bytes]u8) !usize {
+    if (plan.deferred_dsc) return error.State;
     try signal_color.validate(plan.mode);
     if ((plan.mode.color != null) != (plan.color != null)) return error.Descriptor;
     if (plan.color) |color| {
@@ -247,7 +278,10 @@ pub fn encode(plan: Plan, op: Operation, bytes: *[max_bytes]u8) !usize {
     }
     if (plan.mode.displayPort()) return error.Unsupported;
     if (plan.object.epoch == 0 or plan.object.client == 0 or plan.object.display == 0 or plan.object.epoch != plan.mode.epoch or
-        plan.caps & ~@as(u32, 7) != 0 or (!plan.mode.transport_hdmi and op != .caps and op != .enable) or
+        plan.caps & ~@as(u32, 1023) != 0 or ((plan.caps >> 3) & 7 != @as(u32, if (plan.mode.signal.hdmi_frl) plan.mode.frl_max_rate else 0)) or
+        ((plan.caps & 64 != 0) != (plan.mode.signal.hdmi_dsc != null)) or
+        (plan.caps >> 7 != @as(u32, if (plan.mode.signal.hdmi_dsc != null) @intFromEnum(plan.mode.hdmi_dsc_sink.max_frl) else 0)) or
+        (!plan.mode.transport_hdmi and op != .caps and op != .enable) or
         plan.mode.cta_vic > 127 or (plan.mode.cta_vic != 0 and (!plan.mode.transport_hdmi or plan.mode.receiver_mode_id == 0 or plan.hdmi_vic != 0))) return error.Descriptor;
     try mode.validate(plan.mode.signal, plan.mode.head);
     @memset(bytes, 0);

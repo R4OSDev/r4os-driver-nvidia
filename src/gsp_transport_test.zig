@@ -679,7 +679,7 @@ fn displayReply(model: *Model, channel: *display_rpc.Channel, status: u32, value
                 byte.* = @truncate(i);
             };
         },
-        .heads, .active, .windows, .connectors, .resource, .buses, .ports, .ddc, .aux => unreachable, // Dedicated bounded topology/DDC fixtures below.
+        .heads, .active, .windows, .connectors, .resource, .buses, .ports, .ddc, .aux, .dp_source, .frl_source, .mst_allocate, .mst_free => unreachable, // Dedicated bounded topology/DDC fixtures below.
     }
     // The RPC sequence and private result deliberately do not echo the request.
     try model.replyRpc(channel.exchange.session, .{ .function = 76, .result = 0, .result_private = 0x19283746, .sequence = 0xdeadbeef }, encoded);
@@ -1954,6 +1954,805 @@ fn receiverChecksum(bytes: []u8) void {
     for (bytes) |byte| sum +%= byte;
     bytes[127] = 0 -% sum;
 }
+fn checkLiveMst(model: *Model) !void {
+    const mst = @import("gsp_mst_discovery.zig");
+    const wire = @import("gsp_mst_wire.zig");
+    const store = try t.allocator.create(mst.Store);
+    defer t.allocator.destroy(store);
+    const capture = try t.allocator.create(receiver.Capture);
+    defer t.allocator.destroy(capture);
+    const Case = enum { normal, returning, clear_rejected, stale_mailbox, extended_caps, defer_control, firmware_active, heads_changed, allocation_rejected, allocation_hpd, allocation_prepared_hpd };
+    for (std.enums.values(Case)) |case| {
+        store.* = .{ .seed = @splat(9) };
+        var session: transport.Session = undefined;
+        var boot = try startBoot(model, &session);
+        try model.replyRpc(&session, .{ .function = 0x1001, .result = 0 }, &.{ 0, 0, 0, 0 });
+        try boot.complete((try boot.poll()).?.ticket);
+        var token = try boot.handoff(deadline);
+        var owner = try rm_graph.Owner.init(&token, 1, "MST root", deadline);
+        try graphCreate(model, &owner);
+        const resource: display_rpc.Resource = .{ .index = 2, .kind = 2, .protocol = 8, .location = 0, .dynamic = false,
+            .root_port_id = 0, .dcb_index = 27, .vbios_address = 0, .lit_by_vbios = false, .dither_type = 0, .dither_algo = 0 };
+        var observed: topology.Catalog = .{ .epoch = session.epoch, .client = owner.reservation.client,
+            .head_count = 2, .count = 2, .supported = .{ .displays = 12, .ddc = 12 } };
+        observed.routes[0] = .{ .id = 4, .resource = resource,
+            .connectors = .{ .flags = 1, .ddc_partners = 4, .platform = 0, .count = 1,
+                .data = .{ .{ .index = 17, .kind = 0x46 }, .{}, .{}, .{} } } };
+        observed.routes[1] = .{ .id = 8, .resource = resource };
+        observed.routes[1].resource.?.index = 0;
+        observed.routes[1].resource.?.protocol = 1;
+        observed.heads[0].display_id = 8; // An ordinary live HDMI head survives MST work.
+        observed.heads[1].display_id = if (case == .firmware_active) 4 else 0;
+        capture.* = .{ .epoch = session.epoch, .client = owner.reservation.client, .display_id = 4,
+            .receipt_serial = 1, .status = .edid_missing, .connected = true, .resource = resource,
+            .dp = .{ .source_state = .complete, .source = .{ .rate = 30, .increased_watermark = false, .mst = true },
+                .dpcd_state = .complete, .receiver = .{ .mst_state = .complete, .mst = true } } };
+        capture.dp.dpcd[0] = 0x14;
+        capture.dp.dpcd[1] = 30;
+        capture.dp.dpcd[2] = 0x84;
+        capture.dp.dpcd[3] = 0x80; // TPS4 for the advertised HBR3 rate.
+        capture.dp.dpcd[6] = 1; // 8b/10b main-link encoding.
+        var work = try mst.Work.init(&owner, store, &observed, capture, 11, 5 * std.time.ns_per_s);
+        var enabled: u8 = 0;
+        var enables: usize = 0;
+        var allocations: u32 = 0;
+        var supported: u32 = 12;
+        var outgoing: [48]u8 = @splat(0);
+        var response: [512]u8 = @splat(0);
+        var response_count: usize = 0;
+        var sender: ?wire.Sender = null;
+        var packet: [48]u8 = @splat(0);
+        var packet_count: usize = 0;
+        var edid: [256]u8 = undefined;
+        var deferred = false;
+        var extended_reads: u8 = 0;
+        var stale_fragments: u8 = 0;
+        var payload_slots: [64]u8 = @splat(7);
+        var payload_status: u8 = 0;
+        var branch_cleared = false;
+        var clear_count: u8 = 0;
+        if (case == .returning) store.roots[0].payload_dirty = true;
+        receiverFixture(&edid);
+        if (case == .stale_mailbox) {
+            var stale: wire.Sender = .{ .route = .{}, .sequence = 0 };
+            var old_body: [18]u8 = @splat(0);
+            old_body[0] = 1;
+            @memset(old_body[1..17], 9);
+            packet_count = (try stale.next(&old_body, &packet)).?;
+            store.roots[0].mailbox_pending = true;
+            store.roots[0].mailbox_deadline = std.time.ns_per_s;
+        }
+        for (0..1800) |_| {
+            model.count = 0;
+            if (work.stage == .complete or work.stage == .obsolete) break;
+            _ = try work.poll();
+            if (work.waiting()) {
+                try t.expect(case == .defer_control and deferred);
+                model.now += std.time.ns_per_ms;
+                continue;
+            }
+            if (case == .allocation_prepared_hpd and work.stage == .allocate and work.channel.exchange.phase == .prepared) {
+                try work.invalidate();
+                continue;
+            }
+            if (work.channel.exchange.phase != .waiting) continue;
+            const query = work.channel.request.?;
+            model.peerPut(session.link.?.command_read, get(&model.peer[0], 16));
+            var bytes: [display_rpc.max_request_bytes]u8 = undefined;
+            const payload = try display_rpc.encode(work.channel.object, query, &bytes);
+            switch (query) {
+                .supported => { put(&bytes, 28, supported); put(&bytes, 32, supported); },
+                .connected => |id| { try t.expect(id == 4); put(&bytes, 32, 4); },
+                .resource => |id| {
+                    try t.expect(id == 4 or id == 16 or id == 32);
+                    put(&bytes, 32, 2); put(&bytes, 36, 2); put(&bytes, 40, 8); put(&bytes, 60, 27);
+                    if (id != 4) { bytes[73] = 1; put(&bytes, 56, 4); }
+                },
+                .dp_source => { put(&bytes, 32, 4); bytes[48] = 1; },
+                .heads => put(&bytes, 32, 2),
+                .active => |head| put(&bytes, 36, if (head == 0) 8 else if (case == .heads_changed) 4 else 0),
+                .mst_allocate => |root| {
+                    try t.expect(root == 4 and store.roots[0].graph.coherent and enabled == 7);
+                    if (case == .allocation_rejected) put(&bytes, 12, 0x55) else {
+                        const id = @as(u32, 16) << @as(u5, @intCast(allocations));
+                        put(&bytes, 40, id);
+                        supported |= id;
+                    }
+                    allocations += 1;
+                },
+                .aux => |request| {
+                    const aux = display_rpc.aux_wire;
+                    put(&bytes, 60, aux.length(request.operation));
+                    switch (request.operation) {
+                        .caps => {
+                            @memcpy(bytes[44..60], &capture.dp.dpcd);
+                            if (case == .extended_caps) { bytes[45] = 10; bytes[58] = 0x80; }
+                        },
+                        .extended_caps => {
+                            try t.expect(case == .extended_caps);
+                            extended_reads += 1;
+                            @memcpy(bytes[44..60], &capture.dp.dpcd);
+                        },
+                        .mst_caps => bytes[44] = 1,
+                        .mst => |operation| switch (operation) {
+                            .payload_status => |clear| { if (clear) payload_status = 0 else bytes[44] = payload_status; },
+                            .payload => |value| {
+                                try t.expect(value.id == 0 and value.start == 0 and value.count == 63 and
+                                    enabled == 7 and work.clear_required and !work.occupied and store.roots[0].payload_dirty);
+                                @memset(&payload_slots, 0); payload_status = 1; clear_count += 1;
+                            },
+                            .payload_table => |part| for (0..16) |index| {
+                                const at = @as(usize, part) * 16 + index;
+                                bytes[44 + index] = if (at == 0) payload_status else payload_slots[at];
+                            },
+                            .control => |value| {
+                                if (value) |mode| { enabled = mode; enables += 1; }
+                                else if (case == .defer_control and !deferred) { put(&bytes, 64, 2); deferred = true; }
+                                else bytes[44] = enabled;
+                            },
+                            .irq => |irq| {
+                                if (irq.ack) |ack| {
+                                    try t.expect(ack == 0x10 and packet_count != 0);
+                                    if (work.stage == .mailbox) stale_fragments += 1;
+                                    packet_count = 0;
+                                } else {
+                                    if (work.stage != .mailbox and packet_count == 0) {
+                                        packet_count = (try sender.?.next(response[0..response_count], &packet)).?;
+                                        const header = try wire.decodeHeader(packet[0..packet_count]);
+                                        packet[0] &= 0xf0; packet[header.size() - 1] &= 0xf0;
+                                        packet[header.size() - 1] |= try wire.headerCrc(packet[0..header.size()], header.size() * 8 - 4);
+                                    }
+                                    bytes[44] = if (packet_count == 0) 0 else 0x10;
+                                }
+                            },
+                            .mailbox => |mailbox| {
+                                if (mailbox.box == .down_request) {
+                                    @memcpy(outgoing[mailbox.offset..][0..mailbox.count], mailbox.data[0..mailbox.count]);
+                                    if (@as(usize, mailbox.offset) + mailbox.count == work.down.?.packet_count) {
+                                        const fragment = try wire.decode(outgoing[0..work.down.?.packet_count]);
+                                        try t.expect(fragment.header.start and fragment.header.end);
+                                        var expected: [24]u8 = undefined;
+                                        const count = try work.down.?.request.encode(&expected);
+                                        try t.expectEqualSlices(u8, expected[0..count], fragment.body);
+                                        @memset(&response, 0);
+                                        const operation_query = work.down.?.request;
+                                        response[0] = @intFromEnum(operation_query.op());
+                                        switch (operation_query) {
+                                            .clear => {
+                                                try t.expect(clear_count == 1 and std.mem.allEqual(u8, &payload_slots, 0));
+                                                if (case == .clear_rejected) {
+                                                    response[0] |= 0x80; @memset(response[1..17], 9); response[17] = 8; response_count = 19;
+                                                } else { branch_cleared = true; response_count = 1; }
+                                            },
+                                            .link_address => {
+                                                @memset(response[1..17], 9);
+                                                response[17] = 3;
+                                                response[18] = 0x90; response[19] = 0xc0;
+                                                for (0..2) |index| {
+                                                    const at = 20 + index * 20;
+                                                    response[at] = 0x31 + @as(u8, @intCast(index));
+                                                    response[at + 1] = 0x40; response[at + 2] = 0x14;
+                                                    @memset(response[at + 3..][0..16], @intCast(30 + index));
+                                                    response[at + 19] = 0x11;
+                                                }
+                                                response_count = 60;
+                                            },
+                                            .enum_path => |port| {
+                                                try t.expect(branch_cleared and work.clear_complete and !store.roots[0].payload_dirty);
+                                                response[1] = port << 4 | 2;
+                                                std.mem.writeInt(u16, response[2..4], 2000, .big);
+                                                std.mem.writeInt(u16, response[4..6], 1800, .big);
+                                                response_count = 6;
+                                            },
+                                            .dpcd_read => |op| {
+                                                response[1] = op.port; response[2] = op.count;
+                                                @memcpy(response[3..19], &capture.dp.dpcd); response_count = 19;
+                                            },
+                                            .edid => |op| {
+                                                response[1] = op.port; response[2] = 128;
+                                                @memcpy(response[3..131], edid[@as(usize, op.block) * 128..][0..128]); response_count = 131;
+                                            },
+                                            else => return error.TestUnexpectedResult,
+                                        }
+                                        sender = .{ .route = fragment.header.route, .sequence = fragment.header.sequence, .path = fragment.header.path, .broadcast = fragment.header.broadcast };
+                                        packet_count = 0;
+                                    }
+                                } else if (mailbox.box == .down_reply) {
+                                    @memcpy(bytes[44..][0..mailbox.count], packet[mailbox.offset..][0..mailbox.count]);
+                                } else return error.TestUnexpectedResult;
+                            },
+                            else => return error.TestUnexpectedResult,
+                        },
+                        else => return error.TestUnexpectedResult,
+                    }
+                },
+                else => return error.TestUnexpectedResult,
+            }
+            if (case == .allocation_hpd and query == .mst_allocate) try work.invalidate();
+            try model.replyRpc(&session, .{ .function = 76, .result = 0 }, payload);
+            _ = try work.poll();
+        }
+        errdefer std.debug.print("live MST case={s} stage={s} failure={?} registry={s}/{s}\n", .{ @tagName(case), @tagName(work.stage), store.roots[0].failure,
+            @tagName(store.registry.slots[0].state), @tagName(store.registry.slots[1].state) });
+        try t.expect(owner.state == .ready and session.state == .active and (work.stage == .complete or work.stage == .obsolete));
+        if (case == .firmware_active or case == .heads_changed) {
+            try t.expect(enables == 0 and allocations == 0 and clear_count == 0 and store.roots[0].failure != null);
+        } else if (case == .clear_rejected) {
+            try t.expect(enables == 1 and allocations == 0 and clear_count == 1 and !branch_cleared and
+                store.roots[0].payload_dirty and store.roots[0].failure != null and store.roots[0].failure.? == error.BranchRejected and !store.roots[0].graph.coherent);
+        } else if (case == .allocation_hpd) {
+            try t.expect(allocations == 1 and work.stage == .obsolete and !store.roots[0].graph.coherent);
+            try t.expect(store.registry.slots[0].state == .retiring and store.registry.slots[0].display_id == 16 and store.registry.slots[0].pending == .none);
+        } else if (case == .allocation_prepared_hpd) {
+            try t.expect(allocations == 0 and work.stage == .obsolete);
+            for (&store.registry.slots) |*entry| try t.expect(entry.state == .vacant and entry.pending == .none);
+        } else {
+            try t.expect(enables == 1 and allocations == 2 and store.roots[0].failure == null and store.roots[0].graph.coherent);
+            if (case == .normal) {
+                const outputs = @import("gsp_outputs.zig");
+                const binding = @import("gsp_mst_binding.zig");
+                const snapshot = try t.allocator.create(outputs.Snapshot);
+                defer t.allocator.destroy(snapshot);
+                snapshot.* = .{ .generation = 11, .coherent = true, .final_receipt_serial = work.last_receipt,
+                    .topology = observed, .count = 4, .mst = store };
+                snapshot.topology.count = 4;
+                snapshot.receivers[0] = capture.*;
+                snapshot.receivers[1] = .{ .epoch = session.epoch, .client = owner.reservation.client, .display_id = 8,
+                    .status = .valid_edid, .connected = true };
+                for (0..2) |index| {
+                    const id = @as(u32, 16) << @as(u5, @intCast(index));
+                    const route = &snapshot.topology.routes[2 + index];
+                    route.* = .{ .id = id, .resource = resource };
+                    route.resource.?.dynamic = true;
+                    route.resource.?.root_port_id = 4;
+                    try t.expect(store.capture(route, &snapshot.receivers[2 + index], session.epoch, owner.reservation.client, 11));
+                    const view = try binding.derive(snapshot, id);
+                    try t.expect(view.stamp.display_id == id and view.stamp.root == 4 and view.connector.index == 17 and
+                        view.stamp.handle.serial == store.registry.slots[index].serial and view.sink.report.mode_count == 1);
+                    route.resource.?.root_port_id = 8;
+                    try t.expectError(error.Stale, binding.derive(snapshot, id));
+                    route.resource.?.root_port_id = 4;
+                }
+                snapshot.receivers[0].dp.source.?.mst = false;
+                try t.expectError(error.Stale, binding.derive(snapshot, 16));
+                snapshot.receivers[0].dp.source.?.mst = true;
+                const route_owner = @import("gsp_output_route.zig");
+                const boot_mode = @import("gsp_boot_mode.zig");
+                const raw: @import("boot_scanout.zig").Raw = .{ .capabilities = 0x407, .window_mask = 7,
+                    .counts = 3 | (3 << 8) | (3 << 20) };
+                const hardware: @import("gsp_display_engine_wire.zig").StaticInfo = .{ .capabilities = 0, .windows = 7,
+                    .fb_remapper = true, .heads = 3, .i2c_port = 0, .internal_displays = 0, .embedded_dp = 0,
+                    .external_mux = false, .internal_mux = false, .channels = 81 };
+                snapshot.topology.head_count = 3;
+                snapshot.topology.heads[0].display_id = 8;
+                snapshot.topology.heads[1].display_id = 0;
+                snapshot.topology.heads[2].display_id = 0;
+                snapshot.topology.window_heads = @splat(7);
+                const route_source: route_owner.Source = .{ .epoch = session.epoch, .held_generation = 5, .boot_generation = 6 };
+                var claimed: [8]?route_owner.Claim = @splat(null);
+                // HDMI on head0 remains outside the shared root/SOR.
+                claimed[0] = .{ .display_id = 8, .connector = .{ .index = 18, .kind = 0x61, .location = 0 },
+                    .sor = 1, .protocol = 1, .head = 0, .window = 0 };
+                var binding_step: []const u8 = "first route";
+                errdefer std.debug.print("MST binding at {s}\n", .{binding_step});
+                const first = try route_owner.choose(route_source, &raw, hardware, snapshot, &claimed, 16, 1);
+                claimed[first.claim.window] = first.claim;
+                binding_step = "second route";
+                const second = try route_owner.choose(route_source, &raw, hardware, snapshot, &claimed, 32, 1);
+                try t.expect(first.claim.head == 1 and second.claim.head == 2 and first.claim.sor == second.claim.sor and
+                    first.plan.signal.mst.?.root == 4 and second.plan.signal.mst.?.display_id == 32);
+                binding_step = "route identity";
+                try t.expectEqualDeep(first.claim, try route_owner.identify(first.plan, snapshot));
+                try boot_mode.validate(first.plan.signal, first.plan.head);
+                try t.expectError(error.Unsupported, @import("gsp_dp_link.zig").derive(first.plan, work.channel.object, snapshot));
+                var invalid_plan = second.plan;
+                invalid_plan.signal.mst = first.plan.signal.mst;
+                try t.expectError(error.Stale, boot_mode.bind(invalid_plan, snapshot, session.epoch, 5));
+                binding_step = "shared SOR";
+                const Link = struct { pub fn complete(_: @This()) bool { return true; } };
+                const Image = struct { boot_mode: ?boot_mode.Plan, core_point: u64 = 3, window_point: u64 = 4, link: ?Link = .{} };
+                var active_images: [8]?Image = @splat(null);
+                active_images[first.plan.window] = .{ .boot_mode = first.plan };
+                const sor_owner = @import("gsp_mst_sor.zig");
+                try t.expect(try sor_owner.control(second.plan, &active_images, false) == 0x806);
+                active_images[second.plan.window] = .{ .boot_mode = second.plan };
+                try t.expect(try sor_owner.control(first.plan, &active_images, true) == 0x804);
+                active_images[first.plan.window] = null;
+                try t.expect(try sor_owner.control(second.plan, &active_images, true) == 0);
+                active_images[second.plan.window].?.boot_mode.?.signal.mst.?.root = 8;
+                try t.expectError(error.Stale, sor_owner.control(second.plan, &active_images, true));
+                binding_step = "root budget";
+                const mst_mode = @import("gsp_mst_mode.zig");
+                const first_budget = try mst_mode.admit(first.plan, snapshot);
+                try t.expect(first_budget.table.count == 1 and first_budget.table.entries[0].allocation.payload_id == 2);
+                const empty_table: @import("gsp_mst_budget.zig").Table = .{};
+                try t.expect(!std.mem.eql(u8, &(try first_budget.table.digest()), &(try empty_table.digest())));
+                var audio_packet: [@import("gsp_display_audio.zig").max_bytes]u8 = undefined;
+                const audio_plan: @import("gsp_display_audio.zig").Plan = .{ .mode = first.plan, .object = work.channel.object };
+                _ = try @import("gsp_display_audio.zig").encode(audio_plan, .clear, &audio_packet);
+                try t.expect(std.mem.readInt(u32, audio_packet[140..144], .little) == first.plan.head);
+                var physical_mode = first.plan;
+                physical_mode.signal.mst = null; physical_mode.signal.display_id = 4;
+                try t.expectError(error.Unsupported, boot_mode.bind(physical_mode, snapshot, session.epoch, 5));
+                // Modeled acknowledged first stream; the graph's original
+                // free-PBN report still predates this allocation.
+                const branch_root = &store.roots[0];
+                branch_root.stream_serial += 1;
+                const prepared = try branch_root.transaction.reserve(&store.registry, session.epoch, 4, snapshot.generation,
+                    branch_root.stream_serial, &branch_root.live, &first_budget);
+                try branch_root.transaction.validate(prepared, &branch_root.live);
+                try t.expect(store.registry.slots[0].stream_lease != null and branch_root.live.table.count == 0);
+                branch_root.transaction.target.table.entries[0].allocation.start += 1;
+                try t.expectError(error.Stale, branch_root.transaction.validate(prepared, &branch_root.live));
+                branch_root.transaction.target.table.entries[0].allocation.start -= 1;
+                try branch_root.transaction.cancelUnsubmitted(&store.registry, prepared);
+                try t.expect(branch_root.transaction.phase == .vacant and store.registry.slots[0].stream_lease == null);
+                branch_root.live = .{ .epoch = session.epoch, .root = 4, .revision = 1,
+                    .table = first_budget.table, .completion_receipt = work.last_receipt + 2,
+                    .training = .{ .link = first_budget.link, .source = branch_root.source.?, .dpcd = branch_root.dpcd,
+                        .lanes = .{ 1, 0, 0x77, 0x77, 1, 0, 0, 0 }, .receipt = work.last_receipt + 1 } };
+                const second_budget = try mst_mode.admit(second.plan, snapshot);
+                try t.expect(!std.mem.eql(u8, &(try first_budget.table.digest()), &(try second_budget.table.digest())));
+                try t.expect(second_budget.table.count == 2 and second_budget.table.slots == first_budget.table.slots * 2 and
+                    second_budget.table.entries[0].allocation.payload_id == 2 and second_budget.table.entries[1].allocation.payload_id == 3);
+                // A later EPR capture contains the first stream's allocation.
+                const allocated_pbn = first_budget.table.entries[0].allocation.demand.pbn;
+                const first_edge = branch_root.graph.sinks[store.registry.slots[0].sink].edge;
+                const old_free = branch_root.graph.edges[first_edge].resources.?.free_pbn;
+                branch_root.graph.edges[first_edge].resources.?.free_pbn -= allocated_pbn;
+                branch_root.captured_table = first_budget.table;
+                try t.expectEqualDeep(second_budget, try mst_mode.admit(second.plan, snapshot));
+                branch_root.graph.edges[first_edge].resources.?.downstream_pbn = allocated_pbn - 1;
+                try t.expectError(error.Bandwidth, mst_mode.admit(second.plan, snapshot));
+                branch_root.graph.edges[first_edge].resources.?.downstream_pbn = null;
+                // Reordering edge records must not move owned PBN to a sibling.
+                std.mem.swap(@import("gsp_mst_topology.zig").Edge, &branch_root.graph.edges[0], &branch_root.graph.edges[1]);
+                for (branch_root.graph.sinks[0..branch_root.graph.sink_count]) |*sink| {
+                    sink.edge = 1 - sink.edge; sink.path[0] = 1 - sink.path[0];
+                }
+                try t.expectEqualDeep(second_budget, try mst_mode.admit(second.plan, snapshot));
+                std.mem.swap(@import("gsp_mst_topology.zig").Edge, &branch_root.graph.edges[0], &branch_root.graph.edges[1]);
+                for (branch_root.graph.sinks[0..branch_root.graph.sink_count]) |*sink| {
+                    sink.edge = 1 - sink.edge; sink.path[0] = 1 - sink.path[0];
+                }
+                branch_root.graph.edges[first_edge].resources.?.free_pbn = old_free;
+                branch_root.live = .{}; branch_root.captured_table = .{};
+                binding_step = "stream exchange";
+                try checkMstStreams(model, &owner, store, snapshot, first.plan, second.plan, false);
+                try checkMstStreams(model, &owner, store, snapshot, first.plan, second.plan, true);
+                binding_step = "stale generation";
+                snapshot.generation += 1;
+                try t.expectError(error.Stale, binding.derive(snapshot, 16));
+            }
+            if (case == .allocation_rejected) {
+                try t.expect(store.registry.slots[0].state == .unavailable and store.registry.slots[1].state == .unavailable);
+            } else for (0..2) |index| {
+                const entry = &store.registry.slots[index];
+                try t.expect(entry.state == .verified and entry.display_id == @as(u32, 16) << @as(u5, @intCast(index)) and !entry.published);
+                var route: topology.Route = .{ .id = entry.display_id, .resource = resource };
+                route.resource.?.dynamic = true;
+                route.resource.?.root_port_id = 4;
+                try t.expect(store.capture(&route, capture, session.epoch, owner.reservation.client, 11));
+                try t.expect(capture.source == .mst and capture.edid_bytes == 256 and capture.status == .valid_edid and capture.report.mode_count == 1);
+            }
+        }
+        try t.expect(extended_reads == @as(u8, if (case == .extended_caps) 1 else 0));
+        try t.expect(stale_fragments == @as(u8, if (case == .stale_mailbox) 1 else 0));
+        if (case == .normal) {
+            const retire = @import("gsp_mst_retire.zig");
+            store.invalidate(4); // Removed branch; root AUX is no longer required for RM Free.
+            try t.expect(retire.Work.needed(&store.registry));
+            for (0..3) |attempt| {
+                var reaper = try retire.Work.init(&owner, &store.registry, &observed, 5 * std.time.ns_per_s);
+                var sent: u32 = 0;
+                for (0..90) |_| {
+                    model.count = 0;
+                    if (reaper.stage == .complete or reaper.stage == .obsolete) break;
+                    _ = try reaper.poll();
+                    if (attempt == 1 and reaper.stage == .free and reaper.channel.exchange.phase == .prepared) {
+                        try reaper.invalidate();
+                        continue;
+                    }
+                    if (reaper.channel.exchange.phase != .waiting) continue;
+                    const query = reaper.channel.request.?;
+                    model.peerPut(session.link.?.command_read, get(&model.peer[0], 16));
+                    var bytes: [display_rpc.max_request_bytes]u8 = undefined;
+                    const payload = try display_rpc.encode(reaper.channel.object, query, &bytes);
+                    switch (query) {
+                        .supported => { put(&bytes, 28, supported); put(&bytes, 32, supported); },
+                        .heads => put(&bytes, 32, 2),
+                        .active => |head| put(&bytes, 36, if (head == 0) 8 else 0),
+                        .mst_free => |id| {
+                            try t.expect(id == 16 or id == 32);
+                            sent += 1;
+                            if (attempt == 0 and id == 16) put(&bytes, 12, 0x55) else supported &= ~id;
+                        },
+                        else => return error.TestUnexpectedResult,
+                    }
+                    if (attempt == 2 and query == .mst_free) try reaper.invalidate();
+                    try model.replyRpc(&session, .{ .function = 76, .result = 0 }, payload);
+                    _ = try reaper.poll();
+                }
+                try t.expect(owner.state == .ready and session.state == .active);
+                if (attempt == 0) try t.expect(sent == 2 and reaper.released == 1 and store.registry.slots[0].display_id == 16 and store.registry.slots[0].pending == .none)
+                else if (attempt == 1) try t.expect(sent == 0 and reaper.released == 0 and store.registry.slots[0].display_id == 16 and store.registry.slots[0].pending == .none)
+                else try t.expect(sent == 1 and reaper.released == 1 and store.registry.slots[0].state == .vacant);
+            }
+            try t.expect(!retire.Work.needed(&store.registry) and supported == 12);
+        }
+    }
+}
+/// The same ring/ACK model drives real MST Work requests. This receiver has
+/// two ports and an independent compacting payload table; an ACT fails the
+/// fixture if the programmed source disagrees with any receiver slot.
+fn checkMstStreams(model: *Model, owner: *rm_graph.Owner, store: *@import("gsp_mst_discovery.zig").Store,
+    snapshot: *const @import("gsp_outputs.zig").Snapshot, first: @import("gsp_boot_mode.zig").Plan,
+    second: @import("gsp_boot_mode.zig").Plan, root_loss: bool) !void
+{
+    const link = @import("gsp_mst_link.zig");
+    const common_link = @import("gsp_display_link.zig");
+    const wire = @import("gsp_mst_wire.zig");
+    const aux = display_rpc.aux_wire;
+    const stream_end = 5 * std.time.ns_per_s;
+    var loan = try owner.loan(stream_end);
+    var channel = try @import("gsp_exchange.zig").Exchange.init(&loan.runtime, stream_end);
+    const root = &store.roots[0];
+    const captured_graph = try t.allocator.create(@import("gsp_mst_topology.zig").Graph);
+    captured_graph.* = root.graph;
+    defer t.allocator.destroy(captured_graph);
+    defer {
+        // Only this modeled fixture's completed images are reset. Production
+        // retirement must use Core/Window/ARM and the stream stop transaction.
+        root.live = .{}; root.captured_table = .{}; root.payload_dirty = false;
+        root.graph = captured_graph.*;
+        for (store.registry.slots[0..2], 0..) |*slot, index| {
+            slot.state = .verified; slot.generation = snapshot.generation; slot.sink = @intCast(index);
+        }
+        for (&store.registry.slots) |*slot| slot.image = null;
+    }
+    var active: [8]u32 = .{ 8, 0, 0, 0, 0, 0, 0, 0 };
+    var source: [8]?@import("gsp_mst_control.zig").Stream = @splat(null);
+    var table: [64]u8 = @splat(0);
+    var branch_pbn: [8]u16 = @splat(0);
+    var branch_port: [8]u8 = @splat(0);
+    var trained = false;
+    var train_count: u8 = 0;
+    var trained_link: @import("gsp_mst_payload.zig").Link = .{ .rate = 0, .lanes = 0 };
+    var act_count: u8 = 0;
+    var status: u8 = 0;
+    var rate_pending = false;
+    var response: [512]u8 = @splat(0);
+    var response_count: usize = 0;
+    var sender: ?wire.Sender = null;
+    var packet: [48]u8 = @splat(0);
+    var packet_count: usize = 0;
+    var outgoing: [48]u8 = @splat(0);
+    const Proof = struct {
+        plan: link.Plan, result: link.Result,
+        pub fn complete(self: @This()) bool { return self.result.complete(self.plan); }
+    };
+    const Image = struct { boot_mode: ?@import("gsp_boot_mode.zig").Plan, image: struct { dma: u32 }, core_point: u64, window_point: u64, link: ?Proof };
+    var images: [8]?Image = @splat(null);
+    var notice_body: [19]u8 = @splat(0);
+    notice_body[0] = 2; notice_body[1] = 0x10; @memset(notice_body[2..18], 9); notice_body[18] = 3;
+    var notice_sender: wire.Sender = .{ .route = .{}, .sequence = 1 };
+    var notice_packet: [48]u8 = @splat(0);
+    _ = (try notice_sender.next(&notice_body, &notice_packet)).?;
+    var notice_pending = false;
+    var notice_queued = false;
+    var notice_replied = false;
+    var notice_reply: [48]u8 = @splat(0);
+    for ([_]@import("gsp_boot_mode.zig").Plan{ first, second, first, first, first, second }, 0..) |mode, operation| {
+        const stopping = operation >= 4;
+        const old_digest = try root.live.table.digest();
+        var work: common_link.Work = undefined;
+        var restore: ?common_link.Work = null;
+        var stopped_digest: [32]u8 = undefined;
+        if (stopping) {
+            const remaining = try @import("gsp_mst_budget.zig").remove(&root.live.table, mode.epoch, 4, root.live.training.?.link, mode.signal.display_id);
+            stopped_digest = try remaining.digest();
+            const saved = images[mode.head].?;
+            // HPD has invalidated the capture. The actual branch now lacks
+            // this output; the old RM image/ID persists until source stop.
+            root.graph.coherent = false;
+            root.graph.generation += 1;
+            root.graph.branches[0].descriptor.?.ports[operation - 3].connected = false;
+            root.graph.sink_count -= 1; root.graph.edge_count -= 1;
+            if (operation == 4) {
+                root.graph.edges[0] = root.graph.edges[1]; root.graph.sinks[0] = root.graph.sinks[1];
+                root.graph.sinks[0].edge = 0; root.graph.sinks[0].path[0] = 0;
+                store.registry.slots[1].sink = 0; store.registry.slots[1].generation = root.graph.generation;
+            }
+            store.registry.slots[mode.signal.mst.?.handle.slot].state = .retiring;
+            // The common Core/Window fixture has detached this head, while
+            // the old RM ID/image is retained until the link owner finishes.
+            active[mode.head] = 0;
+            const plan: common_link.Plan = .{ .object = saved.link.?.plan.object, .mode = saved.link.?.plan.mode, .transport = .{ .mst = saved.link.?.plan } };
+            restore = try common_link.Work.stopMst(plan, saved.link.?.result,
+                store.registry.slots[mode.signal.mst.?.handle.slot].image.?, store, stream_end);
+            try t.expect(root.transaction.phase == @as(@import("gsp_mst_transaction.zig").Phase, if (root_loss and operation == 5) .disconnected else .reserved) and
+                store.registry.slots[mode.signal.mst.?.handle.slot].stream_lease != null);
+        } else {
+            work = common_link.Work.init(try common_link.derive(mode, loan.object, snapshot));
+            try work.reserveMst(snapshot, store, stream_end);
+        }
+        var injected = false;
+        var scanout_count: u8 = 0;
+        rate_pending = true;
+        errdefer if (!stopping) std.debug.print("MST stream operation={d} stage={s} error={?} channel={s}\n",
+            .{ operation, @tagName(work.mst.?.stage), work.mst.?.failure, @tagName(channel.phase) });
+        errdefer if (restore) |value| std.debug.print("MST restore stage={s} failure={?}\n", .{ @tagName(value.mst_rebuild.?.stage), value.mst_rebuild.?.failure });
+        for (0..3000) |_| {
+            model.count = 0;
+            if (if (restore) |value| value.phase == .complete else work.phase == .complete) break;
+            if (restore) |*value| {
+                if (value.phase == .scanout) {
+                    try t.expectError(error.Stale, value.rebuildScanout(.{ .attached = !stopping, .core_point = value.mst_rebuild.?.candidate_core, .window_point = value.mst_rebuild.?.candidate_window }));
+                    try value.rebuildScanout(.{ .attached = !stopping,
+                        .core_point = if (stopping) 301 + operation * 2 else 201, .window_point = if (stopping) 302 + operation * 2 else 202 });
+                    continue;
+                }
+            } else if (work.phase == .scanout) {
+                try t.expect(channel.phase == .idle and work.mstResult() == null and root.live.revision == operation and work.readyScanout());
+                try t.expectError(error.State, work.scanoutCompleted(0, 1));
+                active[mode.head] = mode.signal.display_id;
+                try work.scanoutCompleted(101 + operation * 2, 102 + operation * 2);
+                scanout_count += 1;
+                continue;
+            }
+            const current_work = if (restore) |*value| value else &work;
+            if (!current_work.pending) {
+                if (!try current_work.prepare(model.now)) { model.now += std.time.ns_per_ms; continue; }
+                current_work.length = try current_work.encode(&current_work.request);
+                try channel.begin(76, current_work.request[0..current_work.length], stream_end);
+                current_work.pending = true;
+                try t.expect(current_work.matches(&channel, stream_end));
+            }
+            const received = try channel.poll(stream_end);
+            if (channel.phase == .waiting) { if (restore) |*value| try value.submitted() else try work.submitted(); }
+            if (received) |dispatch| {
+                try t.expect(dispatch.response);
+                var copied: [link.max_bytes]u8 = undefined;
+                @memcpy(copied[0..dispatch.record.payload.len], dispatch.record.payload);
+                var record = dispatch.record; record.payload = copied[0..dispatch.record.payload.len];
+                const old_revision = root.live.revision;
+                try channel.complete(dispatch.ticket);
+                try t.expect(root.live.revision == old_revision);
+                if (restore) |*value| try value.consume(record, dispatch.ticket.serial, model.now)
+                else work.consume(record, dispatch.ticket.serial, model.now) catch |err| {
+                    try t.expect(operation == 3 and injected and err == error.BranchRejected and root.live.revision == 3);
+                    try t.expect(root.transaction.phase == .posted and store.registry.slots[0].stream_lease != null and store.registry.slots[1].stream_lease != null);
+                    restore = try common_link.Work.restoreMst(&work, stream_end);
+                };
+                continue;
+            }
+            if (channel.phase != .waiting) continue;
+            model.peerPut(channel.session.link.?.command_read, get(&model.peer[0], 16));
+            var bytes: [common_link.max_bytes]u8 = undefined;
+            const count = if (restore) |*value| try value.encode(&bytes) else try work.encode(&bytes);
+            const request = if (restore) |value| value.mst_rebuild.?.request.? else work.mst.?.request.?;
+            switch (request) {
+                .control => |control_query| switch (control_query) {
+                    .train => |value| {
+                        try t.expect(operation == 0 and !trained);
+                        train_count += 1;
+                        if (train_count == 1) { put(&bytes, 40, 1); } else {
+                            try t.expect(train_count == 2 and value.rate == 30 and value.lanes == 2);
+                            trained = true; trained_link = .{ .rate = value.rate, .lanes = value.lanes };
+                        }
+                    },
+                    .stream => |value| { try t.expect(trained); source[value.head] = value; },
+                    .trigger => {},
+                    .clear_vsc, .clear_hdr => |id| {
+                        try t.expect((id == 16 and active[1] == id) or (id == 32 and active[2] == id));
+                    },
+                    .rate => |value| if (value.check) {
+                        if (rate_pending) rate_pending = false else put(&bytes, 36, get(&bytes, 36) | 0x80000000);
+                    },
+                    .act => {
+                        var source_table: [64]u8 = @splat(0);
+                        for (source, 0..) |stream_value, head| if (stream_value) |value| {
+                            if (value.pbn == 0) continue;
+                            for (value.start..value.end + 1) |slot| {
+                                try t.expect(source_table[slot] == 0);
+                                source_table[slot] = @intCast(head + 1);
+                            }
+                        };
+                        try t.expectEqualSlices(u8, &table, &source_table);
+                        status |= 2; act_count += 1;
+                    },
+                    else => return error.TestUnexpectedResult,
+                },
+                .query => |query| switch (query) {
+                    .connected => put(&bytes, 32, if (root_loss and stopping) 0 else 4),
+                    .resource => |id| {
+                        if (id == 8) { put(&bytes, 32, 1); put(&bytes, 36, 2); put(&bytes, 40, 1); }
+                        else {
+                            put(&bytes, 32, 2); put(&bytes, 36, 2); put(&bytes, 40, 8); put(&bytes, 60, 27);
+                            if (id != 4) { bytes[73] = 1; put(&bytes, 56, 4); }
+                        }
+                    },
+                    .dp_source => { put(&bytes, 32, 4); bytes[48] = 1; },
+                    .heads => put(&bytes, 32, 3),
+                    .active => |head| put(&bytes, 36, active[head]),
+                    .aux => |query_aux| {
+                        try t.expect(query_aux.display_id == 4 and !(root_loss and stopping));
+                        put(&bytes, 60, aux.length(query_aux.operation));
+                        switch (query_aux.operation) {
+                            .caps => @memcpy(bytes[44..60], &root.dpcd),
+                            .mst_caps => bytes[44] = 1,
+                            .repeaters => {}, .power => bytes[44] = 1, .power_on => {},
+                            .link_config => { try t.expect(trained); bytes[44] = trained_link.rate; bytes[45] = 0x80 | trained_link.lanes; },
+                            .link_status => @memcpy(bytes[44..52], &[_]u8{ 1, 0, 0x77, 0, 1, 0, 0, 0 }),
+                            .mst => |operation_mst| switch (operation_mst) {
+                                .control => bytes[44] = 7,
+                                .guid => @memset(bytes[44..60], 9),
+                                .payload_status => |clear| { if (clear) status = 0 else bytes[44] = status; },
+                                .payload_table => |part| {
+                                    for (0..16) |index| {
+                                        const at = @as(usize, part) * 16 + index;
+                                        bytes[44 + index] = if (at == 0) status else table[at];
+                                    }
+                                },
+                                .payload => |allocation| {
+                                    if (allocation.id == 0) {
+                                        if (restore == null) try t.expect(operation == 0 and active[1] == 0 and active[2] == 0)
+                                        else for (source) |entry| if (entry) |value| { try t.expect(value.pbn == 0); };
+                                        @memset(&table, 0);
+                                    } else if (allocation.count == 0) {
+                                        try t.expect(table[allocation.start] == allocation.id);
+                                        var next: [64]u8 = @splat(0); var offset: usize = 1;
+                                        for (table[1..]) |id| if (id != 0 and id != allocation.id) { next[offset] = id; offset += 1; };
+                                        table = next;
+                                    } else {
+                                        // New VC allocation must append; no overwriting a sibling.
+                                        for (table[1..allocation.start]) |id| try t.expect(id != 0);
+                                        for (table[allocation.start..]) |id| try t.expect(id == 0);
+                                        @memset(table[allocation.start..][0..allocation.count], allocation.id);
+                                    }
+                                    status |= 1;
+                                },
+                                .irq => |irq| {
+                                    if (irq.ack) |ack| {
+                                        if (ack == 0x20) { try t.expect(notice_pending); notice_pending = false; }
+                                        else { try t.expect(ack == 0x10 and packet_count != 0); packet_count = 0; }
+                                    }
+                                    else {
+                                        if (restore != null and restore.?.mst_rebuild.?.up != null) {
+                                            bytes[44] = if (notice_pending) 0x20 else 0;
+                                        } else {
+                                        if (packet_count == 0) {
+                                            packet_count = (try sender.?.next(response[0..response_count], &packet)).?;
+                                            // Sender emits downstream routing; a reply arrives with
+                                            // no remaining hops, including the CLEAR broadcast.
+                                            const header = try wire.decodeHeader(packet[0..packet_count]);
+                                            packet[0] &= 0xf0;
+                                            packet[header.size() - 1] &= 0xf0;
+                                            packet[header.size() - 1] |= try wire.headerCrc(packet[0..header.size()], header.size() * 8 - 4);
+                                        }
+                                        bytes[44] = 0x10 | @as(u8, if (notice_pending) 0x20 else 0);
+                                        }
+                                    }
+                                },
+                                .mailbox => |mailbox| {
+                                    if (mailbox.box == .down_request) {
+                                        @memcpy(outgoing[mailbox.offset..][0..mailbox.count], mailbox.data[0..mailbox.count]);
+                                        const header = try wire.decodeHeader(outgoing[0..@as(usize, mailbox.offset) + mailbox.count]);
+                                        const length = header.size() + header.payload_bytes;
+                                        if (@as(usize, mailbox.offset) + mailbox.count == length) {
+                                            const frame = try wire.decode(outgoing[0..length]); const body = frame.body;
+                                            @memset(&response, 0); response[0] = body[0];
+                                            switch (body[0]) {
+                                                1 => {
+                                                    if (stopping and operation == 4 and !root_loss and !notice_queued) {
+                                                        notice_pending = true; notice_queued = true;
+                                                    }
+                                                    @memset(response[1..17], 9); response[17] = 3; response[18] = 0x90; response[19] = 0xc0;
+                                                    for (0..2) |index| {
+                                                        const at = 20 + index * 20;
+                                                        response[at] = 0x31 + @as(u8, @intCast(index)); response[at + 1] = 0x40; response[at + 2] = 0x14;
+                                                        if (stopping and index < operation - 3) response[at + 1] = 0;
+                                                        @memset(response[at + 3..][0..16], @intCast(30 + index)); response[at + 19] = 0x11;
+                                                    }
+                                                    response_count = 60;
+                                                },
+                                                0x10 => {
+                                                    var used: u16 = 0;
+                                                    for (branch_pbn, branch_port) |pbn, port| if (port == body[1] >> 4) { used += pbn; };
+                                                    response[1] = body[1] | 2; std.mem.writeInt(u16, response[2..4], 2000, .big);
+                                                    std.mem.writeInt(u16, response[4..6], 1800 - used, .big); response_count = 6;
+                                                },
+                                                0x11 => {
+                                                    const id = body[2]; const pbn = std.mem.readInt(u16, body[3..5], .big);
+                                                    try t.expect(id == 2 or id == 3);
+                                                    if (pbn != 0) try t.expect(active[id - 1] != 0 and status & 2 != 0);
+                                                    branch_pbn[id] = pbn; branch_port[id] = body[1] >> 4;
+                                                    response[1] = body[1] & 0xf0; @memcpy(response[2..5], body[2..5]); response_count = 5;
+                                                    if (operation == 3 and pbn != 0 and !injected) {
+                                                        // A path may have applied partial reservations
+                                                        // before the terminal branch returns a NAK.
+                                                        response[0] |= 0x80; @memset(response[1..17], 9);
+                                                        response[17] = 8; response[18] = 0; response_count = 19; injected = true;
+                                                    }
+                                                },
+                                                0x12 => { response[1] = body[1]; std.mem.writeInt(u16, response[2..4], branch_pbn[body[2]], .big); response_count = 4; },
+                                                0x14 => { try t.expect(operation == 0 or restore != null); @memset(&branch_pbn, 0); response_count = 1; },
+                                                else => return error.TestUnexpectedResult,
+                                            }
+                                            sender = .{ .route = header.route, .sequence = header.sequence, .path = header.path, .broadcast = header.broadcast };
+                                            packet_count = 0;
+                                        }
+                                    } else if (mailbox.box == .up_request) {
+                                        try t.expect(notice_pending and restore != null and restore.?.mst_rebuild.?.up != null);
+                                        @memcpy(bytes[44..][0..mailbox.count], notice_packet[mailbox.offset..][0..mailbox.count]);
+                                    } else if (mailbox.box == .up_reply) {
+                                        try t.expect(!notice_pending);
+                                        @memcpy(notice_reply[mailbox.offset..][0..mailbox.count], mailbox.data[0..mailbox.count]);
+                                        const header = try wire.decodeHeader(notice_reply[0..@as(usize, mailbox.offset) + mailbox.count]);
+                                        if (@as(usize, mailbox.offset) + mailbox.count == header.size() + header.payload_bytes) {
+                                            const reply = try wire.decode(notice_reply[0..header.size() + header.payload_bytes]);
+                                            try t.expectEqualSlices(u8, &.{2}, reply.body); notice_replied = true;
+                                        }
+                                    } else if (mailbox.box == .down_reply) @memcpy(bytes[44..][0..mailbox.count], packet[mailbox.offset..][0..mailbox.count])
+                                    else return error.TestUnexpectedResult;
+                                },
+                                else => return error.TestUnexpectedResult,
+                            },
+                            else => return error.TestUnexpectedResult,
+                        }
+                    },
+                    else => return error.TestUnexpectedResult,
+                },
+            }
+            try model.replyRpc(channel.session, .{ .function = 76, .result = 0 }, bytes[0..count]);
+        }
+        try t.expect(scanout_count == @as(u8, if (stopping) 0 else 1));
+        try t.expect(root.live.revision == (if (root_loss and stopping) operation else operation + 1) and
+            root.transaction.phase == @as(@import("gsp_mst_transaction.zig").Phase, if (root_loss and operation == 4) .disconnected else .vacant) and !root.mailbox_pending);
+        try t.expect(active[0] == 8 and train_count == 2);
+        if (stopping) {
+            const value = &restore.?.mst_rebuild.?;
+            try t.expect(value.stop_only and value.stage == .complete and value.completion_receipt != 0 and
+                root.live.table.count == (if (root_loss and operation == 4) @as(usize, 2) else 5 - operation));
+            if (root_loss and operation == 4) {
+                try t.expectEqualSlices(u8, &old_digest, &(try root.live.table.digest()));
+                try t.expect(root.payload_dirty and root.transaction.stopped_heads == 2 and
+                    store.registry.slots[0].stream_lease != null and store.registry.slots[1].stream_lease != null);
+                try t.expectError(error.Stale, @import("gsp_mst_binding.zig").derive(snapshot, second.signal.display_id));
+            } else if (!root_loss) try t.expectEqualSlices(u8, &stopped_digest, &(try root.live.table.digest()));
+            try store.registry.detached(mode.signal.mst.?.handle, .{ .epoch = mode.epoch, .image = images[mode.head].?,
+                .core_point = value.core.?.core_point, .window_point = value.core.?.window_point, .observed_ns = model.now,
+                .link_stop_receipt = value.completion_receipt });
+            images[mode.head] = null;
+            if (!root_loss) { for (&images) |*entry| if (entry.*) |*image| {
+                image.link.?.result = try value.restoredImage(image.link.?.plan, image.core_point, image.window_point);
+            }; }
+            continue;
+        }
+        const result = if (restore) |*restored| blk: {
+            const value = &restored.mst_rebuild.?;
+            try t.expect(value.stage == .complete and value.completion_receipt != 0 and injected and work.mstResult() == null);
+            try t.expectEqualSlices(u8, &old_digest, &(try root.live.table.digest()));
+            break :blk try value.restoredImage(work.plan.transport.mst, value.core.?.core_point, value.core.?.window_point);
+        } else blk: {
+            try t.expect(work.phase == .complete and work.mstResult() != null and work.mstResult().?.complete(work.plan.transport.mst));
+            break :blk work.mstResult().?;
+        };
+        const confirmed: @import("gsp_runtime.zig").DisplayLink = .{ .plan = work.plan, .acknowledged = 2,
+            .receipt = result.rate_receipt, .mst = result };
+        try t.expect(confirmed.complete() and confirmed.dp == null and confirmed.audio48k() == (result.demand.audio_48k and mode.head < 4));
+        images[mode.head] = .{ .boot_mode = mode,
+            .image = .{ .dma = 100 + @as(u32, @intCast(if (restore != null) 2 else operation)) }, .core_point = result.core_point, .window_point = result.window_point,
+            .link = .{ .plan = work.plan.transport.mst, .result = result } };
+        try store.registry.activated(mode.signal.mst.?.handle, images[mode.head].?);
+    }
+    try t.expect(root.live.table.count == 0 and root.live.training == null and act_count == @as(u8, if (root_loss) 7 else 8) and
+        active[1] == 0 and active[2] == 0 and store.registry.slots[0].stream_lease == null and store.registry.slots[1].stream_lease == null);
+    if (root_loss) try t.expect(root.payload_dirty and !std.mem.allEqual(u8, &table, 0) and !std.mem.allEqual(u16, &branch_pbn, 0))
+    else try t.expect(std.mem.allEqual(u8, &table, 0) and std.mem.allEqual(u16, &branch_pbn, 0) and notice_queued and notice_replied and !notice_pending);
+    var returned = try channel.handoff(stream_end);
+    try owner.reclaim(&returned, stream_end);
+}
 fn receiverEdidReply(model: *Model, refresh: *receiver.Refresh, status: u32, blob: []const u8) !void {
     var bytes: [display_rpc.max_request_bytes]u8 = undefined;
     const payload = try display_rpc.encode(refresh.channel.object, refresh.channel.request.?, &bytes);
@@ -1965,8 +2764,10 @@ fn receiverEdidReply(model: *Model, refresh: *receiver.Refresh, status: u32, blo
 fn checkReceiver(model: *Model) !void {
     const capture = try t.allocator.create(receiver.Capture);
     defer t.allocator.destroy(capture);
-    const Case = enum { valid, base_only, missing, missing_extension, checksum, invalid_base, truncated, edid_rejected, verify_rejected, disconnected, not_supported, changed, hpd, late_hpd, canceled, ack, expired, release_expired };
+    const Case = enum { valid, base_only, missing, missing_extension, checksum, invalid_base, truncated, edid_rejected, verify_rejected, disconnected, not_supported, changed, hpd, late_hpd, canceled, ack, expired, release_expired, frl, frl_rejected, frl_invalid, frl_dsc, frl_dsc_rejected, frl_dsc_invalid };
     for (std.enums.values(Case)) |case| {
+        const probe_dsc = case == .frl_dsc or case == .frl_dsc_rejected or case == .frl_dsc_invalid;
+        const probe_frl = case == .frl or case == .frl_rejected or case == .frl_invalid or probe_dsc;
         var session: transport.Session = undefined;
         var boot = try startBoot(model, &session);
         try model.replyRpc(&session, .{ .function = 0x1001, .result = 0 }, &.{ 0, 0, 0, 0 });
@@ -1981,6 +2782,9 @@ fn checkReceiver(model: *Model) !void {
         try refresh.release(deadline);
         try t.expect(owner.state == .ready and model.count == 0);
         refresh = try receiver.Refresh.init(&owner, 0x80000000, capture, deadline);
+        refresh.probe_hdmi = probe_frl;
+        try t.expectError(error.Query, refresh.channel.begin(.{ .frl_source = 0x80000000 }, deadline));
+        try t.expectError(error.Query, refresh.channel.begin(.{ .dp_source = .{ .display_id = 0x80000000, .sor = 0, .transport = .hdmi } }, deadline));
         try t.expectError(error.State, refresh.borrow(deadline));
         try t.expect((try refresh.poll()) == null);
         var copied = refresh;
@@ -2010,6 +2814,15 @@ fn checkReceiver(model: *Model) !void {
                 };
                 receiverFixture(&blob);
                 if (size != 0) receiverFixture(blob[0..size]);
+                if (probe_frl) {
+                    blob[130] = 24;
+                    @memcpy(blob[144..152], &[_]u8{0x67,0xd8,0x5d,0xc4,1,120,0x80,0x60});
+                    if (probe_dsc) {
+                        blob[130] = 30;
+                        @memcpy(blob[144..158], &[_]u8{0x6d,0xd8,0x5d,0xc4,1,120,0x80,0x60,0,0,0,0x81,0x65,7});
+                    }
+                    receiverChecksum(blob[128..256]);
+                }
                 if (case == .missing_extension or case == .truncated) {
                     blob[126] += 1;
                     receiverChecksum(blob[0..128]);
@@ -2074,6 +2887,35 @@ fn checkReceiver(model: *Model) !void {
                     try model.replyRpc(&session, .{ .function = 76, .result = 0 }, payload);
                     try t.expect((try refresh.poll()) == null);
                 }
+                if (probe_frl) {
+                    try t.expect(refresh.state == .frl_source and capture.report.complete() and refresh.channel.hdmi_display == 0x80000000);
+                    try t.expect((try refresh.poll()) == null);
+                    var bytes: [88]u8 = undefined;
+                    const payload = try display_rpc.encode(refresh.channel.object, refresh.channel.request.?, &bytes);
+                    try t.expect(payload.len == 32 and get(&bytes, 8) == 0x7302a2 and get(&bytes, 24) == 0);
+                    @memcpy(bytes[24..32], @import("gsp_frl_link_test.zig").reference(1));
+                    if (case == .frl_invalid) put(&bytes, 28, 7);
+                    if (case == .frl_rejected) put(&bytes, 12, 0x55);
+                    try model.replyRpc(&session, .{ .function = 76, .result = 0 }, payload);
+                    try t.expect((try refresh.poll()) == null);
+                    if (probe_dsc) {
+                        try t.expect(refresh.state == .hdmi_dsc_source);
+                        try t.expect((try refresh.poll()) == null);
+                        const dsc_payload = try display_rpc.encode(refresh.channel.object, refresh.channel.request.?, &bytes);
+                        try t.expect(dsc_payload.len == 88 and get(&bytes, 8) == 0x731369 and get(&bytes, 28) == 0 and refresh.channel.aux_dp == null);
+                        @memcpy(bytes[60..88], @import("gsp_frl_link_test.zig").reference(0)[36..64]);
+                        if (case == .frl_dsc_rejected) put(&bytes, 12, 0x55);
+                        if (case == .frl_dsc_invalid) bytes[60] = 2;
+                        try model.replyRpc(&session, .{ .function = 76, .result = 0 }, dsc_payload);
+                        try t.expect((try refresh.poll()) == null);
+                    }
+                    try t.expect(refresh.state == .dp_verify);
+                    try t.expect((try refresh.poll()) == null);
+                    const resource = try display_rpc.encode(refresh.channel.object, refresh.channel.request.?, &bytes);
+                    put(&bytes, 36, 2); put(&bytes, 40, 1);
+                    try model.replyRpc(&session, .{ .function = 76, .result = 0 }, resource);
+                    try t.expect((try refresh.poll()) == null);
+                }
                 try t.expect(refresh.state == .verify);
                 try t.expect((try refresh.poll()) == null);
                 try displayReply(model, &refresh.channel, if (case == .verify_rejected) 0x56 else 0, if (case == .changed) 0 else 0x80000000);
@@ -2103,7 +2945,7 @@ fn checkReceiver(model: *Model) !void {
         try t.expect((try refresh.poll()) == null and refresh.state == .complete);
         const result = try refresh.borrow(deadline);
         const expected: receiver.Status = switch (case) {
-            .valid, .base_only, .release_expired => .valid_edid,
+            .valid, .base_only, .release_expired, .frl, .frl_rejected, .frl_invalid, .frl_dsc, .frl_dsc_rejected, .frl_dsc_invalid => .valid_edid,
             .missing => .edid_missing,
             .missing_extension, .checksum, .truncated => .incomplete_edid,
             .invalid_base => .invalid_edid,
@@ -2114,6 +2956,18 @@ fn checkReceiver(model: *Model) !void {
             else => unreachable,
         };
         try t.expectEqual(expected, result.status);
+        if (probe_frl) {
+            try t.expect(result.frl.receipt_serial != 0 and result.frl.receipt_serial == result.receipt_serial and result.report.complete());
+            const expected_frl: @import("gsp_link_caps.zig").Capture = if (case == .frl or probe_dsc) .complete else if (case == .frl_rejected) .unavailable else .invalid;
+            try t.expectEqual(expected_frl, result.frl.state);
+            try t.expect(@intFromEnum(result.frl.source_max) == (if (case == .frl or probe_dsc) @as(u8, 6) else 0));
+            if (probe_dsc) {
+                const expected_dsc: @import("gsp_link_caps.zig").Capture = if (case == .frl_dsc) .complete else if (case == .frl_dsc_rejected) .unavailable else .invalid;
+                try t.expectEqual(expected_dsc, result.frl.dsc_state);
+                try t.expect(result.frl.dsc.usable == (case == .frl_dsc));
+                try t.expect(result.dp.source_state == .unqueried and result.dp.dpcd_state == .unqueried);
+            }
+        }
         try t.expect(result.receipt_serial != 0 and result.epoch == session.epoch and result.client == owner.reservation.client);
         if (case == .valid) try t.expect(result.report.hdmi and result.report.basic_audio and result.report.audio_count == 1 and result.report.mode_count == 1 and result.report.complete());
         if (case == .base_only or case == .missing or case == .checksum or case == .invalid_base or case == .verify_rejected) try t.expect(!result.report.hdmi and !result.report.basic_audio and result.report.audio_count == 0);
@@ -2518,7 +3372,7 @@ fn checkAuxReceiver(model: *Model) !void {
     defer t.allocator.destroy(capture);
     const end = 20 * std.time.ns_per_ms;
     const Case = enum { full, short_final, defer_reply, defer_exhausted, rm_retry, prefix_nack, zero_read,
-        hpd, prepared_hpd, stop_failure, stop_rpc, stop_ack, ack, expired, changed_base, caps_rejected, dynamic, dvi };
+        hpd, prepared_hpd, stop_failure, stop_rpc, stop_ack, ack, expired, changed_base, caps_rejected, dynamic, dvi, branch_no_edid, branch_unassigned };
     for (std.enums.values(Case)) |case| {
         var session: transport.Session = undefined;
         var boot = try startBoot(model, &session);
@@ -2528,6 +3382,7 @@ fn checkAuxReceiver(model: *Model) !void {
         var parent = try rm_graph.Owner.init(&token, 1, "AUX", deadline);
         try graphCreate(model, &parent);
         var refresh = try receiver.Refresh.init(&parent, 1, capture, end);
+        refresh.probe_dp=case==.full or case==.short_final or case==.branch_no_edid or case==.branch_unassigned;
         var blob: [4096]u8 = undefined;
         receiverFixture(&blob);
         if (case == .dvi) receiverFixture(blob[0..128]);
@@ -2573,7 +3428,16 @@ fn checkAuxReceiver(model: *Model) !void {
                 .supported => { put(&buffer, 28, 1); put(&buffer, 32, 1); },
                 .connected => put(&buffer, 32, 1),
                 .edid => put(&buffer, 32, 0), // Missing RAW data triggers the independent AUX path.
-                .resource => { put(&buffer, 36, 2); put(&buffer, 40, 8); buffer[73] = @intFromBool(case == .dynamic); },
+                .resource => {
+                    if (case == .branch_unassigned) put(&buffer, 32, 0xffffffff);
+                    put(&buffer, 36, 2); put(&buffer, 40, 8); buffer[73] = @intFromBool(case == .dynamic);
+                },
+                .dp_source => |source| {
+                    try t.expect(case != .branch_unassigned);
+                    @memcpy(buffer[24..88],@import("gsp_frl_link_test.zig").reference(0));
+                    put(&buffer,28,source.sor);
+                    if(case==.short_final) put(&buffer,12,0x55);
+                },
                 .aux => |request| {
                     aux_requests += 1;
                     try t.expect(get(&buffer, 4) == parent.base.plan.handles.display and get(&buffer, 20) == 1);
@@ -2581,7 +3445,12 @@ fn checkAuxReceiver(model: *Model) !void {
                     var count: u32 = display_rpc.aux_wire.length(operation);
                     if (operation == .caps) {
                         buffer[44] = 0x14;
+                        if(refresh.state==.dp_caps) { buffer[45]=30; buffer[46]=0x84; buffer[47]=0x80; buffer[50]=1; }
                         if (case == .caps_rejected) put(&buffer, 12, 0x1f);
+                    } else if(operation==.mst_caps or operation==.fec_caps) { buffer[44]=1;
+                    } else if(operation==.dsc_caps) {
+                        @memcpy(buffer[44..60],&[_]u8{1,0x21,0,7,0x2b,1,1,0,0,1,6,2,8,1,0,0});
+                    } else if(operation==.repeaters) { @memset(buffer[44..][0..count],0);
                     } else if (operation == .segment) {
                         segment = operation.segment;
                     } else if (operation == .offset) {
@@ -2594,7 +3463,7 @@ fn checkAuxReceiver(model: *Model) !void {
                         if (case == .changed_base and refresh.aux_verifying and offset == 0) buffer[53] ^= 1;
                         offset +%= @intCast(count);
                         if (operation.read.last) segment = 0;
-                        if ((case == .prefix_nack and refresh.block == 2 and !refresh.aux_verifying) or
+                        if (case == .branch_no_edid or case == .branch_unassigned or (case == .prefix_nack and refresh.block == 2 and !refresh.aux_verifying) or
                             case == .stop_failure or case == .stop_rpc or case == .stop_ack) put(&buffer, 64, 4);
                         if (case == .hpd and !changed) {
                             var post: [40]u8 = undefined;
@@ -2647,7 +3516,7 @@ fn checkAuxReceiver(model: *Model) !void {
             const expected: receiver.Status = switch (case) {
                 .caps_rejected, .dynamic => .edid_missing,
                 .prefix_nack => .incomplete_edid,
-                .defer_exhausted, .zero_read => .edid_rejected,
+                .defer_exhausted, .zero_read, .branch_no_edid, .branch_unassigned => .edid_rejected,
                 else => .valid_edid,
             };
             try t.expectEqual(expected, result.status);
@@ -2657,6 +3526,15 @@ fn checkAuxReceiver(model: *Model) !void {
                 try t.expectEqualSlices(u8, blob[0..size], result.bytes[0..size]);
             }
             if (case == .dvi) try t.expect(result.report.audio_count == 0 and !result.report.hdmi);
+            if(case==.full or case==.branch_no_edid) try t.expect(result.dp.source_state==.complete and result.dp.source.?.dsc.usable and
+                result.dp.dpcd_state==.complete and result.dp.dpcd[1]==30 and result.dp.receiver.dsc.usable and
+                result.dp.receiver.fec and result.dp.receiver.mst and result.dp.repeaters_state==.complete and
+                result.dp.repeaters==0 and result.dp.receipt_serial!=0);
+            if(case==.short_final) try t.expect(result.dp.source_state==.unavailable and result.dp.receiver.dsc_state==.unqueried);
+            if(case==.branch_no_edid) try t.expect(stops == 1 and result.edid_bytes == 0 and result.connected == true);
+            if(case==.branch_unassigned) try t.expect(stops == 1 and result.edid_bytes == 0 and result.connected == true and
+                result.dp.source == null and result.dp.source_state == .unqueried and result.dp.dpcd_state == .complete and
+                result.dp.receiver.mst_state == .complete and result.dp.receiver.mst and result.dp.receipt_serial != 0);
             if (case == .defer_reply or case == .defer_exhausted) try t.expect(result.aux_retries == 7);
             if (case == .rm_retry) try t.expect(result.aux_retries == 2 and model.now >= 4 * std.time.ns_per_ms);
             if (case == .prefix_nack) try t.expect(stops == 1 and result.edid_bytes == 256);
@@ -2848,6 +3726,8 @@ test "GSP transport orders range publication, explicit acknowledgement and termi
     defer t.allocator.destroy(model);
     try checkDdcWire();
     try checkAuxWire();
+    try @import("gsp_mst_test.zig").check();
+    try checkLiveMst(model);
     try checkDisplayRpc(model);
     try checkObjects(model);
     try checkRuntimeEvents(model);

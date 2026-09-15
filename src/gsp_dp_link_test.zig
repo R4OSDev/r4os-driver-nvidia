@@ -29,6 +29,7 @@ pub fn receiver(snapshot: *@import("gsp_outputs.zig").Snapshot) void {
 pub fn scanout(raw: *@import("boot_scanout.zig").Raw) void { raw.sors[3] = 0x802; raw.heads[1].hdmi = 0; }
 /// The model supplies physical responses to actual encoded requests; it
 /// never advances Work or fabricates its final proof/ACK receipt.
+const dsc_receiver = [_]u8{ 1, 0x21, 0, 7, 0x2b, 1, 1, 0, 0, 1, 6, 2, 8, 1, 0, 0 };
 pub fn respond(work: *const dp.Work, bytes: []u8, bad_training: bool) void {
     const data = bytes[24..];
     switch (work.stage) {
@@ -41,15 +42,18 @@ pub fn respond(work: *const dp.Work, bytes: []u8, bad_training: bool) void {
         },
         .repeaters => { put(data, 36, 8); @memset(data[20..28], 0); },
         .color_caps => { put(data, 36, 1); data[20] = 8; },
+        .mst_caps, .fec_caps => { put(data, 36, 1); data[20] = 1; },
+        .dsc_caps => { put(data, 36, 16); @memcpy(data[20..36], &dsc_receiver); },
         .power => { put(data, 36, 1); data[20] = 2; },
-        .power_on => put(data, 36, 1),
+        .power_on, .fec_clear, .dsc_enable => put(data, 36, 1),
+        .fec_status, .dsc_verify => { put(data, 36, 1); data[20] = 1; },
         .train => if (bad_training) { put(data, 16, 0x80000000); },
         .link_config => {
             put(data, 36, 2); data[20] = work.candidates[work.index].rate;
             data[21] = work.candidates[work.index].lanes | 0x80;
         },
         .link_status => { put(data, 36, 8); @memcpy(data[20..28], &[_]u8{1,0,0x77,0x77,1,0,0,0}); },
-        .stream, .mute, .vsc, .hdr => {},
+        .fec_enable, .stream, .mute, .vsc, .hdr => {},
         .complete, .post_complete => unreachable,
     }
 }
@@ -62,6 +66,7 @@ fn tag(stage: dp.Stage) u32 { return switch (stage) {
     .link_config => 6, .link_status => 7, .train => 8, .stream => 9, .mute => 10, else => unreachable,
 }; }
 pub fn check() !void {
+    try @import("gsp_dsc_test.zig").check();
     const snapshot = try t.allocator.create(@import("gsp_outputs.zig").Snapshot); defer t.allocator.destroy(snapshot);
     helpers.outputFixture(snapshot, 11, 12); receiver(snapshot);
     var raw = helpers.bootFixture(1920, 1080); scanout(&raw);
@@ -70,6 +75,7 @@ pub fn check() !void {
     const saved = try boot.bind(try boot.capture(&raw, &info, 3), snapshot, 11, 4);
     const object: @import("gsp_display_rpc.zig").Object = .{ .epoch = 11, .client = 12, .display = 13 };
     const plan = try link.derive(saved, object, snapshot);
+    try extendedCaps(plan);
     try t.expect(plan.transport == .dp and !plan.mode.transport_hdmi);
     try t.expectError(error.Unsupported, @import("gsp_hdmi_link.zig").derive(saved, object, snapshot));
     var work = link.Work.init(plan);
@@ -222,4 +228,64 @@ pub fn check() !void {
     snapshot.topology.routes[0].connectors.?.data[0].kind = 0x46;
     _ = try boot.bind(dvi, snapshot, 11, 4);
     try t.expectError(error.Unsupported, audio.derive(dvi, object, snapshot));
+}
+
+fn extendedCaps(plan: link.Plan) !void {
+    const caps = dp.link_caps;
+    const decoded = caps.DscSink.decode(dsc_receiver);
+    try t.expect(decoded.usable and decoded.version_major == 1 and decoded.version_minor == 2);
+    try t.expect(decoded.rc_buffer_bytes == 8192 and decoded.line_buffer_bits == 10);
+    try t.expect(decoded.slice_mask == (1 << 1 | 1 << 2 | 1 << 4 | 1 << 8 | 1 << 16));
+    try t.expect(decoded.bpc_mask == 3 and decoded.slice_clock_mhz == 400 and decoded.max_slice_width == 2560);
+    var invalid = dsc_receiver; invalid[1] = 0x31;
+    try t.expect(!caps.DscSink.decode(invalid).usable);
+    invalid = dsc_receiver; invalid[15] = 5;
+    try t.expect(!caps.DscSink.decode(invalid).usable);
+    invalid = dsc_receiver; invalid[11] = 0;
+    try t.expect(!caps.DscSink.decode(invalid).usable);
+
+    // Real source and optional AUX wire requests flow through the common
+    // copied request/receipt owner. No optional failure withdraws simple SST.
+    for (0..4) |scenario| {
+        var work = link.Work.init(plan);
+        var serial: u64 = 0;
+        var observed: u8 = 0;
+        while (work.phase == .before_scanout and serial < 30) {
+            const stage = work.dp.?.stage;
+            work.length = try work.encode(&work.request);
+            work.pending = true;
+            var reply = work.request;
+            respond(&work.dp.?, reply[0..work.length], false);
+            if (stage == .source) {
+                const data = reply[24..];
+                data[24] = 1; data[28] = 1; data[29] = 1; data[30] = 0;
+                data[36] = 1;
+                put(data, 40, 1); put(data, 44, 64); put(data, 48, 8);
+                put(data, 52, 1); put(data, 56, 8); put(data, 60, 12);
+            }
+            if (stage == .mst_caps or stage == .dsc_caps or stage == .fec_caps) {
+                const address: u32 = if (stage == .mst_caps) 0x21 else if (stage == .dsc_caps) 0x60 else 0x90;
+                try t.expectEqual(address, std.mem.readInt(u32, work.request[40..44], .little));
+                if (stage == .dsc_caps) {
+                    observed += 1;
+                    if (scenario == 1) put(&reply, 64, 1); //Explicit NACK.
+                    if (scenario == 2) reply[45] = 0x31; //Unsupported DSC revision.
+                    if (scenario == 3) put(&reply, 64, 2); //Three DEFER replies exhaust the optional probe.
+                }
+            }
+            serial += 1;
+            try work.consume(record(reply[0..work.length]), serial, serial * std.time.ns_per_ms);
+        }
+        try t.expect(serial < 30 and work.readyScanout());
+        const result = work.dpResult().?;
+        try t.expect(result.source.dsc.usable and result.source.dsc.max_slices == 8);
+        try t.expect(result.source.dsc.line_buffer_pixels == 65536 and result.source.dsc.rate_buffer_bytes == 8192);
+        try t.expect(result.source.mst and result.source.fec and result.source.single_head_mst);
+        try t.expect(result.receiver_caps.mst and result.receiver_caps.fec);
+        try t.expect(result.receiver_caps.mst_state == .complete and result.receiver_caps.fec_state == .complete);
+        try t.expect(result.config.rate == 30 and result.stream.audio_48k);
+        const expected_state: caps.Capture = switch (scenario) { 0 => .complete, 2 => .invalid, else => .unavailable };
+        try t.expect(result.receiver_caps.dsc_state == expected_state);
+        try t.expect(observed == @as(u8, if (scenario == 3) 3 else 1));
+    }
 }

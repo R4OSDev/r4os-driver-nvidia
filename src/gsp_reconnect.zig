@@ -73,6 +73,12 @@ pub fn chooseAssigned(source: route.Source, raw: *const @import("boot_scanout.zi
     return selection.best orelse error.Unsupported;
 }
 fn sameSignal(left: boot.Plan, right: boot.Plan) bool {
+    // Rank pixel timings independently of compression chosen by the former
+    // link. The candidate needs a fresh source/capacity/PPS/IMP admission.
+    var lhs = left.signal;
+    var rhs = right.signal;
+    lhs.dp_dsc = null; rhs.dp_dsc = null;
+    lhs.hdmi_dsc = null; rhs.hdmi_dsc = null;
     return left.transport_hdmi == right.transport_hdmi and left.refresh_micro_hz == right.refresh_micro_hz and
-        std.meta.eql(left.signal, right.signal);
+        std.meta.eql(lhs, rhs);
 }

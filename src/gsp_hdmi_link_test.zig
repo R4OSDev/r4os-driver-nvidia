@@ -35,8 +35,13 @@ pub fn checkColorRequest(plan: link.Plan, op: link.Operation, bytes: []const u8)
     const signal = plan.mode.color orelse return error.Fixture;
     try t.expectEqual(plan.mode.signal.display_id, std.mem.readInt(u32, bytes[28..32], .little));
     if (op != .avi and op != .gcp and op != .hdr_disable) {
-        const expected = try reference(op, plan);
-        try t.expectEqualSlices(u8, expected[32..], bytes[32..]);
+        var legacy = plan;
+        legacy.caps = 0;
+        const expected = try reference(op, legacy);
+        if (op == .caps) {
+            try t.expect(bytes.len == expected.len and std.mem.readInt(u32, bytes[8..12], .little) == 0x730293);
+            try t.expectEqual(plan.caps, std.mem.readInt(u32, bytes[32..36], .little));
+        } else try t.expectEqualSlices(u8, expected[32..], bytes[32..]);
         return;
     }
     if (op == .hdr_disable and signal.transfer == .srgb) {
@@ -80,6 +85,7 @@ pub fn check() !void {
     const saved = try mode.bind(try mode.capture(&raw, &boot, 3), snapshot, 11, 4);
     const object: @import("gsp_display_rpc.zig").Object = .{ .epoch = 11, .client = 12, .display = 13 };
     const plan = try link.derive(saved, object, snapshot);
+    try @import("gsp_frl_link_test.zig").check(saved, object, snapshot);
     try t.expect(plan.mode.transport_hdmi and plan.caps == 0 and !plan.receiver_known);
     var at: usize = 4;
     try t.expect(word(0) == 14);

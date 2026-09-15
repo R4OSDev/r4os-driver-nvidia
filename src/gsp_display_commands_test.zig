@@ -56,6 +56,28 @@ fn checkDetach() !void {
         }
     }
     try t.expectEqual(vectors.len, at);
+    var shared: commands.Config = .{ .notifier = 0x1234, .windows = 2, .initialize = false,
+        .route = .{ .head = 1, .window = 1 }, .detach_sor = 2, .mst_sor_control = 0x804 };
+    const encoded = try commands.encode(shared);
+    var found = false;
+    var cursor: usize = 0;
+    while (cursor < encoded.count) {
+        const header = encoded.words[cursor]; cursor += 1;
+        const count = (header >> 18) & 0x7ff;
+        if (header & 0x3fff == 0x340) {
+            try t.expect(count == 1 and encoded.words[cursor] == 0x804); found = true;
+        }
+        cursor += count;
+    }
+    try t.expect(found);
+    shared.mst_sor_control = 0x806;
+    try t.expectError(error.Descriptor, commands.encode(shared)); // Departing head must be removed.
+    shared.mst_sor_control = 0x104;
+    try t.expectError(error.Descriptor, commands.encode(shared)); // TMDS cannot share an MST SOR.
+    shared.mst_sor_control = 0;
+    _ = try commands.encode(shared); // Last stream disables the SOR.
+    shared.kind = .window;
+    try t.expectError(error.Descriptor, commands.encode(shared));
 }
 fn checkPosition() !void {
     const vectors = @embedFile("fixtures/display-position.bin");
@@ -125,12 +147,34 @@ fn checkBootMode() !void {
     const reference = @embedFile("fixtures/display-boot-mode.bin");
     try t.expectEqual(@as(usize, result.count) * 4, reference.len);
     for (result.words[0..result.count], 0..) |value, i| try t.expectEqual(std.mem.readInt(u32, reference[i * 4..][0..4], .little), value);
+    // Replay the actual emitted route methods against two active peers.
+    // A candidate modeset may clear unused firmware routes, never a peer.
+    var peers = config; peers.initialize = false; peers.preserve_windows = 0x11;
+    const changing = try commands.encode(peers);
+    var routes: [8]u32 = @splat(7); routes[0] = 2; routes[4] = 0;
+    var offset: usize = 0;
+    while (offset < changing.count) {
+        const header = changing.words[offset]; offset += 1;
+        const count = (header >> 18) & 0x7ff;
+        const method = header & 0x3fff;
+        for (0..count) |i| {
+            const address = method + @as(u32, @intCast(i)) * 4;
+            if (address >= 0x1000 and address <= 0x1380 and (address - 0x1000) % 0x80 == 0)
+                routes[(address - 0x1000) / 0x80] = changing.words[offset + i];
+        }
+        offset += count;
+    }
+    try t.expectEqualSlices(u32, &.{ 2, 15, 15, bound.head, 0, 15, 15, 15 }, &routes);
+    peers.initialize = true; try t.expectError(error.Descriptor, commands.encode(peers));
+    peers.initialize = false; peers.preserve_windows = 8; try t.expectError(error.Descriptor, commands.encode(peers));
     raw.heads[1].words[2] ^= 1;
     try t.expect(!std.meta.eql(saved, try mode.capture(&raw, &boot, 3)));
     raw.heads[1].words[1] = 8; try t.expectError(error.Unsupported, mode.capture(&raw, &boot, 3));
     raw = bootFixture(1920, 1080); raw.sors[3] |= 1; try t.expectError(error.Routing, mode.capture(&raw, &boot, 3));
     raw = bootFixture(1920, 1080); raw.sors[3] = 0xc02; try t.expectError(error.Unsupported, mode.capture(&raw, &boot, 3));
     raw = bootFixture(1920, 1080); raw.heads[1].words[4] -= 1; try t.expectError(error.Unsupported, mode.capture(&raw, &boot, 3));
+    raw = bootFixture(1920, 1080); raw.heads[1].dsc_control = 1; try t.expectError(error.Unsupported, mode.capture(&raw, &boot, 3));
+    raw = bootFixture(1920, 1080); raw.heads[1].dsc_pps_control = 1; try t.expectError(error.Unsupported, mode.capture(&raw, &boot, 3));
     snapshot.coherent = false; try t.expectError(error.Stale, mode.bind(saved, snapshot, 11, 4)); snapshot.coherent = true;
     snapshot.topology.heads[0].display_id = 4; try t.expectError(error.Routing, mode.bind(saved, snapshot, 11, 4));
     snapshot.topology.heads[0].display_id = 0; snapshot.topology.heads[1].display_id = 0;

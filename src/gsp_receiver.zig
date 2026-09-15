@@ -102,9 +102,11 @@ const std = @import("std");
 const graph = @import("gsp_rm_graph.zig");
 const display = @import("gsp_display_rpc.zig");
 const aux_edid = @import("gsp_aux_edid.zig");
+const link_caps = @import("gsp_link_caps.zig");
 pub const edid = @import("r4gfx_edid");
 pub const Error = graph.Error;
-pub const State = enum { supported, connected, edid, resource, aux_caps, aux_read, aux_verify_resource, buses, ports, ddc, ddc_verify, bus_verify, verify, drain, complete, obsolete, failed, released };
+pub const State = enum { supported, connected, edid, resource, aux_caps, aux_read, aux_verify_resource, buses, ports, ddc, ddc_verify, bus_verify, verify, drain, complete, obsolete, failed, released,
+    dp_source, dp_caps, dp_extended, dp_mst, dp_dsc, dp_fec, dp_repeaters, dp_verify, frl_source, hdmi_dsc_source };
 pub const Status = enum { pending, not_supported, disconnected, edid_missing, edid_rejected, invalid_edid, unsupported_data, incomplete_edid, valid_edid, query_rejected };
 pub const Capture = struct {
     epoch: u64 = 0,
@@ -122,7 +124,7 @@ pub const Capture = struct {
     edid_bytes: usize = 0,
     bytes: [edid.max_blocks * 128]u8 = @splat(0),
     report: edid.Report = .{},
-    source: enum { rm_raw, ddc, aux } = .rm_raw,
+    source: enum { rm_raw, ddc, aux, mst } = .rm_raw,
     resource: ?display.Resource = null,
     buses: ?display.Buses = null,
     port_info: ?u8 = null,
@@ -135,6 +137,8 @@ pub const Capture = struct {
     aux_rpc_status: ?u32 = null,
     aux_control_status: ?u32 = null,
     aux_reply: ?display.aux_wire.ReplyType = null,
+    dp: link_caps.DpCapture = .{},
+    frl: link_caps.HdmiCapture = .{},
 };
 pub const Refresh = struct {
     owner: *graph.Owner,
@@ -152,6 +156,8 @@ pub const Refresh = struct {
     retry_at_ns: u64 = 0,
     aux: ?aux_edid.Reader = null,
     aux_verifying: bool = false,
+    probe_dp: bool = false, // Only a current topology resource can request it.
+    probe_hdmi: bool = false,
 
     /// Storage and graph remain exclusively borrowed until release. Moving
     /// this value is allowed only before its first poll; never copy it live.
@@ -193,6 +199,13 @@ pub const Refresh = struct {
             .connected, .verify => .{ .connected = self.capture.display_id },
             .edid => .{ .edid = self.capture.display_id },
             .resource, .aux_verify_resource => .{ .resource = self.capture.display_id },
+            .dp_verify => .{ .resource = self.capture.display_id },
+            .dp_source => .{ .dp_source = .{ .display_id = self.capture.display_id,.sor = self.capture.resource.?.index } },
+            .frl_source => .{ .frl_source = self.capture.display_id },
+            .hdmi_dsc_source => .{ .dp_source = .{ .display_id = self.capture.display_id, .sor = 0, .transport = .hdmi } },
+            .dp_caps, .dp_extended, .dp_mst, .dp_dsc, .dp_fec, .dp_repeaters => .{ .aux = .{ .display_id = self.capture.display_id,
+                .operation = switch (self.state) { .dp_caps=>.caps,.dp_extended=>.extended_caps,.dp_mst=>.mst_caps,
+                    .dp_dsc=>.dsc_caps,.dp_fec=>.fec_caps,.dp_repeaters=>.repeaters,else=>unreachable } } },
             .aux_caps => .{ .aux = .{ .display_id = self.capture.display_id, .operation = .caps } },
             .aux_read => .{ .aux = try self.aux.?.query(self.capture.display_id) },
             .buses, .bus_verify => .{ .buses = self.capture.display_id },
@@ -214,7 +227,94 @@ pub const Refresh = struct {
         self.capture.status = if (self.capture.report.complete()) .valid_edid else .incomplete_edid;
     }
     fn fallback(self: *Refresh) void {
-        self.state = if (self.capture.status != .valid_edid) .resource else .verify;
+        const hdmi = self.capture.report.hdmi_links;
+        self.state = if (self.capture.status != .valid_edid or self.probe_dp or
+            (self.probe_hdmi and self.capture.report.hdmi and hdmi != null and hdmi.?.max_frl != .none)) .resource else .verify;
+    }
+    fn beginLinkProbe(self: *Refresh) void {
+        const resource = self.capture.resource orelse { self.state=.verify; return; };
+        self.state = .verify;
+        if (self.probe_dp and self.capture.connected == true and display.nativeDp(resource)) {
+            if (resource.index < 8 and self.capture.dp.source_state == .unqueried) self.state = .dp_source
+            else if (resource.index == 0xffffffff and self.capture.dp.dpcd_state == .unqueried) self.state = .dp_caps;
+        }
+        if (self.state == .verify and self.probe_hdmi and self.capture.status == .valid_edid and self.capture.report.hdmi and
+            display.nativeTmds(resource) and resource.index < 8 and self.capture.frl.state == .unqueried)
+            if (self.capture.report.hdmi_links) |hdmi| { if (hdmi.max_frl != .none) self.state = .frl_source; };
+    }
+    fn nextLinkProbe(self: *Refresh) void {
+        const dp=&self.capture.dp;
+        const source=dp.source orelse {
+            // AUX addresses the physical socket independently of a SOR.
+            // An unassigned hub needs DPCD/MST discovery before its own
+            // EDID-less port can be assigned; encoder caps follow assignment.
+            self.state = if (self.capture.resource != null and self.capture.resource.?.index == 0xffffffff and
+                dp.dpcd_state == .complete and dp.receiver.mst_state == .unqueried) .dp_mst else .dp_verify;
+            return;
+        };
+        if (dp.dpcd_state==.unqueried) { self.state=.dp_caps; return; }
+        if (dp.dpcd_state!=.complete) { self.state=.dp_verify; return; }
+        if (source.mst and dp.receiver.mst_state==.unqueried) { self.state=.dp_mst; return; }
+        if (source.dp14 and source.dsc.advertised and dp.receiver.dsc_state==.unqueried) { self.state=.dp_dsc; return; }
+        if (source.dp14 and source.fec and dp.receiver.fec_state==.unqueried) { self.state=.dp_fec; return; }
+        if (dp.repeaters_state==.unqueried) { self.state=.dp_repeaters; return; }
+        self.state=.dp_verify;
+    }
+    fn linkUnavailable(self: *Refresh) void {
+        const dp=&self.capture.dp;
+        switch(self.state) {
+            .dp_source=>dp.source_state=.unavailable,
+            .dp_caps,.dp_extended=>dp.dpcd_state=.unavailable,
+            .dp_mst=>dp.receiver.mst_state=.unavailable,
+            .dp_dsc=>dp.receiver.dsc_state=.unavailable,
+            .dp_fec=>dp.receiver.fec_state=.unavailable,
+            .dp_repeaters=>dp.repeaters_state=.unavailable,
+            else=>unreachable,
+        }
+        self.attempts=0; self.retry_at_ns=0; self.nextLinkProbe();
+    }
+    fn consumeLinkProbe(self: *Refresh, reply: display.Reply) Error!void {
+        const dp=&self.capture.dp;
+        if (reply==.rpc_error or reply==.control_error) { self.linkUnavailable(); return; }
+        if (self.state==.dp_source) {
+            if (reply!=.dp_source) return error.Unexpected;
+            dp.source=link_caps.DpSource.decode(&reply.dp_source) catch {
+                dp.source_state=.invalid; self.nextLinkProbe(); return;
+            };
+            dp.source_state=.complete; self.nextLinkProbe(); return;
+        }
+        if (reply!=.aux) return error.Unexpected;
+        const aux=reply.aux;
+        if ((aux.status==0 and aux.kind==.defer_reply) or
+            ((aux.status==3 or aux.status==0x66) and aux.retry_ms!=0)) {
+            if(self.attempts>=2 or aux.retry_ms>500) { self.linkUnavailable(); return; }
+            self.attempts+=1; self.capture.aux_retries+=1;
+            self.retry_at_ns=std.math.add(u64,self.channel.exchange.session.last_clock,
+                @max(@as(u64,1),aux.retry_ms)*std.time.ns_per_ms) catch return error.Clock;
+            return;
+        }
+        self.attempts=0; self.retry_at_ns=0;
+        if (self.state==.dp_repeaters and aux.status==0 and aux.kind==.nack) {
+            dp.repeaters_state=.complete; dp.repeaters=0; self.nextLinkProbe(); return;
+        }
+        if(aux.status!=0 or aux.kind!=.ack or aux.count!=display.aux_wire.length((try self.query()).aux.operation)) {
+            self.linkUnavailable(); return;
+        }
+        switch(self.state) {
+            .dp_caps,.dp_extended=>{
+                dp.dpcd=aux.data; dp.dpcd_state=.complete;
+                if(self.state==.dp_caps and aux.data[14]&0x80!=0) { self.state=.dp_extended; return; }
+            },
+            .dp_mst=>{ dp.receiver.mst_state=.complete; dp.receiver.mst=aux.data[0]&1!=0; },
+            .dp_dsc=>{
+                dp.receiver.dsc=link_caps.DscSink.decode(aux.data);
+                dp.receiver.dsc_state=if(dp.receiver.dsc.advertised and !dp.receiver.dsc.usable) .invalid else .complete;
+            },
+            .dp_fec=>{ dp.receiver.fec_state=.complete; dp.receiver.fec=aux.data[0]&1!=0; },
+            .dp_repeaters=>{ dp.repeaters_state=.complete; dp.repeaters=aux.data[2]; },
+            else=>return error.State,
+        }
+        self.nextLinkProbe();
     }
     pub fn waiting(self: *const Refresh) bool {
         const now = self.channel.exchange.session.last_clock;
@@ -274,6 +374,41 @@ pub const Refresh = struct {
             self.invalidated = true;
             return;
         }
+        switch(self.state) {
+            .frl_source => {
+                if (reply == .rpc_error or reply == .control_error) {
+                    self.capture.frl.state = .unavailable;
+                } else {
+                    if (reply != .frl_source) return error.Unexpected;
+                    self.capture.frl.source_max = @import("r4gfx_outputs").links.Frl.decode(@intCast(reply.frl_source & 7)) catch {
+                        self.capture.frl.state = .invalid; self.state = .dp_verify; return;
+                    };
+                    self.capture.frl.state = .complete;
+                }
+                // Reuse the same resource and connection recheck as DP.
+                // Source capability is never an FRL training receipt.
+                self.state = .dp_verify;
+                if (self.capture.frl.state == .complete and self.capture.frl.source_max != .none)
+                    if (self.capture.report.hdmi_links) |hdmi| if (hdmi.dsc.advertised and hdmi.dsc.supported_fields) {
+                        self.state = .hdmi_dsc_source;
+                    };
+                return;
+            },
+            .hdmi_dsc_source => {
+                const target = &self.capture.frl;
+                if (reply == .rpc_error or reply == .control_error) target.dsc_state = .unavailable else {
+                    if (reply != .dp_source) return error.Unexpected;
+                    target.dsc = link_caps.DscSource.decode(reply.dp_source[36..64]) catch {
+                        target.dsc_state = .invalid; self.state = .dp_verify; return;
+                    };
+                    target.dsc_state = .complete;
+                }
+                self.state = .dp_verify;
+                return;
+            },
+            .dp_source,.dp_caps,.dp_extended,.dp_mst,.dp_dsc,.dp_fec,.dp_repeaters=>return self.consumeLinkProbe(reply),
+            else=>{},
+        }
         if (reply == .rpc_error or reply == .control_error) {
             if (self.state == .aux_read) {
                 if (reply == .rpc_error) self.capture.aux_rpc_status = reply.rpc_error else self.capture.aux_control_status = reply.control_error;
@@ -282,9 +417,9 @@ pub const Refresh = struct {
                 try self.takeAux();
                 return;
             }
-            if (self.state == .resource or self.state == .aux_caps or self.state == .aux_verify_resource) {
+            if (self.state == .resource or self.state == .aux_caps or self.state == .aux_verify_resource or self.state==.dp_verify) {
                 if (reply == .rpc_error) self.capture.aux_rpc_status = reply.rpc_error else self.capture.aux_control_status = reply.control_error;
-                if (self.state == .aux_verify_resource) self.invalidated = true;
+                if (self.state == .aux_verify_resource or self.state==.dp_verify) self.invalidated = true;
                 self.state = .verify;
                 return;
             }
@@ -356,6 +491,7 @@ pub const Refresh = struct {
             .resource => {
                 if (reply != .resource) return error.Unexpected;
                 self.capture.resource = reply.resource;
+                if(self.capture.status==.valid_edid) { self.beginLinkProbe(); return; }
                 self.state = if (display.nativeDp(reply.resource)) .aux_caps else
                     if (!reply.resource.dynamic and self.channel.object.i2c != 0 and self.capture.supported_ddc) .buses else .verify;
             },
@@ -394,7 +530,12 @@ pub const Refresh = struct {
             .aux_verify_resource => {
                 if (reply != .resource) return error.Unexpected;
                 if (!std.meta.eql(self.capture.resource.?, reply.resource)) self.invalidated = true;
-                self.state = .verify;
+                self.beginLinkProbe();
+            },
+            .dp_verify => {
+                if(reply!=.resource) return error.Unexpected;
+                if(!std.meta.eql(self.capture.resource.?,reply.resource)) self.invalidated=true;
+                self.state=.verify;
             },
             .buses => {
                 if (reply != .buses) return error.Unexpected;
@@ -434,7 +575,7 @@ pub const Refresh = struct {
             .bus_verify => {
                 if (reply != .buses) return error.Unexpected;
                 if (!std.meta.eql(self.capture.buses.?, reply.buses)) self.invalidated = true;
-                self.state = .verify;
+                self.beginLinkProbe();
             },
             .verify => {
                 if (reply != .connected) return error.Unexpected;
@@ -462,6 +603,11 @@ pub const Refresh = struct {
                 return null;
             }
         }
+        // An MST branch need not expose a root EDID. Its independently
+        // authenticated DP/AUX capabilities must remain discoverable after
+        // the optional EDID reader has closed its MOT transaction.
+        if (self.channel.exchange.phase == .idle and self.channel.aux_open == null and self.state == .verify and
+            self.probe_dp and self.capture.dp.source_state == .unqueried) self.beginLinkProbe();
         if (self.channel.exchange.phase == .idle and self.state != .drain and !self.waiting()) {
             self.channel.begin(try self.query(), self.deadline) catch |err| return self.fail(err);
         }
@@ -490,6 +636,9 @@ pub const Refresh = struct {
             if (!self.invalidated or stopping) self.consume(dispatch.value.reply) catch |err| return self.fail(err);
             if (!aux_value) self.channel.complete(dispatch.ticket) catch |err| return self.fail(err);
             self.capture.receipt_serial = dispatch.ticket.serial;
+            if(self.capture.dp.source_state!=.unqueried or self.capture.dp.dpcd_state!=.unqueried)
+                self.capture.dp.receipt_serial=dispatch.ticket.serial;
+            if (self.capture.frl.state != .unqueried) self.capture.frl.receipt_serial = dispatch.ticket.serial;
             self.guard() catch |err| return self.fail(err);
             if (self.invalidated and self.channel.aux_open == null) self.state = .obsolete;
         } else if (self.state == .drain) {

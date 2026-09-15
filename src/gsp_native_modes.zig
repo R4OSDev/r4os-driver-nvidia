@@ -160,7 +160,7 @@ pub const Owner = struct {
                 if (status.state != .handed_off or run.mode_control_active) return false;
                 if (status.rejected != null or status.unavailable) { self.phase = .unavailable; return true; }
                 const proof = status.info orelse return error.State;
-                if (proof.possible and !proof.over_clock and std.meta.eql(proof.mode, self.plan.?)) {
+                if (proof.possible and !proof.over_clock and proof.mode.sameIntent(self.plan.?)) {
                     const mode = product.receiver.modes[self.cursor];
                     const info = &self.publication.info;
                     self.publication.modes[info.mode_count] = mode; info.mode_count += 1;
@@ -211,7 +211,8 @@ pub const Owner = struct {
                 if (status.state != .handed_off or run.mode_control_active) return false;
                 const proof = status.info orelse return error.Unsupported;
                 if (status.rejected != null or status.unavailable or !proof.possible or proof.over_clock or
-                    proof.receipt == 0 or !std.meta.eql(proof.mode, self.plan.?)) return error.Unsupported;
+                    proof.receipt == 0 or !proof.mode.sameIntent(self.plan.?)) return error.Unsupported;
+                self.plan = proof.mode;
                 self.phase = if (self.job.?.operation == a.gfx_mode_operation_apply) .allocate else .commit;
             },
             .allocate => {
@@ -267,6 +268,25 @@ pub const Owner = struct {
             },
             .commit_wait => {
                 if (run.display_work != null) return false;
+                const dma = if (self.job.?.operation == a.gfx_mode_operation_apply) self.candidate else self.previous_dma;
+                if (try run.takeDisplayLinkFailure(product.engine.?, product.mode.?.window, dma, self.plan.?)) |failed| {
+                    // A failed user rollback has preserved the current trial,
+                    // not the original image requested by the common owner.
+                    if (self.job.?.operation != a.gfx_mode_operation_apply) return failed.reason;
+                    if (self.previous_headless != (failed.previous == null) or
+                        (failed.previous != null and failed.previous.?.image.dma != self.previous_dma)) return error.Stale;
+                    self.error_code = if (failed.reason == error.Bandwidth) a.gfx_output_error_bandwidth else a.gfx_output_error_unsupported;
+                    self.diagnostic.failed(@tagName(self.phase), failed.reason);
+                    self.outcome = a.gfx_output_outcome_old_preserved;
+                    self.retire_dma = self.candidate; self.retire_storage = self.candidate_storage;
+                    self.retire_group = .{}; self.phase = .retire_shadow;
+                    if (failed.previous) |previous| {
+                        product.mode = previous.boot_mode; product.link = previous.link.?.plan;
+                        product.confirmed_image = previous;
+                    }
+                    product.audio.afterLinkRestore();
+                    return true;
+                }
                 const image = try run.displayImageStatus(product.engine.?, product.mode.?.window) orelse return error.Completion;
                 if (image.boot_mode == null or !std.meta.eql(image.boot_mode.?, self.plan.?) or image.mode_receipt == 0 or
                     image.core_point == 0 or image.window_point == 0 or image.link == null or image.link.?.receipt == 0) return error.Completion;
@@ -394,7 +414,7 @@ pub const Owner = struct {
                 if (self.previous_headless) { self.phase = .rollback_stop; return true; }
                 const saved = self.previous.?.boot_mode.?;
                 self.plan = try product.running.?.displayColorModePlan(product.engine.?, product.mode.?.window, saved.receiver_mode_id, saved.color, saved.color_pipeline);
-                if (!std.meta.eql(self.plan.?, self.previous.?.boot_mode.?)) return error.Stale;
+                if (!self.plan.?.sameIntent(saved)) return error.Stale;
                 self.phase = .query;
             } else return error.State;
         } else {

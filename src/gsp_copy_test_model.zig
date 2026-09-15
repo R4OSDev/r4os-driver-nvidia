@@ -24,6 +24,7 @@ const native = @import("gsp_vram_test_model.zig").Model;
 const fifo = @import("gsp_fifo_test_model.zig").Model;
 pub const Model = struct {
     pub const length = 12288;
+    const image_length = 65536; // One minimum-area DSC slice in the existing Device group.
     const system_count = 4; // Primary, retained replacement, additional head and its mode candidate.
     pub const binding: a.GfxBackendBinding = .{ .adapter_id = 0x01000000, .milestone = 1, .device_generation = 7, .reset_generation = 11 };
     const Reference = struct { active: bool = false, buffer: a.GfxBufferHandle = .{}, mapping_only: bool = true, readonly: bool = false };
@@ -33,8 +34,8 @@ pub const Model = struct {
     var direct_mode = false;
     var references: [16]Reference = @splat(.{});
     var original: a.GfxDriverMemoryApi = .{};
-    pub var host: [system_count][length]u8 = undefined;
-    var gpu_data: [system_count][length]u8 = undefined;
+    pub var host: [system_count][image_length]u8 = undefined;
+    var gpu_data: [system_count][image_length]u8 = undefined;
     pub var vram_data: [65536]u8 = undefined;
     pub var replacement_vram: [65536]u8 = undefined;
     var extra_vram: [native.slots.len][65536]u8 = undefined;
@@ -178,7 +179,7 @@ pub const Model = struct {
     }
     pub fn lendReplacement(index: usize, width: u32, height: u32) a.GfxBufferReference {
         std.debug.assert(product_mode and !replacement_lent and index != native_index and
-            dma[1].lease.id == 0 and gpu[1].lease.id == 0 and @as(u64, width) * height * 4 <= length);
+            dma[1].lease.id == 0 and gpu[1].lease.id == 0 and @as(u64, width) * height * 4 <= image_length);
         for (references) |entry| std.debug.assert(!entry.active or !std.meta.eql(entry.buffer, sys(1)));
         replacement_native = index; replacement_lent = true;
         replacement_descriptor = .{ .byte_length = @as(u64, width) * height * 4, .alignment = 4096,
@@ -577,10 +578,12 @@ pub const Model = struct {
     fn word(bytes: []const u8, at: usize) u32 { return std.mem.readInt(u32, bytes[at..][0..4], .little); }
     fn operand(hi: u32, lo: u32) u64 { return (@as(u64, hi) << 32) | lo; }
     fn data(address_value: u64, bytes: usize) ![]u8 {
-        for (0..system_count) |i| if (address_value >= address(i) and address_value - address(i) < length) {
+        for (0..system_count) |i| if (address_value >= address(i) and address_value - address(i) < image_length) {
             const offset: usize = @intCast(address_value - address(i));
-            if (bytes > length - offset or (gpu[i].lease.id == 0 and
-                !(present_mode and dma[i].lease.id != 0 and (active or (initial_read.lease.id != 0 and initial_index == i))))) return error.GpuAddress;
+            if (gpu[i].lease.id == 0 and !(present_mode and dma[i].lease.id != 0 and
+                (active or (initial_read.lease.id != 0 and initial_index == i)))) return error.GpuAddress;
+            const bound: u64 = if (present_mode) descriptor(i).byte_length else length;
+            if (offset > bound or bytes > bound - offset) return error.GpuAddress;
             return gpu_data[i][offset..][0..bytes];
         };
         if (replacement_native) |index| {
@@ -674,7 +677,7 @@ pub const Model = struct {
         // SYS-scope release makes preceding CE data visible before the point.
         // A CE read must not overwrite another head's newer CPU stores.
         const destination = operand(decoded[5], decoded[6]);
-        for (0..system_count) |i| if (destination >= address(i) and destination - address(i) < length) { host[i] = gpu_data[i]; };
+        for (0..system_count) |i| if (destination >= address(i) and destination - address(i) < image_length) { host[i] = gpu_data[i]; };
         std.mem.writeInt(u32, fifo.slots[command_slot].data[8704..8708], decoded[decoded_count - 3], .little);
         signaled = true;
     }

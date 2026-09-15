@@ -45,7 +45,9 @@ pub const Owner = struct {
             }
         }
         const notified = self.sequence != run.receiver_events.sequence;
-        const affected = notified and run.receiver_events.affects(product.mode.?.signal.display_id, self.sequence);
+        const signal = product.mode.?.signal;
+        const affected = notified and (run.receiver_events.affects(signal.display_id, self.sequence) or
+            (if (signal.mst) |stamp| run.receiver_events.affects(stamp.root, self.sequence) else false));
         const idle_modes = !product.modes.pending() and !product.audio.busy() and !product.cursor.busy() and
             (product.modes.phase == .idle or product.modes.phase == .unavailable or product.modes.phase == .detached);
         if (self.phase == .online and !affected and idle_modes and
@@ -150,7 +152,10 @@ pub const Owner = struct {
                 if (product.output.connection_generation != 0) {
                     const result = product.outputs.?.withdraw(&product.output);
                     if (result == a.gfx_output_error_busy) pending = true else if (result != a.gfx_output_ok) return error.Catalog
-                    else product.output = .{};
+                    else {
+                        try run.recordMstPublication(self.previous.?, product.output, false);
+                        product.output = .{};
+                    }
                 }
                 if (!try product.cursor.stopped(product)) return true;
                 if (try product.modes.stopped(product)) return true;
@@ -196,9 +201,10 @@ pub const Owner = struct {
                 if (run.mode_control_active or status.state != .handed_off) return false;
                 const proof = status.info orelse { self.plan = null; self.phase = .receiver_wait; return true; };
                 if (status.rejected != null or status.unavailable or !proof.possible or proof.over_clock or
-                    proof.receipt == 0 or !std.meta.eql(proof.mode, self.plan.?)) {
+                    proof.receipt == 0 or !proof.mode.sameIntent(self.plan.?)) {
                     self.plan = null; self.phase = .receiver_wait; return true;
                 }
+                self.plan = proof.mode;
                 self.phase = .refresh;
             },
             .refresh => {
@@ -218,6 +224,14 @@ pub const Owner = struct {
             },
             .commit_wait => {
                 if (run.display_work != null) return false;
+                const dma = run.currentPresentation(window).?.surface.scanout.?.dma;
+                if (try run.takeDisplayLinkFailure(product.engine.?, window, dma, self.plan.?)) |failed| {
+                    if (failed.previous != null or run.display_images[window] != null) return error.Stale;
+                    self.plan = null; self.phase = .receiver_wait;
+                    if (!product.primaryOutput()) run.preparing_outputs &= ~product.mode.?.signal.display_id;
+                    product.ctx.?.logInfo("NVIDIA hotplug: link-rejected headless=retained retry=next-receiver-capture");
+                    return true;
+                }
                 const image = run.display_images[window] orelse return error.Completion;
                 if (image.boot_mode == null or !std.meta.eql(image.boot_mode.?, self.plan.?) or image.mode_receipt == 0 or
                     image.link == null or !image.link.?.complete()) return error.Completion;
@@ -229,6 +243,7 @@ pub const Owner = struct {
                 const result = product.outputs.?.publish(&product.publication, &product.output);
                 if (result == a.gfx_output_error_busy) return false;
                 if (result != a.gfx_output_ok) return error.Catalog;
+                try run.recordMstPublication(product.mode.?, product.output, true);
                 self.phase = .unpause;
                 try product.syncPresentationTarget();
             },
@@ -255,6 +270,7 @@ pub const Owner = struct {
                 const result = product.outputs.?.publish(&product.publication, &product.output);
                 if (result == a.gfx_output_error_busy) return false;
                 if (result != a.gfx_output_ok) return error.Catalog;
+                try run.recordMstPublication(product.mode.?, product.output, true);
                 self.phase = .resize_catalog;
             },
             .resize_catalog => {

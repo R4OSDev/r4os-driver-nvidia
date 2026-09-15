@@ -29,6 +29,7 @@ pub const Owner = struct {
             (@as(u32, pci.device) << 3) | pci.function, .device = @as(u32, pci.vendor_id) | (@as(u32, pci.device_id) << 16) };
     }
     pub fn busy(self: *const Owner) bool { return self.phase != .idle and self.phase != .failed; }
+    pub fn afterLinkRestore(self: *Owner) void { self.settled = false; }
     pub fn afterStop(self: *Owner) void {
         // Preserve the source's monotonic publication revision across every
         // reconnect; the next transition derives a new ELD from its capture.

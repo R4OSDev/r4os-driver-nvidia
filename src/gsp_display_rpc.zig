@@ -210,8 +210,9 @@
 //  * OTHER DEALINGS IN THE SOFTWARE.
 //  */
 //! Bounded RM display controls over one post-boot GSP queue owner.
-//! Fixed NV0073/402C reads only, including one bounded FINN EDID operation; no object allocation,
-//! continuation records, register access, callback execution or DMA release.
+//! Fixed NV0073/402C controls, bounded FINN EDID and typed native AUX.
+//! MST IDs are owned by the resident registry; this channel retains their
+//! actual allocation/free replies across invalidation. No CPU pointers.
 //! The native caller must supply an actually allocated, retained RM object.
 const std = @import("std");
 const boot_events = @import("gsp_boot_events.zig");
@@ -226,9 +227,11 @@ pub const header_bytes = 24;
 pub const max_edid_bytes = 2048;
 pub const max_request_bytes = header_bytes + 16 + max_edid_bytes;
 pub const max_heads = 32;
-pub const Command = enum(u32) { heads = 0x730102, active = 0x73010c, windows = 0x7302ad, supported = 0x730107, connected = 0x730108, edid = 0x730245, connectors = 0x730250, resource = 0x73028b, buses = 0x730211, ports = 0x402c0101, ddc = ddc_wire.command, aux = aux_wire.command };
+const mst_control = @import("gsp_mst_control.zig");
+pub const Command = enum(u32) { heads = 0x730102, active = 0x73010c, windows = 0x7302ad, supported = 0x730107, connected = 0x730108, edid = 0x730245, connectors = 0x730250, resource = 0x73028b, buses = 0x730211, ports = 0x402c0101, ddc = ddc_wire.command, aux = aux_wire.command, dp_source = 0x731369, frl_source = 0x7302a2, mst_allocate = 0x73135b, mst_free = 0x73135c };
 pub const Ddc = struct { display_id: u32, port: u8, block: u8 };
-pub const Query = union(Command) { heads: void, active: u32, windows: void, supported: void, connected: u32, edid: u32, connectors: u32, resource: u32, buses: u32, ports: void, ddc: Ddc, aux: aux_wire.Request };
+pub const Query = union(Command) { heads: void, active: u32, windows: void, supported: void, connected: u32, edid: u32, connectors: u32, resource: u32, buses: u32, ports: void, ddc: Ddc, aux: aux_wire.Request,
+    dp_source: struct { display_id: u32, sor: u32, transport: enum { dp, hdmi } = .dp }, frl_source: u32, mst_allocate: u32, mst_free: u32 };
 pub const Object = struct { epoch: u64, client: u32, display: u32, i2c: u32 = 0 };
 pub const Supported = struct { displays: u32, ddc: u32 };
 pub const Connector = struct { index: u32 = 0, kind: u32 = 0, location: u32 = 0 };
@@ -270,6 +273,10 @@ pub const Reply = union(enum) {
     ports: [16]u8,
     ddc: [ddc_wire.block_bytes]u8,
     aux: aux_wire.Reply,
+    dp_source: [64]u8,
+    frl_source: u32,
+    mst_allocate: u32,
+    mst_free: void,
     // Raw, bounded bytes only. An empty blob is not an EDID; the receiver
     // parser must validate the header, all advertised blocks and checksums.
     edid: []const u8,
@@ -304,6 +311,10 @@ fn paramsSize(query: Query) usize {
         .ports => 16,
         .ddc => ddc_wire.bytes,
         .aux => aux_wire.bytes,
+        .dp_source => 64,
+        .frl_source => 8,
+        .mst_allocate => 24,
+        .mst_free => 8,
     };
 }
 fn oneBit(mask: u32) bool {
@@ -314,8 +325,12 @@ fn target(object: Object, query: Query) u32 {
     return if (query == .ports or query == .ddc) object.i2c else object.display;
 }
 fn flags(query: Query) u32 { return if (query == .ddc) ddc_wire.rpc_flags else if (query == .aux) aux_wire.rpc_flags else 0; }
-fn stopping(query: Query) bool { return query == .aux and query.aux.operation == .stop; }
+// Allocation/free replies carry ownership even after HPD invalidation.
+// Suppressing them as obsolete would leak an allocated ID or reuse one
+// whose Free request failed. Their owner drains the real result first.
+fn stopping(query: Query) bool { return (query == .aux and query.aux.operation == .stop) or query == .mst_allocate or query == .mst_free; }
 pub fn nativeDp(resource: Resource) bool { return resource.kind == 2 and (resource.protocol == 8 or resource.protocol == 9) and !resource.dynamic; }
+pub fn nativeTmds(resource: Resource) bool { return resource.kind == 2 and (resource.protocol == 1 or resource.protocol == 2) and !resource.dynamic; }
 /// Encode only the fixed allowlist. DDC alone uses FINN serialization; AUX
 /// alone requests the documented retry delay on RM errors. No CPU pointers.
 /// Output-only fields and the complete EDID array start at zero.
@@ -325,6 +340,9 @@ pub fn encode(object: Object, query: Query, output: []u8) Error![]const u8 {
         .supported, .heads, .windows, .ports => {},
         .ddc => |request| if (!oneBit(request.display_id) or request.port >= 16 or request.block >= ddc_wire.max_blocks) return error.Query,
         .aux => |request| if (!oneBit(request.display_id)) return error.Query,
+        .dp_source => |request| if (!oneBit(request.display_id) or request.sor >= 8 or
+            (request.transport == .hdmi and request.sor != 0)) return error.Query,
+        .frl_source, .mst_allocate, .mst_free => |id| if (!oneBit(id)) return error.Query,
         .active => |head| if (head >= max_heads) return error.Query,
         .connected => |mask| if (mask == 0) return error.Query,
         .edid, .connectors, .resource, .buses => |id| if (!oneBit(id)) return error.Query,
@@ -348,6 +366,10 @@ pub fn encode(object: Object, query: Query, output: []u8) Error![]const u8 {
         .active => |head| put(bytes, header_bytes + 4, head),
         .connected => |mask| put(bytes, header_bytes + 8, mask),
         .connectors, .resource, .buses => |id| put(bytes, header_bytes + 4, id),
+        .dp_source => |request| put(bytes, header_bytes + 4, request.sor),
+        .frl_source => {}, // GPU-wide query; receiver identity gates the owner, not the wire.
+        .mst_allocate => |id| { _ = (mst_control.Query{ .allocate = id }).encode(bytes[header_bytes..]) catch return error.Query; },
+        .mst_free => |id| { _ = (mst_control.Query{ .free = id }).encode(bytes[header_bytes..]) catch return error.Query; },
         .edid => |id| {
             put(bytes, header_bytes + 4, id);
             put(bytes, header_bytes + 12, 2);
@@ -384,6 +406,19 @@ pub fn decode(object: Object, query: Query, record: message.Record) Error!Reply 
     if (word(params, 0) != 0) return error.Unexpected;
     return switch (query) {
         .ports, .ddc, .aux => unreachable,
+        .dp_source => |request| blk: {
+            if (word(params,4) != request.sor) return error.Unexpected;
+            break :blk .{ .dp_source = params[0..64].* };
+        },
+        .frl_source => blk: {
+            if (word(params, 0) != 0) return error.Payload;
+            break :blk .{ .frl_source = word(params, 4) };
+        },
+        .mst_allocate => |id| .{ .mst_allocate = (mst_control.Query{ .allocate = id }).decode(0, params) catch return error.Payload },
+        .mst_free => |id| blk: {
+            _ = (mst_control.Query{ .free = id }).decode(0, params) catch return error.Payload;
+            break :blk .mst_free;
+        },
         .windows => .{ .windows = params[4..36].* },
         .heads => blk: {
             if (word(params, 4) != 0 or word(params, 8) > max_heads) return error.Payload;
@@ -442,6 +477,8 @@ pub const Channel = struct {
     ports: ?[16]u8 = null,
     ddc_bus: ?struct { display_id: u32, port: u32 } = null,
     aux_dp: ?u32 = null,
+    dp_sor: ?u32 = null,
+    hdmi_display: ?u32 = null,
     // An in-progress I2C transaction survives metadata invalidation. Only a
     // validated final read/STOP plus its ACK can retire this obligation.
     aux_open: ?u32 = null,
@@ -461,6 +498,8 @@ pub const Channel = struct {
         self.ports = null;
         self.ddc_bus = null;
         self.aux_dp = null;
+        self.dp_sor = null;
+        self.hdmi_display = null;
         return self.exchange.fail(reason);
     }
     pub fn invalidate(self: *Channel) Error!void {
@@ -470,14 +509,25 @@ pub const Channel = struct {
         self.ports = null;
         self.ddc_bus = null;
         self.aux_dp = null;
+        self.dp_sor = null;
+        self.hdmi_display = null;
     }
     pub fn begin(self: *Channel, query: Query, deadline: u64) Error!void {
         if (self.exchange.phase != .idle) return error.State;
         if (self.pending != null) return error.Pending;
         self.exchange.guard(@min(self.exchange.deadline orelse deadline, deadline)) catch |err| return self.fail(err);
-        if (self.aux_open) |id| if (query != .aux or query.aux.display_id != id or query.aux.operation == .caps) return error.Query;
+        if (self.aux_open) |id| if (query != .aux or query.aux.display_id != id or !aux_wire.i2c(query.aux.operation)) return error.Query;
         switch (query) {
             .supported => {},
+            .dp_source => |request| {
+                if (request.display_id & self.connected == 0) return error.Query;
+                if (request.transport == .dp) {
+                    if (self.aux_dp != request.display_id or self.dp_sor != request.sor) return error.Query;
+                } else if (request.sor != 0 or self.hdmi_display != request.display_id) return error.Query;
+            },
+            .frl_source => |id| if (self.hdmi_display != id or id & self.connected == 0) return error.Query,
+            .mst_allocate => |id| if (self.aux_dp != id or self.dp_sor == null or id & self.connected == 0) return error.Query,
+            .mst_free => |id| if (!oneBit(id)) return error.Query, // Retained Registry ID, even after disconnect.
             .aux => |request| {
                 if (request.operation == .stop) {
                     if (self.aux_open == null or self.aux_open.? != request.display_id) return error.Query;
@@ -511,10 +561,10 @@ pub const Channel = struct {
         try self.exchange.begin(function, bytes, deadline);
         self.request = query;
         self.request_revision = self.exchange.revision;
-        if (query == .aux and query.aux.operation != .caps and query.aux.operation != .stop) self.aux_open = query.aux.display_id;
+        if (query == .aux and aux_wire.i2c(query.aux.operation) and query.aux.operation != .stop) self.aux_open = query.aux.display_id;
         if (query == .connected) self.connected &= ~query.connected;
         if (query == .buses) self.ddc_bus = null;
-        if (query == .resource) self.aux_dp = null;
+        if (query == .resource) { self.aux_dp = null; self.dp_sor = null; self.hdmi_display = null; }
         if (query == .ports) self.ports = null;
     }
     /// Pure native notifier admission for this exact encoded display query.
@@ -526,7 +576,7 @@ pub const Channel = struct {
     }
     pub fn poll(self: *Channel, deadline: u64) Error!?Dispatch {
         if (self.exchange.phase == .prepared and self.pending == null and
-            self.request.? != .supported and !stopping(self.request.?) and self.request_revision != self.exchange.revision)
+            self.request.? != .supported and !(self.request.? == .aux and self.request.?.aux.operation == .stop) and self.request_revision != self.exchange.revision)
         {
             const end = @min(self.exchange.deadline.?, deadline);
             self.exchange.guard(end) catch |err| return self.fail(err);
@@ -546,6 +596,8 @@ pub const Channel = struct {
             self.ports = null;
             self.ddc_bus = null;
             self.aux_dp = null;
+            self.dp_sor = null;
+            self.hdmi_display = null;
         }
         var dispatch = Dispatch{ .ticket = received.ticket, .rpc = received.record.rpc, .value = undefined };
         if (received.response) {
@@ -585,11 +637,17 @@ pub const Channel = struct {
                         self.ports = null;
                         self.ddc_bus = null;
                         self.aux_dp = null;
+                        self.dp_sor = null;
+                        self.hdmi_display = null;
                     },
                     .heads => |value| self.heads = value,
                     .ports => |value| self.ports = value,
                     .buses => |value| self.ddc_bus = .{ .display_id = self.request.?.buses, .port = value.ddc },
-                    .resource => |value| self.aux_dp = if (nativeDp(value)) self.request.?.resource else null,
+                    .resource => |value| {
+                        self.aux_dp = if (nativeDp(value)) self.request.?.resource else null;
+                        self.dp_sor = if (nativeDp(value) and value.index < 8) value.index else null;
+                        self.hdmi_display = if (nativeTmds(value) and value.index < 8) self.request.?.resource else null;
+                    },
                     .aux => |value| {
                         const operation = self.request.?.aux.operation;
                         if (value.status == 0 and value.kind == .ack and (operation == .stop or (operation == .read and operation.read.last))) self.aux_open = null;
@@ -616,6 +674,8 @@ pub const Channel = struct {
         self.ports = null;
         self.ddc_bus = null;
         self.aux_dp = null;
+        self.dp_sor = null;
+        self.hdmi_display = null;
         return runtime;
     }
 };

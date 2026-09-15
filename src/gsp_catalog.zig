@@ -72,6 +72,16 @@ pub const Owner = struct {
             if (capture.display_id != route.id or capture.epoch != snapshot.topology.epoch or
                 capture.client != snapshot.topology.client) return error.Binding;
             try encode(&self.records[index], route, capture);
+            if (capture.source == .mst) {
+                if (@import("gsp_mst_binding.zig").derive(snapshot, route.id)) |_| {
+                    self.records[index].connector_kind = a.gfx_output_kind_displayport;
+                } else |_| {
+                    // A stale virtual route cannot withdraw an unrelated
+                    // physical monitor from this metadata batch.
+                    self.records[index] = .{ .connector_id = route.id,
+                        .flags = a.gfx_output_flag_connection_unknown | a.gfx_output_flag_query_failed };
+                }
+            }
         }
         try self.replace(@intCast(snapshot.count));
         self.captured_generation = snapshot.generation;
@@ -88,6 +98,16 @@ pub const Owner = struct {
         return true;
     }
 };
+
+pub fn encodeCaptured(output: *a.GfxReceiverInfo, route: *const topology.Route, capture: *const receiver.Capture,
+    snapshot: *const outputs.Snapshot) !void
+{
+    try encode(output, route, capture);
+    if (capture.source == .mst) {
+        _ = try @import("gsp_mst_binding.zig").derive(snapshot, route.id);
+        output.connector_kind = a.gfx_output_kind_displayport;
+    }
+}
 
 pub fn encode(output: *a.GfxReceiverInfo, route: *const topology.Route, capture: *const receiver.Capture) !void {
     if (route.id == 0 or capture.status == .pending or capture.edid_bytes > capture.bytes.len) return error.State;

@@ -1,7 +1,8 @@
 param(
     [Parameter(Mandatory)][string]$HeaderRoot,
     [Parameter(Mandatory)][string]$LockPath,
-    [Parameter(Mandatory)][string]$SourceCatalogPath
+    [Parameter(Mandatory)][string]$SourceCatalogPath,
+    [Parameter(Mandatory)][string]$DscCatalogPath
 )
 $ErrorActionPreference='Stop'
 Set-StrictMode -Version Latest
@@ -35,3 +36,23 @@ foreach($file in Get-ChildItem -LiteralPath $root -Recurse -Force){
 }
 if($expected.Count){throw 'Native header package is incomplete'}
 Write-Host "NVIDIA native headers: $($origin.headers) original MIT headers, $bytes bytes, source pin and full licenses verified."
+$dsc=Get-Content -Raw -LiteralPath $DscCatalogPath|ConvertFrom-Json
+$owner=[IO.Path]::GetFullPath('..',$PSScriptRoot)
+if($dsc.schema -ne 1 -or $dsc.source_commit -cne $pin.source_commit -or $dsc.unmodified -ne $true){throw 'DSC original source pin differs'}
+$dscExpected=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+foreach($entry in $dsc.files){
+    $relative=[string]$entry.path
+    if($relative -notmatch '^src/dsc/Original/[A-Za-z0-9_./-]+$' -or
+        @($relative.Split('/')|Where-Object {$_ -in @('','.', '..')}).Count -or !$dscExpected.Add($relative) -or
+        $entry.license -cne 'MIT'){throw 'Invalid DSC original source entry'}
+    $path=Join-Path $owner $relative
+    $file=Get-Item -LiteralPath $path
+    if($file.PSIsContainer -or ($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $file.Length -ne $entry.bytes -or
+        (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $entry.sha256){throw "Original DSC source differs: $relative"}
+}
+foreach($file in Get-ChildItem -LiteralPath (Join-Path $owner 'src/dsc/Original') -Recurse -Force){
+    if($file.Attributes -band [IO.FileAttributes]::ReparsePoint){throw 'DSC sources contain a link'}
+    if(!$file.PSIsContainer -and !$dscExpected.Remove([IO.Path]::GetRelativePath($owner,$file.FullName).Replace('\','/'))){throw 'Uncatalogued DSC original source'}
+}
+if($dscExpected.Count){throw 'DSC original sources incomplete'}
+Write-Host "NVIDIA DSC: $($dsc.files.Count) unmodified MIT source/header files verified."

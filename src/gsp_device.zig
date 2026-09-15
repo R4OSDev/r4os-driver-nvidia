@@ -520,7 +520,7 @@ pub const Device = struct {
                 self.running.validateAdaptiveRefresh() catch return error.Binding;
                 if (!self.running.adaptiveReceiverCurrent()) return error.Binding;
             } else {
-                const link = if (work.link) |*value| value else return error.Binding;
+                const link = work.linkControl() orelse return error.Binding;
                 if (channel != &self.running.channel.? or work.deadline != deadline or !link.matches(channel, deadline)) return error.Binding;
                 self.running.validateDisplayLink() catch return error.Binding;
             }
@@ -697,7 +697,37 @@ pub const Device = struct {
             !std.meta.eql(resources.binding.?, root.binding) or config.windows != root_info.hardware.windows or
             config.initialize == channel.ring.initialized) return error.Binding;
         if (part) |value| if (resources.publishedNotifier(slot) != value.notifier or config.notifier != value.notifier.handle) return error.Binding;
-        if (work.detach != null) {
+        const mst_repair = if (work.link_restore) |*restore| restore.control.mst_rebuild != null else false;
+        if (mst_repair) {
+            self.running.validateMstLinkRecovery() catch return error.Binding;
+            const restore = &work.link_restore.?;
+            if (!restore.scanout_replaced or restore.control.phase != .scanout or restore.control.pending) return error.Binding;
+            const window_part = &work.window.?;
+            const route = work.core.config.route.?;
+            if (route.head >= root_info.hardware.heads or route.window >= 8 or window_part.handle.slot != route.window + 1) return error.Binding;
+            if (work.position) |*position| {
+                if (!root_info.immediate or position.handle.epoch != self.epoch or position.handle.slot != 9 + route.window) return error.Binding;
+                const position_owner = if (self.running.display_channels[position.handle.slot]) |*value| value else return error.Binding;
+                if (position_owner.parent != root or position_owner.info() == null or !position_owner.ring.valid() or !position_owner.ring.initialized or
+                    position_owner.config.kind != .immediate or position_owner.config.index != route.window or
+                    position_owner.config.handle != position.handle.handle) return error.Binding;
+                if (position.phase == .submitted) {
+                    const expected = runtime.display_channel.push.commands.immediate(position.config) catch return error.Binding;
+                    if (position.ticket == null or position_owner.ring.pending == null or position_owner.ring.program == null or !position_owner.ring.published or
+                        !std.meta.eql(position.ticket.?, position_owner.ring.pending.?) or
+                        !runtime.display_channel.push.commands.same(expected, position_owner.ring.program.?)) return error.Binding;
+                }
+                if (position_part != null) {
+                    if (phase == .submitted) {
+                        if (access_kind != .read or work.core.phase != .complete or window_part.phase != .complete) return error.Binding;
+                    } else if (work.core.phase != .prepare or window_part.phase != .prepare) return error.Binding;
+                } else if (position.phase != .submitted and !(access_kind == .read and config.kind == .core and
+                    work.core.phase == .complete and position.phase == .complete)) return error.Binding;
+            } else if (position_part != null) return error.Binding;
+            if (config.kind == .core) {
+                if (window_part.phase != .submitted and window_part.phase != .complete) return error.Binding;
+            } else if (config.kind == .window and work.core.phase != .prepare) return error.Binding;
+        } else if (work.detach != null) {
             self.running.validateDisplayDetach() catch return error.Binding;
             const window_part = &work.window.?;
             const route = work.core.config.route.?;
@@ -725,10 +755,15 @@ pub const Device = struct {
             if (work.position) |*position| {
                 if (route.window >= 8 or !root_info.immediate or position.handle.epoch != self.epoch or position.handle.slot != 9 + route.window) return error.Binding;
                 const position_owner = if (self.running.display_channels[position.handle.slot]) |*value| value else return error.Binding;
+                const completed_position = access_kind == .read and config.kind == .core and work.core.config.mst_sor_control != null and
+                    work.core.phase == .complete and window_part.phase == .complete and position.phase == .complete and
+                    position.ticket != null and position_owner.ring.initialized and position_owner.ring.pending == null and
+                    position_owner.ring.completed == position.ticket.?.point;
                 if (position_owner.parent != root or position_owner.info() == null or !position_owner.ring.valid() or
                     position_owner.config.kind != .immediate or position_owner.config.index != route.window or position_owner.config.handle != position.handle.handle or
                     position.config.kind != .immediate or position.config.windows != root_info.hardware.windows or
-                    position.config.initialize == position_owner.ring.initialized or !std.meta.eql(position.config.route, work.core.config.route)) return error.Binding;
+                    (position.config.initialize == position_owner.ring.initialized and !completed_position) or
+                    !std.meta.eql(position.config.route, work.core.config.route)) return error.Binding;
                 const expected = runtime.display_channel.push.commands.immediate(position.config) catch return error.Binding;
                 if (work.boot_mode != null and !std.meta.eql(position.config.position.?, runtime.display_channel.push.commands.Point{})) return error.Binding;
                 if (position.phase == .submitted) {
@@ -740,7 +775,8 @@ pub const Device = struct {
                     if (phase == .submitted) {
                         if (access_kind != .read or work.core.phase != .complete or window_part.phase != .complete) return error.Binding;
                     } else if (work.core.phase != .prepare or window_part.phase != .prepare) return error.Binding;
-                } else if (position.phase != .submitted) return error.Binding;
+                } else if (position.phase != .submitted and !(access_kind == .read and config.kind == .core and
+                    work.core.phase == .complete and work.core.config.mst_sor_control != null and position.phase == .complete)) return error.Binding;
             } else if (position_part != null or work.boot_mode != null) return error.Binding;
             if (self.running.presentation != null) {
                 const scanout = window_part.config.scanout orelse return error.Binding;
@@ -761,7 +797,7 @@ pub const Device = struct {
             if (part) |value| if (ticket.?.kind == .frame and (value.notifier.phase != .armed or value.notifier.point != ticket.?.point or
                 value.notifier.deadline != deadline or value.notifier.offset != config.notifier_offset)) return error.Binding;
         } else if (phase != .prepare and phase != .rewind and !(position_part != null and phase == .submitted) and
-            !((work.cursor != null or work.detach != null) and config.kind == .core and phase == .complete)) return error.Binding;
+            !((work.cursor != null or work.detach != null or work.core.config.mst_sor_control != null) and config.kind == .core and phase == .complete)) return error.Binding;
         const rpc = self.running.activeChannel() orelse return error.State;
         const canonical = if (self.running.channel) |*value| value else return error.State;
         if (rpc != canonical or rpc.session != &self.session.? or port.runtime_session != rpc.session or rpc.session.pending != null or

@@ -47,11 +47,14 @@ pub fn timing(mode: boot.Plan) !edid.timing.Timing {
     return value;
 }
 pub fn derive(mode: boot.Plan, object: display.Object, snapshot: *const outputs.Snapshot, link: anytype, core_class: u32) !Plan {
+    // NVIDIA570 C6 exposes both HDMI FRL and HDMI VRR (nvkms-evo3.c,
+    // evoC6 caps). FRL must already have a real training/capacity receipt.
+    // VRR extends vertical blanking, leaving FRL's HTotal/PClk budget intact.
     if (core_class != 0xc67d or !link.complete()) return error.Unsupported;
     if (object.epoch == 0 or object.client == 0 or object.display == 0 or object.epoch != mode.epoch or
         !snapshot.coherent or snapshot.generation != mode.output_generation or !std.meta.eql(mode, link.plan.mode) or
         !std.meta.eql(object, link.plan.object)) return error.Stale;
-    if (!mode.transport_hdmi and !mode.displayPort()) return error.Unsupported;
+    if (mode.signal.mst != null or (!mode.transport_hdmi and !mode.displayPort())) return error.Unsupported;
     const source: edid.vrr.Source = .{ .adaptive = true, .hdmi_emp = true, .direct_sst = true, .dp_ignore_msa = if (link.dp) |dp| dp.source.dp14 and dp.dpcd[7] & 64 != 0 else false, .max_vtotal = 65535, .max_timeout_us = 0x3fffff, .minimum_span_permille = 1100 };
     for (snapshot.receivers[0..snapshot.count]) |*receiver| {
         if (receiver.display_id != mode.signal.display_id) continue;
