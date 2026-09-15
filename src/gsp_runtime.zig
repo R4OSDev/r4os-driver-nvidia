@@ -4906,6 +4906,7 @@ pub const Owner = struct {
                 if (std.meta.eql(entry.surface.shadow.buffer, owner.source.buffer)) continue :next;
             };
             cached_bytes +|= owner.mapped_bytes;
+            if (!owner.aliases.empty()) continue;
             if (oldest == null or slot.last_used < self.buffers[oldest.?].last_used) oldest = index;
         }
         if (available >= needed and cached_bytes <= byte_limit) return false;

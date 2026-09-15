@@ -1,7 +1,13 @@
 ﻿NVIDIA: nativer Grafik- und Displaybesitzer
 =========================================
 
-Stand: 13.09.2026, NVIDIA 0.1.102. 0.79.14 ist softwareseitig abgeschlossen:
+Stand: 16.09.2026, NVIDIA 0.1.125. Der Unterbau fuer unabhaengige GPU-VA-
+Reservierungen und RAM-/VRAM-Aliase ist hostseitig geprueft. Die Anbindung an
+native NVK-Auftraege und deren Prozesslebensdauer bleibt in 0.79.35 offen.
+Aktueller Detailstand: Docs/Drivers/GrafikVulkan07935.txt/.json; physische
+Nacharbeit ausschliesslich ExFiles/Reports/OssiGPU.txt /0.79.35.
+
+Historischer Displaystand vom 13.09.2026 (NVIDIA 0.1.102): 0.79.14 ist softwareseitig abgeschlossen:
 VBlank/Flips, zwei/drei Present-Puffer, sichtbare Statistik und Hardwarecursor
 sind an Kernel und Desktop angebunden. 0.79.15 ergaenzt generationstreue
 HDMI-ELD-/Audiofreigabe und HDA-Zuordnung. Stereo-PCM benoetigt vollstaendige

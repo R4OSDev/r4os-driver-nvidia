@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.124; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.125; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -11,6 +11,20 @@ Starting with R4OS 0.79.9, `IMAGE_SCOPE=slim` includes the current module in
 Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
+
+Independent GPU VA foundation (0.79.35, in progress): `gsp_virtual_range`
+owns separately aligned/fixed RM virtual allocations and exact map/unmap
+receipts. Resident bindings borrow the original system-RAM registrations or
+native VRAM object; no copied staging buffer or second registration is needed.
+VRAM aliases also keep a common BO import. The original owners reject early
+retirement and the mapping cache skips aliased entries. Ambiguous replies keep
+both sides; reset cleanup releases at most one binding per worker slice.
+The existing copy/display path uses the shared wire encoder. Connecting these
+new range owners to runtime requests, native NVK and process cleanup remains
+software work; this checkpoint does not expose a Vulkan device or new features.
+Details and physical follow-up: GrafikVulkan07935.txt/.json and OssiGPU.txt /35.
+The existing owner step accepts `unit-test "-Downer-test-filter=GPU virtual"`
+for this focused group alone; omitting the filter retains the full owner step.
 
 Generations and adapters (0.79.33): native software now covers GA102/103/104/106/107
 and AD102/103/104/106/107. Each measured chip selects its own firmware family,

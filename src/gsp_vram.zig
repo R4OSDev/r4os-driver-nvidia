@@ -10,6 +10,7 @@ const vaspace = @import("gsp_vaspace.zig");
 pub const wire = @import("gsp_vram_wire.zig");
 pub const surface = @import("gsp_surface_layout.zig");
 pub const storage = @import("gsp_native_backing.zig");
+pub const alias = @import("gsp_memory_alias.zig");
 pub const Error = wire.Error || names.Error || surface.Error || storage.Error || error{ Api, Descriptor, Memory, Busy, Retained };
 pub const State = enum { creating, unwinding, ready, handed_off, destroying, closed, finished, failed };
 pub const Info = struct { reference: a.GfxBufferReference, address: u64, logical_bytes: u64, allocation_bytes: u64, epoch: u64, surface: surface.Plan, physical: ?storage.Physical = null };
@@ -26,6 +27,7 @@ pub const Owner = struct {
     layout: surface.Plan,
     storage_policy: ?storage.Policy = null,
     physical_extent: ?storage.Physical = null,
+    aliases: alias.Set = .{},
     storage_claimed: bool = false,
     state: State = .creating,
     reservation: a.GfxOwnedBufferReservation = .{},
@@ -120,6 +122,18 @@ pub const Owner = struct {
             return err;
         };
         self.storage_claimed = true;
+    }
+    pub fn retainAlias(self: *Owner, use: *alias.Use, offset: u64, bytes: u64) Error!void {
+        const value = self.info() orelse return error.State;
+        if (bytes == 0 or (offset | bytes) & 4095 != 0 or bytes > self.logical_bytes or offset > self.logical_bytes - bytes) return error.Bounds;
+        try self.aliases.acquire(use, .{ .space = self.binding.space, .object = self.binding.memory,
+            .allocation_bytes = self.bytes, .offset = offset, .bytes = bytes, .location = .video });
+        use.retainCommon(self.memory, value.reference) catch |err| {
+            if (err == error.Busy) { try use.close(true); return err; }
+            // A partial/invalid returned import is retained, never dropped or
+            // treated as an ordinary allocation rejection.
+            return self.fail(err);
+        };
     }
     /// Called only with a separately retained canonical active-job reference.
     /// The producer may already have closed its reference; the common queue
@@ -251,6 +265,7 @@ pub const Owner = struct {
             ticket.adapter_id == self.adapter and ticket.driver_owner == self.reservation.driver_owner;
     }
     pub fn beginDestroy(self: *Owner, token: *boot.Handoff, ticket: a.GfxOwnedBufferRelease, deadline: u64) Error!void {
+        if (!self.aliases.empty()) return error.Busy;
         if (!self.accepts(ticket) or token.session != self.exchange.session) return error.Stale;
         self.exchange = try exchange.Exchange.init(token, deadline);
         self.release = ticket; self.deadline = deadline; self.state = .destroying;
@@ -266,6 +281,7 @@ pub const Owner = struct {
     /// requires an exact release ticket, and its outstanding leases still veto
     /// issuance. False means a ticket or one of those consumers remains held.
     pub fn closeAfterReset(self: *Owner, proof: @import("gsp_reset.zig").Quiescence) Error!bool {
+        if (!self.aliases.empty()) return false;
         if ((self.self_address != 0 and self.self_address != @intFromPtr(self)) or
             !proof.valid(self.binding.space.epoch) or self.exchange.session.epoch != self.binding.space.epoch or
             !std.meta.eql(self.reservation, self.reservation_stamp) or

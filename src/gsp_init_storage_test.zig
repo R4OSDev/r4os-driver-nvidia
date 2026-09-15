@@ -9317,6 +9317,7 @@ fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverAp
     const surfaces = std.mem.startsWith(u8, scenario, "vram_surface_");
     const private_storage = std.mem.startsWith(u8, scenario, "vram_storage");
     var storage_use: runtime.vram.storage.Use = .{};
+    var alias_use: runtime.vram.alias.Use = .{};
     const success = model.is("vram_success") or model.is("vram_surface_linear") or model.is("vram_surface_tiled") or model.is("vram_storage");
     const layout: surface.Layout = if (model.is("vram_surface_linear")) .linear else .blocklinear;
     const requests = [_]surface.Request{
@@ -9454,6 +9455,14 @@ fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverAp
             var returned = try running.graph.?.loan(deadline);
             running.channel = try @import("gsp_exchange.zig").Exchange.init(&returned.runtime, deadline);
             if (model.is("vram_success") and index == 0) {
+                const owner = running.native_buffers[handles[0].slot].owner.?;
+                try owner.retainAlias(&alias_use, 65536, 4096);
+                try t.expect(!owner.aliases.empty() and model.slots[0].imported and session.tx_sequence == sent);
+                const held = try alias_use.info();
+                try t.expect(held.object == owner.binding.memory and held.offset == 65536 and held.bytes == 4096 and held.location == .video);
+                var moved = alias_use;
+                try t.expectError(error.Stale, moved.close(true));
+                try t.expectError(error.Busy, alias_use.close(false));
                 const original_limit = model.budget.limit_bytes;
                 const original_charge = model.charged;
                 const original_serial = running.buffer_serial;
@@ -9480,7 +9489,7 @@ fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverAp
         }
     }
     if (target.phase == .ready) {
-        if (success and !private_storage) model.slots[0].imported = true;
+        if (success and !private_storage and !model.is("vram_success")) model.slots[0].imported = true;
         if (success) @import("gsp_buffer_test_model.zig").Model.closeHeapAdmission(table);
         try t.expectError(error.Busy, running.beginDestroyGraph(deadline, false));
         try running.beginDestroyGraph(deadline, true);
@@ -9489,7 +9498,9 @@ fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverAp
             _ = target.step();
             if (success and model.released == 1 and model.slots[0].imported) {
                 try t.expect(model.charged == full and model.slots[0].live and !model.slots[0].claimed and !model.slots[0].reference);
-                if (private_storage) try t.expect(storage_use.close(true)) else model.slots[0].imported = false;
+                if (private_storage) try t.expect(storage_use.close(true))
+                else if (model.is("vram_success")) try alias_use.close(true)
+                else model.slots[0].imported = false;
             }
             if (target.phase != .ready) break;
             const channel = running.activeChannel().?;
@@ -9627,6 +9638,23 @@ fn checkDeviceMappings(target: *@import("gsp_device.zig").Device, table: *a.Driv
             try t.expect(info.parts == @as(u16, if (count == 0) 3 else 1));
             try t.expect(model.refs[count] and model.dma[count].lease.id != 0 and model.gpu[count].lease.id != 0);
             try t.expectError(error.Busy, running.retireBuffer(handles[count], deadline, false));
+            if (model.is("mapping_success") and count == 0) {
+                const owner = running.buffers[handles[0].slot].owner.?;
+                var use: @import("gsp_buffer_mapping.zig").alias.Use = .{};
+                const boundary: u64 = @import("gsp_buffer_wire.zig").max_registration_pages * 4096;
+                const sent = session.tx_sequence;
+                try owner.retainAliasChunk(&use, boundary - 4096, 8192);
+                const first = try use.info();
+                try t.expect(first.object == try owner.reservation.object(0) and first.bytes == 4096 and first.offset == boundary - 4096);
+                try t.expectError(error.Busy, running.retireBuffer(handles[0], deadline, true));
+                try t.expectError(error.Busy, use.close(false));
+                try use.close(true);
+                try owner.retainAliasChunk(&use, boundary, 4096);
+                const second = try use.info();
+                try t.expect(second.object == try owner.reservation.object(1) and second.offset == 0 and second.bytes == 4096);
+                try use.close(true);
+                try t.expect(owner.aliases.empty() and session.tx_sequence == sent);
+            }
             // The parent guard must reject before transmitting even its first
             // event free. Restore the exact loan and keep both children live.
             var token = try running.channel.?.handoff(deadline);

@@ -9,6 +9,7 @@ const exchange = @import("gsp_exchange.zig");
 const names = @import("gsp_rm_names.zig");
 const vaspace = @import("gsp_vaspace.zig");
 pub const wire = @import("gsp_buffer_wire.zig");
+pub const alias = @import("gsp_memory_alias.zig");
 pub const Error = wire.Error || names.Error || error{ Api, Descriptor, Memory, Map, Busy, Retained };
 pub const State = enum { creating, unwinding, ready, handed_off, destroying, closed, finished, failed };
 pub const Info = struct { epoch: u64, buffer: a.GfxBufferHandle, virtual: u32, address: u64, logical_bytes: u64, mapped_bytes: u64, parts: u16 };
@@ -38,6 +39,7 @@ pub const Owner = struct {
     dma_stamp: a.GfxDeviceLease = .{},
     gpu: a.GfxDeviceLease = .{},
     gpu_stamp: a.GfxDeviceLease = .{},
+    aliases: alias.Set = .{},
     prepared: bool = false,
     registered: u16 = 0,
     mapped: u16 = 0,
@@ -109,6 +111,18 @@ pub const Owner = struct {
     fn binding(self: *const Owner, index: u16) Error!wire.Binding {
         if (index >= self.parts) return error.Bounds;
         return .{ .space = self.space, .memory = try self.reservation.object(index), .virtual = try self.reservation.object(self.parts) };
+    }
+    /// One RM registration may cover only part of a large system BO. The
+    /// caller repeats with the returned source.bytes until its range is held.
+    /// No additional registration, page allocation or data copy is needed.
+    pub fn retainAliasChunk(self: *Owner, use: *alias.Use, offset: u64, bytes: u64) Error!void {
+        _ = self.info() orelse return error.State;
+        if (bytes == 0 or (offset | bytes) & 4095 != 0 or bytes > self.leaseBytes() or offset > self.leaseBytes() - bytes) return error.Bounds;
+        const index: u16 = @intCast(offset / chunk_bytes);
+        const extent = self.part(index);
+        const local = offset - extent.offset;
+        try self.aliases.acquire(use, .{ .space = self.space, .object = try self.reservation.object(index),
+            .allocation_bytes = extent.byte_length, .offset = local, .bytes = @min(bytes, extent.byte_length - local), .location = .system });
     }
     fn part(self: *const Owner, index: u16) wire.Part {
         const offset = @as(u64, index) * chunk_bytes;
@@ -266,7 +280,7 @@ pub const Owner = struct {
         if (acquired != a.gfx_buffer_result_ok) return error.Map;
     }
     fn closeBacking(self: *Owner) Error!void {
-        if (self.allocated or self.registered != 0 or self.mapped != 0 or self.operation != null or self.exchange.pending != null) return error.Retained;
+        if (!self.aliases.empty() or self.allocated or self.registered != 0 or self.mapped != 0 or self.operation != null or self.exchange.pending != null) return error.Retained;
         try self.releaseBacking();
         if (self.namespace_live) {
             try self.exchange.session.rm_names.retireChildren(self.reservation);
@@ -294,6 +308,7 @@ pub const Owner = struct {
         self.prepared = false;
     }
     pub fn closeAfterReset(self: *Owner, proof: @import("gsp_reset.zig").Quiescence) Error!void {
+        if (!self.aliases.empty()) return error.Retained;
         if ((self.self_address != 0 and self.self_address != @intFromPtr(self)) or
             !proof.valid(self.space.epoch) or self.exchange.session.epoch != self.space.epoch or
             !std.meta.eql(self.source, self.source_stamp) or !std.meta.eql(self.allocation, self.allocation_stamp) or
@@ -325,7 +340,7 @@ pub const Owner = struct {
     /// Cancellation or CPU callback completion cannot substitute for it.
     pub fn beginDestroy(self: *Owner, token: *boot.Handoff, deadline: u64, quiesced: bool) Error!void {
         try self.stable();
-        if (!quiesced) return error.Busy;
+        if (!quiesced or !self.aliases.empty()) return error.Busy;
         if (self.state != .handed_off or token.session != self.exchange.session) return error.State;
         self.exchange = try exchange.Exchange.init(token, deadline);
         self.deadline = deadline;
