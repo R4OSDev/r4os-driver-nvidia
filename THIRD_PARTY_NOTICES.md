@@ -958,3 +958,14 @@ the pinned NVIDIA570.144 NVKMS console, console-memory and bus originals.
 Their full notices are included in NVIDIA-GSP-RUNTIME-LICENSE.txt. R4OS uses
 its own bounded snapshot restoration, lifetime checks and C67D integration;
 it does not import the host-only NV01_MEMORY_FRAMEBUFFER_CONSOLE as a GSP RPC.
+
+
+Monitor power and display wake (0.79.31)
+
+Fixed NV0073 monitor-power controls, SST DPCD D0/D3 and bounded wake retries
+follow MIT NVIDIA 570.144 sources, pinned at
+8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f. Exact source hashes are recorded in
+ExFiles/Reference/GFX/0.79.31/Sources.json. Complete original notices remain in
+Licenses/NVIDIA-GSP-RUNTIME-LICENSE.txt and its byte-identical distributed copy.
+The R4OS lifecycle, leases, common output metadata and Desktop policy are
+original Apache-2.0 code. No additional firmware is imported.

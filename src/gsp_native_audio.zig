@@ -30,6 +30,15 @@ pub const Owner = struct {
     }
     pub fn busy(self: *const Owner) bool { return self.phase != .idle and self.phase != .failed; }
     pub fn afterLinkRestore(self: *Owner) void { self.settled = false; }
+    /// Withdraw the ready route before physically stopping its display.
+    /// HDA/AUDSVC observe pending through the existing route catalog.
+    pub fn suspendRoute(self: *Owner) !bool {
+        if (self.busy()) return false;
+        if (self.catalog == null or self.plan == null) return true;
+        try self.publish(a.gfx_audio_route_pending);
+        self.enabled = false;
+        return true;
+    }
     pub fn afterStop(self: *Owner) void {
         // Preserve the source's monotonic publication revision across every
         // reconnect; the next transition derives a new ELD from its capture.

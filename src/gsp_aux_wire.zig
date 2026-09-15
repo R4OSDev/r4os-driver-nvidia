@@ -125,6 +125,7 @@ pub const Operation = union(enum) {
     link_status: void,
     power: void,
     power_on: u8,
+    power_off: void,
     segment: u8,
     offset: u8,
     segment_status: void,
@@ -162,7 +163,7 @@ fn cmd(op: Operation) u32 {
     return switch (op) {
         .mst => |value| if (value.write()) 8 else 9,
         .caps, .extended_caps, .color_caps, .dsc_caps, .fec_caps, .mst_caps, .fec_status, .dsc_control, .downspread_read, .repeaters, .link_config, .link_status, .power => 9,
-        .power_on, .downspread_write, .fec_clear, .dsc_enable => 8,
+        .power_on, .power_off, .downspread_write, .fec_clear, .dsc_enable => 8,
         .segment, .offset => 4,
         .segment_status, .offset_status => 6,
         .read => |read| if (read.last) 1 else 5,
@@ -184,7 +185,7 @@ fn address(op: Operation) u32 {
         .downspread_read, .downspread_write => 0x107,
         .link_config => 0x100,
         .link_status => 0x200,
-        .power, .power_on => 0x600,
+        .power, .power_on, .power_off => 0x600,
         .segment, .segment_status => 0x30,
         else => 0x50,
     };
@@ -210,6 +211,7 @@ pub fn encode(request: Request, output: []u8) Error![]const u8 {
         .segment => |segment| buffer[20] = segment,
         .offset => |offset| buffer[20] = offset,
         .power_on, .downspread_write => |value| buffer[20] = value,
+        .power_off => buffer[20] = 2,
         .fec_clear => buffer[20] = 3, // W1C: neither sticky transition may grant a new FEC proof.
         .dsc_enable => |enabled| buffer[20] = @intFromBool(enabled),
         else => {},

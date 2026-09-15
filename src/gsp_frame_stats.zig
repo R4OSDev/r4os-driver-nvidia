@@ -19,9 +19,13 @@ pub const Owner = struct {
         }
     }
     fn publishFor(self: *Owner, product: anytype, mode: Plan, generation: u64, failed: bool, additional: bool) void {
+        const run = product.running.?;
+        // Device-Lost is published while the old presentation still exists.
+        // Its later physical teardown must not advertise an active native
+        // image again merely because the old pause state has been retired.
+        if (run.currentPresentation(mode.window) == null) return;
         self.publishInfo(product, mode, generation, failed, additional);
         if (self.disabled or !product.display.?.supportsPresentationStats()) return;
-        const run = product.running.?;
         const head = mode.head;
         if (head >= run.flip_receipts.len) return;
         const counters = run.output_frames[mode.window];

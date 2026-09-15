@@ -834,6 +834,9 @@ pub const Device = struct {
         } else if (self.running.audio_work) |*work| {
             if (channel != &self.running.channel.? or !work.matches(channel, deadline)) return error.Binding;
             self.running.validateDisplayAudio() catch return error.Binding;
+        } else if (self.running.monitor_work) |*work| {
+            if (channel != &self.running.channel.? or !work.matches(channel, deadline)) return error.Binding;
+            self.running.validateMonitorPower() catch return error.Binding;
         } else if (self.running.graph) |*graph| {
             if (!graph.matches(channel, deadline)) return error.Binding;
         } else if (self.running.static_info == null) {

@@ -6,7 +6,8 @@ const runtime = @import("gsp_runtime.zig");
 const receiver = @import("gsp_hotplug.zig");
 pub const Phase = enum { online, pause, drain, mute, mute_wait, disable, disable_wait, clear, clear_wait, detach, detach_wait,
     settle, receiver_wait, query, query_wait, refresh, refresh_wait, commit, commit_wait, publish, unpause,
-    resize, resize_publish, resize_catalog, source_create, source_map, source_clear, source_unmap, resize_submit, resize_wait, restore_unavailable };
+    resize, resize_publish, resize_catalog, source_create, source_map, source_clear, source_unmap, resize_submit, resize_wait, restore_unavailable,
+    power_quiesce, power_off, power_off_wait, power_asleep, power_on, power_on_wait, power_refresh, power_failed };
 pub const Owner = struct {
     phase: Phase = .online,
     initialized: bool = false,
@@ -27,9 +28,19 @@ pub const Owner = struct {
     source_descriptor: a.GfxBufferDescriptor = .{},
     cleared: u64 = 0,
     restore_ticket: u64 = 0,
+    power_cycle: bool = false,
+    power_waking: bool = false,
+    power_intent: a.GfxPowerRequest = .{},
+    power_published: ?a.GfxOutputPower = null,
+    power_sequence: u64 = 0,
+    power_receipt: u64 = 0,
+    power_attempted: u64 = 0,
+    power_generation: u64 = 0,
+    power_failure: ?anyerror = null,
 
     pub fn step(self: *Owner, product: anytype) !bool {
         const run = product.running.?;
+        try self.pollPower(product);
         if (!self.initialized) {
             self.initialized = true; self.sequence = run.receiver_events.sequence;
             self.generation = product.mode.?.output_generation;
@@ -50,6 +61,16 @@ pub const Owner = struct {
             (if (signal.mst) |stamp| run.receiver_events.affects(stamp.root, self.sequence) else false));
         const idle_modes = !product.modes.pending() and !product.audio.busy() and !product.cursor.busy() and
             (product.modes.phase == .idle or product.modes.phase == .unavailable or product.modes.phase == .detached);
+        if (self.phase == .online and self.power_intent.off != 0 and self.power_intent.sequence != self.power_attempted and
+            !affected and !run.outputs.invalidated and idle_modes) {
+            self.power_cycle = true; self.power_waking = false; self.power_failure = null;
+            self.power_attempted = self.power_intent.sequence;
+            self.deadline = product.last_clock +| 30 * std.time.ns_per_s;
+            self.phase = .power_quiesce;
+            // VRR must stop before outputPaused makes new link work invalid.
+            try self.pollPower(product);
+            return true;
+        }
         if (self.phase == .online and !affected and idle_modes and
             (self.refreshing or (notified and self.route != null and self.observation != null)))
         {
@@ -83,7 +104,7 @@ pub const Owner = struct {
         const changed = self.sequence != run.receiver_events.sequence or
             (self.phase == .online and (run.outputs.invalidated or run.output_generation != self.generation)) or
             (self.plan != null and (run.outputs.invalidated or run.output_generation != self.plan.?.output_generation));
-        if (changed) {
+        if (changed and !self.power_cycle) {
             self.refreshing = false;
             self.sequence = run.receiver_events.sequence;
             self.deadline = product.last_clock +| 30 * std.time.ns_per_s;
@@ -95,7 +116,10 @@ pub const Owner = struct {
             product.ctx.?.logInfo("NVIDIA hotplug: state=draining receiver=invalidated present=paused shadow=retained");
         }
         if (self.phase == .online) return false;
-        if (self.phase != .receiver_wait and product.last_clock >= self.deadline) return error.Deadline;
+        if (self.phase != .power_asleep and self.phase != .power_failed and product.last_clock >= self.deadline) {
+            if (self.phase == .receiver_wait and self.power_cycle) return self.failPower(product, error.Timeout);
+            if (self.phase != .receiver_wait) return error.Deadline;
+        }
         return self.advance(product) catch |err| {
             if (err == error.Busy) return false;
             return err;
@@ -106,6 +130,13 @@ pub const Owner = struct {
         const window = product.mode.?.window;
         switch (self.phase) {
             .online => return false,
+            .power_quiesce => {
+                if (run.anyAdaptiveRefresh() or run.refresh_quiescing) return false;
+                if (!try product.audio.suspendRoute()) return false;
+                try run.pauseOutput(window, true);
+                try run.restoreOutput(window, false);
+                self.phase = .pause;
+            },
             .pause => {
                 const result = try product.pauseCommonOutput(true);
                 if (result == a.gfx_output_error_busy) return false;
@@ -146,6 +177,20 @@ pub const Owner = struct {
                 self.phase = .settle;
             },
             .settle => {
+                if (self.power_cycle) {
+                    if (!try product.cursor.stopped(product)) return true;
+                    if (try product.modes.stopped(product)) return true;
+                    if (product.modes.pending()) return false;
+                    const completed = product.modes.completed_ticket;
+                    product.modes = .{ .completed_ticket = completed };
+                    product.audio.afterStop();
+                    self.restore_ticket = 0;
+                    // Keep the paused common output, CPU image, geometry and
+                    // connector identity, including its MST RM-ID hold.
+                    // Sleep is not a cable withdrawal.
+                    self.phase = .power_off;
+                    return true;
+                }
                 // Withdrawal requests common rollback while its old identity
                 // remains bound. Complete the matching job, then retry.
                 var pending = false;
@@ -190,6 +235,15 @@ pub const Owner = struct {
                 self.plan = choice.plan;
                 if (!product.primaryOutput()) run.preparing_outputs |= product.mode.?.signal.display_id;
                 self.deadline = product.last_clock +| 30 * std.time.ns_per_s;
+                // Same-sized paused outputs can retain their common CPU
+                // owner. A resized secondary needs that old owner drained
+                // while the physical image is still retired.
+                if (choice.resize and self.power_cycle and !product.primaryOutput()) {
+                    if (!try product.quiesceCommonOutput()) {
+                        self.attempted_generation = 0;
+                        return false;
+                    }
+                }
                 self.phase = if (choice.resize) .resize else .query;
             },
             .query => {
@@ -254,6 +308,7 @@ pub const Owner = struct {
                 self.generation = self.plan.?.output_generation;
                 self.route = try runtime.output_route.identify(product.mode.?, run.nativeOutputs() orelse return error.Busy);
                 self.plan = null; self.phase = .online; self.restores +|= 1;
+                self.power_cycle = false; self.power_waking = false;
                 product.cursor.resumeOutput();
                 try run.pauseOutput(window, false);
                 try run.restoreOutput(window, false);
@@ -365,6 +420,48 @@ pub const Owner = struct {
                 if (try self.releaseSource(product)) return true;
                 return self.keepHeadless(product);
             },
+            .power_off, .power_on => {
+                self.power_sequence = try run.beginMonitorPower(window, self.phase == .power_on, self.deadline);
+                self.phase = if (self.phase == .power_off) .power_off_wait else .power_on_wait;
+            },
+            .power_off_wait, .power_on_wait => {
+                if (run.monitor_work != null) return false;
+                const result = run.monitor_result orelse return error.Completion;
+                const on = self.phase == .power_on_wait;
+                if (result.sequence != self.power_sequence or result.on != on) return error.Completion;
+                self.power_receipt = result.receipt;
+                if (result.failure) |err| {
+                    if (on) return self.failPower(product, err);
+                    // A rejected sleep is followed by one wake/reconstruction
+                    // attempt; it cannot strand an otherwise healthy desktop.
+                    self.power_failure = err; self.power_waking = true;
+                    self.deadline = product.last_clock +| 30 * std.time.ns_per_s;
+                    self.phase = .power_on;
+                    return true;
+                }
+                if (!on) {
+                    self.phase = .power_asleep;
+                    product.ctx.?.logInfo("NVIDIA screen: off scanout=retired audio=muted images=retained system=running");
+                } else {
+                    self.power_generation = run.output_generation;
+                    try run.receiver_events.refreshOutput(run.epoch, product.last_clock, product.mode.?.signal.display_id);
+                    self.phase = .power_refresh;
+                }
+            },
+            .power_asleep, .power_failed => {
+                if (self.power_intent.off != 0 or (self.phase == .power_failed and self.power_intent.sequence == self.power_attempted)) return false;
+                self.power_attempted = self.power_intent.sequence;
+                self.power_waking = true;
+                self.deadline = product.last_clock +| 30 * std.time.ns_per_s;
+                self.phase = .power_on;
+            },
+            .power_refresh => {
+                if (run.outputs.active() or run.outputs.state != .returned or run.outputs.invalidated or
+                    run.outputs.data.generation <= self.power_generation) return false;
+                self.sequence = run.receiver_events.sequence;
+                self.attempted_generation = 0;
+                self.phase = .receiver_wait;
+            },
         }
         return true;
     }
@@ -386,10 +483,67 @@ pub const Owner = struct {
         return true;
     }
     fn keepHeadless(self: *Owner, product: anytype) bool {
+        if (self.power_cycle) return self.failPower(product, error.Unavailable);
         self.plan = null; self.restore_ticket = 0; self.phase = .receiver_wait;
         product.running.?.restoreOutput(product.mode.?.window, false) catch return false;
         if (!product.primaryOutput()) product.running.?.preparing_outputs &= ~product.mode.?.signal.display_id;
         product.ctx.?.logInfo("NVIDIA hotplug: state=headless restore=unavailable shadow=retained retry=next-receiver-event");
         return true;
+    }
+    fn failPower(self: *Owner, product: anytype, err: anyerror) bool {
+        self.power_failure = err; self.power_attempted = self.power_intent.sequence;
+        self.plan = null; self.restore_ticket = 0; self.phase = .power_failed;
+        product.running.?.restoreOutput(product.mode.?.window, false) catch {};
+        if (!product.primaryOutput()) product.running.?.preparing_outputs &= ~product.mode.?.signal.display_id;
+        product.ctx.?.logInfo("NVIDIA screen: wake=unavailable image=retained system=running retry=new-request");
+        return true;
+    }
+    fn pollPower(self: *Owner, product: anytype) !void {
+        const outputs = product.outputs orelse return;
+        if (!outputs.supportsPower() or product.output.connection_generation == 0 or product.mode == null) return;
+        const run = product.running.?;
+        const window = product.mode.?.window;
+        if (self.power_published == null or !std.meta.eql(self.power_published.?.identity, product.output)) {
+            self.power_published = null;
+            self.power_intent = .{ .identity = product.output };
+            self.power_attempted = 0;
+        }
+        const active = run.display_images[window];
+        const retired = run.display_retired[window];
+        const image = active orelse (if (retired) |value| value.image else return);
+        const link = image.link orelse return;
+        if (!link.complete()) return;
+        const phase: u32 = if (self.phase == .power_failed) a.gfx_power_phase_unavailable else
+            if (self.phase == .power_asleep) a.gfx_power_phase_off else
+            if (self.power_cycle) (if (self.power_waking) a.gfx_power_phase_waking else a.gfx_power_phase_stopping) else
+            if (self.phase == .online) a.gfx_power_phase_on else a.gfx_power_phase_unavailable;
+        var value: a.GfxOutputPower = .{ .identity = product.output,
+            .capabilities = a.gfx_power_cap_signal | (if (link.mst != null or (link.dp != null and link.dp.?.sink.revision < 0x11))
+                @as(u32, 0) else a.gfx_power_cap_sink), .phase = phase,
+            .sequence = if (self.power_published) |old| old.sequence else 1,
+            .request_sequence = self.power_intent.sequence,
+            .since_ns = if (self.power_published) |old| old.since_ns else product.last_clock,
+            .control_receipt = self.power_receipt,
+            .core_point = if (active) |current| current.core_point else retired.?.core_point,
+            .window_point = if (active) |current| current.window_point else retired.?.window_point,
+            .reason = if (phase == a.gfx_power_phase_unavailable) (if (if (self.power_failure) |err| err == error.Timeout else false)
+                a.gfx_power_reason_timeout else if (self.power_failure != null) a.gfx_power_reason_rejected else a.gfx_power_reason_link) else 0 };
+        if (self.power_published) |old| {
+            if (!std.meta.eql(old, value)) {
+                if (value.sequence == std.math.maxInt(u64)) return error.Exhausted;
+                value.sequence += 1; value.since_ns = product.last_clock;
+            }
+        }
+        if (self.power_published == null or !std.meta.eql(self.power_published.?, value)) {
+            const status = outputs.publishPower(&value);
+            if (status == a.gfx_output_error_busy or status == a.gfx_output_error_stale) return;
+            if (status != a.gfx_output_ok) return error.Catalog;
+            self.power_published = value;
+        }
+        var intent: a.GfxPowerRequest = .{};
+        const status = outputs.readPower(&product.output, &intent);
+        if (status == a.gfx_output_error_busy or status == a.gfx_output_error_stale) return;
+        if (status != a.gfx_output_ok or !std.meta.eql(intent.identity, product.output)) return error.Catalog;
+        self.power_intent = intent;
     }
 };

@@ -3274,6 +3274,46 @@ const NativeCommon = struct {
     var hdmi_dsc_released: u32 = 0;
     var published = false;
     var published_generation: u64 = 0;
+    var screen_power: ?a.GfxOutputPower = null;
+    var power_intent: a.GfxPowerRequest = .{};
+    var additional_power: ?a.GfxOutputPower = null;
+    var additional_power_intent: a.GfxPowerRequest = .{};
+    var power_writes: usize = 0;
+    var power_defer = false;
+    var power_reject: ?bool = null;
+    fn publishPower(input: *const a.GfxOutputPower) callconv(.c) i32 {
+        const run = &target.running;
+        if (input.identity.connector_id == additionalConnector()) {
+            const extra = &target.native_output.additional.outputs[0];
+            std.debug.assert(additional_published and std.meta.eql(input.identity, extra.output) and input.sequence != 0);
+            if (input.phase == a.gfx_power_phase_off) std.debug.assert(run.outputPaused(extra.mode.?.window) and
+                run.display_images[extra.mode.?.window] == null and input.core_point != 0 and input.window_point != 0 and
+                additional_muted and additional_audio_cleared);
+            if (input.phase == a.gfx_power_phase_on) std.debug.assert(!run.outputPaused(extra.mode.?.window) and additional_active);
+            if (additional_power) |previous| if (std.meta.eql(previous.identity, input.identity)) std.debug.assert(input.sequence > previous.sequence);
+            additional_power = input.*;
+            return a.gfx_output_ok;
+        }
+        const product = &target.native_output;
+        std.debug.assert(published and std.meta.eql(input.identity, product.output) and input.sequence != 0);
+        if (input.phase == a.gfx_power_phase_off) std.debug.assert(run.display_paused and run.display_images[product.mode.?.window] == null and
+            run.display_retired[product.mode.?.window] != null and input.core_point != 0 and input.window_point != 0 and
+            (input.capabilities & a.gfx_power_cap_sink == 0 or input.control_receipt != 0) and CatalogModel.audio_muted and std.mem.allEqual(u8, &CatalogModel.audio_eld, 0));
+        if (input.phase == a.gfx_power_phase_on) std.debug.assert(!run.display_paused and run.display_images[product.mode.?.window] != null);
+        if (screen_power) |previous| if (std.meta.eql(previous.identity, input.identity)) std.debug.assert(input.sequence > previous.sequence);
+        screen_power = input.*;
+        return a.gfx_output_ok;
+    }
+    fn readPower(identity: *const a.GfxOutputId, out: *a.GfxPowerRequest) callconv(.c) i32 {
+        if (identity.connector_id == additionalConnector()) {
+            std.debug.assert(additional_power != null and std.meta.eql(identity.*, additional_power.?.identity));
+            if (!std.meta.eql(additional_power_intent.identity, identity.*)) additional_power_intent = .{ .identity = identity.* };
+            out.* = additional_power_intent; return a.gfx_output_ok;
+        }
+        std.debug.assert(screen_power != null and std.meta.eql(identity.*, screen_power.?.identity));
+        if (!std.meta.eql(power_intent.identity, identity.*)) power_intent = .{ .identity = identity.* };
+        out.* = power_intent; return a.gfx_output_ok;
+    }
     var additional_publication: a.GfxOutputPublication = .{};
     var additional_target: a.GfxOutputTarget = .{};
     var additional_published = false;
@@ -3493,7 +3533,7 @@ const NativeCommon = struct {
                 std.debug.assert(additional_modes and modes_enabled and additional_published and extra.modes.phase == .publish and
                     input.info.mode_count == extra.receiver.mode_count);
             } else {
-                std.debug.assert(!additional_published and input.info.mode_count == 1);
+                std.debug.assert((!additional_published or extra.hotplug.power_cycle) and input.info.mode_count == 1);
                 if (extra.hotplug.phase == .resize_publish) {
                     std.debug.assert(target.running.display_images[extra.mode.?.window] == null and
                         input.modes[0].mode_id == extra.hotplug.plan.?.receiver_mode_id);
@@ -3514,7 +3554,7 @@ const NativeCommon = struct {
                 input.modes[0].width == 65 and input.info.limits.bandwidth_bytes_per_second > 0);
             published_generation += 1;
         } else {
-            std.debug.assert(!published and input.info.mode_count == 1 and input.info.limits.flags == 0);
+            std.debug.assert((!published or target.native_output.hotplug.power_cycle) and input.info.mode_count == 1 and input.info.limits.flags == 0);
             if (commits == 0 or (is("context_native_reset") and target.gpu_reset.resumed and target.native_output.phase == .publish)) {
                 std.debug.assert(input.modes[0].flags & a.gfx_output_mode_geometry_only != 0);
                 published_generation = if (commits == 0) 15 else published_generation + 1;
@@ -3569,7 +3609,7 @@ const NativeCommon = struct {
             const window = target.native_output.additional.outputs[0].mode.?.window;
             const retired = target.running.display_retired[window].?;
             std.debug.assert(target.running.display_images[window] == null and retired.core_point != 0 and retired.window_point != 0 and
-                target.running.displayFlip(window) == null and !additional_published);
+                target.running.displayFlip(window) == null and (!additional_published or target.native_output.additional.outputs[0].hotplug.power_cycle));
             additional_target = .{}; additional_statistics = null; additional_info = null;
         }
         additional_active = operation == 0;
@@ -3954,6 +3994,7 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
         try NativeCommon.checkStatistics();
         if (NativeCommon.is("context_native_reset")) {
             checkpoint = "reset with live native display";
+            if (!NativeCommon.is("context_native_console")) try checkNativeScreenPower(target, true);
             try t.expect(run.display_resources_slot.owner != null and run.presentation != null and copy.heldReferences() != 0);
             ResetDeviceModel.effect = display.functionReset;
             var restaging: ResetStorageFixture = .{ .previous = target.memory.?.* };
@@ -4163,6 +4204,8 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
             try checkNativeDetach(target);
             checkpoint = "product hotplug lifecycle";
             try checkNativeHotplug(target, false);
+            checkpoint = "screen power lifecycle";
+            try checkNativeScreenPower(target, false);
         }
         if (NativeCommon.is("context_native_connected")) {
             checkpoint = "additional SOR assignment";
@@ -4329,6 +4372,133 @@ fn checkNativeDetach(target: *@import("gsp_device.zig").Device) !void {
         words[detached_offset / 4] = 2 << 30;
         try t.expect(run.display_retired[mode.window] == null and run.display_images[mode.window].?.image.dma == previous.image.dma);
         run.display_paused = false;
+    }
+}
+fn checkNativeScreenPower(target: *@import("gsp_device.zig").Device, leave_asleep: bool) !void {
+    const run = &target.running; const product = &target.native_output;
+    const copy = @import("gsp_copy_test_model.zig").Model;
+    const vm = @import("gsp_vram_test_model.zig").Model;
+    const dm = @import("gsp_display_test_model.zig").Model;
+    const scan = @import("boot_scanout.zig");
+    const push = @import("gsp_display_push.zig");
+    const snapshot = try t.allocator.create(@TypeOf(run.outputs.data));
+    defer t.allocator.destroy(snapshot);
+    snapshot.* = run.outputs.data;
+    const saved_api = product.outputs.?.table;
+    product.outputs.?.table.size = @sizeOf(a.GfxDriverOutputApi);
+    product.outputs.?.table.power_publish = @intFromPtr(&NativeCommon.publishPower);
+    product.outputs.?.table.power_read = @intFromPtr(&NativeCommon.readPower);
+    defer { product.outputs.?.table = saved_api; NativeCommon.screen_power = null; NativeCommon.power_reject = null; }
+    NativeCommon.screen_power = null; NativeCommon.power_writes = 0;
+    var checkpoint: []const u8 = "off";
+    errdefer |err| std.debug.print("screen power: {s} check={s} hotplug={s} device={s} failure={?}/{?} monitor={?} writes={d}\n", .{
+        @errorName(err), checkpoint, @tagName(product.hotplug.phase), @tagName(target.phase), target.failure, run.failure,
+        if (run.monitor_work) |work| work.stage else null, NativeCommon.power_writes });
+    for (0..2) |cycle| {
+        const mode = product.mode.?;
+        const old_identity = product.output;
+        const released = vm.released;
+        const images = run.display_resources_slot.owner.?;
+        const count = images.table.count;
+        finishInactiveWindow(target);
+        NativeCommon.power_intent = .{ .identity = product.output, .off = 1, .sequence = 10 + cycle * 10,
+            .deadline_ns = clock + 30 * std.time.ns_per_s };
+        var held_stop = false;
+        for (0..200) |_| {
+            clock += std.time.ns_per_ms; _ = target.step();
+            try t.expect(target.phase == .ready and NativeCommon.published and images.table.count == count and vm.released == released);
+            if (product.hotplug.phase == .power_asleep) break;
+            if (run.activeChannel()) |channel| if (channel.phase == .waiting) { try replyNativeProduct(target); continue; };
+            if (run.display_work) |*work| {
+                const previous = work.detach orelse return error.Unexpected;
+                if (work.core.phase == .submitted or work.core.phase == .rewind) {
+                    const user = try push.userBase(.core, 0); dm.words[(user + 4) / 4] = dm.words[user / 4];
+                    if (work.core.phase == .submitted) { const note: *u32 = @ptrFromInt(work.core.notifier.cpu.cpu_address); note.* = 2 << 30; }
+                }
+                if (work.window.?.phase == .submitted or work.window.?.phase == .rewind) {
+                    const user = try push.userBase(.window, mode.window); dm.words[(user + 4) / 4] = dm.words[user / 4];
+                    if (work.window.?.phase == .submitted) {
+                        const words: [*]u32 = @ptrFromInt(work.window.?.notifier.cpu.cpu_address);
+                        words[work.window.?.notifier.offset / 4] = 2 << 30;
+                    }
+                }
+                if (work.core.phase == .complete and work.window.?.phase == .complete) {
+                    if (!held_stop) {
+                        try t.expect(run.display_retired[mode.window] == null and run.monitor_work == null and
+                            run.display_images[mode.window] != null and NativeCommon.screen_power.?.phase == a.gfx_power_phase_stopping);
+                        held_stop = true;
+                    } else {
+                        const use = images.last_window_use[images.table.indexOf(product.window.?.slot, previous.image.dma).?].?;
+                        const words: [*]u32 = @ptrFromInt(images.publishedNotifier(product.window.?.slot).?.cpu.cpu_address);
+                        words[use.offset / 4] = 2 << 30;
+                        const base = scan.armed_base + mode.head * 0x400;
+                        for ([_]u32{ 0x2088, 0x208c, 0x2090, 0x2094, 0x2098, 0x2288, 0x22d4, 0x22d8 }) |method| dm.words[(base + method) / 4] = 0;
+                        dm.words[(base + 0x209c) / 4] = 0xcf;
+                        dm.words[(scan.armed_base + 0x300 + mode.signal.sor * 0x20) / 4] = 0;
+                        dm.words[(scan.armed_base + 0x1000 + mode.window * 0x80) / 4] = 15;
+                        for (0..6) |plane| dm.words[(scan.window_armed_base + mode.window * 0x1000 + 0x240) / 4 + plane] = 0;
+                    }
+                }
+            }
+        }
+        clock += std.time.ns_per_ms; _ = target.step();
+        try t.expect(held_stop and product.hotplug.phase == .power_asleep and NativeCommon.screen_power.?.phase == a.gfx_power_phase_off and
+            NativeCommon.screen_power.?.request_sequence == NativeCommon.power_intent.sequence and run.display_paused and
+            run.display_images[mode.window] == null and std.meta.eql(product.output, old_identity) and NativeCommon.power_writes != 0);
+        if (CatalogModel.audio) |route| try t.expect(route.state == a.gfx_audio_route_pending and route.eld_bytes == 0);
+        if (leave_asleep) return; // The existing real FLR/firmware reconstruction case follows.
+        const writes = NativeCommon.power_writes;
+        for (0..5) |_| { clock += std.time.ns_per_ms; _ = target.step(); }
+        try t.expect(run.monitor_work == null and NativeCommon.power_writes == writes and run.failure == null);
+        // A negative RM wake reply leaves a bounded, retryable headless state.
+        checkpoint = "wake";
+        NativeCommon.power_intent.off = 0; NativeCommon.power_intent.sequence += 1;
+        NativeCommon.power_intent.deadline_ns = 0;
+        if (cycle == 1) {
+            NativeCommon.power_reject = true;
+            for (0..40) |_| {
+                clock += std.time.ns_per_ms; _ = target.step();
+                try t.expect(target.phase == .ready);
+                if (product.hotplug.phase == .power_failed) break;
+                if (run.activeChannel()) |channel| if (channel.phase == .waiting) try replyNativeProduct(target);
+            }
+            try t.expect(product.hotplug.phase == .power_failed and run.display_images[mode.window] == null);
+            const attempts = NativeCommon.power_writes;
+            for (0..8) |_| { clock += std.time.ns_per_ms; _ = target.step(); }
+            try t.expect(NativeCommon.screen_power.?.phase == a.gfx_power_phase_unavailable and NativeCommon.power_writes == attempts);
+            NativeCommon.power_intent.sequence += 1;
+        }
+        NativeCommon.power_defer = mode.displayPort();
+        const fifo = run.fifos[product.copy.?.slot].owner.?;
+        const raw: [*]const u8 = @ptrFromInt(target.port.window.cpu_address);
+        const cpu_index = run.presentation.?.surface.shadow.buffer.id - 1101;
+        @memset(&copy.host[cpu_index], 0x6b);
+        var received = false; var fetched = false; var signaled = false;
+        for (0..300) |_| {
+            if (!received and product.hotplug.phase == .power_refresh) {
+                try returnReceiverFixture(run, snapshot); received = true;
+            }
+            clock += std.time.ns_per_ms; _ = target.step();
+            try t.expect(target.phase == .ready and images.table.count == count and vm.released == released);
+            if (product.hotplug.phase == .online) break;
+            if (run.buffer_active != null) { try replyCopyMapping(target); continue; }
+            if (run.activeChannel()) |channel| if (channel.phase == .waiting) { try replyNativeProduct(target); continue; };
+            if (run.initial_image) |work| if (work.operation.submitted) {
+                if (!fetched) { try copy.fetch(fifo, raw[0..@intCast(target.port.window.byte_length)]); try copy.execute(); fetched = true; }
+                else if (!signaled) { try copy.signal(); signaled = true; }
+            };
+            if (run.display_work != null) try pumpReceiverImage(target);
+        }
+        clock += std.time.ns_per_ms; _ = target.step();
+        try t.expect(received and fetched and signaled and product.hotplug.phase == .online and !run.display_paused and
+            product.mode.?.output_generation > mode.output_generation and product.output.connection_generation > old_identity.connection_generation and
+            NativeCommon.screen_power.?.phase == a.gfx_power_phase_on and NativeCommon.screen_power.?.request_sequence == 0 and
+            run.display_images[mode.window] != null and run.display_retired[mode.window] == null);
+        const memory = images.publishedStorage(product.window.?.slot, run.presentation.?.surface.scanout.?.dma).?.info().?;
+        try t.expect(std.mem.allEqual(u8, copy.imageBytes(memory.reference.buffer.id - 801)[0..mode.width * 4], 0x6b));
+        try pumpNativeAudio(target);
+        try t.expect(CatalogModel.audio.?.state == a.gfx_audio_route_ready and !NativeCommon.power_defer);
+        checkpoint = "second off";
     }
 }
 fn checkNativeHotplug(target: *@import("gsp_device.zig").Device, resize: bool) !void {
@@ -6803,6 +6973,27 @@ fn replyNativeProduct(target: *@import("gsp_device.zig").Device) !void {
             if (link.hdmi.?.operation == .gcp and NativeCommon.is("context_native_link_reject")) outputWord(&response, 12, 0x57);
         }
         }
+    } else if (run.monitor_work) |*work| {
+        const retired = run.display_retired[work.plan.mode.window].?;
+        try t.expect(run.outputPaused(work.plan.mode.window) and run.display_images[work.plan.mode.window] == null and
+            retired.core_point != 0 and retired.window_point != 0);
+        if (work.plan.mode.signal.display_id == NativeCommon.additionalConnector()) {
+            try t.expect(NativeCommon.additional_muted and NativeCommon.additional_audio_cleared);
+        } else try t.expect(CatalogModel.audio_muted and std.mem.allEqual(u8, &CatalogModel.audio_eld, 0));
+        NativeCommon.power_writes += 1;
+        const command = std.mem.readInt(u32, rpc.request[8..12], .little);
+        try t.expect(std.mem.readInt(u32, rpc.request[28..32], .little) == work.plan.mode.signal.display_id);
+        if (command == 0x731341) {
+            try t.expect(rpc.request.len == 72 and std.mem.readInt(u32, rpc.request[40..44], .little) == 0x600 and
+                rpc.request[44] == @as(u8, if (work.on) 1 else 2));
+            outputWord(&response, 60, 1);
+            if (work.on and NativeCommon.power_defer) { outputWord(&response, 64, 2); NativeCommon.power_defer = false; }
+        } else if (command == 0x730295) {
+            try t.expect(rpc.request.len == 44 and std.mem.readInt(u32, rpc.request[32..36], .little) == @intFromBool(work.on));
+        } else try t.expect(command == 0x731356 and !work.on and rpc.request.len == 36 and std.mem.readInt(u32, rpc.request[32..36], .little) == 0);
+        if (NativeCommon.power_reject) |on| if (on == work.on) {
+            outputWord(&response, 12, 0x57); NativeCommon.power_reject = null;
+        };
     } else if (run.audio_work) |*work| {
         if (!work.plan.mode.displayPort()) {
             const expected = @import("gsp_display_audio_test.zig").reference(work.operation);
@@ -10098,11 +10289,13 @@ fn checkNativeAdditionalOutput(target: *@import("gsp_device.zig").Device, mst_ca
         try checkAdditionalModeJobs(target);
         try checkMstRejectedMode(target);
         try checkMstRootLoss(target);
+        try checkAdditionalHotplug(target, false, true);
         return;
     }
     if (NativeCommon.is("context_native_connected_primary_timeout")) return checkPrimaryOutputTimeout(target);
     checkpoint = "additional unplug and reconnect";
-    try checkAdditionalHotplug(target, false);
+    try checkAdditionalHotplug(target, false, false);
+    try checkAdditionalHotplug(target, false, true);
     checkpoint = "additional native mode rollback";
     try checkAdditionalModeJobs(target);
     const mode = extra.mode.?;
@@ -10334,7 +10527,7 @@ fn checkAdditionalModeJobs(target: *@import("gsp_device.zig").Device) !void {
     NativeCommon.mode_job = null; NativeCommon.mode_taken = false; NativeCommon.mode_receipt = null;
     try pumpAdditionalFramePool(target);
     checkpoint = "headless resize";
-    try checkAdditionalHotplug(target, true);
+    try checkAdditionalHotplug(target, true, true);
     try pumpAdditionalFramePool(target);
 }
 fn checkMstRejectedMode(target: *@import("gsp_device.zig").Device) !void {
@@ -10489,7 +10682,7 @@ fn pumpAdditionalFramePool(target: *@import("gsp_device.zig").Device) !void {
     }
     return error.Timeout;
 }
-fn checkAdditionalHotplug(target: *@import("gsp_device.zig").Device, resize: bool) !void {
+fn checkAdditionalHotplug(target: *@import("gsp_device.zig").Device, resize: bool, power: bool) !void {
     const run = &target.running;
     const primary = &target.native_output;
     const extra = &primary.additional.outputs[0];
@@ -10514,8 +10707,20 @@ fn checkAdditionalHotplug(target: *@import("gsp_device.zig").Device, resize: boo
         .{ @errorName(err), checkpoint, @tagName(extra.hotplug.phase), @tagName(primary.hotplug.phase), primary.hotplug.refreshing,
         @tagName(primary.audio.phase), if (extra.hotplug.observation) |seen| @as(?@import("gsp_hotplug.zig").ReceiverState, seen.state) else null,
         @tagName(extra.phase), extra.failure, run.failure });
-    // An authenticated mask targets only the second physical receiver.
-    try devicePostMasks(target, false, false, 0, extra.display_id, 0);
+    const saved_api = primary.outputs.?.table;
+    if (power) {
+        NativeCommon.power_intent = .{};
+        NativeCommon.additional_power = extra.hotplug.power_published;
+        NativeCommon.screen_power = primary.hotplug.power_published;
+        NativeCommon.additional_power_intent = .{ .identity = extra.output, .off = 1, .sequence = 1,
+            .deadline_ns = clock + 30 * std.time.ns_per_s };
+        primary.outputs.?.table.power_publish = @intFromPtr(&NativeCommon.publishPower);
+        primary.outputs.?.table.power_read = @intFromPtr(&NativeCommon.readPower);
+        primary.outputs.?.table.size = @sizeOf(a.GfxDriverOutputApi);
+    } else try devicePostMasks(target, false, false, 0, extra.display_id, 0);
+    defer if (power) { primary.outputs.?.table = saved_api; NativeCommon.screen_power = null; NativeCommon.additional_power = null; };
+    const monitor_writes = NativeCommon.power_writes;
+    const stopped_phase: @import("gsp_native_hotplug.zig").Phase = if (power) .power_asleep else .receiver_wait;
     var held = false;
     for (0..160) |_| {
         clock += 1000; _ = target.step();
@@ -10524,10 +10729,11 @@ fn checkAdditionalHotplug(target: *@import("gsp_device.zig").Device, resize: boo
         try t.expect(std.meta.eql(image.image, prior.image) and image.core_point == prior.core_point and
             image.window_point == prior.window_point and image.link.?.receipt == prior.link.?.receipt and
             copy.heldReferences() == retained and vm.charged == charged);
-        if (extra.hotplug.phase == .receiver_wait) break;
+        if (extra.hotplug.phase == stopped_phase) break;
         if (run.activeChannel()) |rpc| if (rpc.phase == .waiting) { try replyNativeProduct(target); continue; };
         if (run.display_work) |*work| {
             checkpoint = "physical retirement";
+            if (extra.mode.?.signal.mst != null) try NativeMst.executeScanout(run);
             try t.expect(work.detach != null and work.detach.?.boot_mode.?.window == window and !NativeCommon.additional_active);
             const previous = work.detach.?;
             const mode = previous.boot_mode.?;
@@ -10568,10 +10774,16 @@ fn checkAdditionalHotplug(target: *@import("gsp_device.zig").Device, resize: boo
         }
     }
     checkpoint = "absent receiver";
-    try t.expect(held and extra.hotplug.phase == .receiver_wait and !NativeCommon.additional_published and
-        !NativeCommon.additional_active and extra.target.display_generation == 0 and run.presentation_targets[window] == null and
+    try t.expect(held and extra.hotplug.phase == stopped_phase and NativeCommon.additional_published == power and
+        !NativeCommon.additional_active and (extra.target.display_generation == 0) == !power and (run.presentation_targets[window] == null) == !power and
         run.display_images[window] == null and run.display_retired[window] != null and
         NativeCommon.additional_muted and NativeCommon.additional_audio_cleared);
+    if (power) {
+        clock += std.time.ns_per_ms; _ = target.step();
+        try t.expect(NativeCommon.additional_power.?.phase == a.gfx_power_phase_off);
+        if (extra.mode.?.signal.mst) |stamp| try t.expect(NativeCommon.power_writes == monitor_writes and
+            run.outputs.mst_store.registry.slots[stamp.handle.slot].published);
+    } else {
     snapshot.receivers[1].connected = false;
     snapshot.receivers[1].status = .disconnected;
     try returnReceiverFixture(run, snapshot);
@@ -10583,6 +10795,7 @@ fn checkAdditionalHotplug(target: *@import("gsp_device.zig").Device, resize: boo
         if (run.activeChannel()) |rpc| if (rpc.phase == .waiting) try replyNativeProduct(target);
     }
     try t.expect(extra.hotplug.observation.?.state == .disconnected and extra.hotplug.phase == .receiver_wait and !primary.hotplug.refreshing);
+    }
     checkpoint = "primary frame without second receiver";
     try prepareAdditionalTestFrame(target, primary.mode.?.window);
     try submitAdditionalTestFrame(target, primary.mode.?.window);
@@ -10590,6 +10803,18 @@ fn checkAdditionalHotplug(target: *@import("gsp_device.zig").Device, resize: boo
     try t.expect(run.display_images[window] == null and copy.heldReferences() == retained and vm.charged == charged);
     const primary_after = run.display_images[primary.mode.?.window].?;
     checkpoint = "reconnect";
+    if (power) {
+        NativeCommon.additional_power_intent.off = 0;
+        NativeCommon.additional_power_intent.sequence += 1;
+        NativeCommon.additional_power_intent.deadline_ns = 0;
+        for (0..48) |_| {
+            clock += std.time.ns_per_ms; _ = target.step();
+            try t.expect(target.phase == .ready and extra.phase == .active and !run.display_paused);
+            if (extra.hotplug.phase == .power_refresh) break;
+            if (run.activeChannel()) |rpc| if (rpc.phase == .waiting) try replyNativeProduct(target);
+        }
+        try t.expect(extra.hotplug.phase == .power_refresh);
+    } else {
     try devicePostMasks(target, false, false, extra.display_id, 0, 0);
     for (0..16) |_| {
         clock += 1000; _ = target.step();
@@ -10597,6 +10822,8 @@ fn checkAdditionalHotplug(target: *@import("gsp_device.zig").Device, resize: boo
         if (run.outputs.invalidated and extra.hotplug.phase == .receiver_wait) break;
     }
     try t.expect(run.outputs.invalidated and extra.hotplug.phase == .receiver_wait);
+    }
+    if (extra.mode.?.signal.mst == null)
     try @import("gsp_receiver_mode_test.zig").install(&snapshot.receivers[1]);
     if (resize) {
         const receiver = &snapshot.receivers[1];
@@ -10608,6 +10835,7 @@ fn checkAdditionalHotplug(target: *@import("gsp_device.zig").Device, resize: boo
         try t.expect(receiver.report.complete() and receiver.report.mode_count == 1);
     }
     try returnReceiverFixture(run, snapshot);
+    if (extra.mode.?.signal.mst != null) try NativeMst.install(&run.outputs.data, &run.outputs.mst_store);
     const current = run.currentPresentation(window).?;
     const cpu_index = current.surface.shadow.buffer.id - 1101;
     @memset(&copy.host[cpu_index], 0x39);
@@ -10636,7 +10864,8 @@ fn checkAdditionalHotplug(target: *@import("gsp_device.zig").Device, resize: boo
     checkpoint = "fresh identity and complete pixels";
     try t.expect(extra.hotplug.phase == .online and extra.hotplug.restores == restores + 1 and fetched and NativeCommon.additional_active and
         NativeCommon.additional_published and extra.target.connection_generation > before_target.connection_generation and
-        extra.target.display_generation > before_target.display_generation and !run.outputPaused(window) and
+        (if (power and !resize) extra.target.display_generation == before_target.display_generation else
+            extra.target.display_generation > before_target.display_generation) and !run.outputPaused(window) and
         run.display_retired[window] == null and std.meta.eql(run.presentation_targets[window].?, extra.target) and run.preparing_outputs == 0);
     if (resize) {
         try t.expect(extra.mode.?.width == 65 and extra.mode.?.height == 20 and !copy.mode_lent and copy.modeReferences() == 0 and

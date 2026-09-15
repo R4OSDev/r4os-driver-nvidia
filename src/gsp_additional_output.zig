@@ -15,6 +15,7 @@ const SoftwareCursor = struct {
 };
 const NoAudioPublisher = struct {
     pub fn busy(_: *const NoAudioPublisher) bool { return false; }
+    pub fn suspendRoute(_: *NoAudioPublisher) !bool { return true; }
     pub fn afterStop(_: *NoAudioPublisher) void {}
     pub fn afterLinkRestore(_: *NoAudioPublisher) void {}
 };
@@ -68,7 +69,8 @@ pub const Output = struct {
     color: @import("gsp_output_color.zig").Owner = .{},
 
     pub fn busy(self: *const Output) bool {
-        if (self.phase == .active) return (self.hotplug.phase != .online and self.hotplug.phase != .receiver_wait) or
+        if (self.phase == .active) return (self.hotplug.phase != .online and self.hotplug.phase != .receiver_wait and
+            self.hotplug.phase != .power_asleep and self.hotplug.phase != .power_failed) or
             (self.modes.phase != .detached and self.modes.phase != .idle and self.modes.phase != .decision and self.modes.phase != .unavailable);
         return self.phase != .unused and self.phase != .failed;
     }

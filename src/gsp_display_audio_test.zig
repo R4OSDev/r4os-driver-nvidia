@@ -32,6 +32,7 @@ pub fn check() !void {
     const mode = @import("gsp_boot_mode.zig");
     const saved = try mode.bind(try mode.capture(&raw, &boot, 3), snapshot, 11, 4);
     const object: @import("gsp_display_rpc.zig").Object = .{ .epoch = 11, .client = 12, .display = 13 };
+    try checkMonitorPower(saved, object);
     var plan = try audio.derive(saved, object, snapshot);
     var bytes: [audio.max_bytes]u8 = undefined;
     try t.expect(plan.data == null);
@@ -61,3 +62,56 @@ pub fn check() !void {
     receiver.report.warnings |= @import("r4gfx_edid").Warning.checksum;
     try t.expect((try audio.derive(saved, object, snapshot)).data == null);
 }
+fn checkMonitorPower(mode: @import("gsp_boot_mode.zig").Plan, object: @import("gsp_display_rpc.zig").Object) !void {
+    const power = @import("gsp_monitor_power.zig");
+    const deadline = 100 * std.time.ns_per_s;
+    var bytes: [power.max_bytes]u8 = undefined;
+    for ([_]bool{false, true}) |on| {
+        var work = try power.Work.init(.{ .object = object, .mode = mode, .kind = .digital, .sink_control = true }, on, 7, deadline);
+        const length = try work.encode(&bytes);
+        try t.expect(length == 44 and word(&bytes, 8) == 0x730295 and word(&bytes, 16) == 20 and
+            word(&bytes, 24) == 0 and word(&bytes, 28) == mode.signal.display_id and word(&bytes, 32) == @intFromBool(on) and
+            word(&bytes, 36) == 0 and word(&bytes, 40) == 0);
+        work.pending = true;
+        var reply = powerReply(bytes[0..length]);
+        bytes[28] ^= 1;
+        try t.expectError(error.Unexpected, work.consume(reply, 1, 8));
+        bytes[28] ^= 1;
+        reply.rpc.result = 0x57;
+        try t.expectError(error.RmRejected, work.consume(reply, 1, 8));
+        reply.rpc.result = 0;
+        try work.consume(reply, 1, 8);
+        try t.expect(work.stage == .complete and work.receipt == 8);
+    }
+    var dp = mode;
+    dp.transport_hdmi = false; dp.signal.sor_control = 0x802;
+    var off = try power.Work.init(.{ .object = object, .mode = dp, .kind = .dp_sst, .sink_control = true }, false, 9, deadline);
+    try t.expect(try off.encode(&bytes) == 72 and word(&bytes, 8) == 0x731341 and word(&bytes, 40) == 0x600 and bytes[44] == 2);
+    off.pending = true;
+    put(&bytes, 60, 1);
+    try off.consume(powerReply(&bytes), 1, 10);
+    try t.expect(off.stage == .main_link and off.receipt == 10);
+    const length = try off.encode(&bytes);
+    try t.expect(length == 36 and word(&bytes, 8) == 0x731356 and word(&bytes, 32) == 0);
+    try off.consume(powerReply(bytes[0..length]), 2, 11);
+    try t.expect(off.stage == .complete and off.receipt == 11);
+    var on = try power.Work.init(.{ .object = object, .mode = dp, .kind = .dp_sst, .sink_control = true }, true, 12, deadline);
+    try t.expect(try on.encode(&bytes) == 72 and word(&bytes, 40) == 0x600 and bytes[44] == 1);
+    on.pending = true; on.attempts = 1;
+    put(&bytes, 64, 2); // AUX_DEFER must not grant a power receipt.
+    try on.consume(powerReply(&bytes), 1, 13);
+    try t.expect(on.stage == .sink and on.receipt == 0 and on.not_before > 1);
+    on.attempts = 40;
+    try t.expectError(error.RetryExhausted, on.consume(powerReply(&bytes), 2, 14));
+    put(&bytes, 64, 0); put(&bytes, 60, 1);
+    try on.consume(powerReply(&bytes), 3, 15);
+    try t.expect(on.stage == .complete and on.receipt == 15 and on.not_before > 3);
+    const old = try power.Work.init(.{ .object = object, .mode = dp, .kind = .dp_sst, .sink_control = false }, true, 16, deadline);
+    try t.expect(old.stage == .complete and old.receipt == 0); // DP 1.0 has no sink D-state control.
+}
+fn powerReply(bytes: []const u8) @import("gsp_message.zig").Record {
+    return .{ .shape = .{ .message_bytes = @intCast(bytes.len), .checksum_bytes = 0, .storage_bytes = @intCast(bytes.len), .elements = 1 },
+        .queue_sequence = 0, .rpc = .{ .function = 76, .result = 0 }, .payload = bytes };
+}
+fn word(bytes: []const u8, offset: usize) u32 { return std.mem.readInt(u32, bytes[offset..][0..4], .little); }
+fn put(bytes: []u8, offset: usize, value: u32) void { std.mem.writeInt(u32, bytes[offset..][0..4], value, .little); }

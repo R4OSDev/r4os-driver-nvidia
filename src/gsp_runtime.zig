@@ -328,6 +328,9 @@ pub const Owner = struct {
     audio_work: ?display_audio.Work = null,
     audio_result: ?display_audio.Result = null,
     audio_sequence: u64 = 0,
+    monitor_work: ?@import("gsp_monitor_power.zig").Work = null,
+    monitor_result: ?@import("gsp_monitor_power.zig").Result = null,
+    monitor_sequence: u64 = 0,
     cursor_storage: ?CursorStorage = null,
     cursor_upload: ?CursorUpload = null,
     cursor_reserving: bool = false,
@@ -586,7 +589,7 @@ pub const Owner = struct {
         if (self.power_active) return .power;
         if (self.sequence.self_address != 0) return .firmware;
         if (self.display_channel_active != null) return .display_channel;
-        if (self.mode_control_active or self.display_engine_active or self.audio_work != null or self.sor_work != null) return .display_engine;
+        if (self.mode_control_active or self.display_engine_active or self.audio_work != null or self.monitor_work != null or self.sor_work != null) return .display_engine;
         if (self.buffer_active != null) return .mapping;
         if (self.native_active != null) return .native_buffer;
         if (self.fifo_active != null) return .channel;
@@ -836,7 +839,7 @@ pub const Owner = struct {
     }
     fn nativeObjectForDisplay(self: *Owner) ?display.Object {
         if (self.self_address != @intFromPtr(self) or self.failure != null or self.graph == null or
-            self.display_upload_job != null or self.display_work != null or self.cursor_point != null or self.cursor_upload != null or self.audio_work != null or self.sor_work != null or
+            self.display_upload_job != null or self.display_work != null or self.cursor_point != null or self.cursor_upload != null or self.audio_work != null or self.monitor_work != null or self.sor_work != null or
             self.graph.?.self_address != @intFromPtr(&self.graph.?) or self.graph.?.state != .loaned or
             self.display_object == null or self.channel == null or self.activeChannel() != &self.channel.? or
             self.channel.?.session.state != .active) return null;
@@ -2524,7 +2527,7 @@ pub const Owner = struct {
         self.log("NVIDIA gsp-present-image: retired={d} shadow=unmapped,import-released scanout=retained", .{dma});
         return true;
     }
-    fn executionWorkBusy(self: *const Owner) bool { return self.power_active or self.graphics_upload != null or self.graphics_work != null or self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.initial_image != null or self.mode_control_active or self.cursor_upload != null or self.audio_work != null or self.sor_work != null; }
+    fn executionWorkBusy(self: *const Owner) bool { return self.power_active or self.graphics_upload != null or self.graphics_work != null or self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.initial_image != null or self.mode_control_active or self.cursor_upload != null or self.audio_work != null or self.monitor_work != null or self.sor_work != null; }
     fn engineWorkBusy(self: *const Owner) bool { return self.executionWorkBusy() or self.hasDisplayFlips(); }
     fn deviceWorkBusy(self: *const Owner) bool { return self.engineWorkBusy() or self.queued_render != null; }
     fn copyBusy(self: *const Owner) bool { return self.deviceWorkBusy() or self.frame_ready != null or (self.direct_work != null and !self.direct_step); }
@@ -2540,11 +2543,83 @@ pub const Owner = struct {
         return self.executionAdmissionBusy() or self.queued_render != null;
     }
     fn executionAdmissionBusy(self: *const Owner) bool {
-        return self.power_active or self.powerStopping() or self.direct_work != null or self.cursor_reserving or self.graphics_upload != null or self.graphics_work != null or self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.initial_image != null or self.cursor_upload != null or self.audio_work != null or self.sor_work != null or
+        return self.power_active or self.powerStopping() or self.direct_work != null or self.cursor_reserving or self.graphics_upload != null or self.graphics_work != null or self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.initial_image != null or self.cursor_upload != null or self.audio_work != null or self.monitor_work != null or self.sor_work != null or
             self.mode_control_active or (self.hasDisplayFlips() and !self.overlapFlip());
     }
     pub fn cursorWorkAvailable(self: *Owner) bool {
         return !self.copyBusy() and self.cursor_point == null and self.nativeObject() != null and !self.graph_closing;
+    }
+    fn retiredMonitorPlan(self: *Owner, window: u32) !@import("gsp_monitor_power.zig").Plan {
+        if (window >= 8 or !self.outputPaused(window) or self.display_images[window] != null) return error.State;
+        const retired = self.display_retired[window] orelse return error.State;
+        const mode = retired.image.boot_mode orelse return error.State;
+        const link = retired.image.link orelse return error.State;
+        if (retired.epoch != self.epoch or mode.epoch != self.epoch or mode.window != window or
+            retired.core_point == 0 or retired.window_point == 0 or !link.complete() or
+            !std.meta.eql(mode, link.plan.mode) or self.display_object == null or
+            !std.meta.eql(link.plan.object, self.display_object.?)) return error.Stale;
+        // Each MST stream was already retired with its ACT/branch receipts.
+        // Never write D3 or main-link-off to a root that may have live peers.
+        if (link.mst != null and retired.link_stop_receipt == 0) return error.Stale;
+        return .{ .object = link.plan.object, .mode = mode,
+            .kind = if (link.mst != null) .stream_only else if (link.dp != null) .dp_sst else .digital,
+            .sink_control = if (link.mst != null) false else if (link.dp) |dp| dp.sink.revision >= 0x11 else true };
+    }
+    pub fn beginMonitorPower(self: *Owner, window: u32, on: bool, deadline: u64) !u64 {
+        if (!self.cursorWorkAvailable() or self.channel.?.phase != .idle) return error.Busy;
+        if (deadline <= try self.now() or self.monitor_sequence == std.math.maxInt(u64)) return error.Deadline;
+        const plan = try self.retiredMonitorPlan(window);
+        const work = try @import("gsp_monitor_power.zig").Work.init(plan, on, self.monitor_sequence + 1, deadline);
+        self.monitor_sequence += 1;
+        self.monitor_work = work;
+        errdefer self.monitor_work = null;
+        try self.validateMonitorPower();
+        return self.monitor_sequence;
+    }
+    pub fn validateMonitorPower(self: *Owner) !void {
+        const work = self.monitor_work orelse return error.State;
+        if (self.failure != null or self.graph_closing or self.channel == null or self.activeChannel() != &self.channel.? or
+            self.display_work != null or self.hasDisplayFlips() or self.cursor_point != null or self.audio_work != null or
+            !std.meta.eql(work.plan, try self.retiredMonitorPlan(work.plan.mode.window))) return error.Stale;
+    }
+    fn advanceMonitorPower(self: *Owner, current: u64) !Progress {
+        const control = @import("gsp_monitor_power.zig");
+        const work = &self.monitor_work.?;
+        const channel = &self.channel.?;
+        try self.validateMonitorPower();
+        if (current >= work.deadline) return error.Timeout;
+        if (current < work.not_before) return .idle;
+        if (work.stage == .complete) {
+            self.monitor_result = .{ .sequence = work.sequence, .on = work.on, .receipt = work.receipt };
+            self.monitor_work = null;
+            return .progress;
+        }
+        if (!work.pending) {
+            work.length = try work.encode(&work.request);
+            try channel.begin(control.function, work.request[0..work.length], work.deadline);
+            work.attempts += 1;
+            work.pending = true;
+            return .progress;
+        }
+        if (try channel.poll(work.deadline)) |dispatch| {
+            if (!dispatch.response) { try self.notification(channel, dispatch, current); return .progress; }
+            const failure: ?anyerror = blk: {
+                work.consume(dispatch.record, current, dispatch.ticket.serial) catch |err| {
+                    if (err == error.RmRejected or err == error.Aux or err == error.RetryExhausted) break :blk err;
+                    return err;
+                };
+                break :blk null;
+            };
+            try channel.complete(dispatch.ticket);
+            work.pending = false;
+            if (failure) |reason| {
+                self.monitor_result = .{ .sequence = work.sequence, .on = work.on,
+                    .receipt = dispatch.ticket.serial, .failure = reason };
+                self.monitor_work = null;
+            }
+            return .progress;
+        }
+        return if (channel.phase == .waiting) .idle else .progress;
     }
     pub fn beginDisplayAudio(self: *Owner, plan: display_audio.Plan, operation: display_audio.Operation, deadline: u64) !u64 {
         if (!self.cursorWorkAvailable() or self.channel.?.phase != .idle) return error.Busy;
@@ -5190,6 +5265,7 @@ pub const Owner = struct {
                 (link.mst_rebuild != null and link.phase == .scanout)) return self.advanceDisplayLink(current);
         };
         if (self.audio_work != null) return self.advanceDisplayAudio(current);
+        if (self.monitor_work != null) return self.advanceMonitorPower(current);
         if (self.sor_work != null) return self.advanceSorAssignment(current);
         // Drain an already observable GSP fault before publishing CE success.
         // Active RPC owners above already receive before sending their work.
