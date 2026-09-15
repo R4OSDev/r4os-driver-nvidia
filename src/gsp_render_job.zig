@@ -137,5 +137,15 @@ pub const Owner = struct {
         if (self.cache_owner) |programs| programs.release() catch return false;
         self.* = .{}; return true;
     }
+    pub fn closeAfterReset(self: *Owner, proof: @import("gsp_reset.zig").Quiescence) bool {
+        if (self.self_address == 0) return true;
+        if (self.self_address != @intFromPtr(self) or self.cache_owner == null or self.memory == null or
+            !proof.valid(self.cache_owner.?.epoch) or (self.failure != null and self.failure.? == error.Descriptor)) return false;
+        if (!self.source.close(self.memory.?) or !self.target.close(self.memory.?)) return false;
+        // This is a CPU borrow held solely by this command, not a completed
+        // GPU receipt. The cache closes separately after this borrow ends.
+        self.cache_owner.?.borrowed = false;
+        self.* = .{}; return true;
+    }
 };
 fn valid(h: a.GfxBufferHandle) bool { return h.id != 0 and h.generation != 0 and h.reserved0 == 0; }

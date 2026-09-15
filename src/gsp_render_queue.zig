@@ -90,6 +90,19 @@ pub const Owner = struct {
             self.slice_count <= render.batch_capacity and self.draw_cursor <= self.draw_count and self.next_draw <= self.draw_count;
     }
     pub fn commands(self: *const Owner) []const render.Draw { return self.slices[0..self.slice_count]; }
+    /// The enclosing backend has already terminalized every fence after
+    /// proven reset. Drop only this job's retained aliases; never ACK it anew.
+    pub fn closeAfterReset(self: *Owner, proof: @import("gsp_reset.zig").Quiescence, epoch: u64) bool {
+        if (self.self_address == 0) return true;
+        if (self.self_address != @intFromPtr(self) or !proof.valid(epoch) or !std.meta.eql(self.job, self.stamp) or
+            !std.meta.eql(self.references, self.reference_stamps)) return false;
+        for (&self.references, &self.reference_stamps) |*reference, *stamp| {
+            if (reference.reference.id == 0) continue;
+            if (self.memory.bufferRelease(&reference.reference) != a.gfx_buffer_result_ok) return false;
+            reference.* = .{}; stamp.* = .{};
+        }
+        self.* = .{}; return true;
+    }
     pub fn prepareSlice(self: *Owner) !void {
         self.slice_count = 0;
         self.next_draw = self.draw_cursor;

@@ -375,6 +375,9 @@ pub const Owner = struct {
     context_active: ?u16 = null,
     graph_closing: bool = false,
     close_deadline: u64 = 0,
+    reset_stage: enum { loss, queue, transfers, work, presentations, fifos, display_channels, display_resources,
+        contexts, control, mappings, native, done } = .loss,
+    reset_cursor: usize = 0,
     words: [logs.output_bytes]u8 = undefined,
 
     pub fn open(self: *Owner, ctx: *const r4os.r4dev.DriverContext, device: *native.Port,
@@ -423,14 +426,192 @@ pub const Owner = struct {
             return err;
         };
     }
+
+    /// One bounded cleanup slice. Called only while the device's FLR proof
+    /// remains live and bus mastering is disabled. No RM command or GPU
+    /// completion is synthesized; the original journal remains inspectable.
+    pub fn closeAfterReset(self: *Owner, proof: @import("gsp_reset.zig").Quiescence) !bool {
+        if (!proof.valid(proof.epoch)) return error.Retained;
+        if (self.self_address == 0) {
+            // Startup may fail before Runtime borrowed any GPU owner.
+            self.epoch = proof.epoch;
+            self.reset_stage = .done;
+            return true;
+        }
+        if (self.self_address != @intFromPtr(self) or self.failure == null or !proof.valid(self.epoch)) return error.Stale;
+        const memory = self.ctx.?.memory() orelse return error.Api;
+        switch (self.reset_stage) {
+            .loss => {
+                if (memory.deviceLost(self.adapter_id, self.epoch, true) != r4os.abi.gfx_buffer_result_ok) return error.Retained;
+                if (!self.allocations.closeAfterReset(proof, self.epoch)) return false;
+                self.reset_stage = .queue;
+            },
+            .queue => {
+                if (self.copy_backend) |*backend| {
+                    if (self.quarantine_result != r4os.abi.gfx_queue_ok) {
+                        const result = backend.queue.unregister(&backend.binding, 1);
+                        if (result == r4os.abi.gfx_queue_error_busy) return false;
+                        if (result != r4os.abi.gfx_queue_ok) return error.Retained;
+                    }
+                    self.copy_backend = null;
+                }
+                self.reset_stage = .transfers;
+            },
+            .transfers => {
+                if (self.graphics_upload) |*work| { if (!work.operation.closeAfterReset(proof)) return error.Retained; self.graphics_upload = null; }
+                if (self.graphics_work) |*work| { if (!work.resources.closeAfterReset(proof)) return error.Retained; self.graphics_work = null; }
+                if (self.display_upload_job) |*work| { if (!work.operation.closeAfterReset(proof)) return error.Retained; self.display_upload_job = null; }
+                if (self.cursor_upload) |*work| { if (!work.operation.closeAfterReset(proof)) return error.Retained; self.cursor_upload = null; }
+                if (self.initial_image) |*work| { if (!work.operation.closeAfterReset(proof)) return error.Retained; self.initial_image = null; }
+                if (!self.graphics_cache.closeAfterReset(proof)) return error.Retained;
+                self.reset_stage = .work; self.reset_cursor = 0;
+            },
+            .work => {
+                if (self.reset_cursor < self.work_slots.len) {
+                    const slot = &self.work_slots[self.reset_cursor];
+                    switch (slot.*) {
+                        .free => {},
+                        .render => |*work| if (!work.closeAfterReset(proof, self.epoch)) return error.Retained,
+                        .copy => |*work| {
+                            if (!std.meta.eql(work.job, work.job_stamp) or !work.render_read.closeAfterReset(proof)) return error.Retained;
+                            for (&work.references) |*reference| if (reference.reference.id != 0) {
+                                if (work.memory.bufferRelease(&reference.reference) != r4os.abi.gfx_buffer_result_ok) return error.Retained;
+                                reference.* = .{};
+                            };
+                        },
+                    }
+                    slot.* = .free; self.reset_cursor += 1; return false;
+                }
+                self.copy_job = null; self.queued_render = null; self.active_work = null;
+                self.work_schedule = .{}; self.deferred_presentations = @splat(null);
+                self.reset_stage = .presentations; self.reset_cursor = 0;
+            },
+            .presentations => {
+                if (self.reset_cursor < self.presentation_slots.len) {
+                    const slot = &self.presentation_slots[self.reset_cursor];
+                    if (slot.*) |*owner| if (!owner.surface.closeAfterReset(proof)) return error.Retained;
+                    slot.* = null; self.reset_cursor += 1; return false;
+                }
+                self.presentation = null; self.additional_presentations = @splat(null);
+                self.reset_stage = .fifos; self.reset_cursor = 0;
+            },
+            .fifos => {
+                if (self.reset_cursor < self.fifos.len) {
+                    const slot = &self.fifos[self.reset_cursor];
+                    if (slot.owner) |owner| try owner.closeAfterReset(proof);
+                    if (slot.allocation.handle != 0) try self.freeChannelSlot(self.reset_cursor);
+                    self.reset_cursor += 1; return false;
+                }
+                self.reset_stage = .display_channels; self.reset_cursor = 0;
+            },
+            .display_channels => {
+                if (self.reset_cursor < self.display_channels.len) {
+                    const slot = &self.display_channels[self.reset_cursor];
+                    if (slot.*) |*owner| try owner.closeAfterReset(proof);
+                    slot.* = null; self.reset_cursor += 1; return false;
+                }
+                self.reset_stage = .display_resources;
+            },
+            .display_resources => {
+                const slot = &self.display_resources_slot;
+                if (slot.owner) |owner| try owner.closeAfterReset(proof);
+                if (slot.allocation.handle != 0 and slot.heap.?.release(slot.allocation.handle) != r4os.abi.driver_heap_ok) return error.Retained;
+                slot.* = .{};
+                if (self.display_engine_owner) |*owner| { try owner.closeAfterReset(proof); self.display_engine_owner = null; }
+                self.reset_stage = .contexts; self.reset_cursor = 0;
+            },
+            .contexts => {
+                if (self.reset_cursor < self.contexts.len) {
+                    const slot = &self.contexts[self.reset_cursor];
+                    if (slot.owner) |owner| {
+                        if (try owner.closeAfterReset(proof)) try self.freeContextSlot(self.reset_cursor);
+                    } else if (slot.allocation.handle != 0) try self.freeContextSlot(self.reset_cursor);
+                    self.reset_cursor += 1; return false;
+                }
+                for (&self.contexts) |*slot| if (slot.owner != null) { self.reset_cursor = 0; return false; };
+                self.reset_stage = .control;
+            },
+            .control => {
+                if (self.power_owner) |*owner| {
+                    if (!owner.backing.closeAfterReset(proof)) return error.Retained;
+                    self.power_owner = null;
+                }
+                if (self.graph) |*graph| if (graph.control_buffer) |*owner| {
+                    if (!owner.backing.closeAfterReset(proof)) return error.Retained;
+                };
+                self.reset_stage = .mappings; self.reset_cursor = 0;
+            },
+            .mappings => {
+                if (self.reset_cursor < self.buffers.len) {
+                    const slot = &self.buffers[self.reset_cursor];
+                    if (slot.owner) |owner| try owner.closeAfterReset(proof);
+                    if (slot.pending_source.reference.id != 0) {
+                        if (memory.bufferRelease(&slot.pending_source.reference) != r4os.abi.gfx_buffer_result_ok) return error.Retained;
+                        slot.pending_source = .{};
+                    }
+                    if (slot.allocation.handle != 0 and slot.heap.?.release(slot.allocation.handle) != r4os.abi.driver_heap_ok) return error.Retained;
+                    slot.* = .{}; self.reset_cursor += 1; return false;
+                }
+                self.reset_stage = .native; self.reset_cursor = 0;
+            },
+            .native => {
+                if (self.reset_cursor < self.native_buffers.len) {
+                    const slot = &self.native_buffers[self.reset_cursor];
+                    if (slot.owner) |owner| {
+                        if (try owner.closeAfterReset(proof)) try self.freeNativeSlot(self.reset_cursor);
+                    } else if (slot.allocation.handle != 0) try self.freeNativeSlot(self.reset_cursor);
+                    self.reset_cursor += 1; return false;
+                }
+                var ticket: r4os.abi.GfxOwnedBufferRelease = .{};
+                for (&self.native_buffers) |*slot| if (slot.owner != null) {
+                    const result = memory.bufferTakeRelease(self.adapter_id, self.epoch, &ticket);
+                    if (result == r4os.abi.gfx_buffer_error_busy) { self.reset_cursor = 0; return false; }
+                    if (result != r4os.abi.gfx_buffer_result_ok) return error.Retained;
+                    for (&self.native_buffers, 0..) |*candidate, index| if (candidate.owner) |owner| {
+                        if (owner.release.attempt != 0 or !owner.acceptsAfterReset(ticket)) continue;
+                        owner.release = ticket;
+                        self.reset_cursor = index; return false;
+                    };
+                    return error.Descriptor;
+                };
+                if (memory.collect() != r4os.abi.gfx_buffer_result_ok) return error.Retained;
+                self.reset_stage = .done;
+            },
+            .done => return true,
+        }
+        return false;
+    }
+    fn failureOperation(self: *const Owner) diagnostics.Operation {
+        // This is retained owner metadata, never a fault-time device probe.
+        if (self.power_active) return .power;
+        if (self.sequence.self_address != 0) return .firmware;
+        if (self.display_channel_active != null) return .display_channel;
+        if (self.mode_control_active or self.display_engine_active or self.audio_work != null or self.sor_work != null) return .display_engine;
+        if (self.buffer_active != null) return .mapping;
+        if (self.native_active != null) return .native_buffer;
+        if (self.fifo_active != null) return .channel;
+        if (self.context_active != null) return .context;
+        if (self.graphics_work != null or self.graphics_upload != null) return .render;
+        if (self.display_work != null or self.hasDisplayFlips() or
+            self.cursor_upload != null or self.cursor_point != null) return .display_channel;
+        if (self.copy_job != null or self.display_upload_job != null or self.initial_image != null) return .submit;
+        if (self.queued_render != null) return .render;
+        return if (self.graph_closing) .teardown else .event;
+    }
     /// Logical shutdown invalidates every borrowed inventory and retains the
     /// existing RM/session resources. It is not physical GPU quiescence.
     pub fn stop(self: *Owner, err: anyerror) void {
         if (self.self_address == 0 or self.self_address != @intFromPtr(self) or self.failure != null) return;
         self.logResidency();
         self.allocations.close();
+        if (self.ctx) |ctx| if (ctx.memory()) |memory| {
+            const result = memory.deviceLost(self.adapter_id, self.epoch, false);
+            if (result != r4os.abi.gfx_buffer_result_ok and result != r4os.abi.err_no_fn)
+                self.log("NVIDIA gsp-quarantine: native-buffers={d} epoch={d}", .{result, self.epoch});
+        };
+        if (self.power_owner) |*owner| owner.deviceLost(self.last_clock);
         if (self.faults.first_fatal == null and err != error.Stopped and err != error.RmClosed)
-            self.recordFault(diagnostics.host(.teardown, err, true)) catch {};
+            self.recordFault(diagnostics.host(self.failureOperation(), err, true)) catch {};
         self.outputs.invalidate() catch {};
         self.memory_inventory.invalidate();
         if (self.graphics_cache.self_address != 0) self.graphics_cache.failed = true;
@@ -631,7 +812,7 @@ pub const Owner = struct {
         if (endpoint.display.enabled and endpoint.display.epoch == self.epoch) self.head_events = &endpoint.display;
         const code = @atomicLoad(u32, &endpoint.fault, .acquire);
         if (code == 0) return;
-        self.recordFault(.{ .source = .irq, .kind = .device, .operation = .interrupt, .fatal = true, .code = code,
+        self.recordFault(.{ .source = .irq, .kind = .interrupt, .operation = .interrupt, .fatal = true, .code = code,
             .irq = endpoint.irq, .irq_raw = @atomicLoad(u32, &endpoint.last_raw, .acquire),
             .irq_mask = @atomicLoad(u32, &endpoint.last_mask, .acquire), .irq_received = @atomicLoad(u64, &endpoint.interrupts, .acquire),
             .irq_messages = @atomicLoad(u64, &endpoint.messages, .acquire) }) catch {};
@@ -933,6 +1114,13 @@ pub const Owner = struct {
             return resources.bindScanout(window.slot, source, reference);
         };
         return error.Unsupported;
+    }
+    pub fn bindBootConsole(self: *Owner, handle: DisplayEngineHandle, index: u32, source: *@import("boot_console.zig").Owner) !u32 {
+        if (self.presentation != null or self.copy_backend != null or source.lease != self.memory_inventory.lease) return error.State;
+        const parent = try self.mutableDisplayTable(handle);
+        const info = parent.info() orelse return error.State;
+        if (parent.channels_started or index >= 8 or info.hardware.windows & (@as(u32, 1) << @intCast(index)) == 0) return error.Unsupported;
+        return (try self.ensureDisplayResources(parent)).bindConsole(index + 1, source);
     }
     pub fn createDisplayNotifier(self: *Owner, handle: DisplayEngineHandle, kind: display_channel.wire.Kind, index: u32) !u32 {
         if (kind == .immediate) return error.Unsupported; // Completion belongs to the coupled Window/Core.

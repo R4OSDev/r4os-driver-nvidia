@@ -978,6 +978,22 @@ pub const Port = struct {
         self.* = .{};
         return true;
     }
+    /// Retire this old transport without fabricating acknowledgements for its
+    /// pending messages. The full reset belongs to the same resident device,
+    /// remains bus-master-disabled and carries the exact run epoch.
+    pub fn closeAfterReset(self: *Port, proof: @import("gsp_reset.zig").Quiescence) bool {
+        if (self.self_address == 0) return proof.valid(proof.epoch);
+        if (self.self_address != @intFromPtr(self) or !proof.valid(self.run.epoch) or self.owner == null or
+            proof.owner.io.?.context != self.owner.?.context) return false;
+        self.ready = false;
+        if (self.runtime_sequence) |sequence| if (!sequence.close()) return false;
+        if (self.runtime_session) |session| session.stop();
+        if (self.preloaded_session) |session| session.stop();
+        self.recovery_owner = 0;
+        self.effects_possible = false;
+        self.retained = false;
+        return self.close();
+    }
 };
 
 /// One borrowed CPU-sequencer notification in an admitted runtime. Keep this

@@ -267,6 +267,13 @@ pub const Owner = struct {
     }
     fn closeBacking(self: *Owner) Error!void {
         if (self.allocated or self.registered != 0 or self.mapped != 0 or self.operation != null or self.exchange.pending != null) return error.Retained;
+        try self.releaseBacking();
+        if (self.namespace_live) {
+            try self.exchange.session.rm_names.retireChildren(self.reservation);
+            self.namespace_live = false;
+        }
+    }
+    fn releaseBacking(self: *Owner) Error!void {
         if (self.gpu.lease.id != 0) {
             if (self.memory.deviceRelease(&self.gpu, 1) != a.gfx_buffer_result_ok) return error.Retained;
             self.gpu = .{}; self.gpu_stamp = .{};
@@ -284,11 +291,21 @@ pub const Owner = struct {
             if (self.heap.release(self.allocation.handle) != a.driver_heap_ok) return error.Retained;
             self.allocation = .{}; self.allocation_stamp = .{};
         }
-        if (self.namespace_live) {
-            try self.exchange.session.rm_names.retireChildren(self.reservation);
-            self.namespace_live = false;
-        }
         self.prepared = false;
+    }
+    pub fn closeAfterReset(self: *Owner, proof: @import("gsp_reset.zig").Quiescence) Error!void {
+        if ((self.self_address != 0 and self.self_address != @intFromPtr(self)) or
+            !proof.valid(self.space.epoch) or self.exchange.session.epoch != self.space.epoch or
+            !std.meta.eql(self.source, self.source_stamp) or !std.meta.eql(self.allocation, self.allocation_stamp) or
+            !std.meta.eql(self.dma, self.dma_stamp) or !std.meta.eql(self.gpu, self.gpu_stamp) or
+            (self.failure != null and self.failure.? == error.Descriptor)) return error.Retained;
+        if (self.namespace_live) try self.exchange.session.rm_names.validateChildrenAfterReset(self.reservation, proof);
+        try self.releaseBacking();
+        // No RM_FREE reply is invented. The entire old session namespace is
+        // discarded only after every physical owner of that epoch has closed.
+        if (self.namespace_live) try self.exchange.session.rm_names.retireChildrenAfterReset(self.reservation, proof);
+        self.namespace_live = false;
+        self.state = .finished;
     }
     pub fn handoff(self: *Owner, deadline: u64) Error!boot.Handoff {
         try self.stable();

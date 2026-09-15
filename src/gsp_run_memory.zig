@@ -265,13 +265,24 @@ pub const Lease = struct {
     pub fn invalidate(self: *Lease) void {
         self.failed = true;
     }
-    /// Release only an unsubmitted run. There is deliberately no post-submit
-    /// clear operation: native recovery/quiescence still has to be implemented
-    /// and verified. Lost-device, timeout and INIT_DONE do not authorize reuse.
+    /// Lost-device, timeout and INIT_DONE do not authorize this release.
     pub fn releaseBeforeSubmission(self: *Lease) bool {
         if (self.self_address == 0) return true;
         if (self.retained or self.log_owner != 0 or self.recovery_owner != 0 or !self.matches()) return false;
         if (!self.queue.releaseBeforeSubmission()) return false;
+        self.releaseOwners();
+        return true;
+    }
+    /// IRQ/native-port borrowers and the log reader must be retired first.
+    /// This releases the exact old execution graph; it neither starts new
+    /// firmware nor authorizes the held framebuffer or VRAM backup to close.
+    pub fn releaseAfterReset(self: *Lease, proof: @import("gsp_reset.zig").Quiescence) bool {
+        if (!proof.valid(self.queue.epoch) or self.log_owner != 0 or !self.matches()) return false;
+        if (!self.queue.releaseAfterReset(proof)) return false;
+        self.releaseOwners();
+        return true;
+    }
+    fn releaseOwners(self: *Lease) void {
         self.boot_storage.?.execution_owner = 0;
         self.boot_storage.?.image.execution_owner = 0;
         self.init_storage.?.execution_owner = 0;
@@ -279,7 +290,6 @@ pub const Lease = struct {
         self.fwsec_sb_storage.?.device.execution_owner = 0;
         for (&self.booter_storage.?.images) |*image| image.device.execution_owner = 0;
         self.* = .{};
-        return true;
     }
     fn from(p: *anyopaque) *Lease {
         return @ptrCast(@alignCast(p));

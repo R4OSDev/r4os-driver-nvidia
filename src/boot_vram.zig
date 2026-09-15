@@ -37,6 +37,8 @@ pub const Capture = struct {
     self_address: usize = 0,
     effects_latched: bool = false,
     firmware_owner: usize = 0,
+    firmware_restore_generation: u64 = 0,
+    firmware_recovery: ?display.Recovery = null,
     window_writes: u32 = 0,
     last_status: i32 = 0,
     last_error: ?anyerror = null,
@@ -182,7 +184,9 @@ pub const Capture = struct {
 
     fn recoverWindow(raw: u64, generation_value: u64, boot: *const a.GfxNativeBootInfo) callconv(.c) i32 {
         const self: *Capture = @ptrFromInt(raw);
-        if (self.self_address != raw or generation_value != self.boot.held_generation or self.firmware_owner != 0) return 0;
+        if (self.self_address != raw) return 0;
+        if (self.firmware_owner != 0) return self.restoreFirmware(generation_value, boot);
+        if (generation_value != self.boot.held_generation) return 0;
         const original = self.original_boot orelse return 0;
         if (boot.physical_address != original.physical_address or boot.byte_length != original.byte_length or
             boot.width != original.width or boot.height != original.height or boot.pitch != original.pitch) return 0;
@@ -194,6 +198,18 @@ pub const Capture = struct {
         // firmware command, device DMA binding or display-programming write.
         // The verified old window and untouched VGA/scanout admit pixel copy.
         return 1;
+    }
+    /// A common restore callback only requests work. The device worker later
+    /// installs an acknowledgement backed by its rebuilt console resources.
+    pub fn restoreFirmware(self: *Capture, generation_value: u64, boot: *const a.GfxNativeBootInfo) i32 {
+        const original = self.original_boot orelse return 0;
+        if (self.self_address != @intFromPtr(self) or self.firmware_owner == 0 or generation_value <= self.boot.held_generation or
+            boot.generation != generation_value or boot.width != original.width or boot.height != original.height or
+            boot.pitch != original.pitch or boot.format != original.format or boot.physical_address != original.physical_address or
+            boot.byte_length != original.byte_length) return 0;
+        self.firmware_restore_generation = generation_value;
+        const recovery = self.firmware_recovery orelse return 0;
+        return recovery.callback(recovery.context, generation_value, boot);
     }
 
     /// Called by the serialized native owner before its first possible effect.

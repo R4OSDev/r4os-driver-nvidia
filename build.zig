@@ -11,7 +11,9 @@ pub fn build(b: *std.Build) void {
     const render_encoder_path = libraries.namedLazyPath("r4nv_render");
     const telemetry_path = libraries.namedLazyPath("r4nv_telemetry");
     const nv_binding_path = libraries.namedLazyPath("r4nv_zig_binding");
-    const module = sdk.addR4MFWithOptions(b.path("module.R4MF"), .{ .zig_module_roots = &.{ receiver_parser_path, receiver_bridge_path, copy_encoder_path, render_encoder_path, telemetry_path, nv_binding_path } });
+    const identity_path = b.path("Identity.zig");
+    const module = sdk.addR4MFWithOptions(b.path("module.R4MF"), .{ .zig_module_roots = &.{ receiver_parser_path, receiver_bridge_path, copy_encoder_path, render_encoder_path, telemetry_path, nv_binding_path, identity_path } });
+    const identity = b.createModule(.{ .root_source_file = identity_path, .target = b.graph.host, .optimize = .ReleaseSafe });
     const receiver_parser = b.createModule(.{ .root_source_file = receiver_parser_path, .target = b.graph.host, .optimize = .ReleaseSafe });
     const host_sdk = sdk.createR4osModule(b.graph.host, .ReleaseSafe);
     const nv_binding = b.createModule(.{ .root_source_file = nv_binding_path, .target = b.graph.host, .optimize = .ReleaseSafe });
@@ -62,6 +64,7 @@ pub fn build(b: *std.Build) void {
     }) });
     const unit_step = b.step("unit-test", "Passive PCI identity and bounded NVIDIA firmware parsing");
     unit.root_module.addImport("r4os", host_sdk);
+    unit.root_module.addImport("nvidia_identity", identity);
     unit.root_module.addImport("r4gfx_edid", receiver_parser);
     unit.root_module.addImport("r4gfx_outputs", receiver_bridge);
     unit.root_module.addImport("r4nv_copy", copy_encoder);
@@ -71,6 +74,7 @@ pub fn build(b: *std.Build) void {
     unit_step.dependOn(&b.addRunArtifact(unit).step);
     const lifecycle = b.createModule(.{ .root_source_file = b.path("src/lifecycle_test.zig"), .target = b.graph.host, .optimize = .ReleaseSafe });
     lifecycle.addImport("r4os", host_sdk);
+    lifecycle.addImport("nvidia_identity", identity);
     lifecycle.addImport("r4gfx_edid", receiver_parser);
     lifecycle.addImport("r4gfx_outputs", receiver_bridge);
     lifecycle.addImport("r4nv_copy", copy_encoder);
@@ -110,6 +114,7 @@ pub fn build(b: *std.Build) void {
     unit_step.dependOn(&b.addRunArtifact(format_test).step);
     const storage = b.createModule(.{ .root_source_file = b.path("src/firmware_storage_test.zig"), .target = b.graph.host, .optimize = .ReleaseSafe });
     storage.addImport("r4os", host_sdk);
+    storage.addImport("nvidia_identity", identity);
     storage.addImport("r4gfx_edid", receiver_parser);
     storage.addImport("r4gfx_outputs", receiver_bridge);
     storage.addImport("r4nv_copy", copy_encoder);

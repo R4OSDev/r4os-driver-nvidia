@@ -729,6 +729,14 @@ fn checkBoot(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Sna
     log("NVIDIA booters: resources=14 license=matched generation={d} reads={d} source=loaded-r4d gpu-authentication=unverified", .{ booters.generation, booters.reads });
     if (!stageBootInit(ctx, chip.id)) return false;
     if (starting_gsp) {
+        if (starting_native) {
+            const display = ctx.graphicsDisplay() orelse return false;
+            if (!display.supportsReset()) {
+                ctx.logError("NVIDIA native-output: common reset/rebuild API unavailable; firmware-execution=disabled");
+                return false;
+            }
+            native_device.recovery_hooks = .{ .restage = restageBootAfterReset };
+        }
         native_device.open(ctx, &boot_vram, &boot_vram_lease, &run_memory, &firmware_logs, source.board) catch |err| {
             log("NVIDIA gsp-start: rejected phase=owner reason={s} firmware-execution=disabled", .{@errorName(err)});
             return false;
@@ -762,6 +770,16 @@ fn checkBoot(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Sna
     return true;
 }
 
+fn restageBootAfterReset(_: usize, target: *@import("gsp_device.zig").Device) !void {
+    if (target != &native_device or target.phase != .retiring or target.reset_retire_stage != .restage or
+        target.memory != &run_memory or target.reader != &firmware_logs or target.display != &boot_vram or
+        run_memory.self_address != 0 or firmware_logs.self_address != 0 or target.gpu_reset.quiescence() == null) return error.Stale;
+    // Firmware images and the original VRAM reservation remain unchanged.
+    // Only the old, now idle log/queue/init storage is replaced and zeroed.
+    if (!init_storage.close()) return error.Retained;
+    if (!stageBootInit(&target.ctx.?, boot_vram.chip.?.id)) return error.Restage;
+}
+
 fn stageBootInit(ctx: *const r4os.r4dev.DriverContext, chip_id: u16) bool {
     const image_spans = boot_storage.image.segments[0..boot_storage.image.segment_count];
     @memcpy(init_excluded[0..image_spans.len], image_spans);
@@ -777,7 +795,7 @@ fn stageBootInit(ctx: *const r4os.r4dev.DriverContext, chip_id: u16) bool {
     }
     const count = image_spans.len + 5;
     const report = init_storage.stage(ctx, chip_id, init_excluded[0..count], 30 * std.time.ns_per_s) catch |err| {
-        log("NVIDIA boot-init: rejected phase=dma-init reason={s} submitted=no fallback=preserved", .{@errorName(err)});
+        log("NVIDIA boot-init: rejected phase=dma-init reason={s} submitted=no", .{@errorName(err)});
         return false;
     };
     log("NVIDIA boot-init: staged bytes={d} mappings={d} logs={d} queue-segments={d} bounced={d} excluded-spans={d} synchronized=yes submitted=no", .{

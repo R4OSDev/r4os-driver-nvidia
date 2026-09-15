@@ -15,6 +15,7 @@ pub const Model = struct {
     pub var reading = false;
     pub var synced = false;
     pub var releases: usize = 0;
+    pub var reset_losses: u32 = 0;
     pub var scenario: []const u8 = "";
     var sync_failed = false;
     var descriptor: a.GfxBufferDescriptor = .{};
@@ -40,6 +41,7 @@ pub const Model = struct {
         synced = false;
         sync_failed = false;
         releases = 0;
+        reset_losses = 0;
         scenario = name;
         dma = .{};
         gpu = .{};
@@ -61,6 +63,15 @@ pub const Model = struct {
         out.device_segment = @intFromPtr(&segment);
         out.device_release = @intFromPtr(&releaseDevice);
         if (power.is("power_success")) out.telemetry_exchange = @intFromPtr(&power.exchange);
+        if (std.mem.startsWith(u8, scenario, "gpu_reset_") or is("context_native_reset") or is("context_native_console")) {
+            out.size = @sizeOf(a.GfxDriverMemoryApi);
+            out.device_lost = @intFromPtr(&deviceLost);
+        }
+        return a.gfx_buffer_result_ok;
+    }
+    fn deviceLost(adapter: u32, generation: u64, quiesced: u32) callconv(.c) i32 {
+        std.debug.assert(adapter != 0 and generation != 0 and quiesced <= 1);
+        reset_losses |= @as(u32, 1) << @intCast(quiesced);
         return a.gfx_buffer_result_ok;
     }
     fn create(input: *const a.GfxBufferDescriptor, out: *a.GfxBufferReference) callconv(.c) i32 {

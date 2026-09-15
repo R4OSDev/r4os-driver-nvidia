@@ -111,4 +111,19 @@ pub const Owner = struct {
         };
         if (self.handle.id != 0 and memory.nativeUnregister(&self.handle) == 1) self.handle = .{};
     }
+
+    pub fn closeAfterReset(self: *Owner, proof: @import("gsp_reset.zig").Quiescence, epoch: u64) bool {
+        if (!proof.valid(epoch)) return false;
+        self.closing = true;
+        const memory = self.memory orelse return self.handle.id == 0 and self.pending == null;
+        if (self.pending) |pending| {
+            // This ends the common allocation claim. Its partially allocated
+            // native BO is still held by running.native_buffers until retired.
+            if (pending.job.allocation.memory_generation != epoch or
+                memory.nativeComplete(&self.handle, &pending.job.request, a.gfx_queue_error_device_lost, &.{}) != 1) return false;
+            self.pending = null;
+        }
+        self.close();
+        return self.handle.id == 0;
+    }
 };

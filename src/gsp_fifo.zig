@@ -507,6 +507,22 @@ pub const Owner = struct {
         if (!self.namespace_live) { self.unwind = false; self.state = .closed; return; }
         self.unwind = false; self.state = .destroying;
     }
+    pub fn closeAfterReset(self: *Owner, proof: @import("gsp_reset.zig").Quiescence) Error!void {
+        if (self.self_address == 0) return;
+        if (self.self_address != @intFromPtr(self) or self.session == null or !proof.valid(self.session.?.epoch) or
+            self.config.context.epoch != self.session.?.epoch or self.config_stamp == null or
+            !std.meta.eql(self.config, self.config_stamp.?) or
+            (self.failure != null and self.failure.? == error.Descriptor)) return error.Retained;
+        if (self.namespace_live) try self.session.?.rm_names.validateChildrenAfterReset(self.reservation.?, proof);
+        if (!self.ring.closeAfterReset(proof) or !self.userd.closeAfterReset(proof) or !self.instance.closeAfterReset(proof)) return error.Retained;
+        if (self.commands) |*command| if (!command.backing.closeAfterReset(proof)) return error.Retained;
+        if (self.child) |child| {
+            try (self.parent orelse return error.State).releaseChildAfterReset(child, proof);
+            self.child = null; self.parent = null;
+        }
+        if (self.namespace_live) try self.session.?.rm_names.retireChildrenAfterReset(self.reservation.?, proof);
+        self.namespace_live = false; self.state = .finished;
+    }
     pub fn handoff(self: *Owner) Error!boot.Handoff {
         try self.stable();
         if (self.state != .ready and self.state != .closed) return error.State;

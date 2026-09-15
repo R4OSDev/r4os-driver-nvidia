@@ -141,6 +141,15 @@ pub const Upload = struct {
         return true;
     }
     pub fn quarantine(self: *Upload, err: anyerror) void { self.failure = err; self.phase = .failed; }
+    pub fn closeAfterReset(self: *Upload, proof: @import("gsp_reset.zig").Quiescence) bool {
+        if (self.self_address == 0) return true;
+        if (self.self_address != @intFromPtr(self) or self.source == null or self.source_stamp == null or
+            !proof.valid(self.source_stamp.?.epoch) or !std.meta.eql(self.gpu, self.gpu_stamp) or
+            !std.meta.eql(self.input, self.input_stamp) or !std.meta.eql(self.pixels, self.pixels_stamp) or
+            (self.failure != null and self.failure.? == error.Descriptor)) return false;
+        if (!self.release()) return false;
+        self.* = .{}; return true;
+    }
 };
 fn validHandle(h: a.GfxBufferHandle) bool { return h.id != 0 and h.generation != 0 and h.reserved0 == 0; }
 fn validateMap(cpu: a.GfxBufferMap, bytes: u64, alignment: u64) !void {

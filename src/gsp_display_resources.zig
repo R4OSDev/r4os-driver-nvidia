@@ -4,6 +4,7 @@ const std = @import("std");
 const vram = @import("gsp_vram.zig");
 const names = @import("gsp_rm_names.zig");
 const transport = @import("gsp_transport.zig");
+const console = @import("boot_console.zig");
 const wire = @import("gsp_display_engine_wire.zig");
 pub const notifier = @import("gsp_display_notifier.zig");
 const r4os = @import("r4os");
@@ -22,6 +23,7 @@ pub const Owner = struct {
     table: layout.Table = .{},
     storage: [layout.capacity]vram.storage.Use = @splat(.{}),
     surfaces: [layout.capacity]?vram.surface.Plan = @splat(null),
+    consoles: [layout.capacity]?*console.Owner = @splat(null),
     surface_stamps: [layout.capacity]u64 = @splat(0),
     dynamic_names: [layout.capacity]?names.Children = @splat(null),
     last_window_use: [layout.capacity]?struct { point: u64, offset: u16 } = @splat(null),
@@ -54,7 +56,14 @@ pub const Owner = struct {
                         !std.meta.eql(lease.parent, self.reservation.?.parent)) return false;
                 }
                 if (descriptor.target == .vram) {
+                    if (self.consoles[i]) |held| {
+                        const value = held.imageInfo(self.table.epoch, descriptor.handle, descriptor.channel) catch return false;
+                        if (!descriptor.reserved_console or held.consumer != @intFromPtr(self) or descriptor.physical != held.physical or descriptor.bytes != value.bytes or
+                            use.self_address != 0 or self.surfaces[i] != null or self.surface_stamps[i] != 0) return false;
+                        continue;
+                    }
                     const value = use.info() orelse return false;
+                    if (descriptor.reserved_console) return false;
                     if (value.epoch != self.table.epoch or descriptor.physical != value.physical.base or descriptor.bytes != value.bytes) return false;
                     if (self.surfaces[i]) |plan| {
                         if (surfaceHash(plan) != self.surface_stamps[i] or plan.descriptor.byte_length != value.bytes or
@@ -62,17 +71,31 @@ pub const Owner = struct {
                         _ = image.create(plan, descriptor.handle, descriptor.channel) catch return false;
                     } else if (self.surface_stamps[i] != 0) return false;
                 } else {
-                    if (descriptor.channel >= self.notifiers.len or use.self_address != 0 or self.surfaces[i] != null or self.surface_stamps[i] != 0) return false;
+                    if (descriptor.reserved_console or descriptor.channel >= self.notifiers.len or use.self_address != 0 or self.consoles[i] != null or self.surfaces[i] != null or self.surface_stamps[i] != 0) return false;
                     const note = &self.notifiers[descriptor.channel];
                     if (!note.valid() or !note.backing.retained or note.handle != descriptor.handle or note.epoch != self.table.epoch or
                         note.channel != descriptor.channel or note.physical_stamp != descriptor.physical or descriptor.bytes != 4096) return false;
                 }
-            } else if (use.self_address != 0 or self.surfaces[i] != null or self.surface_stamps[i] != 0 or self.dynamic_names[i] != null or self.last_window_use[i] != null) return false;
+            } else if (use.self_address != 0 or self.consoles[i] != null or self.surfaces[i] != null or self.surface_stamps[i] != 0 or self.dynamic_names[i] != null or self.last_window_use[i] != null) return false;
         }
         return true;
     }
     pub fn bindNative(self: *Owner, channel: u32, source: *vram.Owner) Error!u32 {
         return self.bindSource(channel, source, source.info() orelse return error.Stale, false);
+    }
+    /// Original reserved console memory is not a native allocation alias.
+    /// Install only into a fresh table; the enclosing Device keeps its owner
+    /// and the boot reservation until a later proven GPU stop.
+    pub fn bindConsole(self: *Owner, channel: u32, source: *console.Owner) !u32 {
+        if (!self.valid() or source.consumer != 0) return error.Stale;
+        if (self.table.uploading or self.table.uploaded_revision != 0 or self.table.change != null) return error.Busy;
+        const index = self.table.freeIndex() orelse return error.Exhausted;
+        const handle = try self.reservation.?.object(@intCast(index));
+        const value = try source.imageInfo(self.table.epoch, handle, channel);
+        try self.table.add(.{ .channel = channel, .handle = handle, .target = .vram, .physical = source.physical, .bytes = value.bytes, .reserved_console = true });
+        self.consoles[index] = source;
+        source.consumer = @intFromPtr(self);
+        return handle;
     }
     pub fn bindScanout(self: *Owner, channel: u32, source: *vram.Owner, reference: a.GfxBufferReference) Error!u32 {
         return self.bindSource(channel, source, source.scanoutInfo(reference) orelse return error.Stale, true);
@@ -111,6 +134,7 @@ pub const Owner = struct {
     }
     pub fn removeImage(self: *Owner, channel: u32, handle: u32) Error!void {
         if (self.publishedImage(channel, handle) == null) return error.Stale;
+        if (self.consoles[self.table.indexOf(channel, handle).?] != null) return error.Retained;
         if (!try self.imageFinished(channel, handle)) return error.Busy;
         try self.table.remove(channel, handle);
     }
@@ -147,6 +171,7 @@ pub const Owner = struct {
         if (!self.valid() or !self.table.published(channel, handle)) return null;
         for (&self.table.entries, 0..) |*entry, i| if (entry.*) |descriptor| {
             if (descriptor.channel == channel and descriptor.handle == handle) {
+                if (self.consoles[i]) |held| return held.imageInfo(self.table.epoch, handle, channel) catch null;
                 const plan = self.surfaces[i] orelse return null;
                 return image.create(plan, handle, channel) catch null;
             }
@@ -156,14 +181,14 @@ pub const Owner = struct {
     pub fn publishedStorage(self: *Owner, channel: u32, handle: u32) ?*vram.storage.Use {
         if (self.publishedImage(channel, handle) == null) return null;
         for (&self.table.entries, 0..) |*entry, i| if (entry.*) |descriptor| {
-            if (descriptor.channel == channel and descriptor.handle == handle) return &self.storage[i];
+            if (descriptor.channel == channel and descriptor.handle == handle) return if (self.consoles[i] == null) &self.storage[i] else null;
         };
         return null;
     }
     pub fn publishedCursorStorage(self: *Owner, handle: u32) ?*vram.storage.Use {
         if (!self.valid() or !self.table.published(0, handle)) return null;
         const index = self.table.indexOf(0, handle) orelse return null;
-        if (self.table.entries[index].?.target != .vram or self.surfaces[index] != null) return null;
+        if (self.table.entries[index].?.target != .vram or self.consoles[index] != null or self.surfaces[index] != null) return null;
         return &self.storage[index];
     }
     pub fn createNotifier(self: *Owner, ctx: *const r4os.r4dev.DriverContext, channel: u32) Error!u32 {
@@ -196,6 +221,24 @@ pub const Owner = struct {
         for (&self.notifiers) |*note| if (note.self_address != 0) note.quarantine();
         for (&self.dynamic_names) |lease| if (lease) |held| self.session.?.rm_names.retainChildren(held) catch {};
         if (self.reservation) |reservation| self.session.?.rm_names.retainChildren(reservation) catch {};
+    }
+    pub fn closeAfterReset(self: *Owner, proof: @import("gsp_reset.zig").Quiescence) Error!void {
+        if (self.self_address == 0) return;
+        if (self.self_address != @intFromPtr(self) or self.session == null or self.binding == null or
+            !std.meta.eql(self.binding, self.binding_stamp) or !proof.valid(self.binding.?.epoch) or
+            self.session.?.epoch != self.binding.?.epoch) return error.Stale;
+        if (self.reservation) |held| try self.session.?.rm_names.validateChildrenAfterReset(held, proof);
+        for (&self.storage) |*use| if (!use.closeAfterReset(proof)) return error.Retained;
+        for (&self.consoles) |*slot| if (slot.*) |held| {
+            if (held.consumer != @intFromPtr(self) or held.epoch != self.binding.?.epoch) return error.Stale;
+            held.invalidate(); held.consumer = 0; slot.* = null;
+        };
+        for (&self.notifiers) |*note| if (!note.closeAfterReset(proof)) return error.Retained;
+        for (&self.dynamic_names) |*lease| if (lease.*) |held| {
+            try self.session.?.rm_names.retireChildrenAfterReset(held, proof); lease.* = null;
+        };
+        if (self.reservation) |held| try self.session.?.rm_names.retireChildrenAfterReset(held, proof);
+        self.* = .{};
     }
     // No ordinary close: a freed command channel does not prove its last
     // scanout image stopped being fetched. A later display recovery/handoff

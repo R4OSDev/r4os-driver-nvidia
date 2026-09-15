@@ -448,6 +448,15 @@ pub const Owner = struct {
         for (self.children) |child| if (child != 0) return error.Retained;
         self.exchange = try exchange.Exchange.init(token, deadline); self.deadline = deadline; self.state = .destroying;
     }
+    pub fn closeAfterReset(self: *Owner, proof: @import("gsp_reset.zig").Quiescence) Error!void {
+        if ((self.self_address != 0 and self.self_address != @intFromPtr(self)) or
+            !proof.valid(self.binding.epoch) or self.exchange.session.epoch != self.binding.epoch) return error.Stale;
+        for (self.children) |child| if (child != 0) return error.Retained;
+        if (self.namespace_live) try self.exchange.session.rm_names.validateChildrenAfterReset(self.reservation, proof);
+        if (!self.instance_storage.closeAfterReset(proof)) return error.Retained;
+        if (self.namespace_live) try self.exchange.session.rm_names.retireChildrenAfterReset(self.reservation, proof);
+        self.namespace_live = false; self.state = .finished;
+    }
     pub fn handoff(self: *Owner) Error!boot.Handoff {
         try self.stable();
         if (self.state != .ready and self.state != .closed) return error.State;

@@ -150,7 +150,7 @@ pub const ramht_bytes: usize = 8192;
 pub const descriptor_bytes: usize = 32; // 24-byte descriptor, aligned to32.
 pub const image_bytes: usize = ramht_bytes + capacity * descriptor_bytes;
 pub const Target = enum { vram, coherent_system };
-pub const Descriptor = struct { channel: u32, handle: u32, target: Target, physical: u64, bytes: u64 };
+pub const Descriptor = struct { channel: u32, handle: u32, target: Target, physical: u64, bytes: u64, reserved_console: bool = false };
 pub const Change = struct { index: u8, bucket: u16, remove: bool };
 pub const Range = struct { offset: u32, bytes: u32 };
 pub const Table = struct {
@@ -283,7 +283,8 @@ pub const Table = struct {
 };
 pub fn validate(input: Descriptor) Error!void {
     if (input.channel > 8 or input.handle == 0) return error.Handle;
-    if (input.physical == 0 or input.physical & 255 != 0 or input.bytes == 0 or input.bytes & 255 != 0 or
+    if (input.reserved_console and input.target != .vram) return error.Unsupported;
+    if ((input.physical == 0 and !input.reserved_console) or input.physical & 255 != 0 or input.bytes == 0 or input.bytes & 255 != 0 or
         input.physical >= @as(u64, 1) << 40 or input.bytes > (@as(u64, 1) << 40) - input.physical) return error.Bounds;
 }
 pub fn hash(channel: u32, handle: u32) usize {

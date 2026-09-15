@@ -938,3 +938,23 @@ notices accompany the derived codecs and the embedded/distributed
 Licenses/NVIDIA-GSP-RUNTIME-LICENSE.txt. R4OS resource ownership, bounded
 policy and common telemetry cache remain Apache-2.0. No additional firmware
 or Linux GPL implementation is imported.
+
+
+GPU reset and fault recovery (0.79.30)
+
+GA106 fault classification, PCIe function reset, GFW completion and the fixed
+GA102 configuration map follow MIT NVIDIA570.144 originals at commit
+8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f. Exact paths/hashes are recorded in
+ExFiles/Reference/GFX/0.79.30/Sources.json. Complete original notices accompany
+Licenses/NVIDIA-GSP-RUNTIME-LICENSE.txt and its distributed copy. The R4OS
+bounded worker, ownership/proof policy and common metadata remain Apache-2.0.
+No additional firmware binary or Linux/Windows implementation is imported.
+
+
+Reserved console restoration (0.79.30)
+
+The retained console-channel approach and BAR1 binding semantics also consult
+the pinned NVIDIA570.144 NVKMS console, console-memory and bus originals.
+Their full notices are included in NVIDIA-GSP-RUNTIME-LICENSE.txt. R4OS uses
+its own bounded snapshot restoration, lifetime checks and C67D integration;
+it does not import the host-only NV01_MEMORY_FRAMEBUFFER_CONSOLE as a GSP RPC.

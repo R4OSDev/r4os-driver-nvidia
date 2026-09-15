@@ -255,6 +255,42 @@ pub const Owner = struct {
         self.exchange = try exchange.Exchange.init(token, deadline);
         self.release = ticket; self.deadline = deadline; self.state = .destroying;
     }
+    pub fn acceptsAfterReset(self: *const Owner, ticket: a.GfxOwnedBufferRelease) bool {
+        return self.committed and self.common_live and self.closing and !self.reference_live and
+            ticket.version == 1 and ticket.size >= @sizeOf(a.GfxOwnedBufferRelease) and ticket.reserved0 == 0 and ticket.attempt != 0 and
+            std.meta.eql(ticket.buffer, self.reservation.buffer) and ticket.cookie == self.reservation.cookie and ticket.byte_length == self.bytes and
+            ticket.device_generation == self.reservation.device_generation and ticket.driver_generation == self.reservation.driver_generation and
+            ticket.adapter_id == self.adapter and ticket.driver_owner == self.reservation.driver_owner;
+    }
+    /// A reset destroys the complete RM address space. The common owner still
+    /// requires an exact release ticket, and its outstanding leases still veto
+    /// issuance. False means a ticket or one of those consumers remains held.
+    pub fn closeAfterReset(self: *Owner, proof: @import("gsp_reset.zig").Quiescence) Error!bool {
+        if ((self.self_address != 0 and self.self_address != @intFromPtr(self)) or
+            !proof.valid(self.binding.space.epoch) or self.exchange.session.epoch != self.binding.space.epoch or
+            !std.meta.eql(self.reservation, self.reservation_stamp) or
+            (self.failure != null and self.failure.? == error.Descriptor)) return error.Retained;
+        if (self.namespace_live) try self.exchange.session.rm_names.validateChildrenAfterReset(self.names, proof);
+        self.closing = true;
+        if (self.reference_live) {
+            if (!std.meta.eql(self.reference.reference, self.reservation.reference) or
+                self.memory.bufferRelease(&self.reference.reference) != a.gfx_buffer_result_ok) return error.Retained;
+            self.reference_live = false;
+        }
+        if (self.common_live) {
+            if (self.committed) {
+                if (self.release.attempt == 0) return false;
+                if (!self.acceptsAfterReset(self.release) or
+                    self.memory.bufferFinishRelease(&self.release, 1) != a.gfx_buffer_result_ok) return error.Retained;
+            } else if (self.memory.bufferAbort(&self.reservation, 1) != a.gfx_buffer_result_ok) return error.Retained;
+            self.common_live = false;
+        }
+        if (self.namespace_live) try self.exchange.session.rm_names.retireChildrenAfterReset(self.names, proof);
+        self.namespace_live = false;
+        self.physical = false; self.virtual = false; self.mapped = false;
+        self.physical_extent = null; self.state = .finished;
+        return true;
+    }
     pub fn handoff(self: *Owner) Error!boot.Handoff {
         try self.stable();
         if (self.state != .ready and self.state != .closed) return error.State;

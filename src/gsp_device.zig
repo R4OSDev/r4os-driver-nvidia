@@ -1,8 +1,8 @@
 //! Resident GA106 startup/runtime owner in serialized DriverInit/DriverWork.
 //! The separate bounded gsp_irq endpoint ACKs registers and signals its worker;
 //! queue/DMA mutation stays here under the actual boot hold and complete lease.
-//! The first implementation retains the device through poweroff: successful
-//! firmware teardown does not yet prove UEFI restoration or global DMA stop.
+//! Old DMA retires only after the bounded GA106 reset proof. Rebuilt native
+//! output or the restored reserved console keeps its new device graph resident.
 const std = @import("std");
 const r4os = @import("r4os");
 const a = r4os.abi;
@@ -23,9 +23,17 @@ const teardown = @import("gsp_teardown.zig");
 const runtime = @import("gsp_runtime.zig");
 const preboot = @import("gsp_preboot.zig");
 const irq = @import("gsp_irq.zig");
+const reset = @import("gsp_reset.zig");
+const console = @import("boot_console.zig");
 
-pub const Phase = enum { detached, frts, prepare, load, start, notifications, ready, recovering, failed };
+pub const Phase = enum { detached, frts, prepare, load, start, notifications, ready, recovering, resetting, retiring, failed };
 pub const Progress = enum { progress, idle, stopped };
+pub const RecoveryHooks = struct {
+    context: usize = 0,
+    // CPU-only restaging after old Port/Reader/RunMemory ownership retired.
+    // It must leave a fresh, unsubmitted RunMemory and matching log reader.
+    restage: *const fn (usize, *Device) anyerror!void,
+};
 pub const Device = struct {
     self_address: usize = 0,
     ctx: ?r4os.r4dev.DriverContext = null,
@@ -62,6 +70,21 @@ pub const Device = struct {
     irq_wake: ?irq.Wake = null,
     recovery_deadline: u64 = 0,
     recovery_started: bool = false,
+    reset_config: reset.Config = .{},
+    reset_config_failure: ?anyerror = null,
+    gpu_reset: reset.Reset = .{},
+    recovery_hooks: ?RecoveryHooks = null,
+    reset_binding: a.GfxBackendBinding = .{},
+    reset_original_display: u64 = 0,
+    reset_display: a.GfxNativeState = .{},
+    reset_retire_stage: enum { runtime, common, output, console_memory, port, reader, memory, restage, restart } = .runtime,
+    reset_to_console: bool = false,
+    boot_console: console.Owner = .{},
+    reset_retire_deadline: u64 = 0,
+    reset_frame_count: u8 = 2,
+    reset_audio_location: u32 = 0,
+    reset_audio_device: u32 = 0,
+    reset_audio_attached: bool = false,
     heads_reported: u32 = 0,
     tx: [transport.message.max_bytes]u8 = undefined,
     rx: [transport.message.max_bytes]u8 = undefined,
@@ -113,6 +136,11 @@ pub const Device = struct {
         errdefer _ = self.catalog.close();
         try self.checkLive(false);
         const original = display.operation.?.options;
+        self.reset_config.capture(&display.snapshot.?, original.boot0, original.boot1, self.resetIo()) catch |err| {
+            self.reset_config_failure = err;
+            @import("gsp_mode_diagnostics.zig").write(ctx,
+                "NVIDIA gpu-reset: capability=unavailable reason={s} scope=GA106-Fn0 initial-start=allowed", .{@errorName(err)});
+        };
         try self.port.openShared(ctx, &display.snapshot.?, original.boot0, original.boot1,
             .{ .epoch = self.epoch, .deadline_ns = deadline, .resume_args = inputs.resume_args },
             self.owner(), &display.registers);
@@ -170,8 +198,10 @@ pub const Device = struct {
         const progress = self.advance() catch |err| blk: {
             if (self.phase == .recovering) {
                 self.recovery_failure = err;
-                self.phase = .failed;
                 self.logFailure("teardown", err);
+                self.beginReset() catch |reset_error| self.resetFailed(reset_error);
+            } else if (self.phase == .resetting or self.phase == .retiring) {
+                self.resetFailed(err);
             } else self.fail(err);
             break :blk true;
         };
@@ -179,6 +209,36 @@ pub const Device = struct {
         return if (self.phase == .failed) .stopped else if (progress) .progress else .idle;
     }
     fn advance(self: *Device) !bool {
+        if (self.phase == .ready and self.display.?.firmware_restore_generation != 0 and !self.reset_to_console and self.gpu_reset.self_address == 0) {
+            self.reset_to_console = true;
+            self.fail(error.ConsoleRestore);
+            return true;
+        }
+        if (self.phase == .retiring) return self.retireAfterReset();
+        if (self.phase == .resetting) {
+            if (self.gpu_reset.self_address == 0) {
+                const current = self.ctx.?.resources().?.nowNs();
+                if (current == std.math.maxInt(u64) or current < self.last_clock or current >= self.reset_retire_deadline) return error.Timeout;
+                self.last_clock = current;
+                const display = self.ctx.?.graphicsDisplay() orelse return error.Api;
+                if (!display.supportsReset()) return error.Api;
+                const result = display.deviceReset(&self.reset_binding, self.reset_original_display, false, &self.reset_display);
+                if (result == a.gfx_output_error_busy) return false;
+                if (result != a.gfx_output_ok or !validResetState(self.reset_display) or self.reset_display.generation <= self.reset_original_display)
+                    return error.Handoff;
+                try self.display.?.boot.adoptReset(self.reset_display);
+                try self.gpu_reset.open(&self.reset_config, self.epoch, self.resetIo());
+                return true;
+            }
+            if (try self.gpu_reset.step()) {
+                self.phase = if (self.recovery_hooks != null) .retiring else .failed;
+                if (self.recovery_hooks != null)
+                    self.reset_retire_deadline = try std.math.add(u64, self.ctx.?.resources().?.nowNs(), 30 * std.time.ns_per_s);
+                @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,
+                    "NVIDIA gpu-reset: FLR=complete epoch={d} DMA=stopped bus-master=off resources=held display=unrestored", .{self.epoch});
+            }
+            return true;
+        }
         if (self.phase == .recovering) {
             if (!self.recovery_started) {
                 if (try self.now() >= self.recovery_deadline) return error.IrqRetirement;
@@ -188,16 +248,14 @@ pub const Device = struct {
                 return true;
             }
             if (try self.recovery.step()) {
-                self.phase = .failed;
-                self.ctx.?.logWarn("NVIDIA gsp-start: teardown=complete memory=retained display=held poweroff-required=yes");
-                @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,
-                    "NVIDIA native-restore: firmware=complete epoch={d} boot-mapping=unrestored DMA-quiescence=unproved resources=held", .{self.epoch});
+                try self.beginReset();
             }
             return true;
         }
         try self.checkLive(false);
         if (self.phase == .ready) {
             if (self.interrupts.failed()) return error.Interrupt;
+            if (self.running.failure) |err| return err;
             if (self.running.post.snapshot()) |inventory| {
                 if (self.interrupts.self_address == 0) {
                     if (try self.now() >= self.deadline) return error.Deadline;
@@ -333,6 +391,7 @@ pub const Device = struct {
         return true;
     }
     fn fail(self: *Device, err: anyerror) void {
+        if (self.boot_console.self_address != 0) self.boot_console.invalidate();
         if (self.failure == null) { self.failure = err; self.failed_phase = self.phase; }
         self.running.reportIrq(&self.interrupts); // Worker-side snapshot; no allocation or BO mutation in the IRQ.
         self.running.stop(err);
@@ -378,6 +437,241 @@ pub const Device = struct {
     }
 
     fn from(raw: *anyopaque) *Device { return @ptrCast(@alignCast(raw)); }
+    fn beginReset(self: *Device) !void {
+        if (!self.interrupts.close()) return error.IrqRetirement;
+        try self.reader.?.setPolling(false);
+        if (self.reset_config_failure) |err| return err;
+        if (self.gpu_reset.self_address != 0) return error.ResetLimit;
+        self.phase = .resetting;
+        self.reset_retire_deadline = try std.math.add(u64, self.ctx.?.resources().?.nowNs(), 5 * std.time.ns_per_s);
+        if (self.recovery_hooks == null) {
+            try self.gpu_reset.open(&self.reset_config, self.epoch, self.resetIo());
+        } else {
+            self.reset_original_display = if (self.reset_to_console) self.display.?.firmware_restore_generation
+                else if (self.display.?.boot.native_adopted) self.display.?.boot.native_generation else self.display_epoch;
+            self.reset_binding = if (self.running.copy_backend) |backend| backend.binding
+                else .{ .adapter_id = self.running.adapter_id, .milestone = a.gfx_queue_milestone_device_execution };
+            self.reset_frame_count = self.native_output.frame_count;
+            self.reset_audio_location = self.native_output.audio.location;
+            self.reset_audio_device = self.native_output.audio.device;
+            self.reset_audio_attached = self.native_output.audio.catalog != null;
+        }
+        @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,
+            "NVIDIA gpu-reset: attempt=1 scope=GA106-Fn0 epoch={d} original-phase={s} driver={s} firmware={s} resources=held display=held",
+            .{self.epoch,@tagName(self.failed_phase orelse .detached),@import("nvidia_identity").version,@import("firmware.zig").lock.rm_version});
+    }
+    fn validResetState(value: a.GfxNativeState) bool {
+        return value.version == 1 and value.size >= @sizeOf(a.GfxNativeState) and value.reserved0 == 0 and
+            value.generation != 0 and value.state == a.display_state_recovering and value.outcome == a.gfx_output_outcome_lost and value.retained == 1;
+    }
+    fn retireAfterReset(self: *Device) !bool {
+        const proof = self.gpu_reset.quiescence() orelse return error.Retained;
+        const current = self.ctx.?.resources().?.nowNs();
+        if (current == std.math.maxInt(u64) or current < self.last_clock or current >= self.reset_retire_deadline) return error.Timeout;
+        self.last_clock = current;
+        switch (self.reset_retire_stage) {
+            .runtime => {
+                if (!try self.running.closeAfterReset(proof)) return false;
+                self.reset_retire_stage = .common;
+            },
+            .common => {
+                const display = self.ctx.?.graphicsDisplay() orelse return error.Api;
+                var result: a.GfxNativeState = .{};
+                const status = display.deviceReset(&self.reset_binding, self.reset_display.generation, true, &result);
+                if (status == a.gfx_output_error_busy) return false;
+                if (status != a.gfx_output_ok or !validResetState(result) or result.generation != self.reset_display.generation) return error.Handoff;
+                self.reset_retire_stage = .output;
+            },
+            .output => {
+                if (!try self.native_output.closeAfterReset(proof)) return false;
+                self.native_graphics = .{};
+                self.render_startup = .{};
+                self.reset_retire_stage = if (self.reset_to_console) .console_memory else .port;
+            },
+            .console_memory => {
+                if (self.boot_console.self_address == 0) try self.boot_console.open(self.vram.?, proof, self.consoleIo());
+                if (!try self.boot_console.stage(proof)) return false;
+                self.reset_retire_stage = .port;
+            },
+            .port => {
+                if (!self.port.closeAfterReset(proof)) return false;
+                self.reset_retire_stage = .reader;
+            },
+            .reader => {
+                if (!self.reader.?.close()) return false;
+                self.reset_retire_stage = .memory;
+            },
+            .memory => {
+                if (!self.memory.?.releaseAfterReset(proof)) return false;
+                self.reset_retire_stage = .restage;
+            },
+            .restage => {
+                const hooks = self.recovery_hooks orelse return error.Api;
+                try hooks.restage(hooks.context, self);
+                if (self.memory.?.generation() <= self.epoch or self.reader.?.generation() != self.memory.?.generation()) return error.Stale;
+                try self.reader.?.setPolling(false);
+                self.reset_retire_stage = .restart;
+            },
+            .restart => {
+                // Every old GPU/DMA borrower has consumed its proof. Revoke
+                // that proof before the first potentially posted DMA enable.
+                try self.gpu_reset.resumeDma();
+                self.epoch = self.memory.?.generation();
+                if (self.reset_to_console) try self.boot_console.activate(self.epoch);
+                const journal = self.running.faults;
+                const adapter = self.running.adapter_id;
+                self.running = .{};
+                self.running.adapter_id = adapter;
+                self.running.faults = journal;
+                // Keep the first failure and every diagnostic record, but
+                // the retired generation's fatal delivery is now consumed.
+                self.running.faults.pending = false;
+                if (self.board) |*board| self.running.outputs.board = board;
+                self.session = null; self.boot = null; self.sequence = null; self.handoff = null;
+                self.frts_result = null; self.load_result = null; self.expected_firmware = null;
+                self.recovery = .{}; self.recovery_started = false;
+                self.interrupts = .{}; self.heads_reported = 0;
+                self.deadline = try std.math.add(u64, current, 30 * std.time.ns_per_s);
+                const inputs = try self.memory.?.inputs();
+                const original = self.display.?.operation.?.options;
+                try self.port.openShared(&self.ctx.?, &self.display.?.snapshot.?, original.boot0, original.boot1,
+                    .{ .epoch = self.epoch, .deadline_ns = self.deadline, .resume_args = inputs.resume_args }, self.owner(), &self.display.?.registers);
+                self.catalog = .{};
+                try self.catalog.open(&self.ctx.?, adapter);
+                try self.native_output.requestAfterReset(&self.ctx.?, &self.running, self.display.?, self.reset_display.generation);
+                if (self.reset_to_console) {
+                    self.native_output.console = &self.boot_console;
+                    self.display.?.firmware_recovery = .{ .context = self.self_address, .callback = consoleRestored };
+                }
+                self.native_output.frame_count = self.reset_frame_count;
+                if (self.reset_audio_attached) self.native_output.audio = .{ .catalog = &self.catalog,
+                    .location = self.reset_audio_location, .device = self.reset_audio_device };
+                var payloads: preboot.Payloads = .{};
+                try preboot.encode(&self.display.?.snapshot.?, self.display.?.original_boot.?.byte_length, &payloads);
+                self.session = try transport.Session.init(try self.port.transportPort(), .{ .chip_id = 0x176 }, self.epoch, &self.tx, &self.rx);
+                try self.port.preloadInit(&self.session.?, &payloads.system, &payloads.registry);
+                try self.reader.?.setPolling(true);
+                try self.beginFirmware(.frts, &inputs);
+                @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,
+                    "NVIDIA gpu-reset: restart epoch={d} display-generation={d} boot-hold={d} renderer=software DMA=new-generation",
+                    .{self.epoch,self.reset_display.generation,self.display_epoch});
+            },
+        }
+        return true;
+    }
+    fn resetFailed(self: *Device, err: anyerror) void {
+        if (self.boot_console.self_address != 0) self.boot_console.invalidate();
+        self.recovery_failure = err;
+        self.phase = .failed;
+        self.logFailure("reset", err);
+        self.ctx.?.logError("NVIDIA recovery: reset-limit=1 automatic-retry=stopped; next boot: select R4OS Software Graphics in Limine (r4os.graphics=software); SSH/serial remain independent");
+    }
+    fn consoleIo(self: *Device) console.Io {
+        return .{ .context = self, .generation = resetGeneration, .now_ns = resetNow, .read32 = consoleRead, .write32 = consoleWrite };
+    }
+    fn consoleRead(raw: *anyopaque, address: u32) !u32 {
+        const self = from(raw);
+        const pramin = @import("pramin.zig");
+        const bar1 = @import("bar1_reader.zig");
+        if (self.self_address != @intFromPtr(self) or self.stopped or !self.reset_to_console or
+            self.display.?.firmware_owner != self.self_address or address & 3 != 0 or
+            (address != 0 and address != 4 and address != pramin.window_register and
+                address != bar1.block_register and address != bar1.bind_register and
+                !(address >= pramin.aperture and address < pramin.aperture + pramin.aperture_bytes))) return error.Register;
+        const view = try self.display.?.register_access.view(address, 4);
+        const pointer: *volatile u32 = @ptrFromInt(view.cpu_address);
+        asm volatile ("mfence" ::: .{ .memory = true });
+        const value = pointer.*;
+        asm volatile ("mfence" ::: .{ .memory = true });
+        return value;
+    }
+    fn consoleWrite(raw: *anyopaque, address: u32, value: u32) !void {
+        const self = from(raw);
+        const pramin = @import("pramin.zig");
+        const block = @import("bar1_reader.zig").block_register;
+        const stopped = self.phase == .retiring and self.reset_retire_stage == .console_memory and self.gpu_reset.quiescence() != null;
+        const binding_console = self.phase == .ready and self.native_output.phase == .console_mapping and self.boot_console.phase == .bind;
+        if ((!stopped and !binding_console and !(self.phase == .ready and self.native_output.phase == .console_mapping and address == pramin.window_register)) or
+            (address != pramin.window_register and !(binding_console and address == block) and
+                !(stopped and address >= pramin.aperture and address < pramin.aperture + pramin.aperture_bytes))) return error.Register;
+        _ = try consoleRead(raw, address);
+        const view = try self.display.?.register_access.view(address, 4);
+        const pointer: *volatile u32 = @ptrFromInt(view.cpu_address);
+        asm volatile ("mfence" ::: .{ .memory = true });
+        pointer.* = value;
+        asm volatile ("mfence" ::: .{ .memory = true });
+    }
+    fn consoleRestored(raw: u64, generation_value: u64, description: *const a.GfxNativeBootInfo) callconv(.c) i32 {
+        const self: *Device = @ptrFromInt(raw);
+        if (self.self_address != raw or self.stopped or self.phase != .ready or self.native_output.phase != .console_handoff or
+            generation_value < self.reset_display.generation or description.state != a.display_state_recovering) return 0;
+        self.native_output.validateConsoleCompletion() catch return 0;
+        self.boot_console.callback_generation = generation_value;
+        return @intFromBool(self.boot_console.authorize(generation_value, description));
+    }
+    fn resetIo(self: *Device) reset.Io {
+        return .{ .context = self, .generation = resetGeneration, .now_ns = resetNow, .admit = admitReset,
+            .pci_read = resetPciRead, .pci_write = resetPciWrite, .read32 = resetRead, .write32 = resetWrite };
+    }
+    fn resetGeneration(raw: *anyopaque) u64 {
+        const self = from(raw);
+        return if (self.self_address == @intFromPtr(self) and !self.stopped) self.epoch else 0;
+    }
+    fn resetNow(raw: *anyopaque) u64 {
+        const self = from(raw);
+        return if (self.ctx.?.resources()) |clock| clock.nowNs() else std.math.maxInt(u64);
+    }
+    fn admitReset(raw: *anyopaque, epoch: u64) !void {
+        const self = from(raw);
+        const held = self.display orelse return error.Binding;
+        if (self.self_address != @intFromPtr(self) or self.stopped or (self.phase != .resetting and self.phase != .retiring) or
+            self.failure == null or self.epoch != epoch or held.self_address != @intFromPtr(held) or
+            held.firmware_owner != self.self_address or held.borrower != @intFromPtr(self.vram.?) or
+            held.boot.held_generation != self.display_epoch or !held.register_access.valid() or
+            (self.interrupts.self_address != 0 and !self.interrupts.closed) or
+            self.reader.?.enabled or self.reader.?.busy) return error.Binding;
+    }
+    fn resetPciRead(raw: *anyopaque, offset: u16) !u32 {
+        const self = from(raw);
+        if (self.self_address != @intFromPtr(self) or self.stopped or offset >= 4096 or offset & 3 != 0) return error.State;
+        const pci = self.display.?.snapshot.?.pci;
+        if (pci.bus_kind != 2 or pci.function != 0) return error.Unsupported;
+        return self.ctx.?.api.pci_read_config32(pci.bus_kind, pci.bus, pci.device, pci.function, offset);
+    }
+    fn resetPciWrite(raw: *anyopaque, offset: u16, value: u32) !void {
+        const self = from(raw);
+        try admitReset(raw, self.epoch);
+        if (offset != 4 and offset != reset.reg.device_control and offset != reset.reg.downstream and
+            !(offset >= 0x10 and offset <= 0x24 and offset & 3 == 0)) return error.Register;
+        const pci = self.display.?.snapshot.?.pci;
+        if (self.ctx.?.api.pci_write_config32(pci.bus_kind, pci.bus, pci.device, pci.function, offset, value) != 0)
+            return error.Configuration;
+    }
+    fn resetRead(raw: *anyopaque, address: u32) !u32 {
+        const self = from(raw);
+        try admitReset(raw, self.epoch);
+        if (address != 0 and address != 4 and address != core.reg.cpuctl and
+            address != reset.reg.gfw_permission and address != reset.reg.gfw_progress) return error.Register;
+        const view = try self.display.?.register_access.view(address, 4);
+        const pointer: *volatile u32 = @ptrFromInt(view.cpu_address);
+        asm volatile ("mfence" ::: .{ .memory = true });
+        const value = pointer.*;
+        asm volatile ("mfence" ::: .{ .memory = true });
+        return value;
+    }
+    fn resetWrite(raw: *anyopaque, address: u32, value: u32) !void {
+        const self = from(raw);
+        try admitReset(raw, self.epoch);
+        if (address < reset.reg.config_base or address >= reset.reg.config_base + 4096 or
+            !reset.layout.contains(&reset.layout.writable, @intCast(address - reset.reg.config_base)) or
+            address == reset.reg.config_base + 4) return error.Register;
+        const view = try self.display.?.register_access.view(address, 4);
+        const pointer: *volatile u32 = @ptrFromInt(view.cpu_address);
+        asm volatile ("mfence" ::: .{ .memory = true });
+        pointer.* = value;
+        asm volatile ("mfence" ::: .{ .memory = true });
+        if (try resetPciRead(raw, 0) != self.reset_config.identity_word) return error.IdentityChanged;
+    }
     fn checkLive(self: *Device, recovering: bool) !void {
         if (self.self_address == 0 or self.self_address != @intFromPtr(self) or self.stopped) return error.State;
         const display = self.display orelse return error.Binding;
@@ -394,7 +688,10 @@ pub const Device = struct {
         const original = display.original_boot orelse return error.Binding;
         var current: a.GfxNativeBootInfo = .{};
         if (display.boot.display.?.bootInfo(&current) != a.gfx_output_ok or
-            !((current.state == a.display_state_preparing and current.generation == original.generation) or self.native_output.ownsNative(current)) or
+            !((current.state == a.display_state_preparing and current.generation == original.generation) or
+                (self.reset_display.generation != 0 and current.generation == self.reset_display.generation and
+                    (current.state == a.display_state_recovering or current.state == a.display_state_preparing)) or
+                self.native_output.ownsNative(current) or self.native_output.ownsPreparing(current) or self.native_output.ownsConsole(current)) or
             current.physical_address != original.physical_address or
             current.byte_length != original.byte_length or current.width != original.width or
             current.height != original.height or current.pitch != original.pitch or current.format != original.format) return error.Display;
@@ -425,8 +722,9 @@ pub const Device = struct {
     }
     fn quiesced(raw: *anyopaque) bool {
         const self = from(raw);
-        // Deliberately no post-submit success until full device and UEFI
-        // restoration have real implementations and hardware evidence.
+        // This predicate admits old transport/MMIO cleanup only. The boot
+        // display owner separately requires its own scanout/mapping proof.
+        if (self.gpu_reset.quiescence() != null) return true;
         return !self.memory.?.retained and self.display.?.firmware_owner == 0;
     }
     fn polling(raw: *anyopaque, enabled: bool) !void {

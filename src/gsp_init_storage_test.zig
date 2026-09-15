@@ -1357,6 +1357,9 @@ const DeviceModel = struct {
     var restore_logs: usize = 0;
     fn log(text: [*:0]const u8) callconv(.c) void {
         const line = std.mem.span(text);
+        if ((ControlModel.is("context_native_reset") or ControlModel.is("context_native_console")) and
+            (std.mem.startsWith(u8, line, "NVIDIA gsp-start: failed=") or std.mem.startsWith(u8, line, "NVIDIA gpu-reset:")))
+            std.debug.print("{s}\n", .{line});
         if (std.mem.startsWith(u8, line, "NVIDIA gsp-receiver:")) receiver_logs += 1;
         if (std.mem.startsWith(u8, line, "NVIDIA gsp-ddc:")) ddc_logs += 1;
         if (std.mem.startsWith(u8, line, "NVIDIA gsp-aux:")) aux_logs += 1;
@@ -1381,8 +1384,11 @@ const DeviceModel = struct {
             if (words[(base + 0x1668) / 4] == 0) words[(base + 0x1668) / 4] = 1;
             if (words[(base + 0x3c0) / 4] & 1 != 0 and base == hs.reg.gsp)
                 words[core.reg.riscv_cpuctl / 4] = core.bits.halted;
-            if (words[(base + hs.reg.cpu_alias) / 4] == core.bits.start) {
+            if (words[(base + hs.reg.cpu_alias) / 4] == core.bits.start or words[(base + hs.reg.cpu_control) / 4] == core.bits.start) {
                 words[(base + hs.reg.cpu_alias) / 4] = 0;
+                // The reset model can leave the CPU without the alias bit.
+                // Model both documented start registers, as the driver does.
+                words[(base + hs.reg.cpu_control) / 4] = (words[(base + hs.reg.cpu_control) / 4] & hs.bits.cpu_alias) | hs.bits.cpu_halted;
                 if (base == hs.reg.gsp and words[core.reg.bcr / 4] & core.bits.bcr_riscv != 0) {
                     words[core.reg.riscv_cpuctl / 4] = core.bits.active;
                 } else if (base == hs.reg.gsp) {
@@ -1494,11 +1500,11 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
     table.pci_disable_msi = IrqModel.disableMsi;
     table.irq_register = IrqModel.register;
     table.irq_unregister = IrqModel.unregister;
-    var snapshot: identity.Snapshot = .{ .pci = .{ .vendor_id = 0x10de, .device_id = 0x2504, .class_code = 3 }, .command = 7 };
-    snapshot.bars[0] = .{ .kind = .memory32, .base = 0xfb000000, .bytes = words.len * 4 };
-    snapshot.bars[1] = .{ .kind = .memory64, .base = 0xd0000000, .bytes = 0x10000000 };
+    var snapshot: identity.Snapshot = .{ .pci = .{ .bus_kind = 2, .vendor_id = 0x10de, .device_id = 0x2504, .class_code = 3 }, .command = 7 };
+    snapshot.bars[0] = .{ .raw = 0xfb000000, .kind = .memory32, .base = 0xfb000000, .bytes = words.len * 4 };
+    snapshot.bars[1] = .{ .raw = 0xd000000c, .kind = .memory64, .base = 0xd0000000, .bytes = 0x10000000 };
     snapshot.bars[2] = .{ .kind = .upper };
-    snapshot.bars[3] = .{ .kind = .memory64, .base = 0xe0000000, .bytes = 0x2000000 };
+    snapshot.bars[3] = .{ .raw = 0xe000000c, .kind = .memory64, .base = 0xe0000000, .bytes = 0x2000000 };
     snapshot.bars[4] = .{ .kind = .upper };
     const chip = identity.chip(0xb76000a1, 0).?;
     capture.snapshot = snapshot;
@@ -1579,7 +1585,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         context_display_present, context_display_present_timeout, context_display_present_fault,
         context_display_present_initial_timeout, context_display_present_initial_fault, context_display_present_initial_release,
         context_display_present_initial_acquire, context_display_present_initial_retry,
-        context_native_unknown, context_native_connected, context_native_connected_primary_timeout, context_native_dp, context_native_jobs, context_native_job_timeout, context_native_prepare_reject,
+        context_native_unknown, context_native_reset, context_native_console, context_native_connected, context_native_connected_primary_timeout, context_native_dp, context_native_jobs, context_native_job_timeout, context_native_prepare_reject,
         context_native_flip_irq_timeout, context_native_flip_notifier_timeout, context_native_flip_release_timeout,
         context_native_frame_timeout,
         context_native_cursor_timeout, context_native_cursor_reject,
@@ -1594,6 +1600,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         display_dma_pushbuffer, display_dma_allocate, display_dma_ack, display_dma_free, display_dma_busy, display_dma_release, display_dma_fault,
         outputs_empty, outputs_all, outputs_rejected, outputs_partial, outputs_missing, outputs_incomplete, outputs_bad_edid,
         outputs_edid_rejected, outputs_ddc, outputs_ddc_bus_changed, outputs_aux, outputs_wiring, outputs_virtual, outputs_changed, outputs_final_changed, outputs_final_rejected, outputs_hpd, outputs_sequence, outputs_ack, outputs_timeout, catalog_rejected,
+        gpu_reset_success, gpu_reset_gfw_timeout,
         runtime_healthy, runtime_lockdown, runtime_unknown, runtime_unowned, runtime_sequence_timeout,
         runtime_log_failure, runtime_moving_log };
     for (std.enums.values(Case)) |case| {
@@ -1623,9 +1630,14 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         CatalogModel.reject = case == .catalog_rejected;
         IrqModel.reset();
         target.irq_wake = .{ .context = @intFromPtr(target), .signal = IrqModel.wake };
+        const reset_case = case == .gpu_reset_success or case == .gpu_reset_gfw_timeout;
+        const reset_capable = reset_case or case == .context_native_reset or case == .context_native_console;
+        capture.snapshot.?.caps.pcie = if (reset_capable) 0x78 else 0;
+        capture.snapshot.?.caps.power_state = if (reset_capable) 0 else null;
         capture.snapshot.?.caps.msi = if (case == .irq_intx) 0 else 0x68;
         capture.snapshot.?.interrupt_line = 11;
         capture.snapshot.?.interrupt_pin = 1;
+        if (reset_capable) ResetDeviceModel.install(table, words, &capture.snapshot.?);
         if (case == .old_api) {
             table.version = a.driver_api_thread_work_version - 1;
             try t.expectError(error.Api, target.open(ctx, capture, held, lease, &reader, null));
@@ -1740,6 +1752,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
             try checkDeviceStatic(target, words, held.plan.?.frts.offset, case);
             if (target.phase == .ready) try checkDevicePostInit(target, words, held.plan.?.frts.offset, case);
             if (target.phase == .ready) try checkDeviceIrq(target, words, held.plan.?.frts.offset, case);
+            if (reset_case) try checkDeviceReset(target, words, held.plan.?.frts.offset, case == .gpu_reset_gfw_timeout);
             if (target.phase == .ready and !target.stopped) try checkDeviceRm(target, words, held.plan.?.frts.offset, case);
             if (target.phase == .ready and std.mem.startsWith(u8, @tagName(case), "power_")) try checkDevicePower(target);
             if (target.phase == .ready and std.mem.startsWith(u8, @tagName(case), "mapping_")) try checkDeviceMappings(target, table, @tagName(case));
@@ -1761,6 +1774,26 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         }
         try t.expect(!target.closeBeforeSubmission() and !capture.close() and !lease.releaseBeforeSubmission());
         try t.expect(!CatalogModel.active and CatalogModel.count == 0 and lease.retained);
+        if (case == .gpu_reset_success) {
+            const proof = target.gpu_reset.quiescence() orelse return error.NoResetProof;
+            var reset_slices: usize = 0;
+            while (!try target.running.closeAfterReset(proof)) : (reset_slices += 1) {
+                try t.expect(reset_slices < 2000);
+            }
+            try t.expect(ControlModel.reset_losses == 3 and target.running.faults.first_fatal.?.kind == .timeout);
+            // The real old port/reader/execution chain consumes the proof,
+            // then its copied facade cannot address a new queue generation.
+            var old_queue = lease.queue;
+            const b = lease.boot_storage.?; const i = lease.init_storage.?;
+            const f = lease.fwsec_storage.?; const s = lease.fwsec_sb_storage.?; const p = lease.booter_storage.?;
+            try t.expect(!lease.releaseAfterReset(proof)); // reader is still borrowed
+            try t.expect(target.port.closeAfterReset(proof));
+            try t.expect(reader.close() and lease.releaseAfterReset(proof));
+            try t.expect(old_queue.generation() == 0 and i.queue_epoch == 0 and !i.device_access and
+                b.execution_owner == 0 and i.execution_owner == 0 and f.device.execution_owner == 0);
+            try lease.acquire(ctx, b, i, f, s, p);
+            try t.expect(lease.queue.epoch > proof.epoch and old_queue.generation() == 0 and !lease.releaseAfterReset(proof));
+        }
         // Remove injected routing/retirement failures only for host disposal.
         // Production retains the entire mapping graph on these failures.
         IrqModel.unregister_result = 0;
@@ -1770,6 +1803,8 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         // release or replay operation; neither model success nor halt is proof.
         capture.boot.held_generation = original_epoch;
         capture.firmware_owner = 0;
+        capture.firmware_restore_generation = 0;
+        capture.firmware_recovery = null;
         lease.retained = false;
         lease.failed = false;
         lease.recovery_owner = 0;
@@ -1884,9 +1919,12 @@ fn checkDeviceStatic(target: *@import("gsp_device.zig").Device, words: []u32, fr
         try t.expect(memory.epoch == session.epoch and memory.boot_epoch == target.vram.?.epoch);
         try t.expect(memory.reported_bytes == physical and memory.physical_bytes == physical and memory.region_bytes == physical and memory.region_holes == 0);
         try t.expect(memory.speculative_reserved == 4096 and memory.firmware_layout_matches and !memory.rebar_present);
-        try t.expect(memory.surface_extents == 1 and memory.table_pages == 0 and memory.instance_active and memory.payload_extents == 0);
-        try t.expect(memory.retained_count == 4 and memory.retained_bytes == target.vram.?.plan.?.reserved.bytes + 131072 + 65536 + 4096);
-        try t.expect(memory.screened_bytes == physical / 2 - 131072 - 65536 - 4096);
+        const saved_mapping = target.vram.?.boot_mapping.?;
+        try t.expect(memory.surface_extents == 1 and memory.table_pages == saved_mapping.page_count and memory.instance_active and memory.payload_extents == 0);
+        const retained = 131072 + 65536 + saved_mapping.surface_bytes + saved_mapping.page_count * 4096;
+        try t.expect(memory.retained_count == 4 + @as(usize, @intFromBool(saved_mapping.page_count != 0)) and
+            memory.retained_bytes == target.vram.?.plan.?.reserved.bytes + retained);
+        try t.expect(memory.screened_bytes == physical / 2 - retained);
         try t.expect(memory.windows[1].base == 0xd0000000 and memory.windows[1].bytes == 0x10000000 and memory.windows[1].status == .measured);
         try t.expect(memory.windows[2].pci_index == 3 and memory.windows[2].bytes == 0x2000000);
         try t.expect(DeviceModel.memory_logs == memory_logs + 2 and DeviceModel.region_logs == region_logs + 2 and DeviceModel.aperture_logs == aperture_logs + 3);
@@ -2087,6 +2125,126 @@ fn checkDevicePostInit(target: *@import("gsp_device.zig").Device, words: []u32, 
     }
     try t.expect(recovery_steps < 12000 and target.phase == .failed and target.recovery.report != null and target.memory.?.retained);
     try t.expect(std.meta.eql(receipt, session.pending) and post.snapshot() == null and !target.reader.?.enabled);
+}
+
+const ResetDeviceModel = struct {
+    const reset = @import("gsp_reset.zig");
+    var words: []u32 = undefined;
+    var triggered_at: u64 = 0;
+    var triggers: u32 = 0;
+    var writes: u32 = 0;
+    var effect: ?*const fn () void = null;
+    fn install(table: *a.DriverApi, backing_words: []u32, snapshot: *const @import("identity.zig").Snapshot) void {
+        words = backing_words; triggered_at = 0; triggers = 0; writes = 0; effect = null;
+        const config = words[reset.reg.config_base / 4 ..][0..1024];
+        @memset(config, 0);
+        config[0] = 0x250410de; config[1] = 7;
+        for (&snapshot.bars, 0..) |*bar, index| config[4 + index] = bar.raw;
+        config[0x78 / 4] = 0x10;
+        config[reset.reg.device_capability / 4] = 1 << 28;
+        config[snapshot.caps.msi / 4] = 5;
+        table.pci_read_config32 = read;
+        table.pci_write_config32 = write;
+    }
+    fn access(kind: u8, bus: u8, device: u8, function: u8, offset: u16) void {
+        std.debug.assert(kind == 2 and bus == 0 and device == 0 and function == 0 and offset < 4096 and offset & 3 == 0);
+        std.debug.assert(triggered_at == 0 or clock - triggered_at >= reset.quiet_ns);
+    }
+    fn read(kind: u8, bus: u8, device: u8, function: u8, offset: u16) callconv(.c) u32 {
+        access(kind, bus, device, function, offset);
+        const index = (reset.reg.config_base + offset) / 4;
+        if (offset == reset.reg.downstream) words[index] &= ~@as(u32, 1 << 9);
+        return words[index];
+    }
+    fn write(kind: u8, bus: u8, device: u8, function: u8, offset: u16, value: u32) callconv(.c) i32 {
+        access(kind, bus, device, function, offset);
+        std.debug.assert(!IrqModel.in_irq and IrqModel.handler == null and !IrqModel.msi_enabled);
+        writes += 1;
+        const index = (reset.reg.config_base + offset) / 4;
+        if (offset == reset.reg.device_control) {
+            std.debug.assert(value & 0xffff8000 == 0x8000 and words[(reset.reg.config_base + 4) / 4] & 4 == 0);
+            triggers += 1; triggered_at = clock;
+            words[index] = 0;
+            words[(reset.reg.config_base + 4) / 4] = 0;
+            if (effect) |apply| apply();
+        } else words[index] = value;
+        return 0;
+    }
+};
+const ResetStorageFixture = struct {
+    // Only the addresses of surviving CPU storage are copied. No operation
+    // uses this old execution lease as an owner after its real retirement.
+    previous: @import("gsp_run_memory.zig").Lease,
+    calls: usize = 0,
+    fn restage(raw: usize, target: *@import("gsp_device.zig").Device) !void {
+        const self: *ResetStorageFixture = @ptrFromInt(raw);
+        const previous = &self.previous;
+        const storage = previous.init_storage.?;
+        try t.expect(self.calls == 0 and target.phase == .retiring and target.reset_retire_stage == .restage and
+            target.memory.?.self_address == 0 and target.reader.?.self_address == 0 and target.gpu_reset.quiescence() != null and
+            storage.execution_owner == 0 and storage.queue_epoch == 0 and !storage.device_access and previous.queue.generation() == 0);
+        // Reuse is allowed only after all old borrowers have consumed the
+        // physical stop proof. Encode the real release-specific clean queues.
+        var spans: [a.dma_max_segments]init.Span = undefined;
+        const queue = storage.pieces[6].mapping;
+        for (queue.segments[0..queue.segment_count], 0..) |segment, index|
+            spans[index] = .{ .address = segment.phys_addr, .bytes = segment.bytes };
+        const args = storage.pieces[0].mapping.segments[0].phys_addr;
+        var bindings: init.Bindings = .{ .chip_id = 0x176,
+            .libos = .{ .address = args, .bytes = 4096 }, .rm = .{ .address = args + 4096, .bytes = 4096 },
+            .logs = undefined, .queues = spans[0..queue.segment_count] };
+        for (&bindings.logs, 0..) |*span, index|
+            span.* = .{ .address = storage.pieces[index + 1].mapping.segments[0].phys_addr, .bytes = init.log_bytes };
+        const output: [*]u8 = @ptrFromInt(storage.allocation.cpu_address);
+        storage.report.?.init = try init.encode(&bindings, output[0..init.output_bytes]);
+        try t.expect(sync_calls == storage.piece_count);
+        sync_calls = 0; // A new complete synchronization round over retained CPU storage.
+        for (storage.pieces[0..storage.piece_count]) |*piece|
+            try t.expect(target.ctx.?.syncDmaForDevice(&piece.mapping) == 0);
+        try target.memory.?.acquire(&target.ctx.?, previous.boot_storage.?, storage,
+            previous.fwsec_storage.?, previous.fwsec_sb_storage.?, previous.booter_storage.?);
+        try target.reader.?.open(target.memory.?);
+        self.calls += 1;
+    }
+};
+fn checkDeviceReset(target: *@import("gsp_device.zig").Device, words: []u32, frts: u64, gfw_timeout: bool) !void {
+    try t.expect(target.reset_config.valid() and target.reset_config_failure == null);
+    const old_epoch = target.epoch;
+    // The same logical stop used by failed submissions; Device must preserve
+    // its Timeout cause instead of replacing it with a subsequent State error.
+    target.running.stop(error.Timeout);
+    _ = target.step();
+    try t.expect(target.phase == .recovering and target.failure != null and
+        target.failure.? == (if (target.reset_to_console) error.ConsoleRestore else error.Timeout) and target.failed_phase == .ready);
+    var count: usize = 0;
+    while (target.phase != .failed and target.phase != .retiring and count < 4000) : (count += 1) {
+        clock += std.time.ns_per_ms;
+        if (target.phase == .recovering) DeviceModel.tick(words, frts, false);
+        if (target.phase == .resetting) {
+            words[@import("gsp_core.zig").reg.cpuctl / 4] = @import("gsp_core.zig").bits.halted;
+            words[0x118128 / 4] = 1;
+            words[0x118234 / 4] = if (gfw_timeout) 0 else 0xff;
+            if (gfw_timeout and target.gpu_reset.phase == .gfw) clock = target.gpu_reset.deadline;
+        }
+        _ = target.step();
+    }
+    const expected: @import("gsp_device.zig").Phase = if (target.recovery_hooks != null and !gfw_timeout) .retiring else .failed;
+    try t.expect(count < 4000 and target.phase == expected and target.epoch == old_epoch and
+        target.memory.?.retained and target.display.?.firmware_owner == @intFromPtr(target));
+    try t.expect(target.running.faults.first_fatal.?.kind == .timeout);
+    try t.expect(ResetDeviceModel.triggers == 1 and !target.reader.?.enabled and target.interrupts.closed);
+    if (gfw_timeout) {
+        try t.expect(target.gpu_reset.quiescence() == null and target.gpu_reset.failure != null and target.gpu_reset.failure.? == error.Timeout);
+        try t.expect(!target.port.close() and !target.memory.?.releaseBeforeSubmission());
+    } else {
+        const proof = target.gpu_reset.quiescence() orelse return error.NoResetProof;
+        try t.expect(proof.valid(old_epoch) and !proof.valid(old_epoch + 1));
+        try t.expect(target.gpu_reset.phase == .complete and words[(0x88000 + 4) / 4] & 4 == 0);
+    }
+    if (target.phase == .failed) {
+        const write_count = ResetDeviceModel.writes;
+        try t.expect(target.step() == .stopped and ResetDeviceModel.writes == write_count);
+    }
 }
 
 const IrqModel = struct {
@@ -2357,6 +2515,7 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
     const status = init.queues_offset + init.status_offset;
     const original_sequence = session.tx_sequence;
     const vaspace_logs = DeviceModel.vaspace_logs;
+    const control_releases = ControlModel.releases;
     try t.expect(running.nativeAddressSpace() == null);
     var requests: usize = 0;
     var creates: usize = 0;
@@ -2612,7 +2771,7 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
                 graph.control_buffer.?.caps.?.binding.epoch += 1;
                 try t.expect(running.nativeMemoryCapabilities() == null and running.nativeControlBuffer() == null);
                 graph.control_buffer.?.caps.?.binding.epoch -= 1;
-                try t.expect(ControlModel.active and ControlModel.synced and ControlModel.releases == 0);
+                try t.expect(ControlModel.active and ControlModel.synced and ControlModel.releases == control_releases);
                 try t.expect(!graph.control_buffer.?.backing.close());
                 const backing_owner = &graph.control_buffer.?.backing;
                 const original_page = backing_owner.pages[0];
@@ -2625,7 +2784,7 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
                 graph.address_space.?.info.?.handle -= 1;
                 try t.expect(running.nativeControlBuffer() != null);
             } else {
-                try t.expect(ControlModel.releases == @as(usize, if (scenario == .memory_caps_reject) 0 else 1) and !ControlModel.active and !ControlModel.cpu_mapped and !ControlModel.mapped);
+                try t.expect(ControlModel.releases == control_releases + @as(usize, if (scenario == .memory_caps_reject) 0 else 1) and !ControlModel.active and !ControlModel.cpu_mapped and !ControlModel.mapped);
                 try t.expect(graph.control_buffer.?.rejected != null or graph.control_buffer.?.host_rejected != null);
                 if (scenario == .memory_caps_reject) try t.expect(caps_requests == 1 and buffer_requests == 0 and buffer_frees == 0 and running.nativeMemoryCapabilities() == null);
             }
@@ -3171,7 +3330,10 @@ const NativeCommon = struct {
     var scenario: []const u8 = "";
     fn is(name: []const u8) bool {
         return std.mem.eql(u8, scenario, name) or (std.mem.eql(u8, name, "context_native_connected") and
-            std.mem.eql(u8, scenario, "context_native_connected_primary_timeout"));
+            std.mem.eql(u8, scenario, "context_native_connected_primary_timeout")) or
+            ((std.mem.eql(u8, name, "context_native_unknown") or std.mem.eql(u8, name, "context_native_reset")) and
+                std.mem.eql(u8, scenario, "context_native_console")) or
+            (std.mem.eql(u8, name, "context_native_unknown") and std.mem.eql(u8, scenario, "context_native_reset"));
     }
     fn hasModes() bool { return is("context_native_jobs") or is("context_native_job_timeout"); }
     fn additionalConnector() u32 { return if (NativeMst.enabled) 16 else 8; }
@@ -3208,11 +3370,48 @@ const NativeCommon = struct {
     fn display(out: *a.GfxDriverDisplayApi) callconv(.c) i32 {
         out.* = .{ .boot_info = @intFromPtr(&DeviceModel.bootInfo), .prepare_held = @intFromPtr(&prepare), .transition = @intFromPtr(&transition),
             .presentation_stats = @intFromPtr(&presentationStats), .presentation_info = @intFromPtr(&presentationInfo) };
+        if (is("context_native_reset")) {
+            out.device_reset = @intFromPtr(&deviceReset);
+            out.prepare_reset = @intFromPtr(&prepareReset);
+        }
         if (is("context_native_connected")) { out.size = 64; out.presentation_stats = 0; }
         if (is("context_native_cursor_common")) {
             out.cursor_configure = @intFromPtr(&configureCursor); out.cursor_take = @intFromPtr(&takeCursor);
             out.cursor_complete = @intFromPtr(&completeCursor);
         }
+        return a.gfx_output_ok;
+    }
+    fn deviceReset(binding: *const a.GfxBackendBinding, generation: u64, quiesced: u32, out: *a.GfxNativeState) callconv(.c) i32 {
+        std.debug.assert(is("context_native_reset") and quiesced <= 1 and
+            std.meta.eql(binding.*, @import("gsp_copy_test_model.zig").Model.binding));
+        if (quiesced == 0) {
+            std.debug.assert(target.gpu_reset.self_address == 0 and generation == DeviceModel.boot_info.generation and
+                DeviceModel.boot_info.state == (if (is("context_native_console")) a.display_state_unavailable else a.display_state_software_native) and target.running.failure != null);
+            DeviceModel.boot_info.generation += 1;
+            DeviceModel.boot_info.state = a.display_state_recovering;
+        } else {
+            std.debug.assert(generation == DeviceModel.boot_info.generation and target.gpu_reset.quiescence() != null and
+                target.running.reset_stage == .done and target.native_output.self_address != 0 and
+                @import("gsp_copy_test_model.zig").Model.heldReferences() == 0);
+            registration = .{};
+            @import("gsp_copy_test_model.zig").Model.retireReset(target.gpu_reset.quiescence().?);
+            @import("gsp_vram_test_model.zig").Model.retireReset(target.gpu_reset.quiescence().?);
+            statistics = null; presentation_info = null;
+        }
+        out.* = .{ .generation = DeviceModel.boot_info.generation, .state = a.display_state_recovering,
+            .outcome = a.gfx_output_outcome_lost, .retained = 1 };
+        return a.gfx_output_ok;
+    }
+    fn prepareReset(input: *const a.GfxNativeRegistration, held_generation: u64, reset_generation: u64, out: *a.GfxNativeState) callconv(.c) i32 {
+        std.debug.assert(is("context_native_reset") and prepares == 1 and commits == 1 and published and
+            registration.context == 0 and held_generation == target.display_epoch and reset_generation == DeviceModel.boot_info.generation and
+            DeviceModel.boot_info.state == a.display_state_recovering and target.gpu_reset.resumed and
+            input.backend.device_generation > target.reset_binding.device_generation and
+            std.meta.eql(input.reference, target.native_output.shadow.reference));
+        registration = input.*; prepares += 1;
+        DeviceModel.boot_info.generation += 1; DeviceModel.boot_info.state = a.display_state_preparing;
+        out.* = .{ .generation = DeviceModel.boot_info.generation, .state = a.display_state_preparing,
+            .outcome = a.gfx_output_outcome_validated, .retained = 1 };
         return a.gfx_output_ok;
     }
     fn configureCursor(input: *const a.DisplayCursorInfo) callconv(.c) i32 {
@@ -3316,9 +3515,9 @@ const NativeCommon = struct {
             published_generation += 1;
         } else {
             std.debug.assert(!published and input.info.mode_count == 1 and input.info.limits.flags == 0);
-            if (commits == 0) {
+            if (commits == 0 or (is("context_native_reset") and target.gpu_reset.resumed and target.native_output.phase == .publish)) {
                 std.debug.assert(input.modes[0].flags & a.gfx_output_mode_geometry_only != 0);
-                published_generation = 15;
+                published_generation = if (commits == 0) 15 else published_generation + 1;
             } else {
                 std.debug.assert((target.native_output.hotplug.phase == .publish or target.native_output.hotplug.phase == .resize_publish) and
                     input.modes[0].mode_id == target.native_output.hotplug.plan.?.receiver_mode_id);
@@ -3471,8 +3670,22 @@ const NativeCommon = struct {
         return a.gfx_output_ok;
     }
     fn transition(generation: u64, operation: u32, out: *a.GfxNativeState) callconv(.c) i32 {
-        std.debug.assert(registration.context != 0);
         var boot = target.display.?.original_boot.?; boot.generation = generation;
+        if (is("context_native_console") and target.gpu_reset.resumed and operation == 2) {
+            std.debug.assert(registration.context == 0 and DeviceModel.boot_info.state == a.display_state_recovering and
+                generation == DeviceModel.boot_info.generation and target.native_output.phase == .console_handoff);
+            boot.state = a.display_state_recovering;
+            const held = target.display.?;
+            var wrong = boot; wrong.physical_address += 4096;
+            std.debug.assert(held.restoreFirmware(generation, &wrong) == 0);
+            std.debug.assert(held.restoreFirmware(generation, &boot) == 1);
+            DeviceModel.boot_info.generation += 1; DeviceModel.boot_info.state = a.display_state_bootfb;
+            restores += 1;
+            out.* = .{ .generation = DeviceModel.boot_info.generation, .state = a.display_state_bootfb,
+                .outcome = a.gfx_output_outcome_applied, .retained = 0 };
+            return a.gfx_output_ok;
+        }
+        std.debug.assert(registration.context != 0);
         if (operation == 2) {
             std.debug.assert(generation == DeviceModel.boot_info.generation);
             DeviceModel.boot_info.generation += 1; DeviceModel.boot_info.state = a.display_state_recovering;
@@ -3484,17 +3697,20 @@ const NativeCommon = struct {
             out.* = .{ .generation = boot.generation, .state = a.display_state_unavailable, .outcome = a.gfx_output_outcome_lost, .retained = 1 };
             return a.gfx_output_ok;
         }
-        std.debug.assert(operation == 0 and generation == target.display_epoch and commits == 0 and target.running.initial_image == null and target.running.display_work == null);
+        std.debug.assert(operation == 0 and generation == target.native_output.prepared.generation and
+            commits == @as(u32, if (is("context_native_reset") and target.gpu_reset.resumed) 1 else 0) and
+            target.running.initial_image == null and target.running.display_work == null);
         const copy = @import("gsp_copy_test_model.zig").Model;
         const image = target.running.display_images[target.native_output.mode.?.window].?.image;
-        for (0..20) |y| std.debug.assert(std.mem.eql(u8, copy.vram_data[y * image.pitch..][0..260], pixels[y * 272..][0..260]));
+        const captured_pixels: [*]const u8 = @ptrFromInt(target.display.?.boot.read.cpu_address);
+        for (0..20) |y| std.debug.assert(std.mem.eql(u8, copy.vram_data[y * image.pitch..][0..260], captured_pixels[y * boot.pitch..][0..260]));
         // Model the actual common commit's second copy from the same sealed
         // RAM image, including CPU lease release before invoking the driver.
         var cpu_map: a.GfxBufferMap = .{};
         const memory = target.ctx.?.memory().?;
         std.debug.assert(memory.bufferMap(&registration.reference, 1, 0, 5200, &cpu_map) == a.gfx_buffer_result_ok);
         const bytes: [*]u8 = @ptrFromInt(cpu_map.cpu_address);
-        for (0..20) |y| @memcpy(bytes[y * 260..][0..260], pixels[y * 272..][0..260]);
+        for (0..20) |y| @memcpy(bytes[y * 260..][0..260], captured_pixels[y * boot.pitch..][0..260]);
         std.debug.assert(memory.bufferUnmap(&cpu_map.lease) == a.gfx_buffer_result_ok);
         const callback: *const fn (u64, u64, *const a.GfxNativeBootInfo) callconv(.c) i32 = @ptrFromInt(registration.commit_callback);
         const result = callback(registration.context, generation, &boot);
@@ -3520,6 +3736,11 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
     const original_display = captured.boot.display;
     const original_memory = captured.boot.memory;
     const original_info = DeviceModel.boot_info;
+    const boot_mapping = target.vram.?.boot_mapping.?;
+    const original_mapping = boot_mapping.*;
+    defer boot_mapping.* = original_mapping;
+    var console_pixels: [6400]u8 align(4) = undefined;
+    var console_pages: [6 * 4096]u8 align(4) = @splat(0);
     const saved_table = table.*;
     native.install(table, scenario);
     defer { native.dispose(table); table.* = saved_table; }
@@ -3562,6 +3783,29 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
     DeviceModel.boot_info.format = a.gfx_buffer_format_xrgb8888;
     captured.original_boot = DeviceModel.boot_info;
     captured.boot.read = .{ .lease = .{ .id = 2991, .generation = 1 }, .cpu_address = @intFromPtr(&NativeCommon.pixels), .byte_length = NativeCommon.pixels.len };
+    if (NativeCommon.is("context_native_console")) {
+        for (&console_pixels, 0..) |*byte, i| byte.* = @truncate(i * 29 + 3);
+        DeviceModel.boot_info.pitch = 320; DeviceModel.boot_info.byte_length = console_pixels.len;
+        // A virtual BAR1 at offset0 maps the two original surface pages.
+        captured.snapshot.?.bars[1].prefetchable = true;
+        captured.original_boot = DeviceModel.boot_info;
+        captured.boot.read.cpu_address = @intFromPtr(&console_pixels); captured.boot.read.byte_length = console_pixels.len;
+        boot_mapping.control = .{ .boot0 = 0xb76000a1, .boot1 = 0, .block = 0x80000080, .bind_status = 0 };
+        boot_mapping.format = .v2; boot_mapping.page_count = 6;
+        for (boot_mapping.pages[0..6], 0..) |*page_address, i| page_address.* = 0x80000 + i * 4096;
+        boot_mapping.reference = .{ .reference = .{ .id = 2910, .generation = 1 } };
+        boot_mapping.map = .{ .lease = .{ .id = 2911, .generation = 1 }, .cpu_address = @intFromPtr(&console_pages), .byte_length = console_pages.len };
+        boot_mapping.stamp = boot_mapping.map;
+        std.mem.writeInt(u64, console_pages[0x200..][0..8], 0x81000 | 0xc00, .little);
+        std.mem.writeInt(u64, console_pages[0x208..][0..8], 0x0fffffff, .little);
+        for (1..4) |level| std.mem.writeInt(u64, console_pages[level * 4096..][0..8], (0x80000 + (level + 1) * 4096) >> 4 | 2, .little);
+        std.mem.writeInt(u64, console_pages[4 * 4096 + 8..][0..8], 0x8500 | 2, .little);
+        std.mem.writeInt(u64, console_pages[5 * 4096..][0..8], 0x1001, .little);
+        std.mem.writeInt(u64, console_pages[5 * 4096 + 8..][0..8], 0x1101, .little);
+        @memset(raw[(@import("pramin.zig").aperture + 0x80000) / 4 ..][0..console_pages.len / 4], 0xa5a5a5a5);
+    }
+    boot_mapping.ranges[0].bytes = captured.original_boot.?.byte_length;
+    boot_mapping.surface_bytes = captured.original_boot.?.byte_length;
     var scanout = vectors.bootFixture(65, 20);
     if (NativeCommon.is("context_native_dp")) @import("gsp_dp_link_test.zig").scanout(&scanout);
     scanout.instance_control = original_scanout.?.instance_control; scanout.instance_address = original_scanout.?.instance_address;
@@ -3571,6 +3815,8 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
         captured.original_boot = original_boot; captured.scanout_original = original_scanout;
         captured.boot.read = original_read; captured.boot.display = original_display; captured.boot.memory = original_memory;
         captured.boot.native_adopted = false; captured.boot.native_generation = 0;
+        captured.boot.console_active = false; target.vram.?.console_owner = 0;
+        captured.snapshot.?.bars[1].prefetchable = false;
         DeviceModel.boot_info = original_info;
     }
     run.outputs.self_address = @intFromPtr(&run.outputs); run.outputs.state = .returned; run.outputs.graph = &run.graph.?;
@@ -3706,6 +3952,117 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
         }
         try t.expect(!run.power_active);
         try NativeCommon.checkStatistics();
+        if (NativeCommon.is("context_native_reset")) {
+            checkpoint = "reset with live native display";
+            try t.expect(run.display_resources_slot.owner != null and run.presentation != null and copy.heldReferences() != 0);
+            ResetDeviceModel.effect = display.functionReset;
+            var restaging: ResetStorageFixture = .{ .previous = target.memory.?.* };
+            target.recovery_hooks = .{ .context = @intFromPtr(&restaging), .restage = ResetStorageFixture.restage };
+            defer target.recovery_hooks = null;
+            if (NativeCommon.is("context_native_console")) {
+                try t.expect(!captured.boot.close() and target.native_output.restore_requested and captured.firmware_restore_generation != 0);
+            }
+            try checkDeviceReset(target, ResetDeviceModel.words, target.vram.?.plan.?.frts.offset, false);
+            const proof = target.gpu_reset.quiescence() orelse return error.NoResetProof;
+            checkpoint = "retire native GPU graph";
+            errdefer std.debug.print("reset cleanup stage={s} cursor={d} refs={d} vram={d} display={d}\n",
+                .{@tagName(run.reset_stage),run.reset_cursor,copy.heldReferences(),native.released,display.released});
+            var slices: usize = 0;
+            while (target.phase == .retiring and target.reset_retire_stage == .runtime) : (slices += 1) {
+                try t.expect(slices < 2000);
+                clock += 1000; _ = target.step();
+            }
+            try t.expect(target.phase == .retiring and target.reset_retire_stage == .common and proof.valid(proof.epoch));
+            try t.expect(ControlModel.reset_losses == 3 and copy.heldReferences() == 0 and native.released != 0 and display.released != 0);
+            try t.expect(run.display_resources_slot.owner == null and run.display_engine_owner == null and run.presentation == null);
+            for (&run.contexts) |*slot| try t.expect(slot.owner == null and slot.allocation.handle == 0);
+            for (&run.fifos) |*slot| try t.expect(slot.owner == null and slot.allocation.handle == 0);
+            for (&run.native_buffers) |*slot| try t.expect(slot.owner == null and slot.allocation.handle == 0);
+            checkpoint = "fresh native firmware generation";
+            while (target.phase == .retiring) : (slices += 1) {
+                try t.expect(slices < 2100);
+                clock += 1000; _ = target.step();
+            }
+            errdefer std.debug.print("restart phase={s} calls={d} epoch={d}/{d} proof={} old-queue={d} registry={d} frames={d} native-gen={d}/{d} GR={d}/{} slices={d} fw={?} core={?}\n",
+                .{@tagName(target.phase),restaging.calls,target.epoch,proof.epoch,proof.valid(proof.epoch),restaging.previous.queue.generation(),
+                NativeCommon.registration.context,target.native_output.frame_count,target.native_output.reset_generation,captured.boot.native_generation,
+                target.native_graphics.self_address,run.graphics_enabled,slices,
+                if (target.port.firmware_operation) |op| op.phase else null,
+                if (target.port.firmware_operation) |op| op.reset.phase else null});
+            try t.expect(target.phase == .frts and restaging.calls == 1 and target.epoch > proof.epoch and
+                !proof.valid(proof.epoch) and restaging.previous.queue.generation() == 0 and !target.memory.?.releaseAfterReset(proof));
+            try t.expect(NativeCommon.registration.context == 0 and target.native_output.phase == .waiting and
+                target.native_output.reset_generation == captured.boot.native_generation and target.native_output.frame_count == 3 and
+                target.native_graphics.self_address == 0 and !run.graphics_enabled and run.faults.first_fatal.?.kind == .timeout);
+            checkpoint = "restarted firmware handshake";
+            var notified = false;
+            while (target.phase != .ready and target.phase != .failed and slices < 14000) : (slices += 1) {
+                clock += std.time.ns_per_ms;
+                DeviceModel.tick(ResetDeviceModel.words, target.vram.?.plan.?.frts.offset, false);
+                if (target.phase == .notifications and !notified) {
+                    const command_offset = init.queues_offset + init.command_offset;
+                    const status_offset = init.queues_offset + init.status_offset;
+                    @memcpy(backing.?[status_offset..][0..32], backing.?[command_offset..][0..32]);
+                    // Firmware owns a fresh producer. The command header
+                    // already contains the two preloaded outgoing records.
+                    std.mem.writeInt(u32, backing.?[status_offset + 16 ..][0..4], 0, .little);
+                    std.mem.writeInt(u32, backing.?[status_offset + 24 ..][0..4], 64, .little);
+                    std.mem.writeInt(u32, backing.?[status_offset + 64 ..][0..4], 2, .little);
+                    try nativeEvent(&target.session.?, 0x1001, &.{ 0, 0, 0, 0 });
+                    notified = true;
+                }
+                _ = target.step();
+            }
+            try t.expect(target.phase == .ready and notified and target.handoff != null and target.session.?.epoch == target.epoch and
+                target.memory.?.retained and captured.boot.native_adopted and target.native_output.phase == .waiting and
+                run.faults.first_fatal.?.kind == .timeout and ResetDeviceModel.triggers == 1);
+            checkpoint = "rebuild RM, channels and second native image";
+            try checkDeviceStatic(target, ResetDeviceModel.words, target.vram.?.plan.?.frts.offset, .context_native_reset);
+            try checkDevicePostInit(target, ResetDeviceModel.words, target.vram.?.plan.?.frts.offset, .context_native_reset);
+            IrqModel.reset();
+            target.irq_wake = .{ .context = @intFromPtr(target), .signal = IrqModel.wake };
+            try checkDeviceIrq(target, ResetDeviceModel.words, target.vram.?.plan.?.frts.offset, .context_native_reset);
+            try checkDeviceRm(target, ResetDeviceModel.words, target.vram.?.plan.?.frts.offset, .context_native_reset);
+            run.outputs.self_address = @intFromPtr(&run.outputs); run.outputs.state = .returned; run.outputs.graph = &run.graph.?;
+            vectors.outputFixture(&run.outputs.data, run.epoch, run.graph.?.reservation.client);
+            run.output_generation = run.outputs.data.generation;
+            run.receiver_events = .{ .epoch = run.epoch, .not_before_ns = clock + std.time.ns_per_s }; run.outputs.invalidated = false;
+            target.irq_wake = .{ .context = @intFromPtr(target), .signal = copy.wakePresentation };
+            try pumpResetNativeOutput(target);
+            if (NativeCommon.is("context_native_console")) {
+                try t.expect(target.native_output.phase == .console_active and target.native_output.ownsConsole(DeviceModel.boot_info) and
+                    NativeCommon.prepares == 1 and NativeCommon.commits == 1 and NativeCommon.restores == 2 and
+                    run.presentation == null and run.copy_backend == null and captured.boot.console_active and
+                    target.boot_console.confirmed and target.boot_console.phase == .ready and !captured.boot.close() and !target.vram.?.releaseBeforeSubmission());
+                const aperture: [*]const u8 = @ptrCast(raw);
+                try t.expectEqualSlices(u8, &console_pixels, aperture[@import("pramin.zig").aperture + 0x10000 ..][0..console_pixels.len]);
+                try t.expectEqualSlices(u8, &console_pages, aperture[@import("pramin.zig").aperture + 0x80000 ..][0..console_pages.len]);
+                try t.expect(target.step() != .stopped and target.phase == .ready);
+                const console = &target.boot_console;
+                var restored = console.boot; restored.generation = console.callback_generation;
+                try t.expect(console.authorize(restored.generation, &restored));
+                try t.expect(!console.authorize(restored.generation + 1, &restored));
+                console.confirmed = false;
+                try t.expect(!console.authorize(restored.generation, &restored));
+                console.confirmed = true;
+                const block_index = @import("bar1_reader.zig").block_register / 4;
+                raw[block_index] ^= 1;
+                try t.expect(!console.authorize(restored.generation, &restored));
+                raw[block_index] ^= 1;
+                const bind_index = @import("bar1_reader.zig").bind_register / 4;
+                for ([_]u32{1, 2}) |pending| {
+                    raw[bind_index] = pending;
+                    try t.expect(!console.authorize(restored.generation, &restored));
+                }
+                raw[bind_index] = 0;
+                try t.expectError(error.Retained, console.stage(proof));
+                try t.expect(console.authorize(restored.generation, &restored));
+            } else try t.expect(target.native_output.phase == .active and NativeCommon.prepares == 2 and NativeCommon.commits == 2 and
+                target.native_output.ownsNative(DeviceModel.boot_info) and target.native_output.prepared.generation > target.reset_display.generation and
+                captured.boot.held_generation == target.display_epoch and !run.graphics_enabled and copy.shadow_creates == 2);
+            try t.expect(target.stop());
+            return;
+        }
         if (NativeCommon.flipFailure()) {
             checkpoint = "native flip deadline";
             try checkNativeFlip(target);
@@ -4019,7 +4376,7 @@ fn checkNativeHotplug(target: *@import("gsp_device.zig").Device, resize: bool) !
         if (dma != active.image.dma and entry.initial_point != 0 and entry.initial_failure == null and
             std.meta.eql(entry.surface.shadow.buffer, run.presentation.?.surface.shadow.buffer) and
             try table_owner.imageFinished(product.window.?.slot, dma)) { spare = dma; break; }
-    };
+};
     try t.expect(spare != 0);
     const visible = run.flip_visible; const cancelled = run.flip_cancelled; const finished = run.flip_released;
     const old_offset = note.offset;
@@ -6182,6 +6539,72 @@ fn pumpReceiverImage(target: *@import("gsp_device.zig").Device) !void {
     }
     try t.expect(run.display_work == null);
 }
+fn pumpResetNativeOutput(target: *@import("gsp_device.zig").Device) !void {
+    const run = &target.running;
+    const product = &target.native_output;
+    const display = @import("gsp_display_test_model.zig").Model;
+    const copy = @import("gsp_copy_test_model.zig").Model;
+    const wire = @import("gsp_copy_wire.zig");
+    const push = @import("gsp_display_push.zig");
+    var counts: FifoCounts = .{};
+    var initial_fetched = false;
+    var table_fetched = false;
+    errdefer std.debug.print("reconstructed native output: phase={s} device={s} failure={?} output={?} status={d}\n",
+        .{@tagName(product.phase),@tagName(target.phase),target.recovery_failure,product.failure,product.last_status});
+    errdefer if (product.confirmed_image) |active| {
+        std.debug.print("reset image receipt: mode-admission={} initial={?}/{?} work={} boot-mode={} position={?}/{?} core={d} window={d} link={?}/{} image-same={}\n",
+            .{if (run.mode_control_owner) |owner| std.meta.eql(owner.result, product.mode_admission) else false,
+            if (run.presentation) |entry| entry.initial_point else null, if (run.presentation) |entry| entry.initial_failure else null,
+            run.display_work != null, std.meta.eql(active.boot_mode, product.mode),
+            if (active.position) |position| position.sequence else null, if (active.position) |position| std.meta.eql(position.handle, product.immediate.?) else null,
+            active.core_point, active.window_point, if (active.link) |link| link.receipt else null,
+            if (active.link) |link| std.meta.eql(link.plan, product.link.?) and link.complete() else false,
+            std.meta.eql(run.display_images[product.mode.?.window], product.confirmed_image)});
+    };
+    for (0..2000) |_| {
+        clock += 1000; _ = target.step();
+        try t.expect(target.phase == .ready);
+        if (product.phase == .active or product.phase == .console_active) return;
+        if (run.fifo_active != null) { try replyDeviceFifo(target, &counts, "context_native_reset"); continue; }
+        if (run.buffer_active != null) { try replyCopyMapping(target); continue; }
+        if (run.activeChannel()) |rpc| if (rpc.phase == .waiting) { try replyNativeProduct(target); continue; };
+        if (run.display_upload_job) |*upload| if (upload.operation.phase == .submitted) {
+            const channel = run.fifos[product.copy.?.slot].owner.?;
+            try t.expectEqualSlices(u8, &run.display_resources_slot.owner.?.table.image, ControlModel.data[0..@import("gsp_display_table.zig").image_bytes]);
+            const get: *u32 = @ptrFromInt(channel.ring.cpu.cpu_address + wire.userd_offset + 0x88);
+            const completion: *u32 = @ptrFromInt(channel.ring.cpu.cpu_address + wire.completion_offset);
+            if (!table_fetched) { get.* = channel.ring.put; table_fetched = true; } else completion.* = channel.ring.issued;
+        };
+        if (run.initial_image) |*initial| if (initial.operation.submitted) {
+            const channel = run.fifos[product.copy.?.slot].owner.?;
+            if (!initial_fetched) {
+                const raw: [*]const u8 = @ptrFromInt(target.port.window.cpu_address);
+                try copy.fetch(channel, raw[0..@intCast(target.port.window.byte_length)]);
+                try copy.execute(); initial_fetched = true;
+            } else try copy.signal();
+        };
+        if (run.display_work) |*work| {
+            if (work.position) |position| if (position.phase == .submitted) {
+                const user = try push.userBase(.immediate, product.mode.?.window);
+                display.words[(user + 4) / 4] = display.words[user / 4];
+            };
+            if (work.core.phase == .submitted) {
+                const user = try push.userBase(.core, 0);
+                display.words[(user + 4) / 4] = display.words[user / 4];
+                const note: *u32 = @ptrFromInt(run.display_resources_slot.owner.?.publishedNotifier(0).?.cpu.cpu_address);
+                note.* = 2 << 30;
+            }
+            if (work.window) |window| if (window.phase == .submitted) {
+                const user = try push.userBase(.window, product.mode.?.window);
+                display.words[(user + 4) / 4] = display.words[user / 4];
+                const note = run.display_resources_slot.owner.?.publishedNotifier(1 + product.mode.?.window).?;
+                const words: [*]u32 = @ptrFromInt(note.cpu.cpu_address);
+                words[note.offset / 4 + 2] = 202; words[note.offset / 4 + 3] = 9; words[note.offset / 4] = 1 << 30;
+            };
+        }
+    }
+    return error.NativeReconstructionTimeout;
+}
 fn replyNativeProduct(target: *@import("gsp_device.zig").Device) !void {
     const run = &target.running;
     const rpc = run.activeChannel().?;
@@ -6280,6 +6703,10 @@ fn replyNativeProduct(target: *@import("gsp_device.zig").Device) !void {
             if (rejected) outputWord(&response, 16, 0x57);
         } else if (owner.operation.? == .allocate) {
             @memcpy(response[48..56], @import("gsp_display_channel_test.zig").response(owner.config.kind, .allocate)[48..56]);
+            // A new RM channel starts a new push ring. The old physical
+            // PUT/GET values cannot survive its allocation in this model.
+            const user = try @import("gsp_display_push.zig").userBase(owner.config.kind, owner.config.index);
+            dm.words[user / 4] = 0; dm.words[(user + 4) / 4] = 0;
             const slot = &dm.slots[(owner.config.physical - dm.address(0)) / 0x100000];
             slot.hardware = true; slot.control = try wire.controlRegister(owner.config.kind, owner.config.index); slot.state = try wire.statusRegister(owner.config.kind, owner.config.index);
             dm.words[slot.control / 4] = 0x13; dm.words[slot.state / 4] = if (owner.config.kind == .core) 11 << 16 else 4 << 16;

@@ -22,6 +22,13 @@ pub const Model = struct {
         budget = .{}; budget_configurations = 0;
     }
     pub fn dispose(table: *a.DriverApi) void { heap_model.dispose(table); }
+    pub fn retireReset(proof: @import("gsp_reset.zig").Quiescence) void {
+        std.debug.assert(proof.valid(proof.epoch) and charged == 0);
+        for (&slots) |slot| std.debug.assert(!slot.live);
+        // The real common owner keys budgets by memory generation. This
+        // fixture retains one generation only, after its real users retire.
+        budget = .{}; budget_configurations = 0;
+    }
     pub fn is(name: []const u8) bool { return heap_model.is(name); }
     pub fn address(index: usize) u64 {
         // Golden + regular GR, CE and render buffers coexist in the same

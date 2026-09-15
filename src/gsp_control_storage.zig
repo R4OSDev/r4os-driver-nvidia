@@ -112,11 +112,11 @@ pub const Storage = struct {
         const memory = self.memory orelse return false;
         if (self.gpu.lease.id != 0) {
             if (memory.deviceRelease(&self.gpu, 1) != ok) return false;
-            self.gpu = .{};
+            self.gpu = .{}; self.gpu_stamp = .{};
         }
         if (self.dma.lease.id != 0) {
             if (memory.deviceRelease(&self.dma, 1) != ok) return false;
-            self.dma = .{};
+            self.dma = .{}; self.dma_stamp = .{};
         }
         if (self.cpu.lease.id != 0) {
             if (memory.bufferUnmap(&self.cpu.lease) != ok) return false;
@@ -124,11 +124,20 @@ pub const Storage = struct {
         }
         if (self.reference.reference.id != 0) {
             if (memory.bufferRelease(&self.reference.reference) != ok) return false;
-            self.reference = .{};
+            self.reference = .{}; self.reference_stamp = .{};
         }
         if (memory.collect() != ok) return false;
         self.* = .{};
         return true;
+    }
+
+    pub fn closeAfterReset(self: *Storage, proof: @import("gsp_reset.zig").Quiescence) bool {
+        if (self.self_address == 0) return true;
+        if (self.self_address != @intFromPtr(self) or !proof.valid(self.epoch) or self.memory == null or
+            !std.meta.eql(self.reference, self.reference_stamp) or !std.meta.eql(self.dma, self.dma_stamp) or
+            !std.meta.eql(self.gpu, self.gpu_stamp) or !std.meta.eql(self.pages, self.pages_stamp)) return false;
+        self.retained = false;
+        return self.close();
     }
 };
 fn handleValid(value: a.GfxBufferHandle) bool {

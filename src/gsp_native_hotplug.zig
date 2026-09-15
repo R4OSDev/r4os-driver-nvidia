@@ -379,6 +379,12 @@ pub const Owner = struct {
         }
         return false;
     }
+    pub fn closeAfterReset(self: *Owner, product: anytype, proof: @import("gsp_reset.zig").Quiescence) !bool {
+        if (!proof.valid(product.running.?.epoch) or product.running.?.reset_stage != .done) return error.Retained;
+        if (try self.releaseSource(product)) return false;
+        self.* = .{};
+        return true;
+    }
     fn keepHeadless(self: *Owner, product: anytype) bool {
         self.plan = null; self.restore_ticket = 0; self.phase = .receiver_wait;
         product.running.?.restoreOutput(product.mode.?.window, false) catch return false;

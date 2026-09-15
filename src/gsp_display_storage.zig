@@ -106,5 +106,14 @@ pub const Storage = struct {
         if (memory.collect() != a.gfx_buffer_result_ok) return false;
         self.* = .{}; return true;
     }
+
+    pub fn closeAfterReset(self: *Storage, proof: @import("gsp_reset.zig").Quiescence) bool {
+        if (self.self_address == 0) return true;
+        if (self.self_address != @intFromPtr(self) or !proof.valid(self.epoch) or self.memory == null or
+            !std.meta.eql(self.reference, self.reference_stamp) or !std.meta.eql(self.dma, self.dma_stamp) or
+            !std.meta.eql(self.segment, self.segment_stamp) or self.role != self.role_stamp) return false;
+        self.retained = false;
+        return self.close();
+    }
 };
 fn validHandle(h: a.GfxBufferHandle) bool { return h.id != 0 and h.generation != 0 and h.reserved0 == 0; }

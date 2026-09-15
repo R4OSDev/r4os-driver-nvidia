@@ -95,7 +95,10 @@ pub const Model = struct {
         refs[i] = false; releases += 1; return a.gfx_buffer_result_ok;
     }
     fn acquire(input: *const a.GfxBufferHandle, request: *const a.GfxDeviceRequest, out: *a.GfxDeviceLease) callconv(.c) i32 {
-        const i = selected(input).?;
+        const i = selected(input) orelse {
+            const call: *const fn (*const a.GfxBufferHandle, *const a.GfxDeviceRequest, *a.GfxDeviceLease) callconv(.c) i32 = @ptrFromInt(fallback().device_acquire);
+            return call(input, request, out);
+        };
         std.debug.assert(refs[i] and request.byte_offset == 0 and request.byte_length == rounded[i] and request.adapter_id == 0x01000000);
         const virtual = request.access == 3;
         if (virtual) {
@@ -109,6 +112,10 @@ pub const Model = struct {
         return a.gfx_buffer_result_ok;
     }
     fn segment(input: *const a.GfxDeviceLease, offset: u64, out: *a.GfxDmaSegment) callconv(.c) i32 {
+        if (input.lease.id < 191 or input.lease.id >= 195) {
+            const call: *const fn (*const a.GfxDeviceLease, u64, *a.GfxDmaSegment) callconv(.c) i32 = @ptrFromInt(fallback().device_segment);
+            return call(input, offset, out);
+        }
         const i = (input.lease.id - 191) / 2;
         std.debug.assert(i < 2 and refs[i] and std.meta.eql(input.*, dma[i]) and offset < rounded[i] and offset & 4095 == 0);
         segments += 1;
@@ -116,7 +123,7 @@ pub const Model = struct {
         out.* = .{ .dma_address = page(i, offset), .byte_length = 4096, .next_offset = offset + 4096 }; return a.gfx_buffer_result_ok;
     }
     fn releaseDevice(input: *const a.GfxDeviceLease, quiesced: u32) callconv(.c) i32 {
-        if (input.lease.id < 191) {
+        if (input.lease.id < 191 or input.lease.id >= 195) {
             const call: *const fn (*const a.GfxDeviceLease, u32) callconv(.c) i32 = @ptrFromInt(fallback().device_release);
             return call(input, quiesced);
         }

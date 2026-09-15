@@ -282,6 +282,17 @@ pub const Owner = struct {
         self.phase = if (status == 2) .complete else .begun; return self.result;
     }
     pub fn quarantine(self: *Owner) void { self.failed = true; self.phase = .failed; self.backing.retained = true; }
+    pub fn closeAfterReset(self: *Owner, proof: @import("gsp_reset.zig").Quiescence) bool {
+        if (self.self_address == 0) return true;
+        if (self.self_address != @intFromPtr(self) or !proof.valid(self.epoch) or
+            !std.meta.eql(self.cpu, self.cpu_stamp) or self.backing.memory == null) return false;
+        if (self.cpu.lease.id != 0) {
+            if (self.backing.memory.?.bufferUnmap(&self.cpu.lease) != a.gfx_buffer_result_ok) return false;
+            self.cpu = .{}; self.cpu_stamp = .{};
+        }
+        if (!self.backing.closeAfterReset(proof)) return false;
+        self.* = .{}; return true;
+    }
     /// Only an unpublished table may abandon this allocation. There is no
     /// equivalent release from channel Free or CPU-only shutdown.
     pub fn closeUnpublished(self: *Owner) bool {

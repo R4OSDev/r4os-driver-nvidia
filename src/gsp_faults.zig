@@ -75,8 +75,8 @@ const std = @import("std");
 const a = @import("r4os").abi;
 const events = @import("gsp_runtime_events.zig");
 pub const Source = enum { xid, rc, mmu_queue, fecs, recovery, nocat, rm, host, irq };
-pub const Kind = enum { information, mmu, fifo, copy_engine, context, invalid_channel, resource, device, unknown, graphics_command, graphics_exception, shader };
-pub const Operation = enum { event, channel, context, mapping, native_buffer, submit, teardown, interrupt, display_engine, display_channel, render };
+pub const Kind = enum { information, mmu, fifo, copy_engine, context, invalid_channel, resource, device, unknown, graphics_command, graphics_exception, shader, timeout, interrupt, firmware, display };
+pub const Operation = enum { event, channel, context, mapping, native_buffer, submit, teardown, interrupt, display_engine, display_channel, render, firmware, power };
 pub const Shader = enum { none, header, warp, global };
 pub const RenderPhase = enum { none, admission, resources, programs_upload, packet_upload, execution };
 pub const Record = struct {
@@ -135,6 +135,7 @@ pub fn xidKind(code: u32) Kind {
         69 => .graphics_command,
         43, 44, 45 => .context,
         48, 58, 79 => .device,
+        119, 120 => .firmware, // GSP_RPC_TIMEOUT / GSP_ERROR in pinned nverror.h.
         else => .unknown,
     };
 }
@@ -165,7 +166,17 @@ fn retainText(record: *Record, text: []const u8) void {
 }
 pub fn host(operation: Operation, err: anyerror, fatal: bool) Record {
     var record: Record = .{ .source = .host, .operation = operation, .code = @intFromError(err), .fatal = fatal,
-        .kind = switch (err) { error.Memory, error.Exhausted, error.OutOfMemory, error.Budget => .resource, else => .unknown } };
+        .kind = switch (err) {
+            error.Memory, error.Exhausted, error.OutOfMemory, error.Budget => .resource,
+            // A deadline records the missing completion, not its presumed
+            // cause. It does not by itself prove a lost IRQ or a dead GPU.
+            error.Timeout, error.Deadline => .timeout,
+            error.Interrupt, error.IrqRetirement => .interrupt,
+            error.FirmwareError => .firmware,
+            error.Display => .display,
+            error.DeviceLost => .device,
+            else => .unknown,
+        } };
     retainText(&record, @errorName(err));
     return record;
 }

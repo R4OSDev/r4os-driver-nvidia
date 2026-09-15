@@ -227,5 +227,16 @@ pub const Use = struct {
         }
         self.* = .{}; return true;
     }
+
+    pub fn closeAfterReset(self: *Use, proof: @import("gsp_reset.zig").Quiescence) bool {
+        if (self.self_address == 0) return true;
+        if (!self.stable() or self.retained or !proof.valid(self.source.?.epoch)) return false;
+        // A malformed returned descriptor is retained even after GPU stop.
+        if ((self.reference.reference.id != 0 and (!valid(self.reference.reference) or
+            !std.meta.eql(self.reference.buffer, self.source.?.reference.buffer))) or
+            (self.gpu.lease.id != 0 and (!valid(self.gpu.lease) or self.gpu.device_generation != self.source.?.epoch or
+                self.gpu.adapter_id != self.source.?.adapter or self.gpu.driver_owner != self.source.?.driver_owner))) return false;
+        return self.close(true);
+    }
 };
 fn valid(value: a.GfxBufferHandle) bool { return value.id != 0 and value.generation != 0 and value.reserved0 == 0; }

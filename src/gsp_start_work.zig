@@ -125,7 +125,9 @@ pub const Work = struct {
         const self = from(raw);
         if (self.self_address != raw or self.ctx == null or self.device == null) return -1;
         if (@atomicLoad(u32, &self.stopping, .acquire) != 0) return 1;
-        const clock = self.device.?.port.clock orelse return -1;
+        // Reset temporarily retires the firmware port. Pacing belongs to
+        // the resident driver, and must survive that port's replacement.
+        const clock = self.ctx.?.resources() orelse return -1;
         const started_at = clock.nowNs();
         if (started_at == std.math.maxInt(u64)) return -1;
         // Both a step count and a monotonic time bound apply. A single step

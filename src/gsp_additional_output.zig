@@ -361,6 +361,26 @@ pub const Output = struct {
 pub const Owner = struct {
     outputs: [8]Output = @splat(.{}),
     cursor: u3 = 0,
+    reset_cursor: usize = 0,
+    // Common display_reset has already retired additional targets and all
+    // borrowed mode surfaces. These are only the R4D's private CPU sources.
+    pub fn closeAfterReset(self: *Owner, product: anytype, proof: @import("gsp_reset.zig").Quiescence) !bool {
+        if (!proof.valid(product.running.?.epoch) or product.running.?.reset_stage != .done) return error.Retained;
+        if (self.reset_cursor == self.outputs.len) return true;
+        const output = &self.outputs[self.reset_cursor];
+        if (!try output.hotplug.closeAfterReset(product, proof)) return false;
+        if (output.mapping.lease.id != 0) {
+            if (product.memory.?.bufferUnmap(&output.mapping.lease) != a.gfx_buffer_result_ok) return error.Retained;
+            output.mapping = .{}; return false;
+        }
+        if (output.shadow.reference.id != 0) {
+            if (product.memory.?.bufferRelease(&output.shadow.reference) != a.gfx_buffer_result_ok) return error.Retained;
+            output.shadow = .{}; return false;
+        }
+        output.* = .{};
+        self.reset_cursor += 1;
+        return false;
+    }
     pub fn busy(self: *const Owner) bool {
         for (&self.outputs) |*output| if (output.busy()) return true;
         return false;

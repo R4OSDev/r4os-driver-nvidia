@@ -303,6 +303,7 @@ fn checkColdCore() !void {
 }
 
 test "firmware CPU storage GA106 core sequencing and native MMIO ownership" {
+    try @import("gsp_reset_test.zig").checks();
     var checkpoint: []const u8 = "cold-core";
     errdefer |err| std.debug.print("native core check={s}: {s}\n", .{ checkpoint, @errorName(err) });
     try checkColdCore();

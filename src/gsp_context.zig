@@ -463,6 +463,27 @@ pub const Owner = struct {
         };
         return error.Stale;
     }
+    pub fn releaseChildAfterReset(self: *Owner, child: Child, proof: @import("gsp_reset.zig").Quiescence) Error!void {
+        if (self.self_address != @intFromPtr(self) or !proof.valid(self.binding.epoch) or
+            child.epoch != self.binding.epoch or child.group != self.binding.group or child.serial == 0) return error.Stale;
+        for (&self.children) |*slot| if (slot.* == child.serial) { slot.* = 0; return; };
+        return error.Stale;
+    }
+    pub fn closeAfterReset(self: *Owner, proof: @import("gsp_reset.zig").Quiescence) Error!bool {
+        if ((self.self_address != 0 and self.self_address != @intFromPtr(self)) or
+            !proof.valid(self.binding.epoch) or self.exchange.session.epoch != self.binding.epoch) return error.Stale;
+        if (self.namespace_live) try self.exchange.session.rm_names.validateChildrenAfterReset(self.reservation, proof);
+        for (self.children) |child| if (child != 0) return false;
+        for (&self.methods) |*storage| if (!storage.closeAfterReset(proof)) return error.Retained;
+        for (&self.graphics_buffers) |*storage| if (!storage.closeAfterReset(proof)) return error.Retained;
+        if (self.graphics_shared) |owner| {
+            try owner.releaseChildAfterReset(self.graphics_shared_child orelse return error.State, proof);
+            self.graphics_shared = null; self.graphics_shared_child = null;
+        }
+        if (self.namespace_live) try self.exchange.session.rm_names.retireChildrenAfterReset(self.reservation, proof);
+        self.namespace_live = false; self.state = .finished;
+        return true;
+    }
     pub fn poll(self: *Owner) Error!?exchange.Dispatch {
         try self.stable();
         if (self.state != .creating and self.state != .unwinding and self.state != .destroying) return error.State;

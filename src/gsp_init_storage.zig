@@ -217,8 +217,7 @@ pub const QueueLease = struct {
         return self.epoch;
     }
     /// Call BEFORE any MMIO/firmware action can expose this backing to a GPU.
-    /// This latch intentionally has no clear operation yet: native quiescence
-    /// must be implemented and verified before enabling real GPU submission.
+    /// Only a completed, still-quiescent device reset can clear this latch.
     pub fn retainForDevice(self: *QueueLease) bool {
         if (self.generation() == 0 or self.failed) return false;
         self.owner.?.device_access = true;
@@ -228,6 +227,15 @@ pub const QueueLease = struct {
         if (self.owner == null) return self.epoch == 0;
         if (self.generation() == 0 or self.owner.?.device_access) return false;
         self.owner.?.queue_epoch = 0;
+        self.* = .{};
+        return true;
+    }
+    pub fn releaseAfterReset(self: *QueueLease, proof: @import("gsp_reset.zig").Quiescence) bool {
+        if (!proof.valid(self.epoch) or self.generation() != self.epoch) return false;
+        // Invalidate every copied leaf facade before the parent can recycle
+        // logs/queues or issue a different monotonically allocated epoch.
+        self.owner.?.queue_epoch = 0;
+        self.owner.?.device_access = false;
         self.* = .{};
         return true;
     }

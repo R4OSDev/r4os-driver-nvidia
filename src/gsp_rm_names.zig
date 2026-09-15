@@ -218,4 +218,12 @@ pub const Ledger = struct {
         (try self.lookupChildren(lease)).retained = true;
         try self.retain(lease.parent);
     }
+    pub fn validateChildrenAfterReset(self: *Ledger, lease: Children, proof: @import("gsp_reset.zig").Quiescence) Error!void {
+        if (!proof.valid(self.epoch)) return error.Retained;
+        _ = try self.lookupChildren(lease);
+    }
+    pub fn retireChildrenAfterReset(self: *Ledger, lease: Children, proof: @import("gsp_reset.zig").Quiescence) Error!void {
+        try self.validateChildrenAfterReset(lease, proof);
+        (try self.lookupChildren(lease)).* = .{};
+    }
 };

@@ -28,6 +28,9 @@ pub const Lease = struct {
     cpu_address: u64 = 0,
     metadata_address: u64 = 0,
     frts_consumer: usize = 0,
+    // A restored console uses the original reserved VRAM with new native
+    // channels. It is intentionally resident; releasing FRTS is insufficient.
+    console_owner: usize = 0,
 
     /// Serialized native init/work owner. Reject every stale input before
     /// publishing either borrow; no fallible operation follows publication.
@@ -132,7 +135,7 @@ pub const Lease = struct {
     /// The current diagnostic never submits; any retained run blocks this path.
     pub fn releaseBeforeSubmission(self: *Lease) bool {
         if (self.self_address == 0) return true;
-        if (!self.owns() or self.frts_consumer != 0 or self.backing.?.execution_owner != 0 or self.backing.?.image.execution_owner != 0) return false;
+        if (!self.owns() or self.console_owner != 0 or self.frts_consumer != 0 or self.backing.?.execution_owner != 0 or self.backing.?.image.execution_owner != 0) return false;
         self.display.?.borrower = 0;
         self.backing.?.vram_owner = 0;
         self.* = .{ .serial = self.serial };

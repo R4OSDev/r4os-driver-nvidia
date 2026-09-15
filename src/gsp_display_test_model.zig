@@ -15,6 +15,12 @@ pub const Model = struct {
         table.gfx_memory_query = query; slots = @splat(.{}); scenario = name; released = 0; words = mmio;
     }
     pub fn is(name: []const u8) bool { return std.mem.eql(u8, scenario, name); }
+    pub fn functionReset() void {
+        for (&slots) |*slot| if (slot.active and slot.hardware) {
+            words[slot.control / 4] = 0;
+            words[slot.state / 4] = 0;
+        };
+    }
     fn query(out: *a.GfxDriverMemoryApi) callconv(.c) i32 {
         out.* = original;
         out.buffer_create = @intFromPtr(&create); out.buffer_describe = @intFromPtr(&describe); out.buffer_map = @intFromPtr(&map);

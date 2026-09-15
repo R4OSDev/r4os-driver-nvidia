@@ -23,7 +23,7 @@ pub const Phase = enum {
     storage_wait, storage_release, table_upload, table_wait,
     core_create, core_wait, window_create, window_wait, immediate_create, immediate_wait,
     shadow_create, shadow_map, shadow_copy, shadow_unmap, register, publish, prepare,
-    image_upload, image_wait, scanout_commit, scanout_wait, handoff, active, failed,
+    image_upload, image_wait, console_mapping, scanout_commit, scanout_wait, handoff, console_handoff, console_active, active, failed,
 };
 
 pub const Owner = struct {
@@ -79,6 +79,8 @@ pub const Owner = struct {
     color: @import("gsp_output_color.zig").Owner = .{},
     refresh: @import("gsp_native_refresh.zig").Owner = .{},
     output_fault_reported: [8]bool = @splat(false),
+    reset_generation: u64 = 0,
+    console: ?*@import("boot_console.zig").Owner = null,
 
     /// Explicit mode=native only. Check the common handoff API before the
     /// device worker can execute the already prepared firmware operations.
@@ -110,12 +112,43 @@ pub const Owner = struct {
         const now = self.ctx.?.resources().?.nowNs();
         if (now == std.math.maxInt(u64) or now < self.last_clock) return error.Clock;
         self.last_clock = now;
-        if (self.phase != .active and (now >= self.deadline or now >= self.phase_deadline)) return error.Deadline;
+        if (self.phase != .active and self.phase != .console_active and (now >= self.deadline or now >= self.phase_deadline)) return error.Deadline;
         return self.advance() catch |err| {
             if (err == error.Busy) return false;
             self.quarantine(err);
             return err;
         };
+    }
+    /// Reuse the original captured CPU image and discovered device policy,
+    /// while the common bridge retains the independently identified hold.
+    pub fn requestAfterReset(self: *Owner, ctx: *const r4os.r4dev.DriverContext, running: *runtime.Owner,
+        captured: *capture.Capture, generation: u64) !void
+    {
+        if (generation == 0 or !captured.boot.native_adopted or captured.boot.native_generation != generation) return error.Stale;
+        const display = ctx.graphicsDisplay() orelse return error.Api;
+        if (!display.supportsReset()) return error.Api;
+        try self.request(ctx, running, captured);
+        self.reset_generation = generation;
+    }
+
+    // Runtime graph and common display consumers must retire first. A mode
+    // or cursor job contains borrowed references, not additional ownership.
+    pub fn closeAfterReset(self: *Owner, proof: @import("gsp_reset.zig").Quiescence) !bool {
+        if (self.self_address == 0) return true;
+        const run = self.running orelse return error.Stale;
+        if (self.self_address != @intFromPtr(self) or !proof.valid(run.epoch) or run.reset_stage != .done or self.phase != .failed) return error.Retained;
+        if (!try self.additional.closeAfterReset(self, proof)) return false;
+        if (!try self.hotplug.closeAfterReset(self, proof)) return false;
+        if (self.shadow_map.lease.id != 0) {
+            if (self.memory.?.bufferUnmap(&self.shadow_map.lease) != a.gfx_buffer_result_ok) return error.Retained;
+            self.shadow_map = .{}; return false;
+        }
+        if (self.shadow.reference.id != 0) {
+            if (self.memory.?.bufferRelease(&self.shadow.reference) != a.gfx_buffer_result_ok) return error.Retained;
+            self.shadow = .{}; return false;
+        }
+        self.* = .{};
+        return true;
     }
     fn next(self: *Owner, phase: Phase) void {
         self.phase = phase;
@@ -248,6 +281,11 @@ pub const Owner = struct {
                 self.next(.surface_allocate);
             },
             .surface_allocate => {
+                if (self.console) |source| {
+                    self.dma = try run.bindBootConsole(self.engine.?, self.mode.?.window, source);
+                    self.next(.table_upload);
+                    return true;
+                }
                 self.storage = try run.allocateDisplaySurface(.{ .width = boot.width, .height = boot.height,
                     .usage = a.gfx_buffer_usage_scanout | a.gfx_buffer_usage_transfer_target }, self.phase_deadline);
                 self.next_phase = .surface_bind;
@@ -292,7 +330,8 @@ pub const Owner = struct {
                 const status = try run.displayChannelStatus(handle);
                 if (status.rejected != null or status.host_rejected != null) return error.Channel;
                 if (status.info == null) return false;
-                self.next(switch (self.phase) { .core_wait => .window_create, .window_wait => .immediate_create, else => .shadow_create });
+                self.next(switch (self.phase) { .core_wait => .window_create, .window_wait => .immediate_create,
+                    else => if (self.console != null) .console_mapping else .shadow_create });
             },
             .shadow_create => {
                 const pitch = try std.math.mul(u64, boot.width, 4);
@@ -350,10 +389,15 @@ pub const Owner = struct {
                     .reference = self.shadow.reference, .context = self.self_address,
                     .commit_callback = @intFromPtr(&commit), .restore_callback = @intFromPtr(&restore) };
                 @memcpy(registration.name[0..6], "nvidia");
-                self.last_status = self.display.?.prepareHeld(&registration, held.boot.held_generation, &self.prepared);
-                if (self.last_status != a.gfx_output_ok or !validState(self.prepared, held.boot.held_generation,
+                self.last_status = if (self.reset_generation != 0)
+                    self.display.?.prepareReset(&registration, held.boot.held_generation, self.reset_generation, &self.prepared)
+                else self.display.?.prepareHeld(&registration, held.boot.held_generation, &self.prepared);
+                if (self.last_status != a.gfx_output_ok or
+                    (if (self.reset_generation != 0) self.prepared.generation <= self.reset_generation else self.prepared.generation != held.boot.held_generation) or
+                    !validState(self.prepared, self.prepared.generation,
                     a.display_state_preparing, a.gfx_output_outcome_validated)) return error.Handoff;
-                try held.boot.adoptNative(self.prepared);
+                if (self.reset_generation != 0) try held.boot.adoptRecoveredNative(self.prepared, self.reset_generation)
+                else try held.boot.adoptNative(self.prepared);
                 self.next(.image_upload);
             },
             .image_upload => {
@@ -368,8 +412,10 @@ pub const Owner = struct {
                 self.next(.scanout_commit);
             },
             .scanout_commit => {
-                try self.validateRoute();
-                if (!try self.audio.beforeInitial(self)) return false;
+                if (self.console == null) {
+                    try self.validateRoute();
+                    if (!try self.audio.beforeInitial(self)) return false;
+                } else run.require_mode_receipt = true;
                 try run.commitBootDisplayImage(self.core.?, self.window.?, self.dma, self.phase_deadline);
                 self.next(.scanout_wait);
             },
@@ -377,14 +423,20 @@ pub const Owner = struct {
                 const image = try run.displayImageStatus(self.engine.?, self.mode.?.window) orelse return false;
                 if (run.display_work != null) return false;
                 self.confirmed_image = image;
+                if (self.console != null) {
+                    try self.validateConsoleCompletion();
+                    self.console.?.confirmed = true;
+                    self.next(.console_handoff);
+                    return true;
+                }
                 try self.validateCompletion();
                 self.next(.handoff);
             },
             .handoff => {
                 try self.validateCompletion();
-                self.last_status = self.display.?.transition(held.boot.held_generation, 0, &self.receipt);
+                self.last_status = self.display.?.transition(self.prepared.generation, 0, &self.receipt);
                 if (self.last_status != a.gfx_output_ok or !self.callback_confirmed or
-                    !validState(self.receipt, held.boot.held_generation, a.display_state_software_native, a.gfx_output_outcome_applied)) return error.Handoff;
+                    !validState(self.receipt, self.prepared.generation, a.display_state_software_native, a.gfx_output_outcome_applied)) return error.Handoff;
                 // Present and the common bridge each imported their own alias.
                 // The boot creator must not leak after a later confirmation
                 // retires that image. Mode-job references remain borrowed.
@@ -400,6 +452,29 @@ pub const Owner = struct {
                 try self.syncPresentationTarget();
                 self.ctx.?.logInfo("NVIDIA native-output: state=software-native boot-mode=retained shadow=system scanout=vram completion=CE,WIMM,Window,Core link=confirmed common-handoff=confirmed");
             },
+            .console_mapping => {
+                if (!try self.console.?.bindStep()) return false;
+                self.next(.scanout_commit);
+            },
+            .console_handoff => {
+                try self.validateConsoleCompletion();
+                var current: a.GfxNativeBootInfo = .{};
+                if (self.display.?.bootInfo(&current) != a.gfx_output_ok or current.generation < self.reset_generation or
+                    (current.state != a.display_state_recovering and current.state != a.display_state_unavailable)) return error.Handoff;
+                self.last_status = self.display.?.transition(current.generation, 2, &self.receipt);
+                if (self.last_status == a.gfx_output_error_busy) return false;
+                if (self.last_status != a.gfx_output_ok or self.receipt.reserved0 != 0 or self.receipt.version != 1 or
+                    self.receipt.size < @sizeOf(a.GfxNativeState)) return error.Handoff;
+                if (self.receipt.retained == 1 and self.receipt.outcome == a.gfx_output_outcome_lost and
+                    (self.receipt.state == a.display_state_unavailable or self.receipt.state == a.display_state_recovering)) return false;
+                if (self.receipt.retained != 0 or self.receipt.outcome != a.gfx_output_outcome_applied or
+                    self.receipt.state != a.display_state_bootfb or self.receipt.generation <= current.generation) return error.Handoff;
+                held.boot.console_active = true;
+                held.boot.native_adopted = false;
+                self.next(.console_active);
+                self.ctx.?.logInfo("NVIDIA console: original-BAR1=verified scanout=C67D-confirmed bootfb=restored firmware-and-console-reservation=resident");
+            },
+            .console_active => return false,
             .active => {
                 if (try self.refresh.step(self)) return true;
                 if (self.refresh.busy()) return false;
@@ -541,14 +616,46 @@ pub const Owner = struct {
             !image.link.?.complete() or
             self.confirmed_image == null or !std.meta.eql(image, self.confirmed_image.?)) return error.Completion;
     }
+    pub fn validateConsoleCompletion(self: *Owner) !void {
+        const source = self.console orelse return error.State;
+        const run = self.running.?;
+        const mode_status = try run.modeControlStatus(self.mode_control.?);
+        const active = try run.displayImageStatus(self.engine.?, self.mode.?.window) orelse return error.Completion;
+        const expected = try source.imageInfo(run.epoch, self.dma, self.window.?.slot);
+        const current_mode = try run.bootDisplayPlan(self.engine.?, self.mode.?.window);
+        if (source.phase != .ready or run.presentation != null or run.copy_backend != null or run.display_work != null or
+            !std.meta.eql(current_mode, self.mode.?) or
+            mode_status.info == null or self.mode_admission == null or !std.meta.eql(mode_status.info.?, self.mode_admission.?) or
+            !std.meta.eql(active.image, expected) or active.core_point == 0 or active.window_point == 0 or
+            active.mode_receipt == 0 or active.position == null or active.position.?.sequence == 0 or
+            !std.meta.eql(active.position.?.handle, self.immediate.?) or active.boot_mode == null or
+            !std.meta.eql(active.boot_mode.?, self.mode.?) or active.link == null or !active.link.?.complete() or
+            !std.meta.eql(active.link.?.plan, self.link.?) or active.link.?.receipt == 0 or
+            !std.meta.eql(self.confirmed_image, @as(?runtime.ActiveDisplayImage, active))) return error.Completion;
+    }
+    pub fn ownsConsole(self: *const Owner, current: a.GfxNativeBootInfo) bool {
+        if (self.self_address != @intFromPtr(self) or self.console == null) return false;
+        if (self.phase == .console_active) return self.captured.?.boot.console_active and
+            current.state == a.display_state_bootfb and current.generation == self.receipt.generation;
+        return self.phase == .console_handoff and current.generation >= self.reset_generation and
+            current.generation == self.captured.?.firmware_restore_generation and
+            (current.state == a.display_state_unavailable or current.state == a.display_state_recovering);
+    }
     fn validState(state: a.GfxNativeState, generation: u64, expected: u32, outcome: u32) bool {
         return state.version == 1 and state.size >= @sizeOf(a.GfxNativeState) and state.reserved0 == 0 and
             state.generation == generation and state.state == expected and state.outcome == outcome and state.retained == 1;
     }
     pub fn ownsNative(self: *const Owner, current: a.GfxNativeBootInfo) bool {
         return self.self_address == @intFromPtr(self) and (self.phase == .active or self.phase == .failed) and self.callback_confirmed and
-            validState(self.receipt, self.captured.?.boot.held_generation, a.display_state_software_native, a.gfx_output_outcome_applied) and
+            self.prepared.generation != 0 and self.prepared.generation == self.captured.?.boot.native_generation and
+            validState(self.receipt, self.prepared.generation, a.display_state_software_native, a.gfx_output_outcome_applied) and
             current.state == a.display_state_software_native and current.generation == self.receipt.generation;
+    }
+    pub fn ownsPreparing(self: *const Owner, current: a.GfxNativeBootInfo) bool {
+        return self.self_address == @intFromPtr(self) and self.captured != null and self.prepared.generation != 0 and
+            self.prepared.generation == self.captured.?.boot.native_generation and self.captured.?.boot.native_adopted and
+            current.state == a.display_state_preparing and current.generation == self.prepared.generation and
+            (self.phase == .image_upload or self.phase == .image_wait or self.phase == .scanout_commit or self.phase == .scanout_wait or self.phase == .handoff);
     }
     pub fn quarantine(self: *Owner, err: anyerror) void {
         if (self.phase == .detached) return;
@@ -582,7 +689,7 @@ pub const Owner = struct {
         self.callback_confirmed = true;
         return 1;
     }
-    fn restore(raw: u64, generation: u64, _: *const a.GfxNativeBootInfo) callconv(.c) i32 {
+    fn restore(raw: u64, generation: u64, boot: *const a.GfxNativeBootInfo) callconv(.c) i32 {
         if (raw == 0) return 0;
         const self: *Owner = @ptrFromInt(raw);
         if (self.self_address != raw or self.prepared.generation == 0 or generation <= self.prepared.generation) return 0;
@@ -591,9 +698,7 @@ pub const Owner = struct {
             current.state != a.display_state_recovering) return 0;
         self.restore_requested = true;
         @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,
-            "NVIDIA native-restore: requested generation={d} boot-mapping=unrestored DMA-quiescence=unproved resources=held", .{generation});
-        // Acknowledge only after an implemented physical restore and complete
-        // device quiescence. Firmware teardown alone is insufficient.
-        return 0;
+            "NVIDIA native-restore: requested generation={d} worker=reset-and-console resources=held", .{generation});
+        return self.captured.?.restoreFirmware(generation, boot);
     }
 };

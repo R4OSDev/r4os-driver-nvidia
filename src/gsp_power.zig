@@ -143,6 +143,22 @@ pub const Owner = struct {
         self.demanded_until = wanted.until_ns;
         self.timing_until = if (wanted.metric_mask & (1 << 9) != 0 and !self.stopping) wanted.until_ns else 0;
     }
+    /// No firmware call or DMA access. Publish terminal metadata immediately
+    /// so a cached pre-fault temperature/clock cannot remain apparently live.
+    pub fn deviceLost(self: *Owner, now: u64) void {
+        self.stable() catch return;
+        self.stopping = true; self.status = .host_failure;
+        self.snapshot = .{}; self.timer = .{};
+        self.demanded_mask = 0; self.demanded_until = 0; self.timing_until = 0;
+        self.common_next = 0;
+        if (now == 0 or now == std.math.maxInt(u64)) return;
+        const memory = self.ctx.memory() orelse return;
+        var state: a.GfxTelemetryState = .{ .adapter_id = self.adapter, .memory_generation = self.binding.epoch,
+            .sampled_ns = now, .valid_until_ns = now, .source = 1, .state = @intFromEnum(self.status) };
+        var ignored: a.GfxTelemetryDemand = .{};
+        self.common_status = memory.telemetryExchange(&state, &ignored);
+        // Keep any pending control receipt, attached RUSD page and DMA leases.
+    }
     pub fn sample(self: *Owner, now: u64) !void {
         try self.stable();
         if (!self.attached or self.active_mask == 0 or now < self.next_sample) return;

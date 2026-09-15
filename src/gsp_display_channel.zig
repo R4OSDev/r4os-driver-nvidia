@@ -239,6 +239,23 @@ pub const Owner = struct {
         if (self.config.kind == .window and self.parent.children[9 + self.config.index] != 0) return error.Retained;
         self.exchange = try exchange.Exchange.init(token, deadline); self.deadline = deadline; self.state = .destroying;
     }
+    pub fn closeAfterReset(self: *Owner, proof: @import("gsp_reset.zig").Quiescence) Error!void {
+        if ((self.self_address != 0 and self.self_address != @intFromPtr(self)) or
+            !proof.valid(self.config.root.epoch) or self.exchange.session.epoch != self.config.root.epoch or
+            self.parent.self_address != @intFromPtr(self.parent) or self.parent_slot >= self.parent.children.len or
+            !std.meta.eql(self.config.root, self.parent.binding) or (self.failure != null and self.failure.? == error.Descriptor)) return error.Stale;
+        if (self.config_stamp) |stamp| if (!std.meta.eql(self.config, stamp)) return error.Stale;
+        if (self.namespace_live) {
+            try self.exchange.session.rm_names.validateChildrenAfterReset(self.reservation, proof);
+            if (self.parent.children[self.parent_slot] != self.config.handle) return error.Stale;
+        }
+        if (!self.ring.close(true) or !self.backing.closeAfterReset(proof)) return error.Retained;
+        if (self.namespace_live) {
+            try self.exchange.session.rm_names.retireChildrenAfterReset(self.reservation, proof);
+            self.namespace_live = false; self.parent.children[self.parent_slot] = 0;
+        }
+        self.state = .finished;
+    }
     pub fn handoff(self: *Owner) Error!boot.Handoff {
         try self.stable();
         if (self.state != .ready and self.state != .closed) return error.State;

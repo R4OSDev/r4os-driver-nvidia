@@ -17,6 +17,9 @@ pub const Snapshot = struct {
     recovery_required: bool = false,
     native_adopted: bool = false,
     native_generation: u64 = 0,
+    // Common writers may run again, but the immutable capture and original
+    // epoch still belong to the resident driver console reservation.
+    console_active: bool = false,
 
     pub fn capture(self: *Snapshot, ctx: *const r4os.r4dev.DriverContext, adapter: u32) Error!Report {
         return self.captureGuarded(ctx, adapter, .{ .context = 0, .callback = refuseRecovery });
@@ -75,10 +78,28 @@ pub const Snapshot = struct {
         self.native_adopted = true;
         self.native_generation = state.generation;
     }
+    pub fn adoptReset(self: *Snapshot, state: a.GfxNativeState) Error!void {
+        if (!self.recovery_required or self.held_generation == 0 or state.version != 1 or
+            state.size < @sizeOf(a.GfxNativeState) or state.reserved0 != 0 or state.retained != 1 or
+            state.outcome != a.gfx_output_outcome_lost or state.state != a.display_state_recovering or
+            state.generation <= self.held_generation or state.generation <= self.native_generation) return error.Hold;
+        // The immutable hold remains unchanged. Only its close route moves
+        // to the common reset owner; this is no physical restoration proof.
+        self.native_adopted = true;
+        self.native_generation = state.generation;
+    }
+    pub fn adoptRecoveredNative(self: *Snapshot, state: a.GfxNativeState, reset_generation: u64) Error!void {
+        if (!self.native_adopted or !self.recovery_required or self.held_generation == 0 or reset_generation == 0 or
+            self.native_generation != reset_generation or state.version != 1 or state.size < @sizeOf(a.GfxNativeState) or
+            state.reserved0 != 0 or state.retained != 1 or state.outcome != a.gfx_output_outcome_validated or
+            state.state != a.display_state_preparing or state.generation <= reset_generation) return error.Hold;
+        self.native_generation = state.generation;
+    }
 
     // The actual descriptor remains in this resident owner on every failed
     // cleanup. Shutdown retries this same order through the cached tables.
     pub fn close(self: *Snapshot) bool {
+        if (self.console_active) return false;
         const memory = self.memory orelse return self.reference.reference.id == 0 and self.held_generation == 0;
         if (self.native_adopted) {
             const display = self.display orelse return false;

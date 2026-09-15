@@ -270,4 +270,12 @@ pub const Ring = struct {
         if (!self.idle() or self.backing.?.memory.?.bufferUnmap(&self.cpu.lease) != a.gfx_buffer_result_ok) return false;
         self.* = .{}; return true;
     }
+    pub fn closeAfterReset(self: *Ring, proof: @import("gsp_reset.zig").Quiescence) bool {
+        if (self.self_address == 0) return true;
+        const backing = self.backing orelse return false;
+        if (self.self_address != @intFromPtr(self) or !proof.valid(backing.epoch) or
+            !std.meta.eql(self.cpu, self.cpu_stamp) or backing.memory == null) return false;
+        if (self.cpu.lease.id != 0 and backing.memory.?.bufferUnmap(&self.cpu.lease) != a.gfx_buffer_result_ok) return false;
+        self.* = .{}; return true;
+    }
 };

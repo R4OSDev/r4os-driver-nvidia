@@ -116,5 +116,13 @@ pub const Owner = struct {
         }
         return true;
     }
+    pub fn closeAfterReset(self: *Owner, proof: @import("gsp_reset.zig").Quiescence) bool {
+        if (self.self_address == 0) return true;
+        if (self.self_address != @intFromPtr(self) or self.cache_owner == null or self.source == null or
+            !proof.valid(self.cache_owner.?.epoch) or (self.failure != null and self.failure.? == error.Descriptor)) return false;
+        if (!self.release()) return false;
+        self.cache_owner.?.uploading = null;
+        self.* = .{}; return true;
+    }
 };
 fn valid(h: a.GfxBufferHandle) bool { return h.id != 0 and h.generation != 0 and h.reserved0 == 0; }

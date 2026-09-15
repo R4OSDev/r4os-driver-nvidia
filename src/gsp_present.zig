@@ -111,6 +111,13 @@ pub const Owner = struct {
         if (!self.valid() or self.memory.?.bufferRelease(&self.shadow.reference) != a.gfx_buffer_result_ok) return false;
         self.* = .{}; return true;
     }
+    pub fn closeAfterReset(self: *Owner, proof: @import("gsp_reset.zig").Quiescence) bool {
+        if (self.self_address == 0) return true;
+        if (self.self_address != @intFromPtr(self) or self.target_stamp == null or
+            !proof.valid(self.target_stamp.?.epoch) or self.memory == null or !std.meta.eql(self.shadow, self.shadow_stamp)) return false;
+        if (self.shadow.reference.id != 0 and self.memory.?.bufferRelease(&self.shadow.reference) != a.gfx_buffer_result_ok) return false;
+        self.* = .{}; return true;
+    }
 };
 
 /// Initial pixels come from the product owner's immutable boot capture;
@@ -179,6 +186,14 @@ pub const Initial = struct {
     pub fn cancel(self: *Initial) Error!void {
         if (!self.valid() or self.submitted or self.ticket != null) return error.State;
         try self.release();
+    }
+    pub fn closeAfterReset(self: *Initial, proof: @import("gsp_reset.zig").Quiescence) bool {
+        if (self.self_address == 0) return true;
+        if (self.self_address != @intFromPtr(self) or self.source_stamp == null or self.surface == null or
+            !proof.valid(self.source_stamp.?.epoch) or !std.meta.eql(self.gpu, self.gpu_stamp) or
+            (self.failure != null and self.failure.? == error.Descriptor)) return false;
+        self.release() catch return false;
+        return true;
     }
     fn release(self: *Initial) Error!void {
         if (self.surface.?.memory.?.deviceRelease(&self.gpu, 1) != a.gfx_buffer_result_ok) {

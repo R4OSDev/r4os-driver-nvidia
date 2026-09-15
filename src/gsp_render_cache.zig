@@ -139,4 +139,10 @@ pub const Owner = struct {
         if (!self.packet.close(true) or !self.programs.close(true)) return false;
         self.* = .{}; return true;
     }
+    pub fn closeAfterReset(self: *Owner, proof: @import("gsp_reset.zig").Quiescence) bool {
+        if (self.self_address == 0) return true;
+        if (self.self_address != @intFromPtr(self) or !proof.valid(self.epoch) or self.borrowed or self.uploading != null) return false;
+        if (!self.packet.closeAfterReset(proof) or !self.programs.closeAfterReset(proof)) return false;
+        self.* = .{}; return true;
+    }
 };

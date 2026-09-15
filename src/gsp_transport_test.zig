@@ -1244,6 +1244,13 @@ fn checkRuntimeEvents(model: *Model) !void {
     journal.acknowledge(scope);
     try t.expect(journal.first_fatal.?.acknowledged and journal.first_fatal.?.fault_address == 0x80000021);
     try t.expect(diagnostics.rmKind(0x21) == .invalid_channel and diagnostics.rmKind(0x1a) == .resource and diagnostics.rmKind(0x51) == .resource);
+    try t.expect(diagnostics.xidKind(119) == .firmware and diagnostics.xidKind(120) == .firmware);
+    const timeout = diagnostics.host(.display_channel, error.Timeout, true);
+    try t.expect(timeout.kind == .timeout and timeout.operation == .display_channel and timeout.hardware_channel == null and
+        timeout.irq_received == 0 and timeout.receipt == null); // No invented IRQ or hardware completion.
+    try t.expect(diagnostics.host(.event, error.FirmwareError, true).kind == .firmware and
+        diagnostics.host(.interrupt, error.IrqRetirement, true).kind == .interrupt and
+        diagnostics.host(.display_engine, error.Display, true).kind == .display);
     var post: [40]u8 = undefined;
     var event = try runtimeEvent(model, 0x1003, postPayload(&post));
     const p = event.post_event;

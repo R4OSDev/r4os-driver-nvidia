@@ -26,7 +26,7 @@ pub const Model = struct {
     pub const length = 12288;
     const image_length = 65536; // One minimum-area DSC slice in the existing Device group.
     const system_count = 4; // Primary, retained replacement, additional head and its mode candidate.
-    pub const binding: a.GfxBackendBinding = .{ .adapter_id = 0x01000000, .milestone = 1, .device_generation = 7, .reset_generation = 11 };
+    pub var binding: a.GfxBackendBinding = .{ .adapter_id = 0x01000000, .milestone = 1, .device_generation = 7, .reset_generation = 11 };
     const Reference = struct { active: bool = false, buffer: a.GfxBufferHandle = .{}, mapping_only: bool = true, readonly: bool = false };
     const Scanout = struct { job: a.GfxDriverJob, retire: bool = false };
     pub var scanouts: [3]?Scanout = @splat(null);
@@ -88,6 +88,7 @@ pub const Model = struct {
     var executed = false;
     var signaled = false;
     pub fn install(table: *a.DriverApi, index: usize) void {
+        binding = .{ .adapter_id = 0x01000000, .milestone = 1, .device_generation = 7, .reset_generation = 11 };
         std.debug.assert(table.gfx_memory_query.?(&original) == a.gfx_buffer_result_ok);
         table.gfx_memory_query = memory; table.gfx_queue_query = queue;
         references = @splat(.{}); dma = @splat(.{}); gpu = @splat(.{}); queued = false; active = false;
@@ -118,6 +119,13 @@ pub const Model = struct {
         app_reference = false;
         present_mode = true; product_mode = true;
         direct_mode = native.is("context_native_unknown");
+    }
+    pub fn retireReset(proof: @import("gsp_reset.zig").Quiescence) void {
+        std.debug.assert(proof.valid(proof.epoch) and lost and heldReferences() == 0 and !shadow_cpu);
+        for (&scanouts) |slot| std.debug.assert(slot == null);
+        registration = null; active = false; queued = false; lost = false;
+        fetched = false; executed = false; signaled = false;
+        binding.device_generation += 1; binding.reset_generation += 1;
     }
     pub fn installRender(table: *a.DriverApi, index: usize) void {
         install(table, index); render_mode = true;

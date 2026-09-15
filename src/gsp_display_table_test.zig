@@ -22,6 +22,10 @@ pub fn check() !void {
             var bad = input; bad.physical += 1; try t.expectError(error.Bounds, layout.validate(bad));
             bad = input; bad.bytes = (@as(u64, 1) << 40); try t.expectError(error.Bounds, layout.validate(bad));
             bad = input; bad.channel = 9; try t.expectError(error.Handle, layout.validate(bad));
+            bad = input; bad.physical = 0; try t.expectError(error.Bounds, layout.validate(bad));
+            bad.target = .vram; bad.reserved_console = true; try layout.validate(bad);
+            try t.expect(layout.descriptor(bad)[1] == 0);
+            bad.target = .coherent_system; try t.expectError(error.Unsupported, layout.validate(bad));
         }
     }
     try t.expectEqualSlices(u8, fixture[8 + layout.capacity * 32..], &table.image);

@@ -1,16 +1,28 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.121; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.122; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
-subsystem 1458:4074, VBIOS 94.06.2f.00.d6. Software implementation through 0.79.29 is documented; physical native qualification remains separate.
+subsystem 1458:4074, VBIOS 94.06.2f.00.d6. Software implementation through 0.79.30 is documented; physical native qualification remains separate.
 The default path inventories NVIDIA display functions once through
 the kernel PCI inventory. Explicit diagnostic/start modes are described below.
 Starting with R4OS 0.79.9, `IMAGE_SCOPE=slim` includes the current module in
 Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
+
+Reset and recovery (0.79.30): one bounded GA106 Fn0 PCIe FLR attempt requires
+saved configuration, transaction drain and observed firmware/Falcon stop.
+Device-Lost invalidates old native buffers before physical retirement; fresh
+firmware, RM/CE/display resources and CPU sources reconstruct software rendering
+on native scanout. Requested console return restores and verifies the exact
+original BAR1 mapping, then requires a new C67D mode/link/image receipt before
+the common kernel reopens bootfb. Its firmware/channel/console reservation
+remains resident. Uncertain recovery retains resources and names the existing
+Limine `R4OS Software Graphics` entry; it does not reboot automatically.
+See `Docs/Drivers/GrafikReset07930.txt/.json`. Physical FLR, picture and audio
+qualification remains open in `ExFiles/Reports/OssiGPU.txt` /30.
 
 Power and telemetry (0.79.29): the native worker uses documented 570.144
 RUSD, finite boost and GPU timer controls. Collection is demand driven;
