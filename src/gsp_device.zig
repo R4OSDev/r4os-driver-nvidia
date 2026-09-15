@@ -100,7 +100,7 @@ pub const Device = struct {
         if (self.self_address != 0) return error.Busy;
         if (ctx.apiVersion() < a.driver_api_thread_work_version) return error.Api;
         if (display.context == null or display.context.?.api != ctx.api or display.snapshot == null or
-            display.chip == null or display.chip.?.id != 0x176 or display.operation == null or
+            display.chip == null or !@import("generation.zig").ga102Hal(display.chip.?.id) or display.operation == null or
             !display.ready or display.firmware_owner != 0 or reservation.display != display or
             reservation.backing != backing.boot_storage or backing.api != ctx.api or
             reader.memory != backing or reader.generation() != backing.generation() or reader.busy) return error.Binding;
@@ -139,14 +139,14 @@ pub const Device = struct {
         self.reset_config.capture(&display.snapshot.?, original.boot0, original.boot1, self.resetIo()) catch |err| {
             self.reset_config_failure = err;
             @import("gsp_mode_diagnostics.zig").write(ctx,
-                "NVIDIA gpu-reset: capability=unavailable reason={s} scope=GA106-Fn0 initial-start=allowed", .{@errorName(err)});
+                "NVIDIA gpu-reset: capability=unavailable reason={s} scope=selected-NVIDIA-Fn0 initial-start=allowed", .{@errorName(err)});
         };
         try self.port.openShared(ctx, &display.snapshot.?, original.boot0, original.boot1,
             .{ .epoch = self.epoch, .deadline_ns = deadline, .resume_args = inputs.resume_args },
             self.owner(), &display.registers);
         var payloads: preboot.Payloads = .{};
         try preboot.encode(&display.snapshot.?, display.original_boot.?.byte_length, &payloads);
-        self.session = try transport.Session.init(try self.port.transportPort(), .{ .chip_id = 0x176 }, self.epoch, &self.tx, &self.rx);
+        self.session = try transport.Session.init(try self.port.transportPort(), .{ .chip_id = self.display.?.chip.?.id }, self.epoch, &self.tx, &self.rx);
         try self.port.preloadInit(&self.session.?, &payloads.system, &payloads.registry);
         self.ctx.?.logInfo("NVIDIA gsp-start: preboot=system-info,registry rpc-sequence=0 queue-sequence=2 firmware-submitted=no");
         try self.beginFirmware(.frts, &inputs);
@@ -457,7 +457,7 @@ pub const Device = struct {
             self.reset_audio_attached = self.native_output.audio.catalog != null;
         }
         @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,
-            "NVIDIA gpu-reset: attempt=1 scope=GA106-Fn0 epoch={d} original-phase={s} driver={s} firmware={s} resources=held display=held",
+            "NVIDIA gpu-reset: attempt=1 scope=selected-NVIDIA-Fn0 epoch={d} original-phase={s} driver={s} firmware={s} resources=held display=held",
             .{self.epoch,@tagName(self.failed_phase orelse .detached),@import("nvidia_identity").version,@import("firmware.zig").lock.rm_version});
     }
     fn validResetState(value: a.GfxNativeState) bool {
@@ -548,7 +548,7 @@ pub const Device = struct {
                     .location = self.reset_audio_location, .device = self.reset_audio_device };
                 var payloads: preboot.Payloads = .{};
                 try preboot.encode(&self.display.?.snapshot.?, self.display.?.original_boot.?.byte_length, &payloads);
-                self.session = try transport.Session.init(try self.port.transportPort(), .{ .chip_id = 0x176 }, self.epoch, &self.tx, &self.rx);
+                self.session = try transport.Session.init(try self.port.transportPort(), .{ .chip_id = self.display.?.chip.?.id }, self.epoch, &self.tx, &self.rx);
                 try self.port.preloadInit(&self.session.?, &payloads.system, &payloads.registry);
                 try self.reader.?.setPolling(true);
                 try self.beginFirmware(.frts, &inputs);

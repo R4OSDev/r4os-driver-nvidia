@@ -41,7 +41,7 @@ pub const Range = struct { address: u64, bytes: u32 };
 /// A low VBIOS workspace uses NVIDIA's 128 KB workspace size. An already
 /// relocated workspace extends to the reported end of framebuffer memory.
 pub fn workspace(chip_id: u16, raw: *const preflight.Raw) !Range {
-    if (chip_id != 0x176) return error.Profile;
+    if (!@import("generation.zig").ga102Hal(chip_id)) return error.Profile;
     const state = try preflight.decode(raw);
     if (!state.display_enabled or !state.vga_valid) return error.Unavailable;
     if (state.wpr_up or state.reset_asserted or state.scrubbing or !state.falcon_halted or
@@ -78,7 +78,7 @@ pub const Capture = struct {
     previous_clock: u64 = 0,
 
     pub fn init(options: Options) !Capture {
-        if ((identity.chip(options.boot0, options.boot1) orelse return error.Profile).id != 0x176) return error.Profile;
+        if (!@import("generation.zig").ga102Hal((identity.chip(options.boot0, options.boot1) orelse return error.Profile).id)) return error.Profile;
         const range = options.range;
         if (options.epoch == 0 or options.deadline == 0 or options.deadline == std.math.maxInt(u64) or
             !preflight.readable(options.vga) or options.vga & 8 == 0 or

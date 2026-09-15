@@ -4,7 +4,8 @@ param(
     [Parameter(Mandatory)][string]$Compiler,
     [Parameter(Mandatory)][string]$SourceDirectory,
     [Parameter(Mandatory)][string]$ScratchDirectory,
-    [Parameter(Mandatory)][string]$OutputDirectory
+    [Parameter(Mandatory)][string]$OutputDirectory,
+    [ValidateSet('ga10x','all')][string]$GenerationSet='ga10x'
 )
 $ErrorActionPreference='Stop'
 Set-StrictMode -Version Latest
@@ -68,10 +69,27 @@ try {
     [IO.File]::WriteAllBytes((Join-Path $run 'source-catalog.txt'),$bytes)
     if($total -ne $pin.bytes -or $digest -cne $pin.catalog_sha256){throw 'Source catalog mismatch; compiler and decoder not started'}
     $state.source_verified=$true
+    # One canonical archive list supplies source includes, entry names and
+    # provenance. Only entry keys from the already verified copy enter C.
+    $groups=@(Get-Content -Raw (Join-Path $PSScriptRoot 'Bootstrap/Archives.json')|ConvertFrom-Json|
+        Where-Object {$GenerationSet -eq 'all' -or $_.family -in @('ga10x','shared')})
+    $includes=[Text.StringBuilder]::new();$names=[Text.StringBuilder]::new();$expectedEntries=0
+    foreach($group in $groups){
+        if($group.file -cnotmatch '^g_bindata_[A-Za-z0-9_]+\.c$' -or $group.name -cnotmatch '^[A-Za-z0-9-]+$'){throw 'Invalid archive key'}
+        $original=Get-Content -Raw -LiteralPath (Join-Path $snapshot ('src/nvidia/generated/'+$group.file))
+        $records=[regex]::Matches($original,'(?m)^// FUNCTION: ([A-Za-z0-9_]+)\("([A-Za-z0-9_]+)"\)\r?\n// FILE NAME: ([^\r\n]+)')
+        if($records.Count -ne $group.entries){throw "Archive entry count mismatch: $($group.name)"}
+        $null=$includes.Append('#include "').Append($group.file).Append('"').Append([char]10)
+        foreach($record in $records){$null=$names.Append('"').Append($group.name).Append('-').Append($record.Groups[2].Value).Append('",').Append([char]10)}
+        $expectedEntries+=$records.Count
+    }
+    if($expectedEntries -ne $(if($GenerationSet -eq 'all'){100}else{26})){throw 'Unexpected selected archive count'}
+    [IO.File]::WriteAllText((Join-Path $run 'R4NV_ARCHIVES.h'),$includes.ToString(),$utf8)
+    [IO.File]::WriteAllText((Join-Path $run 'R4NV_ARCHIVE_NAMES.h'),$names.ToString(),$utf8)
     . (Join-Path $PSScriptRoot 'Rm/Native.ps1')
     $suffix=if($IsWindows){'.exe'}else{''}
     $exe=Join-Path $run ('bootstrap-export'+$suffix)
-    $compilerArguments=@('cc','-std=c11','-O2','-DNVGZ_USER',
+    $compilerArguments=@('cc','-std=c11','-O2','-DNVGZ_USER','-I',$run,
         '-I',(Join-Path $snapshot 'src/common/sdk/nvidia/inc'),
         '-I',(Join-Path $snapshot 'src/common/inc'),
         '-I',(Join-Path $snapshot 'src/nvidia/arch/nvalloc/common/inc'),
@@ -84,7 +102,7 @@ try {
     $code=Invoke-RmNative -Executable $exe -Arguments @((Join-Path $stage 'artifacts')) -WorkingDirectory $run -LogPath (Join-Path $run 'original.json') -TimeoutSeconds 20
     if($code -ne 0){throw "Original bootstrap decoder failed: $code"}
     $artifacts=Get-Content -Raw (Join-Path $run 'original.json')|ConvertFrom-Json
-    if($artifacts.Count -ne 26){throw 'Unexpected artifact count'}
+    if($artifacts.Count -ne $expectedEntries){throw 'Unexpected artifact count'}
     foreach($entry in $artifacts){
         $encoded=Join-Path $stage ('artifacts/'+$entry.name+'.encoded')
         $decoded=Join-Path $stage ('artifacts/'+$entry.name+'.bin')
@@ -105,11 +123,15 @@ try {
         $entry|Add-Member -NotePropertyName encoded_sha256 -NotePropertyValue (Get-FileHash $encoded).Hash.ToLowerInvariant()
     }
     . (Join-Path $PSScriptRoot 'Bootstrap/Origins.ps1')
-    $references=Add-BootstrapOrigins -Source $snapshot -Stage $stage -Artifacts $artifacts
+    $references=Add-BootstrapOrigins -Source $snapshot -Stage $stage -Artifacts $artifacts -Groups $groups
     . (Join-Path $PSScriptRoot 'Bootstrap/FwsecAbi.ps1')
     $fwsecAbi=Confirm-FwsecAbi -Compiler $Compiler -Source $snapshot -Run $run -Stage $stage
     $report=[ordered]@{schema=1;source_commit=$pin.source_commit;rm_version=$firmware.rm_version;source_catalog_sha256=$digest;source_files=$paths.Count;source_bytes=$total;artifacts=$artifacts;references=$references;decoders=@('unchanged NVIDIA utilGz NVGZ_USER','bounded .NET DeflateStream');source_family_mapping='GA106 uses GA102 GSP-RM boot/load/unload and TU102 generic SEC2 loader';gpu_executed=$false;signature_cryptographically_verified=$false;hardware_variant_selected=$false;module_resources_added=$false}
     $report.fwsec_abi=$fwsecAbi
+    if($GenerationSet -eq 'all'){
+        $report.generation_set=$GenerationSet
+        $report.source_family_mapping='GA10x: GA102; TU102/104/106: TU102; TU116/117: TU116 Booters and TU102 boot; AD10x: AD102; GB20x: GB202 boot/FMC with FSP (no Booter). Assets do not enable a native port.'
+    }
     [IO.File]::WriteAllText((Join-Path $stage 'bootstrap.json'),($report|ConvertTo-Json -Depth 8)+[char]10,$utf8)
     $state.export_complete=$true
     # All provenance, notices and artifacts form one deterministic package.

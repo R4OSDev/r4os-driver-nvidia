@@ -66,7 +66,7 @@ pub const Storage = struct {
     /// no ownership of those external allocations or of GPU execution state.
     pub fn stage(self: *Storage, ctx: *const r4os.r4dev.DriverContext, chip_id: u16, excluded: []const init.Span, timeout_ns: u64) Error!Report {
         if (self.context != null) return error.Busy;
-        if (chip_id != 0x176) return error.Profile;
+        if (!@import("generation.zig").ga102Hal(chip_id)) return error.Profile;
         if (excluded.len > init.max_excluded) return error.Segments;
         if (!ctx.supportsDriverApi(19, @offsetOf(a.DriverApi, "dma_unpin_buffer") + @sizeOf(usize))) return error.Api;
         self.context = ctx.*;

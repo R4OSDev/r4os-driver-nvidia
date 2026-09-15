@@ -1,13 +1,7 @@
 # Original archive metadata is retained with the complete source notices.
-function Add-BootstrapOrigins([string]$Source,[string]$Stage,$Artifacts){
-    $groups=@(
-        @{name='GspRmBoot-GA102';file='g_bindata_kgspGetBinArchiveGspRmBoot_GA102.c'},
-        @{name='BooterLoad-GA102';file='g_bindata_kgspGetBinArchiveBooterLoadUcode_GA102.c'},
-        @{name='BooterUnload-GA102';file='g_bindata_kgspGetBinArchiveBooterUnloadUcode_GA102.c'},
-        @{name='Sec2Bl-TU102';file='g_bindata_ksec2GetBinArchiveBlUcode_TU102.c'}
-    )
+function Add-BootstrapOrigins([string]$Source,[string]$Stage,$Artifacts,$Groups){
     $sources=@()
-    foreach($group in $groups){
+    foreach($group in $Groups){
         $relative='src/nvidia/generated/'+$group.file
         $text=Get-Content -Raw -LiteralPath (Join-Path $Source $relative)
         if(!$text.Contains('SPDX-License-Identifier: MIT')){throw 'Missing original MIT attribution'}

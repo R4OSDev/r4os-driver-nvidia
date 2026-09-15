@@ -137,4 +137,14 @@ fn checkGraphics() !void {
     try t.expectError(error.Unsupported, gr.encode(0xc697, .barrier, 0x50002200, 1));
     try t.expectError(error.Bounds, gr.encode(gr.class, .barrier, 0x10000000000, 1));
     try t.expectError(error.Bounds, gr.encode(gr.class, .barrier, 0x50002200, 0));
+    for ([_]u16{0x162,0x176,0x192,0x1b2}, [_]u32{0xc597,0xc797,0xc997,0xcd97}) |chip, class| {
+        config.chip_id = chip; config.object_class = class;
+        const allocation = try wire.encode(config, .allocate_graphics, &request);
+        try t.expectEqual(class, wire.word(allocation, 12));
+        const completion = try gr.encode(class, .barrier, 0x50002200, 7);
+        try t.expectEqual(class, completion.data[1]);
+        try t.expectEqual(@as(u32,0x1000f010), completion.data[10]);
+        config.object_class = if (class == 0xc797) 0xc997 else 0xc797;
+        try t.expectError(error.Unsupported, wire.encode(config, .allocate_graphics, &request));
+    }
 }

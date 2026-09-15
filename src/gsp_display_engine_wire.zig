@@ -307,7 +307,10 @@ pub const Error = exchange.Error || error{Unsupported};
 pub const Operation = enum { classes, static_info, allocate, preserve, free, instance };
 pub const max_bytes = 428;
 pub const root_class: u32 = 0xc670;
-pub const Binding = struct { epoch: u64, client: u32, device: u32, root: u32, internal_client: u32, internal_subdevice: u32 };
+pub const Binding = struct { chip_id: u16 = 0x176, epoch: u64, client: u32, device: u32, root: u32, internal_client: u32, internal_subdevice: u32 };
+pub fn classes(binding: Binding) @import("generation.zig").Display {
+    return @import("generation.zig").get(binding.chip_id).?.display;
+}
 pub const StaticInfo = struct {
     capabilities: u32, windows: u32, fb_remapper: bool, heads: u32, i2c_port: u32,
     internal_displays: u32, embedded_dp: u32, external_mux: bool, internal_mux: bool, channels: u32,
@@ -319,6 +322,7 @@ pub fn command(op: Operation) u32 { return switch (op) { .classes => 0x800292, .
 pub fn word(data: []const u8, at: usize) u32 { return std.mem.readInt(u32, data[at..][0..4], .little); }
 fn put(out: []u8, at: usize, value: u32) void { std.mem.writeInt(u32, out[at..][0..4], value, .little); }
 pub fn validate(binding: Binding) Error!void {
+    if (@import("generation.zig").get(binding.chip_id) == null) return error.Unsupported;
     if (binding.epoch == 0) return error.Stale;
     if (binding.client == 0 or binding.device == 0 or binding.root == 0 or binding.internal_client == 0 or binding.internal_subdevice == 0 or
         binding.client == binding.device or binding.client == binding.root or binding.device == binding.root or binding.internal_client == binding.client) return error.Handle;
@@ -335,7 +339,7 @@ pub fn encode(binding: Binding, op: Operation, output: []u8) Error![]const u8 {
             // subdeviceIndex=0; the one-shot flag applies to the NEXT RmFree.
             if (op == .preserve) put(out, 28, 1);
         },
-        .allocate => { put(out, 4, binding.device); put(out, 8, binding.root); put(out, 12, root_class); },
+        .allocate => { put(out, 4, binding.device); put(out, 8, binding.root); put(out, 12, classes(binding).root); },
         .free => put(out, 8, binding.root),
         .instance => return error.Unsupported, // Requires retained physical storage.
     }

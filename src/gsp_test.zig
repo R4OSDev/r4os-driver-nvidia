@@ -158,7 +158,7 @@ test "GSP message framing bounds complete records before checksum and preserves 
     try t.expectError(error.Length, message.inspectPrefix(profile, output[0 .. message.header_bytes - 1]));
     try t.expectError(error.Length, message.decode(profile, output, sequence));
     @memset(output, 0xa5);
-    try t.expectError(error.Profile, message.encode(.{ .chip_id = 0x177 }, 0, rpc, payload[0..1], output));
+    try t.expectError(error.Profile, message.encode(.{ .chip_id = 0x170 }, 0, rpc, payload[0..1], output));
     try t.expectError(error.Profile, message.encode(.{ .chip_id = 0x176, .confidential_compute = true }, 0, rpc, payload[0..1], output));
     try t.expectError(error.Length, message.encode(profile, 0, rpc, payload, output));
     try t.expectError(error.Output, message.encode(profile, 0, rpc, &.{}, output[0..4095]));
@@ -227,7 +227,7 @@ test "GSP initialization encodes self-mapped queues and ordered Libos logs witho
         input.queues = &spans;
         const failure: anyerror = switch (case) {
             0 => blk: {
-                input.chip_id = 0x174;
+                input.chip_id = 0x170;
                 break :blk error.Profile;
             },
             1 => blk: {
@@ -618,7 +618,9 @@ test "GA106 first boot keeps WPR layout in the prescribed top 256 MB and never r
     changed.put(.wpr_lo, 0x1000);
     changed.put(.wpr_hi, 0x2000);
     try t.expectError(error.WprActive, layout.firstBoot(0x176, &changed, image_bytes, 24576));
-    try t.expectError(error.UnsupportedChip, layout.firstBoot(0x172, &raw, image_bytes, 24576));
+    try t.expectError(error.UnsupportedChip, layout.firstBoot(0x170, &raw, image_bytes, 24576));
+    for ([_]u16{ 0x172, 0x173, 0x174, 0x176, 0x177 }) |chip_id|
+        try t.expectEqualDeep(plan, try layout.firstBoot(chip_id, &raw, image_bytes, 24576));
     for ([_]u64{ 0, 64 * layout.mb + 1, std.math.maxInt(u64) }) |size|
         try t.expectError(error.ImageSize, layout.firstBoot(0x176, &raw, size, 24576));
     for ([_]u64{ 0, layout.mb + 1, std.math.maxInt(u64) }) |size|

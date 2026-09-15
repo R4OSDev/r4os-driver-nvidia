@@ -57,12 +57,14 @@ pub fn build(b: *std.Build) void {
     }
     verify.addArg("-BooterDirectory");
     verify.addDirectoryArg(b.path("BooterFirmware"));
+    verify.addArg("-GenerationDirectory");
+    verify.addDirectoryArg(b.path("GenerationFirmware"));
     const unit = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/tests.zig"),
         .target = b.graph.host,
         .optimize = .ReleaseSafe,
     }) });
-    const unit_step = b.step("unit-test", "Passive PCI identity and bounded NVIDIA firmware parsing");
+    const unit_step = b.step("unit-test", "NVIDIA owners: identity, firmware, native lifecycle and graphics");
     unit.root_module.addImport("r4os", host_sdk);
     unit.root_module.addImport("nvidia_identity", identity);
     unit.root_module.addImport("r4gfx_edid", receiver_parser);
@@ -129,6 +131,7 @@ pub fn build(b: *std.Build) void {
     // Existing owner step exercises the complete Booter resource/heap/DMA
     // path with the same pinned bytes as the module, never a fake hash bypass.
     const fixture_files = b.addWriteFiles();
+    fixture_files.step.dependOn(&verify.step);
     var fixture_source: []const u8 = "pub const Entry = struct { name: []const u8, bytes: []const u8 };\npub const files = [_]Entry{\n";
     for (pin.booters) |booter| {
         inline for (.{ "image", "header", "signatures", "patch_location", "patch_signature", "patch_metadata", "signature_count" }) |field| {
@@ -136,6 +139,12 @@ pub fn build(b: *std.Build) void {
             _ = fixture_files.addCopyFile(b.path(b.pathJoin(&.{ "BooterFirmware", name })), name);
             fixture_source = b.fmt("{s}.{{ .name = \"{s}\", .bytes = @embedFile(\"{s}\") }},\n", .{ fixture_source, name, name });
         }
+    }
+    for (pin.boot_generations) |profile| {
+        const base = b.pathJoin(&.{ "GenerationFirmware", profile.name });
+        const name = profile.pack.resource;
+        _ = fixture_files.addCopyFile(b.path(b.pathJoin(&.{ base, name })), name);
+        fixture_source = b.fmt("{s}.{{ .name = \"{s}\", .bytes = @embedFile(\"{s}\") }},\n", .{ fixture_source, name, name });
     }
     const notice = pin.booter_license.artifact.resource;
     _ = fixture_files.addCopyFile(b.path(b.pathJoin(&.{ "BooterFirmware", notice })), notice);
@@ -175,7 +184,7 @@ pub fn build(b: *std.Build) void {
     }) });
     const inspect_layout = b.addRunArtifact(layout_inspector);
     if (b.args) |args| inspect_layout.addArgs(args);
-    b.step("inspect-gsp-layout", "Plan GA106 first boot: -- PREFLIGHT.json GSP.bin BOOT.bin DESC.bin OUTPUT.json").dependOn(&inspect_layout.step);
+    b.step("inspect-gsp-layout", "Plan admitted Ampere/Ada first boot: -- PREFLIGHT.json GSP.bin BOOT.bin DESC.bin OUTPUT.json").dependOn(&inspect_layout.step);
     const prepare = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-File" });
     prepare.addFileArg(b.path("Tools/PrepareFirmware.ps1"));
     prepare.addArg("-Inspector");
@@ -185,12 +194,12 @@ pub fn build(b: *std.Build) void {
     const prepare_boot = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-File" });
     prepare_boot.addFileArg(b.path("Tools/PrepareBootFirmware.ps1"));
     if (b.args) |args| prepare_boot.addArgs(args);
-    b.step("prepare-boot-firmware", "Provision admitted boot files/notices: -- -SourceDirectory PATH -BootstrapDirectory PATH -ScratchDirectory PATH [-Component gsp|booter] [-OutputDirectory PATH]").dependOn(&prepare_boot.step);
+    b.step("prepare-boot-firmware", "Provision admitted boot files/notices: -- -SourceDirectory PATH -BootstrapDirectory PATH -ScratchDirectory PATH [-Profile ga102|ad102|tu102|tu116] [-Component gsp|booter] [-OutputDirectory PATH]").dependOn(&prepare_boot.step);
     const bootstrap = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-File" });
     bootstrap.addFileArg(b.path("Tools/PrepareBootstrap.ps1"));
     bootstrap.addArgs(&.{ "-Compiler", b.graph.zig_exe });
     if (b.args) |args| bootstrap.addArgs(args);
-    b.step("prepare-bootstrap", "Export pinned CPU reference data: -- -SourceDirectory PATH -ScratchDirectory Temp/PATH -OutputDirectory PATH").dependOn(&bootstrap.step);
+    b.step("prepare-bootstrap", "Export pinned CPU reference data: -- -SourceDirectory PATH -ScratchDirectory Temp/PATH -OutputDirectory PATH [-GenerationSet ga10x|all]").dependOn(&bootstrap.step);
     const rm_build = b.addSystemCommand(&.{ "pwsh", "-NoProfile", "-File" });
     rm_build.addFileArg(b.path("Tools/BuildRm.ps1"));
     rm_build.addArgs(&.{ "-Compiler", b.graph.zig_exe });

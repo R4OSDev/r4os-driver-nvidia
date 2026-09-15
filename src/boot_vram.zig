@@ -48,7 +48,7 @@ pub const Capture = struct {
     pub fn capture(self: *Capture, ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, chip: identity.Chip) !Report {
         if (self.self_address != 0) return error.Busy;
         const bar = snapshot.bars[0];
-        if (identity.decision(snapshot) != .identity_words_only or chip.id != 0x176 or
+        if (identity.decision(snapshot) != .identity_words_only or !@import("generation.zig").ga102Hal(chip.id) or
             bar.bytes < 0x821000 or bar.base > std.math.maxInt(u64) - bar.bytes) return error.Profile;
         self.self_address = @intFromPtr(self);
         errdefer |err| self.last_error = err;

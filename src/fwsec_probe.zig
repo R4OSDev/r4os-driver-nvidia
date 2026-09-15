@@ -32,7 +32,7 @@ pub const Capture = struct {
 
     fn readSelected(self: *Capture, ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, chip: identity.Chip, catalog: ?*const fwsec.Catalog, fixed_id: u8, shared: ?*bar0.Owner) Error!preparation.Fuses {
         const bar = snapshot.bars[0];
-        if (identity.decision(snapshot) != .identity_words_only or chip.id != 0x176 or
+        if (identity.decision(snapshot) != .identity_words_only or !@import("generation.zig").ga102Hal(chip.id) or
             bar.bytes < 0x825000 or bar.base > std.math.maxInt(u64) - bar.bytes) return error.UnmeasuredRange;
         if (catalog) |entries| {
             if (entries.count > entries.entries.len) return error.Limit;

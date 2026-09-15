@@ -26,6 +26,15 @@ pub const Booter = struct {
     patch_metadata: Artifact,
     signature_count: Artifact,
 };
+pub const Boot = struct { source: Source, image: Artifact, descriptor: Artifact, license: Artifact, notices: [12]Source };
+pub const BooterLicense = struct { artifact: Artifact, notices: [5]Source };
+pub const BootGeneration = struct {
+    name: []const u8,
+    pack: Artifact,
+    boot: Boot,
+    booters: [2]Booter,
+    booter_license: BooterLicense,
+};
 pub const Lock = struct {
     schema: u32,
     rm_version: []const u8,
@@ -35,30 +44,42 @@ pub const Lock = struct {
     license: Artifact,
     firmware: [2]Firmware,
     families: [8]struct { name: []const u8, artifact: usize },
-    boot: struct {
-        source: Source,
-        image: Artifact,
-        descriptor: Artifact,
-        license: Artifact,
-        notices: [12]Source,
-    },
+    boot: Boot,
     booters: [2]Booter,
-    booter_license: struct { artifact: Artifact, notices: [5]Source },
+    booter_license: BooterLicense,
+    boot_generations: [3]BootGeneration,
 };
 pub const Source = struct { path: []const u8, bytes: usize, sha256: []const u8 };
 pub const lock: Lock = blk: {
-    @setEvalBranchQuota(500000);
-    var storage: [65536]u8 = undefined;
+    @setEvalBranchQuota(2000000);
+    var storage: [262144]u8 = undefined;
     var allocator = std.heap.FixedBufferAllocator.init(&storage);
     break :blk std.json.parseFromSliceLeaky(Lock, allocator.allocator(), @embedFile("firmware-lock.json"), .{}) catch
         @compileError("invalid NVIDIA firmware lock");
 };
+pub fn bootGeneration(name: []const u8) ?*const BootGeneration {
+    for (&lock.boot_generations) |*profile| if (std.mem.eql(u8, profile.name, name)) return profile;
+    return null;
+}
+pub fn bootSpecification(chip: u16) ?*const Boot {
+    const profile = @import("generation.zig").get(chip) orelse return null;
+    if (profile.boot == .ga102) return &lock.boot;
+    return &(bootGeneration(@tagName(profile.boot)) orelse return null).boot;
+}
 pub const max_bytes = 64 * 1024 * 1024;
 pub const read_chunk_bytes = 64 * 1024;
 pub const max_sections = 64;
 pub const max_names_bytes = 4096;
 pub const signature_bytes = 4096;
 pub const Family = enum { tu10x, tu11x, ga100, ga10x, ad10x, gh100, gb10x, gb20x };
+pub fn familyFor(chip: u16) ?Family {
+    const profile = @import("generation.zig").get(chip) orelse return null;
+    return switch (profile.family) {
+        .ampere => .ga10x, .ada => .ad10x,
+        .turing => if (profile.boot == .tu116) .tu11x else .tu10x,
+        .blackwell => .gb20x,
+    };
+}
 
 // This is NVIDIA's container-family mapping, not a hardware support list.
 pub fn specification(family: Family) *const Firmware {

@@ -37,7 +37,7 @@ pub const Owner = struct {
     fn advance(self: *Owner, run: *runtime.Owner) !bool {
         switch (self.phase) {
             .allocate => {
-                self.storage = try run.allocateNativeStorage(if (self.kind == .programs) runtime.render.shader_bytes else runtime.render.packet_capacity_bytes, self.deadline);
+                self.storage = try run.allocateNativeStorage(if (self.kind == .programs) try runtime.render.shaderBytesFor(try run.graphicsClass()) else runtime.render.packet_capacity_bytes, self.deadline);
                 self.phase = .storage;
             },
             .storage => {
@@ -72,7 +72,9 @@ pub const Owner = struct {
                     return true;
                 };
                 run.graphics_starting = false; self.phase = .ready;
-                run.ctx.?.logInfo("NVIDIA render: ready engine=C797 shaders=6 cache=warm budget=131072 common-queue=yes pixels=unverified");
+                var line: [180]u8 = undefined;
+                run.ctx.?.logInfo(try std.fmt.bufPrintZ(&line,
+                    "NVIDIA render: ready engine={x} shaders=7 cache=warm budget=131072 common-queue=yes pixels=unverified", .{try run.graphicsClass()}));
             },
             .unwind => {
                 if (self.storage) |handle| { try run.releaseNativeBuffer(handle); self.storage = null; }

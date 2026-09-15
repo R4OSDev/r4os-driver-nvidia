@@ -177,7 +177,13 @@ pub const Operation = enum { pushbuffer, allocate, free };
 pub const Config = struct { root: root.Binding, kind: Kind, index: u32, handle: u32, physical: u64 };
 pub const max_bytes = 80;
 pub const Reply = union(enum) { ok: void, rejected: u32 };
-pub fn class(kind: Kind) u32 { return switch (kind) { .core => 0xc67d, .window => 0xc67e, .immediate => 0xc67b, .cursor => 0xc67a }; }
+pub fn class(kind: Kind) u32 {
+    return classFor(.{ .epoch=1, .client=1, .device=2, .root=3, .internal_client=4, .internal_subdevice=5 }, kind);
+}
+pub fn classFor(binding: root.Binding, kind: Kind) u32 {
+    const classes = root.classes(binding);
+    return switch (kind) { .core => classes.core, .window => classes.window, .immediate => classes.immediate, .cursor => classes.cursor };
+}
 pub fn slot(kind: Kind, index: u32) error{Bounds}!usize {
     if ((kind == .core and index != 0) or index >= 8) return error.Bounds;
     return switch (kind) { .core => 0, .window => 1 + index, .immediate => 9 + index, .cursor => 17 + index };
@@ -203,17 +209,17 @@ pub fn encode(config: Config, op: Operation, output: []u8) Error![]const u8 {
             if (config.kind == .cursor) {
                 // RM requires an explicit invalid pushbuffer before PIO
                 // allocation. No SYSTEM/VRAM backing or DMA descriptor.
-                put(out, 52, class(config.kind)); put(out, 56, config.index);
+                put(out, 52, classFor(config.root, config.kind)); put(out, 56, config.index);
                 return out;
             }
             put(out, 24, 1); // ADDR_SYSMEM.
             std.mem.writeInt(u64, out[32..40], config.physical, .little);
             std.mem.writeInt(u64, out[40..48], 4095, .little);
-            put(out, 48, 1); put(out, 52, class(config.kind)); put(out, 56, config.index); out[60] = 1;
+            put(out, 48, 1); put(out, 52, classFor(config.root, config.kind)); put(out, 56, config.index); out[60] = 1;
             put(out, 64, 3); put(out, 72, 1); // PHYS_PCI_COHERENT, 4KB, subDeviceId BIT0.
         },
         .allocate => {
-            put(out, 4, config.root.root); put(out, 8, config.handle); put(out, 12, class(config.kind));
+            put(out, 4, config.root.root); put(out, 8, config.handle); put(out, 12, classFor(config.root, config.kind));
             if (config.kind == .cursor) {
                 put(out, 20, 16); put(out, 32, config.index); // PIO instance, hObjectNotify=0, pControl=0.
                 return out;

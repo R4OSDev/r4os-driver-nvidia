@@ -3947,7 +3947,7 @@ test "GSP transport orders range publication, explicit acknowledgement and termi
     model.now = deadline;
     try t.expectError(error.Deadline, session.connect(deadline + 1000));
     try t.expectError(error.Profile, transport.Session.init(model.port(), .{ .chip_id = 0x176, .confidential_compute = true }, 7, &model.tx, &model.rx));
-    try t.expectError(error.Profile, transport.Session.init(model.port(), .{ .chip_id = 0x177 }, 7, &model.tx, &model.rx));
+    try t.expectError(error.Profile, transport.Session.init(model.port(), .{ .chip_id = 0x170 }, 7, &model.tx, &model.rx));
     try t.expectError(error.Overlap, transport.Session.init(model.port(), profile, 7, &model.tx, &model.tx));
     try t.expectError(error.Stale, transport.Session.init(model.port(), profile, 0, &model.tx, &model.rx));
 }

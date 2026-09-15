@@ -1,4 +1,4 @@
-//! Admission of the production GA102 GSP-RM RISC-V boot image used by GA106.
+//! Admission of pinned production GA102/Ada GSP-RM RISC-V boot images.
 //! Hashes identify the decoded entries of the pinned original bindata archive.
 //! This does not authenticate firmware on the GPU or allocate boot resources.
 const std = @import("std");
@@ -17,7 +17,7 @@ comptime {
     if (image.bytes != 24576 or descriptor.bytes != 84)
         @compileError("review production boot ABI when changing the artifact profile");
 }
-pub const Error = error{ WrongSize, WrongHash, DescriptorVersion, UnsupportedDescriptor, Bounds, Overlap };
+pub const Error = error{ WrongSize, WrongHash, DescriptorVersion, UnsupportedDescriptor, UnsupportedChip, Bounds, Overlap };
 pub const Range = struct { offset: u32, bytes: u32 };
 pub const Info = struct {
     version: u32,
@@ -74,8 +74,12 @@ pub fn inspect(bytes: []const u8, image_bytes: u32) Error!Info {
 }
 
 pub fn verify(image_bytes: []const u8, descriptor_bytes: []const u8) Error!Info {
-    if (image_bytes.len != image.bytes or descriptor_bytes.len != descriptor.bytes) return error.WrongSize;
-    if (!firmware.digestMatches(image_bytes, image.sha256) or
-        !firmware.digestMatches(descriptor_bytes, descriptor.sha256)) return error.WrongHash;
+    return verifyFor(0x176, image_bytes, descriptor_bytes);
+}
+pub fn verifyFor(chip: u16, image_bytes: []const u8, descriptor_bytes: []const u8) Error!Info {
+    const spec = firmware.bootSpecification(chip) orelse return error.UnsupportedChip;
+    if (image_bytes.len != spec.image.bytes or descriptor_bytes.len != spec.descriptor.bytes) return error.WrongSize;
+    if (!firmware.digestMatches(image_bytes, spec.image.sha256) or
+        !firmware.digestMatches(descriptor_bytes, spec.descriptor.sha256)) return error.WrongHash;
     return inspect(descriptor_bytes, @intCast(image_bytes.len));
 }

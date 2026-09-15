@@ -110,7 +110,7 @@ pub const Session = struct {
     /// owner. Do not copy/rebind an active session or overlap its scratch with
     /// DMA backing. A new epoch requires a genuinely new/quiesced device run.
     pub fn init(port: Port, profile: message.Profile, epoch: u64, tx: *[message.max_bytes]u8, rx: *[message.max_bytes]u8) Error!Session {
-        if (profile.chip_id != 0x176 or profile.confidential_compute) return error.Profile;
+        if (!@import("generation.zig").ga102Hal(profile.chip_id) or profile.confidential_compute) return error.Profile;
         if (epoch == 0) return error.Stale;
         const a = @intFromPtr(tx);
         const b = @intFromPtr(rx);

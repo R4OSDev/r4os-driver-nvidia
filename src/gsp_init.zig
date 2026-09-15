@@ -102,7 +102,7 @@ fn overlap(a: Span, b: Span) bool {
     return a.address < b.address + b.bytes and b.address < a.address + a.bytes;
 }
 fn prepare(input: *const Bindings) Error!Prepared {
-    if (input.chip_id != 0x176) return error.Profile;
+    if (!@import("generation.zig").ga102Hal(input.chip_id)) return error.Profile;
     if (input.queues.len == 0 or input.queues.len > queue_pages or input.excluded.len > max_excluded) return error.Segments;
     const fixed = [_]Span{ input.libos, input.rm } ++ input.logs;
     for (fixed, 0..) |span, index| {

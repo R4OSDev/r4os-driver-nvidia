@@ -163,7 +163,22 @@ test "unknown PCI IDs, D3 and chip mismatches never admit native initialization"
     snapshot.caps.power_state = 3;
     try t.expectEqual(pci.ProbeDecision.power_unavailable, pci.decision(&snapshot));
     try t.expect(pci.chip(0x176000a1, 0) != null);
-    for ([_]u32{ 0, 0xffffffff, 0x172000a1, 0x176001a1, 0x196000a1 }) |boot0| try t.expect(pci.chip(boot0, 0) == null);
+    for ([_]u32{ 0, 0xffffffff, 0x170000a1, 0x176001a1, 0x190000a1 }) |boot0| try t.expect(pci.chip(boot0, 0) == null);
+    const generation = @import("generation.zig");
+    for (&generation.profiles) |*profile| {
+        const observed = pci.chip(@as(u32, profile.id) << 20 | 0xa1, 0).?;
+        try t.expectEqual(profile.id, observed.id);
+        try t.expectEqualStrings(profile.name, observed.name);
+        // A recognized PMC identity still cannot enable an unimplemented port.
+        try t.expectEqual(profile.family == .ampere, generation.ga10x(observed.id));
+        try t.expectEqual(profile.family == .ampere or profile.family == .ada, generation.ga102Hal(observed.id));
+    }
+    for (@import("probe_ids.zig").all) |id| {
+        snapshot.pci.device_id = id;
+        snapshot.caps.power_state = 0;
+        try t.expectEqual(pci.ProbeDecision.identity_words_only, pci.decision(&snapshot));
+    }
+    try checkBootAdapter(snapshot);
     for ([_]u32{ 0xffffffff, 0x100, 0x10000, 0x20000 }) |boot1| try t.expect(pci.chip(0x176000a1, boot1) == null);
     var audio = device;
     audio.function = 1;
@@ -175,6 +190,45 @@ test "unknown PCI IDs, D3 and chip mismatches never admit native initialization"
     audio.device = 0;
     audio.bus_kind = 1;
     try t.expect(!pci.isHdaSibling(device, audio));
+}
+
+fn checkBootAdapter(sample: pci.Snapshot) !void {
+    const adapter = @import("adapter.zig");
+    const boot: @import("r4os").abi.GfxNativeBootInfo = .{ .generation = 1, .state = 1,
+        .physical_address = sample.bars[1].base + 0x10000, .byte_length = 16384,
+        .width = 64, .height = 64, .pitch = 256 };
+    var devices = [_]pci.Snapshot{sample, sample};
+    devices[0].pci.bus = 9;
+    devices[1].pci.bus = 4;
+    devices[1].bars[1].base += devices[1].bars[1].bytes;
+    // Selection follows physical ownership, independently of inventory order.
+    try t.expectEqual(@as(usize, 0), try adapter.selectBoot(&devices, boot));
+    const owner = adapter.id(devices[0].pci);
+    std.mem.swap(pci.Snapshot, &devices[0], &devices[1]);
+    try t.expectEqual(owner, adapter.id(devices[try adapter.selectBoot(&devices, boot)].pci));
+    const saved = devices[1];
+    devices[1].bars[1].bytes = 0;
+    try t.expectError(error.NoBootAdapter, adapter.selectBoot(&devices, boot));
+    devices[1] = saved;
+    devices[0].bars[1] = devices[1].bars[1];
+    try t.expectError(error.AmbiguousBootAdapter, adapter.selectBoot(&devices, boot));
+    devices[0].bars[1] = .{};
+    for ([_]u16{ 0x10de, 0x8086, 0x1002, 0xffff }) |vendor| {
+        devices[1].pci.vendor_id = vendor;
+        devices[1].pci.device_id = 0xbeef;
+        try t.expectError(error.UnsupportedBootAdapter, adapter.selectBoot(&devices, boot));
+    }
+    devices[1] = saved;
+    devices[1].caps.power_state = 3;
+    try t.expectError(error.UnsupportedBootAdapter, adapter.selectBoot(&devices, boot));
+    devices[1] = saved;
+    devices[1].bars[1].bytes = 0x10000 + boot.byte_length - 1;
+    try t.expectError(error.NoBootAdapter, adapter.selectBoot(&devices, boot));
+    devices[1].bars[1].base = ~@as(u64, 0) - 4095;
+    try t.expectError(error.NoBootAdapter, adapter.selectBoot(&devices, boot));
+    var bad = boot; bad.physical_address = ~@as(u64, 0) - 4095;
+    try t.expectError(error.BootUnavailable, adapter.selectBoot(&devices, bad));
+    try t.expectError(error.NoBootAdapter, adapter.selectBoot(&.{}, boot));
 }
 
 test "malformed PCI capability chains and BAR assignments fail within bounded reads" {

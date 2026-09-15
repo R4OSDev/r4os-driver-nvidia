@@ -73,7 +73,7 @@ pub const Config = struct {
     pub fn capture(self: *Config, snapshot: *const identity.Snapshot, boot0: u32, boot1: u32, io: Io) !void {
         if (self.self_address != 0) return error.Busy;
         const chip = identity.chip(boot0, boot1) orelse return error.Profile;
-        if (chip.id != 0x176 or !identity.isDisplay(snapshot.pci) or snapshot.pci.function != 0 or
+        if (!@import("generation.zig").ga102Hal(chip.id) or !identity.isDisplay(snapshot.pci) or snapshot.pci.function != 0 or
             snapshot.pci.bus_kind != 2 or snapshot.caps.pcie != 0x78 or snapshot.caps.power_state != 0 or
             snapshot.command & 2 == 0) return error.Unsupported;
         const word = @as(u32, snapshot.pci.device_id) << 16 | snapshot.pci.vendor_id;

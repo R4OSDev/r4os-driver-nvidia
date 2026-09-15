@@ -9,7 +9,7 @@ const storage = @import("gsp_native_backing.zig");
 const copy = @import("gsp_push_ring.zig");
 const render = @import("r4nv_render");
 comptime {
-    if (@max(render.shader_bytes,render.packet_capacity_bytes) > @import("gsp_control_storage.zig").bytes)
+    if (@max(render.max_shader_bytes,render.packet_capacity_bytes) > @import("gsp_control_storage.zig").bytes)
         @compileError("graphics programs/packets exceed the shared staging owner");
 }
 pub const Owner = struct {
@@ -41,7 +41,7 @@ pub const Owner = struct {
         const src = source.info() orelse return error.Stale;
         const target = programs.buffer(kind);
         const dst = target.info() orelse return error.Stale;
-        const bytes: u64 = if (kind == .programs) render.shader_bytes else render.packet_bytes * draws.len;
+        const bytes: u64 = if (kind == .programs) try render.shaderBytesFor(programs.class) else render.packet_bytes * draws.len;
         if (src.epoch != programs.epoch or dst.epoch != programs.epoch or src.bytes < bytes or dst.bytes < bytes or
             source.adapter != dst.adapter or deadline == 0 or deadline == std.math.maxInt(u64) or
             render.Range.overlaps(.{ .address = src.address, .bytes = src.bytes }, .{ .address = dst.address, .bytes = dst.bytes })) return error.Bounds;

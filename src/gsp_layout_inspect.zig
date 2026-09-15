@@ -61,17 +61,19 @@ pub fn main(init: std.process.Init) !void {
     defer parsed.deinit();
     const snapshot = parsed.value;
     if (snapshot.schema != 1 or snapshot.recorded_utc.len == 0 or snapshot.recorded_utc.len > 64 or
-        snapshot.pci_vendor != 0x10de or snapshot.pci_device != 0x2504) return error.Snapshot;
+        snapshot.pci_vendor != 0x10de or !identity.probeDevice(snapshot.pci_device)) return error.Snapshot;
     const chip = identity.chip(snapshot.pmc_boot0, snapshot.pmc_boot1) orelse return error.UnsupportedChip;
-    const boot_bytes = try read(init, args[3], boot.image.bytes, boot.image.bytes);
+    const boot_spec = firmware.bootSpecification(chip.id) orelse return error.UnsupportedChip;
+    const boot_bytes = try read(init, args[3], boot_spec.image.bytes, boot_spec.image.bytes);
     defer init.gpa.free(boot_bytes);
-    const desc_bytes = try read(init, args[4], boot.descriptor.bytes, boot.descriptor.bytes);
+    const desc_bytes = try read(init, args[4], boot_spec.descriptor.bytes, boot_spec.descriptor.bytes);
     defer init.gpa.free(desc_bytes);
-    const boot_info = try boot.verify(boot_bytes, desc_bytes);
-    const spec = firmware.specification(.ga10x);
+    const boot_info = try boot.verifyFor(chip.id, boot_bytes, desc_bytes);
+    const family = firmware.familyFor(chip.id).?;
+    const spec = firmware.specification(family);
     const firmware_bytes = try read(init, args[2], spec.bytes, spec.bytes);
     defer init.gpa.free(firmware_bytes);
-    const verified = try firmware.verify(firmware_bytes, .ga10x);
+    const verified = try firmware.verify(firmware_bytes, family);
     const plan = try layout.firstBoot(chip.id, &snapshot.raw, verified.layout.image.bytes, boot_info.image_bytes);
     const metadata = try wpr.prepare(&.{
         .chip_id = chip.id,

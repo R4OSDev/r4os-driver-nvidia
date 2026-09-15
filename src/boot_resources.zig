@@ -8,7 +8,11 @@ const firmware = @import("firmware.zig");
 const resources = @import("firmware_resources.zig");
 const boot = @import("gsp_boot.zig");
 const Context = r4os.r4dev.DriverResourceContext;
-const capacity = @max(boot.image.bytes, firmware.lock.boot.license.bytes);
+const capacity = blk: {
+    var value = @max(boot.image.bytes, firmware.lock.boot.license.bytes);
+    for (firmware.lock.boot_generations) |profile| value = @max(value, @max(profile.boot.image.bytes, profile.boot.license.bytes));
+    break :blk value;
+};
 pub const Error = boot.Error || resources.Error || error{ Api, Busy, InvalidDeadline, Timeout, ClockRegression, Generation, ShortRead };
 pub const View = struct { image: []const u8, descriptor: []const u8, info: boot.Info };
 pub const Inputs = struct {
@@ -30,13 +34,10 @@ pub const Inputs = struct {
     fn read(self: *Inputs, ctx: Context, spec: *const firmware.Artifact, output: []u8, deadline: u64) Error!void {
         try self.checkClock(ctx, deadline);
         if (output.len != spec.bytes) return error.Size;
-        var info: a.DriverResourceInfo = .{};
-        if (ctx.stat(spec.resource, &info) != a.driver_resource_ok) return error.Resource;
-        if (info.version != 1 or info.size < @sizeOf(a.DriverResourceInfo) or info.handle == 0 or info.byte_length != spec.bytes) return error.Size;
-        if (info.module_generation != self.generation) return error.Generation;
+        const asset = try resources.openArtifact(ctx, spec, self.generation);
         try self.checkClock(ctx, deadline);
         self.reads += 1;
-        const count = ctx.readAt(info.handle, 0, output, deadline);
+        const count = ctx.readAt(asset.info.handle, asset.offset, output, deadline);
         if (count < 0) return error.Resource;
         if (count != output.len) return error.ShortRead;
         try self.checkClock(ctx, deadline);
@@ -47,7 +48,12 @@ pub const Inputs = struct {
     /// The returned view borrows these resident inputs until close. The DMA
     /// boot owner copies them; no input pointer is ever a device address.
     pub fn load(self: *Inputs, driver: *const r4os.r4dev.DriverContext, timeout_ns: u64) Error!View {
+        return self.loadFor(driver, 0x176, timeout_ns);
+    }
+    pub fn loadFor(self: *Inputs, driver: *const r4os.r4dev.DriverContext, chip: u16, timeout_ns: u64) Error!View {
         if (self.active) return error.Busy;
+        const spec = firmware.bootSpecification(chip) orelse return error.UnsupportedChip;
+        if (spec.descriptor.bytes > self.descriptor.len) return error.Size;
         self.active = true;
         const ctx = driver.resources() orelse return error.Api;
         self.last_clock = ctx.nowNs();
@@ -55,13 +61,13 @@ pub const Inputs = struct {
         if (timeout_ns == 0 or deadline == std.math.maxInt(u64)) return error.InvalidDeadline;
         self.generation = try resources.validateLock(ctx, deadline);
         // Reuse the image storage for license admission before loading code.
-        try self.read(ctx, &firmware.lock.boot.license, self.data[0..firmware.lock.boot.license.bytes], deadline);
-        try self.read(ctx, &boot.image, self.data[0..boot.image.bytes], deadline);
-        try self.read(ctx, &boot.descriptor, &self.descriptor, deadline);
-        const info = try boot.verify(self.data[0..boot.image.bytes], &self.descriptor);
+        try self.read(ctx, &spec.license, self.data[0..spec.license.bytes], deadline);
+        try self.read(ctx, &spec.image, self.data[0..spec.image.bytes], deadline);
+        try self.read(ctx, &spec.descriptor, self.descriptor[0..spec.descriptor.bytes], deadline);
+        const info = try boot.verifyFor(chip, self.data[0..spec.image.bytes], self.descriptor[0..spec.descriptor.bytes]);
         try self.checkClock(ctx, deadline);
         self.admitted = true;
-        return .{ .image = self.data[0..boot.image.bytes], .descriptor = &self.descriptor, .info = info };
+        return .{ .image = self.data[0..spec.image.bytes], .descriptor = self.descriptor[0..spec.descriptor.bytes], .info = info };
     }
 
     pub fn close(self: *Inputs) void {

@@ -344,7 +344,7 @@ pub const Owner = struct {
         try token.session.guard(deadline);
         const children = try token.session.rm_names.reserveChildren(parent, 1);
         errdefer token.session.rm_names.retireChildren(children) catch {};
-        const binding: wire.Binding = .{ .epoch = parent.epoch, .client = parent.client, .device = device, .root = try children.object(0),
+        const binding: wire.Binding = .{ .chip_id = token.session.profile.chip_id, .epoch = parent.epoch, .client = parent.client, .device = device, .root = try children.object(0),
             .internal_client = internal_client, .internal_subdevice = internal_subdevice };
         try wire.validate(binding);
         return .{ .exchange = try exchange.Exchange.init(token, deadline), .binding = binding, .reservation = children, .deadline = deadline };
@@ -414,12 +414,13 @@ pub const Owner = struct {
         if (!dispatch.response) return dispatch;
         const op = self.operation.?;
         const reply = try wire.decode(self.binding, op, self.request[0..wire.length(op)], dispatch.record);
-        const supported = op == .classes and reply == .ok and wire.supports(reply.ok);
+        const classes = wire.classes(self.binding);
+        const supported = op == .classes and reply == .ok and wire.supportsClass(reply.ok, classes.root);
         const hardware = if (op == .static_info and reply == .ok) try wire.staticInfo(reply.ok) else null;
-        const core_supported = op == .classes and reply == .ok and wire.supportsClass(reply.ok, 0xc67d);
-        const window_supported = op == .classes and reply == .ok and wire.supportsClass(reply.ok, 0xc67e);
-        const immediate_supported = op == .classes and reply == .ok and wire.supportsClass(reply.ok, 0xc67b);
-        const cursor_supported = op == .classes and reply == .ok and wire.supportsClass(reply.ok, 0xc67a);
+        const core_supported = op == .classes and reply == .ok and wire.supportsClass(reply.ok, classes.core);
+        const window_supported = op == .classes and reply == .ok and wire.supportsClass(reply.ok, classes.window);
+        const immediate_supported = op == .classes and reply == .ok and wire.supportsClass(reply.ok, classes.immediate);
+        const cursor_supported = op == .classes and reply == .ok and wire.supportsClass(reply.ok, classes.cursor);
         self.last_status = if (reply == .rejected) reply.rejected else 0;
         // A reply never publishes ownership until its exact transport ACK.
         try self.exchange.complete(dispatch.ticket);

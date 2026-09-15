@@ -71,9 +71,10 @@ fn put(output: *[bytes]u8, offset: usize, value: u64) void {
 pub fn prepare(input: *const Input) Error!Prepared {
     if (input.image_bytes != image_bytes) return error.ImageSize;
     if (input.signature_bytes != signature_bytes) return error.SignatureSize;
-    if (input.descriptor.len != boot.descriptor.bytes) return error.WrongSize;
-    if (!firmware.digestMatches(input.descriptor, boot.descriptor.sha256)) return error.WrongHash;
-    const info = try boot.inspect(input.descriptor, boot.image.bytes);
+    const spec = firmware.bootSpecification(input.chip_id) orelse return error.UnsupportedChip;
+    if (input.descriptor.len != spec.descriptor.bytes) return error.WrongSize;
+    if (!firmware.digestMatches(input.descriptor, spec.descriptor.sha256)) return error.WrongHash;
+    const info = try boot.inspect(input.descriptor, @intCast(spec.image.bytes));
     const plan = try layout.firstBoot(input.chip_id, &input.raw, input.image_bytes, info.image_bytes);
     var output: [bytes]u8 = @splat(0);
     const fields = [_]u64{

@@ -49,8 +49,8 @@ fn stat(name: [*]const u8, length: u32, out: *a.DriverResourceInfo) callconv(.c)
 }
 fn read(id: u64, offset: u64, output: [*]u8, length: u32, _: u64) callconv(.c) i32 {
     if (id == 1) {
-        std.debug.assert(offset == 0 and length == resources.lock_bytes.len);
-        @memcpy(output[0..length], resources.lock_bytes);
+        std.debug.assert(offset <= resources.lock_bytes.len and length <= resources.lock_bytes.len - offset);
+        @memcpy(output[0..length], resources.lock_bytes[@intCast(offset)..][0..length]);
     } else {
         std.debug.assert(id == 2 and mapped and length <= 65536);
         if (fault == .read) return a.driver_resource_error_io;

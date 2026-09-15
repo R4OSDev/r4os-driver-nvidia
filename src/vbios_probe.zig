@@ -10,7 +10,7 @@ pub const Error = error{ UnmeasuredRange, Api, Memory, Mapping, Clock, Deadline,
 
 pub fn admitted(snapshot: *const identity.Snapshot, chip: identity.Chip) bool {
     const bar = snapshot.bars[0];
-    return identity.decision(snapshot) == .identity_words_only and chip.id == 0x176 and
+    return identity.decision(snapshot) == .identity_words_only and @import("generation.zig").ga102Hal(chip.id) and
         bar.bytes >= prom_offset + vbios.max_rom_bytes and
         bar.base <= std.math.maxInt(u64) - bar.bytes;
 }

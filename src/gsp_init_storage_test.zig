@@ -925,6 +925,9 @@ fn checkLogSyncFailure(memory: *@import("gsp_run_memory.zig").Lease) !void {
 }
 
 test "firmware CPU storage complete run lease retains all boot DMA owners" {
+    for ([_]u16{0x176,0x192}) |chip| try checkCompleteRun(chip);
+}
+fn checkCompleteRun(chip: u16) !void {
     try @import("gsp_hotplug_test.zig").check();
     const run = @import("gsp_run_memory.zig");
     const boot_storage = @import("gsp_boot_storage.zig");
@@ -948,19 +951,20 @@ test "firmware CPU storage complete run lease retains all boot DMA owners" {
         closing = true;
         _ = storage.close();
     }
-    const init_report = try storage.stage(&ctx, 0x176, &.{}, 1000);
+    const init_report = try storage.stage(&ctx, chip, &.{}, 1000);
     // The init queues use the real storage/SDK path above. The six other
     // already-admitted owners use descriptor fixtures. The boot pack has real
     // CPU metadata for live FRTS binding checks; no fabricated CPU pointer is
     // dereferenced. The capture/VRAM owner graph below is a host fixture, not
     // an actual display hold or GPU execution (covered by the lifecycle case).
+    const shape = try boot_storage.packFor(chip);
     var b: boot_storage.Storage = .{ .context = ctx };
     b.image.context = ctx;
     b.image.piece_count = 1;
     b.image.allocation = .{ .handle = 101, .cpu_address = 0x100000, .byte_length = 4096 };
-    b.allocation = .{ .handle = 102, .cpu_address = 0x110000, .byte_length = 32768 };
+    b.allocation = .{ .handle = 102, .cpu_address = 0x110000, .byte_length = shape.bytes };
     b.image.report = .{ .root_address = 0x500000000, .image_bytes = 4096, .allocation_bytes = 4096, .table_bytes = 4096, .mappings = 1, .segments = 1, .bounced = 0 };
-    b.report = .{ .image = b.image.report.?, .boot_address = 0x501000000, .signature_address = 0x501006000, .metadata_address = 0x501007000, .pack_bounced = false, .app_version = 0x79 };
+    b.report = .{ .image = b.image.report.?, .boot_address = 0x501000000, .signature_address = 0x501000000 + shape.signature, .metadata_address = 0x501000000 + shape.metadata, .pack_bytes = shape.bytes, .boot_bytes = shape.signature, .pack_bounced = false, .app_version = 0x79 };
     var f: security.Storage = .{ .complete = true, .allocation = .{ .handle = 103, .cpu_address = 0x120000, .byte_length = 65536 } };
     f.device.context = ctx;
     f.device.prepared_plan = .{ .imem = .{ .base = 0x502000000, .destination = 0, .source_offset = 0, .bytes = 4096, .command = 0x614 }, .dmem = .{ .base = 0x502001000, .destination = 0, .source_offset = 0, .bytes = 4096, .command = 0x600 }, .boot_vector = 0, .signature_address = 0, .engine_mask = 1, .ucode_id = 1 };
@@ -970,10 +974,13 @@ test "firmware CPU storage complete run lease retains all boot DMA owners" {
     }
     var p: booters.Pair = .{ .api = ctx.api, .context = ctx.resources().?, .complete = true, .generation = 7 };
     for (&p.images, 0..) |*image, n| {
-        const bytes: u32 = if (n == 0) 60416 else 40192;
-        const code: u32 = if (n == 0) 35072 else 20224;
+        const spec = try booter.specificationFor(chip, @enumFromInt(n));
+        var parts: booter.Parts = undefined;
+        inline for (std.meta.fields(booter.Parts)) |field| @field(parts, field.name) = @import("booter_storage_test.zig").asset(&@field(spec.*, field.name));
+        const info = try booter.verify(@enumFromInt(n), chip, .{ .debug_disable_raw = 1, .ucode_version_raw = 1, .ucode_id = 3 }, parts);
+        const bytes = info.image_bytes;
         image.allocation = .{ .handle = 104 + n, .cpu_address = 0x130000 + n * 65536, .byte_length = bytes };
-        image.prepared = .{ .operation = @enumFromInt(n), .info = .{ .image_bytes = bytes, .code_offset = 256, .code_bytes = code, .data_offset = code + 256, .data_bytes = bytes - code - 256, .signature_offset = code + 272 }, .fuse_version = 1, .signature_index = 0 };
+        image.prepared = .{ .operation = @enumFromInt(n), .info = info, .fuse_version = 1, .signature_index = 0 };
         image.device.context = ctx;
         image.device.mapping = .{ .handle = 204 + n, .pin_handle = 304 + n, .segment_count = 1 };
         image.device.mapping.segments[0] = .{ .phys_addr = 0x503000000 + n * 0x1000000, .bytes = bytes };
@@ -990,19 +997,21 @@ test "firmware CPU storage complete run lease retains all boot DMA owners" {
     s.device.mapping.segments[0] = .{ .phys_addr = 0x505000000, .bytes = 65536 };
     const wpr = @import("gsp_wpr.zig");
     const reservation = @import("boot_vram_lease.zig");
-    const pack = try t.allocator.alloc(u8, boot_storage.pack_bytes);
+    const pack = try t.allocator.alloc(u8, shape.bytes);
     defer t.allocator.free(pack);
     @memset(pack, 0);
     const desc_fields = [_]u32{ 5, 20480, 2176, 22656, 16, 0, 0, 0, 0, 2048, 2048, 4096, 6144, 10496, 1, 0, 0, 0, 0, 24576, 0 };
     var descriptor: [84]u8 = undefined;
     for (desc_fields, 0..) |value, index| std.mem.writeInt(u32, descriptor[index * 4 ..][0..4], value, .little);
+    if (chip != 0x176) @memcpy(&descriptor, @import("booter_storage_test.zig").asset(&@import("firmware.zig").bootSpecification(chip).?.descriptor));
     var raw = @import("fwsec_test.zig").preflightFixture();
     raw.put(.bcr, 1);
     raw.put(.riscv_cpuctl, 0x10);
-    const prepared = try wpr.prepare(&.{ .chip_id = 0x176, .raw = raw, .image_bytes = wpr.image_bytes, .descriptor = &descriptor, .signature_bytes = wpr.signature_bytes });
-    @memcpy(pack[boot_storage.metadata_offset..][0..wpr.bytes], &prepared.unbound_template);
+    const prepared = try wpr.prepare(&.{ .chip_id = chip, .raw = raw, .image_bytes = wpr.image_bytes, .descriptor = &descriptor, .signature_bytes = wpr.signature_bytes });
+    @memcpy(pack[shape.metadata..][0..wpr.bytes], &prepared.unbound_template);
     b.allocation.cpu_address = @intFromPtr(pack.ptr);
     b.vram_plan = prepared.plan;
+    b.report.?.app_version = prepared.boot_info.app_version;
     b.pin.handle = b.mapping.pin_handle;
     var capture: @import("boot_vram.zig").Capture = .{ .context = ctx, .ready = true };
     capture.self_address = @intFromPtr(&capture);
@@ -1019,7 +1028,7 @@ test "firmware CPU storage complete run lease retains all boot DMA owners" {
     boot_context.stamp = boot_context.map;
     boot_context.self_address = @intFromPtr(&boot_context);
     capture.context_owner = boot_context.self_address;
-    var held: reservation.Lease = .{ .display = &capture, .boot_mapping = &boot_mapping, .boot_context = &boot_context, .backing = &b, .epoch = 9, .serial = 7, .plan = prepared.plan, .allocation = b.allocation.handle, .cpu_address = b.allocation.cpu_address, .mapping = b.mapping.handle, .pin = b.pin.handle, .metadata_address = b.report.?.metadata_address };
+    var held: reservation.Lease = .{ .display = &capture, .boot_mapping = &boot_mapping, .boot_context = &boot_context, .backing = &b, .epoch = 9, .serial = 7, .plan = prepared.plan, .allocation = b.allocation.handle, .cpu_address = b.allocation.cpu_address, .mapping = b.mapping.handle, .pin = b.pin.handle, .metadata_address = b.report.?.metadata_address, .pack = shape };
     held.self_address = @intFromPtr(&held);
     capture.borrower = held.self_address;
     b.vram_owner = held.self_address;
@@ -1095,9 +1104,13 @@ test "firmware CPU storage complete run lease retains all boot DMA owners" {
         try t.expect(image.prepared != null);
     }
     try t.expectEqual(init_report.init.libos_address, inputs.resume_args.libos_dma);
-    try t.expectEqual(@as(u32, 0x79), inputs.resume_args.app_version);
+    try t.expectEqual(prepared.boot_info.app_version, inputs.resume_args.app_version);
     try t.expectEqual(f.device.prepared_plan.?.imem.base, inputs.fwsec.imem.base);
-    try checkDeviceStartup(&lease, &ctx, &table, &capture, &held);
+    try checkDeviceStartup(&lease, &ctx, &table, &capture, &held, chip);
+    // Reuse the same board/storage fixture while changing the measured ASIC.
+    // PCI identification is not the source of the native generation profile.
+    for (if (chip == 0x176) [_]u16{ 0x172, 0x173, 0x174, 0x177 } else [_]u16{ 0x193, 0x194, 0x196, 0x197 }) |chip_id|
+        try checkDeviceStartup(&lease, &ctx, &table, &capture, &held, chip_id);
     try checkNativeTeardown(&lease, &ctx, &table);
     try checkLogReader(&lease);
     try t.expect(lease.failed and lease.log_owner == 0);
@@ -1475,7 +1488,7 @@ const CatalogModel = struct {
 };
 
 fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r4os.r4dev.DriverContext,
-    table: *a.DriverApi, capture: *@import("boot_vram.zig").Capture, held: *@import("boot_vram_lease.zig").Lease) !void
+    table: *a.DriverApi, capture: *@import("boot_vram.zig").Capture, held: *@import("boot_vram_lease.zig").Lease, chip_id: u16) !void
 {
     const driver = @import("gsp_device.zig");
     const core = @import("gsp_core.zig");
@@ -1506,11 +1519,12 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
     snapshot.bars[2] = .{ .kind = .upper };
     snapshot.bars[3] = .{ .raw = 0xe000000c, .kind = .memory64, .base = 0xe0000000, .bytes = 0x2000000 };
     snapshot.bars[4] = .{ .kind = .upper };
-    const chip = identity.chip(0xb76000a1, 0).?;
+    const boot0 = @as(u32, chip_id) << 20 | 0xa00000a1;
+    const chip = identity.chip(boot0, 0).?;
     capture.snapshot = snapshot;
     capture.chip = chip;
     capture.operation = try @import("pramin.zig").Capture.init(.{ .epoch = capture.boot.held_generation,
-        .deadline = 1000000, .boot0 = 0xb76000a1, .boot1 = 0, .vga = 0x10e08, .range = .{ .address = 0x10e0000, .bytes = 131072 } });
+        .deadline = 1000000, .boot0 = boot0, .boot1 = 0, .vga = 0x10e08, .range = .{ .address = 0x10e0000, .bytes = 131072 } });
     capture.boot.recovery_required = true; // The existing captured-PRAMIN fixture's hold.
     DeviceModel.boot_info = .{ .generation = 1, .physical_address = 0xd0000000, .byte_length = 4096,
         .width = 32, .height = 32, .pitch = 128, .state = a.display_state_preparing };
@@ -1604,12 +1618,19 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         runtime_healthy, runtime_lockdown, runtime_unknown, runtime_unowned, runtime_sequence_timeout,
         runtime_log_failure, runtime_moving_log };
     for (std.enums.values(Case)) |case| {
+        // Existing GA106 fault coverage exercises the shared code once.
+        // Every added ASIC runs the native success paths of each subsystem.
+        if (chip_id != 0x176) switch (case) {
+            .success, .power_success, .mapping_success, .vram_success,
+            .context_graphics, .context_native_connected, .gpu_reset_success => {},
+            else => continue,
+        };
         ControlModel.reset(@tagName(case));
         const exercise_runtime = @intFromEnum(case) >= @intFromEnum(Case.runtime_healthy);
         const boot_success = case == .success or @intFromEnum(case) >= @intFromEnum(Case.static_bad_region);
-        errdefer |err| std.debug.print("native device startup {s}: {s}\n", .{ @tagName(case), @errorName(err) });
+        errdefer |err| std.debug.print("native device startup chip={x} {s}: {s}\n", .{ chip_id, @tagName(case), @errorName(err) });
         @memset(words, 0);
-        words[0] = 0xb76000a1;
+        words[0] = boot0;
         for ([_]u32{ hs.reg.gsp, hs.reg.sec2 }) |base| {
             words[(base + 0xf4) / 4] = core.bits.reset_ready | core.bits.riscv_enabled;
             words[(base + 0x108) / 4] = 0x20100;
@@ -1691,8 +1712,9 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         const before_repeat = range_calls;
         try t.expectError(error.State, target.port.preloadInit(session, &.{1}, &.{1}));
         try t.expect(range_calls == before_repeat and !lease.retained);
-        const system_message = try transport.message.decode(.{ .chip_id = 0x176 }, backing.?[command + 4096 ..][0..4096], 0);
-        const registry_message = try transport.message.decode(.{ .chip_id = 0x176 }, backing.?[command + 8192 ..][0..4096], 1);
+        const system_message = try transport.message.decode(session.profile, backing.?[command + 4096 ..][0..4096], 0);
+        const registry_message = try transport.message.decode(session.profile, backing.?[command + 8192 ..][0..4096], 1);
+        try t.expectEqual(chip_id, session.profile.chip_id);
         try t.expect(system_message.rpc.function == 72 and system_message.rpc.sequence == 0 and system_message.payload.len == 928);
         try t.expect(registry_message.rpc.function == 73 and registry_message.rpc.sequence == 0);
         try t.expect(std.mem.readInt(u64, system_message.payload[0..8], .little) == snapshot.bars[0].base);
@@ -2190,7 +2212,7 @@ const ResetStorageFixture = struct {
         for (queue.segments[0..queue.segment_count], 0..) |segment, index|
             spans[index] = .{ .address = segment.phys_addr, .bytes = segment.bytes };
         const args = storage.pieces[0].mapping.segments[0].phys_addr;
-        var bindings: init.Bindings = .{ .chip_id = 0x176,
+        var bindings: init.Bindings = .{ .chip_id = target.display.?.chip.?.id,
             .libos = .{ .address = args, .bytes = 4096 }, .rm = .{ .address = args + 4096, .bytes = 4096 },
             .logs = undefined, .queues = spans[0..queue.segment_count] };
         for (&bindings.logs, 0..) |*span, index|
@@ -4982,7 +5004,7 @@ fn pumpCursorUpload(target: *@import("gsp_device.zig").Device) !void {
         try t.expect(command[0] == 0x20010000 and command[1] == fifo.config.object_class and command[2] == 0x20040100 and
             source == 0x600000 and destination == gpu_address + work.target_offset + work.completed_bytes and
             command[8] == 16384 and command[10] == 0x04000182 and
-            command[14] == ticket.point and command[16] == 0xc);
+            command[14] == ticket.point and command[16] == 0x0400000c);
         get.* = fifo.ring.put; clock += 1000; _ = target.step();
         try t.expect(work.phase == .submitted and input.imported and input.mapped and ControlModel.reading);
         if (NativeCommon.is("context_native_cursor_upload_timeout")) {
@@ -6200,7 +6222,7 @@ fn pumpLiveTable(target: *@import("gsp_device.zig").Device, gpu_table: *[@import
         try t.expect(command[0] == 0x20010000 and command[1] == fifo.config.object_class and command[2] == 0x20040100 and
             ((@as(u64, command[3]) << 32) | command[4]) == transfer.source and
             ((@as(u64, command[5]) << 32) | command[6]) == transfer.target and command[8] == range.bytes and
-            command[10] == 0x04000182 and command[14] == work.ticket.?.point and command[16] == 0xc);
+            command[10] == 0x04000182 and command[14] == work.ticket.?.point and command[16] == 0x0400000c);
         get.* = fifo.ring.put; clock += 1000; _ = target.step();
         try t.expect(work.phase == .submitted and table_owner.table.uploaded_revision == old_revision and ControlModel.reading);
         // Execute only the range described by the actual submitted CE command,
@@ -6854,9 +6876,11 @@ fn replyNativeProduct(target: *@import("gsp_device.zig").Device) !void {
         }
         if (op == .classes) {
             const with_cursor = NativeCommon.is("context_native_unknown") or NativeCommon.cursorCase();
-            outputWord(&response, 24, if (with_cursor) 5 else 4); outputWord(&response, 32, 0xc67d);
-            outputWord(&response, 36, 0xc67e); outputWord(&response, 40, 0xc67b);
-            if (with_cursor) outputWord(&response, 44, 0xc67a);
+            const display = @import("generation.zig").get(target.display.?.chip.?.id).?.display;
+            outputWord(&response, 28, display.root);
+            outputWord(&response, 24, if (with_cursor) 5 else 4); outputWord(&response, 32, display.core);
+            outputWord(&response, 36, display.window); outputWord(&response, 40, display.immediate);
+            if (with_cursor) outputWord(&response, 44, display.cursor);
         }
         // Primary window3, plus window4 for the HDMI and DP/MST cases.
         // Additional routing must consume this actual modeled RM response.
@@ -7085,7 +7109,7 @@ fn checkDeviceGraphics(target: *@import("gsp_device.zig").Device, table: *a.Driv
         const owner = run.fifos[handle.slot].owner.?;
         const info = owner.info().?;
         try t.expect(target.native_graphics.phase == .ready and stages == 3 and receipt.point == 1 and
-            std.meta.eql(receipt.channel, handle) and info.config.object_class == 0xc797 and info.config.rm_engine == 1 and
+            std.meta.eql(receipt.channel, handle) and info.config.object_class == (try run.graphicsClass()) and info.config.rm_engine == 1 and
             info.engine_caps == 0x81234567 and info.config.system_userd and owner.ring.idle());
         const golden_context = run.contexts[target.native_graphics.golden_context.?.slot].owner.?;
         const regular_context = run.contexts[target.native_graphics.context.?.slot].owner.?;
@@ -7188,14 +7212,17 @@ fn checkGraphicsRendering(target: *@import("gsp_device.zig").Device, table: *@im
     const draw: render.Draw = .{ .target = target_image,
         .destination = .{ .x = -2, .y = 1, .width = 8, .height = 8 },
         .scissor = .{ .x = 0, .y = 4, .width = 4, .height = 4 }, .color = 0x80402010 };
-    var shader_device: [render.shader_bytes]u8 = @splat(0xa5);
+    const render_class = try run.graphicsClass();
+    const shader_length = try render.shaderBytesFor(render_class);
+    var shader_storage: [render.max_shader_bytes]u8 = @splat(0xa5);
+    const shader_device = shader_storage[0..shader_length];
     var packet_device: [render.packet_bytes]u8 = @splat(0xa5);
-    try checkRenderWarmup(target,table,ce,target_native_index,&shader_device);
+    try checkRenderWarmup(target,table,ce,target_native_index,shader_device);
     try run.beginGraphicsUpload(ce,.packet,draw,deadline);
     try checkRenderUpload(target,ce,&packet_device);
-    var expected_shaders: [render.shader_bytes]u8 = undefined;
-    try render.shaderUpload(&expected_shaders);
-    try t.expectEqualSlices(u8,&expected_shaders,&shader_device);
+    var expected_shaders: [render.max_shader_bytes]u8 = undefined;
+    try render.shaderUploadFor(render_class, expected_shaders[0..shader_length]);
+    try t.expectEqualSlices(u8,expected_shaders[0..shader_length],shader_device);
     const gr = target.native_graphics.channel.?;
     const gr_owner = run.fifos[gr.slot].owner.?;
     try run.beginGraphicsDraw(gr,target_buffer,null,deadline);
@@ -7225,8 +7252,8 @@ fn checkGraphicsRendering(target: *@import("gsp_device.zig").Device, table: *@im
     try t.expect(try renderMethod(body,0x814) == 1<<12 and try renderMethod(body,0x808) == target_image.pitch);
     try t.expect(try renderMethod(body,0x274) == 4 and try renderMethod(body,0x1c00) == 40|(1<<12));
     const shader_address = (@as(u64,try renderMethod(body,0x2154))<<32)|try renderMethod(body,0x2158);
-    try t.expect(shader_address-run.graphics_cache.programs.info().?.address == render.shaderOffset(4));
-    try t.expect(load(&shader_device,render.shaderOffset(4)) == 0x00025482);
+    try t.expect(shader_address-run.graphics_cache.programs.info().?.address == render.profiles.get(render_class).?.offset(4));
+    try t.expect(load(shader_device,render.profiles.get(render_class).?.offset(4)) == 0x00025482);
     const vertex_address = (@as(u64,try renderMethod(body,0x1c04))<<32)|try renderMethod(body,0x1c08);
     try t.expect(vertex_address == run.graphics_cache.packet.info().?.address+768);
     const vertex: render.Vertex = @bitCast(packet_device[768..808].*);
@@ -7260,20 +7287,28 @@ fn checkRenderWarmup(target: *@import("gsp_device.zig").Device, table: *a.Driver
     const model = @import("gsp_copy_test_model.zig").Model;
     const cache = @import("gsp_render_cache.zig");
     const run = &target.running;
+    var checkpoint: u8 = 0;
+    errdefer |err| std.debug.print("render warmup checkpoint={d} class={x} phase={s} cache={d} programs={d} upload={} error={s}\n", .{
+        checkpoint, run.graphicsClass() catch 0, @tagName(target.render_startup.phase), run.graphics_cache.reservedBytes(),
+        run.graphics_cache.program_point, run.graphics_upload != null, @errorName(err) });
     const old_memory = table.gfx_memory_query; const old_queue = table.gfx_queue_query;
     defer { table.gfx_memory_query = old_memory; table.gfx_queue_query = old_queue; }
     model.installRender(table,image_index);
     try t.expect(!try run.beginCopyWork(ce,model.binding,clock+std.time.ns_per_s));
+    checkpoint = 1;
     // No presentation object is fabricated. The actual startup state machine
     // owns both allocations and waits for the actual CE upload receipt.
     try t.expect(run.presentation == null and target.render_startup.phase == .waiting);
     try t.expect(try target.render_startup.step(run,target.native_graphics.channel,ce));
+    checkpoint = 2;
     for (0..160) |_| {
         try stepQueuedRendering(target);
         if (run.graphics_upload != null) break;
     }
     try t.expect(run.graphics_upload != null and run.graphics_starting and !run.graphics_enabled and model.render_operations == 13);
+    checkpoint = 3;
     try t.expect(run.graphics_cache.reservedBytes() == cache.budget_bytes and run.graphics_cache.program_uploads == 0);
+    checkpoint = 4;
     try checkRenderUpload(target,ce,output);
     for (0..16) |_| { try stepQueuedRendering(target); if (target.render_startup.phase == .ready) break; }
     try t.expect(target.render_startup.phase == .ready and !run.graphics_starting and run.graphics_enabled and model.render_operations == 893 and
@@ -7307,7 +7342,7 @@ fn checkRenderUpload(target: *@import("gsp_device.zig").Device, ce: @import("gsp
     @memcpy(output,ControlModel.data[0..bytes]);
     try stepQueuedRendering(target); try t.expect(run.graphics_upload != null and ControlModel.reading);
     const semaphore = (@as(u64,load(commands,offset+48))<<32)|load(commands,offset+52);
-    try t.expect(semaphore == fifo.address(1)+0x2200 and load(commands,offset+56) == ticket.point and load(commands,offset+64) == 12);
+    try t.expect(semaphore == fifo.address(1)+0x2200 and load(commands,offset+56) == ticket.point and load(commands,offset+64) == 0x0400000c);
     std.mem.writeInt(u32,commands[0x2200..][0..4],ticket.point,.little);
     for (0..32) |_| { try stepQueuedRendering(target); if (run.graphics_upload == null) break; }
     try t.expect(run.graphics_upload == null and !ControlModel.reading and ce_owner.ring.idle());
@@ -7521,7 +7556,7 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
         try stepQueuedRendering(target); try t.expect(model.completed == completed_copy and model.active);
         const binding = run.graphics_cache.binding() catch return error.RenderBinding;
         try t.expect(binding.additional.len == (if (batched) @as(usize,15) else 0) and count <= 1024);
-        try reference.executeColor(body,packet,binding.programs.address,binding.packet.address,reference.Surface.from(target_image,target_data),
+        try reference.executeColorFor(binding.class,body,packet,binding.programs.address,binding.packet.address,reference.Surface.from(target_image,target_data),
             if (source_image) |value| reference.Surface.from(value,model.imageBytes(source_index.?)) else null,
             if (colored) &queuedSrgbOracle else null);
         for (0..24) |y| {
@@ -7654,7 +7689,7 @@ fn checkQueuedSlices(target: *@import("gsp_device.zig").Device, ce: @import("gsp
             }
             const clip = try binding.draw.clip();
             try t.expect((clip[2]-clip[0])*(clip[3]-clip[1]) <= 128 and binding.additional.len == 0);
-            try reference.executeColor(body,packet[0..packet_length],binding.programs.address,binding.packet.address,
+            try reference.executeColorFor(binding.class,body,packet[0..packet_length],binding.programs.address,binding.packet.address,
                 reference.Surface.from(image,pixels),null,null);
             model.observeRenderExecution();
             std.mem.writeInt(u32,gr[0x2088..][0..4],ticket.put,.little);
@@ -7726,7 +7761,7 @@ fn checkGraphicsFault(target: *@import("gsp_device.zig").Device, ce: @import("gs
         fifo.slots[0].active and fifo.slots[0].cpu and native.slots[image_index].live and native.slots[image_index].imported);
     const record = run.faults.first_fatal.?;
     try t.expect(record.source == .xid and record.fatal and record.acknowledged and record.render_phase == .execution and
-        record.graphics_point == ticket.point and record.graphics_class == 0xc797 and record.epoch == run.epoch and
+        record.graphics_point == ticket.point and record.graphics_class == (try run.graphicsClass()) and record.epoch == run.epoch and
         std.meta.eql(record.active_fence,model.job.fence) and record.programs_address == binding.programs.address and
         record.packet_address == binding.packet.address and session.tx_sequence == tx);
     const expected_kind: @import("gsp_faults.zig").Kind = if (shader) .shader else .graphics_command;
@@ -7780,6 +7815,7 @@ fn modelGraphicsStep(target: *@import("gsp_device.zig").Device, stage: *u32) !vo
     const mmio: [*]volatile u32 = @ptrFromInt(target.port.window.cpu_address);
     try t.expect(mmio[@import("gsp_copy_wire.zig").notify / 4] == ticket.token);
     var expected = @embedFile("fixtures/graphics-570.144.bin")[16..60].*;
+    std.mem.writeInt(u32, expected[4..8], @import("generation.zig").get(target.display.?.chip.?.id).?.render, .little);
     std.mem.writeInt(u32, expected[36..40], ticket.point, .little);
     try t.expectEqualSlices(u8, &expected, bytes[4096..][0..44]);
     try t.expect((try target.running.receiveGraphics(work.channel_handle)) == null);
@@ -9106,7 +9142,7 @@ fn replyDeviceFifo(target: *@import("gsp_device.zig").Device, counts: *FifoCount
         switch (op) {
             .classes => {
                 if (owner.config.engine == .graphics) {
-                    outputWord(&response, 24, 1); outputWord(&response, 28, if (model.is("context_graphics_missing")) 0xc697 else 0xc797);
+                    outputWord(&response, 24, 1); outputWord(&response, 28, if (model.is("context_graphics_missing")) 0xc697 else @import("generation.zig").get(target.display.?.chip.?.id).?.render);
                 } else {
                     outputWord(&response, 24, if (model.is("context_copy_class")) 0 else 2); outputWord(&response, 28, 0xc6b5); outputWord(&response, 32, 0xc7b5);
                 }

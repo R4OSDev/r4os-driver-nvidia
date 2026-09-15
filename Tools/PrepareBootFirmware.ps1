@@ -5,7 +5,8 @@ param(
     [Parameter(Mandatory)][string]$BootstrapDirectory,
     [Parameter(Mandatory)][string]$ScratchDirectory,
     [string]$OutputDirectory,
-    [ValidateSet('gsp','booter')][string]$Component='gsp'
+    [ValidateSet('gsp','booter')][string]$Component='gsp',
+    [ValidateSet('ga102','ad102','tu102','tu116')][string]$Profile='ga102'
 )
 $ErrorActionPreference='Stop'
 Set-StrictMode -Version Latest
@@ -13,21 +14,28 @@ $owner=Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'FirmwarePackage.ps1')
 $lockPath=Join-Path $owner 'src/firmware-lock.json'
 $pin=Get-Content -Raw $lockPath|ConvertFrom-Json
+$assets=$pin
+if($Profile -ne 'ga102'){
+    $selected=@($pin.boot_generations|Where-Object name -CEQ $Profile)
+    if($selected.Count -ne 1){throw 'Unknown or ambiguous boot generation'}
+    $assets=$selected[0]
+}
 $sourcePin=Get-Content -Raw (Join-Path $PSScriptRoot 'Rm/Sources.json')|ConvertFrom-Json
 if($pin.schema -ne 1 -or $pin.source_commit -cne $sourcePin.source_commit -or $pin.boot.notices.Count -ne 12){throw 'Boot/source pin mismatch'}
 if($Component -eq 'booter' -and ($pin.booters.Count -ne 2 -or $pin.booter_license.notices.Count -ne 5)){throw 'Booter/source pin mismatch'}
-$artifacts=@($pin.boot.image,$pin.boot.descriptor)
-$notices=$pin.boot.notices
-$licenseArtifact=$pin.boot.license
+$artifacts=@($assets.boot.image,$assets.boot.descriptor)
+$notices=$assets.boot.notices
+$licenseArtifact=$assets.boot.license
 $licenseHeading="NVIDIA 570.144 GSP boot, WPR metadata, layout and initialization source notices`n`n"
 $folder='BootFirmware'
 if($Component -eq 'booter'){
-    $artifacts=@(foreach($booter in $pin.booters){foreach($field in @('image','header','signatures','patch_location','patch_signature','patch_metadata','signature_count')){$booter.$field}})
-    $notices=$pin.booter_license.notices
-    $licenseArtifact=$pin.booter_license.artifact
-    $licenseHeading="NVIDIA 570.144 GA102 Booter Load/Unload and source notices`n`n"
+    $artifacts=@(foreach($booter in $assets.booters){foreach($field in @('image','header','signatures','patch_location','patch_signature','patch_metadata','signature_count')){$booter.$field}})
+    $notices=$assets.booter_license.notices
+    $licenseArtifact=$assets.booter_license.artifact
+    $licenseHeading="NVIDIA 570.144 $($Profile.ToUpperInvariant()) Booter Load/Unload and source notices`n`n"
     $folder='BooterFirmware'
 }
+if($Profile -ne 'ga102'){$folder='GenerationFirmware/'+$Profile+'/'+$Component}
 if([string]::IsNullOrWhiteSpace($OutputDirectory)){$OutputDirectory=Join-Path $owner $folder}
 foreach($path in @($SourceDirectory,$BootstrapDirectory,$ScratchDirectory,$OutputDirectory)){
     if(![IO.Path]::IsPathFullyQualified($path)){throw 'Provisioning paths must be absolute'}

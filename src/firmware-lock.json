@@ -281,5 +281,706 @@
         "sha256": "b02ffefcfc6af668dade70eeffdc1208ccdcd629d99d20c9e3ce8f9a7a94cbbc"
       }
     ]
-  }
+  },
+  "boot_generations": [
+    {
+      "name": "ad102",
+      "boot": {
+        "source": {
+          "path": "src/nvidia/generated/g_bindata_kgspGetBinArchiveGspRmBoot_AD102.c",
+          "bytes": 386638,
+          "sha256": "fc7b7b0795cb3e06b040cb00f60f845a19f15f404b403563a05a3ba1d7ea8189"
+        },
+        "image": {
+          "file": "GspRmBoot-AD102-ucode_image_prod.bin",
+          "resource": "GSP-570.144-AD102-BOOT.bin",
+          "bytes": 36864,
+          "sha256": "45d6335a8185d6ff13e8d1484cea73f68d3d13aa1c19dc080ed1c3482dd5bac0"
+        },
+        "descriptor": {
+          "file": "GspRmBoot-AD102-ucode_desc_prod.bin",
+          "resource": "GSP-570.144-AD102-BOOT-DESC.bin",
+          "bytes": 84,
+          "sha256": "83f8f3f1f5f9496e0ea8fc7103c2beb64d0b6de2f5ffe725f13514de5a95fa42"
+        },
+        "license": {
+          "file": "NVIDIA-570.144-AD102-GSP-BOOT-LICENSE.txt",
+          "resource": "NVIDIA-570.144-AD102-GSP-BOOT-LICENSE.txt",
+          "bytes": 33543,
+          "sha256": "a3757cd80c5aefa86c4204fb0d2e83d43dd70de1de8e8f3ed236cb67503d9f59"
+        },
+        "notices": [
+          {
+            "path": "COPYING",
+            "bytes": 19391,
+            "sha256": "d8e96d29bc323000e7ba56102d77c88226a7a3d0d94e2081cb4b071ae9de4a06"
+          },
+          {
+            "path": "src/nvidia/generated/g_bindata_kgspGetBinArchiveGspRmBoot_AD102.c",
+            "bytes": 386638,
+            "sha256": "fc7b7b0795cb3e06b040cb00f60f845a19f15f404b403563a05a3ba1d7ea8189"
+          },
+          {
+            "path": "src/nvidia/arch/nvalloc/common/inc/gsp/gsp_fw_wpr_meta.h",
+            "bytes": 8040,
+            "sha256": "69bfe477d74a6a09217caa57eda872425c45d9581038467e5d035e0c14dd425a"
+          },
+          {
+            "path": "src/nvidia/src/kernel/gpu/gsp/arch/turing/kernel_gsp_tu102.c",
+            "bytes": 45126,
+            "sha256": "6eb2e2702f956053a960e26a7bd7917ddb1a8b0fcbbdd0fac2eeebbd73b69303"
+          },
+          {
+            "path": "src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c",
+            "bytes": 168764,
+            "sha256": "5b99422b7e5cf424e4b782d9a9b2389118f9bd9d74085e49223b1c5170e5f018"
+          },
+          {
+            "path": "src/nvidia/inc/kernel/gpu/gsp/gsp_fw_heap.h",
+            "bytes": 5556,
+            "sha256": "f07842783c9c4dfaca7811c14dacb688282c25300162dc0f285550dcc71f99d0"
+          },
+          {
+            "path": "src/common/uproc/os/common/include/libos_init_args.h",
+            "bytes": 2263,
+            "sha256": "75174fb8b643fa28537acba0cf3d936f292e99a1590762ccd4936be093ae33a1"
+          },
+          {
+            "path": "src/nvidia/inc/kernel/gpu/gsp/gsp_init_args.h",
+            "bytes": 2037,
+            "sha256": "6d1117eaf4f4ca805715a95bd7edd46f1f87160b78b4e440936cae499d13631c"
+          },
+          {
+            "path": "src/nvidia/src/kernel/gpu/gsp/message_queue_cpu.c",
+            "bytes": 26090,
+            "sha256": "acefc9555e95cc5663f872c10fa796c9e8416e15ee292b78efd1e85d3a4a7816"
+          },
+          {
+            "path": "src/nvidia/inc/kernel/gpu/gsp/message_queue_priv.h",
+            "bytes": 5006,
+            "sha256": "cbb3aa6001524c75ba3f570dc0e92523f042a293aa6e3779ac00162c100a2980"
+          },
+          {
+            "path": "src/common/shared/msgq/msgq.c",
+            "bytes": 18028,
+            "sha256": "dfd7c7f13f5aad49279f4ac52bf1b0fd88be4c3f22a5d1e2c30feeeffae7bc75"
+          },
+          {
+            "path": "src/common/shared/msgq/inc/msgq/msgq_priv.h",
+            "bytes": 4119,
+            "sha256": "618c75304cb62800073a86b2ef10cc644e767844ca3fa81de94f24ec41808b34"
+          }
+        ]
+      },
+      "booters": [
+        {
+          "operation": "load",
+          "source": {
+            "path": "src/nvidia/generated/g_bindata_kgspGetBinArchiveBooterLoadUcode_AD102.c",
+            "bytes": 428233,
+            "sha256": "6aa52e9871f237ea3a80643e705388ed042248718d603508cfcb6593254d3427"
+          },
+          "image": {
+            "file": "BooterLoad-AD102-image_prod.bin",
+            "resource": "GSP-570.144-AD102-BLOAD-IMAGE.bin",
+            "bytes": 56832,
+            "sha256": "83e06ccd394eb73ab9e599a6db23be01e0df307d3ec4cfd64fa9499837a402da"
+          },
+          "header": {
+            "file": "BooterLoad-AD102-header_prod.bin",
+            "resource": "GSP-570.144-AD102-BLOAD-HEADER.bin",
+            "bytes": 36,
+            "sha256": "64ab9383a450839bc834e715294e248c9e8eceed3115e7ec603b4b84316bb024"
+          },
+          "signatures": {
+            "file": "BooterLoad-AD102-sig_prod.bin",
+            "resource": "GSP-570.144-AD102-BLOAD-SIG.bin",
+            "bytes": 768,
+            "sha256": "11d6c63d7cbcf60f9d2d3cf1a1ea3f248b718fc99882d11fb0d6396cb58fc516"
+          },
+          "patch_location": {
+            "file": "BooterLoad-AD102-patch_loc.bin",
+            "resource": "GSP-570.144-AD102-BLOAD-LOC.bin",
+            "bytes": 4,
+            "sha256": "8e3601bb9e450a3b1b98a18184681a9553d8bc8723e19e8ef800cecc289bff6e"
+          },
+          "patch_signature": {
+            "file": "BooterLoad-AD102-patch_sig.bin",
+            "resource": "GSP-570.144-AD102-BLOAD-INDEX.bin",
+            "bytes": 4,
+            "sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119"
+          },
+          "patch_metadata": {
+            "file": "BooterLoad-AD102-patch_meta.bin",
+            "resource": "GSP-570.144-AD102-BLOAD-META.bin",
+            "bytes": 12,
+            "sha256": "0fe5ea953905a7e632f48916bee4115fa1bc91a8b14bdd57f57ccf3c79f11926"
+          },
+          "signature_count": {
+            "file": "BooterLoad-AD102-num_sigs.bin",
+            "resource": "GSP-570.144-AD102-BLOAD-COUNT.bin",
+            "bytes": 4,
+            "sha256": "26b25d457597a7b0463f9620f666dd10aa2c4373a505967c7c8d70922a2d6ece"
+          }
+        },
+        {
+          "operation": "unload",
+          "source": {
+            "path": "src/nvidia/generated/g_bindata_kgspGetBinArchiveBooterUnloadUcode_AD102.c",
+            "bytes": 280989,
+            "sha256": "5ad80c416f123f8c0cb5b923eedfa4fe2dc107d35b3965ec328c7d99a09eab19"
+          },
+          "image": {
+            "file": "BooterUnload-AD102-image_prod.bin",
+            "resource": "GSP-570.144-AD102-BUNLOAD-IMAGE.bin",
+            "bytes": 40704,
+            "sha256": "8f83aef71b349cdbd3860aa81741a336b85d90e828b1bca89fce47b2dfd0867b"
+          },
+          "header": {
+            "file": "BooterUnload-AD102-header_prod.bin",
+            "resource": "GSP-570.144-AD102-BUNLOAD-HEADER.bin",
+            "bytes": 36,
+            "sha256": "fd5267d136b8a088e25569c258edcd8e8ab729db2b88df4dbcfac0344597b51b"
+          },
+          "signatures": {
+            "file": "BooterUnload-AD102-sig_prod.bin",
+            "resource": "GSP-570.144-AD102-BUNLOAD-SIG.bin",
+            "bytes": 768,
+            "sha256": "b00585981170fc190a006e4c0786171b59d9fff0ad6388b1933990b747adde2e"
+          },
+          "patch_location": {
+            "file": "BooterUnload-AD102-patch_loc.bin",
+            "resource": "GSP-570.144-AD102-BUNLOAD-LOC.bin",
+            "bytes": 4,
+            "sha256": "c5e7ecffc846e85c9d075535d20d09e84cfda89a20cdf53c1b97e56d6a7b8844"
+          },
+          "patch_signature": {
+            "file": "BooterUnload-AD102-patch_sig.bin",
+            "resource": "GSP-570.144-AD102-BUNLOAD-INDEX.bin",
+            "bytes": 4,
+            "sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119"
+          },
+          "patch_metadata": {
+            "file": "BooterUnload-AD102-patch_meta.bin",
+            "resource": "GSP-570.144-AD102-BUNLOAD-META.bin",
+            "bytes": 12,
+            "sha256": "0fe5ea953905a7e632f48916bee4115fa1bc91a8b14bdd57f57ccf3c79f11926"
+          },
+          "signature_count": {
+            "file": "BooterUnload-AD102-num_sigs.bin",
+            "resource": "GSP-570.144-AD102-BUNLOAD-COUNT.bin",
+            "bytes": 4,
+            "sha256": "26b25d457597a7b0463f9620f666dd10aa2c4373a505967c7c8d70922a2d6ece"
+          }
+        }
+      ],
+      "booter_license": {
+        "artifact": {
+          "file": "NVIDIA-570.144-AD102-BOOTER-LICENSE.txt",
+          "resource": "NVIDIA-570.144-AD102-BOOTER-LICENSE.txt",
+          "bytes": 24640,
+          "sha256": "4a25081cee7f388302bc8d642eae598432551298e3e54cc20aa16570f94a2afa"
+        },
+        "notices": [
+          {
+            "path": "COPYING",
+            "bytes": 19391,
+            "sha256": "d8e96d29bc323000e7ba56102d77c88226a7a3d0d94e2081cb4b071ae9de4a06"
+          },
+          {
+            "path": "src/nvidia/generated/g_bindata_kgspGetBinArchiveBooterLoadUcode_AD102.c",
+            "bytes": 428233,
+            "sha256": "6aa52e9871f237ea3a80643e705388ed042248718d603508cfcb6593254d3427"
+          },
+          {
+            "path": "src/nvidia/generated/g_bindata_kgspGetBinArchiveBooterUnloadUcode_AD102.c",
+            "bytes": 280989,
+            "sha256": "5ad80c416f123f8c0cb5b923eedfa4fe2dc107d35b3965ec328c7d99a09eab19"
+          },
+          {
+            "path": "src/nvidia/src/kernel/gpu/gsp/kernel_gsp_booter.c",
+            "bytes": 14575,
+            "sha256": "ca5de71cb8da44814bcd77b00c8d307d1b34fe5a2ca57678b3634204e9a3c4ff"
+          },
+          {
+            "path": "src/nvidia/src/kernel/gpu/sec2/arch/ampere/kernel_sec2_ga100.c",
+            "bytes": 3327,
+            "sha256": "b02ffefcfc6af668dade70eeffdc1208ccdcd629d99d20c9e3ce8f9a7a94cbbc"
+          }
+        ]
+      },
+      "pack": {
+        "file": "NVIDIA-570.144-AD102-BOOT-PACK.bin",
+        "resource": "NVIDIA-570.144-AD102-BOOT-PACK.bin",
+        "bytes": 194448,
+        "sha256": "6d476d906665691c54bed337b76b40da3fb4ea54f26a9e2b122ab3fe006482dd"
+      }
+    },
+    {
+      "name": "tu102",
+      "boot": {
+        "source": {
+          "path": "src/nvidia/generated/g_bindata_kgspGetBinArchiveGspRmBoot_TU102.c",
+          "bytes": 10178,
+          "sha256": "8450ec83789291506bd55c215fec394205923b51fa301041f97369110487fb30"
+        },
+        "image": {
+          "file": "GspRmBoot-TU102-ucode_image.bin",
+          "resource": "GSP-570.144-TU102-BOOT.bin",
+          "bytes": 4096,
+          "sha256": "8765694cd38beaa4e2b8b1b83a31fb7aee6cb9d8b7c6bc7a86e6d931a3a056c2"
+        },
+        "descriptor": {
+          "file": "GspRmBoot-TU102-ucode_desc.bin",
+          "resource": "GSP-570.144-TU102-BOOT-DESC.bin",
+          "bytes": 76,
+          "sha256": "9e7cca2cfdc5ce601b0adba39967850046108df6c2d23fff95578ca3f0ccbe01"
+        },
+        "license": {
+          "file": "NVIDIA-570.144-TU102-GSP-BOOT-LICENSE.txt",
+          "resource": "NVIDIA-570.144-TU102-GSP-BOOT-LICENSE.txt",
+          "bytes": 33543,
+          "sha256": "b1ff212dfb9ed728e8ca9bebc52553ed787901952bbc4726f062960f01e052d6"
+        },
+        "notices": [
+          {
+            "path": "COPYING",
+            "bytes": 19391,
+            "sha256": "d8e96d29bc323000e7ba56102d77c88226a7a3d0d94e2081cb4b071ae9de4a06"
+          },
+          {
+            "path": "src/nvidia/generated/g_bindata_kgspGetBinArchiveGspRmBoot_TU102.c",
+            "bytes": 10178,
+            "sha256": "8450ec83789291506bd55c215fec394205923b51fa301041f97369110487fb30"
+          },
+          {
+            "path": "src/nvidia/arch/nvalloc/common/inc/gsp/gsp_fw_wpr_meta.h",
+            "bytes": 8040,
+            "sha256": "69bfe477d74a6a09217caa57eda872425c45d9581038467e5d035e0c14dd425a"
+          },
+          {
+            "path": "src/nvidia/src/kernel/gpu/gsp/arch/turing/kernel_gsp_tu102.c",
+            "bytes": 45126,
+            "sha256": "6eb2e2702f956053a960e26a7bd7917ddb1a8b0fcbbdd0fac2eeebbd73b69303"
+          },
+          {
+            "path": "src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c",
+            "bytes": 168764,
+            "sha256": "5b99422b7e5cf424e4b782d9a9b2389118f9bd9d74085e49223b1c5170e5f018"
+          },
+          {
+            "path": "src/nvidia/inc/kernel/gpu/gsp/gsp_fw_heap.h",
+            "bytes": 5556,
+            "sha256": "f07842783c9c4dfaca7811c14dacb688282c25300162dc0f285550dcc71f99d0"
+          },
+          {
+            "path": "src/common/uproc/os/common/include/libos_init_args.h",
+            "bytes": 2263,
+            "sha256": "75174fb8b643fa28537acba0cf3d936f292e99a1590762ccd4936be093ae33a1"
+          },
+          {
+            "path": "src/nvidia/inc/kernel/gpu/gsp/gsp_init_args.h",
+            "bytes": 2037,
+            "sha256": "6d1117eaf4f4ca805715a95bd7edd46f1f87160b78b4e440936cae499d13631c"
+          },
+          {
+            "path": "src/nvidia/src/kernel/gpu/gsp/message_queue_cpu.c",
+            "bytes": 26090,
+            "sha256": "acefc9555e95cc5663f872c10fa796c9e8416e15ee292b78efd1e85d3a4a7816"
+          },
+          {
+            "path": "src/nvidia/inc/kernel/gpu/gsp/message_queue_priv.h",
+            "bytes": 5006,
+            "sha256": "cbb3aa6001524c75ba3f570dc0e92523f042a293aa6e3779ac00162c100a2980"
+          },
+          {
+            "path": "src/common/shared/msgq/msgq.c",
+            "bytes": 18028,
+            "sha256": "dfd7c7f13f5aad49279f4ac52bf1b0fd88be4c3f22a5d1e2c30feeeffae7bc75"
+          },
+          {
+            "path": "src/common/shared/msgq/inc/msgq/msgq_priv.h",
+            "bytes": 4119,
+            "sha256": "618c75304cb62800073a86b2ef10cc644e767844ca3fa81de94f24ec41808b34"
+          }
+        ]
+      },
+      "booters": [
+        {
+          "operation": "load",
+          "source": {
+            "path": "src/nvidia/generated/g_bindata_kgspGetBinArchiveBooterLoadUcode_TU102.c",
+            "bytes": 439061,
+            "sha256": "06f6244a787d63d0e4e24626f000742cf3903121ae9481ce0c817d479e9bd95a"
+          },
+          "image": {
+            "file": "BooterLoad-TU102-image_prod.bin",
+            "resource": "GSP-570.144-TU102-BLOAD-IMAGE.bin",
+            "bytes": 59136,
+            "sha256": "e0f0fc93da097b5b68e5af3adb58b2235ed1fad5fce0b23592d3895af44cb743"
+          },
+          "header": {
+            "file": "BooterLoad-TU102-header_prod.bin",
+            "resource": "GSP-570.144-TU102-BLOAD-HEADER.bin",
+            "bytes": 36,
+            "sha256": "be56c8c4c07dfd9a44e3d52c6d092ef2baacffa7303a16bc11f5f4a8485dd4d6"
+          },
+          "signatures": {
+            "file": "BooterLoad-TU102-sig_prod.bin",
+            "resource": "GSP-570.144-TU102-BLOAD-SIG.bin",
+            "bytes": 16,
+            "sha256": "eac2f717515ed7b336d2bd26215757d6ea73b87fdcfe09c67ceb07ae75a9c9b6"
+          },
+          "patch_location": {
+            "file": "BooterLoad-TU102-patch_loc.bin",
+            "resource": "GSP-570.144-TU102-BLOAD-LOC.bin",
+            "bytes": 4,
+            "sha256": "67afaacd65d13ffecc00dcb47ecac2b278a575f4fc8a2109f756ae5004e72bfd"
+          },
+          "patch_signature": {
+            "file": "BooterLoad-TU102-patch_sig.bin",
+            "resource": "GSP-570.144-TU102-BLOAD-INDEX.bin",
+            "bytes": 4,
+            "sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119"
+          },
+          "patch_metadata": {
+            "file": "BooterLoad-TU102-patch_meta.bin",
+            "resource": "GSP-570.144-TU102-BLOAD-META.bin",
+            "bytes": 12,
+            "sha256": "bb1e37791d729f4e30f3d80e459779205111dd38250bc832d360b584804a3423"
+          },
+          "signature_count": {
+            "file": "BooterLoad-TU102-num_sigs.bin",
+            "resource": "GSP-570.144-TU102-BLOAD-COUNT.bin",
+            "bytes": 4,
+            "sha256": "67abdd721024f0ff4e0b3f4c2fc13bc5bad42d0b7851d456d88d203d15aaa450"
+          }
+        },
+        {
+          "operation": "unload",
+          "source": {
+            "path": "src/nvidia/generated/g_bindata_kgspGetBinArchiveBooterUnloadUcode_TU102.c",
+            "bytes": 256127,
+            "sha256": "aafdcafacb30165571b8d0fcd1910d8319abd5d8f17ef446475eeff761e18708"
+          },
+          "image": {
+            "file": "BooterUnload-TU102-image_prod.bin",
+            "resource": "GSP-570.144-TU102-BUNLOAD-IMAGE.bin",
+            "bytes": 39168,
+            "sha256": "08de6763d1fcb4e60296de23a1dc0f6f30fd5b7f97af52200ba17731b9d246a2"
+          },
+          "header": {
+            "file": "BooterUnload-TU102-header_prod.bin",
+            "resource": "GSP-570.144-TU102-BUNLOAD-HEADER.bin",
+            "bytes": 36,
+            "sha256": "33d9418f996159d402b28e9074ff4fae24f5bc92e7a731f99cad2f3eb8d32fd4"
+          },
+          "signatures": {
+            "file": "BooterUnload-TU102-sig_prod.bin",
+            "resource": "GSP-570.144-TU102-BUNLOAD-SIG.bin",
+            "bytes": 16,
+            "sha256": "85f1be78b6307d44e5308f80654eb81d99a16185a9065a815c52ebbbdfea0e3b"
+          },
+          "patch_location": {
+            "file": "BooterUnload-TU102-patch_loc.bin",
+            "resource": "GSP-570.144-TU102-BUNLOAD-LOC.bin",
+            "bytes": 4,
+            "sha256": "4532fe32a029ca70213a3617061239753b07aa6787fe84830cab8d0a717acf28"
+          },
+          "patch_signature": {
+            "file": "BooterUnload-TU102-patch_sig.bin",
+            "resource": "GSP-570.144-TU102-BUNLOAD-INDEX.bin",
+            "bytes": 4,
+            "sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119"
+          },
+          "patch_metadata": {
+            "file": "BooterUnload-TU102-patch_meta.bin",
+            "resource": "GSP-570.144-TU102-BUNLOAD-META.bin",
+            "bytes": 12,
+            "sha256": "bb1e37791d729f4e30f3d80e459779205111dd38250bc832d360b584804a3423"
+          },
+          "signature_count": {
+            "file": "BooterUnload-TU102-num_sigs.bin",
+            "resource": "GSP-570.144-TU102-BUNLOAD-COUNT.bin",
+            "bytes": 4,
+            "sha256": "67abdd721024f0ff4e0b3f4c2fc13bc5bad42d0b7851d456d88d203d15aaa450"
+          }
+        }
+      ],
+      "booter_license": {
+        "artifact": {
+          "file": "NVIDIA-570.144-TU102-BOOTER-LICENSE.txt",
+          "resource": "NVIDIA-570.144-TU102-BOOTER-LICENSE.txt",
+          "bytes": 24640,
+          "sha256": "f2c82fc94d005f92c27591cd8bc383a1e41789549f1056516a1badbae25e2363"
+        },
+        "notices": [
+          {
+            "path": "COPYING",
+            "bytes": 19391,
+            "sha256": "d8e96d29bc323000e7ba56102d77c88226a7a3d0d94e2081cb4b071ae9de4a06"
+          },
+          {
+            "path": "src/nvidia/generated/g_bindata_kgspGetBinArchiveBooterLoadUcode_TU102.c",
+            "bytes": 439061,
+            "sha256": "06f6244a787d63d0e4e24626f000742cf3903121ae9481ce0c817d479e9bd95a"
+          },
+          {
+            "path": "src/nvidia/generated/g_bindata_kgspGetBinArchiveBooterUnloadUcode_TU102.c",
+            "bytes": 256127,
+            "sha256": "aafdcafacb30165571b8d0fcd1910d8319abd5d8f17ef446475eeff761e18708"
+          },
+          {
+            "path": "src/nvidia/src/kernel/gpu/gsp/kernel_gsp_booter.c",
+            "bytes": 14575,
+            "sha256": "ca5de71cb8da44814bcd77b00c8d307d1b34fe5a2ca57678b3634204e9a3c4ff"
+          },
+          {
+            "path": "src/nvidia/src/kernel/gpu/sec2/arch/ampere/kernel_sec2_ga100.c",
+            "bytes": 3327,
+            "sha256": "b02ffefcfc6af668dade70eeffdc1208ccdcd629d99d20c9e3ce8f9a7a94cbbc"
+          }
+        ]
+      },
+      "pack": {
+        "file": "NVIDIA-570.144-TU102-BOOT-PACK.bin",
+        "resource": "NVIDIA-570.144-TU102-BOOT-PACK.bin",
+        "bytes": 160928,
+        "sha256": "6a05b1f0e7c1038ff0d66028bb3790e983f54259769f927e48120a00d9209576"
+      }
+    },
+    {
+      "name": "tu116",
+      "boot": {
+        "source": {
+          "path": "src/nvidia/generated/g_bindata_kgspGetBinArchiveGspRmBoot_TU102.c",
+          "bytes": 10178,
+          "sha256": "8450ec83789291506bd55c215fec394205923b51fa301041f97369110487fb30"
+        },
+        "image": {
+          "file": "GspRmBoot-TU102-ucode_image.bin",
+          "resource": "GSP-570.144-TU116-BOOT.bin",
+          "bytes": 4096,
+          "sha256": "8765694cd38beaa4e2b8b1b83a31fb7aee6cb9d8b7c6bc7a86e6d931a3a056c2"
+        },
+        "descriptor": {
+          "file": "GspRmBoot-TU102-ucode_desc.bin",
+          "resource": "GSP-570.144-TU116-BOOT-DESC.bin",
+          "bytes": 76,
+          "sha256": "9e7cca2cfdc5ce601b0adba39967850046108df6c2d23fff95578ca3f0ccbe01"
+        },
+        "license": {
+          "file": "NVIDIA-570.144-TU116-GSP-BOOT-LICENSE.txt",
+          "resource": "NVIDIA-570.144-TU116-GSP-BOOT-LICENSE.txt",
+          "bytes": 33543,
+          "sha256": "b1ff212dfb9ed728e8ca9bebc52553ed787901952bbc4726f062960f01e052d6"
+        },
+        "notices": [
+          {
+            "path": "COPYING",
+            "bytes": 19391,
+            "sha256": "d8e96d29bc323000e7ba56102d77c88226a7a3d0d94e2081cb4b071ae9de4a06"
+          },
+          {
+            "path": "src/nvidia/generated/g_bindata_kgspGetBinArchiveGspRmBoot_TU102.c",
+            "bytes": 10178,
+            "sha256": "8450ec83789291506bd55c215fec394205923b51fa301041f97369110487fb30"
+          },
+          {
+            "path": "src/nvidia/arch/nvalloc/common/inc/gsp/gsp_fw_wpr_meta.h",
+            "bytes": 8040,
+            "sha256": "69bfe477d74a6a09217caa57eda872425c45d9581038467e5d035e0c14dd425a"
+          },
+          {
+            "path": "src/nvidia/src/kernel/gpu/gsp/arch/turing/kernel_gsp_tu102.c",
+            "bytes": 45126,
+            "sha256": "6eb2e2702f956053a960e26a7bd7917ddb1a8b0fcbbdd0fac2eeebbd73b69303"
+          },
+          {
+            "path": "src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c",
+            "bytes": 168764,
+            "sha256": "5b99422b7e5cf424e4b782d9a9b2389118f9bd9d74085e49223b1c5170e5f018"
+          },
+          {
+            "path": "src/nvidia/inc/kernel/gpu/gsp/gsp_fw_heap.h",
+            "bytes": 5556,
+            "sha256": "f07842783c9c4dfaca7811c14dacb688282c25300162dc0f285550dcc71f99d0"
+          },
+          {
+            "path": "src/common/uproc/os/common/include/libos_init_args.h",
+            "bytes": 2263,
+            "sha256": "75174fb8b643fa28537acba0cf3d936f292e99a1590762ccd4936be093ae33a1"
+          },
+          {
+            "path": "src/nvidia/inc/kernel/gpu/gsp/gsp_init_args.h",
+            "bytes": 2037,
+            "sha256": "6d1117eaf4f4ca805715a95bd7edd46f1f87160b78b4e440936cae499d13631c"
+          },
+          {
+            "path": "src/nvidia/src/kernel/gpu/gsp/message_queue_cpu.c",
+            "bytes": 26090,
+            "sha256": "acefc9555e95cc5663f872c10fa796c9e8416e15ee292b78efd1e85d3a4a7816"
+          },
+          {
+            "path": "src/nvidia/inc/kernel/gpu/gsp/message_queue_priv.h",
+            "bytes": 5006,
+            "sha256": "cbb3aa6001524c75ba3f570dc0e92523f042a293aa6e3779ac00162c100a2980"
+          },
+          {
+            "path": "src/common/shared/msgq/msgq.c",
+            "bytes": 18028,
+            "sha256": "dfd7c7f13f5aad49279f4ac52bf1b0fd88be4c3f22a5d1e2c30feeeffae7bc75"
+          },
+          {
+            "path": "src/common/shared/msgq/inc/msgq/msgq_priv.h",
+            "bytes": 4119,
+            "sha256": "618c75304cb62800073a86b2ef10cc644e767844ca3fa81de94f24ec41808b34"
+          }
+        ]
+      },
+      "booters": [
+        {
+          "operation": "load",
+          "source": {
+            "path": "src/nvidia/generated/g_bindata_kgspGetBinArchiveBooterLoadUcode_TU116.c",
+            "bytes": 439055,
+            "sha256": "5c764f11b073526da6cd85691c85b83b4b44546b7a00b07cc2e9df8371fa744c"
+          },
+          "image": {
+            "file": "BooterLoad-TU116-image_prod.bin",
+            "resource": "GSP-570.144-TU116-BLOAD-IMAGE.bin",
+            "bytes": 58880,
+            "sha256": "be0e00ca9379023438ad6466d9d9f38b2c97f694d54d154553e46479edc96af0"
+          },
+          "header": {
+            "file": "BooterLoad-TU116-header_prod.bin",
+            "resource": "GSP-570.144-TU116-BLOAD-HEADER.bin",
+            "bytes": 36,
+            "sha256": "28cb7929f51779cec722345701700b1c0998aa9c27ed69571334955994db36bd"
+          },
+          "signatures": {
+            "file": "BooterLoad-TU116-sig_prod.bin",
+            "resource": "GSP-570.144-TU116-BLOAD-SIG.bin",
+            "bytes": 16,
+            "sha256": "d55e09e130161b4a7cdb895e7df1ba650e24af2bc0047106fc248d839b73ba2c"
+          },
+          "patch_location": {
+            "file": "BooterLoad-TU116-patch_loc.bin",
+            "resource": "GSP-570.144-TU116-BLOAD-LOC.bin",
+            "bytes": 4,
+            "sha256": "1fd5d539ef90830f02dd9ae1406f9b17994984171f11baf3ecb502593c7f7b8d"
+          },
+          "patch_signature": {
+            "file": "BooterLoad-TU116-patch_sig.bin",
+            "resource": "GSP-570.144-TU116-BLOAD-INDEX.bin",
+            "bytes": 4,
+            "sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119"
+          },
+          "patch_metadata": {
+            "file": "BooterLoad-TU116-patch_meta.bin",
+            "resource": "GSP-570.144-TU116-BLOAD-META.bin",
+            "bytes": 12,
+            "sha256": "bb1e37791d729f4e30f3d80e459779205111dd38250bc832d360b584804a3423"
+          },
+          "signature_count": {
+            "file": "BooterLoad-TU116-num_sigs.bin",
+            "resource": "GSP-570.144-TU116-BLOAD-COUNT.bin",
+            "bytes": 4,
+            "sha256": "67abdd721024f0ff4e0b3f4c2fc13bc5bad42d0b7851d456d88d203d15aaa450"
+          }
+        },
+        {
+          "operation": "unload",
+          "source": {
+            "path": "src/nvidia/generated/g_bindata_kgspGetBinArchiveBooterUnloadUcode_TU116.c",
+            "bytes": 255441,
+            "sha256": "3de39c0b0eabf7061f09ec779778deb07d83a1ba4b95bcd0f34cc0b17c369c18"
+          },
+          "image": {
+            "file": "BooterUnload-TU116-image_prod.bin",
+            "resource": "GSP-570.144-TU116-BUNLOAD-IMAGE.bin",
+            "bytes": 38912,
+            "sha256": "ee6593a30f7570512a4dd0792c8b720c6fed1bb3ee25509a76e39aa3b07df57f"
+          },
+          "header": {
+            "file": "BooterUnload-TU116-header_prod.bin",
+            "resource": "GSP-570.144-TU116-BUNLOAD-HEADER.bin",
+            "bytes": 36,
+            "sha256": "c7393717eacb2bcf7b93282e69498523551e592825d7619187053e05e9c0e94d"
+          },
+          "signatures": {
+            "file": "BooterUnload-TU116-sig_prod.bin",
+            "resource": "GSP-570.144-TU116-BUNLOAD-SIG.bin",
+            "bytes": 16,
+            "sha256": "db789d9cd32d84617da769a334a708679779a84d2e4de377c9fa293522d2550b"
+          },
+          "patch_location": {
+            "file": "BooterUnload-TU116-patch_loc.bin",
+            "resource": "GSP-570.144-TU116-BUNLOAD-LOC.bin",
+            "bytes": 4,
+            "sha256": "ba23d122a341306f71671e6744f57fccc27537e4bd19b7a5ec22fb13644b5a73"
+          },
+          "patch_signature": {
+            "file": "BooterUnload-TU116-patch_sig.bin",
+            "resource": "GSP-570.144-TU116-BUNLOAD-INDEX.bin",
+            "bytes": 4,
+            "sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119"
+          },
+          "patch_metadata": {
+            "file": "BooterUnload-TU116-patch_meta.bin",
+            "resource": "GSP-570.144-TU116-BUNLOAD-META.bin",
+            "bytes": 12,
+            "sha256": "bb1e37791d729f4e30f3d80e459779205111dd38250bc832d360b584804a3423"
+          },
+          "signature_count": {
+            "file": "BooterUnload-TU116-num_sigs.bin",
+            "resource": "GSP-570.144-TU116-BUNLOAD-COUNT.bin",
+            "bytes": 4,
+            "sha256": "67abdd721024f0ff4e0b3f4c2fc13bc5bad42d0b7851d456d88d203d15aaa450"
+          }
+        }
+      ],
+      "booter_license": {
+        "artifact": {
+          "file": "NVIDIA-570.144-TU116-BOOTER-LICENSE.txt",
+          "resource": "NVIDIA-570.144-TU116-BOOTER-LICENSE.txt",
+          "bytes": 24640,
+          "sha256": "38642a5cac9e3a9617f8d52233d75191e60dad785d0b322b5b5ede38e144c30a"
+        },
+        "notices": [
+          {
+            "path": "COPYING",
+            "bytes": 19391,
+            "sha256": "d8e96d29bc323000e7ba56102d77c88226a7a3d0d94e2081cb4b071ae9de4a06"
+          },
+          {
+            "path": "src/nvidia/generated/g_bindata_kgspGetBinArchiveBooterLoadUcode_TU116.c",
+            "bytes": 439055,
+            "sha256": "5c764f11b073526da6cd85691c85b83b4b44546b7a00b07cc2e9df8371fa744c"
+          },
+          {
+            "path": "src/nvidia/generated/g_bindata_kgspGetBinArchiveBooterUnloadUcode_TU116.c",
+            "bytes": 255441,
+            "sha256": "3de39c0b0eabf7061f09ec779778deb07d83a1ba4b95bcd0f34cc0b17c369c18"
+          },
+          {
+            "path": "src/nvidia/src/kernel/gpu/gsp/kernel_gsp_booter.c",
+            "bytes": 14575,
+            "sha256": "ca5de71cb8da44814bcd77b00c8d307d1b34fe5a2ca57678b3634204e9a3c4ff"
+          },
+          {
+            "path": "src/nvidia/src/kernel/gpu/sec2/arch/ampere/kernel_sec2_ga100.c",
+            "bytes": 3327,
+            "sha256": "b02ffefcfc6af668dade70eeffdc1208ccdcd629d99d20c9e3ce8f9a7a94cbbc"
+          }
+        ]
+      },
+      "pack": {
+        "file": "NVIDIA-570.144-TU116-BOOT-PACK.bin",
+        "resource": "NVIDIA-570.144-TU116-BOOT-PACK.bin",
+        "bytes": 160416,
+        "sha256": "c32ca64b657a2431fd946823cfdd535e45c29380dc1312d97c5b57df7069a730"
+      }
+    }
+  ]
 }

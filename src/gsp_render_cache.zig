@@ -13,6 +13,7 @@ pub const Owner = struct {
     programs: storage.Use = .{},
     packet: storage.Use = .{},
     epoch: u64 = 0,
+    class: u32 = 0,
     program_point: u32 = 0,
     packet_point: u32 = 0,
     draw: ?render.Draw = null,
@@ -30,11 +31,15 @@ pub const Owner = struct {
     uploaded_bytes: u64 = 0,
 
     pub fn initialize(self: *Owner, epoch: u64) !void {
+        return self.initializeFor(epoch, 0xc797);
+    }
+    pub fn initializeFor(self: *Owner, epoch: u64, class: u32) !void {
         if (self.self_address != 0 or epoch == 0) return error.State;
-        self.* = .{ .self_address = @intFromPtr(self), .epoch = epoch };
+        _ = try render.shaderBytesFor(class);
+        self.* = .{ .self_address = @intFromPtr(self), .epoch = epoch, .class = class };
     }
     pub fn valid(self: *const Owner) bool {
-        return self.self_address == @intFromPtr(self) and self.epoch != 0 and !self.failed and
+        return self.self_address == @intFromPtr(self) and self.epoch != 0 and render.profiles.get(self.class) != null and !self.failed and
             self.additional_count < render.batch_capacity and self.pending_count < render.batch_capacity;
     }
     pub fn buffer(self: *Owner, kind: Kind) *storage.Use {
@@ -73,11 +78,11 @@ pub const Owner = struct {
         const info = self.buffer(kind).info() orelse return error.State;
         if (info.epoch != self.epoch) return error.Stale;
         try (render.Range{ .address = info.address, .bytes = info.bytes }).validate(256,
-            if (kind == .programs) render.shader_bytes else render.packet_bytes * draws.len);
+            if (kind == .programs) try render.shaderBytesFor(self.class) else render.packet_bytes * draws.len);
         switch (kind) {
             .programs => {
                 if (self.program_point != 0) return error.State;
-                try render.shaderUpload(bytes);
+                try render.shaderUploadFor(self.class, bytes);
             },
             .packet => {
                 if (self.program_point == 0) return error.State;
@@ -97,7 +102,7 @@ pub const Owner = struct {
     pub fn completeUpload(self: *Owner, kind: Kind, point: u32) !void {
         if (!self.valid() or self.uploading != kind or point == 0) return error.State;
         if (kind == .programs) {
-            self.program_point = point; self.program_uploads +|= 1; self.uploaded_bytes +|= render.shader_bytes;
+            self.program_point = point; self.program_uploads +|= 1; self.uploaded_bytes +|= try render.shaderBytesFor(self.class);
         } else {
             self.draw = self.pending_draw orelse return error.State;
             self.additional_count = self.pending_count;
@@ -117,7 +122,7 @@ pub const Owner = struct {
         const programs = self.programs.info() orelse return error.Stale;
         const packet = self.packet.info() orelse return error.Stale;
         if (programs.epoch != self.epoch or packet.epoch != self.epoch or programs.adapter != packet.adapter or programs.driver_owner != packet.driver_owner) return error.Stale;
-        const result: render.Binding = .{ .draw = self.draw orelse return error.State,
+        const result: render.Binding = .{ .class = self.class, .draw = self.draw orelse return error.State,
             .additional = self.additional[0..self.additional_count],
             .programs = .{ .address = programs.address, .bytes = programs.bytes },
             .packet = .{ .address = packet.address, .bytes = packet.bytes } };

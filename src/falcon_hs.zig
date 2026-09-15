@@ -121,7 +121,7 @@ pub const Phase = enum {
 
 pub fn validate(options: *const Options) !void {
     if (options.epoch == 0 or options.deadline == 0 or options.deadline == std.math.maxInt(u64)) return error.Options;
-    if (((options.boot0 >> 20) & 0x1ff) | ((options.boot0 & 0x100) << 1) != 0x176) return error.Profile;
+    if (!@import("generation.zig").ga102Hal(@import("generation.zig").bootId(options.boot0))) return error.Profile;
     const plan = &options.plan;
     const gsp = options.engine == .gsp;
     if (plan.ucode_id != (if (gsp) @as(u8, 9) else 3) or plan.engine_mask != (if (gsp) @as(u16, 0x400) else 1) or

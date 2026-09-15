@@ -50,7 +50,7 @@ pub fn derive(mode: boot.Plan, object: display.Object, snapshot: *const outputs.
     // NVIDIA570 C6 exposes both HDMI FRL and HDMI VRR (nvkms-evo3.c,
     // evoC6 caps). FRL must already have a real training/capacity receipt.
     // VRR extends vertical blanking, leaving FRL's HTotal/PClk budget intact.
-    if (core_class != 0xc67d or !link.complete()) return error.Unsupported;
+    if ((core_class != 0xc67d and core_class != 0xc77d) or !link.complete()) return error.Unsupported;
     if (object.epoch == 0 or object.client == 0 or object.display == 0 or object.epoch != mode.epoch or
         !snapshot.coherent or snapshot.generation != mode.output_generation or !std.meta.eql(mode, link.plan.mode) or
         !std.meta.eql(object, link.plan.object)) return error.Stale;

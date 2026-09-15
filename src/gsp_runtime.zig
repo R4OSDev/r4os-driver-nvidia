@@ -662,7 +662,7 @@ pub const Owner = struct {
         if (self.mode_control_owner) |*owner| self.log("NVIDIA gsp-mode-query: failed={s} handle={x} operation={s} status={?} clock-limit-hz={d} control-live={} resources=retained",
             .{@errorName(err),owner.binding.control,if (owner.operation) |op| @tagName(op) else "none",owner.last_status,owner.source_clock_hz,owner.live});
         for (&self.display_channels) |*slot| if (slot.*) |*owner| self.log("NVIDIA gsp-display-channel: failed={s} handle={x} class={x} index={d} rm-live={} possible={} control={x} state={x} storage-held={}",
-            .{@errorName(err),owner.config.handle,display_channel.wire.class(owner.config.kind),owner.config.index,owner.live,owner.allocation_possible,
+            .{@errorName(err),owner.config.handle,display_channel.wire.classFor(owner.config.root,owner.config.kind),owner.config.index,owner.live,owner.allocation_possible,
                 owner.last_control,owner.last_state,owner.backing.retained});
         if (self.display_resources_slot.owner) |owner| self.log("NVIDIA gsp-display-table: failed={s} entries={d} revision={d} published={d} upload-held={} storage=retained",
             .{@errorName(err),owner.table.count,owner.table.revision,owner.table.uploaded_revision,self.display_upload_job != null});
@@ -906,7 +906,7 @@ pub const Owner = struct {
         const held = self.reservation orelse return error.State;
         _ = try held.binding(.metadata);
         const captured = held.display orelse return error.Stale;
-        if (captured.chip == null or captured.chip.?.id != 0x176) return error.Unsupported;
+        if (captured.chip == null or !@import("generation.zig").ga102Hal(captured.chip.?.id)) return error.Unsupported;
         if (self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         try self.channel.?.guard(deadline);
         var token = try self.channel.?.handoff(deadline);
@@ -1399,7 +1399,7 @@ pub const Owner = struct {
         const info = root.info() orelse return error.State;
         if (!info.core or !info.instance_bound) return error.Unsupported;
         return refresh_control.derive(mode, self.display_object orelse return error.State,
-            self.outputs.snapshot() orelse return error.State, link, display_channel.wire.class(.core));
+            self.outputs.snapshot() orelse return error.State, link, display_channel.wire.classFor(info.binding, .core));
     }
     pub fn beginAdaptiveRefresh(self: *Owner, core_handle: DisplayChannelHandle, window: u32, enabled: bool, deadline: u64) !u64 {
         if (window >= 8 or self.refresh_sequence == std.math.maxInt(u64)) return error.Descriptor;
@@ -1542,7 +1542,7 @@ pub const Owner = struct {
         _ = try held.binding(.metadata);
         const saved = held.display orelse return error.Stale;
         if (saved.original_boot == null or saved.scanout_original == null or saved.boot.held_generation == 0 or
-            saved.chip == null or saved.chip.?.id != 0x176) return error.Stale;
+            saved.chip == null or !@import("generation.zig").ga102Hal(saved.chip.?.id)) return error.Stale;
         if (window >= 8) return error.Bounds;
         if (!info.core or !info.window or
             info.hardware.windows & (@as(u32, 1) << @intCast(window)) == 0) return error.Unsupported;
@@ -3019,17 +3019,23 @@ pub const Owner = struct {
         const owner = try self.findChannel(handle);
         return .{ .state = owner.state, .info = owner.info(), .rejected = owner.rejected, .host_rejected = owner.host_rejected };
     }
+    pub fn graphicsClass(self: *const Owner) !u32 {
+        const device = self.device orelse return error.State;
+        const session = device.runtime_session orelse return error.State;
+        if (session.epoch != self.epoch) return error.Stale;
+        return (@import("generation.zig").get(session.profile.chip_id) orelse return error.Unsupported).render;
+    }
     pub fn attachGraphicsCache(self: *Owner, kind: render_cache.Kind, buffer: BufferHandle) !void {
         _ = try self.now();
         if (self.copyBusy() or self.graph_closing) return error.Busy;
-        if (self.graphics_cache.self_address == 0) try self.graphics_cache.initialize(self.epoch);
+        if (self.graphics_cache.self_address == 0) try self.graphics_cache.initializeFor(self.epoch, try self.graphicsClass());
         if (!self.graphics_cache.valid() or self.graphics_cache.epoch != self.epoch or self.graphics_cache.borrowed or self.graphics_cache.uploading != null) return error.Stale;
         const storage = self.graphics_cache.buffer(kind);
         if (storage.self_address != 0) return error.Busy;
         const info = (try self.findNativeBuffer(buffer)).info() orelse return error.State;
         if (info.surface.request != null or info.surface.privileged or info.surface.readonly) return error.Unsupported;
         try self.graphics_cache.admitStorage(kind,info.allocation_bytes);
-        try (render.Range{ .address = info.address, .bytes = info.logical_bytes }).validate(256, if (kind == .programs) render.shader_bytes else render.packet_bytes);
+        try (render.Range{ .address = info.address, .bytes = info.logical_bytes }).validate(256, if (kind == .programs) try render.shaderBytesFor(self.graphics_cache.class) else render.packet_bytes);
         try self.retainNativeStorage(buffer,storage);
     }
     pub fn beginGraphicsUpload(self: *Owner, handle: ChannelHandle, kind: render_cache.Kind, draw: ?render.Draw, deadline: u64) !void {
@@ -3065,6 +3071,7 @@ pub const Owner = struct {
         const info = fifo.info() orelse return error.State;
         if (info.config.engine != .graphics or info.config.graphics == null or info.config.graphics.?.golden or
             !self.graphics_cache.valid() or self.graphics_cache.program_point == 0 or self.graphics_cache.packet.info() == null) return error.State;
+        if (info.config.object_class != try self.graphicsClass() or self.graphics_cache.class != info.config.object_class) return error.Binding;
         const copy = (try self.findChannel(copy_handle)).info() orelse return error.State;
         if (copy.config.engine != .copy or copy.config.context.vaspace != info.config.context.vaspace) return error.Binding;
         const backend = self.copy_backend orelse return error.State;
@@ -3202,7 +3209,7 @@ pub const Owner = struct {
         if (self.executionAdmissionBusy() or (!queued and self.queued_render != null) or self.graph_closing) return error.Busy;
         const fifo = try self.findChannel(handle);
         const info = fifo.info() orelse return error.State;
-        if (info.config.engine != .graphics or info.config.object_class != 0xc797 or info.config.graphics == null or info.config.graphics.?.golden or fifo.state != .handed_off or !fifo.ring.idle()) return error.Unsupported;
+        if (info.config.engine != .graphics or info.config.object_class != try self.graphicsClass() or info.config.graphics == null or info.config.graphics.?.golden or fifo.state != .handed_off or !fifo.ring.idle()) return error.Unsupported;
         try self.channel.?.guard(deadline);
         self.graphics_work = .{ .channel_handle = handle, .command = .barrier, .deadline = deadline };
     }
@@ -5126,7 +5133,7 @@ pub const Owner = struct {
             if (owner.state == .ready or owner.state == .closed) {
                 if (owner.state == .ready) try self.rejection(.display_channel, owner.config.handle, owner.rejected, owner.host_rejected);
                 if (owner.info()) |value| self.log("NVIDIA gsp-display-channel: handle={x} class={x} index={d} physical={x} bytes={d} methods=empty",
-                    .{value.config.handle,display_channel.wire.class(value.config.kind),value.config.index,value.config.physical,@as(u32, if (value.config.kind == .cursor) 0 else 4096)});
+                    .{value.config.handle,display_channel.wire.classFor(value.config.root,value.config.kind),value.config.index,value.config.physical,@as(u32, if (value.config.kind == .cursor) 0 else 4096)});
                 const deadline = owner.deadline; var token = try owner.handoff(); const finished = owner.state == .finished;
                 self.channel = try exchange.Exchange.init(&token, deadline);
                 if (finished) self.display_channels[index] = null;

@@ -27,6 +27,7 @@ pub const Lease = struct {
     pin: u64 = 0,
     cpu_address: u64 = 0,
     metadata_address: u64 = 0,
+    pack: storage.Pack = .{ .bytes = storage.pack_bytes, .signature = storage.signature_offset, .metadata = storage.metadata_offset },
     frts_consumer: usize = 0,
     // A restored console uses the original reserved VRAM with new native
     // channels. It is intentionally resident; releasing FRTS is insufficient.
@@ -44,22 +45,24 @@ pub const Lease = struct {
         const report = backing.report orelse return error.Storage;
         const staged = backing.vram_plan orelse return error.Storage;
         const allocation = backing.allocation;
-        if (allocation.handle == 0 or allocation.cpu_address == 0 or allocation.byte_length != storage.pack_bytes or
-            allocation.cpu_address > std.math.maxInt(u64) - storage.pack_bytes or
+        const pack = try storage.packFor(display.chip.?.id);
+        if (report.pack_bytes != pack.bytes or report.boot_bytes != pack.signature) return error.Storage;
+        if (allocation.handle == 0 or allocation.cpu_address == 0 or allocation.byte_length != pack.bytes or
+            allocation.cpu_address > std.math.maxInt(u64) - pack.bytes or
             backing.mapping.handle == 0 or backing.pin.handle == 0 or backing.mapping.pin_handle != backing.pin.handle or
             report.metadata_bytes != wpr.bytes) return error.Storage;
         const raw = try display.reobserve();
-        const plan = try layout.firstBoot(display.chip.?.id, &raw, report.image.image_bytes, boot.image.bytes);
+        const plan = try layout.firstBoot(display.chip.?.id, &raw, report.image.image_bytes, pack.signature);
         if (!std.meta.eql(staged, plan)) return error.PlanChanged;
         try boot_mapping.admit(display, &plan);
         const data: [*]const u8 = @ptrFromInt(allocation.cpu_address);
-        if (!wpr.matchesPlan(data[storage.metadata_offset..][0..wpr.bytes], &plan)) return error.MetadataChanged;
+        if (!wpr.matchesPlan(data[pack.metadata..][0..wpr.bytes], &plan)) return error.MetadataChanged;
         try boot_context.admit(display, &plan);
         const epoch = display.boot.held_generation;
         if (epoch == 0) return error.Owner;
         self.* = .{ .self_address = @intFromPtr(self), .display = display, .boot_mapping = boot_mapping, .boot_context = boot_context, .backing = backing, .epoch = epoch, .serial = self.serial + 1, .plan = plan,
             .allocation = allocation.handle, .mapping = backing.mapping.handle, .pin = backing.pin.handle,
-            .cpu_address = allocation.cpu_address, .metadata_address = report.metadata_address };
+            .cpu_address = allocation.cpu_address, .metadata_address = report.metadata_address, .pack = pack };
         display.borrower = self.self_address;
         backing.vram_owner = self.self_address;
     }
@@ -75,7 +78,7 @@ pub const Lease = struct {
             display.boot.held_generation == self.epoch and backing.vram_owner == self.self_address and
             backing.context != null and display.context != null and backing.context.?.api == display.context.?.api and
             backing.allocation.handle == self.allocation and backing.allocation.cpu_address == self.cpu_address and
-            backing.allocation.byte_length == storage.pack_bytes and backing.mapping.handle == self.mapping and
+            backing.allocation.byte_length == self.pack.bytes and report.pack_bytes == self.pack.bytes and report.boot_bytes == self.pack.signature and backing.mapping.handle == self.mapping and
             backing.mapping.pin_handle == self.pin and backing.pin.handle == self.pin and report.metadata_address == self.metadata_address;
     }
 
@@ -86,7 +89,7 @@ pub const Lease = struct {
         const plan = self.plan orelse return error.Stale;
         if (self.backing.?.vram_plan == null or !std.meta.eql(self.backing.?.vram_plan.?, plan)) return error.PlanChanged;
         const data: [*]const u8 = @ptrFromInt(self.cpu_address);
-        if (!wpr.matchesPlan(data[storage.metadata_offset..][0..wpr.bytes], &plan)) return error.MetadataChanged;
+        if (!wpr.matchesPlan(data[self.pack.metadata..][0..wpr.bytes], &plan)) return error.MetadataChanged;
         const range = switch (target) {
             .non_wpr_heap => plan.non_wpr_heap,
             .metadata => plan.metadata_reservation,

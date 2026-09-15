@@ -74,7 +74,7 @@ fn down(value: u64, alignment: u64) u64 {
 /// WPR from an earlier boot must not be reused through this entry point.
 pub fn firstBoot(chip_id: u16, raw: *const preflight.Raw, image_bytes: u64, boot_bytes: u64) Error!Plan {
     _ = boot.source_path; // Enforce the common pin's ABI review at compile time.
-    if (chip_id != 0x176) return error.UnsupportedChip;
+    if (!@import("generation.zig").ga102Hal(chip_id)) return error.UnsupportedChip;
     if (raw.present & ~@as(u16, (1 << preflight.addresses.len) - 1) != 0) return error.MissingRegister;
     const state = try preflight.decode(raw);
     if (state.wpr_up) return error.WprActive;
@@ -93,8 +93,9 @@ pub fn firstBoot(chip_id: u16, raw: *const preflight.Raw, image_bytes: u64, boot
     const metadata_reservation = try up(metadata_bytes, mb);
     const anterior = metadata_reservation + mb; // Plus the non-WPR heap.
     const posterior = try up(fb - image_start, mb);
-    // GA106 has no separate scrubber ucode; everything needed for boot must
-    // fit in the top 256 MB. Reject underflow or less than the minimum heap.
+    // The GA102/Ada path stays inside the firmware-prescrubbed top 256 MB.
+    // Ada's optional larger-heap scrubber is not needed in this bounded plan.
+    // Reject underflow or less than the minimum heap.
     if (anterior + posterior > prescrubbed_bytes) return error.PrescrubbedCapacity;
     const heap_limit = down(prescrubbed_bytes - anterior - posterior, mb);
     if (heap_limit < min_heap_bytes) return error.PrescrubbedCapacity;

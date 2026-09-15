@@ -8,6 +8,7 @@ const resources = @import("firmware_resources.zig");
 const fixtures = @import("booter_fixture").files;
 const Fault = enum { none, generation, short, hash, allocation, allocation_descriptor, pin, map, timeout, regression, unmap, unpin, release };
 var fault: Fault = .none;
+var chip_id: u16 = 0x176;
 var memory: [2]?[]align(256) u8 = .{ null, null };
 var pinned: [2]bool = @splat(false);
 var mapped: [2]bool = @splat(false);
@@ -16,6 +17,17 @@ var closing = false;
 var allocation_count: usize = 0;
 var close_calls: usize = 0;
 
+pub fn asset(spec: *const firmware.Artifact) []const u8 {
+    const where = resources.location(spec) catch unreachable;
+    for (fixtures) |file| if (std.mem.eql(u8, file.name, where.resource)) {
+        std.debug.assert(file.bytes.len == where.total);
+        return file.bytes[where.offset..][0..spec.bytes];
+    };
+    unreachable;
+}
+fn selected(index: usize) *const firmware.Booter {
+    return @import("booter.zig").specificationFor(chip_id, @enumFromInt(index)) catch unreachable;
+}
 fn resourceQuery(out: *a.DriverResourceApi) callconv(.c) i32 {
     std.debug.assert(!closing);
     out.* = .{ .stat = @intFromPtr(&stat), .read_at = @intFromPtr(&read), .now_ns = @intFromPtr(&now) };
@@ -31,16 +43,16 @@ fn stat(name: [*]const u8, length: u32, out: *a.DriverResourceInfo) callconv(.c)
     }
     for (fixtures, 0..) |file, index| {
         if (!std.mem.eql(u8, file.name, name[0..length])) continue;
-        out.* = .{ .handle = index + 1, .byte_length = file.bytes.len, .module_generation = if (fault == .generation and index == 9) 8 else 7 };
+        out.* = .{ .handle = index + 1, .byte_length = file.bytes.len, .module_generation = if (fault == .generation and (index == 9 or index == 14)) 8 else 7 };
         return 0;
     }
     return a.driver_resource_error_not_found;
 }
 fn read(handle: u64, offset: u64, output: [*]u8, length: u32, deadline: u64) callconv(.c) i32 {
     const bytes = if (handle == 100) resources.lock_bytes else fixtures[handle - 1].bytes;
-    std.debug.assert(offset == 0 and bytes.len == length and deadline == 1100);
-    @memcpy(output[0..length], bytes);
-    if (handle == 10) {
+    std.debug.assert(offset <= bytes.len and length <= bytes.len - offset and deadline == 1100);
+    @memcpy(output[0..length], bytes[@intCast(offset)..][0..length]);
+    if (handle == 10 or handle == 15) {
         if (fault == .short) return @as(i32, @intCast(length)) - 1;
         if (fault == .hash) output[0] ^= 1;
     }
@@ -53,7 +65,7 @@ fn heapQuery(out: *a.DriverHeapApi) callconv(.c) i32 {
 }
 fn allocate(bytes: u64, alignment: u32, out: *a.DriverHeapAllocation) callconv(.c) i32 {
     const index = allocation_count;
-    std.debug.assert(index < 2 and memory[index] == null and bytes == firmware.lock.booters[index].image.bytes and alignment == 256);
+    std.debug.assert(index < 2 and memory[index] == null and bytes == selected(index).image.bytes and alignment == 256);
     memory[index] = t.allocator.alignedAlloc(u8, comptime std.mem.Alignment.fromByteUnits(256), @intCast(bytes)) catch return -1;
     allocation_count += 1;
     out.* = .{ .handle = 1000 + index, .cpu_address = @intFromPtr(memory[index].?.ptr), .byte_length = bytes, .alignment = 256 };
@@ -83,10 +95,10 @@ fn map(input: *const a.DmaPinnedBuffer, constraints: *const a.DmaConstraints, di
     // Validate the actual CPU bytes at the DMA boundary: fuse version1 uses
     // signature0, all remaining original image bytes must stay identical.
     const body = memory[index].?;
-    const original = fixtures[index * 7].bytes;
-    const offset = std.mem.readInt(u32, fixtures[index * 7 + 3].bytes[0..4], .little);
+    const original = asset(&selected(index).image);
+    const offset = std.mem.readInt(u32, asset(&selected(index).patch_location)[0..4], .little);
     std.debug.assert(std.mem.eql(u8, body[0..offset], original[0..offset]));
-    std.debug.assert(std.mem.eql(u8, body[offset..][0..384], fixtures[index * 7 + 2].bytes[0..384]));
+    std.debug.assert(std.mem.eql(u8, body[offset..][0..384], asset(&selected(index).signatures)[0..384]));
     std.debug.assert(std.mem.eql(u8, body[offset + 384 ..], original[offset + 384 ..]));
     mapped[index] = true;
     out.* = .{ .handle = 3000 + index, .pin_handle = input.handle, .requested_bytes = input.bytes, .mapped_bytes = input.bytes, .direction = direction, .flags = constraints.flags | a.dma_mapping_flag_bounced, .segment_count = 1 };
@@ -133,8 +145,22 @@ test "firmware CPU storage Booter pair validates production parts and retains ev
     table.dma_unpin_buffer = unpin;
     const ctx = r4os.r4dev.DriverContext.init(&table);
     const fuses = @import("booter.zig").Fuses{ .debug_disable_raw = 1, .ucode_version_raw = 1, .ucode_id = 3 };
-    inline for (std.meta.fields(Fault)) |field| {
-        fault = @enumFromInt(field.value);
+    for ([_]u16{0x176,0x192,0x193,0x194,0x196,0x197}) |chip| {
+        chip_id = chip;
+        if (chip != 0x176) {
+            clock = 100; closing = false; fault = .none;
+            const inputs = try t.allocator.create(@import("boot_resources.zig").Inputs);
+            defer t.allocator.destroy(inputs);
+            inputs.* = .{};
+            const view = try inputs.loadFor(&ctx, chip, 1000);
+            try t.expectEqual(@as(u32, 36864), view.info.image_bytes);
+            try t.expectEqualSlices(u8, asset(&firmware.bootSpecification(chip).?.image), view.image);
+            try t.expect(inputs.admitted and inputs.generation == 7 and inputs.reads == 3);
+            inputs.close();
+        }
+    for (std.enums.values(Fault)) |selected_fault| {
+        if (chip != 0x176 and chip != 0x194 and selected_fault != .none) continue;
+        fault = selected_fault;
         clock = 100;
         closing = false;
         allocation_count = 0;
@@ -142,7 +168,13 @@ test "firmware CPU storage Booter pair validates production parts and retains ev
         const pair = try t.allocator.create(Pair);
         defer t.allocator.destroy(pair);
         pair.* = .{};
-        const result = pair.stage(&ctx, 0x176, fuses, 7, 1000);
+        errdefer {
+            std.debug.print("Booter chip={x} fault={s} reads={d}\n", .{chip_id,@tagName(selected_fault),pair.reads});
+            fault = .none;
+            for (&pair.images) |*image| image.device.execution_owner = 0;
+            _ = pair.close();
+        }
+        const result = pair.stage(&ctx, chip_id, fuses, 7, 1000);
         switch (fault) {
             .generation => try t.expectError(error.Generation, result),
             .short => try t.expectError(error.ShortRead, result),
@@ -155,7 +187,7 @@ test "firmware CPU storage Booter pair validates production parts and retains ev
             else => {
                 try result;
                 try t.expect(pair.complete and pair.reads == 15 and pair.generation == 7);
-                try t.expectError(error.Busy, pair.stage(&ctx, 0x176, fuses, 7, 1000));
+                try t.expectError(error.Busy, pair.stage(&ctx, chip_id, fuses, 7, 1000));
                 pair.images[1].device.execution_owner = 79;
                 try t.expect(!pair.close() and !pair.images[1].close());
                 try t.expect(pair.complete and pair.images[0].prepared != null and pair.images[1].prepared != null and close_calls == 0);
@@ -168,11 +200,12 @@ test "firmware CPU storage Booter pair validates production parts and retains ev
             try t.expect(memory[0] != null and memory[1] != null and mapped[0] and pinned[0]);
             if (fault == .unmap) try t.expectEqual(@as(u64, 3001), pair.images[1].device.mapping.handle);
             if (fault == .unpin) try t.expectEqual(@as(u64, 2001), pair.images[1].device.pin.handle);
-            try t.expectError(error.Busy, pair.stage(&ctx, 0x176, fuses, 7, 1000));
+            try t.expectError(error.Busy, pair.stage(&ctx, chip_id, fuses, 7, 1000));
         }
         fault = .none;
         try t.expect(pair.close());
         try t.expect(pair.close());
         try t.expect(memory[0] == null and memory[1] == null and !mapped[0] and !mapped[1] and !pinned[0] and !pinned[1]);
+    }
     }
 }

@@ -1,16 +1,56 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.122; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.124; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
-subsystem 1458:4074, VBIOS 94.06.2f.00.d6. Software implementation through 0.79.30 is documented; physical native qualification remains separate.
+subsystem 1458:4074, VBIOS 94.06.2f.00.d6. Software implementation through 0.79.33 is documented; physical native qualification remains separate.
 The default path inventories NVIDIA display functions once through
 the kernel PCI inventory. Explicit diagnostic/start modes are described below.
 Starting with R4OS 0.79.9, `IMAGE_SCOPE=slim` includes the current module in
 Slim and Full. The standard configuration selects `mode=passive`; no GPU
 firmware is executed. The boot framebuffer and existing display owner remain
 in control. Full includes DISPLAYD for subsequent hardware diagnostics.
+
+Generations and adapters (0.79.33): native software now covers GA102/103/104/106/107
+and AD102/103/104/106/107. Each measured chip selects its own firmware family,
+boot assets and display/copy/render classes. Ada uses AD102 boot assets, C770/C77D
+with C67E/C67B/C67A windows/cursor, and C997/SM89 rendering. Ampere retains
+C670/C67D and C797/SM86. The complete native Device startup model exercises all
+ten chips, including mappings, graphics, connected display, power and reset.
+These are experimental software implementations, not physical board approval.
+
+Turing and Blackwell have independent profiles, reproducible SM75/SM120 fixed
+shaders and generation-specific copy/render encoders. Their native bootstrap
+is unavailable: Turing requires direct-HS/v4 integration; Blackwell requires
+FSP/FMC bootstrap and CA display integration. They remain on bootfb. Compiler
+output, signed asset extraction or a PCI ID does not authorize native startup.
+Pre-Turing native ports are not agreed or implemented. Exact component/status
+matrix, source references and porting order: Docs/Drivers/GrafikGenerationen07933.txt/.json.
+
+Read-only probe IDs come from the pinned published 570.144 list. Native startup
+first identifies the unique adapter whose measured BAR1 contains the complete
+boot framebuffer. It retains one native NVIDIA owner; a second enumerated GPU
+cannot replace that owner's board or HDA state. Offscreen-only NVIDIA startup,
+automatic hybrid-GPU composition and PCIe peer-to-peer transfer are unavailable.
+R4GFX independently selects among registered render adapters and provides an
+explicit bounded system-memory transfer with two imports and retired source
+completion before destination upload. Unknown/unsupported or ambiguous adapters
+preserve the working firmware framebuffer. Default mode remains passive.
+
+Bootstrap reproduction uses prepare-bootstrap -GenerationSet all and
+prepare-boot-firmware -Profile ga102|ad102|tu102|tu116 -Component gsp|booter.
+Non-GA profiles go into GenerationFirmware/<profile>/<component>; build-time
+verification creates one bounded, hash-pinned resource bundle per profile.
+All original signed bytes and complete license notices remain unchanged.
+A fresh checkout must provision all four boot profiles, both `gsp` and `booter`,
+before a module build; `GenerationFirmware` is intentionally ignored. The
+default GA102-only export is insufficient for the current resource manifest.
+Use the same pinned NVIDIA source, the `GenerationSet=all` bootstrap output
+and an absolute workspace `Temp` scratch directory for all eight provisioning
+calls. The default output paths are selected by `-Profile` and `-Component`.
+The following entries describe earlier software checkpoints; the current
+generation/status matrix above takes precedence for their hardware scope.
 
 Reset and recovery (0.79.30): one bounded GA106 Fn0 PCIe FLR attempt requires
 saved configuration, transaction drain and observed firmware/Falcon stop.

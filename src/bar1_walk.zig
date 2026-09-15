@@ -207,7 +207,7 @@ fn word(entry: *const Entry, offset: usize) u64 {
 /// complete path is returned for future preservation, not as a recovery token.
 pub fn resolve(request: Request, reader: Reader) !Report {
     const chip = identity.chip(request.boot0, request.boot1) orelse return error.Profile;
-    if (chip.id != 0x176 or request.epoch == 0 or request.deadline == 0 or request.deadline == std.math.maxInt(u64)) return error.Profile;
+    if (!@import("generation.zig").ga102Hal(chip.id) or request.epoch == 0 or request.deadline == 0 or request.deadline == std.math.maxInt(u64)) return error.Profile;
     const bar = request.bar;
     if ((bar.kind != .memory32 and bar.kind != .memory64) or !bar.prefetchable or bar.base == 0 or bar.bytes == 0 or (bar.base | bar.bytes) & 4095 != 0 or
         bar.base > std.math.maxInt(u64) - bar.bytes or request.cpu_physical < bar.base or request.bytes == 0 or

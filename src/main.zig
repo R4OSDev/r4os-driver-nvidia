@@ -149,10 +149,11 @@ pub export fn nvidia_init(api: *const a.DriverApi) callconv(.c) i32 {
         ctx.logInfo("NVIDIA bind: absent inventory=canonical native-writes=disabled fallback=preserved");
         return -4;
     }
-    if (starting_gsp and count != 1) {
-        ctx.logError("NVIDIA gsp-start: rejected reason=ambiguous-adapter firmware-execution=disabled");
-        return -12;
-    }
+    // Gather read-only configuration before selecting the one resident native
+    // owner. Enumerating a second adapter cannot overwrite a running owner's
+    // board, HDA sibling, firmware storage or display hold.
+    var snapshots: [8]identity.Snapshot = undefined;
+    var captured: usize = 0;
     for (devices[0..count]) |info| {
         const pci = pciIdentity(info);
         var reader: ConfigReader = .{ .ctx = ctx, .info = info };
@@ -160,6 +161,27 @@ pub export fn nvidia_init(api: *const a.DriverApi) callconv(.c) i32 {
             log("NVIDIA pci={x:0>2}:{x:0>2}.{x} rejected={s} native-writes=disabled", .{ pci.bus, pci.device, pci.function, @errorName(err) });
             continue;
         };
+        snapshots[captured] = snapshot;
+        captured += 1;
+    }
+    var selected: ?usize = null;
+    if (checking_boot) {
+        const display = ctx.graphicsDisplay() orelse return -11;
+        var boot: a.GfxNativeBootInfo = .{};
+        if (display.bootInfo(&boot) != a.gfx_output_ok) return -11;
+        selected = @import("adapter.zig").selectBoot(snapshots[0..captured], boot) catch |err| {
+            log("NVIDIA boot-adapter: unavailable reason={s} firmware-execution=disabled fallback=preserved", .{@errorName(err)});
+            return -11;
+        };
+        log("NVIDIA boot-adapter={x} selection=framebuffer-in-measured-bar1 adapters={d} render-selection=independent", .{
+            @import("adapter.zig").id(snapshots[selected.?].pci), captured });
+    }
+    for (snapshots[0..captured], 0..) |snapshot, adapter_index| {
+        const pci = snapshot.pci;
+        if (selected != null and selected.? != adapter_index) {
+            log("NVIDIA adapter={x} native-init=not-selected bootfb=preserved", .{@import("adapter.zig").id(pci)});
+            continue;
+        }
         log("NVIDIA pci={x:0>2}:{x:0>2}.{x} id=10de:{x:0>4} subsystem={x:0>4}:{x:0>4} revision={x:0>2} command={x:0>4}", .{ pci.bus, pci.device, pci.function, pci.device_id, snapshot.subsystem_vendor, snapshot.subsystem_device, snapshot.revision, snapshot.command });
         var sibling_count: usize = 0;
         native_hda = null;
@@ -284,7 +306,7 @@ fn readIdentity(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.
         ctx.logInfo("NVIDIA chip=unmeasured reason=MMIO-contract-unavailable");
         return true;
     };
-    // The sole PCI bootstrap profile uses the published PMC identity page.
+    // Published PCI probe entries use the minimum PMC identity page.
     // This is a minimum register aperture, NOT a measured whole-BAR size.
     // Only the two read-only boot dwords are accessed. No assumption about
     // display-engine compatibility follows from this bootstrap mapping.
@@ -304,7 +326,11 @@ fn readIdentity(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.
         if (identity.chip(boot0, boot1)) |chip| {
             measured.* = chip;
             log("NVIDIA chip={s} id={x} revision={x} boot0={x:0>8} boot1={x:0>8} profile={s} native-writes=disabled", .{ chip.name, chip.id, chip.revision, boot0, boot1, chip.profile });
-            ctx.logInfo("NVIDIA display-generation=GA102-NVDisplay root-class=c670 core-class=c67d source=measured-chip-and-pinned-reference class-query=unperformed native-writes=disabled");
+            const profile = @import("generation.zig").get(chip.id).?;
+            log("NVIDIA generation={s} boot={s} root-class={x} core-class={x} window-class={x} copy-class={x}/{x} render-class={x} sm={d} implementation={s} hardware-verified=no class-query=unperformed", .{
+                @tagName(profile.family), @tagName(profile.boot), profile.display.root, profile.display.core, profile.display.window,
+                profile.copy[0], profile.copy[1], profile.render, profile.sm, @tagName(profile.status) });
+            log("NVIDIA generation-limit={s}", .{profile.restriction});
         } else log("NVIDIA chip=unrecognized boot0={x:0>8} boot1={x:0>8} native-writes=disabled", .{ boot0, boot1 });
     } else ctx.logInfo("NVIDIA chip=unmeasured reason=unstable-identity native-writes=disabled");
     return releaseWindow(ctx);
@@ -632,7 +658,7 @@ fn checkBoot(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Sna
             asset.memory.span.address, asset.memory.span.bytes, asset.backup_offset,
         });
     }
-    const inputs = boot_inputs.load(ctx, 30 * std.time.ns_per_s) catch |err| {
+    const inputs = boot_inputs.loadFor(ctx, chip.id, 30 * std.time.ns_per_s) catch |err| {
         log("NVIDIA boot-check: rejected phase=boot-resources reason={s} fallback=preserved", .{@errorName(err)});
         boot_inputs.close();
         return false;
@@ -640,7 +666,8 @@ fn checkBoot(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Sna
     log("NVIDIA boot-resource: verified image-bytes={d} descriptor-bytes={d} license=matched generation={d} reads={d} source=loaded-r4d gpu-authentication=unverified", .{
         inputs.image.len, inputs.descriptor.len, boot_inputs.generation, boot_inputs.reads,
     });
-    firmware_cpu.begin(ctx, .ga10x, 30 * std.time.ns_per_s) catch |err| {
+    const family = firmware.familyFor(chip.id).?;
+    firmware_cpu.begin(ctx, family, 30 * std.time.ns_per_s) catch |err| {
         log("NVIDIA boot-check: rejected phase=gsp-resource reason={s} fallback=preserved", .{@errorName(err)});
         boot_inputs.close();
         _ = firmware_cpu.close();

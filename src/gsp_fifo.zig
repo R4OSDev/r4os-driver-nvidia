@@ -329,7 +329,7 @@ pub const Owner = struct {
         try token.session.guard(deadline);
         const reservation = try token.session.rm_names.reserveChildren(graph, if (userd == null) 4 else 3);
         self.* = .{ .self_address = @intFromPtr(self), .session = token.session, .parent = parent, .reservation = reservation, .namespace_live = true, .deadline = deadline,
-            .config = .{ .context = parent_info.binding, .handle = try reservation.object(2), .rm_engine = parent_info.rm_engine, .runqueue = runqueue,
+            .config = .{ .chip_id = token.session.profile.chip_id, .context = parent_info.binding, .handle = try reservation.object(2), .rm_engine = parent_info.rm_engine, .runqueue = runqueue,
                 .address = 4096, .instance = inst.physical.?.base, .userd = userd_address,
                 .system_userd = userd == null, .engine = engine, .graphics = graphics, .object_handle = if (userd == null) try reservation.object(3) else 0,
                 .methods = methods.physical.base, .method_bytes = parent_info.method_bytes } };

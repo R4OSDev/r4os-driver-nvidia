@@ -237,7 +237,7 @@ pub const Port = struct {
         if (self.self_address != 0) return error.Busy;
         const chip = identity.chip(boot0, boot1) orelse return error.Profile;
         const bar = snapshot.bars[0];
-        if (chip.id != 0x176 or identity.decision(snapshot) != .identity_words_only or
+        if (!@import("generation.zig").ga102Hal(chip.id) or identity.decision(snapshot) != .identity_words_only or
             bar.bytes < 0x841000 or bar.bytes > 0x100000000 or bar.bytes % 4096 != 0 or
             bar.base > std.math.maxInt(u64) - bar.bytes) return error.Profile;
         if (run.epoch == 0 or run.deadline_ns == 0 or run.deadline_ns == std.math.maxInt(u64)) return error.Options;

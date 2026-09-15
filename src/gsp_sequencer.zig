@@ -128,7 +128,7 @@ pub const Runner = struct {
     /// unacknowledged Boot dispatch). This value and the port have one owner;
     /// no rebinding or replay within the same device run is permitted.
     pub fn init(seq: events.Sequencer, port: Port, options: Options) Error!Runner {
-        if (options.profile.chip_id != 0x176 or options.profile.confidential_compute) return error.Profile;
+        if (!@import("generation.zig").ga102Hal(options.profile.chip_id) or options.profile.confidential_compute) return error.Profile;
         if (options.epoch == 0 or options.deadline_ns == std.math.maxInt(u64) or
             options.default_timeout_ns == 0 or options.default_timeout_ns == std.math.maxInt(u64) or
             options.poll_interval_ns == 0 or options.poll_interval_ns == std.math.maxInt(u64) or

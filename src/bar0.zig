@@ -31,7 +31,7 @@ pub const Owner = struct {
     pub fn open(self: *Owner, ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, chip: identity.Chip) Error!void {
         if (self.self_address != 0) return error.Busy;
         const bar = snapshot.bars[0];
-        if (identity.decision(snapshot) != .identity_words_only or chip.id != 0x176 or
+        if (identity.decision(snapshot) != .identity_words_only or !@import("generation.zig").ga102Hal(chip.id) or
             bar.bytes < 0x821000 or bar.bytes > 0x100000000 or bar.bytes & 4095 != 0 or
             bar.base > std.math.maxInt(u64) - bar.bytes) return error.Profile;
         const memory = ctx.memory() orelse return error.Api;

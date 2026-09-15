@@ -10,36 +10,18 @@
 #include "lib/zlib/inflate.h"
 #define BINDATA_CONST const
 #define BINDATA_INCLUDE_DATA
-#include "g_bindata_kgspGetBinArchiveGspRmBoot_GA102.c"
-#include "g_bindata_kgspGetBinArchiveBooterLoadUcode_GA102.c"
-#include "g_bindata_kgspGetBinArchiveBooterUnloadUcode_GA102.c"
-#include "g_bindata_ksec2GetBinArchiveBlUcode_TU102.c"
+#include "R4NV_ARCHIVES.h"
 #undef BINDATA_INCLUDE_DATA
 /* Private host records receive the original initializers. Their layout is
  * not an RM ABI and no pointer or host padding is written to the report. */
 struct ExportStorage { NvU32 bytes, encoded; const void *data; NvBool compressed, override, referenced; };
 #define BINDATA_INCLUDE_STORAGE_PVT_DEFN
 static const struct ExportStorage entries[] = {
-#include "g_bindata_kgspGetBinArchiveGspRmBoot_GA102.c"
-#include "g_bindata_kgspGetBinArchiveBooterLoadUcode_GA102.c"
-#include "g_bindata_kgspGetBinArchiveBooterUnloadUcode_GA102.c"
-#include "g_bindata_ksec2GetBinArchiveBlUcode_TU102.c"
+#include "R4NV_ARCHIVES.h"
 };
 #undef BINDATA_INCLUDE_STORAGE_PVT_DEFN
 static const char *names[] = {
-    "GspRmBoot-GA102-ucode_image_dbg", "GspRmBoot-GA102-ucode_desc_dbg",
-    "GspRmBoot-GA102-ucode_image_prod", "GspRmBoot-GA102-ucode_desc_prod",
-    "BooterLoad-GA102-image_dbg", "BooterLoad-GA102-header_dbg",
-    "BooterLoad-GA102-image_prod", "BooterLoad-GA102-header_prod",
-    "BooterLoad-GA102-sig_dbg", "BooterLoad-GA102-sig_prod",
-    "BooterLoad-GA102-patch_loc", "BooterLoad-GA102-patch_sig",
-    "BooterLoad-GA102-patch_meta", "BooterLoad-GA102-num_sigs",
-    "BooterUnload-GA102-image_dbg", "BooterUnload-GA102-header_dbg",
-    "BooterUnload-GA102-image_prod", "BooterUnload-GA102-header_prod",
-    "BooterUnload-GA102-sig_dbg", "BooterUnload-GA102-sig_prod",
-    "BooterUnload-GA102-patch_loc", "BooterUnload-GA102-patch_sig",
-    "BooterUnload-GA102-patch_meta", "BooterUnload-GA102-num_sigs",
-    "Sec2Bl-TU102-ucode_image", "Sec2Bl-TU102-ucode_desc"
+#include "R4NV_ARCHIVE_NAMES.h"
 };
 _Static_assert(sizeof(entries)/sizeof(entries[0]) == sizeof(names)/sizeof(names[0]), "initializer names/count");
 _Static_assert(sizeof(RM_FLCN_BL_DESC) == 24, "original SEC2 descriptor");

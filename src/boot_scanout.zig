@@ -376,7 +376,7 @@ pub const Capture = struct {
     /// error the same capture object must close its retained child lease.
     pub fn readShared(self: *Capture, ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, chip: identity.Chip, shared: *bar0.Owner, hold: Hold) !Raw {
         if (self.self_address != 0) return error.Busy;
-        if (chip.id != 0x176 or hold.epoch == 0 or snapshot.pci.function != 0 or identity.decision(snapshot) != .identity_words_only) return error.Profile;
+        if (!@import("generation.zig").ga102Hal(chip.id) or hold.epoch == 0 or snapshot.pci.function != 0 or identity.decision(snapshot) != .identity_words_only) return error.Profile;
         self.self_address = @intFromPtr(self);
         self.clock = ctx.resources() orelse return error.Api;
         self.hold = hold;

@@ -47,6 +47,17 @@ pub const Prepared = struct { operation: Operation, info: Info, fuse_version: u3
 pub fn specification(operation: Operation) *const firmware.Booter {
     return &firmware.lock.booters[@intFromEnum(operation)];
 }
+pub fn specificationFor(chip: u16, operation: Operation) Error!*const firmware.Booter {
+    const profile = @import("generation.zig").get(chip) orelse return error.Profile;
+    if (profile.boot == .ga102) return specification(operation);
+    const assets = firmware.bootGeneration(@tagName(profile.boot)) orelse return error.Profile;
+    return &assets.booters[@intFromEnum(operation)];
+}
+pub fn licenseFor(chip: u16) Error!*const firmware.Artifact {
+    const profile = @import("generation.zig").get(chip) orelse return error.Profile;
+    if (profile.boot == .ga102) return &firmware.lock.booter_license.artifact;
+    return &(firmware.bootGeneration(@tagName(profile.boot)) orelse return error.Profile).booter_license.artifact;
+}
 comptime {
     if (!std.mem.eql(u8, firmware.lock.booters[0].operation, "load") or
         !std.mem.eql(u8, firmware.lock.booters[1].operation, "unload")) @compileError("Booter operation order differs from pin");
@@ -62,12 +73,17 @@ pub fn inspect(parts: Parts) Error!Info {
     const code = word(parts.header, 6);
     const data_offset = word(parts.header, 2);
     const data_bytes = word(parts.header, 3);
+    const data_end = @as(u64, data_offset) + data_bytes;
     if (code == 0 or data_bytes == 0 or (code | data_offset | data_bytes) & 255 != 0 or
-        @as(u64, 256) + code != data_offset or @as(u64, data_offset) + data_bytes != parts.image.len) return error.Layout;
+        @as(u64, 256) + code != data_offset or data_end > parts.image.len or parts.image.len - data_end > 256) return error.Layout;
+    // AD102 Unload retains one zero-filled block after the declared DMEM.
+    // RM copies the header extents, not the complete file into TCM. Retain and
+    // hash the entire source, but never transfer this trailing padding.
+    if (!std.mem.allEqual(u8, parts.image[@intCast(data_end)..], 0)) return error.Layout;
     if (word(parts.patch_signature, 0) != 0 or word(parts.signature_count, 0) != 2 or
         word(parts.patch_metadata, 0) != 1 or word(parts.patch_metadata, 1) != 1 or word(parts.patch_metadata, 2) != 3) return error.Profile;
     const offset = word(parts.patch_location, 0);
-    if (@as(u64, data_offset) + 16 != offset or @as(u64, offset) + signature_bytes >= parts.image.len) return error.Signature;
+    if (@as(u64, data_offset) + 16 != offset or @as(u64, offset) + signature_bytes >= data_end) return error.Signature;
     return .{ .image_bytes = @intCast(parts.image.len), .code_offset = 256, .code_bytes = code, .data_offset = data_offset, .data_bytes = data_bytes, .signature_offset = offset };
 }
 fn signatureIndex(fuses: Fuses) Error!struct { version: u32, index: u8 } {
@@ -81,9 +97,9 @@ fn signatureIndex(fuses: Fuses) Error!struct { version: u32, index: u8 } {
     return .{ .version = version, .index = @intCast(1 - version) };
 }
 pub fn verify(operation: Operation, chip_id: u16, fuses: Fuses, parts: Parts) Error!Info {
-    if (chip_id != 0x176) return error.Profile;
+    if (!@import("generation.zig").ga102Hal(chip_id)) return error.Profile;
     _ = try signatureIndex(fuses);
-    const spec = specification(operation);
+    const spec = try specificationFor(chip_id, operation);
     inline for (std.meta.fields(Parts)) |field| {
         const bytes = @field(parts, field.name);
         const expected = @field(spec.*, field.name);
@@ -123,9 +139,10 @@ fn prepareChecked(operation: Operation, fuses: Fuses, parts: Parts, info: Info, 
 /// native-owner obligations before any register or transfer is executed.
 pub fn loadPlan(prepared: Prepared, address: u64, bytes: u32) Error!transfer.Plan {
     const info = prepared.info;
+    const data_end = @as(u64, info.data_offset) + info.data_bytes;
     if (bytes == 0 or bytes != info.image_bytes or @as(u64, info.code_offset) + info.code_bytes != info.data_offset or
-        @as(u64, info.data_offset) + info.data_bytes != bytes or info.code_offset != 256 or info.code_bytes == 0 or info.data_bytes == 0 or
-        @as(u64, info.data_offset) + 16 != info.signature_offset or @as(u64, info.signature_offset) + signature_bytes >= bytes) return error.Layout;
+        data_end > bytes or bytes - data_end > 256 or info.code_offset != 256 or info.code_bytes == 0 or info.data_bytes == 0 or
+        @as(u64, info.data_offset) + 16 != info.signature_offset or @as(u64, info.signature_offset) + signature_bytes >= data_end) return error.Layout;
     if (address == 0 or address > transfer.dma_mask or @as(u64, bytes) - 1 > transfer.dma_mask - address) return error.Address;
     if ((address | bytes | info.code_bytes | info.data_bytes | info.data_offset) & 255 != 0) return error.Alignment;
     if (info.code_bytes > 0x1000000 or info.data_bytes > 0x1000000 or prepared.fuse_version > 1 or
@@ -176,6 +193,14 @@ test "GA102 Booter preparation selects its own fuse signature before any mutatio
         @memset(image, 0x39);
         const parts = Parts{ .image = image[0..bytes], .header = &header, .signatures = &signatures, .patch_location = &location, .patch_signature = &index, .patch_metadata = &metadata, .signature_count = &count };
         const info = try inspect(parts);
+        var padded = parts;
+        @memset(image[bytes..][0..256], 0);
+        padded.image = image[0 .. bytes + 256];
+        const padded_info = try inspect(padded);
+        try t.expect(padded_info.data_bytes == info.data_bytes and padded_info.image_bytes == bytes + 256);
+        image[bytes] = 1;
+        try t.expectError(error.Layout, inspect(padded));
+        @memset(image[bytes..][0..256], 0x39);
         const fuses = Fuses{ .debug_disable_raw = 1, .ucode_version_raw = 1, .ucode_id = 3 };
         @memset(output, 0xa5);
         try t.expectError(error.Hash, prepare(operation, 0x176, fuses, parts, output));
@@ -237,6 +262,6 @@ test "GA102 Booter preparation selects its own fuse signature before any mutatio
         metadata[8] = 3;
         std.mem.writeInt(u32, &location, @intCast(bytes - 128), .little);
         try t.expectError(error.Signature, inspect(parts));
-        try t.expectError(error.Profile, verify(operation, 0x177, fuses, parts));
+        try t.expectError(error.Profile, verify(operation, 0x170, fuses, parts));
     }
 }

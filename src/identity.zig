@@ -194,8 +194,11 @@ fn extendedCaps(result: *Snapshot, reader: anytype) Error!void {
 }
 
 pub const ProbeDecision = enum { identity_words_only, unknown_pci_id, decode_disabled, power_unavailable, invalid_bar };
+pub fn probeDevice(device_id: u16) bool {
+    return std.mem.indexOfScalar(u16, &@import("probe_ids.zig").all, device_id) != null;
+}
 pub fn decision(snapshot: *const Snapshot) ProbeDecision {
-    if (!isDisplay(snapshot.pci) or snapshot.pci.device_id != 0x2504) return .unknown_pci_id;
+    if (!isDisplay(snapshot.pci) or !probeDevice(snapshot.pci.device_id)) return .unknown_pci_id;
     if (snapshot.command & 2 == 0) return .decode_disabled;
     if (snapshot.caps.power_state) |power| {
         if (power != 0) return .power_unavailable;
@@ -208,9 +211,9 @@ pub fn decision(snapshot: *const Snapshot) ProbeDecision {
 pub const Chip = struct { id: u16, revision: u8, name: []const u8, profile: []const u8 };
 pub fn chip(boot0: u32, boot1: u32) ?Chip {
     if (boot0 == 0 or boot0 == 0xffffffff or boot1 == 0xffffffff or boot1 & 0x30100 != 0) return null;
-    const id: u16 = @intCast(((boot0 >> 20) & 0x1ff) | ((boot0 & 0x100) << 1));
-    // Only the measured GA106 identity matches the sole bootstrap PCI entry.
-    // This profile admits identification reads; it grants no engine writes.
-    if (id != 0x176) return null;
-    return .{ .id = id, .revision = @truncate(boot0), .name = "GA106", .profile = "ga106-passive" };
+    const generation = @import("generation.zig");
+    const id = generation.bootId(boot0);
+    const selected = generation.get(id) orelse return null;
+    // Identification remains independent of native implementation admission.
+    return .{ .id = id, .revision = @truncate(boot0), .name = selected.name, .profile = @tagName(selected.family) };
 }

@@ -354,6 +354,7 @@ pub const Engine = enum { none, copy, graphics };
 pub const max_bytes: usize = 584;
 pub const entries: u32 = 512;
 pub const Config = struct {
+    chip_id: u16 = 0x176,
     context: context.Binding,
     handle: u32,
     rm_engine: u32,
@@ -377,6 +378,7 @@ pub const word = context.word;
 fn put(out: []u8, at: usize, value: u32) void { std.mem.writeInt(u32, out[at..][0..4], value, .little); }
 fn wide(out: []u8, at: usize, value: u64) void { std.mem.writeInt(u64, out[at..][0..8], value, .little); }
 pub fn validate(config: Config) Error!void {
+    const profile = @import("generation.zig").get(config.chip_id) orelse return error.Unsupported;
     try context.validate(config.context); _ = try context.nvEngine(config.rm_engine);
     if (config.graphics) |graphics| {
         if (config.engine != .graphics) return error.Unsupported;
@@ -400,8 +402,8 @@ pub fn validate(config: Config) Error!void {
         if (config.userd > (@as(u64, 1) << 40) - 4096 or config.object_handle == 0) return error.Bounds;
         switch (config.engine) {
             .none => return error.Unsupported,
-            .copy => if (config.rm_engine < 9 or (config.object_class != 0 and config.object_class != 0xc6b5 and config.object_class != 0xc7b5)) return error.Unsupported,
-            .graphics => if (config.rm_engine != 1 or (config.object_class != 0 and config.object_class != 0xc797)) return error.Unsupported,
+            .copy => if (config.rm_engine < 9 or (config.object_class != 0 and config.object_class != profile.copy[0] and config.object_class != profile.copy[1])) return error.Unsupported,
+            .graphics => if (config.rm_engine != 1 or (config.object_class != 0 and config.object_class != profile.render)) return error.Unsupported,
         }
         for ([_]u32{config.handle, config.context.client,config.context.device,config.context.subdevice,config.context.vaspace,config.context.group,config.context.share}) |handle|
             if (config.object_handle == handle) return error.Handle;
@@ -449,7 +451,7 @@ pub fn encode(config: Config, op: Operation, output: []u8) Error![]const u8 {
             put(out, 32, 1); put(out, 36, try context.nvEngine(config.rm_engine));
         },
         .allocate_graphics => {
-            if (!config.system_userd or config.engine != .graphics or config.object_class != 0xc797) return error.Unsupported;
+            if (!config.system_userd or config.engine != .graphics or config.object_class == 0) return error.Unsupported;
             put(out, 4, config.handle); put(out, 8, config.object_handle); put(out, 12, config.object_class); put(out, 20, 16);
             // nvos.h NV_GR_ALLOCATION_PARAMETERS: version, flags, size, caps.
             // Caps is RM output; it never changes the admitted class/profile.
@@ -469,10 +471,11 @@ pub fn decode(config: Config, op: Operation, request: []const u8, record: exchan
     if (op == .classes) {
         const reply = try context.decode(config.context, config.rm_engine, 0, .classes, request, record);
         if (reply == .rejected) return .{ .rejected = reply.rejected };
+        const profile = @import("generation.zig").get(config.chip_id).?;
         return .{ .ok = switch (config.engine) {
             .none => 0,
-            .copy => if (context.supports(reply.ok, 0xc7b5)) 0xc7b5 else if (context.supports(reply.ok, 0xc6b5)) 0xc6b5 else 0,
-            .graphics => if (context.supports(reply.ok, 0xc797)) 0xc797 else 0,
+            .copy => if (context.supports(reply.ok, profile.copy[0])) profile.copy[0] else if (profile.copy[1] != 0 and context.supports(reply.ok, profile.copy[1])) profile.copy[1] else 0,
+            .graphics => if (context.supports(reply.ok, profile.render)) profile.render else 0,
         } };
     }
     if (request.len != length(op) or record.rpc.function != function(op) or record.rpc.cpu_rm_gfid != 0) return error.Payload;

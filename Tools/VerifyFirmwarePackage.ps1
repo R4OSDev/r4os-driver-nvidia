@@ -6,7 +6,8 @@ param(
     [Parameter(Mandatory)][string]$BootImagePath,
     [Parameter(Mandatory)][string]$BootDescriptorPath,
     [Parameter(Mandatory)][string]$BootLicensePath,
-    [Parameter(Mandatory)][string]$BooterDirectory
+    [Parameter(Mandatory)][string]$BooterDirectory,
+    [Parameter(Mandatory)][string]$GenerationDirectory
 )
 $ErrorActionPreference='Stop'
 Set-StrictMode -Version Latest
@@ -27,4 +28,19 @@ foreach($booter in $pin.booters){
     }
 }
 Test-NvidiaFirmwareArtifact (Join-Path $BooterDirectory $pin.booter_license.artifact.resource) $pin.booter_license.artifact
+foreach($profile in $pin.boot_generations){
+    if($profile.name -cnotmatch '^(ad102|tu102|tu116)$'){throw 'Unsupported boot generation'}
+    $directory=Join-Path $GenerationDirectory $profile.name
+    foreach($artifact in @($profile.boot.image,$profile.boot.descriptor,$profile.boot.license)){
+        Test-NvidiaFirmwareArtifact (Join-Path $directory ('gsp/'+$artifact.resource)) $artifact
+    }
+    foreach($booter in $profile.booters){
+        foreach($field in @('image','header','signatures','patch_location','patch_signature','patch_metadata','signature_count')){
+            $artifact=$booter.$field
+            Test-NvidiaFirmwareArtifact (Join-Path $directory ('booter/'+$artifact.resource)) $artifact
+        }
+    }
+    Test-NvidiaFirmwareArtifact (Join-Path $directory ('booter/'+$profile.booter_license.artifact.resource)) $profile.booter_license.artifact
+}
+& (Join-Path $PSScriptRoot 'PrepareBootPacks.ps1') -LockPath $LockPath -GenerationDirectory $GenerationDirectory
 Write-Host "NVIDIA module package: pinned $($pin.rm_version), original GSP/boot/Booter files with complete licenses verified."

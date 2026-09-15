@@ -166,7 +166,7 @@ pub const Owner = struct {
                     self.reason = error.Unsupported; self.rm_status = status.rejected;
                     self.next(.channel_close); return true;
                 };
-                if (info.config.engine != .graphics or info.config.object_class != 0xc797) return error.Descriptor;
+                if (info.config.engine != .graphics or info.config.object_class != try run.graphicsClass()) return error.Descriptor;
                 self.next(if (self.regular) .probe_start else .channel_close);
             },
             .probe_start => {
@@ -178,8 +178,8 @@ pub const Owner = struct {
                 self.next(.ready);
                 var line: [200]u8 = undefined;
                 run.ctx.?.logInfo(try std.fmt.bufPrintZ(&line,
-                    "NVIDIA graphics-engine: ready class=c797 rm-engine=1 golden=complete epoch={d} barrier={d} render=unavailable",
-                    .{self.epoch, self.receipt.?.point}));
+                    "NVIDIA graphics-engine: ready class={x} rm-engine=1 golden=complete epoch={d} barrier={d} render=unavailable",
+                    .{try run.graphicsClass(), self.epoch, self.receipt.?.point}));
             },
             .channel_close => {
                 try run.retireExecutionChannel(self.channel.?, self.phase_deadline, true);

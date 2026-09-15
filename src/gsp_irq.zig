@@ -371,7 +371,7 @@ pub const Owner = struct {
         if (index >= inventory.entry_count or index >= inventory.entries.len or
             inventory.entries[index].engine != postinit.gsp_engine) return error.Vector;
         const vector = inventory.entries[index].stall;
-        if (chip.id != 0x176 or vector >= postinit.vector_count or snapshot.bars[0].bytes < reg.bytes) return error.Profile;
+        if (!@import("generation.zig").ga102Hal(chip.id) or vector >= postinit.vector_count or snapshot.bars[0].bytes < reg.bytes) return error.Profile;
         self.self_address = @intFromPtr(self);
         self.ctx = ctx.*;
         self.wake = wake;

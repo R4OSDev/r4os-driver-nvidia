@@ -485,11 +485,11 @@ fn resourceStat(name: [*]const u8, length: u32, output: *a.DriverResourceInfo) c
 }
 fn resourceRead(handle: u64, offset: u64, out: [*]u8, length: u32, deadline: u64) callconv(.c) i32 {
     std.debug.assert(handle == 0x100000001 or handle == 0x100000002);
-    std.debug.assert(deadline > resourceNow() and offset == 0);
+    std.debug.assert(deadline > resourceNow());
     if (state.resource_fault == .deadline) return a.driver_resource_error_deadline;
     if (handle == 0x100000001) {
-        std.debug.assert(length == resource_loader.lock_bytes.len);
-        @memcpy(out[0..length], resource_loader.lock_bytes);
+        std.debug.assert(offset <= resource_loader.lock_bytes.len and length <= resource_loader.lock_bytes.len - offset);
+        @memcpy(out[0..length], resource_loader.lock_bytes[@intCast(offset)..][0..length]);
         if (state.resource_fault == .wrong) out[0] ^= 1;
     } else {
         @memset(out[0..length], 0);
@@ -830,10 +830,10 @@ test "NVIDIA actual driver lifecycle reads bounded PROM and retains each failed 
         try t.expectEqual(@as(usize, if (fault == 2) 1 else 2), state.maps);
     }
     cpu_closed = false;
-    // Actual non-GA106 words must never reach the PROM map or allocation,
+    // An unsupported PMC identity must never reach PROM or allocation,
     // even when a device advertises adequate ReBAR extents.
     state = .{ .rom_fixture = true };
-    state.words[0] = 0x172000a1;
+    state.words[0] = 0x170000a1;
     const before = cpu_calls;
     try t.expectEqual(@as(i32, 0), driver.nvidia_init(&api));
     try t.expectEqual(@as(usize, 1), state.maps);

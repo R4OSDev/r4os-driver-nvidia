@@ -24,7 +24,7 @@ pub const Capture = struct {
     }
     fn readUsing(self: *Capture, ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, chip: identity.Chip, shared: ?*bar0.Owner) Error!state.Raw {
         const bar = snapshot.bars[0];
-        if (identity.decision(snapshot) != .identity_words_only or chip.id != 0x176 or
+        if (identity.decision(snapshot) != .identity_words_only or !@import("generation.zig").ga102Hal(chip.id) or
             bar.bytes < 0x821000 or bar.base > std.math.maxInt(u64) - bar.bytes) return error.UnmeasuredRange;
         if (self.memory != null or self.cleanup_needed) return error.Busy;
         const clock = ctx.resources() orelse return error.Api;

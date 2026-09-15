@@ -9,6 +9,11 @@ const resources = @import("firmware_resources.zig");
 const booter = @import("booter.zig");
 const dma = @import("fwsec_dma.zig");
 const Context = r4os.r4dev.DriverResourceContext;
+const license_capacity = blk: {
+    var maximum = firmware.lock.booter_license.artifact.bytes;
+    for (firmware.lock.boot_generations) |profile| maximum = @max(maximum, profile.booter_license.artifact.bytes);
+    break :blk maximum;
+};
 pub const Error = booter.Error || dma.Error || resources.Error || error{ Api, Busy, Memory, Resource, Generation, ShortRead, Timeout, ClockRegression, InvalidDeadline };
 pub const Image = struct {
     heap: ?r4os.r4dev.DriverHeapContext = null,
@@ -19,7 +24,7 @@ pub const Image = struct {
 
     fn stage(self: *Image, owner: *Pair, ctx: *const r4os.r4dev.DriverContext, operation: booter.Operation, chip_id: u16, fuses: booter.Fuses) Error!void {
         if (self.heap != null or self.allocation.handle != 0 or self.device.context != null) return error.Busy;
-        const spec = booter.specification(operation);
+        const spec = try booter.specificationFor(chip_id, operation);
         self.heap = ctx.heap() orelse return error.Api;
         if (self.heap.?.allocate(spec.image.bytes, 256, &self.allocation) != a.driver_heap_ok) return error.Memory;
         if (self.allocation.version != 1 or self.allocation.size < @sizeOf(a.DriverHeapAllocation) or self.allocation.reserved != 0 or
@@ -66,7 +71,7 @@ pub const Pair = struct {
     api: ?*const a.DriverApi = null,
     context: ?Context = null,
     images: [2]Image = .{ .{}, .{} },
-    license: [firmware.lock.booter_license.artifact.bytes]u8 = @splat(0),
+    license: [license_capacity]u8 = @splat(0),
     generation: u64 = 0,
     deadline: u64 = 0,
     last_clock: u64 = 0,
@@ -75,7 +80,7 @@ pub const Pair = struct {
 
     pub fn stage(self: *Pair, ctx: *const r4os.r4dev.DriverContext, chip_id: u16, fuses: booter.Fuses, expected_generation: u64, timeout_ns: u64) Error!void {
         if (self.context != null) return error.Busy;
-        if (chip_id != 0x176 or fuses.ucode_id != 3 or expected_generation == 0) return error.Profile;
+        if (!@import("generation.zig").ga102Hal(chip_id) or fuses.ucode_id != 3 or expected_generation == 0) return error.Profile;
         self.context = ctx.resources() orelse return error.Api;
         self.api = ctx.api;
         self.last_clock = self.context.?.nowNs();
@@ -83,7 +88,8 @@ pub const Pair = struct {
         if (timeout_ns == 0 or self.last_clock == 0 or self.deadline == std.math.maxInt(u64)) return error.InvalidDeadline;
         self.generation = try resources.validateLock(self.context.?, self.deadline);
         if (self.generation != expected_generation) return error.Generation;
-        try self.read(&firmware.lock.booter_license.artifact, &self.license);
+        const notice = try booter.licenseFor(chip_id);
+        try self.read(notice, self.license[0..notice.bytes]);
         try self.images[0].stage(self, ctx, .load, chip_id, fuses);
         try self.images[1].stage(self, ctx, .unload, chip_id, fuses);
         self.complete = true;
@@ -98,13 +104,10 @@ pub const Pair = struct {
     fn read(self: *Pair, spec: *const firmware.Artifact, output: []u8) Error!void {
         try self.checkClock();
         if (output.len != spec.bytes) return error.Size;
-        var info: a.DriverResourceInfo = .{};
-        if (self.context.?.stat(spec.resource, &info) != a.driver_resource_ok) return error.Resource;
-        if (info.version != 1 or info.size < @sizeOf(a.DriverResourceInfo) or info.handle == 0 or info.byte_length != spec.bytes) return error.Size;
-        if (info.module_generation != self.generation) return error.Generation;
+        const asset = try resources.openArtifact(self.context.?, spec, self.generation);
         try self.checkClock();
         self.reads += 1;
-        const count = self.context.?.readAt(info.handle, 0, output, self.deadline);
+        const count = self.context.?.readAt(asset.info.handle, asset.offset, output, self.deadline);
         if (count < 0) return error.Resource;
         if (count != output.len) return error.ShortRead;
         try self.checkClock();

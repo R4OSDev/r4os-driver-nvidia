@@ -1,0 +1,16 @@
+[
+  {"family":"ga10x","name":"GspRmBoot-GA102","file":"g_bindata_kgspGetBinArchiveGspRmBoot_GA102.c","entries":4},
+  {"family":"ga10x","name":"BooterLoad-GA102","file":"g_bindata_kgspGetBinArchiveBooterLoadUcode_GA102.c","entries":10},
+  {"family":"ga10x","name":"BooterUnload-GA102","file":"g_bindata_kgspGetBinArchiveBooterUnloadUcode_GA102.c","entries":10},
+  {"family":"shared","name":"Sec2Bl-TU102","file":"g_bindata_ksec2GetBinArchiveBlUcode_TU102.c","entries":2},
+  {"family":"turing","name":"GspRmBoot-TU102","file":"g_bindata_kgspGetBinArchiveGspRmBoot_TU102.c","entries":2},
+  {"family":"turing","name":"BooterLoad-TU102","file":"g_bindata_kgspGetBinArchiveBooterLoadUcode_TU102.c","entries":10},
+  {"family":"turing","name":"BooterUnload-TU102","file":"g_bindata_kgspGetBinArchiveBooterUnloadUcode_TU102.c","entries":10},
+  {"family":"turing","name":"BooterLoad-TU116","file":"g_bindata_kgspGetBinArchiveBooterLoadUcode_TU116.c","entries":10},
+  {"family":"turing","name":"BooterUnload-TU116","file":"g_bindata_kgspGetBinArchiveBooterUnloadUcode_TU116.c","entries":10},
+  {"family":"ada","name":"GspRmBoot-AD102","file":"g_bindata_kgspGetBinArchiveGspRmBoot_AD102.c","entries":4},
+  {"family":"ada","name":"BooterLoad-AD102","file":"g_bindata_kgspGetBinArchiveBooterLoadUcode_AD102.c","entries":10},
+  {"family":"ada","name":"BooterUnload-AD102","file":"g_bindata_kgspGetBinArchiveBooterUnloadUcode_AD102.c","entries":10},
+  {"family":"blackwell","name":"GspRmBoot-GB202","file":"g_bindata_kgspGetBinArchiveGspRmBoot_GB202.c","entries":4},
+  {"family":"blackwell","name":"GspRmFmc-GB202","file":"g_bindata_kgspGetBinArchiveGspRmFmcGfwProdSigned_GB202.c","entries":4}
+]

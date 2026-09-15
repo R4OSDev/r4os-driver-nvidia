@@ -57,12 +57,13 @@ pub const Program = struct {
 };
 fn inc(method: u32, count: u32) u32 { return 0x20000000 | (count << 16) | (method >> 2); }
 pub fn encode(object_class: u32, command: Command, completion: u64, point: u32) Error!Program {
-    if (object_class != class) return error.Unsupported;
+    if (render.profiles.get(object_class) == null) return error.Unsupported;
     if (completion == 0 or completion & 3 != 0 or completion > (@as(u64, 1) << 40) - 4 or point == 0) return error.Bounds;
     var out: Program = .{};
     switch (command) {
         .barrier => {},
         .draw => |binding| {
+            if (binding.class != object_class) return error.Unsupported;
             var body: render.Program = .{};
             try render.encode(binding,&body);
             @memcpy(out.data[0..body.count],body.slice());
@@ -72,7 +73,7 @@ pub fn encode(object_class: u32, command: Command, completion: u64, point: u32) 
     // Wait includes preceding reads; the flushed, one-word release at ALL
     // includes writes. No render completion is inferred from USERD/GP_GET.
     const release = [_]u32{
-        inc(0x0000, 1), class,
+        inc(0x0000, 1), object_class,
         inc(0x0110, 1), 0,
         inc(0x1144, 1), 0,
         inc(0x1b00, 4), @intCast(completion >> 32), @truncate(completion), point, 0x1000f010,

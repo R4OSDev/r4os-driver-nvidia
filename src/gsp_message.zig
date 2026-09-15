@@ -64,7 +64,7 @@ comptime {
         @compileError("GSP framing requires a new original-source ABI comparison");
 }
 fn profileCheck(profile: Profile) Error!void {
-    if (profile.chip_id != 0x176 or profile.confidential_compute) return error.Profile;
+    if (!@import("generation.zig").ga102Hal(profile.chip_id) or profile.confidential_compute) return error.Profile;
 }
 fn word(bytes: []const u8, offset: usize) u32 {
     return std.mem.readInt(u32, bytes[offset..][0..4], .little);

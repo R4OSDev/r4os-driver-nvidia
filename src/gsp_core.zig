@@ -144,7 +144,7 @@ pub const Operation = struct {
 
     pub fn init(op: seq.Opcode, epoch: u64, deadline: u64, boot0: u32, resume_args: ?Resume) !Operation {
         if (epoch == 0 or deadline == 0 or deadline == std.math.maxInt(u64)) return error.Options;
-        if (((boot0 >> 20) & 0x1ff) | ((boot0 & 0x100) << 1) != 0x176) return error.Profile;
+        if (!@import("generation.zig").ga102Hal(@import("generation.zig").bootId(boot0))) return error.Profile;
         const phase: Phase = switch (op) {
             .core_reset => .pre_reset,
             .core_start => .start,
