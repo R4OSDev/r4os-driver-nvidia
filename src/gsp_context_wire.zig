@@ -327,7 +327,8 @@ const std = @import("std");
 const exchange = @import("gsp_exchange.zig");
 pub const Error = exchange.Error || error{Unsupported};
 pub const graphics = @import("gsp_gr_context.zig");
-pub const Operation = enum { classes, engines, method_size, graphics_info, group, share, free_share, free_group };
+pub const Operation = enum { classes, engines, method_size, graphics_info, group, timeslice, share, free_share, free_group };
+pub const timeslice = @import("gsp_timeslice.zig");
 pub const max_bytes: usize = 3236;
 pub const Binding = struct { epoch: u64, client: u32, device: u32, subdevice: u32, vaspace: u32, group: u32, share: u32, internal_client: u32 = 0, internal_subdevice: u32 = 0 };
 pub const Engine = struct { data: [16]u32, pbdma: [2]u32, faults: [2]u32, count: u32, name: [16]u8 };
@@ -335,9 +336,9 @@ pub const Reply = union(enum) { rejected: u32, ok: []const u8 };
 pub fn nvEngine(rm: u32) Error!u32 {
     return if (rm >= 1 and rm <= 18) rm else if (rm >= 19 and rm <= 28) rm - 19 + 0x34 else error.Unsupported;
 }
-pub fn function(op: Operation) u32 { return switch (op) { .classes, .engines, .method_size, .graphics_info => 76, .group, .share => 103, .free_share, .free_group => 10 }; }
-pub fn command(op: Operation) u32 { return switch (op) { .classes => 0x800292, .engines => 0x20801112, .method_size => 0x20802a08, .graphics_info => 0x20800a32, else => 0 }; }
-pub fn length(op: Operation) usize { return switch (op) { .classes => 428, .engines => max_bytes, .method_size => 28, .graphics_info => 24 + graphics.info_bytes, .group => 52, .share => 44, .free_share, .free_group => 16 }; }
+pub fn function(op: Operation) u32 { return switch (op) { .classes, .engines, .method_size, .graphics_info, .timeslice => 76, .group, .share => 103, .free_share, .free_group => 10 }; }
+pub fn command(op: Operation) u32 { return switch (op) { .classes => 0x800292, .engines => 0x20801112, .method_size => 0x20802a08, .graphics_info => 0x20800a32, .timeslice => timeslice.command, else => 0 }; }
+pub fn length(op: Operation) usize { return switch (op) { .classes => 428, .engines => max_bytes, .method_size => 28, .graphics_info => 24 + graphics.info_bytes, .timeslice => 32, .group => 52, .share => 44, .free_share, .free_group => 16 }; }
 pub fn word(data: []const u8, at: usize) u32 { return std.mem.readInt(u32, data[at..][0..4], .little); }
 fn put(out: []u8, at: usize, value: u32) void { std.mem.writeInt(u32, out[at..][0..4], value, .little); }
 pub fn validate(binding: Binding) Error!void {
@@ -364,6 +365,10 @@ pub fn encode(binding: Binding, rm_engine: u32, base: u32, op: Operation, output
             if (rm_engine != 1 or binding.internal_client == 0 or binding.internal_subdevice == 0 or binding.internal_client == binding.client) return error.Handle;
             put(out, 0, binding.internal_client); put(out, 4, binding.internal_subdevice);
             put(out, 8, command(op)); put(out, 16, graphics.info_bytes);
+        },
+        .timeslice => {
+            put(out, 4, binding.group); put(out, 8, command(op)); put(out, 16, 8);
+            std.mem.writeInt(u64, out[24..32], timeslice.requested_us, .little);
         },
         .group, .share => {
             put(out, 4, if (op == .group) binding.device else binding.group);
@@ -402,7 +407,7 @@ pub fn decode(binding: Binding, rm_engine: u32, base: u32, op: Operation, reques
         },
         .method_size => if (word(payload, 0) == 0) return error.Bounds,
         .graphics_info => {}, // The context owner validates the bounded GR0 plan before ACK.
-        .group => if (!std.mem.eql(u8, payload, request[header..])) return error.Payload,
+        .group, .timeslice => if (!std.mem.eql(u8, payload, request[header..])) return error.Payload,
         .share => {
             if (!std.mem.eql(u8, payload[0..8], request[header..][0..8]) or word(payload, 8) & 0x80000000 != 0) return error.Payload;
         },

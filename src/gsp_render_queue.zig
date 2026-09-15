@@ -23,6 +23,13 @@ pub const Owner = struct {
     color_stamp: ?render.ColorProgram = null,
     draws: [render.batch_capacity]render.Draw = undefined,
     draw_count: usize = 0,
+    slices: [render.batch_capacity]render.Draw = undefined,
+    slice_count: usize = 0,
+    draw_cursor: usize = 0,
+    pixel_cursor: u64 = 0,
+    next_draw: usize = 0,
+    next_pixel: u64 = 0,
+    pixel_limit: u32 = @import("gsp_work_scheduling.zig").render_pixels,
     phase: Phase = .retain,
     deadline: u64 = 0,
     acknowledged: bool = false,
@@ -31,9 +38,11 @@ pub const Owner = struct {
     pub fn open(self: *Owner, queue: r4os.driver_queue.Context, memory: r4os.driver_memory.Context,
         binding: a.GfxBackendBinding, job: a.GfxDriverJob, now: u64) !void {
         if (self.self_address != 0) return error.Busy;
-        self.* = .{ .self_address = @intFromPtr(self), .queue = queue, .memory = memory,
+        const pixel_limit = self.pixel_limit;
+        if (pixel_limit == 0 or pixel_limit > @import("gsp_work_scheduling.zig").render_pixels) return error.Bounds;
+        self.* = .{ .self_address = @intFromPtr(self), .queue = queue, .memory = memory, .pixel_limit = pixel_limit,
             .binding = binding, .job = job, .stamp = job, .deadline = job.deadline_ns };
-        if (job.version != 1 or job.size < @sizeOf(a.GfxDriverJob) or
+        if (job.version != 1 or job.size < @offsetOf(a.GfxDriverJob, "producer_kind") or
             (job.operation != a.gfx_queue_operation_render and job.operation != a.gfx_queue_operation_render_list and job.operation != a.gfx_queue_operation_render_grid_list and job.operation != a.gfx_queue_operation_render_color_list) or
             job.reserved0 != 0 or job.reserved1 != 0 or job.source_offset != 0 or job.target_offset != 0 or job.byte_length != 0 or
             job.row_count != 0 or job.source_pitch != 0 or job.target_pitch != 0 or job.render.reserved0 != 0 or
@@ -77,9 +86,39 @@ pub const Owner = struct {
         return self.self_address == @intFromPtr(self) and !self.failed and std.meta.eql(self.job, self.stamp) and
             std.meta.eql(self.references, self.reference_stamps) and self.deadline == self.stamp.deadline_ns and
             std.meta.eql(self.list, self.list_stamp) and std.meta.eql(self.grids, self.grid_stamps) and
-            std.meta.eql(self.color, self.color_stamp) and self.draw_count <= render.batch_capacity;
+            std.meta.eql(self.color, self.color_stamp) and self.draw_count <= render.batch_capacity and
+            self.slice_count <= render.batch_capacity and self.draw_cursor <= self.draw_count and self.next_draw <= self.draw_count;
     }
-    pub fn commands(self: *const Owner) []const render.Draw { return self.draws[0..self.draw_count]; }
+    pub fn commands(self: *const Owner) []const render.Draw { return self.slices[0..self.slice_count]; }
+    pub fn prepareSlice(self: *Owner) !void {
+        self.slice_count = 0;
+        self.next_draw = self.draw_cursor;
+        self.next_pixel = self.pixel_cursor;
+        var remaining: u64 = self.pixel_limit;
+        while (remaining != 0 and self.next_draw < self.draw_count and self.slice_count < render.batch_capacity) {
+            const part = try render.slice(self.draws[self.next_draw], self.next_pixel, remaining);
+            self.slices[self.slice_count] = part.draw;
+            self.slice_count += 1;
+            remaining -= part.next - self.next_pixel;
+            self.next_pixel = part.next;
+            if (part.next == part.total) { self.next_draw += 1; self.next_pixel = 0; }
+        }
+        if (self.slice_count == 0) return error.Empty;
+    }
+    pub fn validateSlice(self: *const Owner) !void {
+        var draw = self.draw_cursor;
+        var pixel = self.pixel_cursor;
+        var remaining: u64 = self.pixel_limit;
+        for (self.commands()) |command| {
+            if (draw >= self.draw_count) return error.Binding;
+            const part = try render.slice(self.draws[draw], pixel, remaining);
+            if (!std.meta.eql(command, part.draw)) return error.Binding;
+            remaining -= part.next - pixel;
+            pixel = part.next;
+            if (part.next == part.total) { draw += 1; pixel = 0; }
+        }
+        if (self.slice_count == 0 or draw != self.next_draw or pixel != self.next_pixel) return error.Binding;
+    }
     fn finish(self: *Owner, result: u32) !void {
         if (!self.valid() or self.acknowledged) return error.Retained;
         if (self.queue.complete(&self.job.fence, result, 1) != a.gfx_queue_ok) return error.Retained;
@@ -128,6 +167,7 @@ pub const Owner = struct {
                     }
                     return err;
                 };
+                try self.prepareSlice();
                 self.phase = .upload;
             },
             .upload => {
@@ -145,8 +185,15 @@ pub const Owner = struct {
             },
             .draw_wait => {
                 _ = (try run.receiveGraphics(run.graphics_channel.?)) orelse return false;
-                run.graphics_completed +|= 1;
-                try self.finish(a.gfx_queue_result_complete);
+                self.draw_cursor = self.next_draw; self.pixel_cursor = self.next_pixel;
+                if (self.draw_cursor == self.draw_count) {
+                    run.graphics_completed +|= 1;
+                    try self.finish(a.gfx_queue_result_complete);
+                } else {
+                    try self.prepareSlice();
+                    self.phase = .upload;
+                    try run.yieldWork();
+                }
             },
             .done => unreachable,
         }

@@ -165,7 +165,7 @@ fn retainText(record: *Record, text: []const u8) void {
 }
 pub fn host(operation: Operation, err: anyerror, fatal: bool) Record {
     var record: Record = .{ .source = .host, .operation = operation, .code = @intFromError(err), .fatal = fatal,
-        .kind = switch (err) { error.Memory, error.Exhausted, error.OutOfMemory => .resource, else => .unknown } };
+        .kind = switch (err) { error.Memory, error.Exhausted, error.OutOfMemory, error.Budget => .resource, else => .unknown } };
     retainText(&record, @errorName(err));
     return record;
 }

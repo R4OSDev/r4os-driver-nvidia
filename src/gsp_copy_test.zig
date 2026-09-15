@@ -11,6 +11,7 @@ fn record(function: u32, payload: []const u8) message.Record {
         .queue_sequence = 0, .rpc = .{ .function = function, .result = 0 }, .payload = payload };
 }
 pub fn check() !void {
+    try checkScheduling();
     var config: fifo.Config = .{ .context = .{ .epoch = 7, .client = 0xc1d00000, .device = 0x10000000, .subdevice = 0x10000001,
         .vaspace = 0x10000006, .group = 0x10000009, .share = 0x1000000a }, .handle = 0x1000000d, .rm_engine = 19, .runqueue = 0,
         .address = 0x600000, .instance = 0x10000000, .userd = 0x8000004000, .methods = 0x30000000, .method_bytes = 0x6000,
@@ -47,6 +48,76 @@ pub fn check() !void {
     config.address = (1 << 40) - 8192; try t.expectError(error.Bounds, fifo.encode(config, .allocate, &request));
     config.address = 0x600000; config.userd = 1 << 40; try t.expectError(error.Bounds, fifo.encode(config, .allocate, &request));
     try checkRows();
+}
+
+fn checkScheduling() !void {
+    const scheduling = @import("gsp_work_scheduling.zig");
+    const a = @import("r4os").abi;
+    var scheduler: scheduling.Owner = .{};
+    // Three queues cannot buy one producer three turns. Rejoining inherits
+    // its other live queues' producer turn; unknown old kernels use timelines.
+    const producers = [_]u64{ 10, 10, 10, 20, 30 };
+    for (producers, 0..) |producer, i| try scheduler.admit(i, .{ .producer_kind = 2,
+        .producer_id = producer, .producer_generation = 9, .fence = .{ .timeline = i + 1 } });
+    for ([_]usize{0, 3, 4, 1, 3, 4, 2, 3, 4, 0}) |expected| {
+        try t.expectEqual(expected, scheduler.choose().?);
+        try scheduler.yield(expected);
+    }
+    try scheduler.release(1);
+    try scheduler.admit(1, .{ .producer_kind = 2, .producer_id = 10, .producer_generation = 9, .fence = .{ .timeline = 99 } });
+    try t.expectEqual(@as(usize,3), scheduler.choose().?);
+    try scheduler.admit(5, .{ .size = 272, .fence = .{ .timeline = 55 } });
+    try scheduler.admit(6, .{ .size = 272, .fence = .{ .timeline = 66 } });
+    try scheduler.admit(7, .{ .size = 272, .fence = .{ .timeline = 77 } });
+    try t.expect(scheduler.free() == null and scheduler.high_water == scheduling.capacity);
+    var continuous: scheduling.Owner = .{};
+    try continuous.admit(0,.{ .producer_kind = 2, .producer_id = 1, .producer_generation = 1, .fence = .{ .timeline = 1 } });
+    for (0..8) |round| {
+        try t.expectEqual(@as(usize,0),continuous.choose().?);
+        try continuous.yield(0);
+        try continuous.admit(1,.{ .producer_kind = 2, .producer_id = 2, .producer_generation = 1, .fence = .{ .timeline = round+2 } });
+        // The returning short producer gets at most its next turn.
+        const selected = continuous.choose().?;
+        if (selected == 0) { try continuous.yield(0); try t.expectEqual(@as(usize,1),continuous.choose().?); }
+        try continuous.release(1);
+    }
+    try t.expectError(error.Descriptor, blk: {
+        var invalid: scheduling.Owner = .{};
+        break :blk invalid.admit(0, a.GfxDriverJob{ .producer_kind = 2, .fence = .{ .timeline = 1 } });
+    });
+    const limit = scheduling.copy_bytes;
+    const cases = [_]copy.Transfer{
+        .{ .source = 0x10000000, .target = 0x20000000, .bytes = 3 * limit + 17 },
+        .{ .source = 0x10000000, .target = 0x20000000, .bytes = 8192,
+            .rows = .{ .count = 511, .source_pitch = 8256, .target_pitch = 8320 } },
+        .{ .source = 0x10000000, .target = 0x20000000, .bytes = 2 * limit + 16,
+            .rows = .{ .count = 2, .source_pitch = 2 * limit + 64, .target_pitch = 2 * limit + 128 } },
+        .{ .source = 0x10000000, .target = 0x20000000, .bytes = 8192,
+            .rows = .{ .count = 511, .source_pitch = 16384, .target_pitch = 8192 },
+            .source_block = .{ .width = 16384, .height = 1024, .x = 128, .y = 31, .log2_gobs = 2 } },
+    };
+    for (cases) |transfer| {
+        var offset: u64 = 0;
+        const total = try copy.logicalBytes(transfer);
+        while (offset < total) {
+            const part = try copy.slice(transfer, offset, limit);
+            try t.expect(part.next > offset and part.next <= total and part.next - offset <= limit);
+            try t.expectEqual(part.next - offset, try copy.logicalBytes(part.transfer));
+            if (transfer.rows) |rows| {
+                const row = offset / transfer.bytes;
+                const column = offset % transfer.bytes;
+                if (part.transfer.source_block) |block| {
+                    try t.expect(part.transfer.source == transfer.source and block.x == transfer.source_block.?.x + column and
+                        block.y == transfer.source_block.?.y + row);
+                } else try t.expectEqual(transfer.source + row * rows.source_pitch + column, part.transfer.source);
+                try t.expectEqual(transfer.target + row * rows.target_pitch + column, part.transfer.target);
+            } else try t.expectEqual(transfer.source + offset, part.transfer.source);
+            _ = try copy.encodeTransfer(0xc7b5, part.transfer, 0x30000000, 1);
+            offset = part.next;
+        }
+        try t.expectError(error.Bounds, copy.slice(transfer, total, limit));
+        try t.expectError(error.Bounds, copy.slice(transfer, 0, 0));
+    }
 }
 fn checkRows() !void {
     const expected = @embedFile("fixtures/copy-2d.bin");

@@ -309,7 +309,8 @@ pub const wire = @import("gsp_context_wire.zig");
 pub const Error = wire.Error || names.Error || vram.Error || error{Retained, Busy};
 pub const State = enum { creating, unwinding, ready, handed_off, destroying, closed, finished, failed };
 pub const Unavailable = enum { classes, engine, context_buffers };
-pub const Info = struct { binding: wire.Binding, rm_engine: u32, nv_engine: u32, engine: wire.Engine, method_bytes: u32, subcontext: u32 };
+pub const Info = struct { binding: wire.Binding, rm_engine: u32, nv_engine: u32, engine: wire.Engine, method_bytes: u32, subcontext: u32,
+    timeslice_requested_us: u64 = 0, timeslice_rejection: ?u32 = null };
 pub const Child = struct { epoch: u64, group: u32, serial: u64 };
 pub const Owner = struct {
     self_address: usize = 0,
@@ -326,6 +327,8 @@ pub const Owner = struct {
     method_bytes: u32 = 0,
     subcontext: u32 = 0,
     group_live: bool = false,
+    timeslice_attempted: bool = false,
+    timeslice_rejection: ?u32 = null,
     share_live: bool = false,
     child_serial: u64 = 0,
     children: [64]u64 = @splat(0),
@@ -371,7 +374,9 @@ pub const Owner = struct {
         if (self.self_address != @intFromPtr(self) or !self.share_live or self.exchange.session.state != .active or
             (self.state != .ready and self.state != .handed_off)) return null;
         return .{ .binding = self.binding, .rm_engine = self.rm_engine, .nv_engine = wire.nvEngine(self.rm_engine) catch return null,
-            .engine = self.selected orelse return null, .method_bytes = self.method_bytes, .subcontext = self.subcontext };
+            .engine = self.selected orelse return null, .method_bytes = self.method_bytes, .subcontext = self.subcontext,
+            .timeslice_requested_us = if (self.timeslice_attempted and self.timeslice_rejection == null) wire.timeslice.requested_us else 0,
+            .timeslice_rejection = self.timeslice_rejection };
     }
     pub fn retainChild(self: *Owner) Error!Child {
         if (self.info() == null or self.state != .handed_off) return error.State;
@@ -474,6 +479,7 @@ pub const Owner = struct {
                 if (self.method_bytes == 0) break :blk .method_size;
                 if (self.rm_engine == 1 and self.graphics_plan == null) break :blk .graphics_info;
                 if (!self.group_live) break :blk .group;
+                if (!self.timeslice_attempted) break :blk .timeslice;
                 if (!self.share_live) break :blk .share;
                 self.state = .ready; return null;
             } else if (self.share_live) .free_share else if (self.group_live) .free_group else {
@@ -515,7 +521,12 @@ pub const Owner = struct {
             else if (reply == .ok and op == .share) wire.word(reply.ok, 8) else 0;
         self.last_status = if (reply == .rejected) reply.rejected else 0;
         try self.exchange.complete(dispatch.ticket);
-        if (reply == .rejected) {
+        if (op == .timeslice) {
+            // This optional setter has no child allocation to unwind. A
+            // validated RM rejection keeps software quantum limits in force.
+            self.timeslice_attempted = true;
+            self.timeslice_rejection = if (reply == .rejected) reply.rejected else null;
+        } else if (reply == .rejected) {
             if (self.state != .creating) return error.FirmwareResult;
             self.rejected = reply.rejected; self.state = .unwinding;
         } else switch (op) {
@@ -537,6 +548,7 @@ pub const Owner = struct {
                 else self.graphics_plan = graphics_plan;
             },
             .group => self.group_live = true,
+            .timeslice => unreachable,
             .share => { self.share_live = true; self.subcontext = value; },
             .free_share => self.share_live = false,
             .free_group => self.group_live = false,

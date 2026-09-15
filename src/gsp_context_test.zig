@@ -20,6 +20,20 @@ pub fn check() !void {
     try t.expectError(error.Unsupported, wire.nvEngine(29));
     var request: [wire.max_bytes]u8 = undefined;
     var reply: [wire.max_bytes]u8 = undefined;
+    // NVA06C_CTRL_CMD_SET_TIMESLICE / NVA06C_CTRL_TIMESLICE_PARAMS from
+    // the pinned original ctrla06c.h: group target, eight-byte microseconds.
+    const slice = try wire.encode(binding, 19, 0, .timeslice, &request);
+    try t.expect(slice.len == 32 and wire.word(slice,4) == binding.group and wire.word(slice,8) == 0xa06c0103 and
+        wire.word(slice,16) == 8 and std.mem.readInt(u64,slice[24..32],.little) == 2000);
+    @memcpy(reply[0..32],slice);
+    var timeslice_record: message.Record = .{ .shape = .{ .message_bytes = 112, .checksum_bytes = 112, .storage_bytes = 4096, .elements = 1 },
+        .queue_sequence = 0, .rpc = .{ .function = 76, .result = 0 }, .payload = reply[0..32] };
+    try t.expect((try wire.decode(binding,19,0,.timeslice,slice,timeslice_record)) == .ok);
+    reply[28] ^= 1;
+    try t.expectError(error.Payload,wire.decode(binding,19,0,.timeslice,slice,timeslice_record));
+    reply[28] ^= 1; reply[12] = 0x56;
+    timeslice_record.payload = reply[0..24];
+    try t.expect((try wire.decode(binding,19,0,.timeslice,slice,timeslice_record)).rejected == 0x56);
     var offset: usize = 0;
     for (ops, 0..) |op, index| {
         const base: u32 = if (index >= 2) 32 else 0;

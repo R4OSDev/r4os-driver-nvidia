@@ -9,6 +9,8 @@ pub const Model = struct {
     pub var charged: u64 = 0;
     pub var released: u32 = 0;
     pub var aborted: u32 = 0;
+    pub var budget: a.GfxDeviceBudgetState = .{};
+    pub var budget_configurations: u32 = 0;
     var query: *const fn (*a.GfxDriverMemoryApi) callconv(.c) i32 = undefined;
     var fallback_release: u64 = 0;
     var fallback_import: u64 = 0;
@@ -17,6 +19,7 @@ pub const Model = struct {
     pub fn install(table: *a.DriverApi, scenario: []const u8) void {
         heap_model.install(table, scenario); query = table.gfx_memory_query.?;
         table.gfx_memory_query = memory; slots = @splat(.{}); charged = 0; released = 0; aborted = 0;
+        budget = .{}; budget_configurations = 0;
     }
     pub fn dispose(table: *a.DriverApi) void { heap_model.dispose(table); }
     pub fn is(name: []const u8) bool { return heap_model.is(name); }
@@ -34,6 +37,19 @@ pub const Model = struct {
         out.buffer_reserve = @intFromPtr(&reserve); out.buffer_commit = @intFromPtr(&commit); out.buffer_abort = @intFromPtr(&abort);
         out.buffer_take_release = @intFromPtr(&take); out.buffer_finish_release = @intFromPtr(&finish); out.buffer_release = @intFromPtr(&drop);
         out.buffer_import = @intFromPtr(&import); out.device_acquire = @intFromPtr(&acquire); out.device_release = @intFromPtr(&releaseDevice);
+        out.memory_budget = @intFromPtr(&memoryBudget);
+        if (is("vram_surface_linear")) out.size = 184; // Existing native ABI, no optional budget service.
+        return a.gfx_buffer_result_ok;
+    }
+    fn memoryBudget(input: *const a.GfxDeviceBudgetRequest, output: *a.GfxDeviceBudgetState) callconv(.c) i32 {
+        std.debug.assert(input.version == 1 and input.size == 32 and input.adapter_id == 0x01000000 and input.memory_generation != 0 and output.version == 1 and output.size == 64);
+        if (input.operation == a.gfx_memory_budget_configure) {
+            std.debug.assert(input.limit_bytes % 4096 == 0);
+            if (budget_configurations != 0) std.debug.assert(budget.memory_generation == input.memory_generation);
+            budget = .{ .adapter_id = input.adapter_id, .memory_generation = input.memory_generation, .limit_bytes = input.limit_bytes };
+            budget_configurations += 1;
+        } else std.debug.assert(input.operation == a.gfx_memory_budget_query and input.limit_bytes == 0 and budget_configurations != 0 and budget.memory_generation == input.memory_generation);
+        output.* = budget; output.charged_bytes = charged;
         return a.gfx_buffer_result_ok;
     }
     fn reserve(d: *const a.GfxBufferDescriptor, cookie: u64, out: *a.GfxOwnedBufferReservation) callconv(.c) i32 {
@@ -41,6 +57,7 @@ pub const Model = struct {
         if (is("vram_budget")) return a.gfx_buffer_error_budget;
         for (&slots, 0..) |*slot, i| if (!slot.live) {
             const bytes = std.mem.alignForward(u64, d.byte_length, d.alignment);
+            if (budget_configurations != 0 and (charged > budget.limit_bytes or bytes > budget.limit_bytes - charged)) return a.gfx_buffer_error_budget;
             out.* = .{ .buffer = .{ .id = @intCast(801+i), .generation = 601 }, .reference = .{ .id = @intCast(811+i), .generation = 701 },
                 .allocation_bytes = bytes, .cookie = cookie, .device_generation = d.device_generation, .driver_generation = 0x200000003,
                 .adapter_id = d.adapter_id, .driver_owner = 7 };

@@ -924,3 +924,5 @@ installs the identical file and the separate DSC notice. Source hashes and
 original-header vector provenance are retained in
 `ExFiles/Reference/GFX/Nvidia/0.79.27`; original R4OS ownership code remains
 Apache-2.0. No Linux GPL implementation or new firmware binary is imported.
+
+0.79.28: RM TSG scheduling uses NVIDIA570.144 ctrla06c.h (MIT), pin 8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f. The complete original notice is included in NVIDIA-GSP-RUNTIME-LICENSE.txt. R4OS scheduling/residency ownership code remains Apache-2.0. No new firmware binary.

@@ -25,7 +25,7 @@ pub const Owner = struct {
         if (self.closing or running.failure != null or running.graph_closing or running.nativeAddressSpace() == null) return false;
         if (self.memory == null) {
             const memory = running.ctx.?.memory() orelse return false;
-            if (memory.table.size < @sizeOf(a.GfxDriverMemoryApi) or memory.table.native_register == 0 or memory.table.native_take == 0 or
+            if (memory.table.size < @offsetOf(a.GfxDriverMemoryApi, "native_complete") + 8 or memory.table.native_register == 0 or memory.table.native_take == 0 or
                 memory.table.native_complete == 0 or memory.table.native_unregister == 0) return false;
             self.memory = memory;
         }
@@ -75,6 +75,7 @@ pub const Owner = struct {
             if (err == error.Busy) return false;
             const result: i32 = switch (err) {
                 error.Unsupported => a.gfx_buffer_error_unsupported,
+                error.Budget => a.gfx_buffer_error_budget,
                 error.Exhausted, error.Memory => a.gfx_buffer_error_oom,
                 error.Overflow, error.Bounds => a.gfx_buffer_error_overflow,
                 else => a.gfx_buffer_error_invalid,

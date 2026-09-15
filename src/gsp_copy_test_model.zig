@@ -154,6 +154,11 @@ pub const Model = struct {
         job.operation = a.gfx_queue_operation_render_color_list; render_color = color;
     }
     pub fn observeRenderSemaphore() void { std.debug.assert(render_mode and active and executed); signaled = true; }
+    pub fn retireSlice() void {
+        std.debug.assert(active and executed and signaled and !lost);
+        fetched = false; executed = false; signaled = false;
+    }
+    pub fn sliceCompleted() bool { return signaled; }
     pub fn shadowReference() a.GfxBufferHandle { return .{ .id = 1499, .generation = 951 }; }
     fn additionalReference() a.GfxBufferHandle { return .{ .id = 1496, .generation = 951 }; }
     fn replacementReference() a.GfxBufferHandle { return .{ .id = 1497, .generation = 951 }; }

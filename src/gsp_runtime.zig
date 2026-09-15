@@ -161,6 +161,7 @@ pub const render = @import("r4nv_render");
 pub const render_cache = @import("gsp_render_cache.zig");
 const render_job = @import("gsp_render_job.zig");
 const render_queue = @import("gsp_render_queue.zig");
+pub const scheduling = @import("gsp_work_scheduling.zig");
 pub const GraphicsWork = struct {
     channel_handle: ChannelHandle,
     command: execution_fifo.copy.graphics.Command,
@@ -206,9 +207,12 @@ pub const CopyJob = struct {
     presentation: bool = false,
     output_window: ?u3 = null,
     transfer: ?execution_fifo.copy.wire.Transfer = null,
+    copied: u64 = 0,
+    slice_end: u64 = 0,
     target_presentation: ?*Presentation = null,
     render_read: present.Initial = .{},
 };
+const WorkSlot = union(enum) { free, copy: CopyJob, render: render_queue.Owner };
 pub const execution_context = @import("gsp_context.zig");
 pub const ContextHandle = struct { epoch: u64, serial: u64, slot: u16 };
 pub const ContextStatus = struct { state: execution_context.State, info: ?execution_context.Info, rejected: ?u32, unavailable: ?execution_context.Unavailable };
@@ -254,6 +258,7 @@ pub const Owner = struct {
     static_info: ?static.Info = null,
     reservation: ?*const @import("boot_vram_lease.zig").Lease = null,
     memory_inventory: inventory.Owner = .{},
+    memory_admission: @import("gsp_residency.zig").Admission = .{},
     physical_bytes: u64 = 0,
     startup_deadline: u64 = 0,
     post: postinit.Owner = .{},
@@ -330,15 +335,19 @@ pub const Owner = struct {
     buffer_active: ?u16 = null,
     buffer_serial: u64 = 0,
     mapping_evictions: u64 = 0,
+    residency_rejections: u64 = 0,
     native_buffers: [256]NativeBufferSlot = @splat(.{}),
     native_active: ?u16 = null,
     allocations: @import("gsp_allocation.zig").Owner = .{},
     fifos: [64]ChannelSlot = @splat(.{}),
     fifo_active: ?u16 = null,
-    copy_job: ?CopyJob = null,
+    work_slots: [scheduling.capacity]WorkSlot = @splat(.free),
+    work_schedule: scheduling.Owner = .{},
+    active_work: ?usize = null,
+    copy_job: ?*CopyJob = null,
     graphics_work: ?GraphicsWork = null,
     graphics_cache: render_cache.Owner = .{},
-    queued_render: ?render_queue.Owner = null,
+    queued_render: ?*render_queue.Owner = null,
     graphics_channel: ?ChannelHandle = null,
     graphics_copy_channel: ?ChannelHandle = null,
     graphics_enabled: bool = false,
@@ -414,6 +423,7 @@ pub const Owner = struct {
     /// existing RM/session resources. It is not physical GPU quiescence.
     pub fn stop(self: *Owner, err: anyerror) void {
         if (self.self_address == 0 or self.self_address != @intFromPtr(self) or self.failure != null) return;
+        self.logResidency();
         self.allocations.close();
         if (self.faults.first_fatal == null and err != error.Stopped and err != error.RmClosed)
             self.recordFault(diagnostics.host(.teardown, err, true)) catch {};
@@ -436,7 +446,7 @@ pub const Owner = struct {
             self.quarantine_attempted = true;
             self.quarantine_result = backend.queue.unregister(&backend.binding, 0);
             self.log("NVIDIA gsp-quarantine: epoch={d} result={d} quiesced=no job-held={} resources=retained",
-                .{self.epoch, self.quarantine_result.?, self.copy_job != null});
+                .{self.epoch, self.quarantine_result.?, self.hasQueuedWork()});
         };
         if (self.activeChannel()) |channel| {
             self.protocol_failure = channel.fail(error.Handler);
@@ -498,7 +508,7 @@ pub const Owner = struct {
                 record.candidate_rm_handle = owner.config.handle; record.candidate_rm_cid = owner.cid;
             } else { record.candidate_rm_handle = 0; record.candidate_rm_cid = 0; }
         };
-        if (self.copy_job) |*work| {
+        if (self.copy_job) |work| {
             record.active_fence = work.job.fence;
             if (work.ticket) |ticket| record.copy_point = ticket.point;
             if (record.fault_address) |va| {
@@ -519,7 +529,7 @@ pub const Owner = struct {
                 }
             }
         }
-        if (self.queued_render) |*work| {
+        if (self.queued_render) |work| {
             record.active_fence = work.job.fence;
             record.render_phase = switch (work.phase) {
                 .retain => .resources, .prepare => .admission,
@@ -602,8 +612,15 @@ pub const Owner = struct {
     }
     fn hostRejection(self: *Owner, operation: diagnostics.Operation, err: anyerror) void {
         if (self.failure != null or self.self_address != @intFromPtr(self)) return;
-        if (err == error.Memory or err == error.Exhausted or err == error.OutOfMemory)
+        if (err == error.Memory or err == error.Exhausted or err == error.OutOfMemory or err == error.Budget) {
             self.recordFault(diagnostics.host(operation, err, false)) catch {};
+            if (operation == .native_buffer) {
+                self.residency_rejections +|= 1;
+                // Pressure retries must not flood the serial path with a full
+                // owner inventory. Keep every journal entry, sample details.
+                if (self.residency_rejections & (self.residency_rejections - 1) == 0) self.logResidency();
+            }
+        }
     }
     pub fn reportIrq(self: *Owner, endpoint: *const @import("gsp_irq.zig").Owner) void {
         if (self.self_address != @intFromPtr(self) or self.failure != null) return;
@@ -648,6 +665,27 @@ pub const Owner = struct {
     pub fn nativeMemory(self: *Owner) ?*const inventory.Summary {
         _ = self.now() catch return null;
         return self.memory_inventory.snapshot();
+    }
+    pub fn residencySnapshot(self: *const Owner) !@import("gsp_residency.zig").Snapshot {
+        return @import("gsp_residency.zig").read(self);
+    }
+    fn logResidency(self: *Owner) void {
+        const data = self.residencySnapshot() catch {
+            self.log("NVIDIA residency: unavailable owner-inconsistent resources=retained", .{});
+            return;
+        };
+        self.log("NVIDIA residency: epoch={d} firmware-known={} physical={d} firmware={d} boot-union={d} rm-hint={d}",
+            .{data.epoch,data.firmware_capture_known,data.physical_bytes,data.firmware_reserved_bytes,data.boot_retained_bytes,data.rm_reserved_hint_bytes});
+        self.log("NVIDIA residency: native-slots={d} reserved={d} physical-acked={d} mapped={d} retiring={d} uncertain={d}",
+            .{data.native_slots,data.native_reserved_bytes,data.native_physical_bytes,data.native_mapped_bytes,data.native_retiring_bytes,data.native_uncertain_bytes});
+        self.log("NVIDIA residency: control={d} scanout={d} render-cache={d} mapping-reserved={d} mapping-cache={d} evicting={d} evictions={d} subsets=yes",
+            .{data.control_reserved_bytes,data.scanout_reserved_bytes,data.render_cache_bytes,data.mapping_reserved_bytes,data.mapping_cache_bytes,data.mapping_evicting_bytes,data.mapping_evictions});
+        self.log("NVIDIA residency: budget-configured={} limit={d} progress-margin={d} last-admission-charge={d} denials={d}",
+            .{self.memory_admission.configured,self.memory_admission.limit_bytes,self.memory_admission.progress_bytes,self.memory_admission.charged_bytes,self.memory_admission.denials});
+        self.log("NVIDIA residency: placement=RM largest-free-extent=unknown fragmentation=unmeasured retained-is-not-leak=yes", .{});
+        self.log("NVIDIA scheduling: held={d}/{d} high-water={d} slices={d} copy-limit={d} render-pixels={d} cursor=between-physical-slices",
+            .{self.work_schedule.count(),scheduling.capacity,self.work_schedule.high_water,self.work_schedule.slices,
+                self.work_schedule.copy_limit,self.work_schedule.render_limit});
     }
     pub fn nativeAddressSpace(self: *Owner) ?*const @import("gsp_vaspace.zig").Info {
         _ = self.now() catch return null;
@@ -2104,7 +2142,7 @@ pub const Owner = struct {
         // Original primary uploads and older queue prefixes have no target.
         // A nonempty tail must always match a complete registered identity.
         if (std.meta.eql(job.display_target, a.GfxOutputTarget{})) return self.presentation orelse error.State;
-        if (job.size < @sizeOf(a.GfxDriverJob)) return error.Stale;
+        if (job.size < @offsetOf(a.GfxDriverJob, "producer_kind")) return error.Stale;
         for (&self.presentation_targets, 0..) |*slot, window| if (slot.*) |target| {
             if (std.meta.eql(target, job.display_target)) return self.currentPresentation(@intCast(window)) orelse error.Stale;
         };
@@ -2274,7 +2312,7 @@ pub const Owner = struct {
         // Direct sources share their shadow with the composition pool. Only
         // advanceDirect may remove their DMA context and retire their fence.
         if (entry.direct != null) return error.Busy;
-        if (self.currentPresentation(entry.window.slot - 1) == entry or self.copyBusy() or self.graph_closing) return error.Busy;
+        if (self.currentPresentation(entry.window.slot - 1) == entry or self.copyBusy() or self.hasQueuedWork() or self.graph_closing) return error.Busy;
         if (self.readyImage(entry.window.slot - 1)) |ready| if (ready.image == entry) return error.Busy;
         const resources = self.display_resources_slot.owner orelse return error.State;
         for (&self.display_images) |active| if (active) |image| if (image.image.dma == dma) return error.Busy;
@@ -2397,7 +2435,7 @@ pub const Owner = struct {
         if (!self.overlapFlip()) return error.Stale;
         for (&self.display_flips, 0..) |*slot, window| if (slot.*) |*flip_work| {
             try self.validateOutputFlip(@intCast(window));
-            if (self.copy_job) |*work| {
+            if (self.copy_job) |work| {
                 if (work.target_presentation) |target| {
                     if (target == flip_work.presentation or target.surface.scanout.?.dma == flip_work.previous.image.dma) return error.Stale;
                     if (target.window.slot == flip_work.presentation.window.slot and
@@ -2445,10 +2483,18 @@ pub const Owner = struct {
                 !std.meta.eql(entry.window, current.window) or
                 !std.meta.eql(entry.surface.shadow.buffer, current.surface.shadow.buffer)) continue;
             if (self.readyImage(entry.window.slot - 1)) |ready| if (ready.image == entry) continue;
+            if (self.presentationHeld(entry)) continue;
             if (self.displayFlip(entry.window.slot - 1)) |work| if (entry == work.presentation or entry.surface.scanout.?.dma == work.previous.image.dma) continue;
             if (try resources.imageFinished(entry.window.slot, entry.surface.scanout.?.dma)) return entry;
         }
         return null;
+    }
+    fn presentationHeld(self: *const Owner, entry: *const Presentation) bool {
+        for (&self.work_slots) |*slot| switch (slot.*) {
+            .copy => |*work| if (work.target_presentation == entry) return true,
+            else => {},
+        };
+        return false;
     }
     pub fn prepareFramePool(self: *Owner) !bool {
         const current = if (self.frame_setup) |work| work.image else self.presentation orelse return false;
@@ -2771,7 +2817,7 @@ pub const Owner = struct {
         self.graphics_channel = handle; self.graphics_copy_channel = copy_handle; self.graphics_enabled = true;
     }
     fn queuedRender(self: *Owner, input: *render_queue.Owner) !void {
-        const held = if (self.queued_render) |*value| value else return error.State;
+        const held = if (self.queued_render) |value| value else return error.State;
         if (input != held or !held.valid() or !self.graphics_enabled or self.graphics_channel == null or
             self.copy_backend == null or !std.meta.eql(held.binding, self.copy_backend.?.binding)) return error.Stale;
     }
@@ -2803,6 +2849,7 @@ pub const Owner = struct {
             count += 1;
         }
         if (count == 0 or count != input.draw_count) return error.Binding;
+        try input.validateSlice();
     }
     fn queuedGraphicsDraw(self: *Owner, input: *render_queue.Owner, state: r4os.abi.GfxRenderCommand, grid: r4os.abi.GfxSampleGrid) !render.Draw {
         try self.queuedRender(input);
@@ -2865,7 +2912,7 @@ pub const Owner = struct {
     pub fn validateGraphicsWork(self: *Owner) !void {
         const work = if (self.graphics_work) |*value| value else return error.State;
         if (work.queued) {
-            const queued = if (self.queued_render) |*value| value else return error.State;
+            const queued = if (self.queued_render) |value| value else return error.State;
             const binding = switch (work.command) { .draw => |value| value, else => return error.Binding };
             try self.validateQueuedGraphics(queued);
             if (queued.phase != .draw_wait or !binding.matches(queued.commands())) return error.Binding;
@@ -2948,7 +2995,7 @@ pub const Owner = struct {
     pub fn retireExecutionChannel(self: *Owner, handle: ChannelHandle, deadline: u64, quiesced: bool) !void {
         if (self.presentation) |entry| if (std.meta.eql(entry.channel_handle, handle)) return error.Busy;
         const owner = try self.findChannel(handle);
-        if (self.copyBusy()) return error.Busy;
+        if (self.copyBusy() or self.hasQueuedWork()) return error.Busy;
         if (self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or
             self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         var token = try self.channel.?.handoff(deadline);
@@ -2971,6 +3018,12 @@ pub const Owner = struct {
         if (job.operation != a.gfx_queue_operation_upload and job.operation != a.gfx_queue_operation_present) return false;
         const current = self.presentationForJob(job) catch return false;
         const window = current.window.slot - 1;
+        // At most one partially composed image per output. Another output,
+        // copy or render producer can still use the intervening quantum.
+        for (&self.work_slots) |*slot| switch (slot.*) {
+            .copy => |*work| if (work.presentation and work.output_window != null and work.output_window.? == window) return true,
+            else => {},
+        };
         // Invalid/stopped requests go through the usual completion path.
         if (!self.validPresentation(current) or self.outputPaused(window) or self.presentation_buffers == 0 or
             job.version != 1 or job.size < @offsetOf(a.GfxDriverJob, "render") or job.reserved0 != 0 or job.reserved1 != 0) return false;
@@ -2991,8 +3044,38 @@ pub const Owner = struct {
     }
     /// Take the canonical job directly from the common queue. No caller can
     /// supply source addresses, completion points or edited job extents.
+    pub fn hasQueuedWork(self: *const Owner) bool { return self.work_schedule.count() != 0; }
+    fn activateWork(self: *Owner) !bool {
+        if (self.copy_job != null or self.queued_render != null or self.active_work != null) return error.State;
+        const index = self.work_schedule.choose() orelse return false;
+        self.active_work = index;
+        switch (self.work_slots[index]) {
+            .copy => |*work| self.copy_job = work,
+            .render => |*work| self.queued_render = work,
+            .free => return error.Stale,
+        }
+        return true;
+    }
+    fn selectWork(self: *Owner) !void {
+        // Only a newly admitted, unsubmitted job may enter this selector.
+        self.copy_job = null; self.queued_render = null; self.active_work = null;
+        if (!try self.activateWork()) return error.State;
+    }
+    pub fn yieldWork(self: *Owner) !void {
+        if (self.graphics_upload != null or self.graphics_work != null or
+            (if (self.copy_job) |work| work.submitted else false)) return error.Busy;
+        try self.work_schedule.yield(self.active_work orelse return error.State);
+        self.copy_job = null; self.queued_render = null; self.active_work = null;
+    }
+    fn releaseWork(self: *Owner) !void {
+        const index = self.active_work orelse return error.State;
+        try self.work_schedule.release(index);
+        self.copy_job = null; self.queued_render = null; self.active_work = null;
+        self.work_slots[index] = .free;
+    }
     pub fn beginCopyWork(self: *Owner, handle: ChannelHandle, binding: r4os.abi.GfxBackendBinding, deadline: u64) !bool {
         if (self.refresh_quiescing) return error.Busy;
+        const work_slot = self.work_schedule.free() orelse return error.Busy;
         const fifo = try self.findChannel(handle);
         const value = fifo.info() orelse return error.State;
         if (!value.config.system_userd or !fifo.ring.idle() or self.copyAdmissionBusy() or self.graphics_starting or self.graph_closing or self.display_engine_active or self.display_channel_active != null or
@@ -3039,7 +3122,7 @@ pub const Owner = struct {
             // Additional heads advertise only copied presentation until their
             // independent direct-image retirement path is wired as well.
             if (!self.directOutputAvailable(current.window.slot - 1) or !queue.supportsScanout() or !self.validPresentation(current) or self.outputPaused(current.window.slot - 1) or
-                job.version != 1 or job.size < @sizeOf(a.GfxDriverJob) or job.reserved0 != 0 or job.reserved1 != 0 or
+                job.version != 1 or job.size < @offsetOf(a.GfxDriverJob, "producer_kind") or job.reserved0 != 0 or job.reserved1 != 0 or
                 job.fence.adapter_id != binding.adapter_id or job.fence.device_generation != binding.device_generation or
                 job.fence.reset_generation != binding.reset_generation or job.fence.timeline == 0 or job.fence.point == 0 or
                 job.source_offset != 0 or job.target_offset != 0 or job.target_pitch != 0 or !std.meta.eql(job.target_buffer, a.GfxBufferHandle{}) or
@@ -3060,12 +3143,20 @@ pub const Owner = struct {
             return true;
         }
         if (result == a.gfx_queue_ok and (job.operation == a.gfx_queue_operation_render or job.operation == a.gfx_queue_operation_render_list or job.operation == a.gfx_queue_operation_render_grid_list or job.operation == a.gfx_queue_operation_render_color_list)) {
-            self.queued_render = .{};
+            try self.work_schedule.admit(work_slot, job);
+            self.work_slots[work_slot] = .{ .render = .{} };
+            self.active_work = work_slot;
+        self.queued_render = &self.work_slots[work_slot].render;
+            self.queued_render.?.pixel_limit = self.work_schedule.render_limit;
             self.queued_render.?.open(queue, memory, binding, job, try self.now()) catch |err| { self.stop(err); return err; };
+            try self.selectWork();
             return true;
         }
-        self.copy_job = .{ .queue = queue, .memory = memory, .channel_handle = handle, .binding = binding,
-            .job = job, .job_stamp = job, .deadline = work_deadline };
+        try self.work_schedule.admit(work_slot, job);
+        self.work_slots[work_slot] = .{ .copy = .{ .queue = queue, .memory = memory, .channel_handle = handle, .binding = binding,
+            .job = job, .job_stamp = job, .deadline = work_deadline } };
+        self.active_work = work_slot;
+        self.copy_job = &self.work_slots[work_slot].copy;
         if (result != a.gfx_queue_ok or job.version != 1 or job.size < @offsetOf(a.GfxDriverJob, "row_count") or job.reserved0 != 0 or job.reserved1 != 0 or
             job.fence.adapter_id != binding.adapter_id or job.fence.timeline == 0 or job.fence.point == 0 or
             job.fence.device_generation != binding.device_generation or job.fence.reset_generation != binding.reset_generation) {
@@ -3128,13 +3219,14 @@ pub const Owner = struct {
                 self.stop(error.Descriptor); return error.Descriptor;
             }
         }
+        try self.selectWork();
         return true;
     }
     fn finishCopy(self: *Owner, result: u32) !void {
         self.retireCopy(result) catch |err| { self.stop(err); return err; };
     }
     fn retireCopy(self: *Owner, result: u32) !void {
-        const work = &self.copy_job.?;
+        const work = self.copy_job.?;
         const a = r4os.abi;
         if (work.render_read.self_address != 0) {
             if (result == a.gfx_queue_result_complete) try work.render_read.complete(work.ticket.?.point)
@@ -3155,14 +3247,21 @@ pub const Owner = struct {
             self.frames_rejected +|= 1;
             self.output_frames[work.output_window.?].rejected +|= 1;
         }
-        self.copy_job = null;
+        try self.releaseWork();
     }
     fn advanceCopy(self: *Owner, current: u64) !bool {
-        const work = if (self.copy_job) |*value| value else return false;
+        const work = if (self.copy_job) |value| value else return false;
         if (!std.meta.eql(work.job, work.job_stamp)) return error.Stale;
         const fifo = try self.findChannel(work.channel_handle);
         if (work.submitted) {
             if (try fifo.ring.poll() >= work.ticket.?.point) {
+                work.copied = work.slice_end;
+                if (work.copied < try execution_fifo.copy.wire.logicalBytes(work.transfer orelse return error.State)) {
+                    work.submitted = false; work.ticket = null;
+                    if (work.render_read.self_address != 0) { work.render_read.submitted = false; work.render_read.ticket = null; }
+                    try self.yieldWork();
+                    return true;
+                }
                 if (work.target_presentation) |entry| {
                     const window = entry.window.slot - 1;
                     if (self.readyImage(window) != null) return error.State;
@@ -3245,8 +3344,11 @@ pub const Owner = struct {
             if (err == error.Bounds or err == error.Unsupported or err == error.Overflow) { try self.finishCopy(r4os.abi.gfx_queue_result_failed); return true; }
             return err;
         };
-        work.transfer = transfer;
-        work.ticket = fifo.prepareCopy(transfer) catch |err| {
+        if (work.transfer) |original| { if (!std.meta.eql(original, transfer)) return error.Stale; }
+        else work.transfer = transfer;
+        const part = try execution_fifo.copy.wire.slice(transfer, work.copied, self.work_schedule.copy_limit);
+        work.slice_end = part.next;
+        work.ticket = fifo.prepareCopy(part.transfer) catch |err| {
             if (err == error.Bounds or err == error.Unsupported or err == error.Exhausted) { try self.finishCopy(r4os.abi.gfx_queue_result_failed); return true; }
             return err;
         };
@@ -3257,7 +3359,7 @@ pub const Owner = struct {
     }
     pub fn copyTransfer(self: *Owner) !execution_fifo.copy.wire.Transfer {
         try self.validateCopyOverlap();
-        const work = if (self.copy_job) |*value| value else return error.State;
+        const work = if (self.copy_job) |value| value else return error.State;
         if (!std.meta.eql(work.job, work.job_stamp)) return error.Stale;
         if (work.presentation) {
             const current = try self.copyPresentation(work);
@@ -4514,7 +4616,7 @@ pub const Owner = struct {
     pub fn prepareCopyMappings(self: *Owner, needed: usize, byte_limit: u64, deadline: u64) !bool {
         _ = try self.now();
         if (needed > self.buffers.len) return error.Bounds;
-        if (self.copyBusy() or self.cursor_point != null or self.cursor_reserving or self.graph_closing or self.buffer_active != null or
+        if (self.copyBusy() or self.hasQueuedWork() or self.cursor_point != null or self.cursor_reserving or self.graph_closing or self.buffer_active != null or
             self.fifo_active != null or self.native_active != null or self.context_active != null or self.outputs.active() or self.sequence.self_address != 0 or
             self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         var available: usize = 0;
@@ -4540,7 +4642,7 @@ pub const Owner = struct {
     }
     pub fn retireBuffer(self: *Owner, handle: BufferHandle, deadline: u64, quiesced: bool) !void {
         const owner = try self.findBuffer(handle);
-        if (self.copyBusy()) return error.Busy;
+        if (self.copyBusy() or self.hasQueuedWork()) return error.Busy;
         if (!quiesced or self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or
             self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         if (owner.state != .handed_off) return error.State;
@@ -4607,6 +4709,7 @@ pub const Owner = struct {
         const space = (self.nativeAddressSpace() orelse return error.State).*;
         if (self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         try self.channel.?.guard(deadline);
+        try self.memory_admission.admit(self, plan.allocation_bytes, policy != null);
         const serial = try std.math.add(u64, self.buffer_serial, 1);
         const index: u16 = blk: {
             for (&self.native_buffers, 0..) |*slot, i| if (slot.allocation.handle == 0) break :blk @intCast(i);
@@ -4684,7 +4787,7 @@ pub const Owner = struct {
     /// is drained before graph.beginDestroy may send any parent/event free.
     pub fn beginDestroyGraph(self: *Owner, deadline: u64, quiesced: bool) !void {
         _ = try self.now();
-        if (self.copyBusy() or self.display_engine_owner != null or self.mode_control_owner != null) return error.Busy;
+        if (self.copyBusy() or self.hasQueuedWork() or self.display_engine_owner != null or self.mode_control_owner != null) return error.Busy;
         if (!quiesced or self.graph_closing or self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or
             self.sequence.self_address != 0 or self.nativeObject() == null or self.channel.?.phase != .idle) return error.Busy;
         try self.channel.?.guard(deadline);
@@ -4794,8 +4897,8 @@ pub const Owner = struct {
             const owner = self.contexts[index].owner orelse return error.State;
             if (owner.state == .ready or owner.state == .closed) {
                 if (owner.state == .ready) try self.rejection(.context, owner.binding.group, owner.rejected, null);
-                if (owner.info()) |info| self.log("NVIDIA gsp-context: group={x} share={x} engine={x} runlist={d} fifo=unallocated",
-                    .{info.binding.group, info.binding.share, info.nv_engine, info.engine.data[3]});
+                if (owner.info()) |info| self.log("NVIDIA gsp-context: group={x} share={x} engine={x} runlist={d} timeslice-request-us={d} rejection={?x} commands=bounded fifo=unallocated",
+                    .{info.binding.group, info.binding.share, info.nv_engine, info.engine.data[3],info.timeslice_requested_us,info.timeslice_rejection});
                 const deadline = owner.deadline; var token = try owner.handoff();
                 self.channel = try exchange.Exchange.init(&token, deadline);
                 if (owner.state == .finished) try self.freeContextSlot(index);
@@ -4876,8 +4979,8 @@ pub const Owner = struct {
         if (try self.advanceCursorPoint(current)) return .progress;
         if (try self.advanceCopy(current)) return .progress;
         if (try self.advanceGraphics(current)) return .progress;
-        if (self.queued_render) |*queued| {
-            if (queued.phase == .done) { self.queued_render = null; return .progress; }
+        if (self.queued_render) |queued| {
+            if (queued.phase == .done) { try self.releaseWork(); return .progress; }
             if (try queued.step(self, current)) return .progress;
         }
         if (try self.advancePresentFrame(current)) return .progress;
@@ -4904,6 +5007,14 @@ pub const Owner = struct {
             // A pending frame must not starve an output query or other
             // runtime owner that currently prevents taking the queue job.
         };
+        // A physical slice completion returned through the outer device loop,
+        // giving cursor/output owners one admission opportunity. Retained jobs
+        // now resume by producer turn even when no new queue wake is pending.
+        if (!self.copyAdmissionBusy() and self.cursor_point == null and self.fifo_active == null and
+            self.context_active == null and self.native_active == null and self.buffer_active == null and
+            !self.display_engine_active and self.display_channel_active == null and !self.outputs.active() and
+            self.sequence.self_address == 0 and self.channel.?.phase == .idle and self.channel.?.pending == null and
+            self.channel.?.in_lockdown == false and try self.activateWork()) return .progress;
         if (self.nativeObject() != null and try self.collectNativeBuffer(if (self.graph_closing) self.close_deadline else try std.math.add(u64, current, 5 * std.time.ns_per_s))) return .progress;
         if (self.graph_closing and self.graph.?.state == .loaned) graph_close: {
             try channel.guard(self.close_deadline);
@@ -5140,6 +5251,7 @@ pub const Owner = struct {
         for (self.memory_inventory.regions[0..data.region_count], 0..) |*region, index|
             self.log("NVIDIA gsp-region: index={d} base={x} bytes={d} rm-budget={d} protected={any} iso={any} compressed={any} performance={d}",
                 .{index, region.base, region.bytes, region.reserved, region.protected, region.iso, region.compressed, region.performance});
+        self.logResidency();
     }
     fn notification(self: *Owner, channel: *exchange.Exchange, dispatch: exchange.Dispatch, current: u64) !void {
         if (dispatch.response) return error.Unexpected;

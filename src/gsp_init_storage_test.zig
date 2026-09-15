@@ -2766,6 +2766,11 @@ fn finishContextBuffer(target: *@import("gsp_device.zig").Device, handle: @impor
         try nativeReply(session, channel.function, 0, response[0..channel.request.len]); _ = target.step();
     }
     try t.expect(steps < 80 and target.phase == .ready and (try running.nativeBufferStatus(handle)).info != null);
+    const memory = try running.residencySnapshot();
+    const held = running.native_buffers[handle.slot].owner.?;
+    try t.expect(memory.firmware_capture_known and !memory.stopped and memory.native_reserved_bytes >= held.bytes and
+        memory.native_physical_bytes >= held.bytes and memory.native_mapped_bytes >= held.bytes and
+        memory.native_mapped_bytes <= memory.native_physical_bytes and memory.native_physical_bytes <= memory.native_reserved_bytes);
     return handle;
 }
 fn checkDeviceDisplayEngine(target: *@import("gsp_device.zig").Device, scenario: []const u8) !void {
@@ -3346,7 +3351,7 @@ const NativeCommon = struct {
         const source = target.running.currentPresentation(extra.mode.?.window).?.surface.descriptor;
         std.debug.assert((extra.phase == .register or extra.hotplug.phase == .unpause or extra.modes.phase == .publish) and additional_published and !additional_active and
             std.meta.eql(input.backend, product.backend) and std.meta.eql(input.output, extra.output) and
-            input.job_size == @sizeOf(a.GfxDriverJob) and input.head_id == extra.mode.?.head and input.head_id != product.mode.?.head and
+            (input.job_size == 272 or input.job_size == @sizeOf(a.GfxDriverJob)) and input.head_id == extra.mode.?.head and input.head_id != product.mode.?.head and
             input.width == source.width and input.height == source.height and input.format == source.format);
         if (image) |value| std.debug.assert(value.core_point != 0 and value.window_point != 0 and value.mode_receipt != 0 and value.link.?.complete())
         else std.debug.assert(target.running.outputPaused(extra.mode.?.window) and target.running.display_retired[extra.mode.?.window] != null);
@@ -6176,8 +6181,8 @@ fn replyNativeProduct(target: *@import("gsp_device.zig").Device) !void {
         if (op == .graphics_info) {
             try t.expect(owner.rm_engine == 1 and @import("gsp_context_wire.zig").word(rpc.request, 0) == run.static_info.?.client and @import("gsp_context_wire.zig").word(rpc.request, 4) == run.static_info.?.subdevice);
             @memcpy(response[24..1688], @embedFile("fixtures/gr-context-570.144.bin")[0..1664]);
-        } else {
-        const vector: usize = switch (op) { .classes => 0, .engines => if (owner.base == 0) 1 else 2, .method_size => 3, .group => 4, .share => 5, .free_share => 6, .free_group => 7, .graphics_info => unreachable };
+        } else if (op != .timeslice) {
+        const vector: usize = switch (op) { .classes => 0, .engines => if (owner.base == 0) 1 else 2, .method_size => 3, .group => 4, .share => 5, .free_share => 6, .free_group => 7, .graphics_info, .timeslice => unreachable };
         const bytes = @import("gsp_context_test.zig").response(vector);
         const header: usize = if (rpc.function == 76) 24 else if (rpc.function == 103) 32 else 16;
         @memcpy(response[header..rpc.request.len], bytes[header..]);
@@ -6690,10 +6695,10 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
     const model = @import("gsp_copy_test_model.zig").Model;
     const run = &target.running;
     errdefer |err| std.debug.print("queued render: {s} phase={?} active={} completed={d} result={d} upload={} submitted={} native={?}\n", .{
-        @errorName(err), if (run.queued_render) |*value| value.phase else null, model.active, model.completed, model.result,
+        @errorName(err), if (run.queued_render) |value| value.phase else null, model.active, model.completed, model.result,
         run.graphics_upload != null, if (run.graphics_upload) |*value| value.operation.submitted else false, run.native_active });
     const deadline = clock + 5 * std.time.ns_per_s;
-    const before = run.graphics_completed;
+    var before = run.graphics_completed;
     const buffer = try run.allocateNativeSurface(.{ .width = 32, .height = 24, .format = .argb8888, .usage = 28 },deadline);
     try driveRenderSetup(target,counts,scenario);
     const target_info = (try run.nativeBufferStatus(buffer)).info.?;
@@ -6727,6 +6732,15 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
     // Reinstalling a fresh host memory view does not re-register the runtime.
     else model.render_operations = 893;
     try t.expect(model.render_operations == 893 and run.graphics_enabled);
+    if (scene_index == 11 and !graphicsFaultScenario(scenario)) {
+        try checkQueuedSlices(target,ce,native_index,target_image,deadline);
+        table.gfx_memory_query = old_memory; table.gfx_queue_query = old_queue;
+        model.installRender(table,native_index);
+        model.render_operations = 893;
+        before = run.graphics_completed;
+        @memset(target_data,0xcc);
+        for (0..24) |y| @memcpy(target_data[y*target_image.pitch..][0..128],target_pixels[y*128..][0..128]);
+    }
     if (source_index) |index| {
         // The same copy_rows contract emitted by image_prepare. Its actual
         // CE stream turns SYS rows into tiled texture storage; GPGet and
@@ -6902,6 +6916,123 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
     try t.expect(!try run.graphics_cache.reusePacket(old_draw));
     try t.expectError(error.State,run.graphics_cache.binding());
 }
+fn checkQueuedSlices(target: *@import("gsp_device.zig").Device, ce: @import("gsp_runtime.zig").ChannelHandle,
+    image_index: usize, image: @import("r4nv_render").image.Image, deadline: u64) !void {
+    const model = @import("gsp_copy_test_model.zig").Model;
+    const fifo = @import("gsp_fifo_test_model.zig").Model;
+    const render = @import("r4nv_render");
+    const reference = render.reference_model;
+    const run = &target.running;
+    const ce_owner = run.fifos[ce.slot].owner.?;
+    const mmio: [*]const u8 = @ptrFromInt(target.port.window.cpu_address);
+    var checkpoint: []const u8 = "CE configure";
+    errdefer |err| std.debug.print("slice-check {s}: {s} active-slot={?} held={d} copy={} render={} copy-count={d} faults={d}\n",
+        .{checkpoint,@errorName(err),run.active_work,run.work_schedule.count(),run.copy_job != null,run.queued_render != null,model.completed,run.faults.serial});
+    try run.work_schedule.configure(512,128);
+    const completed = model.completed;
+    model.enqueueRows(null,image_index,0,0,128,24,128,image.pitch);
+    try t.expect(try run.beginCopyWork(ce,model.binding,deadline));
+    var copy_gaps: usize = 0;
+    for (0..160) |_| {
+        checkpoint = "CE worker";
+        try stepQueuedRendering(target);
+        try t.expect(target.phase == .ready);
+        if (model.completed != completed) break;
+        if (run.copy_job) |work| {
+            if (!work.submitted or model.sliceCompleted()) continue;
+            checkpoint = "CE execution";
+            try t.expect(work.slice_end - work.copied <= 512);
+            try model.fetch(ce_owner,mmio[0..@intCast(target.port.window.byte_length)]);
+            try model.execute();
+            try stepQueuedRendering(target);
+            try t.expect(model.completed == completed and run.copy_job != null);
+            try model.signal();
+        } else if (run.hasQueuedWork() and model.sliceCompleted()) {
+            checkpoint = "CE yield";
+            copy_gaps += 1;
+            try t.expect(model.active and model.heldReferences() == 3 and run.cursorWorkAvailable());
+            try t.expectError(error.Busy,run.prepareCopyMappings(2,0,deadline));
+            try t.expectError(error.Busy,run.work_schedule.configure(512,128));
+            model.retireSlice();
+        }
+    }
+    try t.expect(copy_gaps == 5 and model.completed == completed+1 and !run.hasQueuedWork() and model.heldReferences() == 1);
+    checkpoint = "CE completion";
+    const pixels = model.imageBytes(image_index)[0..image.pitch*image.height];
+    for (0..24) |y| try t.expectEqualSlices(u8,model.host[0][y*128..][0..128],pixels[y*image.pitch..][0..128]);
+    try t.expect(try run.prepareCopyMappings(2,0,deadline));
+    for (0..64) |_| { try stepQueuedRendering(target); if (run.buffer_active == null) break; }
+    try t.expect(run.buffer_active == null and model.heldReferences() == 0);
+    checkpoint = "GR admission";
+    model.enqueueRender(image_index,null,.{ .kind = 0, .color = 0xff112233, .opacity = 255,
+        .target_rect = .{ .width = 32, .height = 24 }, .scissor = .{ .width = 32, .height = 24 } },deadline);
+    try t.expect(try run.beginCopyWork(ce,model.binding,deadline));
+    var packet: [render.packet_capacity_bytes]u8 = undefined;
+    var packet_length: usize = 0;
+    var render_gaps: usize = 0;
+    var draws: usize = 0;
+    const load = @import("gsp_fifo_wire.zig").word;
+    for (0..160) |_| {
+        checkpoint = "GR worker";
+        try stepQueuedRendering(target);
+        try t.expect(target.phase == .ready);
+        if (model.completed == completed+2 and !run.hasQueuedWork()) break;
+        if (run.graphics_upload) |*upload| {
+            checkpoint = "GR packet";
+            packet_length = upload.operation.bytes;
+            try checkRenderUpload(target,ce,packet[0..packet_length]);
+        }
+        if (run.graphics_work) |*work| {
+            if (!work.submitted or work.receipt != null or model.sliceCompleted()) continue;
+            checkpoint = "GR execution";
+            const gr = &fifo.slots[0].data;
+            const ticket = work.ticket.?;
+            const gp: usize = @as(usize,(ticket.put+511)%512)*8;
+            const count: usize = load(gr,gp+4)>>10;
+            const command_address = @as(u64,load(gr,gp))|(@as(u64,load(gr,gp+4)&255)<<32);
+            const offset: usize = @intCast(command_address-fifo.address(0));
+            const body = gr[offset..][0..count*4];
+            const binding = try run.graphics_cache.binding();
+            if (draws == 0) {
+                checkpoint = "GR pressure";
+                const native = @import("gsp_vram_test_model.zig").Model;
+                const limit = native.budget.limit_bytes;
+                const charge = native.charged;
+                const serial = run.buffer_serial;
+                const tx = target.session.?.tx_sequence;
+                native.budget.limit_bytes = charge - 65536;
+                defer native.budget.limit_bytes = limit;
+                try t.expectError(error.Budget,run.allocateNativeBuffer(4096,deadline));
+                try t.expect(native.charged == charge and run.buffer_serial == serial and target.session.?.tx_sequence == tx and
+                    run.native_active == null and run.graphics_cache.borrowed and model.active);
+                try t.expectEqualDeep(binding,try run.graphics_cache.binding());
+                try t.expect((try run.residencySnapshot()).render_cache_bytes == @import("gsp_render_cache.zig").budget_bytes);
+            }
+            const clip = try binding.draw.clip();
+            try t.expect((clip[2]-clip[0])*(clip[3]-clip[1]) <= 128 and binding.additional.len == 0);
+            try reference.executeColor(body,packet[0..packet_length],binding.programs.address,binding.packet.address,
+                reference.Surface.from(image,pixels),null,null);
+            model.observeRenderExecution();
+            std.mem.writeInt(u32,gr[0x2088..][0..4],ticket.put,.little);
+            try stepQueuedRendering(target);
+            try t.expect(model.completed == completed+1 and run.graphics_cache.borrowed);
+            model.observeRenderSemaphore();
+            std.mem.writeInt(u32,gr[0x2200..][0..4],ticket.point,.little);
+            draws += 1;
+        } else if (run.queued_render == null and run.hasQueuedWork() and model.sliceCompleted()) {
+            checkpoint = "GR yield";
+            render_gaps += 1;
+            try t.expect(model.active and model.heldReferences() == 1 and !run.graphics_cache.borrowed and
+                !ControlModel.reading and run.cursorWorkAvailable());
+            model.retireSlice();
+        }
+    }
+    try t.expect(draws == 6 and render_gaps == 5 and model.completed == completed+2 and !model.active and
+        model.result == a.gfx_queue_result_complete and model.heldReferences() == 0 and !run.hasQueuedWork());
+    for (0..24) |y| for (0..32) |x| try t.expectEqual(@as(u32,0xff112233),load(pixels,y*image.pitch+x*4));
+    try run.work_schedule.configure(@import("gsp_work_scheduling.zig").copy_bytes,@import("gsp_work_scheduling.zig").render_pixels);
+    std.debug.print("[nvidia-slices] CE6+GR6; exact semaphores; one public fence each; retained mappings/cache; cursor admission between slices\n",.{});
+}
 fn queuedSrgbProgram() @import("r4nv_render").ColorProgram {
     var program: @import("r4nv_render").ColorProgram = .{};
     program.words[0..5].* = .{0,1,2,3,4};
@@ -7060,7 +7191,7 @@ fn checkDeviceContexts(target: *@import("gsp_device.zig").Device, table: *a.Driv
             const channel = running.activeChannel().?;
             if (channel.phase != .waiting) continue;
             const op = owner.operation.?;
-            const vector_index: usize = switch (op) { .classes => 0, .engines => if (owner.base == 0) 1 else 2, .method_size => 3, .group => 4, .share => 5, .free_share => 6, .free_group => 7, .graphics_info => unreachable };
+            const vector_index: usize = switch (op) { .classes => 0, .engines => if (owner.base == 0) 1 else 2, .method_size => 3, .group => 4, .share => 5, .free_share => 6, .free_group => 7, .timeslice => 0, .graphics_info => unreachable };
             const cursor = (session.tx_write + 62) % 63;
             const record = try transport.message.decode(session.profile, backing.?[command + 4096 + cursor * 4096..][0..4096], session.tx_sequence - 1);
             try t.expectEqualSlices(u8, channel.request, record.payload);
@@ -7075,7 +7206,8 @@ fn checkDeviceContexts(target: *@import("gsp_device.zig").Device, table: *a.Driv
             var response: [wire.max_bytes]u8 = @splat(0);
             @memcpy(response[0..channel.request.len], channel.request);
             const header: usize = if (wire.function(op) == 76) 24 else if (wire.function(op) == 103) 32 else 16;
-            @memcpy(response[header..channel.request.len], vectors.response(vector_index)[header..]);
+            if (op != .timeslice) @memcpy(response[header..channel.request.len], vectors.response(vector_index)[header..]);
+            if (op == .timeslice and index == 1) outputWord(&response, 12, 0x56); // NV_ERR_NOT_SUPPORTED: bounded fallback.
             if (wire.function(op) == 103) allocations += 1;
             if (wire.function(op) == 10) frees += 1;
             if (op == .classes and model.is("context_classes")) outputWord(&response, 24, 0);
@@ -7106,6 +7238,8 @@ fn checkDeviceContexts(target: *@import("gsp_device.zig").Device, table: *a.Driv
         if (result.info) |info| {
             try t.expect(info.binding.client == running.graph.?.reservation.client and info.rm_engine == 19 and info.nv_engine == 0x34);
             try t.expect(info.engine.data[3] == 7 and info.method_bytes == 0x6000 and info.subcontext == 0);
+            try t.expect(info.timeslice_requested_us == (if (index == 0) @as(u64,2000) else 0) and
+                info.timeslice_rejection == (if (index == 0) @as(?u32,null) else 0x56));
             if (methods and index == 0) {
                 const buffer = try allocateContextStorage(target, info.method_bytes, deadline);
                 const context = running.contexts[handles[0].slot].owner.?;
@@ -7770,12 +7904,14 @@ fn checkDevicePresentation(target: *@import("gsp_device.zig").Device, handle: @i
         checkpoint = "submit";
         while (target.phase == .ready and (running.copy_job == null or !running.copy_job.?.submitted) and steps < 100) : (steps += 1) {
             if (frame == 0 and !admission_checked and running.copy_job != null and running.buffer_active == null) {
-                const job = &running.copy_job.?;
+                const job = running.copy_job.?;
                 for (&running.buffers) |*slot| if (slot.owner) |mapping| if (mapping.info()) |source| {
                     if (!std.meta.eql(source.buffer, job.job.source_buffer)) continue;
                     job.addresses[0] = .{ .address = source.address, .bytes = source.logical_bytes };
                     job.transfer = try running.copyTransfer();
-                    job.ticket = try fifo.prepareCopy(job.transfer.?);
+                    const slice = try @import("gsp_copy_wire.zig").slice(job.transfer.?, job.copied, running.work_schedule.copy_limit);
+                    job.slice_end = slice.next;
+                    job.ticket = try fifo.prepareCopy(slice.transfer);
                     const io = target.port.owner.?; const gate = io.admit_copy.?;
                     try gate(io.context, &target.port, fifo, job.ticket.?, job.deadline);
                     job.transfer.?.rows.?.target_pitch += 64;
@@ -7790,7 +7926,7 @@ fn checkDevicePresentation(target: *@import("gsp_device.zig").Device, handle: @i
                     try t.expectError(error.Binding, gate(io.context, &target.port, fifo, job.ticket.?, job.deadline));
                     pitch.* ^= 4;
                     try gate(io.context, &target.port, fifo, job.ticket.?, job.deadline);
-                    fifo.ring.pending = null; job.ticket = null; job.transfer = null; // CPU-only preparation, before PUT.
+                    fifo.ring.pending = null; job.ticket = null; job.transfer = null; job.slice_end = 0; // CPU-only preparation, before PUT.
                     admission_checked = true;
                     break;
                 };
@@ -8520,6 +8656,9 @@ fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverAp
         const bytes: u64 = if (plan) |p| p.descriptor.byte_length else if (index == 0) full - 5 else 4091;
         handles[index] = if (surfaces) try running.allocateNativeSurface(requests[index], deadline)
             else if (private_storage) try running.allocateNativeStorage(bytes, deadline) else try running.allocateNativeBuffer(bytes, deadline);
+        try t.expect(running.memory_admission.epoch == running.epoch);
+        if (model.is("vram_surface_linear")) try t.expect(!running.memory_admission.configured and model.budget_configurations == 0)
+        else try t.expect(running.memory_admission.configured and model.budget_configurations == 1 and model.budget.limit_bytes == @import("gsp_residency.zig").Admission.ceiling(running.nativeMemory().?));
         var forged = handles[index]; forged.serial += 1;
         try t.expectError(error.Stale, running.nativeBufferStatus(forged));
         var steps: usize = 0;
@@ -8629,6 +8768,24 @@ fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverAp
             try t.expect(session.tx_sequence == sent);
             var returned = try running.graph.?.loan(deadline);
             running.channel = try @import("gsp_exchange.zig").Exchange.init(&returned.runtime, deadline);
+            if (model.is("vram_success") and index == 0) {
+                const original_limit = model.budget.limit_bytes;
+                const original_charge = model.charged;
+                const original_serial = running.buffer_serial;
+                // A software budget reduction must stop the actual allocation
+                // entrypoint before heap/RM mutation, retaining the first BO.
+                model.budget.limit_bytes = original_charge + running.memory_admission.progress_bytes;
+                try t.expectError(error.Budget, running.allocateNativeBuffer(4096, deadline));
+                try running.memory_admission.admit(running, 65536, true);
+                model.budget.limit_bytes = original_charge - 65536;
+                try t.expectError(error.Budget, running.allocateNativeStorage(4096, deadline));
+                try t.expect(session.tx_sequence == sent and running.buffer_serial == original_serial and
+                    running.native_active == null and model.charged == original_charge and
+                    (try running.nativeBufferStatus(handles[0])).info != null and running.memory_admission.denials == 2);
+                model.budget.limit_bytes = original_limit;
+                // The next iteration allocates and completes a real second BO
+                // through the same runtime after admission has been restored.
+            }
         } else {
             try t.expect(result.rejected != null or result.host_rejected != null);
             try t.expect(model.charged == 0 and !model.slots[index].live);
@@ -8673,8 +8830,13 @@ fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverAp
     if (uncertain) {
         try t.expect(model.charged == full and model.slots[0].live and running.native_buffers[0].owner != null);
         try t.expect(running.native_buffers[0].owner.?.namespace_live);
+        const held = try running.residencySnapshot();
+        try t.expect(held.stopped and !held.firmware_capture_known and held.native_reserved_bytes == full and
+            held.native_uncertain_bytes == full and held.native_mapped_bytes <= held.native_physical_bytes);
     } else {
         try t.expect(target.failure.? == error.RmClosed and model.charged == 0);
+        const released = try running.residencySnapshot();
+        try t.expect(released.native_reserved_bytes == 0 and released.native_physical_bytes == 0);
         if (success) try t.expect(model.released == 2 and model.aborted == 0);
     }
 }

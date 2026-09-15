@@ -17,5 +17,7 @@ pub const inc = encoder.inc;
 pub const extent = encoder.extent;
 pub const encode = encoder.encode;
 pub const encodeTransfer = encoder.encodeTransfer;
+pub const logicalBytes = encoder.logicalBytes;
+pub const slice = encoder.slice;
 pub const entry = encoder.entry;
 pub const entryWords = encoder.entryWords;

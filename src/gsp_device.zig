@@ -616,7 +616,7 @@ pub const Device = struct {
             if (!fifo.ring.matchesTransfer(ticket, fifo.config.object_class, transfer)) return error.Binding;
             break :blk entry.channel_handle;
         } else blk: {
-            const work = if (self.running.copy_job) |*value| value else return error.Binding;
+            const work = if (self.running.copy_job) |value| value else return error.Binding;
             if (work.submitted or work.ticket == null or !std.meta.eql(work.ticket.?, ticket) or !std.meta.eql(work.job, work.job_stamp) or
                 work.deadline != deadline) return error.Binding;
             if (work.target_presentation != null) {
@@ -627,7 +627,9 @@ pub const Device = struct {
                 } else if (!work.render_read.matches(ticket, deadline)) return error.Binding;
             }
             const transfer = self.running.copyTransfer() catch return error.Binding;
-            if (!std.meta.eql(work.transfer, transfer) or !fifo.ring.matchesTransfer(ticket, fifo.config.object_class, transfer)) return error.Binding;
+            const part = @import("gsp_copy_wire.zig").slice(transfer, work.copied, self.running.work_schedule.copy_limit) catch return error.Binding;
+            if (!std.meta.eql(work.transfer, transfer) or work.slice_end != part.next or
+                !fifo.ring.matchesTransfer(ticket, fifo.config.object_class, part.transfer)) return error.Binding;
             break :blk work.channel_handle;
         };
         if (channel_handle.epoch != self.epoch or channel_handle.slot >= self.running.fifos.len) return error.Binding;
