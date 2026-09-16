@@ -34,17 +34,18 @@ pub fn describe(pci: *const identity.Snapshot, chip: u16, topology: *const posti
     // Mesa 26.2.2 nouveau_device.c uses two MPs/TPC and 48 warps/MP here.
     if (profile.sm != 86 and profile.sm != 89) return error.Unsupported;
     const value: nv.R4NvArchitecture = .{
-        .version = 1, .size = @sizeOf(nv.R4NvArchitecture), .vendor_id = pci.pci.vendor_id,
+        .version = nv.architecture_version, .size = @sizeOf(nv.R4NvArchitecture), .vendor_id = pci.pci.vendor_id,
         .device_id = pci.pci.device_id, .chipset = chip, .pci_revision = pci.revision, .pci_domain = 0,
         .pci_bus = pci.pci.bus, .pci_device = pci.pci.device, .pci_function = pci.pci.function,
         .gpc_count = gpc, .tpc_count = tpc, .shader_model = profile.sm, .mp_per_tpc = 2, .max_warps_per_mp = 48,
         .rm_release = nv.rm_release, .vram_bytes = memory.fb_bytes, .va_start = va.base, .va_end = va.base + va.bytes,
-        .memory_generation = epoch, .bind_alignment = va.big_page_bytes, .flags = 0,
+        .memory_generation = epoch, .bind_alignment = va.big_page_bytes,
+        .flags = if (@import("gsp_buffer_wire.zig").hostCoherentPolicy()) nv.architecture_host_coherent else 0,
         .graphics_class = profile.render, .compute_class = profile.computeClass(),
         .copy_class = copy_class, .gpfifo_class = 0xc56f,
     };
     var result: r4os.abi.GfxBackendProperties = .{ .interface_id_lo = nv.backend_v1_header.interface_id_lo,
-        .interface_id_hi = nv.backend_v1_header.interface_id_hi, .revision = 1, .data_bytes = @sizeOf(nv.R4NvArchitecture) };
+        .interface_id_hi = nv.backend_v1_header.interface_id_hi, .revision = nv.architecture_version, .data_bytes = @sizeOf(nv.R4NvArchitecture) };
     @memcpy(result.data[0..@sizeOf(nv.R4NvArchitecture)], std.mem.asBytes(&value));
     return result;
 }

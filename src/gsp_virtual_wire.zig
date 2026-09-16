@@ -192,6 +192,17 @@ pub const Error = exchange.Error;
 pub const Encoded = struct { function: u32, bytes: []const u8 };
 pub const Reply = union(enum) { ok: u64, rejected: u32 };
 pub const Location = enum { system, video };
+const system_attributes: u32 = 0x22800000;
+const system_gpu_cache: u32 = 8;
+const system_snoop: u32 = 0x10;
+/// CPU cache visibility only. The RM mapping must still be acknowledged and
+/// Vulkan/engine barriers must order actual CPU/GPU accesses. Pinned nvos.h:
+/// NVOS32_ATTR_COHERENCY_CACHED, ATTR2_GPU_CACHEABLE_NO, NVOS46_CACHE_SNOOP_ENABLE.
+pub fn hostCoherentSystemPolicy() bool {
+    return @import("builtin").cpu.arch == .x86_64 and
+        system_attributes & 0xe0000000 == 0x20000000 and
+        system_gpu_cache & 0xc == 8 and system_snoop & 0x10 != 0;
+}
 pub const Allocation = struct {
     space: vaspace.Info,
     object: u32,
@@ -263,9 +274,9 @@ pub fn allocate(value: Allocation, output: []u8) Error!Encoded {
     put(p, 4, 6); // NVOS32_TYPE_DMA.
     put(p, 8, 0x80100 | @as(u32, if (value.fixed_address != 0) 0x10 else 0) |
         @as(u32, if (value.privileged) 0x08000000 else 0));
-    put(p, 24, @as(u32, if (value.location == .system) 0x22800000 else 0x00800000) |
+    put(p, 24, @as(u32, if (value.location == .system) system_attributes else 0x00800000) |
         @as(u32, if (value.blocklinear) 2 << 16 else 0));
-    put(p, 28, if (value.location == .system) 8 else 4); // Explicit GPU cache policy.
+    put(p, 28, if (value.location == .system) system_gpu_cache else 4); // Explicit GPU cache policy.
     wide(p, 64, value.bytes);
     wide(p, 72, value.alignment);
     wide(p, 80, value.fixed_address);
@@ -294,7 +305,7 @@ pub fn mapping(value: Mapping, operation: MapOperation, output: []u8) Error!Enco
     if (operation == .map) {
         wide(out, 16, value.memory_offset);
         wide(out, 24, value.bytes);
-        put(out, 32, 0x100 | @as(u32, if (value.location == .system) 0x10 else 0) |
+        put(out, 32, 0x100 | @as(u32, if (value.location == .system) system_snoop else 0) |
             @as(u32, @intFromBool(value.readonly)) | @as(u32, if (value.virtual_kind) 8 else 0));
         wide(out, 40, value.virtual_offset); // Relative non-CTXDMA input, absolute output.
     } else wide(out, 24, value.address + value.virtual_offset);

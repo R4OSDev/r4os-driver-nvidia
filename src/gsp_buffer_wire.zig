@@ -203,6 +203,12 @@ pub const Binding = struct { space: space.Info, memory: u32, virtual: u32 };
 pub const Encoded = virtual.Encoded;
 pub const Reply = union(enum) { ok: u64, rejected: u32 };
 const registration_flags: u32 = 0x40001010; // No CPU map; cached, PCI, noncontiguous.
+/// Canonical system BO DMA segments are WB RAM (kernel gfx_driver_memory).
+/// On native x86_64, cached RM registration plus acknowledged snooped,
+/// GPU-uncached mappings supports HOST_COHERENT. No VRAM/BAR claim follows.
+pub fn hostCoherentPolicy() bool {
+    return registration_flags & 0xf000 == 0x1000 and virtual.hostCoherentSystemPolicy();
+}
 fn put(out: []u8, at: usize, value: u32) void {
     std.mem.writeInt(u32, out[at..][0..4], value, .little);
 }

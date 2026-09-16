@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.137; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.138; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -23,12 +23,26 @@ The existing copy/display path uses the shared wire encoder. Dynamic resident
 range/binding metadata now runs through the real Device worker, command admission
 and graph/reset retirement. New VA names bypass the legacy fixed child ledger;
 malformed heap ownership stays retained. The common application/process broker
-and native NVK memory/VA adapters now exist; full Vulkan device/module/submit
+and native NVK memory/VA/submit/sync adapters now exist; full Vulkan device/module
 integration remains software work.
 This checkpoint does not expose a Vulkan device or promise Vulkan features.
 Details and physical follow-up: GrafikVulkan07935.txt/.json and OssiGPU.txt /35.
 The existing owner step accepts `unit-test "-Downer-test-filter=GPU virtual"`
 for this focused group alone; omitting the filter retains the full owner step.
+
+Native host coherence (0.1.138): architecture-properties revision 2 keeps the
+120-byte layout and explicitly reports coherent system-BO CPU cache access.
+The flag follows the actual x86_64 path: canonical WB RAM, cached RM memory-list
+registration, GPU-uncached virtual allocation and acknowledged CPU-snoop maps.
+Wire constants and receipt validation are shared with the established buffer
+and VA paths; no memory-protocol bytes change. This does not promise BAR/VRAM
+CPU mapping, replace execution/barrier ordering or constitute a hardware test.
+Revision 1 remains interpretable as having no coherence guarantee; older
+revision-1-only readers reject revision 2. Backend/profile/native-submit
+revisions and the R4NV runtime artifact remain unchanged. The NVK adapter now
+admits coherent GART/LOCAL allocations only with the explicit capability,
+while coherent explicit VRAM stays unsupported. Physical readback remains in
+OssiGPU /35; Vulkan device integration remains software work.
 
 Adapter-owned CE (0.79.35): `gsp_native_copy` builds the actual RM copy context
 and channel before any display consumer. Its one backend publishes the real
