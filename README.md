@@ -55,8 +55,10 @@ Timeout/stop retains the batch until the actual device-reset proof. The existing
 complete-run case covers the real Runtime/Device path with modeled GPU/MMIO,
 plus rejected map gaps, array snapshots, empty batches and subsequent CE work.
 This serialized private producer is not a public raw queue or NVK execution
-context. Canonical common-queue BO execution leases, public submit admission,
-native NVK sync/queues and pipelined submission remain open software work.
+context. R4DRAW now supplies opaque native submissions with canonical BO/VA
+execution ownership. Connecting this NVIDIA producer to those public jobs,
+native NVK sync/queues and pipelined submission remains open software work.
+NVIDIA does not yet advertise the common native-operation bit.
 
 Generations and adapters (0.79.33): native software now covers GA102/103/104/106/107
 and AD102/103/104/106/107. Each measured chip selects its own firmware family,
