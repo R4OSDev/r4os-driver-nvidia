@@ -123,7 +123,7 @@ pub const Model = struct {
     pub fn installHeadless(table: *a.DriverApi, index: usize) void {
         install(table, index);
         app_reference = false;
-        product_mode = true;
+        product_mode = true; render_mode = true;
     }
     pub fn retireReset(proof: @import("gsp_reset.zig").Quiescence) void {
         std.debug.assert(proof.valid(proof.epoch) and lost and heldReferences() == 0 and !shadow_cpu);

@@ -3891,7 +3891,7 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
     if (NativeCommon.is("context_native_connected") or NativeCommon.is("context_native_dp") or NativeCommon.hasModes()) try @import("gsp_receiver_mode_test.zig").install(&run.outputs.data.receivers[0]);
     if (NativeCommon.is("context_native_dp")) @import("gsp_dp_link_test.zig").receiver(&run.outputs.data);
     if (NativeCommon.is("context_native_connected") or NativeCommon.hasModes()) installFrlReceiver(&run.outputs.data.receivers[0].report);
-    if (NativeCommon.is("context_native_headless")) return checkNativeHeadless(target);
+    if (NativeCommon.is("context_native_headless")) return checkNativeHeadless(target,table);
     try target.native_output.request(&target.ctx.?, run, captured);
     if (NativeCommon.is("context_native_connected") or NativeCommon.is("context_native_dp")) {
         @import("gsp_display_audio_test.zig").install(&run.outputs.data.receivers[0].report);
@@ -6803,7 +6803,7 @@ fn pumpResetNativeOutput(target: *@import("gsp_device.zig").Device) !void {
 }
 // Existing lifecycle fixture: actual CE startup, queue worker and retirement;
 // only firmware replies, MMIO and GPU stores are supplied by the host model.
-fn checkNativeHeadless(target: *@import("gsp_device.zig").Device) !void {
+fn checkNativeHeadless(target: *@import("gsp_device.zig").Device, table: *a.DriverApi) !void {
     const copy = @import("gsp_copy_test_model.zig").Model;
     const run = &target.running;
     var stage: u8 = 0;
@@ -6815,19 +6815,31 @@ fn checkNativeHeadless(target: *@import("gsp_device.zig").Device) !void {
     run.outputs.data.count = 0;
     run.outputs.data.topology.count = 0;
     run.receiver_events.not_before_ns = clock + 600 * std.time.ns_per_s;
-    try run.native_copy.request();
+    try target.native_output.request(&target.ctx.?,run,target.display.?);
+    try target.native_graphics.request();
     var counts: FifoCounts = .{};
-    for (0..300) |_| {
-        _ = target.step();
-        try t.expect(target.phase == .ready);
-        if (run.fifo_active != null) try replyDeviceFifo(target, &counts, "context_native_headless")
-        else if (run.activeChannel().?.phase == .waiting) try replyNativeProduct(target);
-        if (run.native_copy.phase == .ready) break;
+    var graphics_stage: u32 = 0;
+    var before_display = false;
+    var shaders: [@import("r4nv_render").max_shader_bytes]u8 = undefined;
+    for (0..1200) |_| {
+        _ = try stepNativeQueues(target,&counts,"context_native_headless",&graphics_stage);
+        if (target.native_graphics.phase != .ready or target.render_startup.phase != .ready)
+            try t.expect(run.display_engine_owner == null and target.native_output.phase == .waiting);
+        if (run.graphics_upload != null)
+            try checkRenderUpload(target,run.native_copy.channel.?,shaders[0..try @import("r4nv_render").shaderBytesFor(try run.graphicsClass())]);
+        if (target.render_startup.phase == .ready and run.display_engine_owner == null) before_display = true;
+        if (target.native_output.phase == .receiver_wait) break;
     }
     stage = 1;
-    try t.expect(run.native_copy.phase == .ready and run.copy_backend != null and run.copy_backend.?.operations == 9 and
-        run.presentation == null and target.native_output.phase == .detached and run.display_engine_owner == null and
+    try t.expect(before_display and target.native_graphics.phase == .ready and target.render_startup.phase == .ready and
+        run.graphics_enabled and run.native_copy.phase == .ready and run.copy_backend != null and run.copy_backend.?.operations == 857 and
+        run.presentation == null and target.native_output.phase == .receiver_wait and
         copy.shadow_creates == 0 and NativeCommon.prepares == 0 and NativeCommon.commits == 0);
+    const graphics_handle = target.native_graphics.channel.?;
+    const graphics_context = target.native_graphics.context.?;
+    // Exercise the existing public consumer while the display waits for a
+    // receiver; actual RM/VA/context/ring ownership remains in the driver.
+    _ = try checkNativeQueues(target,table,&counts,"context_native_headless");
     const binding = run.copy_backend.?.binding;
     const handle = run.native_copy.channel.?;
     try t.expectError(error.Busy, run.retireExecutionChannel(handle, clock + std.time.ns_per_s, true));
@@ -6860,9 +6872,7 @@ fn checkNativeHeadless(target: *@import("gsp_device.zig").Device) !void {
     try t.expect(run.copy_job == null and copy.completed == 1 and copy.result == a.gfx_queue_result_complete);
     stage = 4;
     for (0..3) |row| try t.expectEqualSlices(u8, copy.host[0][17 + row * 80..][0..64], copy.host[1][31 + row * 96..][0..64]);
-    // Attaching the later display owner reuses the CE and binding. Missing
-    // routing consumes no modeset deadline and never tears the GPU down.
-    try target.native_output.request(&target.ctx.?, run, target.display.?);
+    // Receiver waiting consumes no modeset deadline or GPU execution owner.
     for (0..100) |_| {
         _ = target.step();
         try t.expect(target.phase == .ready);
@@ -6880,8 +6890,13 @@ fn checkNativeHeadless(target: *@import("gsp_device.zig").Device) !void {
     stage = 5;
     clock += 180 * std.time.ns_per_s;
     try t.expect(!try target.native_output.step());
+    for (0..64) |_| {
+        const progress = try stepNativeQueues(target,&counts,"context_native_headless",&graphics_stage);
+        if (!progress and run.activeChannel().?.phase == .idle) break;
+    }
     try t.expect(run.failure == null and run.presentation == null and copy.shadow_creates == 0 and
-        std.meta.eql(run.copy_backend.?.binding, binding) and std.meta.eql(run.native_copy.channel.?, handle));
+        std.meta.eql(run.copy_backend.?.binding, binding) and std.meta.eql(run.native_copy.channel.?, handle) and
+        std.meta.eql(target.native_graphics.channel.?,graphics_handle) and std.meta.eql(target.native_graphics.context.?,graphics_context));
     run.outputs.data = snapshot;
     stage = 6;
     const resumed = try target.native_output.step();
@@ -6889,7 +6904,7 @@ fn checkNativeHeadless(target: *@import("gsp_device.zig").Device) !void {
         .{run.nativeOutputs() != null,run.nativeObject() != null,run.outputs.data.count,run.outputs.data.topology.count,run.outputs.data.coherent,
             run.outputs.data.topology.rejected,run.outputs.data.final_rejection,@tagName(run.activeChannel().?.phase),run.power_active,run.context_active,run.fifo_active,run.native_active});
     try t.expect(resumed);
-    try t.expect(target.native_output.phase == .mode_create and run.copy_backend.?.operations == 9 and NativeCommon.commits == 0);
+    try t.expect(target.native_output.phase == .mode_create and run.copy_backend.?.operations == 857 and NativeCommon.commits == 0);
     // An execution timeout retains the mapped BO and all batch metadata.
     // Only the existing whole-device reset owner may release these holds.
     const batch_end = clock + std.time.ns_per_s;
@@ -6911,8 +6926,14 @@ fn checkNativeHeadless(target: *@import("gsp_device.zig").Device) !void {
     const sent = target.session.?.tx_sequence;
     stage = 9;
     var cleanup: usize = 0;
-    while (!try run.closeAfterReset(proof)) : (cleanup += 1) try t.expect(cleanup < 500);
+    errdefer std.debug.print("headless reset slices={d} phase={s} cursor={d} gr-requested={} tx={d}/{d}\n", .{
+        cleanup,@tagName(run.reset_stage),run.reset_cursor,target.reset_graphics_requested,target.session.?.tx_sequence,sent });
+    // GR global/context/cache storage is retired one acknowledged BO per
+    // slice, using the same bound as the existing virtual-resource reset case.
+    while (!try run.closeAfterReset(proof)) : (cleanup += 1) try t.expect(cleanup < 2000);
     try t.expect(run.batch_work == null and run.virtuals.ranges.root == null and target.session.?.tx_sequence == sent);
+    try t.expect(target.reset_graphics_requested);
+    std.debug.print("[nvidia-headless-graphics] CE/GR/cache precede display; native queues without receiver; 180-second wait preserves contexts; late route reuses GPU; reset retires owners\n",.{});
 }
 
 fn checkNativeBatchExecution(target: *@import("gsp_device.zig").Device,
@@ -6976,7 +6997,11 @@ fn checkNativeBatchExecution(target: *@import("gsp_device.zig").Device,
     // Only this modeled physical release store lets the real runtime drop
     // mappings and return its receipt. No public Vulkan execution is modeled.
     std.mem.writeInt(u32, bytes[layout.completion_offset..][0..4], ticket.point, .little);
-    _ = target.step();
+    for (0..32) |_| {
+        _ = target.step(); try t.expect(target.phase == .ready);
+        if (run.activeChannel().?.phase == .waiting) try replyNativeProduct(target);
+        if (run.batch_work.?.receipt != null) break;
+    }
     const receipt = (try run.receivePushBatch(handle)) orelse return error.NoReceipt;
     try t.expect(receipt.point == ticket.point and first_owner.executions == 0 and second_owner.executions == 0 and ring.idle());
     try run.unmapVirtualBuffer(second.handle, end, true);
@@ -6989,7 +7014,11 @@ fn checkNativeBatchExecution(target: *@import("gsp_device.zig").Device,
     const empty = run.batch_work.?.ticket.?;
     std.mem.writeInt(u32, bytes[layout.userd_offset+0x88..][0..4], empty.put, .little);
     std.mem.writeInt(u32, bytes[layout.completion_offset..][0..4], empty.point, .little);
-    _ = target.step();
+    for (0..32) |_| {
+        _ = target.step(); try t.expect(target.phase == .ready);
+        if (run.activeChannel().?.phase == .waiting) try replyNativeProduct(target);
+        if (run.batch_work.?.receipt != null) break;
+    }
     try t.expect((try run.receivePushBatch(handle)).?.point == empty.point);
     return first.handle;
 }
@@ -7660,7 +7689,7 @@ fn stepNativeQueues(target: *@import("gsp_device.zig").Device, counts: *FifoCoun
     } else stage.* = 0;
     return progress;
 }
-fn checkNativeQueues(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, counts: *FifoCounts, scenario: []const u8) !usize {
+fn checkNativeQueues(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, counts: *FifoCounts, scenario: []const u8) anyerror!usize {
     const load = @import("gsp_fifo_wire.zig").word;
     const peer = @import("gsp_native_queue_test_model.zig").Model;
     const provider = @import("gsp_virtual_provider_test_model.zig").Model;
@@ -7683,7 +7712,19 @@ fn checkNativeQueues(target: *@import("gsp_device.zig").Device, table: *a.Driver
     const ce = run.graphics_copy_channel.?;
     const original_backend = run.copy_backend;
     try t.expect(!run.hasQueuedWork() and run.batch_work == null and run.virtual_provider.handle.id == 0);
-    const buffer = try run.allocateNativeBuffer(4096,deadline);
+    var stage: u32 = 0;
+    const buffer = allocation: {
+        for (0..200) |_| {
+            const candidate = run.allocateNativeBuffer(4096,deadline) catch |err| {
+                // Zig 0.16 requires an explicit union here with errdefer capture.
+                if (err != error.Busy) return @as(anyerror!usize, err);
+                _ = try stepNativeQueues(target,counts,scenario,&stage);
+                continue;
+            };
+            break :allocation candidate;
+        }
+        return error.SetupTimeout;
+    };
     try driveRenderSetup(target,counts,scenario);
     const buffer_index = (try run.nativeBufferStatus(buffer)).info.?.reference.buffer.id - 801;
     const borrowed = native.borrow(buffer_index,0);
@@ -7716,7 +7757,6 @@ fn checkNativeQueues(target: *@import("gsp_device.zig").Device, table: *a.Driver
     _ = try run.registerCopyBackend(ce,deadline);
     try t.expect(try run.native_queues.step(run,&target.native_graphics));
     try t.expect(peer.operations == 9 | @as(u64,1) << a.gfx_queue_operation_native);
-    var stage: u32 = 0;
     var first_channel: ?@import("gsp_runtime.zig").ChannelHandle = null;
     var first_context: ?@import("gsp_runtime.zig").ContextHandle = null;
     for (0..3) |round| {
@@ -7886,12 +7926,13 @@ fn checkRenderUpload(target: *@import("gsp_device.zig").Device, ce: @import("gsp
     for (0..20) |_| { try stepQueuedRendering(target); if (run.graphics_upload.?.operation.submitted) break; }
     const work = &run.graphics_upload.?.operation;
     try t.expect(work.submitted and work.ticket != null);
-    const commands = &fifo.slots[1].data;
+    const index = ce_owner.commands.?.backing.reference.reference.id - 901;
+    const commands = &fifo.slots[index].data;
     const ticket = work.ticket.?;
     const load = @import("gsp_fifo_wire.zig").word;
     const gp = @as(usize,(ticket.put+511)%512)*8;
     const command_address = @as(u64,load(commands,gp))|(@as(u64,load(commands,gp+4)&255)<<32);
-    const offset: usize = @intCast(command_address-fifo.address(1));
+    const offset: usize = @intCast(command_address-fifo.address(index));
     try t.expect(load(commands,gp+4)>>10 == 17 and load(commands,offset) == 0x20010000 and load(commands,offset+8) == 0x20040100);
     const source_address = (@as(u64,load(commands,offset+12))<<32)|load(commands,offset+16);
     const destination = (@as(u64,load(commands,offset+20))<<32)|load(commands,offset+24);
@@ -7902,7 +7943,7 @@ fn checkRenderUpload(target: *@import("gsp_device.zig").Device, ce: @import("gsp
     @memcpy(output,ControlModel.data[0..bytes]);
     try stepQueuedRendering(target); try t.expect(run.graphics_upload != null and ControlModel.reading);
     const semaphore = (@as(u64,load(commands,offset+48))<<32)|load(commands,offset+52);
-    try t.expect(semaphore == fifo.address(1)+0x2200 and load(commands,offset+56) == ticket.point and load(commands,offset+64) == 0x0400000c);
+    try t.expect(semaphore == fifo.address(index)+0x2200 and load(commands,offset+56) == ticket.point and load(commands,offset+64) == 0x0400000c);
     std.mem.writeInt(u32,commands[0x2200..][0..4],ticket.point,.little);
     for (0..32) |_| { try stepQueuedRendering(target); if (run.graphics_upload == null) break; }
     try t.expect(run.graphics_upload == null and !ControlModel.reading and ce_owner.ring.idle());

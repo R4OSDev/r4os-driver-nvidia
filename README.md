@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.136; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.137; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -38,6 +38,15 @@ display reuses this binding and adds its supported operations; absent routing
 waits before display programming without expiring the GPU. Live registration
 prevents channel/graph retirement. Existing Device quarantine/FLR retains and
 retires the same resources; explicit recovery to the console exposes no backend.
+Graphics startup (0.1.137) now follows CE readiness, independently of a receiver.
+Requested GR contexts and optional fixed-renderer warmup complete before the
+display leaves its waiting state. Known GR/cache unavailability still permits
+the CE display path. Receiver waiting consumes no GPU startup deadline;
+attaching a route later reuses the existing execution contexts and backend.
+Reset remembers whether GR was requested and requests it in the new epoch;
+explicit console recovery intentionally omits it. The existing headless case
+checks native queues, a modeled 180-second receiver wait and reset retirement.
+Physical execution remains unverified; this case does not exercise GR restart.
 Bootstrap still requires the selected GPU's captured boot framebuffer. This
 does not add secondary/non-boot GPU startup or a Vulkan logical device.
 The existing `unit-test` step accepts
@@ -84,7 +93,7 @@ its requesting job waits; live or uncertain channels retain their busy guard.
 Queue close/producer exit retires an idle context asynchronously; submitted jobs
 retain their context and maps until the physical semaphore or proven reset.
 Malformed input fails before publication; uncertain retirement quarantines.
-NVK submission/sync, independent headless GR startup, Vulkan device admission
+NVK submission/sync and Vulkan device admission
 and an installed R4VK provider remain software work. Optional legacy 2D/M2MF and
 copy-only queues are not admitted by this graphics-queue packet. Host models are
 not physical GPU acceptance; see GrafikVulkan07935.json/native_engines and

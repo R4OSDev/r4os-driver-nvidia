@@ -39,7 +39,7 @@ pub const Model = struct {
     pub fn address(index: usize) u64 {
         // Golden + regular GR, CE and render buffers coexist in the same
         // 4GB test VA space. Keep this larger scenario below the FIFO region.
-        const stride: u64 = if (std.mem.startsWith(u8, heap_model.scenario, "context_graphics")) 0x02000000 else 0x10000000;
+        const stride: u64 = if (std.mem.startsWith(u8, heap_model.scenario, "context_graphics") or is("context_native_headless")) 0x02000000 else 0x10000000;
         return 0x10000000 + index * stride;
     }
     fn memory(out: *a.GfxDriverMemoryApi) callconv(.c) i32 {

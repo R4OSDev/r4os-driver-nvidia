@@ -82,6 +82,7 @@ pub const Device = struct {
     boot_console: console.Owner = .{},
     reset_retire_deadline: u64 = 0,
     reset_frame_count: u8 = 2,
+    reset_graphics_requested: bool = false,
     reset_audio_location: u32 = 0,
     reset_audio_device: u32 = 0,
     reset_audio_attached: bool = false,
@@ -285,17 +286,28 @@ pub const Device = struct {
                 } else try self.catalog.invalidate();
             }
             const copy_progress = try self.running.native_copy.step(&self.running);
-            const output_progress = try self.native_output.step();
             const allocation_progress = try self.running.allocations.step(&self.running);
             const virtual_progress = try self.running.virtual_provider.step(&self.running);
             const graphics_progress = try self.native_graphics.step(&self.running,
-                self.native_output.phase == .active or self.native_output.phase == .detached);
+                self.running.native_copy.phase == .ready or self.running.native_copy.phase == .detached);
             if (progress) self.running.native_queues.wake();
             const native_progress = try self.running.native_queues.step(&self.running,
                 if (self.native_graphics.phase == .ready) &self.native_graphics else null);
             const render_progress = try self.render_startup.step(&self.running,
                 if (self.native_graphics.phase == .ready) self.native_graphics.channel else null,
                 if (self.running.native_copy.phase == .ready) self.running.native_copy.channel else null);
+            // GPU execution starts before the optional display consumer. Its
+            // finite startup deadlines must not include receiver/FRL/DP waits,
+            // nor may display startup expire while shader warmup borrows RM/CE.
+            // Known GR/cache unavailability still permits the CE display path.
+            const graphics_starting = switch (self.native_graphics.phase) {
+                .detached, .ready, .unavailable, .closed => false,
+                else => true,
+            };
+            const render_starting = self.native_graphics.phase == .ready and self.running.native_copy.phase == .ready and
+                self.render_startup.phase != .ready and self.render_startup.phase != .unavailable;
+            const output_progress = if (self.native_output.phase == .waiting and (graphics_starting or render_starting)) false
+                else try self.native_output.step();
             if (self.native_output.phase == .active and self.interrupts.display.epoch == 0) {
                 const root = (try self.running.displayEngineStatus(self.native_output.engine.?)).info orelse return error.State;
                 const head = self.native_output.mode.?.head;
@@ -450,6 +462,7 @@ pub const Device = struct {
         if (self.gpu_reset.self_address != 0) return error.ResetLimit;
         self.phase = .resetting;
         self.reset_retire_deadline = try std.math.add(u64, self.ctx.?.resources().?.nowNs(), 5 * std.time.ns_per_s);
+        self.reset_graphics_requested = self.native_graphics.self_address != 0 and !self.reset_to_console;
         if (self.recovery_hooks == null) {
             try self.gpu_reset.open(&self.reset_config, self.epoch, self.resetIo());
         } else {
@@ -545,6 +558,7 @@ pub const Device = struct {
                 self.catalog = .{};
                 try self.catalog.open(&self.ctx.?, adapter);
                 try self.native_output.requestAfterReset(&self.ctx.?, &self.running, self.display.?, self.reset_display.generation);
+                if (self.reset_graphics_requested) try self.native_graphics.request();
                 if (self.reset_to_console) {
                     self.running.native_copy.publish_backend = false;
                     self.native_output.console = &self.boot_console;
