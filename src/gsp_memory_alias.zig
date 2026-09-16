@@ -6,6 +6,7 @@ const r4os = @import("r4os");
 const a = r4os.abi;
 const wire = @import("gsp_virtual_wire.zig");
 pub const Error = wire.Error || error{ Busy, Descriptor, Retained };
+pub const RetainError = Error || error{ Api, Memory, Unsupported };
 pub const Source = struct {
     space: @import("gsp_vaspace.zig").Info,
     object: u32,
@@ -65,23 +66,40 @@ pub const Use = struct {
     }
     /// Native VRAM needs an independent common import as well as an RM hold:
     /// otherwise bufferTakeRelease could issue a release ticket too early.
-    pub fn retainCommon(self: *Use, memory: r4os.driver_memory.Context, reference: a.GfxBufferReference) Error!void {
+    /// The common owner resolves the source reference. A caller's object ID
+    /// is only an expected identity, never proof of its backing or access mode.
+    pub fn retainReference(self: *Use, memory: r4os.driver_memory.Context, reference: a.GfxBufferHandle, expected: a.GfxBufferHandle) RetainError!void {
         _ = try self.info();
         if (self.memory != null or self.reference.reference.id != 0) return error.Busy;
         self.memory = memory;
-        const result = memory.bufferImport(&reference.reference, &self.reference);
+        const result = memory.bufferImport(&reference, &self.reference);
         self.reference_stamp = self.reference;
         const v = self.reference;
         if (result != a.gfx_buffer_result_ok and v.reference.id == 0 and v.buffer.id == 0) {
             self.memory = null;
             self.reference = .{};
             self.reference_stamp = .{};
-            return error.Busy;
+            return switch (result) {
+                a.gfx_buffer_error_busy => error.Busy,
+                a.gfx_buffer_error_oom, a.gfx_buffer_error_capacity, a.gfx_buffer_error_budget => error.Memory,
+                a.gfx_buffer_error_stale, a.gfx_buffer_error_closed, a.gfx_buffer_error_invalid => error.Stale,
+                a.gfx_buffer_error_unsupported => error.Unsupported,
+                else => error.Api,
+            };
         }
-        if (v.version != 1 or v.size < @sizeOf(a.GfxBufferReference) or v.flags != 0 or v.reserved0 != 0 or
+        if (v.version != 1 or v.size < @sizeOf(a.GfxBufferReference) or v.flags & ~@as(u32, a.gfx_buffer_reference_immutable | a.gfx_buffer_reference_mapping_only) != 0 or v.reserved0 != 0 or
             v.reference.id == 0 or v.reference.generation == 0 or v.reference.reserved0 != 0 or
-            !std.meta.eql(v.buffer, reference.buffer)) { self.damaged = true; return error.Descriptor; }
+            v.buffer.id == 0 or v.buffer.generation == 0 or v.buffer.reserved0 != 0) { self.damaged = true; return error.Descriptor; }
         if (result != a.gfx_buffer_result_ok) return error.Retained;
+        if (v.flags != 0 or !std.meta.eql(v.buffer, expected)) {
+            // A valid canonical import of an unsuitable BO is a rejected
+            // request, not a damaged device. Release precisely that import.
+            if (memory.bufferRelease(&v.reference) != a.gfx_buffer_result_ok) return error.Retained;
+            self.memory = null;
+            self.reference = .{};
+            self.reference_stamp = .{};
+            return if (v.flags != 0) error.Unsupported else error.Stale;
+        }
     }
     pub fn close(self: *Use, quiesced: bool) Error!void {
         if (self.mapping_owner != null) return error.Busy;

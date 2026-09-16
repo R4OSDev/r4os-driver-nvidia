@@ -224,7 +224,7 @@ pub const VirtualHandle = virtual_resources.Handle;
 pub const VirtualBindingHandle = virtual_resources.BindingHandle;
 pub const VirtualStatus = struct { state: virtual_resources.range.State, info: ?virtual_resources.range.Info, rejected: ?u32 };
 pub const VirtualBindingStatus = struct { mapped: bool, bytes: u64, rejected: ?u32 };
-pub const VirtualSource = union(enum) { system: BufferHandle, native: BufferHandle };
+pub const VirtualSource = union(enum) { system: BufferHandle, native: BufferHandle, native_reference: r4os.abi.GfxBufferReference };
 pub const BufferStatus = struct { state: buffer_mapping.State, info: ?buffer_mapping.Info, rejected: ?u32, host_rejected: ?buffer_mapping.Error };
 const BufferSlot = struct { owner: ?*buffer_mapping.Owner = null, allocation: r4os.abi.DriverHeapAllocation = .{}, heap: ?r4os.r4dev.DriverHeapContext = null, serial: u64 = 0, pending_source: r4os.abi.GfxBufferReference = .{}, cacheable: bool = false, last_used: u64 = 0, evicting: bool = false };
 pub const NativeBufferStatus = struct { state: vram.State, info: ?vram.Info, rejected: ?u32, host_rejected: ?i32 };
@@ -5130,6 +5130,13 @@ pub const Owner = struct {
         switch (source) {
             .system => |buffer| try (try self.findBuffer(buffer)).retainAliasChunk(use, memory_offset, bytes),
             .native => |buffer| try (try self.findNativeBuffer(buffer)).retainAlias(use, memory_offset, bytes),
+            .native_reference => |reference| {
+                const owner = for (&self.native_buffers) |*slot| {
+                    const candidate = slot.owner orelse continue;
+                    if (std.meta.eql(candidate.reservation.buffer, reference.buffer)) break candidate;
+                } else return error.Stale;
+                try owner.retainAliasReference(use, reference, memory_offset, bytes);
+            },
         }
         const retained = try use.info();
         var token = try self.channel.?.handoff(deadline);

@@ -9494,9 +9494,32 @@ fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverAp
             try alias_use.close(true);
             const virtual = try running.allocateVirtualRange(.{ .bytes = 16384, .fixed_address = 0x90000000, .location = .video }, deadline);
             try finishVirtual(target, false);
-            const mapped = try running.mapVirtualBuffer(virtual, .{ .native = handles[0] }, 65536, 8192, 4096, deadline);
+            const owner = running.native_buffers[handles[0].slot].owner.?;
+            const memory = running.ctx.?.memory().?;
+            const sent = session.tx_sequence;
+            // The reference's real common identity, not caller-supplied
+            // buffer/flag fields, decides whether this VRAM may be aliased.
+            var wrong = (try running.nativeBufferStatus(handles[1])).info.?.reference;
+            wrong.buffer = owner.reservation.buffer;
+            try t.expectError(error.Stale, running.mapVirtualBuffer(virtual, .{ .native_reference = wrong }, 0, 0, 4096, deadline));
+            try t.expect(!model.slots[1].imported and owner.aliases.empty() and running.failure == null);
+            var readonly = model.borrow(0, r4os.abi.gfx_buffer_reference_immutable);
+            readonly.flags = 0;
+            try t.expectError(error.Unsupported, running.mapVirtualBuffer(virtual, .{ .native_reference = readonly }, 0, 0, 4096, deadline));
+            try t.expect(!model.slots[0].imported and owner.aliases.empty() and running.failure == null);
+            try t.expect(memory.bufferRelease(&readonly.reference) == 1);
+            const borrowed = model.borrow(0, 0);
+            try running.releaseNativeBuffer(handles[0]);
+            try t.expect((try running.nativeBufferStatus(handles[0])).info == null and model.slots[0].borrowed and !model.slots[0].reference);
+            try t.expectError(error.State, running.mapVirtualBuffer(virtual, .{ .native = handles[0] }, 0, 0, 4096, deadline));
+            model.import_failure = r4os.abi.gfx_buffer_error_oom;
+            try t.expectError(error.Memory, running.mapVirtualBuffer(virtual, .{ .native_reference = borrowed }, 0, 0, 4096, deadline));
+            model.import_failure = 0;
+            try t.expect(owner.aliases.empty() and running.failure == null and session.tx_sequence == sent);
+            const mapped = try running.mapVirtualBuffer(virtual, .{ .native_reference = borrowed }, 65536, 8192, 4096, deadline);
             try finishVirtual(target, false);
             try t.expect(mapped.bytes == 4096 and (try running.virtualBindingStatus(mapped.handle)).mapped and model.slots[0].imported);
+            try t.expect(memory.bufferRelease(&borrowed.reference) == 1 and !model.slots[0].borrowed);
         }
         if (success) @import("gsp_buffer_test_model.zig").Model.closeHeapAdmission(table);
         try t.expectError(error.Busy, running.beginDestroyGraph(deadline, false));

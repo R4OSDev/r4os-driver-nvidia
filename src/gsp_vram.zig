@@ -125,12 +125,25 @@ pub const Owner = struct {
     }
     pub fn retainAlias(self: *Owner, use: *alias.Use, offset: u64, bytes: u64) Error!void {
         const value = self.info() orelse return error.State;
+        try self.retainAliasReference(use, value.reference, offset, bytes);
+    }
+    /// A broker-retained full reference may survive the allocation producer's
+    /// initial close. Authenticate it through a new common import before RM
+    /// work; the supplied object identity alone cannot authorize a mapping.
+    pub fn retainAliasReference(self: *Owner, use: *alias.Use, reference: a.GfxBufferReference, offset: u64, bytes: u64) Error!void {
+        try self.stable();
+        if (self.self_address != @intFromPtr(self) or !self.committed or !self.common_live or !self.mapped or
+            self.failure != null or self.exchange.session.state != .active or
+            (self.state != .ready and self.state != .handed_off)) return error.State;
+        if (reference.version != 1 or reference.size < @sizeOf(a.GfxBufferReference) or reference.reserved0 != 0 or
+            !valid(reference.reference) or !std.meta.eql(reference.buffer, self.reservation.buffer)) return error.Stale;
+        if (reference.flags != 0) return error.Unsupported;
         if (self.storage_policy != null or self.layout.privileged or self.layout.readonly) return error.Unsupported;
         if (bytes == 0 or (offset | bytes) & 4095 != 0 or bytes > self.logical_bytes or offset > self.logical_bytes - bytes) return error.Bounds;
         try self.aliases.acquire(use, .{ .space = self.binding.space, .object = self.binding.memory,
             .allocation_bytes = self.bytes, .offset = offset, .bytes = bytes, .location = .video });
-        use.retainCommon(self.memory, value.reference) catch |err| {
-            if (err == error.Busy) { try use.close(true); return err; }
+        use.retainReference(self.memory, reference.reference, self.reservation.buffer) catch |err| {
+            if (err != error.Descriptor and err != error.Retained) { try use.close(true); return err; }
             // A partial/invalid returned import is retained, never dropped or
             // treated as an ordinary allocation rejection.
             return self.fail(err);

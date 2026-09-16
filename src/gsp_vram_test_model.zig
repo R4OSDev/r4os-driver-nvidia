@@ -4,13 +4,14 @@ const std = @import("std");
 const a = @import("r4os").abi;
 const heap_model = @import("gsp_buffer_test_model.zig").Model;
 pub const Model = struct {
-    const Slot = struct { reservation: a.GfxOwnedBufferReservation = .{}, descriptor: a.GfxBufferDescriptor = .{}, live: bool = false, published: bool = false, reference: bool = false, imported: bool = false, claimed: bool = false, gpu: a.GfxDeviceLease = .{} };
+    const Slot = struct { reservation: a.GfxOwnedBufferReservation = .{}, descriptor: a.GfxBufferDescriptor = .{}, live: bool = false, published: bool = false, reference: bool = false, imported: bool = false, borrowed: bool = false, borrowed_flags: u32 = 0, claimed: bool = false, gpu: a.GfxDeviceLease = .{} };
     pub var slots: [32]Slot = @splat(.{});
     pub var charged: u64 = 0;
     pub var released: u32 = 0;
     pub var aborted: u32 = 0;
     pub var budget: a.GfxDeviceBudgetState = .{};
     pub var budget_configurations: u32 = 0;
+    pub var import_failure: i32 = 0;
     var query: *const fn (*a.GfxDriverMemoryApi) callconv(.c) i32 = undefined;
     var fallback_release: u64 = 0;
     var fallback_import: u64 = 0;
@@ -19,7 +20,7 @@ pub const Model = struct {
     pub fn install(table: *a.DriverApi, scenario: []const u8) void {
         heap_model.install(table, scenario); query = table.gfx_memory_query.?;
         table.gfx_memory_query = memory; slots = @splat(.{}); charged = 0; released = 0; aborted = 0;
-        budget = .{}; budget_configurations = 0;
+        budget = .{}; budget_configurations = 0; import_failure = 0;
     }
     pub fn dispose(table: *a.DriverApi) void { heap_model.dispose(table); }
     pub fn retireReset(proof: @import("gsp_reset.zig").Quiescence) void {
@@ -92,6 +93,9 @@ pub const Model = struct {
         return a.gfx_buffer_result_ok;
     }
     fn drop(reference: *const a.GfxBufferHandle) callconv(.c) i32 {
+        for (&slots, 0..) |*slot, i| if (slot.live and std.meta.eql(borrowedReference(i), reference.*)) {
+            std.debug.assert(slot.borrowed); slot.borrowed = false; return a.gfx_buffer_result_ok;
+        };
         for (&slots, 0..) |*slot, i| if (slot.live and std.meta.eql(importedReference(i), reference.*)) {
             std.debug.assert(slot.imported and slot.gpu.lease.id == 0); slot.imported = false; return a.gfx_buffer_result_ok;
         };
@@ -101,7 +105,25 @@ pub const Model = struct {
         const call: *const fn (*const a.GfxBufferHandle) callconv(.c) i32 = @ptrFromInt(fallback_release); return call(reference);
     }
     fn importedReference(index: usize) a.GfxBufferHandle { return .{ .id = @intCast(821 + index), .generation = 702 }; }
+    fn borrowedReference(index: usize) a.GfxBufferHandle { return .{ .id = @intCast(861 + index), .generation = 711 }; }
+    // Independent common reference obtained by an application/broker before
+    // the native allocation producer closes its initial reference.
+    pub fn borrow(index: usize, flags: u32) a.GfxBufferReference {
+        const slot = &slots[index];
+        std.debug.assert(slot.live and slot.published and slot.reference and !slot.claimed and !slot.borrowed);
+        slot.borrowed = true; slot.borrowed_flags = flags;
+        return .{ .buffer = slot.reservation.buffer, .reference = borrowedReference(index), .flags = flags };
+    }
     fn import(input: *const a.GfxBufferHandle, out: *a.GfxBufferReference) callconv(.c) i32 {
+        if (import_failure != 0) return import_failure;
+        for (&slots, 0..) |*slot, i| if (slot.live and std.meta.eql(borrowedReference(i), input.*)) {
+            if (!slot.borrowed) return a.gfx_buffer_error_stale;
+            if (slot.borrowed_flags & a.gfx_buffer_reference_mapping_only != 0) return a.gfx_buffer_error_unsupported;
+            std.debug.assert(slot.published and !slot.claimed and !slot.imported);
+            slot.imported = true;
+            out.* = .{ .reference = importedReference(i), .buffer = slot.reservation.buffer, .flags = slot.borrowed_flags };
+            return a.gfx_buffer_result_ok;
+        };
         for (&slots, 0..) |*slot, i| if (slot.live and std.meta.eql(slot.reservation.reference, input.*)) {
             std.debug.assert(slot.reference and slot.published and !slot.claimed and !slot.imported);
             slot.imported = true; out.* = .{ .reference = importedReference(i), .buffer = slot.reservation.buffer }; return a.gfx_buffer_result_ok;
@@ -136,7 +158,7 @@ pub const Model = struct {
             .device_generation = r.device_generation, .driver_generation = r.driver_generation, .adapter_id = r.adapter_id, .driver_owner = r.driver_owner };
     }
     fn take(adapter: u32, epoch: u64, out: *a.GfxOwnedBufferRelease) callconv(.c) i32 {
-        for (&slots) |*slot| if (slot.live and slot.published and !slot.reference and !slot.imported and slot.gpu.lease.id == 0 and !slot.claimed) {
+        for (&slots) |*slot| if (slot.live and slot.published and !slot.reference and !slot.imported and !slot.borrowed and slot.gpu.lease.id == 0 and !slot.claimed) {
             std.debug.assert(slot.reservation.adapter_id == adapter and slot.reservation.device_generation == epoch);
             slot.claimed = true; out.* = ticket(slot.*); return a.gfx_buffer_result_ok;
         };
@@ -144,7 +166,7 @@ pub const Model = struct {
     }
     fn finish(r: *const a.GfxOwnedBufferRelease, quiesced: u32) callconv(.c) i32 {
         for (&slots) |*slot| if (slot.live and std.meta.eql(ticket(slot.*), r.*)) {
-            std.debug.assert(slot.claimed and !slot.reference and !slot.imported and slot.gpu.lease.id == 0 and quiesced == 1);
+            std.debug.assert(slot.claimed and !slot.reference and !slot.imported and !slot.borrowed and slot.gpu.lease.id == 0 and quiesced == 1);
             if (is("vram_finish")) return a.gfx_buffer_error_busy;
             slot.live = false; charged -= r.byte_length; released += 1; return a.gfx_buffer_result_ok;
         };
