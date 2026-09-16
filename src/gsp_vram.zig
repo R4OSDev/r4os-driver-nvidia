@@ -65,6 +65,11 @@ pub const Owner = struct {
     pub fn initStorage(token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext, adapter: u32, space: vaspace.Info,
         parent: names.Lease, plan: surface.Plan, policy: ?storage.Policy, deadline: u64) Error!Owner
     {
+        return initResident(token, ctx, adapter, space, parent, plan, policy, deadline, null);
+    }
+    pub fn initResident(token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext, adapter: u32, space: vaspace.Info,
+        parent: names.Lease, plan: surface.Plan, policy: ?storage.Policy, deadline: u64, resident: ?*names.ResidentChildren) Error!Owner
+    {
         if (token.claimed or token.session.state != .active or token.session.pending != null or adapter == 0 or
             space.epoch != token.session.epoch or parent.epoch != space.epoch or parent.client != space.client) return error.Stale;
         try token.session.guard(deadline);
@@ -82,7 +87,8 @@ pub const Owner = struct {
             }
             try value.validate(space, plan.allocation_bytes);
         }
-        const children = try token.session.rm_names.reserveChildren(parent, 2);
+        const children = if (resident) |node| try token.session.rm_names.reserveResidentChildren(parent, 2, node)
+            else try token.session.rm_names.reserveChildren(parent, 2);
         errdefer token.session.rm_names.retireChildren(children) catch {};
         const binding: wire.Binding = .{ .space = space, .memory = try children.object(0), .virtual = try children.object(1) };
         return .{ .exchange = try exchange.Exchange.init(token, deadline), .memory = memory, .names = children,

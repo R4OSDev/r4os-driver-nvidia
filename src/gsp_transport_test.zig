@@ -3958,6 +3958,7 @@ test "GPU virtual ranges keep independent addresses and exact memory ownership" 
     const range = @import("gsp_virtual_range.zig");
     const wire = range.wire;
     try checkResidentRmNames();
+    try checkResourceSlots();
     const model = try t.allocator.create(Model);
     defer t.allocator.destroy(model);
     // Existing captured packets remain unchanged through the shared encoder.
@@ -4121,6 +4122,64 @@ test "GPU virtual ranges keep independent addresses and exact memory ownership" 
         plan = owner.plan;
         plan.bytes = std.math.maxInt(u64) - 4095;
         try t.expectError(error.Bounds, wire.allocate(plan, &reply));
+    }
+}
+fn checkResourceSlots() !void {
+    const r4os = @import("r4os");
+    const a = r4os.abi;
+    const heap = @import("gsp_buffer_test_model.zig").Model;
+    const Slot = struct { allocation: a.DriverHeapAllocation = .{}, serial: u64 = 0, owner: ?*u64 = null };
+    const Pool = @import("gsp_resource_slots.zig").Pool(Slot);
+    for (0..3) |scenario| {
+        var table: a.DriverApi = undefined;
+        table.magic = a.driver_magic; table.version = 34; table.size = @sizeOf(a.DriverApi);
+        heap.install(&table, "resource_slots"); defer heap.dispose(&table);
+        const ctx = r4os.r4dev.DriverContext.init(&table);
+        const api = ctx.heap().?;
+        var pool: Pool = .{};
+        var owners: [513]u64 = undefined;
+        const total: usize = if (scenario == 0) owners.len else if (scenario == 1) 64 else 32;
+        for (0..total) |i| {
+            if (i == 32) for ([_]@TypeOf(heap.allocation_fault){ .empty, .partial }) |fault| {
+                heap.allocation_fault = fault;
+                try t.expectError(error.Memory, pool.acquire(api));
+                try t.expect(pool.items().len == 32 and heap.heapLive() == 0 and pool.pending.handle == 0);
+            };
+            const index = try pool.acquire(api);
+            try t.expect(index == i);
+            owners[i] = 700 + i;
+            pool.items()[index] = .{ .allocation = .{ .handle = i + 1 }, .serial = 1000 + i, .owner = &owners[i] };
+            for (pool.view()[0..i + 1], 0..) |slot, prior| {
+                try t.expect(slot.serial == 1000 + prior and slot.owner.? == &owners[prior] and slot.owner.?.* == 700 + prior);
+            }
+        }
+        var copied = pool;
+        try t.expectError(error.Stale, copied.acquire(api));
+        try t.expectError(error.Busy, pool.closeEmpty());
+        if (scenario == 0) {
+            // Reuse an index; the resource serial, not array position, is its
+            // identity. Other owners survive every metadata relocation.
+            pool.items()[257] = .{};
+            try t.expect(try pool.acquire(api) == 257 and pool.items()[258].owner.? == &owners[258]);
+            try t.expect(heap.heapLive() == 1);
+        } else if (scenario == 1) {
+            heap.release_fault = true;
+            try t.expectError(error.Retained, pool.acquire(api));
+            try t.expect(pool.items().len == 128 and heap.heapLive() == 2 and pool.items()[63].owner.? == &owners[63]);
+            try t.expectError(error.Retained, pool.acquire(api));
+        } else {
+            heap.allocation_fault = .descriptor;
+            try t.expectError(error.Descriptor, pool.acquire(api));
+            try t.expect(pool.items().len == 32 and heap.heapLive() == 1 and !pool.pending_valid);
+        }
+        @memset(pool.items(), .{}); // Synthetic resources have no GPU lifetime.
+        if (scenario == 2) {
+            try t.expectError(error.Descriptor, pool.closeEmpty());
+            try t.expect(heap.heapLive() == 1); // Never free a guessed descriptor.
+        } else {
+            try pool.closeEmpty(); try pool.closeEmpty();
+            try t.expect(heap.heapLive() == 0 and pool.dynamic.len == 0);
+        }
     }
 }
 fn checkResidentRmNames() !void {

@@ -2925,7 +2925,7 @@ fn finishContextBuffer(target: *@import("gsp_device.zig").Device, handle: @impor
     while (target.phase == .ready and running.native_active != null and steps < 80) : (steps += 1) {
         _ = target.step();
         if (target.phase != .ready or running.native_active == null) break;
-        const owner = running.native_buffers[running.native_active.?].owner.?;
+        const owner = running.native_buffers.items()[running.native_active.?].owner.?;
         const private = owner.storage_policy != null;
         const channel = running.activeChannel().?;
         if (channel.phase != .waiting) continue;
@@ -2950,7 +2950,7 @@ fn finishContextBuffer(target: *@import("gsp_device.zig").Device, handle: @impor
     }
     try t.expect(steps < 80 and target.phase == .ready and (try running.nativeBufferStatus(handle)).info != null);
     const memory = try running.residencySnapshot();
-    const held = running.native_buffers[handle.slot].owner.?;
+    const held = running.native_buffers.items()[handle.slot].owner.?;
     try t.expect(memory.firmware_capture_known and !memory.stopped and memory.native_reserved_bytes >= held.bytes and
         memory.native_physical_bytes >= held.bytes and memory.native_mapped_bytes >= held.bytes and
         memory.native_mapped_bytes <= memory.native_physical_bytes and memory.native_physical_bytes <= memory.native_reserved_bytes);
@@ -4040,7 +4040,7 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
             try t.expect(run.display_resources_slot.owner == null and run.display_engine_owner == null and run.presentation == null);
             for (&run.contexts) |*slot| try t.expect(slot.owner == null and slot.allocation.handle == 0);
             for (&run.fifos) |*slot| try t.expect(slot.owner == null and slot.allocation.handle == 0);
-            for (&run.native_buffers) |*slot| try t.expect(slot.owner == null and slot.allocation.handle == 0);
+            for (run.native_buffers.items()) |*slot| try t.expect(slot.owner == null and slot.allocation.handle == 0);
             checkpoint = "fresh native firmware generation";
             while (target.phase == .retiring) : (slices += 1) {
                 try t.expect(slices < 2100);
@@ -5429,7 +5429,7 @@ fn checkComposedNativeImage(target: *@import("gsp_device.zig").Device) !void {
         }
         checkpoint = "allocate info";
         const source = (try run.nativeBufferStatus(buffer)).info orelse {
-            const value = run.native_buffers[buffer.slot].owner.?;
+            const value = run.native_buffers.items()[buffer.slot].owner.?;
             std.debug.print("composed allocation: state={s} operation={?} rejected={?} host={?} rpc={s}\n",
                 .{ @tagName(value.state), value.operation, value.rejected, value.host_rejected, @tagName(value.exchange.phase) });
             return error.State;
@@ -5505,9 +5505,9 @@ fn checkComposedNativeImage(target: *@import("gsp_device.zig").Device) !void {
         for (0..50) |_| {
             clock += 1000; _ = target.step(); try t.expect(target.phase == .ready);
             if (run.activeChannel().?.phase == .waiting) try replyNativeProduct(target);
-            if (run.primaryFlip() == null and !native.slots[source_index].live and run.native_active == null and run.native_buffers[buffer.slot].owner == null) break;
+            if (run.primaryFlip() == null and !native.slots[source_index].live and run.native_active == null and run.native_buffers.items()[buffer.slot].owner == null) break;
         }
-        try t.expect(run.primaryFlip() == null and !native.slots[source_index].live and run.native_active == null and run.native_buffers[buffer.slot].owner == null);
+        try t.expect(run.primaryFlip() == null and !native.slots[source_index].live and run.native_active == null and run.native_buffers.items()[buffer.slot].owner == null);
     }
     try t.expectEqualDeep(before_cpu, copy.host);
 }
@@ -6831,7 +6831,7 @@ fn replyNativeProduct(target: *@import("gsp_device.zig").Device) !void {
         }
         }
     } else if (run.native_active) |index| {
-        const owner = run.native_buffers[index].owner.?;
+        const owner = run.native_buffers.items()[index].owner.?;
         const slot = owner.reservation.buffer.id - 801;
         switch (owner.operation.?) {
             .allocate_memory, .allocate_virtual => {
@@ -8585,7 +8585,7 @@ fn checkDevicePresentation(target: *@import("gsp_device.zig").Device, handle: @i
         while (target.phase == .ready and (running.copy_job == null or !running.copy_job.?.submitted) and steps < 100) : (steps += 1) {
             if (frame == 0 and !admission_checked and running.copy_job != null and running.buffer_active == null) {
                 const job = running.copy_job.?;
-                for (&running.buffers) |*slot| if (slot.owner) |mapping| if (mapping.info()) |source| {
+                for (running.buffers.items()) |*slot| if (slot.owner) |mapping| if (mapping.info()) |source| {
                     if (!std.meta.eql(source.buffer, job.job.source_buffer)) continue;
                     job.addresses[0] = .{ .address = source.address, .bytes = source.logical_bytes };
                     job.transfer = try running.copyTransfer();
@@ -8790,7 +8790,7 @@ fn checkDeviceDisplaySubmissions(target: *@import("gsp_device.zig").Device, hand
 const FifoCounts = struct { allocations: usize = 0, frees: usize = 0, enables: usize = 0, disables: usize = 0, event: bool = false };
 fn replyCopyMapping(target: *@import("gsp_device.zig").Device) !void {
     const running = &target.running; const session = &target.session.?;
-    const owner = running.buffers[running.buffer_active.?].owner.?;
+    const owner = running.buffers.items()[running.buffer_active.?].owner.?;
     const rpc = &owner.exchange;
     if (rpc.phase != .waiting) return;
     var response: [1024]u8 = @splat(0); @memcpy(response[0..rpc.request.len], rpc.request);
@@ -8914,19 +8914,19 @@ fn checkDeviceCopies(target: *@import("gsp_device.zig").Device, table: *a.Driver
             const before_put = fifo_owner.ring.put;
             const held_before = model.heldReferences();
             try t.expect(held_before == 2 and running.mapping_evictions == 0);
-            try t.expect(try running.prepareCopyMappings(running.buffers.len - 1, 128 * 1024 * 1024, deadline));
+            try t.expect(try running.prepareCopyMappings(running.buffers.items().len - 1, 128 * 1024 * 1024, deadline));
             const evicted = running.buffer_active.?;
-            const old_serial = running.buffers[evicted].serial;
-            try t.expect(running.buffers[evicted].owner.?.source.buffer.id == 1101 and model.heldReferences() == held_before and
+            const old_serial = running.buffers.items()[evicted].serial;
+            try t.expect(running.buffers.items()[evicted].owner.?.source.buffer.id == 1101 and model.heldReferences() == held_before and
                 running.mapping_evictions == 0 and fifo_owner.ring.put == before_put);
-            try t.expectError(error.Busy, running.prepareCopyMappings(running.buffers.len, 0, deadline));
+            try t.expectError(error.Busy, running.prepareCopyMappings(running.buffers.items().len, 0, deadline));
             var eviction_steps: usize = 0;
             while (running.buffer_active != null and eviction_steps < 64) : (eviction_steps += 1) {
                 _ = target.step();
                 if (running.buffer_active != null) try replyCopyMapping(target);
             }
             try t.expect(eviction_steps < 64 and target.phase == .ready and running.mapping_evictions == 1 and
-                model.heldReferences() == held_before - 1 and running.buffers[evicted].owner == null and fifo_owner.ring.put == before_put);
+                model.heldReferences() == held_before - 1 and running.buffers.items()[evicted].owner == null and fifo_owner.ring.put == before_put);
             try t.expectError(error.Stale, running.bufferStatus(.{ .epoch = running.epoch, .serial = old_serial, .slot = evicted }));
             // Byte pressure also evicts with plenty of free metadata slots.
             try t.expect(try running.prepareCopyMappings(2, 0, deadline));
@@ -8979,7 +8979,7 @@ fn checkDeviceCopies(target: *@import("gsp_device.zig").Device, table: *a.Driver
     }
     try t.expect(steps < 300 and target.phase == .recovering and target.failure.? == error.RmClosed and vram_model.charged == 0 and fifo_model.released == 1);
     for (&running.fifos) |*slot| try t.expect(slot.owner == null);
-    for (&running.buffers) |*slot| try t.expect(slot.owner == null);
+    for (running.buffers.items()) |*slot| try t.expect(slot.owner == null);
     if (vram_model.is("context_copy_success")) try t.expect(model.heldReferences() == 0);
 }
 fn checkCopyLayouts(target: *@import("gsp_device.zig").Device, table: *a.DriverApi,
@@ -9340,8 +9340,12 @@ fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverAp
     for (0..total) |index| {
         const plan = if (surfaces) try surface.create(running.adapter_id, running.nativeAddressSpace().?.*, running.nativeMemoryCapabilities().?, requests[index]) else null;
         const bytes: u64 = if (plan) |p| p.descriptor.byte_length else if (index == 0) full - 5 else 4091;
+        const names = @import("gsp_rm_names.zig");
+        var reserved_names: [names.max_child_ranges]names.Children = undefined;
+        const reserved_count = if (model.is("vram_success")) try fillLegacyNames(&session.rm_names, running.graph.?.reservation, &reserved_names) else 0;
         handles[index] = if (surfaces) try running.allocateNativeSurface(requests[index], deadline)
             else if (private_storage) try running.allocateNativeStorage(bytes, deadline) else try running.allocateNativeBuffer(bytes, deadline);
+        for (reserved_names[0..reserved_count]) |lease| try session.rm_names.retireChildren(lease);
         try t.expect(running.memory_admission.epoch == running.epoch);
         if (model.is("vram_surface_linear")) try t.expect(!running.memory_admission.configured and model.budget_configurations == 0)
         else try t.expect(running.memory_admission.configured and model.budget_configurations == 1 and model.budget.limit_bytes == @import("gsp_residency.zig").Admission.ceiling(running.nativeMemory().?));
@@ -9353,7 +9357,7 @@ fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverAp
             if (target.phase != .ready or running.native_active == null) break;
             const channel = running.activeChannel().?;
             if (channel.phase != .waiting) continue;
-            const owner = running.native_buffers[running.native_active.?].owner.?;
+            const owner = running.native_buffers.items()[running.native_active.?].owner.?;
             const op = owner.operation.?;
             const cursor = (session.tx_write + 62) % 63;
             const record = try transport.message.decode(session.profile, backing.?[command + 4096 + cursor * 4096 ..][0..4096], session.tx_sequence - 1);
@@ -9455,7 +9459,7 @@ fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverAp
             var returned = try running.graph.?.loan(deadline);
             running.channel = try @import("gsp_exchange.zig").Exchange.init(&returned.runtime, deadline);
             if (model.is("vram_success") and index == 0) {
-                const owner = running.native_buffers[handles[0].slot].owner.?;
+                const owner = running.native_buffers.items()[handles[0].slot].owner.?;
                 try owner.retainAlias(&alias_use, 65536, 4096);
                 try t.expect(!owner.aliases.empty() and model.slots[0].imported and session.tx_sequence == sent);
                 const held = try alias_use.info();
@@ -9494,7 +9498,7 @@ fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverAp
             try alias_use.close(true);
             const virtual = try running.allocateVirtualRange(.{ .bytes = 16384, .fixed_address = 0x90000000, .location = .video }, deadline);
             try finishVirtual(target, false);
-            const owner = running.native_buffers[handles[0].slot].owner.?;
+            const owner = running.native_buffers.items()[handles[0].slot].owner.?;
             const memory = running.ctx.?.memory().?;
             const sent = session.tx_sequence;
             // The reference's real common identity, not caller-supplied
@@ -9542,7 +9546,7 @@ fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverAp
             if (channel.phase != .waiting) continue;
             var response: [160]u8 = @splat(0); @memcpy(response[0..channel.request.len], channel.request);
             if (running.native_active) |index| {
-                const owner = running.native_buffers[index].owner.?;
+                const owner = running.native_buffers.items()[index].owner.?;
                 try t.expect(owner.state == .destroying and model.slots[index].claimed);
                 if (owner.operation.? == .unmap) {
                     try t.expect(std.mem.readInt(u64, response[24..32], .little) == model.address(index));
@@ -9559,8 +9563,8 @@ fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverAp
         model.is("vram_storage_bounds") or model.is("vram_storage_contiguity") or model.is("vram_storage_descriptor");
     try t.expect(target.phase == .recovering and target.failure != null);
     if (uncertain) {
-        try t.expect(model.charged == full and model.slots[0].live and running.native_buffers[0].owner != null);
-        try t.expect(running.native_buffers[0].owner.?.namespace_live);
+        try t.expect(model.charged == full and model.slots[0].live and running.native_buffers.items()[0].owner != null);
+        try t.expect(running.native_buffers.items()[0].owner.?.namespace_live);
         const held = try running.residencySnapshot();
         try t.expect(held.stopped and !held.firmware_capture_known and held.native_reserved_bytes == full and
             held.native_uncertain_bytes == full and held.native_mapped_bytes <= held.native_physical_bytes);
@@ -9674,7 +9678,7 @@ const ProviderCase = enum { normal, reject_second, timeout_map, close_map };
 fn answerProviderBuffer(target: *@import("gsp_device.zig").Device) !void {
     const model = @import("gsp_buffer_test_model.zig").Model;
     const running = &target.running;
-    const owner = running.buffers[running.buffer_active.?].owner.?;
+    const owner = running.buffers.items()[running.buffer_active.?].owner.?;
     const rpc = &owner.exchange;
     if (rpc.phase != .waiting) return;
     const session = &target.session.?;
@@ -9772,6 +9776,10 @@ fn checkVirtualProvider(target: *@import("gsp_device.zig").Device, table: *a.Dri
     const model = @import("gsp_buffer_test_model.zig").Model;
     const peer = @import("gsp_virtual_provider_test_model.zig").Model;
     const running = &target.running;
+    const names = @import("gsp_rm_names.zig");
+    var reserved_names: [names.max_child_ranges]names.Children = undefined;
+    const reserved_count = try fillLegacyNames(&target.session.?.rm_names, running.graph.?.reservation, &reserved_names);
+    defer for (reserved_names[0..reserved_count]) |lease| target.session.?.rm_names.retireChildren(lease) catch {};
     var checkpoint: []const u8 = "register";
     errdefer |err| std.debug.print("public VA checkpoint={s} error={s} phase={s} failure={?} heap={d} refs={any} completion={any}\n",
         .{checkpoint,@errorName(err),@tagName(target.phase),target.failure,model.heapLive(),model.refs,peer.completion});
@@ -9822,17 +9830,69 @@ fn checkVirtualProvider(target: *@import("gsp_device.zig").Device, table: *a.Dri
     const bound = peer.completion.?;
     try t.expect(success.maps == 2 and bound.result == 1 and bound.address == range_result.address + 4096 and
         model.refs[0] and model.full_refs[0] and model.dma[0].lease.id != 0 and model.gpu[0].lease.id == 0);
+    checkpoint = "shared registration";
+    var other_range = range_job;
+    other_range.resource.id = 903; other_range.request.fixed_address = 0x93000000;
+    peer.submit(other_range); _ = try driveVirtualProvider(target, .normal);
+    const other_range_result = peer.completion.?;
+    try t.expect(other_range_result.result == 1);
+    const gathered = model.segments;
+    var other_binding = binding;
+    other_binding.resource.id = 904; other_binding.parent_token = other_range_result.token;
+    other_binding.request.parent = other_range.resource;
+    peer.submit(other_binding);
+    const shared = try driveVirtualProvider(target, .normal);
+    const other_bound = peer.completion.?;
+    try t.expect(shared.maps == 2 and other_bound.result == 1 and other_bound.address == other_range_result.address + 4096 and
+        model.segments == gathered and model.refs[0] and !model.verification_refs[0] and running.public_import.empty());
+    const shared_handle: @import("gsp_runtime.zig").BufferHandle = blk: {
+        for (running.buffers.items(), 0..) |*slot, index| if (slot.public_users == 2) {
+            break :blk .{ .epoch = running.epoch, .serial = slot.serial, .slot = @intCast(index) };
+        };
+        return error.MissingSharedRegistration;
+    };
+    try t.expectError(error.Busy, running.retireBuffer(shared_handle, end, true));
+    try t.expectError(error.Busy, running.releaseVirtualReference(shared_handle, end, false));
     var retire = binding; retire.operation = 1; retire.token = bound.token;
-    checkpoint = "retire multipart";
+    checkpoint = "retire non-last binding";
     peer.submit(retire);
     const released = try driveVirtualProvider(target, .normal);
-    try t.expect(released.unmaps == 2 and peer.completion.?.result == 1 and !model.refs[0] and model.heapLive() == range_heap);
+    try t.expect(released.unmaps == 2 and peer.completion.?.result == 1 and model.refs[0] and
+        model.dma[0].lease.id != 0 and running.buffers.items()[shared_handle.slot].public_users == 1);
+    const shared_heap = model.heapLive();
     binding.resource.generation += 1;
-    checkpoint = "partial rollback";
+    checkpoint = "reuse import rejection";
+    const before_reuse_rejections = target.session.?.tx_sequence;
+    forged = binding; forged.reference.buffer.id += 1;
+    peer.submit(forged);
+    for (0..3) |_| { if (peer.completion != null) break; try t.expect(try running.virtual_provider.step(running)); }
+    try t.expect(peer.completion.?.result == a.gfx_buffer_error_stale);
+    model.import_immutable = true;
+    peer.submit(binding);
+    for (0..3) |_| { if (peer.completion != null) break; try t.expect(try running.virtual_provider.step(running)); }
+    try t.expect(peer.completion.?.result == a.gfx_buffer_error_unsupported);
+    model.import_immutable = false; model.import_oom = true;
+    peer.submit(binding);
+    for (0..3) |_| { if (peer.completion != null) break; try t.expect(try running.virtual_provider.step(running)); }
+    try t.expect(peer.completion.?.result == a.gfx_buffer_error_oom);
+    model.import_oom = false;
+    try t.expect(model.refs[0] and !model.verification_refs[0] and model.heapLive() == shared_heap and running.public_import.empty() and
+        running.buffers.items()[shared_handle.slot].public_users == 1 and target.session.?.tx_sequence == before_reuse_rejections);
+    checkpoint = "shared partial rollback";
     peer.submit(binding);
     const rejected = try driveVirtualProvider(target, .reject_second);
     try t.expect(rejected.maps == 2 and rejected.unmaps == 1 and peer.completion.?.result == a.gfx_buffer_error_unavailable and
-        !model.refs[0] and model.heapLive() == range_heap and running.failure == null);
+        model.refs[0] and !model.verification_refs[0] and model.segments == gathered and model.heapLive() == shared_heap and
+        running.buffers.items()[shared_handle.slot].public_users == 1 and running.failure == null);
+    checkpoint = "retire last binding";
+    retire = other_binding; retire.operation = 1; retire.token = other_bound.token;
+    peer.submit(retire);
+    const last_released = try driveVirtualProvider(target, .normal);
+    try t.expect(last_released.unmaps == 2 and peer.completion.?.result == 1 and !model.refs[0] and !model.verification_refs[0]);
+    try t.expectError(error.Stale, running.releaseVirtualReference(shared_handle, end, true));
+    retire = other_range; retire.operation = 1; retire.token = other_range_result.token;
+    peer.submit(retire); _ = try driveVirtualProvider(target, .normal);
+    try t.expect(peer.completion.?.result == 1 and model.heapLive() == range_heap);
     binding.resource.generation += 1; binding.request.deadline_ns = clock + std.time.ns_per_ms;
     checkpoint = "timeout";
     peer.submit(binding);
@@ -9851,6 +9911,22 @@ fn checkVirtualProvider(target: *@import("gsp_device.zig").Device, table: *a.Dri
     _ = try running.virtual_provider.step(running);
     try t.expect(running.virtual_provider.closed() and running.virtuals.ranges.root == null and model.heapLive() == heap_before);
     model.releases = 0; model.segments = 0; // The subsequent existing mapping cases own their counters.
+}
+
+// Namespace-only reservations: no RM objects are transmitted for these. The
+// real RAM/VRAM owners must still allocate names when the old table is full.
+fn fillLegacyNames(ledger: *@import("gsp_rm_names.zig").Ledger, parent: @import("gsp_rm_names.zig").Lease,
+    leases: []@import("gsp_rm_names.zig").Children) !usize
+{
+    var count: usize = 0;
+    while (count < leases.len) : (count += 1) {
+        leases[count] = ledger.reserveChildren(parent, 1) catch |err| {
+            if (err == error.Exhausted) return count;
+            return err;
+        };
+    }
+    try t.expectError(error.Exhausted, ledger.reserveChildren(parent, 1));
+    return count;
 }
 
 fn checkVirtualProviderReset(target: *@import("gsp_device.zig").Device, table: *a.DriverApi) !void {
@@ -9930,7 +10006,7 @@ fn checkDeviceMappings(target: *@import("gsp_device.zig").Device, table: *a.Driv
             _ = target.step();
             try t.expect(model.segments - segment_count <= 64);
             if (target.phase != .ready or running.buffer_active == null) break;
-            const owner = running.buffers[running.buffer_active.?].owner.?;
+            const owner = running.buffers.items()[running.buffer_active.?].owner.?;
             const channel = &owner.exchange;
             if (channel.phase != .waiting) continue;
             try t.expect(running.nativeAddressSpace() == null and running.nativeControlBuffer() == null and owner.info() == null);
@@ -10001,7 +10077,7 @@ fn checkDeviceMappings(target: *@import("gsp_device.zig").Device, table: *a.Driv
             try t.expect(model.refs[count] and model.dma[count].lease.id != 0 and model.gpu[count].lease.id != 0);
             try t.expectError(error.Busy, running.retireBuffer(handles[count], deadline, false));
             if (model.is("mapping_success") and count == 0) {
-                const owner = running.buffers[handles[0].slot].owner.?;
+                const owner = running.buffers.items()[handles[0].slot].owner.?;
                 var use: @import("gsp_buffer_mapping.zig").alias.Use = .{};
                 const boundary: u64 = @import("gsp_buffer_wire.zig").max_registration_pages * 4096;
                 const sent = session.tx_sequence;
@@ -10054,7 +10130,7 @@ fn checkDeviceMappings(target: *@import("gsp_device.zig").Device, table: *a.Driv
             var response: [160]u8 = @splat(0);
             @memcpy(response[0..channel.request.len], channel.request);
             if (running.buffer_active) |index| {
-                const owner = running.buffers[index].owner.?;
+                const owner = running.buffers.items()[index].owner.?;
                 try t.expect(!freeing);
                 if (owner.operation.? == .unmap) {
                     const offset = @as(u64, owner.operation_part) * @import("gsp_buffer_wire.zig").max_registration_pages * 4096;

@@ -490,7 +490,7 @@ pub const Owner = struct {
         // The creator reference was closed after the display Use imported it,
         // so Owner.info() deliberately no longer exports that closed alias.
         // Match the retained allocator against the live Use instead.
-        for (&run.native_buffers, 0..) |*slot, index| if (slot.owner) |owner| {
+        for (run.native_buffers.items(), 0..) |*slot, index| if (slot.owner) |owner| {
             if (owner.self_address == @intFromPtr(owner) and owner.failure == null and owner.committed and owner.common_live and
                 owner.namespace_live and owner.mapped and owner.storage_claimed and owner.state == .handed_off and
                 owner.binding.space.epoch == source.epoch and owner.adapter == source.adapter and

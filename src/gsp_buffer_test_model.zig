@@ -9,6 +9,7 @@ pub const Model = struct {
     pub var original: a.DriverApi = undefined;
     pub var refs: [2]bool = @splat(false);
     pub var full_refs: [2]bool = @splat(false);
+    pub var verification_refs: [2]bool = @splat(false);
     pub var import_oom: bool = false;
     pub var import_immutable: bool = false;
     pub var dma: [2]a.GfxDeviceLease = @splat(.{});
@@ -34,6 +35,7 @@ pub const Model = struct {
         scenario = name;
         refs = @splat(false); dma = @splat(.{}); gpu = @splat(.{});
         full_refs = @splat(false); import_oom = false; import_immutable = false;
+        verification_refs = @splat(false);
         releases = 0; segments = 0;
         allocation_fault = .none; release_fault = false;
     }
@@ -51,6 +53,7 @@ pub const Model = struct {
     pub fn page(index: usize, offset: u64) u64 { return 0x6000000000 + index * 0x100000000 + offset * 2; }
     pub fn address(index: usize) u64 { return 0x10000000 + index * 0x10000000; }
     fn reference(index: usize) a.GfxBufferHandle { return .{ .id = @intCast(171 + index), .generation = 331 }; }
+    fn verificationReference(index: usize) a.GfxBufferHandle { return .{ .id = @intCast(3171 + index), .generation = 331 }; }
     pub fn borrowed(index: usize) a.GfxBufferReference {
         return .{ .reference = .{ .id = @intCast(2171 + index), .generation = 331 }, .buffer = .{ .id = @intCast(181 + index), .generation = 431 } };
     }
@@ -103,9 +106,14 @@ pub const Model = struct {
     fn import(input: *const a.GfxBufferHandle, out: *a.GfxBufferReference) callconv(.c) i32 {
         for (0..2) |i| if (std.meta.eql(input.*, borrowed(i).reference)) {
             if (import_oom) return a.gfx_buffer_error_oom;
-            if (refs[i]) return a.gfx_buffer_error_busy;
-            refs[i] = true; full_refs[i] = true;
-            out.* = borrowed(i); out.reference = reference(i);
+            if (refs[i]) {
+                if (!full_refs[i] or verification_refs[i]) return a.gfx_buffer_error_busy;
+                verification_refs[i] = true;
+                out.* = borrowed(i); out.reference = verificationReference(i);
+            } else {
+                refs[i] = true; full_refs[i] = true;
+                out.* = borrowed(i); out.reference = reference(i);
+            }
             out.flags = if (import_immutable) a.gfx_buffer_reference_immutable else 0;
             return 1;
         };
@@ -113,7 +121,7 @@ pub const Model = struct {
         return call(input, out);
     }
     fn describe(input: *const a.GfxBufferHandle, out: *a.GfxBufferDescriptor) callconv(.c) i32 {
-        for (0..2) |i| if (std.meta.eql(input.*, borrowed(i).reference)) {
+        for (0..2) |i| if (std.meta.eql(input.*, borrowed(i).reference) or (verification_refs[i] and std.meta.eql(input.*, verificationReference(i)))) {
             out.* = .{ .byte_length = rounded[i] - 5, .alignment = 4096, .usage = 15 }; return 1;
         };
         const i = selected(input) orelse {
@@ -123,11 +131,15 @@ pub const Model = struct {
         std.debug.assert(refs[i]); out.* = .{ .byte_length = rounded[i] - 5, .alignment = 4096, .usage = 15 }; return a.gfx_buffer_result_ok;
     }
     fn release(input: *const a.GfxBufferHandle) callconv(.c) i32 {
+        for (0..2) |i| if (std.meta.eql(input.*, verificationReference(i))) {
+            std.debug.assert(verification_refs[i] and refs[i] and full_refs[i]);
+            verification_refs[i] = false; releases += 1; return 1;
+        };
         const i = selected(input) orelse {
             const call: *const fn (*const a.GfxBufferHandle) callconv(.c) i32 = @ptrFromInt(fallback().buffer_release);
             return call(input);
         };
-        std.debug.assert(refs[i] and dma[i].lease.id == 0 and gpu[i].lease.id == 0);
+        std.debug.assert(refs[i] and !verification_refs[i] and dma[i].lease.id == 0 and gpu[i].lease.id == 0);
         refs[i] = false; full_refs[i] = false; releases += 1; return a.gfx_buffer_result_ok;
     }
     fn acquire(input: *const a.GfxBufferHandle, request: *const a.GfxDeviceRequest, out: *a.GfxDeviceLease) callconv(.c) i32 {

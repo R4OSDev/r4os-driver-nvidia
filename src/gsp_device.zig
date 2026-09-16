@@ -812,10 +812,10 @@ pub const Device = struct {
             const context = self.running.contexts[index].owner orelse return error.Binding;
             if (!context.matches(channel, deadline)) return error.Binding;
         } else if (self.running.native_active) |index| {
-            const allocation = self.running.native_buffers[index].owner orelse return error.Binding;
+            const allocation = self.running.native_buffers.items()[index].owner orelse return error.Binding;
             if (!allocation.matches(channel, deadline)) return error.Binding;
         } else if (self.running.buffer_active) |index| {
-            const mapping = self.running.buffers[index].owner orelse return error.Binding;
+            const mapping = self.running.buffers.items()[index].owner orelse return error.Binding;
             if (!mapping.matches(channel, deadline)) return error.Binding;
         } else if (self.running.virtuals.active()) |mapping| {
             if (!mapping.matches(channel, deadline)) return error.Binding;

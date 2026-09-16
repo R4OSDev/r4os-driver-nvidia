@@ -98,7 +98,7 @@ pub fn read(run: anytype) !Snapshot {
         result.boot_retained_bytes = memory.retained_bytes;
         result.rm_reserved_hint_bytes = memory.speculative_reserved;
     }
-    for (&run.native_buffers) |slot| if (slot.owner) |owner| {
+    for (run.native_buffers.view()) |slot| if (slot.owner) |owner| {
         if (slot.allocation.handle == 0 or slot.serial == 0 or owner.binding.space.epoch != run.epoch or
             (owner.self_address != 0 and owner.self_address != @intFromPtr(owner))) return error.Stale;
         result.native_slots += 1;
@@ -119,7 +119,7 @@ pub fn read(run: anytype) !Snapshot {
             .scanout => try add(&result.scanout_reserved_bytes, owner.bytes),
         };
     };
-    for (&run.buffers) |slot| if (slot.owner) |owner| {
+    for (run.buffers.view()) |slot| if (slot.owner) |owner| {
         if (slot.allocation.handle == 0 or slot.serial == 0 or owner.space.epoch != run.epoch or
             (owner.self_address != 0 and owner.self_address != @intFromPtr(owner))) return error.Stale;
         result.mapping_slots += 1;

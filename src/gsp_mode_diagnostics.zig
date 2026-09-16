@@ -81,7 +81,7 @@ pub const Report = struct {
         if (run.hasDisplayFlips()) self.pending |= 32;
         if (run.readyImage(product.mode.?.window) != null) self.pending |= 64;
         if (run.frame_setup != null) self.pending |= 128;
-        for (&run.native_buffers) |*slot| if (slot.owner != null) { self.native_owners += 1; };
+        for (run.native_buffers.items()) |*slot| if (slot.owner != null) { self.native_owners += 1; };
         for (&run.presentation_slots) |*slot| if (slot.*) |*entry| {
             if (entry.surface.shadow.reference.id != 0) self.shadow_imports += 1;
         };

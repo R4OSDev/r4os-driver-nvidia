@@ -64,6 +64,16 @@ pub const Owner = struct {
     pub fn init(token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext, adapter: u32, space: vaspace.Info,
         parent: names.Lease, source: a.GfxBufferReference, deadline: u64) Error!Owner
     {
+        return initStorage(token, ctx, adapter, space, parent, source, deadline, null);
+    }
+    pub fn initResident(token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext, adapter: u32, space: vaspace.Info,
+        parent: names.Lease, source: a.GfxBufferReference, deadline: u64, resident: *names.ResidentChildren) Error!Owner
+    {
+        return initStorage(token, ctx, adapter, space, parent, source, deadline, resident);
+    }
+    fn initStorage(token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext, adapter: u32, space: vaspace.Info,
+        parent: names.Lease, source: a.GfxBufferReference, deadline: u64, resident: ?*names.ResidentChildren) Error!Owner
+    {
         if (token.claimed or token.session.state != .active or token.session.pending != null or
             adapter == 0 or space.epoch != token.session.epoch or parent.epoch != space.epoch or parent.client != space.client) return error.Stale;
         try token.session.guard(deadline);
@@ -79,7 +89,8 @@ pub const Owner = struct {
         const rounded = (std.math.add(u64, descriptor.byte_length, 4095) catch return error.Bounds) & ~@as(u64, 4095);
         const count = (rounded - 1) / chunk_bytes + 1;
         if (count >= std.math.maxInt(u16)) return error.Bounds;
-        const reservation = try token.session.rm_names.reserveChildren(parent, @intCast(count + 1));
+        const reservation = if (resident) |node| try token.session.rm_names.reserveResidentChildren(parent, @intCast(count + 1), node)
+            else try token.session.rm_names.reserveChildren(parent, @intCast(count + 1));
         errdefer token.session.rm_names.retireChildren(reservation) catch {};
         try wire.validatePart(.{ .space = space, .memory = try reservation.object(0), .virtual = try reservation.object(@intCast(count)) },
             .{ .total_bytes = rounded, .byte_length = @min(rounded, chunk_bytes) });

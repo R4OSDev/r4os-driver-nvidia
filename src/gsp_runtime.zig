@@ -218,7 +218,7 @@ pub const execution_context = @import("gsp_context.zig");
 pub const ContextHandle = struct { epoch: u64, serial: u64, slot: u16 };
 pub const ContextStatus = struct { state: execution_context.State, info: ?execution_context.Info, rejected: ?u32, unavailable: ?execution_context.Unavailable };
 const ContextSlot = struct { owner: ?*execution_context.Owner = null, allocation: r4os.abi.DriverHeapAllocation = .{}, heap: ?r4os.r4dev.DriverHeapContext = null, serial: u64 = 0 };
-pub const BufferHandle = struct { epoch: u64, serial: u64, slot: u16 };
+pub const BufferHandle = struct { epoch: u64, serial: u64, slot: u32 };
 pub const virtual_resources = @import("gsp_virtual_resources.zig");
 pub const VirtualHandle = virtual_resources.Handle;
 pub const VirtualBindingHandle = virtual_resources.BindingHandle;
@@ -226,9 +226,12 @@ pub const VirtualStatus = struct { state: virtual_resources.range.State, info: ?
 pub const VirtualBindingStatus = struct { mapped: bool, bytes: u64, rejected: ?u32 };
 pub const VirtualSource = union(enum) { system: BufferHandle, native: BufferHandle, native_reference: r4os.abi.GfxBufferReference };
 pub const BufferStatus = struct { state: buffer_mapping.State, info: ?buffer_mapping.Info, rejected: ?u32, host_rejected: ?buffer_mapping.Error };
-const BufferSlot = struct { owner: ?*buffer_mapping.Owner = null, allocation: r4os.abi.DriverHeapAllocation = .{}, heap: ?r4os.r4dev.DriverHeapContext = null, serial: u64 = 0, pending_source: r4os.abi.GfxBufferReference = .{}, cacheable: bool = false, last_used: u64 = 0, evicting: bool = false };
+const BufferSlot = struct { owner: ?*buffer_mapping.Owner = null, allocation: r4os.abi.DriverHeapAllocation = .{}, heap: ?r4os.r4dev.DriverHeapContext = null, serial: u64 = 0, pending_source: r4os.abi.GfxBufferReference = .{}, cacheable: bool = false, last_used: u64 = 0, evicting: bool = false, public_users: u64 = 0 };
 pub const NativeBufferStatus = struct { state: vram.State, info: ?vram.Info, rejected: ?u32, host_rejected: ?i32 };
 const NativeBufferSlot = struct { owner: ?*vram.Owner = null, allocation: r4os.abi.DriverHeapAllocation = .{}, heap: ?r4os.r4dev.DriverHeapContext = null, serial: u64 = 0 };
+const ResourceSlots = @import("gsp_resource_slots.zig");
+const BufferStorage = struct { owner: buffer_mapping.Owner, names: @import("gsp_rm_names.zig").ResidentChildren };
+const NativeBufferStorage = struct { owner: vram.Owner, names: @import("gsp_rm_names.zig").ResidentChildren };
 pub const Progress = enum { idle, progress };
 pub const Snapshot = struct {
     polls: u64 = 0,
@@ -344,13 +347,14 @@ pub const Owner = struct {
     outputs: outputs.Owner = .{},
     receiver_events: hotplug.Work = .{},
     output_generation: u64 = 0,
-    buffers: [256]BufferSlot = @splat(.{}),
-    buffer_active: ?u16 = null,
+    buffers: ResourceSlots.Pool(BufferSlot) = .{},
+    public_import: @import("gsp_common_reference.zig").Owner = .{},
+    buffer_active: ?u32 = null,
     buffer_serial: u64 = 0,
     mapping_evictions: u64 = 0,
     residency_rejections: u64 = 0,
-    native_buffers: [256]NativeBufferSlot = @splat(.{}),
-    native_active: ?u16 = null,
+    native_buffers: ResourceSlots.Pool(NativeBufferSlot) = .{},
+    native_active: ?u32 = null,
     virtuals: virtual_resources.Owner = .{},
     allocations: @import("gsp_allocation.zig").Owner = .{},
     virtual_provider: @import("gsp_virtual_provider.zig").Owner = .{},
@@ -557,8 +561,9 @@ pub const Owner = struct {
                 self.reset_stage = .mappings; self.reset_cursor = 0;
             },
             .mappings => {
-                if (self.reset_cursor < self.buffers.len) {
-                    const slot = &self.buffers[self.reset_cursor];
+                try self.public_import.closeAfterReset(proof);
+                if (self.reset_cursor < self.buffers.items().len) {
+                    const slot = &self.buffers.items()[self.reset_cursor];
                     if (slot.owner) |owner| try owner.closeAfterReset(proof);
                     if (slot.pending_source.reference.id != 0) {
                         if (memory.bufferRelease(&slot.pending_source.reference) != r4os.abi.gfx_buffer_result_ok) return error.Retained;
@@ -567,6 +572,7 @@ pub const Owner = struct {
                     if (slot.allocation.handle != 0 and slot.heap.?.release(slot.allocation.handle) != r4os.abi.driver_heap_ok) return error.Retained;
                     slot.* = .{}; self.reset_cursor += 1; return false;
                 }
+                try self.buffers.closeEmpty();
                 self.reset_stage = .virtual_provider;
             },
             .virtual_provider => {
@@ -574,25 +580,26 @@ pub const Owner = struct {
                 self.reset_stage = .native; self.reset_cursor = 0;
             },
             .native => {
-                if (self.reset_cursor < self.native_buffers.len) {
-                    const slot = &self.native_buffers[self.reset_cursor];
+                if (self.reset_cursor < self.native_buffers.items().len) {
+                    const slot = &self.native_buffers.items()[self.reset_cursor];
                     if (slot.owner) |owner| {
                         if (try owner.closeAfterReset(proof)) try self.freeNativeSlot(self.reset_cursor);
                     } else if (slot.allocation.handle != 0) try self.freeNativeSlot(self.reset_cursor);
                     self.reset_cursor += 1; return false;
                 }
                 var ticket: r4os.abi.GfxOwnedBufferRelease = .{};
-                for (&self.native_buffers) |*slot| if (slot.owner != null) {
+                for (self.native_buffers.items()) |*slot| if (slot.owner != null) {
                     const result = memory.bufferTakeRelease(self.adapter_id, self.epoch, &ticket);
                     if (result == r4os.abi.gfx_buffer_error_busy) { self.reset_cursor = 0; return false; }
                     if (result != r4os.abi.gfx_buffer_result_ok) return error.Retained;
-                    for (&self.native_buffers, 0..) |*candidate, index| if (candidate.owner) |owner| {
+                    for (self.native_buffers.items(), 0..) |*candidate, index| if (candidate.owner) |owner| {
                         if (owner.release.attempt != 0 or !owner.acceptsAfterReset(ticket)) continue;
                         owner.release = ticket;
                         self.reset_cursor = index; return false;
                     };
                     return error.Descriptor;
                 };
+                try self.native_buffers.closeEmpty();
                 if (memory.collect() != r4os.abi.gfx_buffer_result_ok) return error.Retained;
                 self.reset_stage = .done;
             },
@@ -845,8 +852,8 @@ pub const Owner = struct {
         if (self.display_engine_active) if (self.display_engine_owner) |*owner| return &owner.exchange;
         if (self.fifo_active) |index| if (self.fifos[index].owner) |owner| return owner.channel();
         if (self.context_active) |index| if (self.contexts[index].owner) |owner| return &owner.exchange;
-        if (self.native_active) |index| if (self.native_buffers[index].owner) |owner| return &owner.exchange;
-        if (self.buffer_active) |index| if (self.buffers[index].owner) |owner| return &owner.exchange;
+        if (self.native_active) |index| if (self.native_buffers.items()[index].owner) |owner| return &owner.exchange;
+        if (self.buffer_active) |index| if (self.buffers.items()[index].owner) |owner| return &owner.exchange;
         if (self.virtuals.active()) |owner| return &owner.exchange;
         if (self.outputs.channel()) |channel| return &channel.exchange;
         if (self.graph) |*graph| if (graph.channel()) |channel| return channel;
@@ -1130,7 +1137,7 @@ pub const Owner = struct {
         if (!self.direct_step or self.direct_work == null or self.presentation == null or !std.meta.eql(self.presentation.?.window, window)) return error.State;
         const parent = try self.mutableDisplayTable(root);
         const resources = try self.ensureDisplayResources(parent);
-        for (&self.native_buffers) |*slot| if (slot.owner) |source| if (source.scanoutInfo(reference)) |value| {
+        for (self.native_buffers.items()) |*slot| if (slot.owner) |source| if (source.scanoutInfo(reference)) |value| {
             if (value.surface.descriptor.width != self.presentation.?.surface.descriptor.width or
                 value.surface.descriptor.height != self.presentation.?.surface.descriptor.height) return error.Unsupported;
             return resources.bindScanout(window.slot, source, reference);
@@ -2534,7 +2541,7 @@ pub const Owner = struct {
         if (!try resources.imageFinished(entry.window.slot, dma)) return error.Busy;
         const index = self.presentationIndex(entry) orelse return error.Stale;
         entry.retiring = true;
-        for (&self.buffers, 0..) |*slot, i| if (slot.owner) |owner| {
+        for (self.buffers.items(), 0..) |*slot, i| if (slot.owner) |owner| {
             if (!std.meta.eql(owner.source.buffer, entry.surface.shadow.buffer)) continue;
             if (self.buffer_active != null) return false;
             try self.retireBuffer(.{ .epoch = self.epoch, .serial = slot.serial, .slot = @intCast(i) }, deadline, true);
@@ -3117,7 +3124,7 @@ pub const Owner = struct {
     }
     fn queuedGraphicsResource(self: *Owner, reference: r4os.abi.GfxBufferReference) !render_job.Resource {
         const space = self.nativeAddressSpace() orelse return error.State;
-        for (&self.native_buffers) |*slot| if (slot.owner) |owner| if (owner.queuedInfo(reference)) |value| {
+        for (self.native_buffers.items()) |*slot| if (slot.owner) |owner| if (owner.queuedInfo(reference)) |value| {
             if (value.epoch != self.epoch or owner.binding.space.handle != space.handle) return error.Stale;
             return .{ .info = value, .driver_owner = owner.reservation.driver_owner };
         };
@@ -3595,7 +3602,7 @@ pub const Owner = struct {
         for (0..resource_count) |i| {
             if (work.addresses[i] != null) continue;
             const reference = work.references[i];
-            for (&self.native_buffers) |*slot| if (slot.owner) |owner| {
+            for (self.native_buffers.items()) |*slot| if (slot.owner) |owner| {
                 if (owner.queuedInfo(reference)) |value| {
                     if (value.epoch != self.epoch or owner.binding.space.handle != fifo.config.context.vaspace) return error.Stale;
                     work.addresses[i] = .{ .address = value.address, .bytes = value.logical_bytes }; break;
@@ -3611,7 +3618,7 @@ pub const Owner = struct {
             }
             // Reuse confirmed whole-BO mappings across jobs; no repeated DMA
             // registration, heap allocation or RPC is needed for this case.
-            for (&self.buffers) |*slot| if (slot.owner) |owner| {
+            for (self.buffers.items()) |*slot| if (slot.owner) |owner| {
                 if (owner.info()) |value| if (std.meta.eql(value.buffer, reference.buffer) and value.epoch == self.epoch and owner.space.handle == fifo.config.context.vaspace) {
                     slot.last_used = self.copy_completed +| 1;
                     work.addresses[i] = .{ .address = value.address, .bytes = value.logical_bytes }; break;
@@ -3627,7 +3634,7 @@ pub const Owner = struct {
         if (work.target_presentation) |entry| if (work.job.operation != r4os.abi.gfx_queue_operation_present and work.render_read.self_address == 0) {
             const address = work.addresses[0] orelse return error.State;
             var source: ?*buffer_mapping.Owner = null;
-            for (&self.buffers) |*slot| if (slot.owner) |owner| if (owner.info()) |mapped| {
+            for (self.buffers.items()) |*slot| if (slot.owner) |owner| if (owner.info()) |mapped| {
                 if (std.meta.eql(mapped.buffer, work.job.source_buffer) and mapped.address == address.address and
                     mapped.logical_bytes == address.bytes and owner.space.handle == fifo.config.context.vaspace) { source = owner; break; }
             };
@@ -3664,7 +3671,7 @@ pub const Owner = struct {
             const source = work.addresses[0] orelse return error.State;
             const fifo = try self.findChannel(work.channel_handle);
             var confirmed = false;
-            for (&self.buffers) |*slot| if (slot.owner) |owner| if (owner.info()) |value| {
+            for (self.buffers.items()) |*slot| if (slot.owner) |owner| if (owner.info()) |value| {
                 if (std.meta.eql(value.buffer, work.references[0].buffer) and value.epoch == self.epoch and
                     value.address == source.address and value.logical_bytes == source.bytes and owner.space.handle == fifo.config.context.vaspace)
                     confirmed = true;
@@ -3689,11 +3696,11 @@ pub const Owner = struct {
             const value = source orelse return error.State;
             var confirmed = false;
             var plan: ?vram.surface.Plan = null;
-            for (&self.native_buffers) |*slot| if (slot.owner) |owner| if (owner.queuedInfo(work.references[i])) |info| {
+            for (self.native_buffers.items()) |*slot| if (slot.owner) |owner| if (owner.queuedInfo(work.references[i])) |info| {
                 if (info.epoch != self.epoch or owner.binding.space.handle != fifo.config.context.vaspace or info.address != value.address or info.logical_bytes != value.bytes) return error.Stale;
                 confirmed = true; plan = info.surface; break;
             };
-            if (!confirmed) for (&self.buffers) |*slot| if (slot.owner) |owner| if (owner.info()) |info| {
+            if (!confirmed) for (self.buffers.items()) |*slot| if (slot.owner) |owner| if (owner.info()) |info| {
                 if (std.meta.eql(info.buffer, work.references[i].buffer) and info.epoch == self.epoch and owner.space.handle == fifo.config.context.vaspace and info.address == value.address and info.logical_bytes == value.bytes) {
                     confirmed = true; break;
                 }
@@ -3732,7 +3739,7 @@ pub const Owner = struct {
                 descriptor.driver_owner != 0 or descriptor.usage & a.gfx_buffer_usage_transfer_source == 0) return error.Unsupported;
             const fifo = try self.findChannel(work.channel_handle);
             var confirmed = false;
-            for (&self.buffers) |*slot| if (slot.owner) |owner| if (owner.info()) |info| {
+            for (self.buffers.items()) |*slot| if (slot.owner) |owner| if (owner.info()) |info| {
                 if (std.meta.eql(info.buffer, work.references[0].buffer) and info.epoch == self.epoch and
                     owner.space.handle == fifo.config.context.vaspace and info.address == source.address and
                     info.logical_bytes == source.bytes) { confirmed = true; break; }
@@ -3859,7 +3866,7 @@ pub const Owner = struct {
         if (work.mapping == null) {
             // A cancelled pre-submit attempt can leave a confirmed mapping.
             // Keep it resident and reuse it for the retry and later frames.
-            for (&self.buffers, 0..) |*slot, index| if (slot.owner) |source| if (source.info()) |value| {
+            for (self.buffers.items(), 0..) |*slot, index| if (slot.owner) |source| if (source.info()) |value| {
                 if (std.meta.eql(value.buffer, entry.surface.shadow.buffer) and value.epoch == self.epoch and
                     source.space.handle == fifo.config.context.vaspace) {
                     work.mapping = .{ .epoch = self.epoch, .serial = slot.serial, .slot = @intCast(index) }; break;
@@ -4817,13 +4824,34 @@ pub const Owner = struct {
     fn mapJobBuffer(self: *Owner, fence: *const r4os.abi.GfxFence, which: u32, deadline: u64) !BufferHandle {
         return self.mapBuffer(.{ .queue = .{ .fence = fence.*, .which = which } }, deadline);
     }
-    /// Borrow a canonical common reference. mapBuffer imports its own full
-    /// reference before asynchronous RM registration; the loan stays caller-owned.
+    /// Authenticate each loan independently, then reuse a public full-reference
+    /// registration of that exact BO. Queue mapping-only cache entries cannot
+    /// grant public access and are deliberately outside this sharing domain.
     pub fn mapVirtualReference(self: *Owner, reference: r4os.abi.GfxBufferReference, deadline: u64) !BufferHandle {
         try self.admitVirtual(deadline, false);
-        return self.mapBuffer(.{ .reference = reference }, deadline);
+        const memory = self.ctx.?.memory() orelse return error.Api;
+        self.public_import.acquire(memory, self.epoch, reference) catch |err| {
+            if (!self.public_import.empty()) self.stop(err);
+            return err;
+        };
+        for (self.buffers.items(), 0..) |*slot, index| {
+            if (slot.public_users == 0) continue;
+            const owner = slot.owner orelse { self.stop(error.Retained); return error.Retained; };
+            const info = owner.info() orelse continue;
+            if (owner.state != .handed_off or owner.source.flags != 0 or
+                !std.meta.eql(info.buffer, self.public_import.reference.buffer)) continue;
+            // Drop only the fresh verification import. The original physical
+            // owner retains its own reference and every page registration.
+            self.public_import.close() catch |err| { self.stop(err); return err; };
+            slot.public_users = try std.math.add(u64, slot.public_users, 1);
+            return .{ .epoch = self.epoch, .serial = slot.serial, .slot = @intCast(index) };
+        }
+        return self.mapBuffer(.public_import, deadline) catch |err| {
+            self.public_import.close() catch |cleanup| { self.stop(cleanup); return cleanup; };
+            return err;
+        };
     }
-    const MappingSource = union(enum) { queue: struct { fence: r4os.abi.GfxFence, which: u32 }, initial_image, reference: r4os.abi.GfxBufferReference };
+    const MappingSource = union(enum) { queue: struct { fence: r4os.abi.GfxFence, which: u32 }, initial_image, public_import };
     fn mapBuffer(self: *Owner, request: MappingSource, deadline: u64) !BufferHandle {
         _ = try self.now();
         if (self.graph_closing or self.fifo_active != null or self.context_active != null or self.virtuals.active_range != null or self.native_active != null or self.buffer_active != null or self.sequence.self_address != 0 or self.outputs.active()) return error.Busy;
@@ -4831,20 +4859,17 @@ pub const Owner = struct {
         if (self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         try self.channel.?.guard(deadline);
         const serial = try std.math.add(u64, self.buffer_serial, 1);
-        const index: u16 = blk: {
-            for (&self.buffers, 0..) |*slot, i| if (slot.allocation.handle == 0) break :blk @intCast(i);
-            return error.Exhausted;
-        };
         const heap = self.ctx.?.heap() orelse return error.Api;
+        const index = self.buffers.acquire(heap) catch |err| { if (err != error.Memory and err != error.Exhausted) self.stop(err); return err; };
         const memory = self.ctx.?.memory() orelse return error.Api;
-        const slot = &self.buffers[index];
+        const slot = &self.buffers.items()[index];
         slot.heap = heap;
-        const result = heap.allocate(@sizeOf(buffer_mapping.Owner), @alignOf(buffer_mapping.Owner), &slot.allocation);
+        const result = heap.allocate(@sizeOf(BufferStorage), @alignOf(BufferStorage), &slot.allocation);
         const allocation = slot.allocation;
         if (result != r4os.abi.driver_heap_ok and allocation.handle == 0) return error.Memory;
         if (allocation.version != 1 or allocation.size < @sizeOf(r4os.abi.DriverHeapAllocation) or allocation.handle == 0 or
-            allocation.cpu_address == 0 or allocation.cpu_address % @alignOf(buffer_mapping.Owner) != 0 or allocation.reserved != 0 or
-            allocation.byte_length < @sizeOf(buffer_mapping.Owner) or allocation.alignment < @alignOf(buffer_mapping.Owner) or
+            allocation.cpu_address == 0 or allocation.cpu_address % @alignOf(BufferStorage) != 0 or allocation.reserved != 0 or
+            allocation.byte_length < @sizeOf(BufferStorage) or allocation.alignment < @alignOf(BufferStorage) or
             allocation.cpu_address > std.math.maxInt(u64) - allocation.byte_length) {
             self.stop(error.Descriptor);
             return error.Descriptor;
@@ -4866,7 +4891,7 @@ pub const Owner = struct {
                 if (!self.preparedPresentation(work.presentation)) return error.State;
                 break :blk memory.bufferImport(&work.presentation.surface.shadow.reference, source);
             },
-            .reference => |reference| memory.bufferImport(&reference.reference, source),
+            .public_import => blk: { source.* = try self.public_import.take(); break :blk r4os.abi.gfx_buffer_result_ok; },
         };
         if (status != r4os.abi.gfx_buffer_result_ok and source.reference.id == 0 and source.buffer.id == 0) return switch (status) {
             r4os.abi.gfx_buffer_error_oom => error.Memory,
@@ -4889,21 +4914,23 @@ pub const Owner = struct {
         if (status != r4os.abi.gfx_buffer_result_ok) return error.Resource;
         if (source.flags != @as(u32, if (request == .queue) r4os.abi.gfx_buffer_reference_mapping_only else 0)) return error.Unsupported;
         if (request == .initial_image and !std.meta.eql(source.buffer, self.initial_image.?.presentation.surface.shadow.buffer)) return error.Stale;
-        if (request == .reference and !std.meta.eql(source.buffer, request.reference.buffer)) return error.Stale;
         var token = try self.channel.?.handoff(deadline);
-        const value = buffer_mapping.Owner.init(&token, &self.ctx.?, self.adapter_id, space, self.graph.?.reservation, source.*, deadline) catch |err| {
+        const storage: *BufferStorage = @ptrFromInt(allocation.cpu_address);
+        storage.names = .{};
+        const value = buffer_mapping.Owner.initResident(&token, &self.ctx.?, self.adapter_id, space, self.graph.?.reservation, source.*, deadline, &storage.names) catch |err| {
             self.channel = exchange.Exchange.init(&token, deadline) catch |restore| {
                 self.stop(restore);
                 return restore;
             };
             return err;
         };
-        const owner: *buffer_mapping.Owner = @ptrFromInt(allocation.cpu_address);
+        const owner = &storage.owner;
         owner.* = value;
         slot.owner = owner;
         source.* = .{};
         slot.serial = serial;
         slot.cacheable = request == .queue;
+        slot.public_users = if (request == .public_import) 1 else 0;
         slot.last_used = self.copy_completed +| 1;
         self.buffer_serial = serial;
         self.buffer_active = index;
@@ -4911,9 +4938,9 @@ pub const Owner = struct {
     }
     fn findBuffer(self: *Owner, handle: BufferHandle) !*buffer_mapping.Owner {
         _ = try self.now();
-        if (handle.epoch != self.epoch or handle.slot >= self.buffers.len or handle.serial == 0 or
-            self.buffers[handle.slot].serial != handle.serial) return error.Stale;
-        return self.buffers[handle.slot].owner orelse return error.Stale;
+        if (handle.epoch != self.epoch or handle.slot >= self.buffers.items().len or handle.serial == 0 or
+            self.buffers.items()[handle.slot].serial != handle.serial) return error.Stale;
+        return self.buffers.items()[handle.slot].owner orelse return error.Stale;
     }
     pub fn bufferStatus(self: *Owner, handle: BufferHandle) !BufferStatus {
         const owner = try self.findBuffer(handle);
@@ -4924,14 +4951,14 @@ pub const Owner = struct {
     /// entry starts real RM retirement per call; completion frees its slot.
     pub fn prepareCopyMappings(self: *Owner, needed: usize, byte_limit: u64, deadline: u64) !bool {
         _ = try self.now();
-        if (needed > self.buffers.len) return error.Bounds;
+        if (needed > std.math.maxInt(u32)) return error.Bounds;
         if (self.copyBusy() or self.hasQueuedWork() or self.cursor_point != null or self.cursor_reserving or self.graph_closing or self.buffer_active != null or
             self.fifo_active != null or self.virtuals.active_range != null or self.native_active != null or self.context_active != null or self.outputs.active() or self.sequence.self_address != 0 or
             self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         var available: usize = 0;
         var cached_bytes: u64 = 0;
         var oldest: ?usize = null;
-        next: for (&self.buffers, 0..) |*slot, index| {
+        next: for (self.buffers.items(), 0..) |*slot, index| {
             if (slot.allocation.handle == 0) { available += 1; continue; }
             const owner = slot.owner orelse continue;
             if (!slot.cacheable or slot.evicting or owner.state != .handed_off or owner.info() == null or
@@ -4941,16 +4968,33 @@ pub const Owner = struct {
             };
             cached_bytes +|= owner.mapped_bytes;
             if (!owner.aliases.empty()) continue;
-            if (oldest == null or slot.last_used < self.buffers[oldest.?].last_used) oldest = index;
+            if (oldest == null or slot.last_used < self.buffers.items()[oldest.?].last_used) oldest = index;
         }
         if (available >= needed and cached_bytes <= byte_limit) return false;
         const index = oldest orelse return false; // Existing mappings may still satisfy a queued copy.
-        const slot = &self.buffers[index];
+        const slot = &self.buffers.items()[index];
         try self.retireBuffer(.{ .epoch = self.epoch, .serial = slot.serial, .slot = @intCast(index) }, deadline, true);
         slot.evicting = true;
         return true;
     }
     pub fn retireBuffer(self: *Owner, handle: BufferHandle, deadline: u64, quiesced: bool) !void {
+        _ = try self.findBuffer(handle);
+        if (self.buffers.items()[handle.slot].public_users != 0) return error.Busy;
+        return self.retireBufferOwned(handle, deadline, quiesced);
+    }
+    /// Returns true only when the last reference starts physical retirement.
+    /// A non-last close ends this caller's use without waiting for other VAs.
+    pub fn releaseVirtualReference(self: *Owner, handle: BufferHandle, deadline: u64, quiesced: bool) !bool {
+        _ = try self.findBuffer(handle);
+        if (!quiesced) return error.Busy;
+        const slot = &self.buffers.items()[handle.slot];
+        if (slot.public_users == 0) return error.Stale;
+        if (slot.public_users > 1) { slot.public_users -= 1; return false; }
+        try self.retireBufferOwned(handle, deadline, true);
+        slot.public_users = 0; // No new borrower may join a destroying owner.
+        return true;
+    }
+    fn retireBufferOwned(self: *Owner, handle: BufferHandle, deadline: u64, quiesced: bool) !void {
         const owner = try self.findBuffer(handle);
         if (self.copyBusy() or self.hasQueuedWork()) return error.Busy;
         if (!quiesced or self.fifo_active != null or self.context_active != null or self.virtuals.active_range != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or
@@ -5026,39 +5070,38 @@ pub const Owner = struct {
         try self.channel.?.guard(deadline);
         try self.memory_admission.admit(self, plan.allocation_bytes, policy != null);
         const serial = try std.math.add(u64, self.buffer_serial, 1);
-        const index: u16 = blk: {
-            for (&self.native_buffers, 0..) |*slot, i| if (slot.allocation.handle == 0) break :blk @intCast(i);
-            return error.Exhausted;
-        };
         const heap = self.ctx.?.heap() orelse return error.Api;
-        const slot = &self.native_buffers[index];
+        const index = self.native_buffers.acquire(heap) catch |err| { if (err != error.Memory and err != error.Exhausted) self.stop(err); return err; };
+        const slot = &self.native_buffers.items()[index];
         slot.heap = heap;
-        const result = heap.allocate(@sizeOf(vram.Owner), @alignOf(vram.Owner), &slot.allocation);
+        const result = heap.allocate(@sizeOf(NativeBufferStorage), @alignOf(NativeBufferStorage), &slot.allocation);
         const allocation = slot.allocation;
         if (result != r4os.abi.driver_heap_ok and allocation.handle == 0) return error.Memory;
         if (allocation.version != 1 or allocation.size < @sizeOf(r4os.abi.DriverHeapAllocation) or allocation.handle == 0 or
-            allocation.cpu_address == 0 or allocation.cpu_address % @alignOf(vram.Owner) != 0 or allocation.reserved != 0 or
-            allocation.byte_length < @sizeOf(vram.Owner) or allocation.alignment < @alignOf(vram.Owner) or
+            allocation.cpu_address == 0 or allocation.cpu_address % @alignOf(NativeBufferStorage) != 0 or allocation.reserved != 0 or
+            allocation.byte_length < @sizeOf(NativeBufferStorage) or allocation.alignment < @alignOf(NativeBufferStorage) or
             allocation.cpu_address > std.math.maxInt(u64) - allocation.byte_length) {
             self.stop(error.Descriptor); return error.Descriptor;
         }
         errdefer if (heap.release(allocation.handle) == r4os.abi.driver_heap_ok) { slot.* = .{}; } else self.stop(error.Retained);
         if (result != r4os.abi.driver_heap_ok) return error.Memory;
         var token = try self.channel.?.handoff(deadline);
-        const value = vram.Owner.initStorage(&token, &self.ctx.?, self.adapter_id, space, self.graph.?.reservation, plan, policy, deadline) catch |err| {
+        const storage: *NativeBufferStorage = @ptrFromInt(allocation.cpu_address);
+        storage.names = .{};
+        const value = vram.Owner.initResident(&token, &self.ctx.?, self.adapter_id, space, self.graph.?.reservation, plan, policy, deadline, &storage.names) catch |err| {
             self.channel = exchange.Exchange.init(&token, deadline) catch |restore| { self.stop(restore); return restore; };
             return err;
         };
-        const owner: *vram.Owner = @ptrFromInt(allocation.cpu_address);
+        const owner = &storage.owner;
         owner.* = value; slot.owner = owner; slot.serial = serial;
         self.buffer_serial = serial; self.native_active = index;
         return .{ .epoch = self.epoch, .serial = serial, .slot = index };
     }
     fn findNativeBuffer(self: *Owner, handle: BufferHandle) !*vram.Owner {
         _ = try self.now();
-        if (handle.epoch != self.epoch or handle.slot >= self.native_buffers.len or handle.serial == 0 or
-            self.native_buffers[handle.slot].serial != handle.serial) return error.Stale;
-        return self.native_buffers[handle.slot].owner orelse return error.Stale;
+        if (handle.epoch != self.epoch or handle.slot >= self.native_buffers.items().len or handle.serial == 0 or
+            self.native_buffers.items()[handle.slot].serial != handle.serial) return error.Stale;
+        return self.native_buffers.items()[handle.slot].owner orelse return error.Stale;
     }
     pub fn nativeBufferStatus(self: *Owner, handle: BufferHandle) !NativeBufferStatus {
         const owner = try self.findNativeBuffer(handle);
@@ -5074,7 +5117,7 @@ pub const Owner = struct {
         if (!owner.common_live and !owner.namespace_live) try self.freeNativeSlot(handle.slot);
     }
     fn freeNativeSlot(self: *Owner, index: usize) !void {
-        const slot = &self.native_buffers[index];
+        const slot = &self.native_buffers.items()[index];
         const heap = slot.heap orelse return error.Api;
         if (heap.release(slot.allocation.handle) != r4os.abi.driver_heap_ok) return error.Retained;
         slot.* = .{};
@@ -5083,14 +5126,14 @@ pub const Owner = struct {
         if (self.fifo_active != null or self.context_active != null or self.virtuals.active_range != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or
             self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return false;
         const memory = blk: {
-            for (&self.native_buffers) |*slot| if (slot.owner) |owner| { if (owner.closing and owner.common_live) break :blk owner.memory; };
+            for (self.native_buffers.items()) |*slot| if (slot.owner) |owner| { if (owner.closing and owner.common_live) break :blk owner.memory; };
             return false;
         };
         var ticket: r4os.abi.GfxOwnedBufferRelease = .{};
         const result = memory.bufferTakeRelease(self.adapter_id, self.epoch, &ticket);
         if (result == r4os.abi.gfx_buffer_error_busy) return false;
         if (result != r4os.abi.gfx_buffer_result_ok) return error.Retained;
-        for (&self.native_buffers, 0..) |*slot, index| if (slot.owner) |owner| {
+        for (self.native_buffers.items(), 0..) |*slot, index| if (slot.owner) |owner| {
             if (!owner.accepts(ticket)) continue;
             var token = try self.channel.?.handoff(deadline);
             try owner.beginDestroy(&token, ticket, deadline);
@@ -5152,7 +5195,7 @@ pub const Owner = struct {
             .system => |buffer| try (try self.findBuffer(buffer)).retainAliasChunk(use, memory_offset, bytes),
             .native => |buffer| try (try self.findNativeBuffer(buffer)).retainAlias(use, memory_offset, bytes),
             .native_reference => |reference| {
-                const owner = for (&self.native_buffers) |*slot| {
+                const owner = for (self.native_buffers.items()) |*slot| {
                     const candidate = slot.owner orelse continue;
                     if (std.meta.eql(candidate.reservation.buffer, reference.buffer)) break candidate;
                 } else return error.Stale;
@@ -5207,7 +5250,7 @@ pub const Owner = struct {
             self.sequence.self_address != 0 or self.nativeObject() == null or self.channel.?.phase != .idle) return error.Busy;
         try self.channel.?.guard(deadline);
         if (self.power_owner) |*owner| if (!try owner.stop(current)) return error.Busy;
-        for (&self.native_buffers, 0..) |*slot, index| if (slot.owner != null) {
+        for (self.native_buffers.items(), 0..) |*slot, index| if (slot.owner != null) {
             try self.releaseNativeBuffer(.{ .epoch = self.epoch, .serial = slot.serial, .slot = @intCast(index) });
         };
         self.graph_closing = true;
@@ -5372,7 +5415,7 @@ pub const Owner = struct {
             return if (owner.exchange.phase == .waiting) .idle else .progress;
         }
         if (self.native_active) |index| {
-            const owner = self.native_buffers[index].owner orelse return error.State;
+            const owner = self.native_buffers.items()[index].owner orelse return error.State;
             if (owner.state == .ready or owner.state == .closed) {
                 if (owner.state == .ready) try self.rejection(.native_buffer, owner.binding.memory, owner.rejected, null);
                 if (owner.state == .ready) if (owner.host_rejected) |status| try self.recordFault(.{ .source = .host,
@@ -5392,7 +5435,7 @@ pub const Owner = struct {
             return if (owner.exchange.phase == .waiting) .idle else .progress;
         }
         if (self.buffer_active) |index| {
-            const slot = &self.buffers[index];
+            const slot = &self.buffers.items()[index];
             const owner = slot.owner orelse return error.State;
             if (owner.state == .ready or owner.state == .closed) {
                 if (owner.state == .ready) try self.rejection(.mapping, owner.reservation.object(0) catch 0, owner.rejected, owner.host_rejected);
@@ -5504,11 +5547,13 @@ pub const Owner = struct {
                 } else try self.retireVirtualRange(handle, self.close_deadline, true);
                 return .progress;
             }
-            for (&self.buffers, 0..) |*slot, index| if (slot.owner != null) {
+            for (self.buffers.items(), 0..) |*slot, index| if (slot.owner != null) {
                 try self.retireBuffer(.{ .epoch = self.epoch, .serial = slot.serial, .slot = @intCast(index) }, self.close_deadline, true);
                 return .progress;
             };
-            for (&self.native_buffers) |*slot| if (slot.owner != null) break :graph_close;
+            for (self.native_buffers.items()) |*slot| if (slot.owner != null) break :graph_close;
+            try self.buffers.closeEmpty();
+            try self.native_buffers.closeEmpty();
             var token = try channel.handoff(self.close_deadline);
             try self.graph.?.reclaim(&token, self.close_deadline);
             try self.graph.?.beginDestroy(self.close_deadline);

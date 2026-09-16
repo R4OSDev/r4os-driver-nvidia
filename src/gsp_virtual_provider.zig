@@ -270,8 +270,8 @@ pub const Owner = struct {
             return true;
         }
         if (node.buffer) |buffer| {
-            try running.retireBuffer(buffer, budget, true);
-            node.waiting = .buffer_destroy; return true;
+            if (try running.releaseVirtualReference(buffer, budget, true)) node.waiting = .buffer_destroy else node.buffer = null;
+            return true;
         }
         if (node.request.kind == 1) if (node.range) |range| {
             try running.retireVirtualRange(range, budget, true);
