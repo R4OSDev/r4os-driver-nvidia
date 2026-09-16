@@ -3957,9 +3957,11 @@ test "GSP transport orders range publication, explicit acknowledgement and termi
 test "GPU virtual ranges keep independent addresses and exact memory ownership" {
     const range = @import("gsp_virtual_range.zig");
     const wire = range.wire;
+    try checkResidentRmNames();
     const model = try t.allocator.create(Model);
     defer t.allocator.destroy(model);
     // Existing captured packets remain unchanged through the shared encoder.
+    try checkVirtualRegistry(model);
     for ([_][]const u8{ "control", "part" }) |kind| {
         const legacy = @import("gsp_buffer_wire.zig");
         const binding: legacy.Binding = .{ .space = .{ .epoch = 7, .client = 0xc1d00000, .device = 0x10000000,
@@ -4022,13 +4024,19 @@ test "GPU virtual ranges keep independent addresses and exact memory ownership" 
         const space: @import("gsp_vaspace.zig").Info = .{ .epoch = 7, .client = parent.client, .device = try parent.object(0),
             .handle = try parent.object(6), .base = 0x200000, .bytes = 0x100000000, .big_page_bytes = 65536 };
         const memory_names = try session.rm_names.reserveChildren(parent, 1);
-        var owner = try range.Owner.init(&token, space, parent, .{ .bytes = 128 * 1024, .alignment = 65536, .fixed_address = 0x800000 }, deadline);
+        var resident: rm_names.ResidentChildren = .{};
+        const config: range.Config = .{ .bytes = 128 * 1024, .alignment = 65536, .fixed_address = 0x800000 };
+        try t.expectError(error.Bounds, range.Owner.initResident(&token, space, parent, .{ .bytes = 4095 }, deadline, &resident));
+        try t.expect(!token.claimed and resident.self_address == 0);
+        var owner = if (scenario == .success) try range.Owner.init(&token, space, parent, config, deadline)
+            else try range.Owner.initResident(&token, space, parent, config, deadline, &resident);
         try t.expect(owner.info() == null);
         try virtualReply(model, &owner, if (scenario == .allocation_rejected) 0x51 else 0);
         try t.expect(owner.state == .ready);
         token = try owner.handoff(deadline);
         if (scenario == .allocation_rejected) {
             try t.expect(owner.info() == null and owner.state == .finished and !owner.namespace_live and owner.rejected.? == 0x51);
+            try t.expect(resident.self_address == 0);
             try session.rm_names.retireChildren(memory_names);
             try session.rm_names.retire(parent);
             continue;
@@ -4113,6 +4121,133 @@ test "GPU virtual ranges keep independent addresses and exact memory ownership" 
         plan = owner.plan;
         plan.bytes = std.math.maxInt(u64) - 4095;
         try t.expectError(error.Bounds, wire.allocate(plan, &reply));
+    }
+}
+fn checkResidentRmNames() !void {
+    var ledger = try rm_names.Ledger.init(7);
+    const parent = try ledger.reserve(7);
+    var legacy: [rm_names.max_child_ranges]rm_names.Children = undefined;
+    for (&legacy) |*lease| lease.* = try ledger.reserveChildren(parent, 1);
+    try t.expectError(error.Exhausted, ledger.reserveChildren(parent, 1));
+    // A chosen lower-bound probe, not a pool dimension in the implementation.
+    const storage = try t.allocator.alloc(rm_names.ResidentChildren, 513);
+    defer t.allocator.free(storage);
+    @memset(storage, .{});
+    const leases = try t.allocator.alloc(rm_names.Children, storage.len);
+    defer t.allocator.free(leases);
+    for (storage, leases, 0..) |*node, *lease, i| {
+        lease.* = try ledger.reserveResidentChildren(parent, @intCast(i % 7 + 1), node);
+        try ledger.validateChildren(lease.*);
+        try t.expect(try lease.object(0) == lease.first_object);
+        try t.expectError(error.Stale, ledger.reserveResidentChildren(parent, 1, node));
+    }
+    var copied = ledger;
+    try t.expectError(error.Stale, copied.validateChildren(leases[257]));
+    try t.expectError(error.Retained, ledger.retire(parent));
+    for (legacy) |lease| try ledger.retireChildren(lease);
+    try t.expectError(error.Retained, ledger.requireNoChildren(parent));
+    for (0..storage.len) |i| {
+        const index = (i * 37) % storage.len;
+        const old = leases[index];
+        try ledger.retireChildren(old);
+        try t.expect(storage[index].self_address == 0 and storage[index].entry.lease == null);
+        try t.expectError(error.Stale, ledger.validateChildren(old));
+        const replacement = try ledger.reserveResidentChildren(parent, 2, &storage[index]);
+        try t.expect(replacement.first_object > old.first_object);
+        try t.expectError(error.Stale, ledger.validateChildren(old));
+        try ledger.retireChildren(replacement);
+    }
+    try t.expect(ledger.resident_children.root == null);
+    try ledger.retire(parent);
+}
+fn checkVirtualRegistry(model: *Model) !void {
+    const r4os = @import("r4os");
+    const a = r4os.abi;
+    const resources = @import("gsp_virtual_resources.zig");
+    const heap = @import("gsp_buffer_test_model.zig").Model;
+    const reset = @import("gsp_reset.zig");
+    const Scenario = enum { pending_map, release_failure, invalid_allocation };
+    for (std.enums.values(Scenario)) |scenario| {
+        var table: a.DriverApi = undefined;
+        table.magic = a.driver_magic; table.version = 34; table.size = @sizeOf(a.DriverApi);
+        heap.install(&table, "virtual_registry");
+        defer heap.dispose(&table);
+        const ctx = r4os.r4dev.DriverContext.init(&table);
+        var registry: resources.Owner = .{};
+        try registry.configure(&ctx, 7);
+        var copied = registry;
+        try t.expectError(error.Stale, copied.first());
+        var session: transport.Session = undefined;
+        var boot = try startBoot(model, &session);
+        try model.replyRpc(&session, .{ .function = 0x1001, .result = 0 }, &.{ 0, 0, 0, 0 });
+        try boot.complete((try boot.poll()).?.ticket);
+        var token = try boot.handoff(deadline);
+        const parent = try session.rm_names.reserve(7);
+        const memory = try session.rm_names.reserveChildren(parent, 1);
+        const space: @import("gsp_vaspace.zig").Info = .{ .epoch = 7, .client = parent.client, .device = try parent.object(0),
+            .handle = try parent.object(6), .base = 0x200000, .bytes = 0x100000000, .big_page_bytes = 65536 };
+        const config: resources.range.Config = .{ .bytes = 16384, .fixed_address = 0x800000 };
+        for ([_]@TypeOf(heap.allocation_fault){ .empty, .partial }) |fault| {
+            heap.allocation_fault = fault;
+            try t.expectError(error.Memory, registry.create(&token, space, parent, config, deadline));
+            try t.expect(!token.claimed and registry.pending.handle == 0 and heap.heapLive() == 0 and try registry.first() == null);
+        }
+        var modeled: reset.Reset = .{ .epoch = 7, .triggered = true, .io = .{
+            .context = model, .generation = Model.generation, .now_ns = Model.clock,
+            .admit = ResetNoIo.admit, .pci_read = ResetNoIo.pciRead, .pci_write = ResetNoIo.pciWrite,
+            .read32 = ResetNoIo.read, .write32 = ResetNoIo.write,
+        } };
+        modeled.self_address = @intFromPtr(&modeled);
+        const proof: reset.Quiescence = .{ .owner = &modeled, .epoch = 7 };
+        if (scenario == .invalid_allocation) {
+            heap.allocation_fault = .descriptor;
+            try t.expectError(error.Descriptor, registry.create(&token, space, parent, config, deadline));
+            modeled.phase = .complete;
+            try t.expectError(error.Retained, registry.closeAfterReset(proof));
+            try t.expect(heap.heapLive() == 1 and registry.pending.handle != 0 and registry.ranges.root == null and !token.claimed);
+            continue; // Only host fixture disposal may free this unproven descriptor.
+        }
+        const handle = try registry.create(&token, space, parent, config, deadline);
+        var owner = registry.active().?;
+        try virtualReply(model, owner, 0);
+        token = try owner.handoff(deadline);
+        _ = try registry.complete();
+        const binding = try registry.prepareBinding(handle);
+        const value = &(try registry.findBinding(binding)).value;
+        var sources: resources.range.alias.Set = .{};
+        try sources.acquire(&value.source, .{ .space = space, .object = try memory.object(0), .allocation_bytes = 16384,
+            .offset = 4096, .bytes = 4096, .location = .system });
+        try registry.beginMap(&token, binding, 8192, deadline);
+        owner = registry.active().?;
+        if (scenario == .pending_map) {
+            _ = try owner.poll();
+            model.now = deadline;
+            try t.expectError(error.Deadline, owner.poll());
+            try t.expect(!sources.empty() and heap.heapLive() == 2 and registry.active_range != null);
+        } else {
+            try virtualReply(model, owner, 0);
+            token = try owner.handoff(deadline);
+            _ = try registry.complete();
+            try registry.beginUnmap(&token, binding, deadline, true);
+            try virtualReply(model, owner, 0);
+            token = try owner.handoff(deadline);
+            heap.release_fault = true;
+            try t.expectError(error.Retained, registry.complete());
+            try t.expect(sources.empty() and heap.heapLive() == 2 and registry.pending.handle != 0 and registry.active_range == null);
+        }
+        try t.expectError(error.Retained, registry.closeAfterReset(proof));
+        modeled.phase = .complete; // CPU ownership proof only, as above.
+        var slices: usize = 0;
+        while (true) {
+            const before = heap.heapLive();
+            const done = try registry.closeAfterReset(proof);
+            try t.expect(before - heap.heapLive() <= 1);
+            if (done) break;
+            slices += 1;
+            try t.expect(slices <= 5);
+        }
+        try t.expect(sources.empty() and heap.heapLive() == 0 and registry.ranges.root == null and
+            registry.pending.handle == 0 and session.rm_names.resident_children.root == null);
     }
 }
 fn virtualReply(model: *Model, owner: *@import("gsp_virtual_range.zig").Owner, status: u32) !void {

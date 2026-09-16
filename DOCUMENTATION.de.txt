@@ -1,8 +1,9 @@
 ﻿NVIDIA: nativer Grafik- und Displaybesitzer
 =========================================
 
-Stand: 16.09.2026, NVIDIA 0.1.125. Der Unterbau fuer unabhaengige GPU-VA-
-Reservierungen und RAM-/VRAM-Aliase ist hostseitig geprueft. Die Anbindung an
+Stand: 16.09.2026, NVIDIA 0.1.126. Der Unterbau fuer unabhaengige GPU-VA-
+Reservierungen und RAM-/VRAM-Aliase ist im Device-Worker mit dynamischer
+Verwaltung, Befehlspruefung und Graph-/Reset-Abbau hostseitig geprueft. Die Anbindung an
 native NVK-Auftraege und deren Prozesslebensdauer bleibt in 0.79.35 offen.
 Aktueller Detailstand: Docs/Drivers/GrafikVulkan07935.txt/.json; physische
 Nacharbeit ausschliesslich ExFiles/Reports/OssiGPU.txt /0.79.35.

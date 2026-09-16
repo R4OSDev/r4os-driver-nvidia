@@ -9490,6 +9490,14 @@ fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverAp
     }
     if (target.phase == .ready) {
         if (success and !private_storage and !model.is("vram_success")) model.slots[0].imported = true;
+        if (model.is("vram_success")) {
+            try alias_use.close(true);
+            const virtual = try running.allocateVirtualRange(.{ .bytes = 16384, .fixed_address = 0x90000000, .location = .video }, deadline);
+            try finishVirtual(target, false);
+            const mapped = try running.mapVirtualBuffer(virtual, .{ .native = handles[0] }, 65536, 8192, 4096, deadline);
+            try finishVirtual(target, false);
+            try t.expect(mapped.bytes == 4096 and (try running.virtualBindingStatus(mapped.handle)).mapped and model.slots[0].imported);
+        }
         if (success) @import("gsp_buffer_test_model.zig").Model.closeHeapAdmission(table);
         try t.expectError(error.Busy, running.beginDestroyGraph(deadline, false));
         try running.beginDestroyGraph(deadline, true);
@@ -9499,10 +9507,13 @@ fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverAp
             if (success and model.released == 1 and model.slots[0].imported) {
                 try t.expect(model.charged == full and model.slots[0].live and !model.slots[0].claimed and !model.slots[0].reference);
                 if (private_storage) try t.expect(storage_use.close(true))
-                else if (model.is("vram_success")) try alias_use.close(true)
-                else model.slots[0].imported = false;
+                else if (!model.is("vram_success")) model.slots[0].imported = false;
             }
             if (target.phase != .ready) break;
+            if (running.virtuals.active_range != null) {
+                try answerVirtual(target, false);
+                continue;
+            }
             const channel = running.activeChannel().?;
             if (channel.phase != .waiting) continue;
             var response: [160]u8 = @splat(0); @memcpy(response[0..channel.request.len], channel.request);
@@ -9535,6 +9546,104 @@ fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverAp
         try t.expect(released.native_reserved_bytes == 0 and released.native_physical_bytes == 0);
         if (success) try t.expect(model.released == 2 and model.aborted == 0);
     }
+}
+
+// Uses Device.step, native command admission and the retained physical queue
+// fixture. Only the peer RM replies are modeled, as in the existing BO cases.
+fn answerVirtual(target: *@import("gsp_device.zig").Device, rejected: bool) !void {
+    const running = &target.running;
+    const session = &target.session.?;
+    const command = init.queues_offset + init.command_offset;
+    const status = init.queues_offset + init.status_offset;
+    const owner = running.virtuals.active() orelse return error.TestExpectedEqual;
+    const channel = &owner.exchange;
+    if (channel.phase != .waiting) return;
+    const cursor = (session.tx_write + 62) % 63;
+    const record = try transport.message.decode(session.profile, backing.?[command + 4096 + cursor * 4096 ..][0..4096], session.tx_sequence - 1);
+    try t.expectEqualSlices(u8, channel.request, record.payload);
+    channel.phase = .prepared;
+    try target.port.owner.?.admit_command.?(target.port.owner.?.context, &target.port, owner.deadline);
+    const original = channel.request;
+    channel.request = record.payload;
+    try t.expectError(error.Binding, target.port.owner.?.admit_command.?(target.port.owner.?.context, &target.port, owner.deadline));
+    channel.request = original;
+    channel.phase = .waiting;
+    var response: [160]u8 = @splat(0);
+    @memcpy(response[0..channel.request.len], channel.request);
+    switch (owner.state) {
+        .creating => {
+            std.mem.writeInt(u64, response[112..120], owner.plan.fixed_address, .little);
+            std.mem.writeInt(u64, response[120..128], owner.plan.bytes - 1, .little);
+            if (rejected) std.mem.writeInt(u32, response[16..20], 0x51, .little);
+        },
+        .mapping => {
+            const mapping = owner.active.?.mapping.?;
+            std.mem.writeInt(u64, response[40..48], owner.address + mapping.virtual_offset, .little);
+            if (rejected) std.mem.writeInt(u32, response[48..52], 0x51, .little);
+        },
+        .unmapping, .destroying => try t.expect(!rejected),
+        else => return error.TestExpectedEqual,
+    }
+    std.mem.writeInt(u32, backing.?[status + 64 ..][0..4], session.tx_write, .little);
+    try nativeReply(session, channel.function, 0, response[0..channel.request.len]);
+}
+fn finishVirtual(target: *@import("gsp_device.zig").Device, rejected: bool) !void {
+    var steps: usize = 0;
+    while (target.phase == .ready and target.running.virtuals.active_range != null and steps < 16) : (steps += 1) {
+        _ = target.step();
+        if (target.phase == .ready and target.running.virtuals.active_range != null) try answerVirtual(target, rejected);
+    }
+    try t.expect(target.phase == .ready and steps < 16 and target.running.virtuals.active_range == null);
+}
+fn checkVirtualRuntime(target: *@import("gsp_device.zig").Device, source: @import("gsp_runtime.zig").BufferHandle, deadline: u64) !void {
+    const running = &target.running;
+    const session = &target.session.?;
+    const config: @import("gsp_virtual_range.zig").Config = .{ .bytes = 16384, .fixed_address = 0x90000000 };
+    const sent = session.tx_sequence;
+    try t.expectError(error.Bounds, running.allocateVirtualRange(.{ .bytes = 4095 }, deadline));
+    try t.expect(session.tx_sequence == sent and try running.virtuals.first() == null and running.channel.?.phase == .idle);
+    const refused = try running.allocateVirtualRange(config, deadline);
+    try finishVirtual(target, true);
+    const no_address = try running.virtualStatus(refused);
+    try t.expect(no_address.state == .finished and no_address.info == null and no_address.rejected == 0x51);
+    try running.retireVirtualRange(refused, deadline, true);
+    try t.expectError(error.Stale, running.virtualStatus(refused));
+    const first = try running.allocateVirtualRange(config, deadline);
+    try t.expect((try running.virtualStatus(first)).info == null);
+    try t.expectError(error.Busy, running.allocateVirtualRange(config, deadline));
+    try finishVirtual(target, false);
+    const second = try running.allocateVirtualRange(.{ .bytes = 16384, .fixed_address = 0x91000000 }, deadline);
+    try finishVirtual(target, false);
+    const boundary: u64 = @import("gsp_buffer_wire.zig").max_registration_pages * 4096;
+    const map1 = try running.mapVirtualBuffer(first, .{ .system = source }, boundary - 4096, 4096, 8192, deadline);
+    try t.expect(map1.bytes == 4096 and !(try running.virtualBindingStatus(map1.handle)).mapped);
+    try finishVirtual(target, false);
+    const map2 = try running.mapVirtualBuffer(second, .{ .system = source }, boundary - 4096, 8192, 4096, deadline);
+    try finishVirtual(target, false);
+    const owner1 = try running.virtuals.findBinding(map1.handle);
+    const owner2 = try running.virtuals.findBinding(map2.handle);
+    try t.expect(owner1.value.mapping.?.memory == owner2.value.mapping.?.memory and owner1.value.mapping.?.memory_offset == owner2.value.mapping.?.memory_offset);
+    try t.expect(owner1.value.mapping.?.address != owner2.value.mapping.?.address);
+    try t.expectError(error.Busy, running.retireBuffer(source, deadline, true));
+    try t.expectError(error.Busy, running.retireVirtualRange(first, deadline, true));
+    try t.expectError(error.Busy, running.unmapVirtualBuffer(map1.handle, deadline, false));
+    try t.expectError(error.Busy, running.mapVirtualBuffer(first, .{ .system = source }, 0, 4096, 4096, deadline));
+    try t.expectError(error.Bounds, running.mapVirtualBuffer(first, .{ .system = source }, 0, 16384, 4096, deadline));
+    const refused_map = try running.mapVirtualBuffer(first, .{ .system = source }, boundary, 8192, 4096, deadline);
+    try finishVirtual(target, true);
+    const no_map = try running.virtualBindingStatus(refused_map.handle);
+    try t.expect(!no_map.mapped and no_map.bytes == 0 and no_map.rejected == 0x51);
+    try running.discardVirtualBinding(refused_map.handle);
+    try running.unmapVirtualBuffer(map2.handle, deadline, true);
+    try finishVirtual(target, false);
+    try t.expectError(error.Stale, running.virtualBindingStatus(map2.handle));
+    try running.retireVirtualRange(second, deadline, true);
+    try finishVirtual(target, false);
+    try t.expectError(error.Stale, running.virtualStatus(second));
+    // Leave two mappings on different RM registrations for graph retirement.
+    _ = try running.mapVirtualBuffer(first, .{ .system = source }, boundary, 8192, 4096, deadline);
+    try finishVirtual(target, false);
+    try t.expect((try running.virtualBindingStatus(map1.handle)).mapped);
 }
 
 fn checkDeviceMappings(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, scenario: []const u8) !void {
@@ -9672,13 +9781,21 @@ fn checkDeviceMappings(target: *@import("gsp_device.zig").Device, table: *a.Driv
         if (model.is("mapping_release")) break;
     }
     if (target.phase == .ready) {
-        if (model.is("mapping_success")) model.closeHeapAdmission(table);
+        if (model.is("mapping_success")) {
+            try checkVirtualRuntime(target, handles[0], deadline);
+            model.closeHeapAdmission(table);
+        }
         try t.expectError(error.Busy, running.beginDestroyGraph(deadline, false));
         try running.beginDestroyGraph(deadline, true);
         var steps: usize = 0;
         while (target.phase == .ready and steps < 120) : (steps += 1) {
             _ = target.step();
             if (target.phase != .ready) break;
+            if (running.virtuals.active_range != null) {
+                try t.expect(!freeing and model.refs[0] and model.refs[1]);
+                try answerVirtual(target, false);
+                continue;
+            }
             const channel = running.activeChannel().?;
             if (channel.phase != .waiting) continue;
             var response: [160]u8 = @splat(0);
@@ -9705,7 +9822,8 @@ fn checkDeviceMappings(target: *@import("gsp_device.zig").Device, table: *a.Driv
         if (!model.is("mapping_release")) {
             try t.expect(freeing and running.graph.?.state == .finished and !ControlModel.active);
             try t.expectError(error.Stale, session.rm_names.validate(running.graph.?.reservation));
-            if (model.is("mapping_success")) try t.expect(registers == 4 and maps_done == 4 and unmaps == 4 and model.releases == 2 and model.segments == 20481);
+            if (model.is("mapping_success")) try t.expect(registers == 4 and maps_done == 4 and unmaps == 4 and model.releases == 2 and model.segments == 20481 and
+                running.virtuals.ranges.root == null and running.virtuals.pending.handle == 0);
         }
     }
     try t.expect(target.phase == .recovering and running.failure != null and running.nativeObject() == null);

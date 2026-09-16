@@ -219,6 +219,12 @@ pub const ContextHandle = struct { epoch: u64, serial: u64, slot: u16 };
 pub const ContextStatus = struct { state: execution_context.State, info: ?execution_context.Info, rejected: ?u32, unavailable: ?execution_context.Unavailable };
 const ContextSlot = struct { owner: ?*execution_context.Owner = null, allocation: r4os.abi.DriverHeapAllocation = .{}, heap: ?r4os.r4dev.DriverHeapContext = null, serial: u64 = 0 };
 pub const BufferHandle = struct { epoch: u64, serial: u64, slot: u16 };
+pub const virtual_resources = @import("gsp_virtual_resources.zig");
+pub const VirtualHandle = virtual_resources.Handle;
+pub const VirtualBindingHandle = virtual_resources.BindingHandle;
+pub const VirtualStatus = struct { state: virtual_resources.range.State, info: ?virtual_resources.range.Info, rejected: ?u32 };
+pub const VirtualBindingStatus = struct { mapped: bool, bytes: u64, rejected: ?u32 };
+pub const VirtualSource = union(enum) { system: BufferHandle, native: BufferHandle };
 pub const BufferStatus = struct { state: buffer_mapping.State, info: ?buffer_mapping.Info, rejected: ?u32, host_rejected: ?buffer_mapping.Error };
 const BufferSlot = struct { owner: ?*buffer_mapping.Owner = null, allocation: r4os.abi.DriverHeapAllocation = .{}, heap: ?r4os.r4dev.DriverHeapContext = null, serial: u64 = 0, pending_source: r4os.abi.GfxBufferReference = .{}, cacheable: bool = false, last_used: u64 = 0, evicting: bool = false };
 pub const NativeBufferStatus = struct { state: vram.State, info: ?vram.Info, rejected: ?u32, host_rejected: ?i32 };
@@ -345,6 +351,7 @@ pub const Owner = struct {
     residency_rejections: u64 = 0,
     native_buffers: [256]NativeBufferSlot = @splat(.{}),
     native_active: ?u16 = null,
+    virtuals: virtual_resources.Owner = .{},
     allocations: @import("gsp_allocation.zig").Owner = .{},
     fifos: [64]ChannelSlot = @splat(.{}),
     fifo_active: ?u16 = null,
@@ -379,7 +386,7 @@ pub const Owner = struct {
     graph_closing: bool = false,
     close_deadline: u64 = 0,
     reset_stage: enum { loss, queue, transfers, work, presentations, fifos, display_channels, display_resources,
-        contexts, control, mappings, native, done } = .loss,
+        contexts, control, virtuals, mappings, native, done } = .loss,
     reset_cursor: usize = 0,
     words: [logs.output_bytes]u8 = undefined,
 
@@ -542,6 +549,10 @@ pub const Owner = struct {
                 if (self.graph) |*graph| if (graph.control_buffer) |*owner| {
                     if (!owner.backing.closeAfterReset(proof)) return error.Retained;
                 };
+                self.reset_stage = .virtuals;
+            },
+            .virtuals => {
+                if (!try self.virtuals.closeAfterReset(proof)) return false;
                 self.reset_stage = .mappings; self.reset_cursor = 0;
             },
             .mappings => {
@@ -591,6 +602,7 @@ pub const Owner = struct {
         if (self.display_channel_active != null) return .display_channel;
         if (self.mode_control_active or self.display_engine_active or self.audio_work != null or self.monitor_work != null or self.sor_work != null) return .display_engine;
         if (self.buffer_active != null) return .mapping;
+        if (self.virtuals.active_range != null) return .mapping;
         if (self.native_active != null) return .native_buffer;
         if (self.fifo_active != null) return .channel;
         if (self.context_active != null) return .context;
@@ -829,6 +841,7 @@ pub const Owner = struct {
         if (self.context_active) |index| if (self.contexts[index].owner) |owner| return &owner.exchange;
         if (self.native_active) |index| if (self.native_buffers[index].owner) |owner| return &owner.exchange;
         if (self.buffer_active) |index| if (self.buffers[index].owner) |owner| return &owner.exchange;
+        if (self.virtuals.active()) |owner| return &owner.exchange;
         if (self.outputs.channel()) |channel| return &channel.exchange;
         if (self.graph) |*graph| if (graph.channel()) |channel| return channel;
         return if (self.channel) |*channel| channel else null;
@@ -2814,7 +2827,7 @@ pub const Owner = struct {
         const fifo = try self.findChannel(entry.channel_handle);
         if (entry.initial_point != 0 or self.copyBusy() or
             self.graph_closing or !fifo.ring.idle() or self.fifo_active != null or self.context_active != null or
-            self.native_active != null or self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or
+            self.virtuals.active_range != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or
             self.display_engine_active or self.display_channel_active != null or self.channel.?.phase != .idle or self.channel.?.in_lockdown)
             return error.Busy;
         if (self.display_images[entry.window.slot - 1]) |active| if (active.image.dma == dma) return error.Busy;
@@ -2858,7 +2871,7 @@ pub const Owner = struct {
     fn createContext(self: *Owner, rm_engine: u32, deadline: u64) !ContextHandle {
         _ = try self.now();
         if (rm_engine == 1 and self.static_info == null) return error.State;
-        if (self.graph_closing or self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or self.sequence.self_address != 0 or self.outputs.active()) return error.Busy;
+        if (self.graph_closing or self.fifo_active != null or self.context_active != null or self.virtuals.active_range != null or self.native_active != null or self.buffer_active != null or self.sequence.self_address != 0 or self.outputs.active()) return error.Busy;
         const space = (self.nativeAddressSpace() orelse return error.State).*;
         const subdevice = self.graph.?.base.plan.handles.subdevice;
         if (self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
@@ -2911,7 +2924,7 @@ pub const Owner = struct {
         try (try self.findContext(handle)).releaseChild(child, quiesced);
     }
     pub fn attachContextMethods(self: *Owner, context: ContextHandle, runqueue: u8, buffer: BufferHandle) !void {
-        if (self.copyBusy() or self.graph_closing or self.fifo_active != null or self.context_active != null or self.native_active != null or self.display_engine_active or self.display_channel_active != null) return error.Busy;
+        if (self.copyBusy() or self.graph_closing or self.fifo_active != null or self.context_active != null or self.virtuals.active_range != null or self.native_active != null or self.display_engine_active or self.display_channel_active != null) return error.Busy;
         const owner = try self.findContext(context);
         try owner.attachMethods(runqueue, try self.findNativeBuffer(buffer));
     }
@@ -2927,16 +2940,16 @@ pub const Owner = struct {
         return (try self.findContext(context)).graphicsRequirement(index);
     }
     pub fn attachGraphicsContextBuffer(self: *Owner, context: ContextHandle, index: usize, buffer: BufferHandle) !void {
-        if (self.copyAdmissionBusy() or self.context_active != null or self.native_active != null or self.fifo_active != null or self.graph_closing) return error.Busy;
+        if (self.copyAdmissionBusy() or self.context_active != null or self.virtuals.active_range != null or self.native_active != null or self.fifo_active != null or self.graph_closing) return error.Busy;
         try (try self.findContext(context)).attachGraphics(index, try self.findNativeBuffer(buffer));
     }
     pub fn shareGraphicsContextGlobals(self: *Owner, context: ContextHandle, golden: ContextHandle) !void {
-        if (self.copyAdmissionBusy() or self.context_active != null or self.native_active != null or self.fifo_active != null or self.graph_closing) return error.Busy;
+        if (self.copyAdmissionBusy() or self.context_active != null or self.virtuals.active_range != null or self.native_active != null or self.fifo_active != null or self.graph_closing) return error.Busy;
         try (try self.findContext(context)).shareGraphicsGlobals(try self.findContext(golden));
     }
     pub fn retireExecutionContext(self: *Owner, handle: ContextHandle, deadline: u64) !void {
         const owner = try self.findContext(handle);
-        if (self.copyBusy() or self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or
+        if (self.copyBusy() or self.fifo_active != null or self.context_active != null or self.virtuals.active_range != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or
             self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         if (owner.held()) return error.Retained;
         var token = try self.channel.?.handoff(deadline);
@@ -2971,7 +2984,7 @@ pub const Owner = struct {
     }
     fn openChannel(self: *Owner, context_handle: ContextHandle, runqueue: u8, instance: BufferHandle, userd: ?BufferHandle, engine: execution_fifo.wire.Engine, deadline: u64) !ChannelHandle {
         _ = try self.now();
-        if (self.graph_closing or self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or self.sequence.self_address != 0 or self.outputs.active()) return error.Busy;
+        if (self.graph_closing or self.fifo_active != null or self.context_active != null or self.virtuals.active_range != null or self.native_active != null or self.buffer_active != null or self.sequence.self_address != 0 or self.outputs.active()) return error.Busy;
         _ = self.nativeAddressSpace() orelse return error.State;
         if (self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         const parent = try self.findContext(context_handle);
@@ -3236,7 +3249,7 @@ pub const Owner = struct {
             return false;
         }
         if (current >= work.deadline) return error.Deadline;
-        if (self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or
+        if (self.fifo_active != null or self.context_active != null or self.virtuals.active_range != null or self.native_active != null or self.buffer_active != null or
             self.display_engine_active or self.display_channel_active != null or self.mode_control_active or self.outputs.active() or
             self.sequence.self_address != 0 or self.channel.?.phase != .idle or self.channel.?.pending != null) return false;
         work.ticket = try fifo.prepareGraphics(work.command);
@@ -3259,7 +3272,7 @@ pub const Owner = struct {
         if (current >= work.operation.deadline) {
             try work.operation.cancel(); self.graphics_upload = null; return true;
         }
-        if (self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or
+        if (self.fifo_active != null or self.context_active != null or self.virtuals.active_range != null or self.native_active != null or self.buffer_active != null or
             self.display_engine_active or self.display_channel_active != null or self.mode_control_active or self.outputs.active() or
             self.sequence.self_address != 0 or self.channel.?.phase != .idle or self.channel.?.pending != null) return false;
         work.operation.ticket = try fifo.prepareCopy(try work.operation.transfer());
@@ -3271,7 +3284,7 @@ pub const Owner = struct {
         if (self.presentation) |entry| if (std.meta.eql(entry.channel_handle, handle)) return error.Busy;
         const owner = try self.findChannel(handle);
         if (self.copyBusy() or self.hasQueuedWork()) return error.Busy;
-        if (self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or
+        if (self.fifo_active != null or self.context_active != null or self.virtuals.active_range != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or
             self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         var token = try self.channel.?.handoff(deadline);
         owner.beginDestroy(&token, deadline, quiesced) catch |err| {
@@ -3354,7 +3367,7 @@ pub const Owner = struct {
         const fifo = try self.findChannel(handle);
         const value = fifo.info() orelse return error.State;
         if (!value.config.system_userd or !fifo.ring.idle() or self.copyAdmissionBusy() or self.graphics_starting or self.graph_closing or self.display_engine_active or self.display_channel_active != null or
-            self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or
+            self.fifo_active != null or self.context_active != null or self.virtuals.active_range != null or self.native_active != null or self.buffer_active != null or
             self.outputs.active() or self.sequence.self_address != 0 or self.channel.?.phase != .idle or self.channel.?.in_lockdown) return error.Busy;
         if (self.frame_setup != null) return error.Busy;
         try self.channel.?.guard(deadline);
@@ -4631,7 +4644,7 @@ pub const Owner = struct {
             return self.direct_work.?.phase != phase;
         }
         if (self.copyBusy() or self.cursor_point != null or self.nativeObject() == null or self.graph_closing or
-            self.display_channel_active != null or self.display_engine_active or self.buffer_active != null or self.native_active != null or
+            self.display_channel_active != null or self.display_engine_active or self.buffer_active != null or self.virtuals.active_range != null or self.native_active != null or
             self.fifo_active != null or self.context_active != null or self.outputs.active() or self.sequence.self_address != 0 or
             self.channel.?.phase != .idle or self.channel.?.pending != null) return false;
         const backend = self.copy_backend orelse return false;
@@ -4801,7 +4814,7 @@ pub const Owner = struct {
     const MappingSource = union(enum) { queue: struct { fence: r4os.abi.GfxFence, which: u32 }, initial_image };
     fn mapBuffer(self: *Owner, request: MappingSource, deadline: u64) !BufferHandle {
         _ = try self.now();
-        if (self.graph_closing or self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or self.sequence.self_address != 0 or self.outputs.active()) return error.Busy;
+        if (self.graph_closing or self.fifo_active != null or self.context_active != null or self.virtuals.active_range != null or self.native_active != null or self.buffer_active != null or self.sequence.self_address != 0 or self.outputs.active()) return error.Busy;
         const space = (self.nativeAddressSpace() orelse return error.State).*;
         if (self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         try self.channel.?.guard(deadline);
@@ -4892,7 +4905,7 @@ pub const Owner = struct {
         _ = try self.now();
         if (needed > self.buffers.len) return error.Bounds;
         if (self.copyBusy() or self.hasQueuedWork() or self.cursor_point != null or self.cursor_reserving or self.graph_closing or self.buffer_active != null or
-            self.fifo_active != null or self.native_active != null or self.context_active != null or self.outputs.active() or self.sequence.self_address != 0 or
+            self.fifo_active != null or self.virtuals.active_range != null or self.native_active != null or self.context_active != null or self.outputs.active() or self.sequence.self_address != 0 or
             self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         var available: usize = 0;
         var cached_bytes: u64 = 0;
@@ -4919,7 +4932,7 @@ pub const Owner = struct {
     pub fn retireBuffer(self: *Owner, handle: BufferHandle, deadline: u64, quiesced: bool) !void {
         const owner = try self.findBuffer(handle);
         if (self.copyBusy() or self.hasQueuedWork()) return error.Busy;
-        if (!quiesced or self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or
+        if (!quiesced or self.fifo_active != null or self.context_active != null or self.virtuals.active_range != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or
             self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         if (owner.state != .handed_off) return error.State;
         var token = try self.channel.?.handoff(deadline);
@@ -4986,7 +4999,7 @@ pub const Owner = struct {
     fn openNativeBuffer(self: *Owner, plan: vram.surface.Plan, policy: ?vram.storage.Policy, deadline: u64) !BufferHandle {
         _ = try self.now();
         if (self.power_active or self.powerStopping()) return error.Busy;
-        if (self.graph_closing or self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or self.sequence.self_address != 0 or self.outputs.active()) return error.Busy;
+        if (self.graph_closing or self.fifo_active != null or self.context_active != null or self.virtuals.active_range != null or self.native_active != null or self.buffer_active != null or self.sequence.self_address != 0 or self.outputs.active()) return error.Busy;
         const space = (self.nativeAddressSpace() orelse return error.State).*;
         if (self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         try self.channel.?.guard(deadline);
@@ -5046,7 +5059,7 @@ pub const Owner = struct {
         slot.* = .{};
     }
     fn collectNativeBuffer(self: *Owner, deadline: u64) !bool {
-        if (self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or
+        if (self.fifo_active != null or self.context_active != null or self.virtuals.active_range != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or
             self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return false;
         const memory = blk: {
             for (&self.native_buffers) |*slot| if (slot.owner) |owner| { if (owner.closing and owner.common_live) break :blk owner.memory; };
@@ -5064,12 +5077,105 @@ pub const Owner = struct {
         };
         return error.Descriptor; // Claimed unknown identity remains held.
     }
+    fn admitVirtual(self: *Owner, deadline: u64, closing: bool) !void {
+        _ = try self.now();
+        if (self.graph_closing and !closing) return error.Busy;
+        if (self.power_active or self.powerStopping() and !closing or self.copyBusy() or self.hasQueuedWork() or
+            self.cursor_point != null or self.cursor_reserving or self.display_work != null or self.hasDisplayFlips() or
+            self.sequence.self_address != 0 or self.outputs.active() or self.virtuals.active_range != null or
+            self.channel == null or self.activeChannel() != &self.channel.? or self.graph == null or self.graph.?.state != .loaned or
+            self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
+        try self.channel.?.guard(deadline);
+        try self.virtuals.configure(&self.ctx.?, self.epoch);
+    }
+    fn returnVirtualLoan(self: *Owner, token: *boot.Handoff, deadline: u64) !void {
+        if (token.claimed) { self.stop(error.Retained); return error.Retained; }
+        self.channel = exchange.Exchange.init(token, deadline) catch |err| { self.stop(err); return err; };
+    }
+    /// Internal worker handles only. The common broker must authenticate any
+    /// future application request before calling these operations.
+    pub fn allocateVirtualRange(self: *Owner, config: virtual_resources.range.Config, deadline: u64) !VirtualHandle {
+        try self.admitVirtual(deadline, false);
+        const space = (self.nativeAddressSpace() orelse return error.State).*;
+        var token = try self.channel.?.handoff(deadline);
+        return self.virtuals.create(&token, space, self.graph.?.reservation, config, deadline) catch |err| {
+            try self.returnVirtualLoan(&token, deadline);
+            if (self.virtuals.failure != null) self.stop(err);
+            return err;
+        };
+    }
+    pub fn virtualStatus(self: *Owner, handle: VirtualHandle) !VirtualStatus {
+        _ = try self.now();
+        const entry = try self.virtuals.find(handle);
+        const value = if (entry.value) |*owner| owner else return error.State;
+        return .{ .state = value.state, .info = value.info(), .rejected = value.rejected };
+    }
+    pub fn virtualBindingStatus(self: *Owner, handle: VirtualBindingHandle) !VirtualBindingStatus {
+        _ = try self.now();
+        const value = &(try self.virtuals.findBinding(handle)).value;
+        return .{ .mapped = value.mapped, .bytes = if (value.mapping) |mapping| mapping.bytes else 0, .rejected = value.rejected };
+    }
+    /// RAM may cross several existing RM registrations. Returns one bounded
+    /// chunk; the caller advances both offsets by bytes for the next request.
+    pub fn mapVirtualBuffer(self: *Owner, handle: VirtualHandle, source: VirtualSource, memory_offset: u64,
+        virtual_offset: u64, bytes: u64, deadline: u64) !struct { handle: VirtualBindingHandle, bytes: u64 }
+    {
+        try self.admitVirtual(deadline, false);
+        const binding = self.virtuals.prepareBinding(handle) catch |err| {
+            if (self.virtuals.failure != null) self.stop(err);
+            return err;
+        };
+        errdefer self.virtuals.discardBinding(binding) catch |err| self.stop(err);
+        const use = &(try self.virtuals.findBinding(binding)).value.source;
+        switch (source) {
+            .system => |buffer| try (try self.findBuffer(buffer)).retainAliasChunk(use, memory_offset, bytes),
+            .native => |buffer| try (try self.findNativeBuffer(buffer)).retainAlias(use, memory_offset, bytes),
+        }
+        const retained = try use.info();
+        var token = try self.channel.?.handoff(deadline);
+        self.virtuals.beginMap(&token, binding, virtual_offset, deadline) catch |err| {
+            try self.returnVirtualLoan(&token, deadline);
+            return err;
+        };
+        return .{ .handle = binding, .bytes = retained.bytes };
+    }
+    pub fn unmapVirtualBuffer(self: *Owner, handle: VirtualBindingHandle, deadline: u64, quiesced: bool) !void {
+        if (!quiesced) return error.Busy;
+        try self.admitVirtual(deadline, true);
+        var token = try self.channel.?.handoff(deadline);
+        self.virtuals.beginUnmap(&token, handle, deadline, true) catch |err| {
+            try self.returnVirtualLoan(&token, deadline); return err;
+        };
+    }
+    pub fn discardVirtualBinding(self: *Owner, handle: VirtualBindingHandle) !void {
+        _ = try self.now();
+        self.virtuals.discardBinding(handle) catch |err| {
+            if (self.virtuals.failure != null) self.stop(err);
+            return err;
+        };
+    }
+    pub fn retireVirtualRange(self: *Owner, handle: VirtualHandle, deadline: u64, quiesced: bool) !void {
+        if (!quiesced) return error.Busy;
+        try self.admitVirtual(deadline, true);
+        const entry = try self.virtuals.find(handle);
+        if (entry.value != null and entry.value.?.state == .finished) {
+            self.virtuals.discardRejected(handle) catch |err| {
+                if (self.virtuals.failure != null) self.stop(err);
+                return err;
+            };
+            return;
+        }
+        var token = try self.channel.?.handoff(deadline);
+        self.virtuals.beginDestroy(&token, handle, deadline, true) catch |err| {
+            try self.returnVirtualLoan(&token, deadline); return err;
+        };
+    }
     /// Requires all engine users independently quiesced. Each child mapping
     /// is drained before graph.beginDestroy may send any parent/event free.
     pub fn beginDestroyGraph(self: *Owner, deadline: u64, quiesced: bool) !void {
         const current = try self.now();
         if (self.copyBusy() or self.hasQueuedWork() or self.display_engine_owner != null or self.mode_control_owner != null) return error.Busy;
-        if (!quiesced or self.graph_closing or self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or
+        if (!quiesced or self.graph_closing or self.fifo_active != null or self.context_active != null or self.virtuals.active_range != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or
             self.sequence.self_address != 0 or self.nativeObject() == null or self.channel.?.phase != .idle) return error.Busy;
         try self.channel.?.guard(deadline);
         if (self.power_owner) |*owner| if (!try owner.stop(current)) return error.Busy;
@@ -5221,6 +5327,21 @@ pub const Owner = struct {
             }
             return if (owner.exchange.phase == .waiting) .idle else .progress;
         }
+        if (self.virtuals.active()) |owner| {
+            if (owner.state == .ready or owner.state == .closed) {
+                if (owner.state == .ready) try self.rejection(.mapping, owner.plan.object, owner.rejected, null);
+                const deadline = owner.deadline;
+                var token = try owner.handoff(deadline);
+                self.channel = try exchange.Exchange.init(&token, deadline);
+                _ = try self.virtuals.complete();
+                return .progress;
+            }
+            if (owner.poll() catch |err| { self.rmFailure(.mapping, owner.plan.object, owner.rejected); return err; }) |dispatch| {
+                try self.notification(&owner.exchange, dispatch, current);
+                return .progress;
+            }
+            return if (owner.exchange.phase == .waiting) .idle else .progress;
+        }
         if (self.native_active) |index| {
             const owner = self.native_buffers[index].owner orelse return error.State;
             if (owner.state == .ready or owner.state == .closed) {
@@ -5325,7 +5446,7 @@ pub const Owner = struct {
         // giving cursor/output owners one admission opportunity. Retained jobs
         // now resume by producer turn even when no new queue wake is pending.
         if (!self.copyAdmissionBusy() and self.cursor_point == null and self.fifo_active == null and
-            self.context_active == null and self.native_active == null and self.buffer_active == null and
+            self.context_active == null and self.virtuals.active_range == null and self.native_active == null and self.buffer_active == null and
             !self.display_engine_active and self.display_channel_active == null and !self.outputs.active() and
             self.sequence.self_address == 0 and self.channel.?.phase == .idle and self.channel.?.pending == null and
             self.channel.?.in_lockdown == false and try self.activateWork()) return .progress;
@@ -5344,6 +5465,13 @@ pub const Owner = struct {
             };
             for (&self.contexts) |*slot| if (slot.owner != null) break :graph_close;
             if (!self.graphics_cache.close(true)) return error.Retained;
+            if (try self.virtuals.first()) |handle| {
+                if (try self.virtuals.firstBinding(handle)) |binding| {
+                    if ((try self.virtualBindingStatus(binding)).mapped) try self.unmapVirtualBuffer(binding, self.close_deadline, true)
+                    else try self.discardVirtualBinding(binding);
+                } else try self.retireVirtualRange(handle, self.close_deadline, true);
+                return .progress;
+            }
             for (&self.buffers, 0..) |*slot, index| if (slot.owner != null) {
                 try self.retireBuffer(.{ .epoch = self.epoch, .serial = slot.serial, .slot = @intCast(index) }, self.close_deadline, true);
                 return .progress;
@@ -5577,7 +5705,7 @@ pub const Owner = struct {
     }
     fn beginPower(self: *Owner, current: u64) !bool {
         if (!self.power_enabled or !self.rm_enabled or self.power_active or self.copyBusy() or self.cursor_point != null or
-            self.cursor_reserving or self.fifo_active != null or self.context_active != null or self.native_active != null or
+            self.cursor_reserving or self.fifo_active != null or self.context_active != null or self.virtuals.active_range != null or self.native_active != null or
             self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or self.graph_closing or
             self.nativeObject() == null or self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return false;
         const owner = (try self.ensurePower()) orelse return false;

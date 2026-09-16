@@ -50,10 +50,21 @@ pub const Owner = struct {
     pub fn init(token: *boot.Handoff, space: @import("gsp_vaspace.zig").Info,
         parent: names.Lease, config: Config, deadline: u64) Error!Owner
     {
+        return initStorage(token, space, parent, config, deadline, null);
+    }
+    pub fn initResident(token: *boot.Handoff, space: @import("gsp_vaspace.zig").Info,
+        parent: names.Lease, config: Config, deadline: u64, storage: *names.ResidentChildren) Error!Owner
+    {
+        return initStorage(token, space, parent, config, deadline, storage);
+    }
+    fn initStorage(token: *boot.Handoff, space: @import("gsp_vaspace.zig").Info,
+        parent: names.Lease, config: Config, deadline: u64, storage: ?*names.ResidentChildren) Error!Owner
+    {
         if (token.claimed or token.session.state != .active or token.session.pending != null or
             space.epoch != token.session.epoch or parent.epoch != space.epoch or parent.client != space.client) return error.Stale;
         try token.session.guard(deadline);
-        const reservation = try token.session.rm_names.reserveChildren(parent, 1);
+        const reservation = if (storage) |resident| try token.session.rm_names.reserveResidentChildren(parent, 1, resident)
+            else try token.session.rm_names.reserveChildren(parent, 1);
         errdefer token.session.rm_names.retireChildren(reservation) catch {};
         const plan: wire.Allocation = .{ .space = space, .object = try reservation.object(0), .bytes = config.bytes,
             .alignment = config.alignment, .fixed_address = config.fixed_address, .location = config.location, .blocklinear = config.blocklinear };

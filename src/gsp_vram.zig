@@ -125,6 +125,7 @@ pub const Owner = struct {
     }
     pub fn retainAlias(self: *Owner, use: *alias.Use, offset: u64, bytes: u64) Error!void {
         const value = self.info() orelse return error.State;
+        if (self.storage_policy != null or self.layout.privileged or self.layout.readonly) return error.Unsupported;
         if (bytes == 0 or (offset | bytes) & 4095 != 0 or bytes > self.logical_bytes or offset > self.logical_bytes - bytes) return error.Bounds;
         try self.aliases.acquire(use, .{ .space = self.binding.space, .object = self.binding.memory,
             .allocation_bytes = self.bytes, .offset = offset, .bytes = bytes, .location = .video });

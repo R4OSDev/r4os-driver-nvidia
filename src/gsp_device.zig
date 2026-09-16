@@ -816,6 +816,8 @@ pub const Device = struct {
         } else if (self.running.buffer_active) |index| {
             const mapping = self.running.buffers[index].owner orelse return error.Binding;
             if (!mapping.matches(channel, deadline)) return error.Binding;
+        } else if (self.running.virtuals.active()) |mapping| {
+            if (!mapping.matches(channel, deadline)) return error.Binding;
         } else if (self.running.outputs.active()) {
             if (!self.running.outputs.matches(channel, deadline)) return error.Binding;
         } else if (self.running.sor_work) |*work| {
@@ -860,7 +862,7 @@ pub const Device = struct {
         const run = &self.running;
         if (self.phase != .ready or port != &self.port or port.phase != .runtime or self.session == null or self.inLockdown() or
             run.self_address != @intFromPtr(run) or run.failure != null or run.sequence.self_address != 0 or run.graph_closing or run.power_active or
-            run.fifo_active != null or run.context_active != null or run.native_active != null or run.buffer_active != null or
+            run.fifo_active != null or run.context_active != null or run.virtuals.active_range != null or run.native_active != null or run.buffer_active != null or
             run.outputs.active() or run.display_engine_active or run.display_channel_active != null or run.mode_control_active or
             run.copy_job != null or run.display_upload_job != null or run.initial_image != null or run.cursor_upload != null or
             run.display_work != null or run.audio_work != null or run.graphics_upload != null) return error.State;
@@ -881,7 +883,7 @@ pub const Device = struct {
         try self.checkLive(false);
         if (self.phase != .ready or port != &self.port or port.phase != .runtime or self.session == null or self.inLockdown() or
             self.running.self_address != @intFromPtr(&self.running) or self.running.failure != null or self.running.sequence.self_address != 0 or
-            self.running.fifo_active != null or self.running.context_active != null or self.running.native_active != null or self.running.buffer_active != null or
+            self.running.fifo_active != null or self.running.context_active != null or self.running.virtuals.active_range != null or self.running.native_active != null or self.running.buffer_active != null or
             self.running.outputs.active() or self.running.graph_closing or self.running.power_active or self.running.display_engine_active or self.running.display_channel_active != null or self.running.display_work != null or self.running.mode_control_active or self.running.graphics_work != null) return error.State;
         self.running.validateCopyOverlap() catch return error.Binding;
         const channel_handle = if (self.running.graphics_upload) |*work| blk: {
@@ -971,7 +973,7 @@ pub const Device = struct {
         if (channel.config.kind == .cursor) return self.admitCursorPoint(port, channel, deadline, access_kind);
         if (self.phase != .ready or port != &self.port or port.phase != .runtime or self.session == null or self.inLockdown() or
             self.running.self_address != @intFromPtr(&self.running) or self.running.failure != null or self.running.sequence.self_address != 0 or
-            self.running.fifo_active != null or self.running.context_active != null or self.running.native_active != null or self.running.buffer_active != null or
+            self.running.fifo_active != null or self.running.context_active != null or self.running.virtuals.active_range != null or self.running.native_active != null or self.running.buffer_active != null or
             self.running.outputs.active() or self.running.graph_closing or self.running.display_engine_active or self.running.display_channel_active != null or self.running.mode_control_active or
             self.running.copy_job != null or self.running.display_upload_job != null or self.running.cursor_upload != null or self.running.initial_image != null) return error.State;
         if (channel.config.kind == .window and self.running.displayFlip(channel.config.index) != null)

@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.125; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.126; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -19,9 +19,12 @@ native VRAM object; no copied staging buffer or second registration is needed.
 VRAM aliases also keep a common BO import. The original owners reject early
 retirement and the mapping cache skips aliased entries. Ambiguous replies keep
 both sides; reset cleanup releases at most one binding per worker slice.
-The existing copy/display path uses the shared wire encoder. Connecting these
-new range owners to runtime requests, native NVK and process cleanup remains
-software work; this checkpoint does not expose a Vulkan device or new features.
+The existing copy/display path uses the shared wire encoder. Dynamic resident
+range/binding metadata now runs through the real Device worker, command admission
+and graph/reset retirement. New VA names bypass the legacy fixed child ledger;
+malformed heap ownership stays retained. The common application/process broker,
+NVK integration and legacy physical-resource capacity remain software work.
+This checkpoint does not expose a Vulkan device or new public features.
 Details and physical follow-up: GrafikVulkan07935.txt/.json and OssiGPU.txt /35.
 The existing owner step accepts `unit-test "-Downer-test-filter=GPU virtual"`
 for this focused group alone; omitting the filter retains the full owner step.

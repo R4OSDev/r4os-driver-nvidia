@@ -129,12 +129,24 @@ pub const Children = struct {
     }
 };
 const ChildEntry = struct { lease: ?Children = null, retained: bool = false };
+const ResidentTree = std.Treap(u32, std.math.order);
+const resident_slot = std.math.maxInt(u16);
+/// Caller-owned stable metadata for general resources. The ledger allocates
+/// no memory and does not cap these entries at the legacy bootstrap table.
+/// Retirement detaches the node before its owning heap allocation may close.
+pub const ResidentChildren = struct {
+    self_address: usize = 0,
+    ledger_address: usize = 0,
+    node: ResidentTree.Node = undefined,
+    entry: ChildEntry = .{},
+};
 pub const Ledger = struct {
     epoch: u64,
     next_client: u32 = 0,
     next_object: u32 = object_first,
     entries: [max_clients]Entry = @splat(.{}),
     children: [max_child_ranges]ChildEntry = @splat(.{}),
+    resident_children: ResidentTree = .{},
 
     pub fn init(epoch: u64) error{Stale}!Ledger {
         if (epoch == 0) return error.Stale;
@@ -178,6 +190,13 @@ pub const Ledger = struct {
         for (&self.children) |child| if (child.lease) |held| {
             if (std.meta.eql(held.parent, lease)) return error.Retained;
         };
+        var cursor = self.resident_children.getMin();
+        while (cursor) |node| : (cursor = node.next()) {
+            const child: *ResidentChildren = @fieldParentPtr("node", node);
+            if (child.self_address != @intFromPtr(child) or child.ledger_address != @intFromPtr(self)) return error.Stale;
+            const held = child.entry.lease orelse return error.Stale;
+            if (std.meta.eql(held.parent, lease)) return error.Retained;
+        }
     }
     /// An uncertain graph stays in the ledger until the whole device run is
     /// discarded after independent quiescence. There is no unretain method.
@@ -199,12 +218,41 @@ pub const Ledger = struct {
         }
         return error.Exhausted;
     }
+    pub fn reserveResidentChildren(self: *Ledger, parent: Lease, count: u16, storage: *ResidentChildren) Error!Children {
+        try self.validate(parent);
+        if (storage.self_address != 0 or storage.ledger_address != 0 or storage.entry.lease != null or storage.entry.retained) return error.Stale;
+        if (count == 0) return error.Bounds;
+        if (self.next_object < object_first or self.next_object >= object_end or count > object_end - self.next_object) return error.Exhausted;
+        var place = self.resident_children.getEntryFor(self.next_object);
+        if (place.node != null) return error.Stale;
+        const value: Children = .{ .parent = parent, .slot = resident_slot, .first_object = self.next_object, .object_count = count };
+        storage.* = .{ .self_address = @intFromPtr(storage), .ledger_address = @intFromPtr(self), .entry = .{ .lease = value } };
+        place.set(&storage.node);
+        self.next_object += count;
+        return value;
+    }
     fn lookupChildren(self: *Ledger, lease: Children) Error!*ChildEntry {
         _ = try self.lookup(lease.parent);
-        if (lease.slot >= self.children.len) return error.Stale;
-        const selected = &self.children[lease.slot];
+        const selected = if (lease.slot == resident_slot) blk: {
+            const node = self.resident_children.getEntryFor(lease.first_object).node orelse return error.Stale;
+            const storage: *ResidentChildren = @fieldParentPtr("node", node);
+            if (storage.self_address != @intFromPtr(storage) or storage.ledger_address != @intFromPtr(self)) return error.Stale;
+            break :blk &storage.entry;
+        } else blk: {
+            if (lease.slot >= self.children.len) return error.Stale;
+            break :blk &self.children[lease.slot];
+        };
         if (!std.meta.eql(selected.lease orelse return error.Stale, lease)) return error.Stale;
         return selected;
+    }
+    fn removeChildren(self: *Ledger, lease: Children) Error!void {
+        const entry = try self.lookupChildren(lease);
+        if (lease.slot == resident_slot) {
+            const storage: *ResidentChildren = @fieldParentPtr("entry", entry);
+            var place = self.resident_children.getEntryForExisting(&storage.node);
+            place.set(null);
+            storage.* = .{};
+        } else entry.* = .{};
     }
     pub fn validateChildren(self: *Ledger, lease: Children) Error!void {
         try self.validate(lease.parent);
@@ -212,7 +260,7 @@ pub const Ledger = struct {
     }
     pub fn retireChildren(self: *Ledger, lease: Children) Error!void {
         try self.validateChildren(lease);
-        (try self.lookupChildren(lease)).* = .{};
+        try self.removeChildren(lease);
     }
     pub fn retainChildren(self: *Ledger, lease: Children) Error!void {
         (try self.lookupChildren(lease)).retained = true;
@@ -224,6 +272,6 @@ pub const Ledger = struct {
     }
     pub fn retireChildrenAfterReset(self: *Ledger, lease: Children, proof: @import("gsp_reset.zig").Quiescence) Error!void {
         try self.validateChildrenAfterReset(lease, proof);
-        (try self.lookupChildren(lease)).* = .{};
+        try self.removeChildren(lease);
     }
 };

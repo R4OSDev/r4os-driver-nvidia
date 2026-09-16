@@ -16,6 +16,13 @@ pub const Model = struct {
     const Allocation = struct { bytes: ?[]align(8) u8 = null, handle: u64 = 0 };
     var allocations: [32]Allocation = @splat(.{}); // Golden + normal GR metadata owners coexist.
     var serial: u64 = 0;
+    pub var allocation_fault: enum { none, empty, partial, descriptor } = .none;
+    pub var release_fault: bool = false;
+    pub fn heapLive() usize {
+        var count: usize = 0;
+        for (&allocations) |*entry| if (entry.bytes != null) { count += 1; };
+        return count;
+    }
     pub fn install(table: *a.DriverApi, name: []const u8) void {
         original = table.*;
         table.heap_query = heap;
@@ -24,6 +31,7 @@ pub const Model = struct {
         scenario = name;
         refs = @splat(false); dma = @splat(.{}); gpu = @splat(.{});
         releases = 0; segments = 0;
+        allocation_fault = .none; release_fault = false;
     }
     pub fn dispose(table: *a.DriverApi) void {
         table.* = original;
@@ -48,16 +56,21 @@ pub const Model = struct {
     }
     fn allocate(bytes: u64, alignment: u32, out: *a.DriverHeapAllocation) callconv(.c) i32 {
         std.debug.assert(alignment <= 8 and bytes <= 132000);
+        const fault = allocation_fault;
+        allocation_fault = .none;
+        if (fault == .empty) return a.driver_heap_error_closed;
         for (&allocations) |*entry| if (entry.bytes == null) {
             const data = t.allocator.alignedAlloc(u8, .@"8", @intCast(bytes)) catch return -1;
             serial += 1;
             entry.* = .{ .bytes = data, .handle = 0xe10000000 + serial };
             out.* = .{ .handle = entry.handle, .cpu_address = @intFromPtr(data.ptr), .byte_length = bytes, .alignment = 8 };
-            return 0;
+            if (fault == .descriptor) out.byte_length = 0;
+            return if (fault == .none) a.driver_heap_ok else a.driver_heap_error_closed;
         };
         return -1;
     }
     fn releaseHeap(handle: u64) callconv(.c) i32 {
+        if (release_fault) { release_fault = false; return a.driver_heap_error_closed; }
         for (&allocations) |*entry| if (entry.handle == handle) {
             t.allocator.free(entry.bytes.?); entry.* = .{}; return 0;
         };
