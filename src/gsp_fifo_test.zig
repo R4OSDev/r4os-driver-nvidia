@@ -11,6 +11,7 @@ pub fn response(index: usize) []const u8 {
     const bytes = wire.length(ops[index]); return golden[at + bytes..][0..bytes];
 }
 pub fn check() !void {
+    try @import("gsp_architecture_test.zig").check();
     try @import("gsp_copy_test.zig").check();
     try checkGraphics();
     try checkGraphicsContexts();

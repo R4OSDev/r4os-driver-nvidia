@@ -2225,7 +2225,23 @@ pub const Owner = struct {
         if (result != r4os.abi.gfx_queue_ok or entry.binding.version != 1 or entry.binding.size < @sizeOf(r4os.abi.GfxBackendBinding) or
             entry.binding.adapter_id != self.adapter_id or entry.binding.milestone != r4os.abi.gfx_queue_milestone_device_execution or
             entry.binding.device_generation == 0 or entry.binding.reset_generation == 0) { self.stop(error.Descriptor); return error.Descriptor; }
+        self.publishArchitecture(&queue, entry.binding, fifo.config.object_class);
         return entry.binding;
+    }
+    fn publishArchitecture(self: *Owner, queue: *const r4os.driver_queue.Context, binding: r4os.abi.GfxBackendBinding, copy_class: u32) void {
+        const held = self.reservation orelse return;
+        const captured = held.display orelse return;
+        const pci = if (captured.snapshot) |*value| value else return;
+        const chip = captured.chip orelse return;
+        const topology = self.post.snapshot() orelse return;
+        if (self.post.epoch != self.epoch) return;
+        const memory = if (self.static_info) |*value| value else return;
+        const va = self.nativeAddressSpace() orelse return;
+        const properties = @import("gsp_architecture.zig").describe(pci, chip.id, topology, memory, va.*, self.epoch, copy_class) catch |err| {
+            self.log("NVIDIA architecture: unavailable reason={s}", .{@errorName(err)}); return;
+        };
+        const result = queue.publishProperties(&binding, &properties);
+        if (result != r4os.abi.gfx_queue_ok) self.log("NVIDIA architecture: unavailable result={d}", .{result});
     }
     fn registerAdditionalPresentation(self: *Owner, handle: ChannelHandle, root: DisplayEngineHandle,
         window: DisplayChannelHandle, dma: u32, shadow: r4os.abi.GfxBufferHandle, deadline: u64) !r4os.abi.GfxBackendBinding
