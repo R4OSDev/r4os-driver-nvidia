@@ -14,6 +14,7 @@ pub const Model = struct {
     pub var import_failure: i32 = 0;
     var query: *const fn (*a.GfxDriverMemoryApi) callconv(.c) i32 = undefined;
     var fallback_release: u64 = 0;
+    var fallback_describe: u64 = 0;
     var fallback_import: u64 = 0;
     var fallback_acquire: u64 = 0;
     var fallback_device_release: u64 = 0;
@@ -40,14 +41,27 @@ pub const Model = struct {
     fn memory(out: *a.GfxDriverMemoryApi) callconv(.c) i32 {
         if (query(out) != a.gfx_buffer_result_ok) return -1;
         fallback_release = out.buffer_release;
+        fallback_describe = out.buffer_describe;
         fallback_import = out.buffer_import; fallback_acquire = out.device_acquire; fallback_device_release = out.device_release;
         out.size = @sizeOf(a.GfxDriverMemoryApi);
         out.buffer_reserve = @intFromPtr(&reserve); out.buffer_commit = @intFromPtr(&commit); out.buffer_abort = @intFromPtr(&abort);
         out.buffer_take_release = @intFromPtr(&take); out.buffer_finish_release = @intFromPtr(&finish); out.buffer_release = @intFromPtr(&drop);
         out.buffer_import = @intFromPtr(&import); out.device_acquire = @intFromPtr(&acquire); out.device_release = @intFromPtr(&releaseDevice);
+        out.buffer_describe = @intFromPtr(&describe);
         out.memory_budget = @intFromPtr(&memoryBudget);
         if (is("vram_surface_linear")) out.size = 184; // Existing native ABI, no optional budget service.
         return a.gfx_buffer_result_ok;
+    }
+    fn describe(input: *const a.GfxBufferHandle, out: *a.GfxBufferDescriptor) callconv(.c) i32 {
+        for (&slots, 0..) |*slot, i| if (slot.live and slot.published) {
+            if ((slot.reference and std.meta.eql(slot.reservation.reference, input.*)) or
+                (slot.imported and std.meta.eql(importedReference(i), input.*)) or
+                (slot.borrowed and std.meta.eql(borrowedReference(i), input.*))) {
+                out.* = slot.descriptor; return 1;
+            }
+        };
+        const call: *const fn (*const a.GfxBufferHandle, *a.GfxBufferDescriptor) callconv(.c) i32 = @ptrFromInt(fallback_describe);
+        return call(input, out);
     }
     fn memoryBudget(input: *const a.GfxDeviceBudgetRequest, output: *a.GfxDeviceBudgetState) callconv(.c) i32 {
         std.debug.assert(input.version == 1 and input.size == 32 and input.adapter_id == 0x01000000 and input.memory_generation != 0 and output.version == 1 and output.size == 64);

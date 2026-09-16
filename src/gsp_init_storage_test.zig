@@ -1573,7 +1573,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         control_short, control_bounds, control_map_address, control_ack, control_timeout, control_unmap, control_free, control_dma_unmap, control_release, control_gpu_acquire, control_gpu_release,
         memory_caps_reject, memory_caps_none, memory_caps_rpc, memory_caps_short, memory_caps_wrong, memory_caps_ack, memory_caps_timeout,
         power_success, power_attach_reject, power_poll_reject, power_detach_reject, power_ack_failure,
-        mapping_success, mapping_reject, mapping_offset, mapping_ack, mapping_timeout, mapping_release, mapping_segment, mapping_gpu,
+        mapping_success, mapping_reject, mapping_offset, mapping_ack, mapping_timeout, mapping_release, mapping_segment, mapping_gpu, mapping_provider_reset,
         vram_success, vram_budget, vram_physical_reject, vram_virtual_reject, vram_map_reject, vram_commit, vram_size, vram_ack, vram_timeout, vram_free, vram_finish,
         vram_surface_linear, vram_surface_tiled, vram_surface_changed, vram_surface_contiguity,
         vram_storage, vram_storage_bounds, vram_storage_contiguity, vram_storage_acquire, vram_storage_descriptor, vram_storage_no_clear,
@@ -1652,7 +1652,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         IrqModel.reset();
         target.irq_wake = .{ .context = @intFromPtr(target), .signal = IrqModel.wake };
         const reset_case = case == .gpu_reset_success or case == .gpu_reset_gfw_timeout;
-        const reset_capable = reset_case or case == .context_native_reset or case == .context_native_console;
+        const reset_capable = reset_case or case == .context_native_reset or case == .context_native_console or case == .mapping_provider_reset;
         capture.snapshot.?.caps.pcie = if (reset_capable) 0x78 else 0;
         capture.snapshot.?.caps.power_state = if (reset_capable) 0 else null;
         capture.snapshot.?.caps.msi = if (case == .irq_intx) 0 else 0x68;
@@ -9516,6 +9516,7 @@ fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverAp
             try t.expectError(error.Memory, running.mapVirtualBuffer(virtual, .{ .native_reference = borrowed }, 0, 0, 4096, deadline));
             model.import_failure = 0;
             try t.expect(owner.aliases.empty() and running.failure == null and session.tx_sequence == sent);
+            try checkNativeVirtualProvider(target, table, borrowed);
             const mapped = try running.mapVirtualBuffer(virtual, .{ .native_reference = borrowed }, 65536, 8192, 4096, deadline);
             try finishVirtual(target, false);
             try t.expect(mapped.bytes == 4096 and (try running.virtualBindingStatus(mapped.handle)).mapped and model.slots[0].imported);
@@ -9669,6 +9670,233 @@ fn checkVirtualRuntime(target: *@import("gsp_device.zig").Device, source: @impor
     try t.expect((try running.virtualBindingStatus(map1.handle)).mapped);
 }
 
+const ProviderCase = enum { normal, reject_second, timeout_map, close_map };
+fn answerProviderBuffer(target: *@import("gsp_device.zig").Device) !void {
+    const model = @import("gsp_buffer_test_model.zig").Model;
+    const running = &target.running;
+    const owner = running.buffers[running.buffer_active.?].owner.?;
+    const rpc = &owner.exchange;
+    if (rpc.phase != .waiting) return;
+    const session = &target.session.?;
+    const index = owner.source.buffer.id - 181;
+    try t.expect(index < 2 and model.full_refs[index] and owner.source.flags == 0);
+    // Check the real device admission, including the resident request pointer.
+    rpc.phase = .prepared;
+    try target.port.owner.?.admit_command.?(target.port.owner.?.context, &target.port, owner.deadline);
+    rpc.phase = .waiting;
+    var response: [160]u8 = @splat(0);
+    const bytes = if (owner.operation.? == .register) 0 else rpc.request.len;
+    if (bytes != 0) @memcpy(response[0..bytes], rpc.request);
+    const offset = @as(u64, owner.operation_part) * @import("gsp_buffer_mapping.zig").chunk_bytes;
+    switch (owner.operation.?) {
+        .allocate => {
+            std.mem.writeInt(u64, response[112..120], model.address(index), .little);
+            std.mem.writeInt(u64, response[120..128], model.rounded[index] - 1, .little);
+        },
+        .register => {
+            const payload = rpc.request;
+            try t.expect(payload.len == 56 + std.mem.readInt(u32, payload[40..44], .little) * 8);
+            for (0..(payload.len - 56) / 8) |page| try t.expect(std.mem.readInt(u64, payload[56 + page * 8 ..][0..8], .little) == model.page(index, offset + page * 4096) >> 12);
+        },
+        .map => std.mem.writeInt(u64, response[40..48], model.address(index) + offset, .little),
+        else => {},
+    }
+    const status = init.queues_offset + init.status_offset;
+    std.mem.writeInt(u32, backing.?[status + 64 ..][0..4], session.tx_write, .little);
+    try nativeReply(session, rpc.function, 0, response[0..bytes]);
+}
+fn driveVirtualProvider(target: *@import("gsp_device.zig").Device, mode: ProviderCase) !struct { maps: usize, unmaps: usize } {
+    const peer = @import("gsp_virtual_provider_test_model.zig").Model;
+    var steps: usize = 0;
+    var bind_count: usize = 0;
+    var unbind_count: usize = 0;
+    errdefer |err| std.debug.print("virtual provider: {s} mode={s} phase={s} failure={?} steps={d} maps={d} unmaps={d}\n",
+        .{@errorName(err),@tagName(mode),@tagName(target.phase),target.failure,steps,bind_count,unbind_count});
+    errdefer std.debug.print("provider blocked power={} outputs={} channel={s} virtual={} buffer={?}\n", .{target.running.power_active,target.running.outputs.active(),
+        if (target.running.activeChannel()) |rpc| @tagName(rpc.phase) else "none",target.running.virtuals.active_range != null,target.running.buffer_active});
+    while (steps < 1000 and peer.completion == null and target.phase == .ready) : (steps += 1) {
+        // Drain a bounded number of CPU-only phase changes before advancing
+        // Device. Receiver discovery has its own response fixture afterwards.
+        for (0..8) |_| {
+            const progress = try target.running.virtual_provider.step(&target.running);
+            if (peer.completion != null or !progress or target.running.virtuals.active_range != null or target.running.buffer_active != null) break;
+        }
+        if (peer.completion != null) break;
+        _ = target.step();
+        if (target.phase != .ready or peer.completion != null) break;
+        if (target.running.power_active and target.running.activeChannel().?.phase == .waiting) try replyNativeProduct(target);
+        if (target.running.buffer_active != null) try answerProviderBuffer(target);
+        if (target.running.virtuals.active()) |owner| {
+            if (owner.exchange.phase != .waiting) continue;
+            if (owner.state == .mapping) {
+                bind_count += 1;
+                if (bind_count == 1 and mode == .timeout_map) clock = peer.claim.?.request.deadline_ns + 1;
+                if (bind_count == 1 and mode == .close_map) target.running.virtual_provider.close();
+            }
+            if (owner.state == .unmapping) unbind_count += 1;
+            try t.expect(peer.completion == null and peer.claim != null);
+            try answerVirtual(target, mode == .reject_second and bind_count == 2 and owner.state == .mapping);
+        }
+    }
+    try t.expect(steps < 1000 and target.phase == .ready and peer.completion != null);
+    return .{ .maps = bind_count, .unmaps = unbind_count };
+}
+fn checkNativeVirtualProvider(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, borrowed: a.GfxBufferReference) !void {
+    const peer = @import("gsp_virtual_provider_test_model.zig").Model;
+    const model = @import("gsp_vram_test_model.zig").Model;
+    const running = &target.running;
+    peer.install(table); defer peer.dispose(table);
+    try t.expect(try running.virtual_provider.step(running));
+    const range: a.GfxVirtualJob = .{ .resource = .{ .id = 905, .generation = 17 }, .request = .{ .kind = 1,
+        .adapter_id = running.adapter_id, .memory_generation = running.epoch, .location = 1,
+        .byte_length = 4096, .alignment = 4096, .fixed_address = 0x92000000, .deadline_ns = clock + 5 * std.time.ns_per_s } };
+    peer.submit(range); _ = try driveVirtualProvider(target, .normal);
+    try t.expect(peer.completion.?.result == 1);
+    const binding: a.GfxVirtualJob = .{ .resource = .{ .id = 906, .generation = 17 }, .reference = borrowed,
+        .parent_token = peer.completion.?.token, .request = .{ .kind = 2, .parent = range.resource, .reference = borrowed.reference,
+            .adapter_id = running.adapter_id, .memory_generation = running.epoch, .byte_offset = 65536,
+            .byte_length = 4096, .deadline_ns = range.request.deadline_ns } };
+    peer.submit(binding);
+    const bound = try driveVirtualProvider(target, .normal);
+    try t.expect(bound.maps == 1 and peer.completion.?.result == 1 and model.slots[0].imported and model.slots[0].borrowed and !model.slots[0].reference);
+    var retire = binding; retire.operation = 1; retire.token = peer.completion.?.token;
+    peer.submit(retire);
+    const retired = try driveVirtualProvider(target, .normal);
+    try t.expect(retired.unmaps == 1 and peer.completion.?.result == 1 and !model.slots[0].imported and model.slots[0].borrowed);
+    running.virtual_provider.close(); peer.completion = null;
+    _ = try driveVirtualProvider(target, .normal);
+    _ = try running.virtual_provider.step(running);
+    try t.expect(running.virtual_provider.closed());
+}
+fn checkVirtualProvider(target: *@import("gsp_device.zig").Device, table: *a.DriverApi) !void {
+    const model = @import("gsp_buffer_test_model.zig").Model;
+    const peer = @import("gsp_virtual_provider_test_model.zig").Model;
+    const running = &target.running;
+    var checkpoint: []const u8 = "register";
+    errdefer |err| std.debug.print("public VA checkpoint={s} error={s} phase={s} failure={?} heap={d} refs={any} completion={any}\n",
+        .{checkpoint,@errorName(err),@tagName(target.phase),target.failure,model.heapLive(),model.refs,peer.completion});
+    const heap_before = model.heapLive();
+    peer.install(table); defer peer.dispose(table);
+    try t.expect(try running.virtual_provider.step(running));
+    const end = clock + 5 * std.time.ns_per_s;
+    const range_job: a.GfxVirtualJob = .{ .resource = .{ .id = 901, .generation = 12 },
+        .request = .{ .kind = 1, .adapter_id = running.adapter_id, .memory_generation = running.epoch,
+            .byte_length = 16384, .alignment = 4096, .fixed_address = 0x92000000, .deadline_ns = end } };
+    const sent = target.session.?.tx_sequence;
+    checkpoint = "metadata OOM";
+    for ([_]@TypeOf(model.allocation_fault){ .empty, .partial }) |allocation_case| {
+        model.allocation_fault = allocation_case;
+        peer.submit(range_job); try t.expect(try running.virtual_provider.step(running));
+        try t.expect(peer.completion.?.result == a.gfx_buffer_error_oom and model.heapLive() == heap_before and target.session.?.tx_sequence == sent);
+    }
+    checkpoint = "range";
+    peer.submit(range_job); _ = try driveVirtualProvider(target, .normal);
+    const range_result = peer.completion.?;
+    try t.expect(range_result.result == 1 and range_result.address == 0x92000000);
+    const range_heap = model.heapLive();
+    const boundary = @import("gsp_buffer_mapping.zig").chunk_bytes;
+    var binding: a.GfxVirtualJob = .{ .resource = .{ .id = 902, .generation = 12 }, .parent_token = range_result.token,
+        .reference = model.borrowed(0), .request = .{ .kind = 2, .adapter_id = running.adapter_id, .memory_generation = running.epoch,
+            .parent = range_job.resource, .reference = model.borrowed(0).reference, .byte_offset = boundary - 4096,
+            .virtual_offset = 4096, .byte_length = 8192, .deadline_ns = end } };
+    const before_rejections = target.session.?.tx_sequence;
+    checkpoint = "canonical imports";
+    // The full-reference import, not the supplied BO/flags, is authoritative.
+    var forged = binding; forged.reference.buffer.id += 1;
+    peer.submit(forged);
+    for (0..3) |_| { if (peer.completion != null) break; try t.expect(try running.virtual_provider.step(running)); }
+    try t.expect(peer.completion.?.result == a.gfx_buffer_error_stale and !model.refs[0]);
+    model.import_immutable = true;
+    peer.submit(binding);
+    for (0..3) |_| { if (peer.completion != null) break; try t.expect(try running.virtual_provider.step(running)); }
+    try t.expect(peer.completion.?.result == a.gfx_buffer_error_unsupported and !model.refs[0]);
+    model.import_immutable = false; model.import_oom = true;
+    peer.submit(binding);
+    for (0..3) |_| { if (peer.completion != null) break; try t.expect(try running.virtual_provider.step(running)); }
+    try t.expect(peer.completion.?.result == a.gfx_buffer_error_oom and !model.refs[0]);
+    model.import_oom = false;
+    try t.expect(model.heapLive() == range_heap and target.session.?.tx_sequence == before_rejections and running.failure == null);
+    checkpoint = "multipart bind";
+    peer.submit(binding);
+    const success = try driveVirtualProvider(target, .normal);
+    const bound = peer.completion.?;
+    try t.expect(success.maps == 2 and bound.result == 1 and bound.address == range_result.address + 4096 and
+        model.refs[0] and model.full_refs[0] and model.dma[0].lease.id != 0 and model.gpu[0].lease.id == 0);
+    var retire = binding; retire.operation = 1; retire.token = bound.token;
+    checkpoint = "retire multipart";
+    peer.submit(retire);
+    const released = try driveVirtualProvider(target, .normal);
+    try t.expect(released.unmaps == 2 and peer.completion.?.result == 1 and !model.refs[0] and model.heapLive() == range_heap);
+    binding.resource.generation += 1;
+    checkpoint = "partial rollback";
+    peer.submit(binding);
+    const rejected = try driveVirtualProvider(target, .reject_second);
+    try t.expect(rejected.maps == 2 and rejected.unmaps == 1 and peer.completion.?.result == a.gfx_buffer_error_unavailable and
+        !model.refs[0] and model.heapLive() == range_heap and running.failure == null);
+    binding.resource.generation += 1; binding.request.deadline_ns = clock + std.time.ns_per_ms;
+    checkpoint = "timeout";
+    peer.submit(binding);
+    const expired = try driveVirtualProvider(target, .timeout_map);
+    try t.expect(expired.maps == 1 and expired.unmaps == 1 and peer.completion.?.result == a.gfx_queue_error_wait_timeout and !model.refs[0] and model.heapLive() == range_heap);
+    binding.resource.generation += 1; binding.request.deadline_ns = end;
+    checkpoint = "close claimed bind";
+    peer.submit(binding);
+    const closed = try driveVirtualProvider(target, .close_map);
+    try t.expect(closed.maps == 1 and closed.unmaps == 1 and peer.completion.?.result == a.gfx_queue_error_device_lost and !model.refs[0]);
+    // Continue after the failed claimed bind: the peer supplies parent retire.
+    peer.completion = null;
+    checkpoint = "close parent";
+    _ = try driveVirtualProvider(target, .normal);
+    try t.expect(peer.completion.?.operation == 1 and std.meta.eql(peer.completion.?.resource, range_job.resource));
+    _ = try running.virtual_provider.step(running);
+    try t.expect(running.virtual_provider.closed() and running.virtuals.ranges.root == null and model.heapLive() == heap_before);
+    model.releases = 0; model.segments = 0; // The subsequent existing mapping cases own their counters.
+}
+
+fn checkVirtualProviderReset(target: *@import("gsp_device.zig").Device, table: *a.DriverApi) !void {
+    const model = @import("gsp_buffer_test_model.zig").Model;
+    const peer = @import("gsp_virtual_provider_test_model.zig").Model;
+    const running = &target.running;
+    const heap_before = model.heapLive();
+    peer.install(table); defer peer.dispose(table);
+    try t.expect(try running.virtual_provider.step(running));
+    const range: a.GfxVirtualJob = .{ .resource = .{ .id = 910, .generation = 31 }, .request = .{ .kind = 1,
+        .adapter_id = running.adapter_id, .memory_generation = running.epoch, .byte_length = 8192,
+        .alignment = 4096, .fixed_address = 0x92000000, .deadline_ns = clock + 5 * std.time.ns_per_s } };
+    peer.submit(range); _ = try driveVirtualProvider(target, .normal);
+    try t.expect(peer.completion.?.result == 1);
+    const binding: a.GfxVirtualJob = .{ .resource = .{ .id = 911, .generation = 31 }, .parent_token = peer.completion.?.token,
+        .reference = model.borrowed(0), .request = .{ .kind = 2, .parent = range.resource, .reference = model.borrowed(0).reference,
+            .adapter_id = running.adapter_id, .memory_generation = running.epoch,
+            .byte_offset = @import("gsp_buffer_mapping.zig").chunk_bytes - 4096, .byte_length = 8192, .deadline_ns = range.request.deadline_ns } };
+    peer.submit(binding);
+    var slices: usize = 0;
+    while (target.phase == .ready and slices < 1000) : (slices += 1) {
+        _ = try running.virtual_provider.step(running);
+        _ = target.step();
+        if (running.power_active and running.activeChannel().?.phase == .waiting) try replyNativeProduct(target);
+        if (running.buffer_active != null) try answerProviderBuffer(target);
+        if (running.virtuals.active()) |owner| if (owner.state == .mapping and owner.exchange.phase == .waiting) break;
+    }
+    try t.expect(slices < 1000 and target.phase == .ready and peer.claim != null and peer.completion == null and model.refs[0]);
+    // No MAP reply is delivered. Neither logical stop nor a wrong reset epoch
+    // can turn this claim into a successful retirement or release its backing.
+    const unproven: @import("gsp_reset.zig").Quiescence = .{ .owner = &target.gpu_reset, .epoch = running.epoch };
+    try t.expectError(error.Retained, running.virtual_provider.closeAfterReset(unproven, running.epoch));
+    try t.expect(model.refs[0] and peer.completion == null);
+    try checkDeviceReset(target, ResetDeviceModel.words, target.vram.?.plan.?.frts.offset, false);
+    const proof = target.gpu_reset.quiescence() orelse return error.NoResetProof;
+    try t.expect(model.refs[0] and peer.completion == null and running.virtual_provider.pending != null);
+    try t.expectError(error.Retained, running.virtual_provider.closeAfterReset(proof, running.epoch + 1));
+    slices = 0;
+    const completed = peer.completed;
+    const sent = target.session.?.tx_sequence;
+    while (!try running.closeAfterReset(proof)) : (slices += 1) try t.expect(slices < 2000);
+    try t.expect(peer.completed == completed + 2 and !model.refs[0] and model.heapLive() == heap_before and
+        running.virtual_provider.closed() and running.virtuals.ranges.root == null and target.session.?.tx_sequence == sent and ControlModel.reset_losses == 3);
+    try t.expect(try running.closeAfterReset(proof));
+}
+
 fn checkDeviceMappings(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, scenario: []const u8) !void {
     const model = @import("gsp_buffer_test_model.zig").Model;
     const runtime = @import("gsp_runtime.zig");
@@ -9682,6 +9910,8 @@ fn checkDeviceMappings(target: *@import("gsp_device.zig").Device, table: *a.Driv
     defer t.allocator.free(transmitted);
     model.install(table, scenario);
     defer model.dispose(table);
+    if (model.is("mapping_provider_reset")) return checkVirtualProviderReset(target, table);
+    if (model.is("mapping_success")) try checkVirtualProvider(target, table);
     var handles: [2]runtime.BufferHandle = undefined;
     var interleaved = false;
     var registers: usize = 0;

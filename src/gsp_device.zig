@@ -286,6 +286,7 @@ pub const Device = struct {
             }
             const output_progress = try self.native_output.step();
             const allocation_progress = try self.running.allocations.step(&self.running);
+            const virtual_progress = try self.running.virtual_provider.step(&self.running);
             const graphics_progress = try self.native_graphics.step(&self.running,
                 self.native_output.phase == .active or self.native_output.phase == .detached);
             const render_progress = try self.render_startup.step(&self.running,
@@ -296,7 +297,7 @@ pub const Device = struct {
                 if (head >= root.hardware.heads or head >= 8) return error.Binding;
                 self.interrupts.enableDisplay(self.running.post.snapshot() orelse return error.State,
                     self.epoch, @as(u32, 1) << @as(u5, @intCast(head))) catch |err| {
-                    if (err == error.Busy) return progress or output_progress or allocation_progress or graphics_progress or render_progress;
+                    if (err == error.Busy) return progress or output_progress or allocation_progress or virtual_progress or graphics_progress or render_progress;
                     return err;
                 };
                 self.running.head_events = &self.interrupts.display;
@@ -312,7 +313,7 @@ pub const Device = struct {
                 };
                 if (mask != self.interrupts.display.head_mask) {
                     self.interrupts.extendDisplay(self.running.post.snapshot() orelse return error.State, self.epoch, mask) catch |err| {
-                        if (err == error.Busy) return progress or output_progress or allocation_progress or graphics_progress or render_progress;
+                        if (err == error.Busy) return progress or output_progress or allocation_progress or virtual_progress or graphics_progress or render_progress;
                         return err;
                     };
                     return true;
@@ -328,7 +329,7 @@ pub const Device = struct {
                     "NVIDIA head-events: head={d} epoch={d} sequence={d} observed-ns={d} frame-counter={d} scanline={d}",
                     .{index,self.epoch,sample.sequence,sample.observed_ns,sample.frame_counter,sample.scanline});
             };
-            return progress or output_progress or allocation_progress or graphics_progress or render_progress;
+            return progress or output_progress or allocation_progress or virtual_progress or graphics_progress or render_progress;
         }
         if (try self.now() >= self.deadline) return error.Deadline;
         switch (self.phase) {

@@ -8,6 +8,9 @@ pub const Model = struct {
     pub const fence: a.GfxFence = .{ .slot = 1, .adapter_id = 0x01000000, .timeline = 19, .point = 31, .device_generation = 7, .reset_generation = 11 };
     pub var original: a.DriverApi = undefined;
     pub var refs: [2]bool = @splat(false);
+    pub var full_refs: [2]bool = @splat(false);
+    pub var import_oom: bool = false;
+    pub var import_immutable: bool = false;
     pub var dma: [2]a.GfxDeviceLease = @splat(.{});
     pub var gpu: [2]a.GfxDeviceLease = @splat(.{});
     pub var releases: usize = 0;
@@ -30,6 +33,7 @@ pub const Model = struct {
         table.gfx_queue_query = queue;
         scenario = name;
         refs = @splat(false); dma = @splat(.{}); gpu = @splat(.{});
+        full_refs = @splat(false); import_oom = false; import_immutable = false;
         releases = 0; segments = 0;
         allocation_fault = .none; release_fault = false;
     }
@@ -47,6 +51,9 @@ pub const Model = struct {
     pub fn page(index: usize, offset: u64) u64 { return 0x6000000000 + index * 0x100000000 + offset * 2; }
     pub fn address(index: usize) u64 { return 0x10000000 + index * 0x10000000; }
     fn reference(index: usize) a.GfxBufferHandle { return .{ .id = @intCast(171 + index), .generation = 331 }; }
+    pub fn borrowed(index: usize) a.GfxBufferReference {
+        return .{ .reference = .{ .id = @intCast(2171 + index), .generation = 331 }, .buffer = .{ .id = @intCast(181 + index), .generation = 431 } };
+    }
     fn selected(input: *const a.GfxBufferHandle) ?usize {
         for (0..2) |i| if (std.meta.eql(input.*, reference(i))) return i;
         return null;
@@ -88,11 +95,27 @@ pub const Model = struct {
     fn memory(out: *a.GfxDriverMemoryApi) callconv(.c) i32 {
         if (original.gfx_memory_query.?(out) != a.gfx_buffer_result_ok) return -1;
         out.buffer_describe = @intFromPtr(&describe); out.buffer_release = @intFromPtr(&release);
+        out.buffer_import = @intFromPtr(&import);
         out.device_acquire = @intFromPtr(&acquire); out.device_segment = @intFromPtr(&segment); out.device_release = @intFromPtr(&releaseDevice);
         return a.gfx_buffer_result_ok;
     }
     fn fallback() a.GfxDriverMemoryApi { var api: a.GfxDriverMemoryApi = .{}; std.debug.assert(original.gfx_memory_query.?(&api) == a.gfx_buffer_result_ok); return api; }
+    fn import(input: *const a.GfxBufferHandle, out: *a.GfxBufferReference) callconv(.c) i32 {
+        for (0..2) |i| if (std.meta.eql(input.*, borrowed(i).reference)) {
+            if (import_oom) return a.gfx_buffer_error_oom;
+            if (refs[i]) return a.gfx_buffer_error_busy;
+            refs[i] = true; full_refs[i] = true;
+            out.* = borrowed(i); out.reference = reference(i);
+            out.flags = if (import_immutable) a.gfx_buffer_reference_immutable else 0;
+            return 1;
+        };
+        const call: *const fn (*const a.GfxBufferHandle, *a.GfxBufferReference) callconv(.c) i32 = @ptrFromInt(fallback().buffer_import);
+        return call(input, out);
+    }
     fn describe(input: *const a.GfxBufferHandle, out: *a.GfxBufferDescriptor) callconv(.c) i32 {
+        for (0..2) |i| if (std.meta.eql(input.*, borrowed(i).reference)) {
+            out.* = .{ .byte_length = rounded[i] - 5, .alignment = 4096, .usage = 15 }; return 1;
+        };
         const i = selected(input) orelse {
             const call: *const fn (*const a.GfxBufferHandle, *a.GfxBufferDescriptor) callconv(.c) i32 = @ptrFromInt(fallback().buffer_describe);
             return call(input, out);
@@ -105,14 +128,14 @@ pub const Model = struct {
             return call(input);
         };
         std.debug.assert(refs[i] and dma[i].lease.id == 0 and gpu[i].lease.id == 0);
-        refs[i] = false; releases += 1; return a.gfx_buffer_result_ok;
+        refs[i] = false; full_refs[i] = false; releases += 1; return a.gfx_buffer_result_ok;
     }
     fn acquire(input: *const a.GfxBufferHandle, request: *const a.GfxDeviceRequest, out: *a.GfxDeviceLease) callconv(.c) i32 {
         const i = selected(input) orelse {
             const call: *const fn (*const a.GfxBufferHandle, *const a.GfxDeviceRequest, *a.GfxDeviceLease) callconv(.c) i32 = @ptrFromInt(fallback().device_acquire);
             return call(input, request, out);
         };
-        std.debug.assert(refs[i] and request.byte_offset == 0 and request.byte_length == rounded[i] and request.adapter_id == 0x01000000);
+        std.debug.assert(refs[i] and request.byte_offset == 0 and request.byte_length == rounded[i] - @as(u64, if (full_refs[i]) 5 else 0) and request.adapter_id == 0x01000000);
         const virtual = request.access == 3;
         if (virtual) {
             std.debug.assert(dma[i].lease.id != 0 and gpu[i].lease.id == 0 and request.gpu_virtual_address == address(i));
@@ -133,7 +156,8 @@ pub const Model = struct {
         std.debug.assert(i < 2 and refs[i] and std.meta.eql(input.*, dma[i]) and offset < rounded[i] and offset & 4095 == 0);
         segments += 1;
         if (is("mapping_segment") and offset >= 40 * 1024 * 1024) return -1;
-        out.* = .{ .dma_address = page(i, offset), .byte_length = 4096, .next_offset = offset + 4096 }; return a.gfx_buffer_result_ok;
+        const bytes = @min(@as(u64, 4096), input.byte_length - offset);
+        out.* = .{ .dma_address = page(i, offset), .byte_length = bytes, .next_offset = offset + bytes }; return a.gfx_buffer_result_ok;
     }
     fn releaseDevice(input: *const a.GfxDeviceLease, quiesced: u32) callconv(.c) i32 {
         if (input.lease.id < 191 or input.lease.id >= 195) {
