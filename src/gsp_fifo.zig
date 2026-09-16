@@ -470,7 +470,7 @@ pub const Owner = struct {
     pub fn matchesCopy(self: *const Owner, ticket: copy.Ticket) bool {
         const value = self.info() orelse return false;
         return self.state == .handed_off and value.config.engine == .copy and value.config.system_userd and value.config.handle == ticket.channel and
-            value.config.context.epoch == ticket.epoch and value.work_submit_token == ticket.token and self.ring.matches(ticket);
+            value.config.context.epoch == ticket.epoch and value.work_submit_token == ticket.token and !self.ring.pending_batch and self.ring.matches(ticket);
     }
     pub fn prepareGraphics(self: *Owner, command: copy.graphics.Command) Error!copy.Ticket {
         const value = self.info() orelse return error.State;
@@ -482,6 +482,17 @@ pub const Owner = struct {
         return self.state == .handed_off and value.config.engine == .graphics and value.config.handle == ticket.channel and
             value.config.context.epoch == ticket.epoch and value.work_submit_token == ticket.token and
             self.ring.matchesGraphics(ticket, value.config.object_class, command);
+    }
+    pub fn prepareBatch(self: *Owner, pushes: []const copy.batch.Push) Error!copy.Ticket {
+        const value = self.info() orelse return error.State;
+        if (self.state != .handed_off or !value.config.system_userd or value.config.engine == .none or self.golden()) return error.State;
+        return self.ring.prepareBatch(value.config.handle, value.work_submit_token, pushes);
+    }
+    pub fn matchesBatch(self: *const Owner, ticket: copy.Ticket, pushes: []const copy.batch.Push) bool {
+        const value = self.info() orelse return false;
+        return self.state == .handed_off and value.config.system_userd and value.config.engine != .none and !self.golden() and
+            value.config.handle == ticket.channel and value.config.context.epoch == ticket.epoch and value.work_submit_token == ticket.token and
+            self.ring.matchesBatch(ticket, pushes);
     }
     fn releasePrivate(self: *Owner) bool {
         if (!self.userd.close(true) or !self.instance.close(true)) return false;

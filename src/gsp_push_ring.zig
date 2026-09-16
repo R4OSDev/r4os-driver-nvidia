@@ -143,6 +143,7 @@ const a = r4os.abi;
 const storage = @import("gsp_control_storage.zig");
 pub const wire = @import("gsp_copy_wire.zig");
 pub const graphics = @import("gsp_gr_wire.zig");
+pub const batch = @import("gsp_push_batch.zig");
 pub const Error = wire.Error || graphics.Error || storage.Error || error{ Stale, State, Exhausted, Completion, Retained };
 pub const Kind = enum { copy, graphics };
 // C56F transport length is independent of the CE encoder's admitted packet
@@ -166,6 +167,9 @@ pub const Ring = struct {
     published: bool = false,
     failed: bool = false,
     kind: Kind = .copy,
+    pending_batch: bool = false,
+    batch_entries: u32 = 0,
+    batch_point: u32 = 0,
 
     pub fn open(self: *Ring, backing: *storage.Storage, address: u64) Error!void {
         return self.openKind(backing, address, .copy);
@@ -200,7 +204,7 @@ pub const Ring = struct {
     fn pushOffset(self: *const Ring) usize { return wire.push_offset + (self.issued % self.capacity()) * self.slotBytes(); }
     fn nextPoint(self: *const Ring) Error!u32 {
         if (!self.valid()) return error.Stale;
-        if (self.pending != null or self.issued - self.completed >= self.capacity()) return error.Busy;
+        if (self.pending != null or self.batch_point != 0 or self.issued - self.completed >= self.capacity()) return error.Busy;
         return std.math.add(u32, self.issued, 1) catch error.Exhausted;
     }
     pub fn prepare(self: *Ring, class: u32, channel_handle: u32, token: u32, transfer: wire.Transfer) Error!Ticket {
@@ -215,6 +219,35 @@ pub const Ring = struct {
         const commands = try graphics.encode(class, command, self.address + wire.completion_offset, point);
         return self.prepareWords(channel_handle, token, point, commands.slice());
     }
+    /// The caller must hold every submitted VA/binding and referenced BO
+    /// through completion/reset. This private ring never imports user pointers
+    /// or claims that an address alone is a live GPU resource.
+    pub fn prepareBatch(self: *Ring, channel_handle: u32, token: u32, pushes: []const batch.Push) Error!Ticket {
+        const point = try self.nextPoint();
+        // Ordinary producers count jobs, not external GPFIFO entries. Drain
+        // before changing producers, and exclude them until this batch retires.
+        if (!self.idle()) return error.Busy;
+        try batch.validate(pushes);
+        const commands = try batch.completion(self.address + wire.completion_offset, point);
+        const push = self.pushOffset();
+        const tail = try entryWords(self.address + push, commands.len);
+        // All bounds were checked before touching DMA-visible memory.
+        for (pushes, 0..) |item, i| {
+            const gp = try batch.entry(item);
+            const index = (self.put + @as(u32, @intCast(i))) % batch.ring_entries;
+            self.word(index * 8).* = gp[0]; self.word(index * 8 + 4).* = gp[1];
+        }
+        for (commands, 0..) |value, i| self.word(push + i * 4).* = value;
+        const count: u32 = @intCast(pushes.len);
+        const end = (self.put + count) % batch.ring_entries;
+        self.word(end * 8).* = tail[0]; self.word(end * 8 + 4).* = tail[1];
+        const ticket: Ticket = .{ .owner = @intFromPtr(self), .epoch = self.backing.?.epoch,
+            .channel = channel_handle, .token = token, .point = point, .put = (end + 1) % batch.ring_entries };
+        self.pending_batch = true;
+        self.batch_entries = count;
+        self.pending = ticket;
+        return ticket;
+    }
     fn prepareWords(self: *Ring, channel_handle: u32, token: u32, point: u32, commands: []const u32) Error!Ticket {
         if (commands.len == 0 or commands.len > self.slotBytes() / 4) return error.Bounds;
         const push = self.pushOffset();
@@ -223,6 +256,7 @@ pub const Ring = struct {
         self.word(self.put * 8).* = gp[0]; self.word(self.put * 8 + 4).* = gp[1];
         const ticket: Ticket = .{ .owner = @intFromPtr(self), .epoch = self.backing.?.epoch,
             .channel = channel_handle, .token = token, .point = point, .put = (self.put + 1) % 512 };
+        self.pending_batch = false; self.batch_entries = 0;
         self.pending = ticket; return ticket;
     }
     pub fn matches(self: *const Ring, ticket: Ticket) bool {
@@ -240,7 +274,24 @@ pub const Ring = struct {
         const expected = graphics.encode(class, command, self.address + wire.completion_offset, ticket.point) catch return false;
         return self.matchesWords(expected.slice());
     }
+    pub fn matchesBatch(self: *const Ring, ticket: Ticket, pushes: []const batch.Push) bool {
+        if (!self.matches(ticket) or !self.pending_batch or self.batch_entries != pushes.len) return false;
+        batch.validate(pushes) catch return false;
+        const expected = batch.completion(self.address + wire.completion_offset, ticket.point) catch return false;
+        const push = self.pushOffset();
+        const tail = entryWords(self.address + push, expected.len) catch return false;
+        fence();
+        for (pushes, 0..) |item, i| {
+            const gp = batch.entry(item) catch return false;
+            const index = (self.put + @as(u32, @intCast(i))) % batch.ring_entries;
+            if (self.word(index * 8).* != gp[0] or self.word(index * 8 + 4).* != gp[1]) return false;
+        }
+        for (expected, 0..) |value, i| if (self.word(push + i * 4).* != value) return false;
+        const end = (self.put + self.batch_entries) % batch.ring_entries;
+        return self.word(end * 8).* == tail[0] and self.word(end * 8 + 4).* == tail[1] and ticket.put == (end + 1) % batch.ring_entries;
+    }
     fn matchesWords(self: *const Ring, expected: []const u32) bool {
+        if (self.pending_batch) return false;
         const push = self.pushOffset();
         const gp = entryWords(self.address + push, @intCast(expected.len)) catch return false;
         fence();
@@ -252,17 +303,20 @@ pub const Ring = struct {
         // Private producer accepts SYS memory only: no CPU BAR1 writes belong
         // to this submission. A future BAR1 producer also needs UVM's BAR1 read.
         fence(); self.published = true; self.issued = ticket.point; self.put = ticket.put;
+        if (self.pending_batch) self.batch_point = ticket.point;
         self.word(wire.put_offset).* = ticket.put; fence();
     }
     pub fn notified(self: *Ring, ticket: Ticket) Error!void {
         if (!self.valid() or !self.published or self.pending == null or !std.meta.eql(self.pending.?, ticket)) return error.Stale;
-        self.pending = null; self.published = false;
+        self.pending = null; self.published = false; self.pending_batch = false;
     }
     pub fn poll(self: *Ring) Error!u32 {
         if (!self.valid()) return error.Stale;
         const point = self.word(wire.completion_offset).*; fence();
         if (point < self.completed or point > self.issued) { self.failed = true; return error.Completion; }
-        self.completed = point; return point;
+        self.completed = point;
+        if (self.batch_point != 0 and point >= self.batch_point) self.batch_point = 0;
+        return point;
     }
     pub fn idle(self: *const Ring) bool { return self.valid() and self.pending == null and self.issued == self.completed; }
     pub fn close(self: *Ring) bool {

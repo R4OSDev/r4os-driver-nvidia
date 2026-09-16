@@ -6832,6 +6832,7 @@ fn checkNativeHeadless(target: *@import("gsp_device.zig").Device) !void {
     try t.expectError(error.Busy, run.retireExecutionChannel(handle, clock + std.time.ns_per_s, true));
     try t.expectError(error.Busy, run.beginDestroyGraph(clock + std.time.ns_per_s, true));
     const fifo = run.fifos[handle.slot].owner.?;
+    try checkNativeBatchRing(fifo);
     const raw: [*]const u8 = @ptrFromInt(target.port.window.cpu_address);
     const mmio = raw[0..@intCast(target.port.window.byte_length)];
     copy.enqueueRows(null, null, 17, 31, 64, 3, 80, 96);
@@ -6890,6 +6891,80 @@ fn checkNativeHeadless(target: *@import("gsp_device.zig").Device) !void {
     _ = target.stop();
     stage = 7;
     try t.expect(copy.lost and copy.unregisters == 1 and run.failure.? == error.Stopped);
+}
+
+// Transport-only extension of the existing native lifecycle case. Actual
+// channel/ring/storage owners are used, but external push addresses and GPU
+// fetch/completion stores are modeled. No public raw-submit path is claimed.
+fn checkNativeBatchRing(fifo: *@import("gsp_fifo.zig").Owner) !void {
+    const ring = &fifo.ring;
+    const batch = @import("gsp_push_batch.zig");
+    const layout = @import("gsp_copy_wire.zig");
+    const packet = @embedFile("fixtures/push-batch-570.144.bin");
+    const fence_words = try batch.completion(0x1234567800, 0x12345678);
+    try t.expect(packet.len == (batch.completion_words + 4) * 4);
+    for (fence_words, 0..) |word, i| try t.expectEqual(std.mem.readInt(u32, packet[i*4..][0..4], .little), word);
+    for ([_]bool{false,true}, 0..) |wait, i| {
+        const entry = try batch.entry(.{ .address = 0xabcdef0000, .bytes = 0x345678, .no_prefetch = wait });
+        for (entry, 0..) |word, j| try t.expectEqual(std.mem.readInt(u32, packet[(batch.completion_words+i*2+j)*4..][0..4], .little), word);
+    }
+    var pushes: [batch.capacity + 1]batch.Push = undefined;
+    for (&pushes, 0..) |*push, i| push.* = .{ .address = 0x100000000 + i * 0x1000, .bytes = 4096,
+        .incomplete = i % 3 == 0, .no_prefetch = i % 5 == 0 };
+    pushes[batch.capacity - 1].incomplete = false;
+    const bytes: [*]u8 = @ptrFromInt(ring.cpu.cpu_address);
+    var saved: [12288]u8 = undefined;
+    @memcpy(&saved, bytes[0..saved.len]);
+    try t.expectError(error.Bounds, fifo.prepareBatch(&pushes));
+    try t.expectError(error.Bounds, fifo.prepareBatch(&.{.{ .address = 0x100000000, .bytes = 4, .incomplete = true }}));
+    for ([_]batch.Push{
+        .{ .address = 0, .bytes = 4 }, .{ .address = 4097, .bytes = 4 },
+        .{ .address = 4096, .bytes = 3 }, .{ .address = 4096, .bytes = 0 },
+        .{ .address = 4096, .bytes = 1 << 23 }, .{ .address = (1 << 40) - 4, .bytes = 8 },
+    }) |invalid| try t.expectError(error.Bounds, fifo.prepareBatch(&.{invalid}));
+    try t.expectEqualSlices(u8, &saved, bytes[0..saved.len]);
+    try t.expect(ring.pending == null and ring.idle());
+    pushes[0].bytes = (1 << 23) - 4;
+    const sizes = [_]usize{batch.capacity, 3, 0};
+    for (sizes) |count| {
+        if (count != 0) pushes[count-1].incomplete = false;
+        const active = pushes[0..count];
+        const before = ring.put;
+        const completed = ring.completed;
+        const ticket = try fifo.prepareBatch(active);
+        try t.expect(fifo.matchesBatch(ticket,active) and !fifo.matchesCopy(ticket));
+        try t.expect(std.mem.readInt(u32, bytes[layout.put_offset..][0..4], .little) == before);
+        try t.expectEqual(@as(u32,@intCast((before+count+1)%batch.ring_entries)),ticket.put);
+        var altered = ticket; altered.put = (altered.put + 1) % batch.ring_entries;
+        try t.expect(!fifo.matchesBatch(altered,active));
+        // Verify actual resident entries, including wrap and SYNC_WAIT.
+        for (active, 0..) |push, i| {
+            const expected = try batch.entry(push);
+            const index = (before+i)%batch.ring_entries;
+            for (expected, 0..) |value, j| try t.expectEqual(value,std.mem.readInt(u32,bytes[index*8+j*4..][0..4],.little));
+        }
+        bytes[before*8] ^= 4;
+        try t.expect(!fifo.matchesBatch(ticket,active));
+        bytes[before*8] ^= 4;
+        const suffix = layout.push_offset + (ring.issued % layout.capacity) * layout.slot_bytes;
+        bytes[suffix] ^= 4;
+        try t.expect(!fifo.matchesBatch(ticket,active));
+        bytes[suffix] ^= 4;
+        try ring.publish(ticket);
+        try t.expect(!ring.close() and ring.batch_point == ticket.point);
+        try t.expectError(error.Busy, fifo.prepareBatch(&.{}));
+        try ring.notified(ticket);
+        // Fetch acknowledgement alone cannot release the private suffix or
+        // allow ordinary CE commands to overwrite live batch entries.
+        std.mem.writeInt(u32,bytes[layout.userd_offset+0x88..][0..4],ticket.put,.little);
+        try t.expectEqual(completed,try ring.poll());
+        try t.expect(!ring.idle() and !ring.close());
+        try t.expectError(error.Busy, fifo.prepareCopy(.{ .source = 0x100000, .target = 0x200000, .bytes = 4 }));
+        try t.expectError(error.Busy, fifo.prepareBatch(&.{}));
+        std.mem.writeInt(u32,bytes[layout.completion_offset..][0..4],ticket.point,.little);
+        try t.expectEqual(ticket.point,try ring.poll());
+        try t.expect(ring.idle() and ring.batch_point == 0);
+    }
 }
 
 fn replyNativeProduct(target: *@import("gsp_device.zig").Device) !void {

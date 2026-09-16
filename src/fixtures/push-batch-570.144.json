@@ -1,0 +1,32 @@
+{
+  "source": "NVIDIA Open GPU Kernel Modules 570.144, MIT",
+  "purpose": "Independent C56F WFI/SYS_MEMBAR/32-bit semaphore and subroutine GPFIFO SYNC_PROCEED/WAIT words",
+  "compiler": "Debian clang version 19.1.7 (3+b1)",
+  "inputs": [
+    {
+      "path": "ExFiles/Reference/GFX/Nvidia/OpenKernelModules-570.144/src/common/sdk/nvidia/inc/class/clc56f.h",
+      "bytes": 25985,
+      "sha256": "8b7a6d6d5d5e3538f2f3e3b975d00c4aa94bd2480008c49aefcfc2566e3f658e"
+    },
+    {
+      "path": "ExFiles/Reference/GFX/Nvidia/OpenKernelModules-570.144/src/common/sdk/nvidia/inc/nvmisc.h",
+      "bytes": 42112,
+      "sha256": "707e5a739d9b8781c05003188d6e64888303c84039e4f2ecc0810b8411669248"
+    },
+    {
+      "path": "ExFiles/Reference/GFX/Nvidia/OpenKernelModules-570.144/src/common/sdk/nvidia/inc/nvtypes.h",
+      "bytes": 25775,
+      "sha256": "3fd5e2c20b1432421a214b12e52778f48f7914b87645d4736cf55324d25c9d3c"
+    },
+    {
+      "path": "Temp/gfx-nvk-push-batch-20260916/Reference.c",
+      "bytes": 1711,
+      "sha256": "bdd255d91c5aee24fa9268487f6e64d3eefa08eb16227a53e103454778bb909a"
+    }
+  ],
+  "output": {
+    "path": "Repositories/Drivers/NVIDIA/src/fixtures/push-batch-570.144.bin",
+    "bytes": 68,
+    "sha256": "6d37dca919881de8b474d663f8eea442ea7e4ba5db8253e264042882daefd99c"
+  }
+}

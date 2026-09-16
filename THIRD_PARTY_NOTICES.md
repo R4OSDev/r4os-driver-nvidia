@@ -1,5 +1,12 @@
 ﻿# Third-Party Notices
 
+Native pushbuffer preparation (0.79.35, NVIDIA 0.1.132):
+C56F field definitions and WFI/system-memory-barrier ordering use the already
+attributed MIT NVIDIA 570.144 headers and host HAL. No additional upstream C
+implementation is linked. Original-header vectors and source hashes are in
+GFX/0.79.35/Evidence/NvkPushBatch; existing complete runtime notices remain
+unchanged. R4OS packet composition, ring ownership and tests are Apache-2.0.
+
 DisplayPort SST and audio (0.79.23, NVIDIA 0.1.115):
 The bounded link owner uses the MIT NVIDIA 570.144 control definitions and
 SST watermark arithmetic at source pin 8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f.
