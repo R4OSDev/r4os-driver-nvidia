@@ -1599,7 +1599,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         context_display_present, context_display_present_timeout, context_display_present_fault,
         context_display_present_initial_timeout, context_display_present_initial_fault, context_display_present_initial_release,
         context_display_present_initial_acquire, context_display_present_initial_retry,
-        context_native_unknown, context_native_reset, context_native_console, context_native_connected, context_native_connected_primary_timeout, context_native_dp, context_native_jobs, context_native_job_timeout, context_native_prepare_reject,
+        context_native_unknown, context_native_headless, context_native_reset, context_native_console, context_native_connected, context_native_connected_primary_timeout, context_native_dp, context_native_jobs, context_native_job_timeout, context_native_prepare_reject,
         context_native_flip_irq_timeout, context_native_flip_notifier_timeout, context_native_flip_release_timeout,
         context_native_frame_timeout,
         context_native_cursor_timeout, context_native_cursor_reject,
@@ -2825,7 +2825,9 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
             try t.expect(changes.serial == 2 and changes.plug == 0 and changes.unplug == 0 and changes.dp_irq == 0x82);
             const cleared = try running.takeDisplayChanges();
             try t.expect(cleared.serial == 2 and cleared.dp_irq == 0);
-            try t.expect(running.snapshot.hotplug_events == 1 and running.snapshot.dp_irq_events == 1 and running.nativeObject() != null);
+            // An independently requested CE may already hold the RM exchange;
+            // delivered topology metadata remains consumable between RPCs.
+            try t.expect(running.snapshot.hotplug_events == 1 and running.snapshot.dp_irq_events == 1);
             return;
         }
     }
@@ -3809,7 +3811,7 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
     fifo.install(table, scenario);
     const raw: [*]u32 = @ptrFromInt(target.port.window.cpu_address);
     display.install(table, scenario, raw[0..@intCast(target.port.window.byte_length / 4)]);
-    copy.installProduct(table, 3);
+    if (std.mem.eql(u8, scenario, "context_native_headless")) copy.installHeadless(table, 3) else copy.installProduct(table, 3);
     @import("gsp_cursor_test_model.zig").Model.install(table);
     target.irq_wake = .{ .context = @intFromPtr(target), .signal = copy.wakePresentation };
     NativeCommon.target = target; NativeCommon.scenario = scenario;
@@ -3888,6 +3890,7 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
     if (NativeCommon.is("context_native_connected") or NativeCommon.is("context_native_dp") or NativeCommon.hasModes()) try @import("gsp_receiver_mode_test.zig").install(&run.outputs.data.receivers[0]);
     if (NativeCommon.is("context_native_dp")) @import("gsp_dp_link_test.zig").receiver(&run.outputs.data);
     if (NativeCommon.is("context_native_connected") or NativeCommon.hasModes()) installFrlReceiver(&run.outputs.data.receivers[0].report);
+    if (NativeCommon.is("context_native_headless")) return checkNativeHeadless(target);
     try target.native_output.request(&target.ctx.?, run, captured);
     if (NativeCommon.is("context_native_connected") or NativeCommon.is("context_native_dp")) {
         @import("gsp_display_audio_test.zig").install(&run.outputs.data.receivers[0].report);
@@ -6797,6 +6800,98 @@ fn pumpResetNativeOutput(target: *@import("gsp_device.zig").Device) !void {
     }
     return error.NativeReconstructionTimeout;
 }
+// Existing lifecycle fixture: actual CE startup, queue worker and retirement;
+// only firmware replies, MMIO and GPU stores are supplied by the host model.
+fn checkNativeHeadless(target: *@import("gsp_device.zig").Device) !void {
+    const copy = @import("gsp_copy_test_model.zig").Model;
+    const run = &target.running;
+    var stage: u8 = 0;
+    errdefer _ = target.stop();
+    errdefer |err| std.debug.print("headless stage={d} error={s} device={s}/{?} ce={s} output={s} work={} completed={d} result={d}\n",
+        .{stage,@errorName(err),@tagName(target.phase),target.failure,@tagName(run.native_copy.phase),@tagName(target.native_output.phase),
+            run.copy_job != null,copy.completed,copy.result});
+    const snapshot = run.outputs.data;
+    run.outputs.data.count = 0;
+    run.outputs.data.topology.count = 0;
+    run.receiver_events.not_before_ns = clock + 600 * std.time.ns_per_s;
+    try run.native_copy.request();
+    var counts: FifoCounts = .{};
+    for (0..300) |_| {
+        _ = target.step();
+        try t.expect(target.phase == .ready);
+        if (run.fifo_active != null) try replyDeviceFifo(target, &counts, "context_native_headless")
+        else if (run.activeChannel().?.phase == .waiting) try replyNativeProduct(target);
+        if (run.native_copy.phase == .ready) break;
+    }
+    stage = 1;
+    try t.expect(run.native_copy.phase == .ready and run.copy_backend != null and run.copy_backend.?.operations == 9 and
+        run.presentation == null and target.native_output.phase == .detached and run.display_engine_owner == null and
+        copy.shadow_creates == 0 and NativeCommon.prepares == 0 and NativeCommon.commits == 0);
+    const binding = run.copy_backend.?.binding;
+    const handle = run.native_copy.channel.?;
+    try t.expectError(error.Busy, run.retireExecutionChannel(handle, clock + std.time.ns_per_s, true));
+    try t.expectError(error.Busy, run.beginDestroyGraph(clock + std.time.ns_per_s, true));
+    const fifo = run.fifos[handle.slot].owner.?;
+    const raw: [*]const u8 = @ptrFromInt(target.port.window.cpu_address);
+    const mmio = raw[0..@intCast(target.port.window.byte_length)];
+    copy.enqueueRows(null, null, 17, 31, 64, 3, 80, 96);
+    try copy.notifyQueue();
+    try t.expect(run.copy_backend.?.pending and run.presentation == null);
+    stage = 2;
+    for (0..160) |_| {
+        _ = target.step();
+        try t.expect(target.phase == .ready);
+        if (run.activeChannel().?.phase == .waiting) {
+            if (run.buffer_active != null) try replyCopyMapping(target) else try replyNativeProduct(target);
+        }
+        if (run.copy_job != null and run.copy_job.?.submitted) break;
+    }
+    try t.expect(run.copy_job != null and run.copy_job.?.submitted and copy.completed == 0);
+    stage = 3;
+    try copy.fetch(fifo, mmio);
+    _ = target.step(); try t.expect(copy.completed == 0);
+    try copy.execute();
+    _ = target.step(); try t.expect(copy.completed == 0);
+    try copy.signal();
+    for (0..16) |_| { _ = target.step(); if (run.copy_job == null) break; }
+    try t.expect(run.copy_job == null and copy.completed == 1 and copy.result == a.gfx_queue_result_complete);
+    stage = 4;
+    for (0..3) |row| try t.expectEqualSlices(u8, copy.host[0][17 + row * 80..][0..64], copy.host[1][31 + row * 96..][0..64]);
+    // Attaching the later display owner reuses the CE and binding. Missing
+    // routing consumes no modeset deadline and never tears the GPU down.
+    try target.native_output.request(&target.ctx.?, run, target.display.?);
+    for (0..100) |_| {
+        _ = target.step();
+        try t.expect(target.phase == .ready);
+        if (run.activeChannel().?.phase == .waiting) try replyNativeProduct(target);
+        if (target.native_output.phase == .receiver_wait) break;
+    }
+    try t.expect(target.native_output.phase == .receiver_wait);
+    for (0..32) |_| {
+        if (run.nativeOutputs() != null and run.activeChannel().?.phase == .idle) break;
+        _ = target.step();
+        try t.expect(target.phase == .ready);
+        if (run.activeChannel().?.phase == .waiting) try replyNativeProduct(target);
+    }
+    try t.expect(run.nativeOutputs() != null and run.activeChannel().?.phase == .idle);
+    stage = 5;
+    clock += 180 * std.time.ns_per_s;
+    try t.expect(!try target.native_output.step());
+    try t.expect(run.failure == null and run.presentation == null and copy.shadow_creates == 0 and
+        std.meta.eql(run.copy_backend.?.binding, binding) and std.meta.eql(run.native_copy.channel.?, handle));
+    run.outputs.data = snapshot;
+    stage = 6;
+    const resumed = try target.native_output.step();
+    if (!resumed) std.debug.print("headless resume: snapshot={} native={} count={d}/{d} coherent={} rejected={?}/{?} phase={s} power={} context={?} fifo={?} native-buffer={?}\n",
+        .{run.nativeOutputs() != null,run.nativeObject() != null,run.outputs.data.count,run.outputs.data.topology.count,run.outputs.data.coherent,
+            run.outputs.data.topology.rejected,run.outputs.data.final_rejection,@tagName(run.activeChannel().?.phase),run.power_active,run.context_active,run.fifo_active,run.native_active});
+    try t.expect(resumed);
+    try t.expect(target.native_output.phase == .mode_create and run.copy_backend.?.operations == 9 and NativeCommon.commits == 0);
+    _ = target.stop();
+    stage = 7;
+    try t.expect(copy.lost and copy.unregisters == 1 and run.failure.? == error.Stopped);
+}
+
 fn replyNativeProduct(target: *@import("gsp_device.zig").Device) !void {
     const run = &target.running;
     const rpc = run.activeChannel().?;
@@ -7311,7 +7406,7 @@ fn checkRenderWarmup(target: *@import("gsp_device.zig").Device, table: *a.Driver
     checkpoint = 4;
     try checkRenderUpload(target,ce,output);
     for (0..16) |_| { try stepQueuedRendering(target); if (target.render_startup.phase == .ready) break; }
-    try t.expect(target.render_startup.phase == .ready and !run.graphics_starting and run.graphics_enabled and model.render_operations == 893 and
+    try t.expect(target.render_startup.phase == .ready and !run.graphics_starting and run.graphics_enabled and model.render_operations == 857 and
         run.graphics_cache.program_uploads == 1 and run.graphics_cache.packet_uploads == 0 and run.graphics_cache.uploaded_bytes == output.len);
     var bounded: cache.Owner = .{}; try bounded.initialize(run.epoch);
     try t.expectError(error.Exhausted,bounded.admitStorage(.programs,cache.slot_budget_bytes+1));
@@ -7405,13 +7500,13 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
     try t.expect(!try run.beginCopyWork(ce,model.binding,deadline));
     if (!run.graphics_enabled) try run.enableGraphicsQueue(target.native_graphics.channel.?,ce)
     // Reinstalling a fresh host memory view does not re-register the runtime.
-    else model.render_operations = 893;
-    try t.expect(model.render_operations == 893 and run.graphics_enabled);
+    else model.render_operations = 857;
+    try t.expect(model.render_operations == 857 and run.graphics_enabled);
     if (scene_index == 11 and !graphicsFaultScenario(scenario)) {
         try checkQueuedSlices(target,ce,native_index,target_image,deadline);
         table.gfx_memory_query = old_memory; table.gfx_queue_query = old_queue;
         model.installRender(table,native_index);
-        model.render_operations = 893;
+        model.render_operations = 857;
         before = run.graphics_completed;
         @memset(target_data,0xcc);
         for (0..24) |y| @memcpy(target_data[y*target_image.pitch..][0..128],target_pixels[y*128..][0..128]);

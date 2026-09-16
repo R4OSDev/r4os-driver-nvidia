@@ -382,7 +382,14 @@ pub const Owner = struct {
     output_frames: [8]FrameCounters = @splat(.{}),
     output_faults: [8]?anyerror = @splat(null),
     preparing_outputs: u32 = 0,
-    copy_backend: ?struct { queue: r4os.driver_queue.Context, binding: r4os.abi.GfxBackendBinding } = null,
+    native_copy: @import("gsp_native_copy.zig").Owner = .{},
+    copy_backend: ?struct {
+        queue: r4os.driver_queue.Context,
+        binding: r4os.abi.GfxBackendBinding,
+        channel: ?ChannelHandle = null,
+        operations: u64 = 9,
+        pending: bool = false,
+    } = null,
     quarantine_attempted: bool = false,
     quarantine_result: ?i32 = null,
     faults: diagnostics.Journal = .{},
@@ -2175,7 +2182,46 @@ pub const Owner = struct {
         if (!std.meta.eql(current, expected)) return error.Stale;
         _ = try self.headSource(route.head);
     }
-    /// Register the common queue consumer for a prepared private image.
+    /// The adapter owns one CE consumer, with no display or receiver input.
+    /// Register only after RM admitted the real class/channel and its memory
+    /// epoch. Operations describe executable work, never architecture alone.
+    pub fn registerCopyBackend(self: *Owner, handle: ChannelHandle, deadline: u64) !r4os.abi.GfxBackendBinding {
+        const fifo = try self.findChannel(handle);
+        const info = fifo.info() orelse return error.Busy;
+        if (self.copyBusy() or self.graph_closing or self.nativeObject() == null or !fifo.ring.idle()) return error.Busy;
+        const va = self.nativeAddressSpace() orelse return error.Busy;
+        if (info.config.engine != .copy or !info.config.system_userd or info.config.context.vaspace != va.handle) return error.Binding;
+        try self.channel.?.guard(deadline);
+        if (self.copy_backend) |backend| {
+            if (backend.channel == null or !std.meta.eql(backend.channel.?, handle)) return error.Stale;
+            return backend.binding;
+        }
+        const queue = self.ctx.?.graphicsQueue() orelse return error.Api;
+        if (queue.table.unregister_backend == 0 or queue.table.update_operations == 0) return error.Api;
+        const nv = @import("r4nv_binding");
+        const details: nv.R4NvDriverProfile = .{ .version = 1, .size = @sizeOf(nv.R4NvDriverProfile), .vendor_id = 0x10de,
+            .copy_class = info.config.object_class, .rm_release = nv.rm_release, .command_abi = nv.command_abi, .reserved0 = 0, .reserved1 = 0 };
+        var profile: r4os.abi.GfxBackendProfile = .{ .interface_id_lo = nv.backend_v1_header.interface_id_lo,
+            .interface_id_hi = nv.backend_v1_header.interface_id_hi, .revision = 1, .data_bytes = @sizeOf(nv.R4NvDriverProfile) };
+        @memcpy(profile.data[0..@sizeOf(nv.R4NvDriverProfile)], std.mem.asBytes(&details));
+        const registration: r4os.abi.GfxBackendRegistration = .{ .adapter_id = self.adapter_id,
+            .milestone = r4os.abi.gfx_queue_milestone_device_execution, .operations = 9, .memory_generation = self.epoch,
+            .notify_callback = @intFromPtr(&notifyCopyBackend), .context = @intFromPtr(self) };
+        var binding: r4os.abi.GfxBackendBinding = .{};
+        var result = queue.registerProfile(&registration, &profile, &binding);
+        if (result == r4os.abi.err_no_fn) result = queue.register(&registration, &binding);
+        if (result != r4os.abi.gfx_queue_ok and binding.device_generation == 0) return error.Queue;
+        // Keep a returned identity even after a malformed/uncertain response.
+        // Only the existing quarantine/reset path may retire this backend.
+        self.copy_backend = .{ .queue = queue, .binding = binding, .channel = handle };
+        if (result != r4os.abi.gfx_queue_ok or binding.version != 1 or binding.size < @sizeOf(r4os.abi.GfxBackendBinding) or
+            binding.adapter_id != self.adapter_id or binding.milestone != r4os.abi.gfx_queue_milestone_device_execution or
+            binding.device_generation == 0 or binding.reset_generation == 0) { self.stop(error.Descriptor); return error.Descriptor; }
+        self.publishArchitecture(&queue, binding, info.config.object_class);
+        self.log("NVIDIA device-backend: epoch={d} copy-class={x} operations=copy,copy-rows output-required=no", .{self.epoch,info.config.object_class});
+        return binding;
+    }
+    /// Attach a prepared private image to the adapter's existing queue.
     /// The display transition owner supplies its real CPU shadow; queued
     /// uploads are admitted only while that exact image is active.
     /// Registration alone does not adopt the boot framebuffer or change mode.
@@ -2186,7 +2232,7 @@ pub const Owner = struct {
         const fifo = try self.findChannel(handle);
         const window_owner = try self.findDisplayChannel(window);
         const engine = try self.findDisplayEngine(root);
-        if (self.presentation != null or self.copy_backend != null or self.copyBusy() or self.nativeObject() == null or
+        if (self.presentation != null or self.copyBusy() or self.nativeObject() == null or
             self.graph_closing or fifo.info() == null or !fifo.ring.idle() or window_owner.info() == null or window_owner.parent != engine or
             window_owner.config.kind != .window) return error.Busy;
         if (self.display_images[window_owner.config.index] != null) return error.Busy;
@@ -2195,37 +2241,28 @@ pub const Owner = struct {
         const target = resources.publishedStorage(window.slot, dma) orelse return error.State;
         if (fifo.config.context.vaspace != self.nativeAddressSpace().?.handle) return error.Stale;
         try self.channel.?.guard(deadline);
-        const queue = self.ctx.?.graphicsQueue() orelse return error.Api;
         const memory = self.ctx.?.memory() orelse return error.Api;
-        if (queue.table.unregister_backend == 0) return error.Api;
         for (&self.presentation_slots) |*slot| if (slot.* != null) return error.Retained;
-        self.presentation_slots[0] = .{ .channel_handle = handle, .root = root, .window = window };
+        const binding = try self.registerCopyBackend(handle, deadline);
+        const backend = &self.copy_backend.?;
+        self.presentation_slots[0] = .{ .channel_handle = handle, .root = root, .window = window, .binding = binding };
         const entry = &self.presentation_slots[0].?;
         self.presentation = entry;
         entry.surface.open(memory, shadow, target, image) catch |err| {
             if (entry.surface.failed) self.stop(err) else { self.presentation = null; self.presentation_slots[0] = null; }
             return err;
         };
-        const nv = @import("r4nv_binding");
-        const details: nv.R4NvDriverProfile = .{ .version = 1, .size = @sizeOf(nv.R4NvDriverProfile), .vendor_id = 0x10de,
-            .copy_class = fifo.config.object_class, .rm_release = nv.rm_release, .command_abi = nv.command_abi, .reserved0 = 0, .reserved1 = 0 };
-        var profile: r4os.abi.GfxBackendProfile = .{ .interface_id_lo = nv.backend_v1_header.interface_id_lo,
-            .interface_id_hi = nv.backend_v1_header.interface_id_hi, .revision = 1, .data_bytes = @sizeOf(nv.R4NvDriverProfile) };
-        @memcpy(profile.data[0..@sizeOf(nv.R4NvDriverProfile)], std.mem.asBytes(&details));
-        const registration: r4os.abi.GfxBackendRegistration = .{ .adapter_id = self.adapter_id, .milestone = r4os.abi.gfx_queue_milestone_device_execution, .operations = 13, .memory_generation = self.epoch,
-            .notify_callback = @intFromPtr(&notifyPresentation), .context = @intFromPtr(self) };
-        var result = queue.registerProfile(&registration, &profile, &entry.binding);
-        if (result == r4os.abi.err_no_fn) result = queue.register(&registration, &entry.binding);
-        if (result != r4os.abi.gfx_queue_ok and entry.binding.device_generation == 0) {
+        const operations = backend.operations | (@as(u64, 1) << r4os.abi.gfx_queue_operation_upload) |
+            @as(u64, if (self.graphics_enabled) 1 << r4os.abi.gfx_queue_operation_present else 0);
+        const result = backend.queue.updateOperations(&backend.binding, operations);
+        if (result != r4os.abi.gfx_queue_ok) {
             if (!entry.surface.closeUnregistered()) { self.stop(error.Retained); return error.Retained; }
-            self.presentation = null; self.presentation_slots[0] = null; return error.Queue;
+            self.presentation = null; self.presentation_slots[0] = null;
+            return if (result == r4os.abi.gfx_queue_error_busy) error.Busy else error.Queue;
         }
+        backend.operations = operations;
         entry.registered = true;
-        self.copy_backend = .{ .queue = queue, .binding = entry.binding };
-        if (result != r4os.abi.gfx_queue_ok or entry.binding.version != 1 or entry.binding.size < @sizeOf(r4os.abi.GfxBackendBinding) or
-            entry.binding.adapter_id != self.adapter_id or entry.binding.milestone != r4os.abi.gfx_queue_milestone_device_execution or
-            entry.binding.device_generation == 0 or entry.binding.reset_generation == 0) { self.stop(error.Descriptor); return error.Descriptor; }
-        self.publishArchitecture(&queue, entry.binding, fifo.config.object_class);
+        entry.pending = backend.pending;
         return entry.binding;
     }
     fn publishArchitecture(self: *Owner, queue: *const r4os.driver_queue.Context, binding: r4os.abi.GfxBackendBinding, copy_class: u32) void {
@@ -2278,14 +2315,14 @@ pub const Owner = struct {
         self.additional_presentations[claim.window] = entry;
         return backend.binding;
     }
-    fn notifyPresentation(raw: usize) callconv(.c) i32 {
+    fn notifyCopyBackend(raw: usize) callconv(.c) i32 {
         if (raw == 0) return -1;
         const self: *Owner = @ptrFromInt(raw);
         if (self.self_address != raw or self.failure != null) return -1;
-        const entry = self.presentation orelse return -1;
-        if (!entry.registered or !entry.surface.valid()) return -1;
+        const backend = if (self.copy_backend) |*value| value else return -1;
         // Already under the serialized DriverWork owner. Pacing owns waits.
-        entry.pending = true;
+        backend.pending = true;
+        if (self.presentation) |entry| entry.pending = true;
         if (self.device.?.owner) |io| if (io.wake_work) |wake| wake(io.context);
         return 0;
     }
@@ -2826,7 +2863,7 @@ pub const Owner = struct {
                     if (backend.queue.supportsScanout()) {
                         const rc = backend.queue.updateOperations(&backend.binding, 13 | 32 | 128);
                         if (rc == r4os.abi.gfx_queue_error_busy) return error.Busy;
-                        if (rc == r4os.abi.gfx_queue_ok) { self.direct_enabled = true; return true; }
+                        if (rc == r4os.abi.gfx_queue_ok) { self.copy_backend.?.operations = 13 | 32 | 128; self.direct_enabled = true; return true; }
                         if (rc != r4os.abi.err_no_fn and rc != r4os.abi.gfx_queue_error_invalid) return error.Queue;
                     }
                 }
@@ -3118,19 +3155,22 @@ pub const Owner = struct {
         if (copy.config.engine != .copy or copy.config.context.vaspace != info.config.context.vaspace) return error.Binding;
         const backend = self.copy_backend orelse return error.State;
         const lists = backend.queue.supportsRenderList() and self.graphics_cache.packet.info().?.bytes >= render.packet_capacity_bytes;
-        const direct = backend.queue.supportsScanout() and self.presentation_buffers >= 2;
-        const ordinary: u64 = if (lists) 125 else 61;
+        const direct = backend.queue.supportsScanout() and self.presentation != null and self.presentation_buffers >= 2;
+        const display_bits: u64 = if (self.presentation != null) 36 else 0; // upload and image-to-output
+        const ordinary: u64 = (if (lists) @as(u64, 89) else 25) | display_bits;
         const grid: u64 = if (lists and backend.queue.supportsRenderGridList()) 256 else 0;
         const color: u64 = if (lists and backend.queue.supportsRenderColorList()) 512 else 0;
-        var rc = backend.queue.updateOperations(&backend.binding, ordinary | @as(u64, if (direct) 128 else 0) | grid | color);
+        var operations = ordinary | @as(u64, if (direct) 128 else 0) | grid | color;
+        var rc = backend.queue.updateOperations(&backend.binding, operations);
         self.direct_enabled = direct and rc == r4os.abi.gfx_queue_ok;
-        if ((direct or grid != 0 or color != 0) and rc == r4os.abi.gfx_queue_error_invalid) rc = backend.queue.updateOperations(&backend.binding, ordinary);
-        if (rc == r4os.abi.gfx_queue_error_invalid and lists) rc = backend.queue.updateOperations(&backend.binding, 61);
+        if ((direct or grid != 0 or color != 0) and rc == r4os.abi.gfx_queue_error_invalid) { operations = ordinary; rc = backend.queue.updateOperations(&backend.binding, operations); }
+        if (rc == r4os.abi.gfx_queue_error_invalid and lists) { operations = 25 | display_bits; rc = backend.queue.updateOperations(&backend.binding, operations); }
         // Earlier common queues can still use offscreen rendering. They
         // never receive the new image-to-output operation.
-        if (rc == r4os.abi.gfx_queue_error_invalid) rc = backend.queue.updateOperations(&backend.binding, 29);
+        if (rc == r4os.abi.gfx_queue_error_invalid) { operations = 25 | (display_bits & 4); rc = backend.queue.updateOperations(&backend.binding, operations); }
         if (rc == r4os.abi.err_no_fn) return error.Unsupported;
         if (rc != r4os.abi.gfx_queue_ok) return error.Queue;
+        self.copy_backend.?.operations = operations;
         self.graphics_channel = handle; self.graphics_copy_channel = copy_handle; self.graphics_enabled = true;
     }
     fn queuedRender(self: *Owner, input: *render_queue.Owner) !void {
@@ -3310,6 +3350,7 @@ pub const Owner = struct {
         return true;
     }
     pub fn retireExecutionChannel(self: *Owner, handle: ChannelHandle, deadline: u64, quiesced: bool) !void {
+        if (self.copy_backend) |backend| if (backend.channel) |channel| if (std.meta.eql(channel, handle)) return error.Busy;
         if (self.presentation) |entry| if (std.meta.eql(entry.channel_handle, handle)) return error.Busy;
         const owner = try self.findChannel(handle);
         if (self.copyBusy() or self.hasQueuedWork()) return error.Busy;
@@ -5261,6 +5302,7 @@ pub const Owner = struct {
     /// is drained before graph.beginDestroy may send any parent/event free.
     pub fn beginDestroyGraph(self: *Owner, deadline: u64, quiesced: bool) !void {
         const current = try self.now();
+        if (self.copy_backend) |backend| if (backend.channel != null) return error.Busy;
         if (self.copyBusy() or self.hasQueuedWork() or self.display_engine_owner != null or self.mode_control_owner != null) return error.Busy;
         if (!quiesced or self.graph_closing or self.fifo_active != null or self.context_active != null or self.virtuals.active_range != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or
             self.sequence.self_address != 0 or self.nativeObject() == null or self.channel.?.phase != .idle) return error.Busy;
@@ -5275,8 +5317,11 @@ pub const Owner = struct {
     }
     pub fn takeDisplayChanges(self: *Owner) !subscriptions.Changes {
         const current = try self.now();
-        if (self.nativeObject() == null) return error.State;
-        return self.graph.?.takeChanges(try std.math.add(u64, current, std.time.ns_per_s));
+        const graph = if (self.graph) |*value| value else return error.State;
+        if (self.graph_closing or graph.state != .loaned) return error.State;
+        // Coalesced metadata is independent of who currently owns the RM
+        // exchange. The subscription owner still rejects a pending receipt.
+        return graph.takeChanges(try std.math.add(u64, current, std.time.ns_per_s));
     }
     fn advance(self: *Owner) !Progress {
         const current = try self.now();
@@ -5511,7 +5556,15 @@ pub const Owner = struct {
         // queued frame. A continuously repainting desktop must not starve HPD.
         if (self.outputs.state != .detached and try self.beginReceiverRefresh(current)) return .progress;
         if (try self.beginPower(current)) return .progress;
-        if (self.presentation) |entry| if (entry.pending and !self.copyAdmissionBusy() and (self.display_paused or self.presentationValid())) {
+        if (self.copy_backend) |backend| copy_admission: {
+            if (self.copyAdmissionBusy()) break :copy_admission;
+            const handle = if (self.presentation) |entry| blk: {
+                if (!entry.pending or (!self.display_paused and !self.presentationValid())) break :copy_admission;
+                break :blk entry.channel_handle;
+            } else blk: {
+                if (!backend.pending) break :copy_admission;
+                break :blk backend.channel orelse break :copy_admission;
+            };
             const copy_deadline = try std.math.add(u64, current, 3 * std.time.ns_per_s);
             if (!self.copyBusy() and self.cursor_point == null and self.buffer_active == null) {
                 // Keep room for the next source/target and bound idle mapping
@@ -5520,16 +5573,17 @@ pub const Owner = struct {
                     if (err == error.Busy) break :blk false; return err;
                 }) return .progress;
             }
-            const taken: ?bool = self.beginCopyWork(entry.channel_handle, entry.binding, copy_deadline) catch |err| blk: {
+            const taken: ?bool = self.beginCopyWork(handle, backend.binding, copy_deadline) catch |err| blk: {
                 if (err == error.Busy) break :blk null; return err;
             };
             if (taken) |claimed| {
                 if (claimed) return .progress;
-                entry.pending = self.hasDeferredPresentations();
+                self.copy_backend.?.pending = self.hasDeferredPresentations();
+                if (self.presentation) |entry| entry.pending = self.copy_backend.?.pending;
             }
             // A pending frame must not starve an output query or other
             // runtime owner that currently prevents taking the queue job.
-        };
+        }
         // A physical slice completion returned through the outer device loop,
         // giving cursor/output owners one admission opportunity. Retained jobs
         // now resume by producer turn even when no new queue wake is pending.

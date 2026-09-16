@@ -284,20 +284,22 @@ pub const Device = struct {
                     }
                 } else try self.catalog.invalidate();
             }
+            const copy_progress = try self.running.native_copy.step(&self.running);
             const output_progress = try self.native_output.step();
             const allocation_progress = try self.running.allocations.step(&self.running);
             const virtual_progress = try self.running.virtual_provider.step(&self.running);
             const graphics_progress = try self.native_graphics.step(&self.running,
                 self.native_output.phase == .active or self.native_output.phase == .detached);
             const render_progress = try self.render_startup.step(&self.running,
-                if (self.native_graphics.phase == .ready) self.native_graphics.channel else null, self.native_output.copy);
+                if (self.native_graphics.phase == .ready) self.native_graphics.channel else null,
+                if (self.running.native_copy.phase == .ready) self.running.native_copy.channel else null);
             if (self.native_output.phase == .active and self.interrupts.display.epoch == 0) {
                 const root = (try self.running.displayEngineStatus(self.native_output.engine.?)).info orelse return error.State;
                 const head = self.native_output.mode.?.head;
                 if (head >= root.hardware.heads or head >= 8) return error.Binding;
                 self.interrupts.enableDisplay(self.running.post.snapshot() orelse return error.State,
                     self.epoch, @as(u32, 1) << @as(u5, @intCast(head))) catch |err| {
-                    if (err == error.Busy) return progress or output_progress or allocation_progress or virtual_progress or graphics_progress or render_progress;
+                    if (err == error.Busy) return progress or copy_progress or output_progress or allocation_progress or virtual_progress or graphics_progress or render_progress;
                     return err;
                 };
                 self.running.head_events = &self.interrupts.display;
@@ -313,7 +315,7 @@ pub const Device = struct {
                 };
                 if (mask != self.interrupts.display.head_mask) {
                     self.interrupts.extendDisplay(self.running.post.snapshot() orelse return error.State, self.epoch, mask) catch |err| {
-                        if (err == error.Busy) return progress or output_progress or allocation_progress or virtual_progress or graphics_progress or render_progress;
+                        if (err == error.Busy) return progress or copy_progress or output_progress or allocation_progress or virtual_progress or graphics_progress or render_progress;
                         return err;
                     };
                     return true;
@@ -329,7 +331,7 @@ pub const Device = struct {
                     "NVIDIA head-events: head={d} epoch={d} sequence={d} observed-ns={d} frame-counter={d} scanline={d}",
                     .{index,self.epoch,sample.sequence,sample.observed_ns,sample.frame_counter,sample.scanline});
             };
-            return progress or output_progress or allocation_progress or virtual_progress or graphics_progress or render_progress;
+            return progress or copy_progress or output_progress or allocation_progress or virtual_progress or graphics_progress or render_progress;
         }
         if (try self.now() >= self.deadline) return error.Deadline;
         switch (self.phase) {
@@ -541,6 +543,7 @@ pub const Device = struct {
                 try self.catalog.open(&self.ctx.?, adapter);
                 try self.native_output.requestAfterReset(&self.ctx.?, &self.running, self.display.?, self.reset_display.generation);
                 if (self.reset_to_console) {
+                    self.running.native_copy.publish_backend = false;
                     self.native_output.console = &self.boot_console;
                     self.display.?.firmware_recovery = .{ .context = self.self_address, .callback = consoleRestored };
                 }

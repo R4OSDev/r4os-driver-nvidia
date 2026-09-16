@@ -60,6 +60,8 @@ pub fn build(b: *std.Build) void {
     verify.addArg("-GenerationDirectory");
     verify.addDirectoryArg(b.path("GenerationFirmware"));
     const owner_filter = b.option([]const u8, "owner-test-filter", "Run only matching src/tests.zig owner tests");
+    const storage_filter = b.option([]const u8, "storage-test-filter", "Run only matching firmware storage/lifecycle tests in unit-test");
+    if (owner_filter != null and storage_filter != null) @panic("Select one owner or storage filter");
     const unit = b.addTest(.{ .filters = if (owner_filter) |value| &.{value} else &.{}, .root_module = b.createModule(.{
         .root_source_file = b.path("src/tests.zig"),
         .target = b.graph.host,
@@ -74,7 +76,7 @@ pub fn build(b: *std.Build) void {
     unit.root_module.addImport("r4nv_render", render_encoder);
     unit.root_module.addImport("r4nv_telemetry", telemetry);
     unit.root_module.addImport("r4nv_binding", nv_binding);
-    unit_step.dependOn(&b.addRunArtifact(unit).step);
+    if (storage_filter == null) unit_step.dependOn(&b.addRunArtifact(unit).step);
     const lifecycle = b.createModule(.{ .root_source_file = b.path("src/lifecycle_test.zig"), .target = b.graph.host, .optimize = .ReleaseSafe });
     lifecycle.addImport("r4os", host_sdk);
     lifecycle.addImport("nvidia_identity", identity);
@@ -102,7 +104,7 @@ pub fn build(b: *std.Build) void {
     };
     const lifecycle_test = b.addTest(.{ .root_module = lifecycle, .filters = &.{"NVIDIA actual driver lifecycle"} });
     lifecycle_test.step.dependOn(&headers.step);
-    if (owner_filter == null) unit_step.dependOn(&b.addRunArtifact(lifecycle_test).step);
+    if (owner_filter == null and storage_filter == null) unit_step.dependOn(&b.addRunArtifact(lifecycle_test).step);
     // The existing owner test also exercises the original-header C varargs
     // boundary against host libc. Its log sink stays in this host executable.
     const format_module = b.createModule(.{ .target = b.graph.host, .optimize = .ReleaseSafe, .link_libc = true });
@@ -114,7 +116,7 @@ pub fn build(b: *std.Build) void {
     format_module.addCSourceFile(.{ .file = b.path("Tests/RmFormat.c"), .flags = &.{ "-std=gnu11", "-fno-builtin" } });
     const format_test = b.addExecutable(.{ .name = "rm-format-test", .root_module = format_module });
     format_test.step.dependOn(&headers.step);
-    if (owner_filter == null) unit_step.dependOn(&b.addRunArtifact(format_test).step);
+    if (owner_filter == null and storage_filter == null) unit_step.dependOn(&b.addRunArtifact(format_test).step);
     const storage = b.createModule(.{ .root_source_file = b.path("src/firmware_storage_test.zig"), .target = b.graph.host, .optimize = .ReleaseSafe });
     storage.addImport("r4os", host_sdk);
     storage.addImport("nvidia_identity", identity);
@@ -155,7 +157,8 @@ pub fn build(b: *std.Build) void {
         .target = b.graph.host,
         .optimize = .ReleaseSafe,
     }));
-    if (owner_filter == null) unit_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = storage, .filters = &.{"firmware CPU storage"} })).step);
+    if (owner_filter == null) unit_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = storage,
+        .filters = if (storage_filter) |value| &.{value} else &.{"firmware CPU storage"} })).step);
     const inspector = b.addExecutable(.{ .name = "nvbios-inspect", .root_module = b.createModule(.{
         .root_source_file = b.path("src/inspect.zig"),
         .target = b.graph.host,
@@ -169,7 +172,7 @@ pub fn build(b: *std.Build) void {
         .target = b.graph.host,
         .optimize = .ReleaseSafe,
     }) });
-    if (owner_filter == null) unit_step.dependOn(&b.addRunArtifact(firmware_test).step);
+    if (owner_filter == null and storage_filter == null) unit_step.dependOn(&b.addRunArtifact(firmware_test).step);
     const firmware_inspector = b.addExecutable(.{ .name = "nvfirmware-inspect", .root_module = b.createModule(.{
         .root_source_file = b.path("src/firmware_inspect.zig"),
         .target = b.graph.host,

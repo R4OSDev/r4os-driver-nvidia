@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.126; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.131; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -22,12 +22,28 @@ both sides; reset cleanup releases at most one binding per worker slice.
 The existing copy/display path uses the shared wire encoder. Dynamic resident
 range/binding metadata now runs through the real Device worker, command admission
 and graph/reset retirement. New VA names bypass the legacy fixed child ledger;
-malformed heap ownership stays retained. The common application/process broker,
-NVK integration and legacy physical-resource capacity remain software work.
+malformed heap ownership stays retained. The common application/process broker
+and native NVK memory/VA adapters now exist; full Vulkan device/module/submit
+integration remains software work.
 This checkpoint does not expose a Vulkan device or new public features.
 Details and physical follow-up: GrafikVulkan07935.txt/.json and OssiGPU.txt /35.
 The existing owner step accepts `unit-test "-Downer-test-filter=GPU virtual"`
 for this focused group alone; omitting the filter retains the full owner step.
+
+Adapter-owned CE (0.79.35): `gsp_native_copy` builds the actual RM copy context
+and channel before any display consumer. Its one backend publishes the real
+copy class, memory epoch and architecture facts with copy/copy-row operations.
+Queue notification and dispatch work without a presentation object. A later
+display reuses this binding and adds its supported operations; absent routing
+waits before display programming without expiring the GPU. Live registration
+prevents channel/graph retirement. Existing Device quarantine/FLR retains and
+retires the same resources; explicit recovery to the console exposes no backend.
+Bootstrap still requires the selected GPU's captured boot framebuffer. This
+does not add secondary/non-boot GPU startup or a Vulkan logical device.
+The existing `unit-test` step accepts
+`"-Dstorage-test-filter=firmware CPU storage complete run lease"` for the native
+lifecycle group, including the no-output case. It is a host firmware/GPU model,
+not hardware qualification. OssiGPU.txt /35 lists the physical follow-up.
 
 Generations and adapters (0.79.33): native software now covers GA102/103/104/106/107
 and AD102/103/104/106/107. Each measured chip selects its own firmware family,
@@ -48,7 +64,7 @@ matrix, source references and porting order: Docs/Drivers/GrafikGenerationen0793
 Read-only probe IDs come from the pinned published 570.144 list. Native startup
 first identifies the unique adapter whose measured BAR1 contains the complete
 boot framebuffer. It retains one native NVIDIA owner; a second enumerated GPU
-cannot replace that owner's board or HDA state. Offscreen-only NVIDIA startup,
+cannot replace that owner's board or HDA state. Starting a non-boot NVIDIA adapter,
 automatic hybrid-GPU composition and PCIe peer-to-peer transfer are unavailable.
 R4GFX independently selects among registered render adapters and provides an
 explicit bounded system-memory transfer with two imports and retired source

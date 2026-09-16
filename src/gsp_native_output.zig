@@ -16,9 +16,7 @@ pub fn frameCount(option: []const u8) !u8 {
 }
 
 pub const Phase = enum {
-    detached, waiting, context_start, context_wait, context_retire, context_retiring,
-    methods_allocate, methods_attach, copy_allocate, copy_create, copy_wait,
-    engine_create, engine_wait, mode_create, mode_wait, instance_allocate, instance_attach, instance_wait,
+    detached, waiting, engine_create, engine_wait, receiver_wait, mode_create, mode_wait, instance_allocate, instance_attach, instance_wait,
     core_notifier, window_notifier, surface_allocate, surface_bind,
     storage_wait, storage_release, table_upload, table_wait,
     core_create, core_wait, window_create, window_wait, immediate_create, immediate_wait,
@@ -43,8 +41,6 @@ pub const Owner = struct {
     deadline: u64 = 0,
     phase_deadline: u64 = 0,
     next_phase: Phase = .detached,
-    rm_engine: u32 = 19,
-    context: ?runtime.ContextHandle = null,
     storage: ?runtime.BufferHandle = null,
     copy: ?runtime.ChannelHandle = null,
     engine: ?runtime.DisplayEngineHandle = null,
@@ -81,6 +77,7 @@ pub const Owner = struct {
     output_fault_reported: [8]bool = @splat(false),
     reset_generation: u64 = 0,
     console: ?*@import("boot_console.zig").Owner = null,
+    waiting_generation: u64 = 0,
 
     /// Explicit mode=native only. Check the common handoff API before the
     /// device worker can execute the already prepared firmware operations.
@@ -100,6 +97,7 @@ pub const Owner = struct {
         if (bytes == 0 or captured.boot.read.byte_length < bytes or captured.boot.read.cpu_address > std.math.maxInt(u64) - bytes) return error.Descriptor;
         const now = clock.nowNs();
         if (now == 0 or now == std.math.maxInt(u64)) return error.Clock;
+        if (running.native_copy.phase == .detached) try running.native_copy.request();
         self.* = .{ .self_address = @intFromPtr(self), .ctx = ctx.*, .running = running, .captured = captured,
             .memory = memory, .display = display, .outputs = outputs, .phase = .waiting, .last_clock = now,
             .deadline = try std.math.add(u64, now, 120 * std.time.ns_per_s),
@@ -112,7 +110,8 @@ pub const Owner = struct {
         const now = self.ctx.?.resources().?.nowNs();
         if (now == std.math.maxInt(u64) or now < self.last_clock) return error.Clock;
         self.last_clock = now;
-        if (self.phase != .active and self.phase != .console_active and (now >= self.deadline or now >= self.phase_deadline)) return error.Deadline;
+        if (self.phase != .active and self.phase != .console_active and self.phase != .waiting and self.phase != .receiver_wait and
+            (now >= self.deadline or now >= self.phase_deadline)) return error.Deadline;
         return self.advance() catch |err| {
             if (err == error.Busy) return false;
             self.quarantine(err);
@@ -170,53 +169,10 @@ pub const Owner = struct {
         const boot = held.original_boot.?;
         switch (self.phase) {
             .waiting => {
-                if (run.nativeObject() == null or run.nativeOutputs() == null or run.nativeMemoryCapabilities() == null or
-                    run.nativeAddressSpace() == null or run.nativeControlBuffer() == null) return false;
-                self.next(.context_start);
-            },
-            .context_start => {
-                if (self.rm_engine > 28) return error.Unsupported;
-                self.context = try run.createExecutionContext(self.rm_engine, self.phase_deadline);
-                self.next(.context_wait);
-            },
-            .context_wait => {
-                const status = try run.executionContextStatus(self.context.?);
-                if (status.rejected != null or status.unavailable == .classes) return error.Unsupported;
-                if (status.state != .handed_off) return false;
-                if (status.unavailable == .engine) self.next(.context_retire) else {
-                    if (status.info == null or status.info.?.method_bytes == 0) return error.Descriptor;
-                    self.next(.methods_allocate);
-                }
-            },
-            .context_retire => {
-                try run.retireExecutionContext(self.context.?, self.phase_deadline);
-                self.next(.context_retiring);
-            },
-            .context_retiring => {
-                _ = run.executionContextStatus(self.context.?) catch |err| {
-                    if (err != error.Stale) return err;
-                    self.context = null;
-                    self.rm_engine += 1;
-                    self.next(.context_start);
-                    return true;
-                };
-                return false;
-            },
-            .methods_allocate => try self.allocate((try run.executionContextStatus(self.context.?)).info.?.method_bytes, .methods_attach),
-            .methods_attach => {
-                try run.attachContextMethods(self.context.?, 0, self.storage.?);
-                self.release(.copy_allocate);
-            },
-            .copy_allocate => try self.allocate(4096, .copy_create),
-            .copy_create => {
-                self.copy = try run.createCopyChannel(self.context.?, 0, self.storage.?, self.phase_deadline);
-                self.next(.copy_wait);
-            },
-            .copy_wait => {
-                const status = try run.executionChannelStatus(self.copy.?);
-                if (status.rejected != null or status.host_rejected != null) return error.Channel;
-                if (status.info == null) return false;
-                self.release(.engine_create);
+                if (run.native_copy.phase != .ready or run.nativeObject() == null) return false;
+                self.copy = run.native_copy.channel orelse return error.State;
+                self.deadline = try std.math.add(u64, self.last_clock, 120 * std.time.ns_per_s);
+                self.next(.engine_create);
             },
             .engine_create => {
                 self.engine = try run.createDisplayEngine(self.phase_deadline);
@@ -227,16 +183,33 @@ pub const Owner = struct {
                 if (status.rejected != null or status.unavailable) return error.Unsupported;
                 const info = status.info orelse return false;
                 if (!info.core or !info.window or !info.immediate or info.hardware.windows == 0) return error.Unsupported;
+                self.next(.receiver_wait);
+            },
+            .receiver_wait => {
+                const info = (try run.displayEngineStatus(self.engine.?)).info orelse return error.State;
                 const mask = info.hardware.windows & held.scanout_original.?.window_mask & 255;
                 if (mask == 0) return error.Unsupported;
                 const saved = try runtime.boot_mode.capture(&held.scanout_original.?, &boot, @ctz(mask));
                 const snapshot = run.nativeOutputs() orelse return error.Busy;
-                self.mode = try runtime.boot_mode.bind(saved, snapshot, run.epoch, held.boot.held_generation);
+                self.mode = runtime.boot_mode.bind(saved, snapshot, run.epoch, held.boot.held_generation) catch |err| {
+                    if (err != error.Routing and err != error.Stale and err != error.Unsupported) return err;
+                    // A missing/currently unusable receiver cannot invalidate
+                    // an otherwise running GPU. No display PUT has occurred.
+                    if (snapshot.generation != self.waiting_generation) {
+                        self.waiting_generation = snapshot.generation;
+                        @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,
+                            "NVIDIA native-output: waiting-for-route generation={d} reason={s} device-backend=retained",
+                            .{snapshot.generation,@errorName(err)});
+                    }
+                    return false;
+                };
                 if (info.cursor) {
                     try run.configureCursorUsage(self.engine.?, @import("gsp_cursor_image.zig").max_size);
                     self.mode.?.cursor_size = @import("gsp_cursor_image.zig").max_size;
                 }
                 self.link = try runtime.display_link.derive(self.mode.?, run.nativeObject() orelse return error.Busy, snapshot);
+                // Time without a receiver consumes no active modeset budget.
+                self.deadline = try std.math.add(u64, self.last_clock, 120 * std.time.ns_per_s);
                 self.next(.mode_create);
             },
             .mode_create => {

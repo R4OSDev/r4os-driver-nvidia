@@ -120,6 +120,11 @@ pub const Model = struct {
         present_mode = true; product_mode = true;
         direct_mode = native.is("context_native_unknown");
     }
+    pub fn installHeadless(table: *a.DriverApi, index: usize) void {
+        install(table, index);
+        app_reference = false;
+        product_mode = true;
+    }
     pub fn retireReset(proof: @import("gsp_reset.zig").Quiescence) void {
         std.debug.assert(proof.valid(proof.epoch) and lost and heldReferences() == 0 and !shadow_cpu);
         for (&scanouts) |slot| std.debug.assert(slot == null);
@@ -212,8 +217,14 @@ pub const Model = struct {
     pub fn closeShadow() void { shadow_live = false; }
     pub fn wakePresentation(raw: usize) i32 {
         const target: *@import("gsp_device.zig").Device = @ptrFromInt(raw);
-        std.debug.assert(target.running.presentation.?.pending);
+        std.debug.assert(target.running.copy_backend.?.pending);
+        if (target.running.presentation) |entry| std.debug.assert(entry.pending);
         presentation_wakes += 1; return 0;
+    }
+    pub fn notifyQueue() !void {
+        const registered = registration orelse return error.State;
+        const callback: *const fn (usize) callconv(.c) i32 = @ptrFromInt(registered.notify_callback);
+        try t.expect(callback(@intCast(registered.context)) == 0);
     }
     pub fn enqueuePresent(x: u32, y: u32, width: u32, height: u32) !void {
         return enqueuePresentFrom(0, x, y, width, height);
@@ -303,9 +314,9 @@ pub const Model = struct {
         job.source_offset = source_offset; job.target_offset = target_offset; job.byte_length = bytes;
         job.row_count = rows; job.source_pitch = source_pitch; job.target_pitch = target_pitch;
     }
-    fn queue(out: *a.GfxDriverQueueApi) callconv(.c) i32 { out.* = .{ .size = if (product_mode or render_mode) @sizeOf(a.GfxDriverQueueApi) else 64,
+    fn queue(out: *a.GfxDriverQueueApi) callconv(.c) i32 { out.* = .{ .size = if (product_mode or present_mode or render_mode) @sizeOf(a.GfxDriverQueueApi) else 64,
         .register_backend = @intFromPtr(&register), .register_profile = if (product_mode) @intFromPtr(&registerProfile) else 0,
-        .update_operations = if (render_mode or direct_mode) @intFromPtr(&updateOperations) else 0,
+        .update_operations = if (product_mode or present_mode or render_mode) @intFromPtr(&updateOperations) else 0,
         .read_render_list = if (render_mode) @intFromPtr(&readRenderList) else 0,
         .read_render_grid_list = if (render_mode) @intFromPtr(&readRenderGridList) else 0,
         .read_render_color_list = if (render_mode) @intFromPtr(&readRenderColorList) else 0,
@@ -314,8 +325,9 @@ pub const Model = struct {
         .scanout_retire_requested = if (direct_mode) @intFromPtr(&retireRequested) else 0,
         .unregister_backend = @intFromPtr(&unregister), .take = @intFromPtr(&take), .retain_resource = @intFromPtr(&retain), .complete = @intFromPtr(&complete) }; return a.gfx_queue_ok; }
     fn updateOperations(input: *const a.GfxBackendBinding, operations: u64) callconv(.c) i32 {
-        std.debug.assert(std.meta.eql(input.*, binding) and ((direct_mode and operations == 173) or
-            (render_mode and (operations == 29 or operations == 61 or operations == 125 or operations == 381 or operations == 893))));
+        const with_display = operations | 36;
+        std.debug.assert(std.meta.eql(input.*, binding) and ((present_mode and operations == 13) or (direct_mode and operations == 173) or
+            (render_mode and (with_display == 29 or with_display == 61 or with_display == 125 or with_display == 381 or with_display == 893))));
         render_operations = operations; return a.gfx_queue_ok;
     }
     fn readRenderList(input: *const a.GfxFence, out: *a.GfxRenderList) callconv(.c) i32 {
@@ -342,7 +354,7 @@ pub const Model = struct {
         return register(input, out);
     }
     fn register(input: *const a.GfxBackendRegistration, out: *a.GfxBackendBinding) callconv(.c) i32 {
-        std.debug.assert(present_mode and registration == null and input.adapter_id == binding.adapter_id and
+        std.debug.assert((present_mode or product_mode) and registration == null and input.adapter_id == binding.adapter_id and input.operations == 9 and
             input.milestone == binding.milestone and input.notify_callback != 0 and input.context != 0);
         registration = input.*; out.* = binding; return a.gfx_queue_ok;
     }
