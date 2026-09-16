@@ -100,6 +100,12 @@ pub const Owner = struct {
         const request = job.request;
         if (request.memory_generation != running.epoch or request.adapter_id != running.adapter_id or
             (request.kind != 1 and request.kind != 2)) return error.Invalid;
+        if (request.kind == 1) {
+            const kind = (request.flags & a.gfx_virtual_layout_mask) >> a.gfx_virtual_layout_shift;
+            if (request.flags & ~(a.gfx_virtual_flag_blocklinear | a.gfx_virtual_layout_mask) != 0 or kind > 6)
+                return error.Unsupported;
+            if (kind != 0 and request.flags & a.gfx_virtual_flag_blocklinear == 0) return error.Invalid;
+        } else if (request.flags != 0) return error.Unsupported;
         var parent: ?*Node = null;
         var system = false;
         var capacity: u64 = 0;
@@ -242,7 +248,8 @@ pub const Owner = struct {
                 if (node.range == null) {
                     node.range = running.allocateVirtualRange(.{ .bytes = node.request.byte_length, .alignment = node.request.alignment,
                         .fixed_address = node.request.fixed_address, .location = if (node.request.location == 0) .system else .video,
-                        .blocklinear = node.request.flags & 1 != 0 }, budget) catch |err| return self.reject(running, node, err);
+                        .blocklinear = node.request.flags & a.gfx_virtual_flag_blocklinear != 0,
+                        .pte_kind = @intCast((node.request.flags & a.gfx_virtual_layout_mask) >> a.gfx_virtual_layout_shift) }, budget) catch |err| return self.reject(running, node, err);
                     node.waiting = .range_create;
                     return true;
                 }

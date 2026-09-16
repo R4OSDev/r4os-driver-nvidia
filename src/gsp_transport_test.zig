@@ -3957,6 +3957,59 @@ test "GSP transport orders range publication, explicit acknowledgement and termi
 test "GPU virtual ranges keep independent addresses and exact memory ownership" {
     const range = @import("gsp_virtual_range.zig");
     const wire = range.wire;
+    try @import("gsp_architecture_test.zig").check();
+    {
+        // Original NVIDIA C types/macros generate all six uncompressed kinds
+        // independently for both memory locations. A changed kind in an ACK
+        // must not silently authorize a differently swizzled image.
+        const golden = @embedFile("fixtures/image-layout-570.144.bin");
+        var offset: usize = 0;
+        for ([_]wire.Location{ .system, .video }) |location| {
+            for (1..7) |kind| {
+                var plan: wire.Allocation = .{ .space = .{ .epoch = 7, .client = 0xc1d00000, .device = 0x10000000,
+                    .handle = 0x10000006, .base = 0x200000, .bytes = 0x100000000, .big_page_bytes = 65536 },
+                    .object = 0x10000008, .bytes = 128 * 1024, .alignment = 65536, .fixed_address = 0x800000,
+                    .location = location, .pte_kind = @intCast(kind) };
+                const map: wire.Mapping = .{ .allocation = plan, .address = 0x800000, .memory = 0x10000007,
+                    .memory_bytes = 65536, .memory_offset = 8192, .virtual_offset = 32768,
+                    .bytes = 16384, .location = location, .virtual_kind = true };
+                var request: [160]u8 = undefined;
+                var physical_kind = map;
+                physical_kind.virtual_kind = false;
+                try t.expectError(error.Profile, wire.mapping(physical_kind, .map, &request));
+                for (0..2) |index| {
+                    const encoded = if (index == 0) try wire.allocate(plan, &request) else try wire.mapping(map, .map, &request);
+                    const size = encoded.bytes.len;
+                    try t.expectEqualSlices(u8, golden[offset..][0..size], encoded.bytes);
+                    var ack: [160]u8 = undefined;
+                    @memcpy(ack[0..size], golden[offset + size ..][0..size]);
+                    const record: message.Record = .{ .shape = .{ .message_bytes = size + 80, .checksum_bytes = size + 80, .storage_bytes = 4096, .elements = 1 },
+                        .queue_sequence = 0, .rpc = .{ .function = encoded.function, .result = 0 }, .payload = ack[0..size] };
+                    const reply = if (index == 0) try wire.allocated(plan, record) else try wire.mapped(map, .map, record);
+                    try t.expect(reply == .ok and reply.ok == (if (index == 0) @as(u64, 0x800000) else 0x808000));
+                    if (index == 0) {
+                        ack[64] ^= 1; // format in the 32-byte-header allocation.
+                        try t.expectError(error.Payload, wire.allocated(plan, record));
+                    } else {
+                        ack[32] ^= 8; // Physical instead of virtual page kind.
+                        try t.expectError(error.Payload, wire.mapped(map, .map, record));
+                    }
+                    offset += size * 2;
+                }
+                for ([_]u8{ 7, 8, 14, 255 }) |unsupported| {
+                    plan.pte_kind = unsupported;
+                    try t.expectError(error.Profile, wire.allocate(plan, &request));
+                }
+                if (kind == 6) {
+                    plan.pte_kind = 0;
+                    plan.blocklinear = true;
+                    const encoded = try wire.allocate(plan, &request);
+                    try t.expectEqualSlices(u8, golden[offset - 432 ..][0..160], encoded.bytes);
+                }
+            }
+        }
+        try t.expectEqual(golden.len, offset);
+    }
     try checkResidentRmNames();
     try checkResourceSlots();
     const model = try t.allocator.create(Model);
@@ -4026,7 +4079,8 @@ test "GPU virtual ranges keep independent addresses and exact memory ownership" 
             .handle = try parent.object(6), .base = 0x200000, .bytes = 0x100000000, .big_page_bytes = 65536 };
         const memory_names = try session.rm_names.reserveChildren(parent, 1);
         var resident: rm_names.ResidentChildren = .{};
-        const config: range.Config = .{ .bytes = 128 * 1024, .alignment = 65536, .fixed_address = 0x800000 };
+        const config: range.Config = .{ .bytes = 128 * 1024, .alignment = 65536, .fixed_address = 0x800000,
+            .pte_kind = if (scenario == .success) 4 else 0 };
         try t.expectError(error.Bounds, range.Owner.initResident(&token, space, parent, .{ .bytes = 4095 }, deadline, &resident));
         try t.expect(!token.claimed and resident.self_address == 0);
         var owner = if (scenario == .success) try range.Owner.init(&token, space, parent, config, deadline)
@@ -4053,7 +4107,8 @@ test "GPU virtual ranges keep independent addresses and exact memory ownership" 
         try owner.beginMap(&token, &binding, 32768, deadline);
         try t.expect(!source_set.empty() and owner.info() == null);
         try t.expect((try owner.poll()) == null and owner.exchange.phase == .waiting);
-        try t.expect(get(&owner.request, 32) == 0x110 and std.mem.readInt(u64, owner.request[16..24], .little) == 8192 and
+        try t.expect(get(&owner.request, 32) == @as(u32, if (scenario == .success) 0x118 else 0x110) and
+            std.mem.readInt(u64, owner.request[16..24], .little) == 8192 and
             std.mem.readInt(u64, owner.request[40..48], .little) == 32768);
         var reply: [160]u8 = undefined;
         @memcpy(reply[0..56], owner.request[0..56]);

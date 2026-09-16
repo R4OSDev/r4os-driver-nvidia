@@ -17,7 +17,8 @@ pub fn check() !void {
         @memcpy(std.mem.asBytes(&info), result.data[0..@sizeOf(nv.R4NvArchitecture)]);
         try t.expect(result.data_bytes == 120 and result.revision == nv.architecture_version and info.version == result.revision and std.mem.allEqual(u8, result.data[120..], 0));
         try t.expect(info.memory_generation == va.epoch and info.va_start == va.base and info.va_end == va.base + va.bytes);
-        try t.expect(info.gpc_count == 2 and info.tpc_count == 7 and info.vram_bytes == 12 << 30 and info.flags == nv.architecture_host_coherent);
+        try t.expect(info.gpc_count == 2 and info.tpc_count == 7 and info.vram_bytes == 12 << 30 and
+            info.flags == nv.architecture_host_coherent | nv.architecture_image_layouts);
         try t.expect(info.chipset == chip and info.pci_bus == 0x31 and info.pci_device == 7 and info.pci_function == 1 and info.pci_revision == 0xa1);
         try t.expect(info.shader_model == (if (chip < 0x190) @as(u32,86) else 89));
     }

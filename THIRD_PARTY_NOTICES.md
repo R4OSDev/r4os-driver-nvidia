@@ -1,5 +1,12 @@
 ﻿# Third-Party Notices
 
+Native image page layouts (0.79.35, NVIDIA 0.1.139): uncompressed kind IDs and
+depth/stencil attribute selection follow NVIDIA570.144 nvos.h, TU102 dev_mmu.h
+and mem_mgr_tu102.c (MIT). Complete source notices accompany the encoder;
+the memory-manager notice is added to the packaged/image runtime license.
+Original headers, independent C vectors and hashes are archived in
+GFX/0.79.35/Evidence/NvkImageLayout. R4OS broker and lifetime code is Apache-2.0.
+
 Combined native engine objects (0.79.35, NVIDIA 0.1.136): topology fields,
 class IDs and RM allocation layouts use the already attributed NVIDIA570.144
 MIT definitions. Engine/runlist grouping and parameter-free GR allocation

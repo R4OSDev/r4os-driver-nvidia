@@ -1,0 +1,25 @@
+{
+  "reference": "NVIDIA Open Kernel Modules 570.144",
+  "generator": "ExFiles/Reference/GFX/0.79.35/Evidence/NvkImageLayout/image_reference.c",
+  "bytes": 5184,
+  "sha256": "1925a7dfc1d15c66eb58d5284f52fc27fb4390eda5ce41e43efcfd893cbdbe38",
+  "records": "system then video; kind1..6; allocation request160/reply160, map request56/reply56",
+  "sources": [
+    {
+      "path": "src/common/sdk/nvidia/inc/nvos.h",
+      "sha256": "9e878195c522919f133c497aefbc3f4c076aae8bda25d4c7915e8981bb43563a"
+    },
+    {
+      "path": "src/common/inc/swref/published/turing/tu102/dev_mmu.h",
+      "sha256": "1668eb3c9399b35fc2e2c6a5f6986ff65be6151d9f110f569b9ca6cc25104c06"
+    },
+    {
+      "path": "src/nvidia/src/kernel/gpu/mem_mgr/arch/turing/mem_mgr_tu102.c",
+      "sha256": "b1f1e301792563f3f703ca1a40c76378ffe767ae6b1232a9ff27cb61902ffa7c"
+    },
+    {
+      "path": "src/nvidia/src/kernel/mem_mgr/virtual_mem.c",
+      "sha256": "d3d9311c355e9b210c84b588d8a3a0448a2f6132c834705368990aac7856927b"
+    }
+  ]
+}

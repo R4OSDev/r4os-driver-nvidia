@@ -15,6 +15,7 @@ pub const Config = struct {
     fixed_address: u64 = 0,
     location: wire.Location = .system,
     blocklinear: bool = false,
+    pte_kind: u8 = 0,
 };
 pub const Binding = struct {
     source: alias.Use = .{},
@@ -67,7 +68,8 @@ pub const Owner = struct {
             else try token.session.rm_names.reserveChildren(parent, 1);
         errdefer token.session.rm_names.retireChildren(reservation) catch {};
         const plan: wire.Allocation = .{ .space = space, .object = try reservation.object(0), .bytes = config.bytes,
-            .alignment = config.alignment, .fixed_address = config.fixed_address, .location = config.location, .blocklinear = config.blocklinear };
+            .alignment = config.alignment, .fixed_address = config.fixed_address, .location = config.location,
+            .blocklinear = config.blocklinear, .pte_kind = config.pte_kind };
         try plan.validate();
         return .{ .exchange = try exchange.Exchange.init(token, deadline), .plan = plan, .stamp = plan,
             .reservation = reservation, .deadline = deadline };
@@ -133,7 +135,7 @@ pub const Owner = struct {
         if (!std.meta.eql(source.space, self.plan.space)) return error.Stale;
         const map: wire.Mapping = .{ .allocation = self.plan, .address = self.address, .memory = source.object,
             .memory_bytes = source.allocation_bytes, .memory_offset = source.offset, .virtual_offset = offset,
-            .bytes = source.bytes, .location = source.location, .virtual_kind = self.plan.blocklinear };
+            .bytes = source.bytes, .location = source.location, .virtual_kind = self.plan.blocklinear or self.plan.pte_kind != 0 };
         try map.validate();
         var cursor = self.bindings;
         while (cursor) |entry| : (cursor = entry.next) {

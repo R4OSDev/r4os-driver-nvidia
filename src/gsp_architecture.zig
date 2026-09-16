@@ -40,7 +40,8 @@ pub fn describe(pci: *const identity.Snapshot, chip: u16, topology: *const posti
         .gpc_count = gpc, .tpc_count = tpc, .shader_model = profile.sm, .mp_per_tpc = 2, .max_warps_per_mp = 48,
         .rm_release = nv.rm_release, .vram_bytes = memory.fb_bytes, .va_start = va.base, .va_end = va.base + va.bytes,
         .memory_generation = epoch, .bind_alignment = va.big_page_bytes,
-        .flags = if (@import("gsp_buffer_wire.zig").hostCoherentPolicy()) nv.architecture_host_coherent else 0,
+        .flags = nv.architecture_image_layouts |
+            @as(u32, if (@import("gsp_buffer_wire.zig").hostCoherentPolicy()) nv.architecture_host_coherent else 0),
         .graphics_class = profile.render, .compute_class = profile.computeClass(),
         .copy_class = copy_class, .gpfifo_class = 0xc56f,
     };

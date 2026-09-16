@@ -1,3 +1,49 @@
+// src/nvidia/src/kernel/gpu/mem_mgr/arch/turing/mem_mgr_tu102.c
+// /*
+//  * SPDX-FileCopyrightText: Copyright (c) 2017-2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//  * SPDX-License-Identifier: MIT
+//  *
+//  * Permission is hereby granted, free of charge, to any person obtaining a
+//  * copy of this software and associated documentation files (the "Software"),
+//  * to deal in the Software without restriction, including without limitation
+//  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//  * and/or sell copies of the Software, and to permit persons to whom the
+//  * Software is furnished to do so, subject to the following conditions:
+//  *
+//  * The above copyright notice and this permission notice shall be included in
+//  * all copies or substantial portions of the Software.
+//  *
+//  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+//  * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+//  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+//  * DEALINGS IN THE SOFTWARE.
+//  */
+// src/common/inc/swref/published/turing/tu102/dev_mmu.h
+// /*
+//  * SPDX-FileCopyrightText: Copyright (c) 2003-2022 NVIDIA CORPORATION & AFFILIATES
+//  * SPDX-License-Identifier: MIT
+//  *
+//  * Permission is hereby granted, free of charge, to any person obtaining a
+//  * copy of this software and associated documentation files (the "Software"),
+//  * to deal in the Software without restriction, including without limitation
+//  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//  * and/or sell copies of the Software, and to permit persons to whom the
+//  * Software is furnished to do so, subject to the following conditions:
+//  *
+//  * The above copyright notice and this permission notice shall be included in
+//  * all copies or substantial portions of the Software.
+//  *
+//  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+//  * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+//  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+//  * DEALINGS IN THE SOFTWARE.
+//  */
 // Pinned NVIDIA570.144 contracts retain these complete original MIT notices.
 // src/common/sdk/nvidia/inc/nvos.h
 // /*
@@ -192,6 +238,24 @@ pub const Error = exchange.Error;
 pub const Encoded = struct { function: u32, bytes: []const u8 };
 pub const Reply = union(enum) { ok: u64, rejected: u32 };
 pub const Location = enum { system, video };
+// Uncompressed TU102+ kinds, from NVIDIA570.144 dev_mmu.h and
+// memmgrChooseKindZ_TU102. Depth/stencil attributes are required as well as
+// format: RM may choose the kind again from type/attributes during allocation.
+const Layout = struct { kind: u32, memory_type: u32, attributes: u32 };
+fn layout(blocklinear: bool, pte_kind: u8) Error!Layout {
+    const kind: u32 = if (pte_kind != 0) pte_kind else if (blocklinear) 6 else 0;
+    const tile: u32 = 2 << 16;
+    return switch (kind) {
+        0 => .{ .kind = 0, .memory_type = 6, .attributes = 0 },
+        1 => .{ .kind = 1, .memory_type = 1, .attributes = tile | 2 | (7 << 19) },
+        2 => .{ .kind = 2, .memory_type = 16, .attributes = tile | 1 },
+        3 => .{ .kind = 3, .memory_type = 1, .attributes = tile | 4 | (1 << 19) },
+        4 => .{ .kind = 4, .memory_type = 1, .attributes = tile | 5 | (1 << 18) | (5 << 19) },
+        5 => .{ .kind = 5, .memory_type = 1, .attributes = tile | 4 },
+        6 => .{ .kind = 6, .memory_type = 6, .attributes = tile },
+        else => error.Profile, // Compression and unknown kinds are not implemented.
+    };
+}
 const system_attributes: u32 = 0x22800000;
 const system_gpu_cache: u32 = 8;
 const system_snoop: u32 = 0x10;
@@ -211,9 +275,11 @@ pub const Allocation = struct {
     fixed_address: u64 = 0,
     location: Location = .system,
     blocklinear: bool = false,
+    pte_kind: u8 = 0,
     privileged: bool = false,
 
     pub fn validate(self: Allocation) Error!void {
+        _ = try layout(self.blocklinear, self.pte_kind);
         const s = self.space;
         if (s.epoch == 0 or s.client == 0 or s.device == 0 or s.handle == 0 or self.object == 0) return error.Handle;
         if (s.client == s.device or s.client == s.handle or s.device == s.handle) return error.Handle;
@@ -246,6 +312,7 @@ pub const Mapping = struct {
     pub fn validate(self: Mapping) Error!void {
         try self.allocation.validate();
         try self.allocation.validateAddress(self.address);
+        if ((self.allocation.blocklinear or self.allocation.pte_kind != 0) and !self.virtual_kind) return error.Profile;
         const s = self.allocation.space;
         if (self.memory == 0) return error.Handle;
         for ([_]u32{ s.client, s.device, s.handle, self.allocation.object }) |name| if (self.memory == name) return error.Handle;
@@ -271,12 +338,14 @@ pub fn allocate(value: Allocation, output: []u8) Error!Encoded {
     put(out, 12, 0x50a0); // NV50_MEMORY_VIRTUAL; RM owns page tables.
     put(out, 20, 128);
     const p = out[32..];
-    put(p, 4, 6); // NVOS32_TYPE_DMA.
+    const image = try layout(value.blocklinear, value.pte_kind);
+    put(p, 4, image.memory_type);
     put(p, 8, 0x80100 | @as(u32, if (value.fixed_address != 0) 0x10 else 0) |
         @as(u32, if (value.privileged) 0x08000000 else 0));
     put(p, 24, @as(u32, if (value.location == .system) system_attributes else 0x00800000) |
-        @as(u32, if (value.blocklinear) 2 << 16 else 0));
+        image.attributes);
     put(p, 28, if (value.location == .system) system_gpu_cache else 4); // Explicit GPU cache policy.
+    put(p, 32, image.kind);
     wide(p, 64, value.bytes);
     wide(p, 72, value.alignment);
     wide(p, 80, value.fixed_address);
