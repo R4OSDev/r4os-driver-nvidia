@@ -110,7 +110,7 @@ pub const Owner = struct {
         self.spare = .{};
         self.spare_valid = false;
     }
-    fn acquire(self: *Owner, run: *runtime.Owner, job: a.GfxDriverJob) !*Node {
+    fn acquire(self: *Owner, run: *runtime.Owner, job: a.GfxDriverJob, engine_mask: u32) !*Node {
         if (self.source == null or self.epoch != run.epoch or self.spare.handle != 0) return error.Unsupported;
         const identity = producer(job);
         var info: a.GfxQueueOwnerInfo = .{};
@@ -122,6 +122,7 @@ pub const Owner = struct {
             const node: *Node = @fieldParentPtr("index", index);
             try self.validate(node);
             if (!std.meta.eql(node.producer, identity)) return error.Stale;
+            if (engine_mask & ~node.graphics.engine_mask != 0) return error.Unsupported;
             if (node.closing or node.graphics.phase == .closed or node.graphics.phase == .unavailable) return error.Cancelled;
             node.jobs = try std.math.add(usize, node.jobs, 1);
             return node;
@@ -136,7 +137,7 @@ pub const Owner = struct {
         }
         const node: *Node = @ptrFromInt(self.spare.cpu_address);
         node.* = .{ .allocation = self.spare, .stamp = self.spare, .producer = identity, .jobs = 1 };
-        node.graphics.requestRegular(self.source.?) catch |err| {
+        node.graphics.requestEngines(self.source.?, engine_mask) catch |err| {
             try self.releaseSpare();
             return err;
         };
@@ -293,7 +294,7 @@ pub const Job = struct {
                     self.info.revision != 1 or self.info.command_bytes < @sizeOf(nv.R4NvNativeSubmitHeader)) return error.Unsupported;
                 try self.read(0, std.mem.asBytes(&self.header));
                 if (self.header.version != nv.native_submit_version or self.header.size != @sizeOf(nv.R4NvNativeSubmitHeader) or
-                    self.header.engine_mask != nv.native_engine_graphics or self.header.reserved0 != 0 or self.header.reserved1 != 0 or
+                    !@import("gsp_fifo_wire.zig").validGraphicsEngines(self.header.engine_mask) or self.header.reserved0 != 0 or self.header.reserved1 != 0 or
                     self.header.push_count > batch.capacity or self.info.command_bytes != @sizeOf(nv.R4NvNativeSubmitHeader) +
                     self.header.push_count * @sizeOf(nv.R4NvNativePush)) return error.Unsupported;
                 self.phase = .count_bindings;
@@ -347,7 +348,7 @@ pub const Job = struct {
                 }
             },
             .context => {
-                if (self.node == null) self.node = try run.native_queues.acquire(run, self.job);
+                if (self.node == null) self.node = try run.native_queues.acquire(run, self.job, self.header.engine_mask);
                 if (self.node.?.closing) return error.Cancelled;
                 if (self.node.?.graphics.phase == .unavailable or self.node.?.graphics.phase == .closed) return error.Unsupported;
                 _ = try self.channel();

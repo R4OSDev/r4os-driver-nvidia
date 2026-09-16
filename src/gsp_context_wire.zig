@@ -332,6 +332,31 @@ pub const timeslice = @import("gsp_timeslice.zig");
 pub const max_bytes: usize = 3236;
 pub const Binding = struct { epoch: u64, client: u32, device: u32, subdevice: u32, vaspace: u32, group: u32, share: u32, internal_client: u32 = 0, internal_subdevice: u32 = 0 };
 pub const Engine = struct { data: [16]u32, pbdma: [2]u32, faults: [2]u32, count: u32, name: [16]u8 };
+/// RM 570 has COPY0..COPY19. Only a CE on GR's actual runlist may be
+/// instantiated on its channel (Nouveau r535/fifo.c). Enumeration order and
+/// the NV2080 numbering gap at COPY10 must not choose the engine for us.
+pub const CopyTopology = struct {
+    const Row = struct { present: bool = false, runlist: u32 = 0, base: u32 = 0, count: u32 = 0, pbdma: [2]u32 = .{ 0, 0 } };
+    rows: [20]Row = @splat(.{}),
+    pub fn add(self: *CopyTopology, value: Engine) Error!void {
+        const rm = value.data[2];
+        if (rm < 9 or rm > 28) return;
+        const row = &self.rows[rm - 9];
+        if (row.present) return error.Payload;
+        row.* = .{ .present = true, .runlist = value.data[3], .base = value.data[11], .count = value.count, .pbdma = value.pbdma };
+    }
+    pub fn paired(self: *const CopyTopology, gr: Engine) ?u32 {
+        if (gr.data[2] != 1 or gr.count == 0 or gr.count > 2 or
+            gr.data[3] == 0xffffffff or gr.data[11] == 0 or
+            gr.data[11] == 0xffffffff or gr.data[11] & 3 != 0) return null;
+        for (&self.rows, 0..) |*row, index| {
+            if (row.present and row.runlist == gr.data[3] and row.base == gr.data[11] and
+                row.count == gr.count and std.mem.eql(u32, row.pbdma[0..row.count], gr.pbdma[0..gr.count]))
+                return @intCast(9 + index);
+        }
+        return null;
+    }
+};
 pub const Reply = union(enum) { rejected: u32, ok: []const u8 };
 pub fn nvEngine(rm: u32) Error!u32 {
     return if (rm >= 1 and rm <= 18) rm else if (rm >= 19 and rm <= 28) rm - 19 + 0x34 else error.Unsupported;

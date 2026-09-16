@@ -12,6 +12,7 @@ pub fn response(index: usize) []const u8 {
     return golden[offset + bytes..][0..bytes];
 }
 pub fn check() !void {
+    try checkCopyTopology();
     const binding: wire.Binding = .{ .epoch = 7, .client = 0xc1d00000, .device = 0x10000000,
         .subdevice = 0x10000001, .vaspace = 0x10000006, .group = 0x10000009, .share = 0x1000000a };
     const types = @embedFile("fixtures/context-engines-570.144.bin");
@@ -73,4 +74,32 @@ pub fn check() !void {
         offset += data.len * 2;
     }
     try t.expect(offset == 14112 and offset == golden.len);
+}
+
+pub fn checkCopyTopology() !void {
+    const graphics = wire.engine(response(1)[24..],0);
+    var copy = wire.engine(response(2)[24..],0);
+    var topology: wire.CopyTopology = .{};
+    try t.expect(topology.paired(graphics) == null);
+    try topology.add(copy); // COPY10: an unrelated asynchronous runlist.
+    try t.expect(topology.paired(graphics) == null);
+    try t.expectError(error.Payload,topology.add(copy));
+    copy.data[2] = 20;
+    copy.data[3] = graphics.data[3];
+    try topology.add(copy); // Same ID, different PRI base still is not GRCE.
+    try t.expect(topology.paired(graphics) == null);
+    copy.data[2] = 21;
+    copy.data[11] = graphics.data[11];
+    try topology.add(copy);
+    try t.expectEqual(@as(?u32,21),topology.paired(graphics));
+    try t.expectEqual(@as(u32,0x36),try wire.nvEngine(topology.paired(graphics).?));
+    copy.data[2] = 9;
+    try topology.add(copy);
+    try t.expectEqual(@as(?u32,9),topology.paired(graphics));
+    var invalid = graphics;
+    invalid.data[11] = 0;
+    try t.expect(topology.paired(invalid) == null);
+    invalid = graphics;
+    invalid.pbdma[0] += 1;
+    try t.expect(topology.paired(invalid) == null);
 }

@@ -7098,6 +7098,15 @@ fn replyNativeProduct(target: *@import("gsp_device.zig").Device) !void {
             if (op == .engines and owner.base == 0) {
                 @memset(response[120..136], 0); @memcpy(response[120..123], "GR0");
             }
+            if (op == .engines and owner.base == 32) {
+                // COPY10 is on another runlist. COPY11 really shares GR's
+                // runlist; the production owner must find it across pages.
+                outputWord(&response, 28, 2);
+                @memcpy(response[136..236], response[36..136]);
+                outputWord(&response, 144, 20);
+                outputWord(&response, 148, if (@import("gsp_native_queue_test_model.zig").Model.engine_fault == .topology) 9 else 2);
+                outputWord(&response, 180, 0x800400);
+            }
             if (op == .group or op == .share) @memcpy(response[32..rpc.request.len], rpc.request[32..]);
         }
         }
@@ -7660,6 +7669,8 @@ fn checkNativeQueues(target: *@import("gsp_device.zig").Device, table: *a.Driver
     const layout = @import("gsp_copy_wire.zig");
     const run = &target.running;
     var checkpoint: []const u8 = "setup";
+    try @import("gsp_context_test.zig").checkCopyTopology();
+    try @import("gsp_fifo_test.zig").checkNativeEngines();
     errdefer |err| std.debug.print("native queue {s}: {s} device={s} failure={?} native={?} nodes={d} jobs={d} batch={}\n",
         .{checkpoint,@errorName(err),@tagName(target.phase),target.failure,
         if (run.queued_native) |job| job.phase else null,run.native_queues.count,run.work_schedule.count(),run.batch_work != null});
@@ -7711,6 +7722,7 @@ fn checkNativeQueues(target: *@import("gsp_device.zig").Device, table: *a.Driver
     for (0..3) |round| {
         checkpoint = "submit";
         peer.enqueue(if (round == 2) 1 else 0,false,0);
+        if (round != 1) std.mem.writeInt(u32,peer.command[8..12],7,.little);
         var steps: usize = 0;
         while (steps < 700) : (steps += 1) {
             _ = try stepNativeQueues(target,counts,scenario,&stage);
@@ -7726,6 +7738,9 @@ fn checkNativeQueues(target: *@import("gsp_device.zig").Device, table: *a.Driver
         if (round == 1) try t.expect(std.meta.eql(handle,first_channel.?) and std.meta.eql(node.graphics.context.?,first_context.?));
         if (round == 2) try t.expect(!std.meta.eql(handle,first_channel.?) and !std.meta.eql(node.graphics.context.?,first_context.?));
         const context = run.contexts[node.graphics.context.?.slot].owner.?;
+        try t.expect(owner.config.engine_mask == 7 and owner.compute_live and owner.copy_live and
+            owner.config.compute_class == @import("generation.zig").get(target.display.?.chip.?.id).?.computeClass() and
+            owner.config.copy_rm_engine == 20 and context.info().?.copy_rm_engine == 20);
         try t.expect(!std.meta.eql(handle,target.native_graphics.channel.?) and context.graphics_shared ==
             run.contexts[target.native_graphics.golden_context.?.slot].owner.? and (try run.virtuals.findBinding(mapped)).executions == 1);
         const ticket = work.ticket.?;
@@ -7754,7 +7769,7 @@ fn checkNativeQueues(target: *@import("gsp_device.zig").Device, table: *a.Driver
             (try run.virtuals.findBinding(mapped)).executions == 0);
     }
     checkpoint = "invalid snapshots";
-    for (0..6) |bad| {
+    for (0..8) |bad| {
         const before = peer.completed;
         peer.enqueue(0,false,deadline);
         switch (bad) {
@@ -7764,6 +7779,8 @@ fn checkNativeQueues(target: *@import("gsp_device.zig").Device, table: *a.Driver
             3 => std.mem.writeInt(u64,peer.command[32..40],public_binding.address+4096,.little),
             4 => std.mem.writeInt(u32,peer.command[12..16],511,.little),
             5 => peer.resource.token.opaque1 += 10000,
+            6 => std.mem.writeInt(u32,peer.command[8..12],8,.little),
+            7 => std.mem.writeInt(u32,peer.command[8..12],6,.little),
             else => unreachable,
         }
         for (0..250) |_| { _ = try stepNativeQueues(target,counts,scenario,&stage); if (peer.completed != before and !run.hasQueuedWork()) break; }
@@ -7777,9 +7794,35 @@ fn checkNativeQueues(target: *@import("gsp_device.zig").Device, table: *a.Driver
     try t.expect(peer.job == null and peer.result == a.gfx_queue_result_cancelled);
     checkpoint = "idle queue retirement";
     peer.closed[0] = true; peer.notify();
-    for (0..600) |_| { _ = try stepNativeQueues(target,counts,scenario,&stage); if (run.native_queues.count == 0 and run.native_active == null) break; }
+    for (0..600) |_| { _ = try stepNativeQueues(target,counts,scenario,&stage); if (run.native_queues.count == 0 and run.native_active == null and !native.pendingReleases()) break; }
     try t.expect(run.native_queues.count == 0 and run.native_queues.spare.handle == 0 and fifo.released == released+2 and
         run.fifos[target.native_graphics.channel.?.slot].owner.?.ring.idle());
+    try t.expectEqualSlices(usize,&.{2,2},&peer.engine_allocations);
+    try t.expectEqualSlices(usize,&peer.engine_allocations,&peer.engine_frees);
+    checkpoint = "engine admission and partial unwind";
+    const faults = [_]@TypeOf(peer.engine_fault){.topology,.compute_class,.copy_class,.compute_allocate,.copy_allocate};
+    for (faults, 3..) |engine_fault, queue_index| {
+        peer.engine_fault = engine_fault;
+        const before = peer.completed;
+        const alloc_before = peer.engine_allocations;
+        const heap_before = @import("gsp_buffer_test_model.zig").Model.heapLive();
+        errdefer std.debug.print("engine fault={s} completed={d}/{d} heap={d}/{d} allocations={any}/{any} frees={any} nodes={d}\n", .{
+            @tagName(engine_fault),peer.completed,before,@import("gsp_buffer_test_model.zig").Model.heapLive(),heap_before,
+            peer.engine_allocations,alloc_before,peer.engine_frees,run.native_queues.count});
+        peer.enqueue(queue_index,true,deadline);
+        std.mem.writeInt(u32,peer.command[8..12],7,.little);
+        for (0..900) |_| { _ = try stepNativeQueues(target,counts,scenario,&stage); if (peer.completed != before and !run.hasQueuedWork()) break; }
+        try t.expect(peer.completed == before+1 and peer.result == a.gfx_queue_result_failed and run.batch_work == null and
+            run.failure == null and !run.hasQueuedWork() and (try run.virtuals.findBinding(mapped)).executions == 0);
+        peer.closed[queue_index] = true; peer.notify();
+        for (0..600) |_| { _ = try stepNativeQueues(target,counts,scenario,&stage); if (run.native_queues.count == 0 and run.native_active == null and !native.pendingReleases()) break; }
+        try t.expect(run.native_queues.count == 0 and run.native_queues.spare.handle == 0);
+        try t.expectEqual(heap_before,@import("gsp_buffer_test_model.zig").Model.heapLive());
+        try t.expect(peer.engine_allocations[0] == alloc_before[0] + @intFromBool(engine_fault == .copy_allocate) and
+            peer.engine_allocations[1] == alloc_before[1]);
+        try t.expectEqualSlices(usize,&peer.engine_allocations,&peer.engine_frees);
+    }
+    peer.engine_fault = .none;
     checkpoint = "VA retirement";
     run.virtual_provider.close();
     for (0..4) |_| {
@@ -7795,7 +7838,7 @@ fn checkNativeQueues(target: *@import("gsp_device.zig").Device, table: *a.Driver
     _ = try run.native_queues.step(run,null);
     run.copy_backend = original_backend;
     try t.expect(run.native_queues.source == null and !run.hasQueuedWork());
-    std.debug.print("[nvidia-native-queue] two isolated contexts; reuse; canonical VA; GET retains; semaphore completes; invalid input; active/idle close; no idle spin\n",.{});
+    std.debug.print("[nvidia-native-queue] two GR+compute+paired-CE contexts; subset reuse; canonical VA; GET retains; semaphore completes; invalid masks; active/idle close; missing topology/classes and partial RM unwind; no idle spin\n",.{});
     return fifo.released-released;
 }
 fn checkRenderWarmup(target: *@import("gsp_device.zig").Device, table: *a.DriverApi,
@@ -9664,6 +9707,13 @@ fn replyDeviceFifo(target: *@import("gsp_device.zig").Device, counts: *FifoCount
             .classes => {
                 if (owner.config.engine == .graphics) {
                     outputWord(&response, 24, 1); outputWord(&response, 28, if (model.is("context_graphics_missing")) 0xc697 else @import("generation.zig").get(target.display.?.chip.?.id).?.render);
+                    if (owner.config.engine_mask != 1) {
+                        const peer = @import("gsp_native_queue_test_model.zig").Model;
+                        outputWord(&response, 24, 4);
+                        outputWord(&response, 32, if (peer.engine_fault == .compute_class) 0 else @import("generation.zig").get(target.display.?.chip.?.id).?.computeClass());
+                        outputWord(&response, 36, if (peer.engine_fault == .copy_class) 0 else 0xc7b5);
+                        outputWord(&response, 40, if (peer.engine_fault == .copy_class) 0 else 0xc6b5);
+                    }
                 } else {
                     outputWord(&response, 24, if (model.is("context_copy_class")) 0 else 2); outputWord(&response, 28, 0xc6b5); outputWord(&response, 32, 0xc7b5);
                 }
@@ -9697,9 +9747,30 @@ fn replyDeviceFifo(target: *@import("gsp_device.zig").Device, counts: *FifoCount
                 outputWord(&response, 44, 0x81234567);
                 if (model.is("context_graphics_reject")) outputWord(&response, 16, 0x57);
             },
+            .allocate_compute, .allocate_gr_copy => {
+                const peer = @import("gsp_native_queue_test_model.zig").Model;
+                const compute = op == .allocate_compute;
+                try t.expect(owner.engine_live and owner.graphics_promoted and owner.bound and !owner.enabled and !owner.copy_live and
+                    owner.compute_live == !compute and !owner.config.graphics.?.golden);
+                try t.expect(@import("gsp_fifo_wire.zig").word(channel.request,4) == owner.config.handle);
+                if (compute) try t.expect(channel.request.len == 32 and @import("gsp_fifo_wire.zig").word(channel.request,20) == 0)
+                else try t.expect(channel.request.len == 40 and @import("gsp_fifo_wire.zig").word(channel.request,32) == 1 and
+                    @import("gsp_fifo_wire.zig").word(channel.request,36) == 0x35);
+                if ((compute and peer.engine_fault == .compute_allocate) or (!compute and peer.engine_fault == .copy_allocate))
+                    outputWord(&response,16,0x51)
+                else peer.engine_allocations[if (compute) @as(usize,0) else 1] += 1;
+            },
             .enable => { counts.enables += 1; try t.expect(owner.work_submit_token != null and !owner.enabled); },
             .disable => { counts.disables += 1; try t.expect(owner.enabled); },
-            .free_copy => try t.expect(owner.engine_live and !owner.enabled and owner.ring.idle()),
+            .free_copy => try t.expect(owner.engine_live and !owner.compute_live and !owner.copy_live and !owner.enabled and owner.ring.idle()),
+            .free_compute, .free_gr_copy => {
+                const peer = @import("gsp_native_queue_test_model.zig").Model;
+                const compute = op == .free_compute;
+                try t.expect(owner.engine_live and !owner.enabled and owner.ring.idle() and owner.copy_live == !compute and
+                    (if (compute) owner.compute_live else true));
+                try t.expect(@import("gsp_fifo_wire.zig").word(channel.request,8) == (if (compute) owner.config.compute_handle else owner.config.copy_handle));
+                peer.engine_frees[if (compute) @as(usize,0) else 1] += 1;
+            },
             .free => { counts.frees += 1; try t.expect(owner.live and !owner.enabled); },
         }
         if ((op == .allocate and model.is("context_fifo_allocate")) or (op == .bind and model.is("context_fifo_bind")) or

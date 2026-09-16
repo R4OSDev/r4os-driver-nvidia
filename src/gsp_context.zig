@@ -310,6 +310,7 @@ pub const Error = wire.Error || names.Error || vram.Error || error{Retained, Bus
 pub const State = enum { creating, unwinding, ready, handed_off, destroying, closed, finished, failed };
 pub const Unavailable = enum { classes, engine, context_buffers };
 pub const Info = struct { binding: wire.Binding, rm_engine: u32, nv_engine: u32, engine: wire.Engine, method_bytes: u32, subcontext: u32,
+    copy_rm_engine: ?u32 = null,
     timeslice_requested_us: u64 = 0, timeslice_rejection: ?u32 = null };
 pub const Child = struct { epoch: u64, group: u32, serial: u64 };
 const ChildUse = struct { serial: u64 = 0, globals: bool = false };
@@ -325,6 +326,7 @@ pub const Owner = struct {
     engines: bool = false,
     base: u32 = 0,
     selected: ?wire.Engine = null,
+    copies: wire.CopyTopology = .{},
     method_bytes: u32 = 0,
     subcontext: u32 = 0,
     group_live: bool = false,
@@ -376,6 +378,7 @@ pub const Owner = struct {
             (self.state != .ready and self.state != .handed_off)) return null;
         return .{ .binding = self.binding, .rm_engine = self.rm_engine, .nv_engine = wire.nvEngine(self.rm_engine) catch return null,
             .engine = self.selected orelse return null, .method_bytes = self.method_bytes, .subcontext = self.subcontext,
+            .copy_rm_engine = self.copies.paired(self.selected orelse return null),
             .timeslice_requested_us = if (self.timeslice_attempted and self.timeslice_rejection == null) wire.timeslice.requested_us else 0,
             .timeslice_rejection = self.timeslice_rejection };
     }
@@ -537,8 +540,10 @@ pub const Owner = struct {
         } else null;
         // Validate the selected engine before ACK, publish its copy after ACK.
         var candidate = self.selected;
+        var copies = self.copies;
         if (op == .engines and reply == .ok) for (0..wire.word(reply.ok, 4)) |index| {
             const row = wire.engine(reply.ok, index);
+            if (self.rm_engine == 1) try copies.add(row);
             if (row.data[2] == self.rm_engine) {
                 if (candidate != null or row.count == 0 or row.data[3] == 0xffffffff or row.data[11] == 0 or
                     row.data[11] == 0xffffffff or row.data[11] & 3 != 0) return error.Payload;
@@ -567,6 +572,7 @@ pub const Owner = struct {
             },
             .engines => {
                 self.selected = candidate;
+                self.copies = copies;
                 if (more) self.base += 32 else {
                     self.engines = true;
                     if (self.selected == null) { self.unavailable = .engine; self.state = .unwinding; }

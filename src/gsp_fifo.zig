@@ -282,6 +282,8 @@ pub const Owner = struct {
     userd: vram.storage.Use = .{},
     ring: copy.Ring = .{},
     engine_live: bool = false,
+    compute_live: bool = false,
+    copy_live: bool = false,
     engine_caps: u32 = 0,
     graphics_promoted: bool = false,
     graphics_initialized: bool = false,
@@ -303,7 +305,16 @@ pub const Owner = struct {
     pub fn open(self: *Owner, token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext, adapter: u32, graph: names.Lease,
         parent: *context.Owner, runqueue: u8, instance: *vram.Owner, userd: ?*vram.Owner, engine: wire.Engine, deadline: u64) Error!void
     {
+        return self.openEngines(token, ctx, adapter, graph, parent, runqueue, instance, userd, engine, @import("r4nv_binding").native_engine_graphics, deadline);
+    }
+    pub fn openEngines(self: *Owner, token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext, adapter: u32, graph: names.Lease,
+        parent: *context.Owner, runqueue: u8, instance: *vram.Owner, userd: ?*vram.Owner, engine: wire.Engine, engine_mask: u32, deadline: u64) Error!void
+    {
+        const nv = @import("r4nv_binding");
         if (self.self_address != 0) return error.State;
+        if (!wire.validGraphicsEngines(engine_mask) or (engine != .graphics and engine_mask != nv.native_engine_graphics)) return error.Unsupported;
+        const compute = engine_mask & nv.native_engine_compute != 0;
+        const paired_copy = engine_mask & nv.native_engine_copy != 0;
         if ((userd != null) != (engine == .none)) return error.Unsupported;
         const parent_info = parent.info() orelse return error.State;
         const methods = parent.methodStorage(runqueue) orelse return error.State;
@@ -326,12 +337,16 @@ pub const Owner = struct {
             .graphics => if (parent_info.rm_engine != 1) return error.Unsupported,
         }
         const graphics = if (engine == .graphics) try parent.graphicsPromotion() else null;
+        if (graphics != null and graphics.?.golden and engine_mask != nv.native_engine_graphics) return error.Unsupported;
+        const copy_rm_engine = if (paired_copy) parent_info.copy_rm_engine orelse return error.Unsupported else 0;
         try token.session.guard(deadline);
-        const reservation = try token.session.rm_names.reserveChildren(graph, if (userd == null) 4 else 3);
+        const reservation = try token.session.rm_names.reserveChildren(graph, if (userd == null) 4 + @as(u8, @intFromBool(compute)) + @as(u8, @intFromBool(paired_copy)) else 3);
         self.* = .{ .self_address = @intFromPtr(self), .session = token.session, .parent = parent, .reservation = reservation, .namespace_live = true, .deadline = deadline,
             .config = .{ .chip_id = token.session.profile.chip_id, .context = parent_info.binding, .handle = try reservation.object(2), .rm_engine = parent_info.rm_engine, .runqueue = runqueue,
                 .address = 4096, .instance = inst.physical.?.base, .userd = userd_address,
                 .system_userd = userd == null, .engine = engine, .graphics = graphics, .object_handle = if (userd == null) try reservation.object(3) else 0,
+                .engine_mask = engine_mask, .compute_handle = if (compute) try reservation.object(4) else 0,
+                .copy_handle = if (paired_copy) try reservation.object(4 + @as(u8, @intFromBool(compute))) else 0, .copy_rm_engine = copy_rm_engine,
                 .methods = methods.physical.base, .method_bytes = parent_info.method_bytes } };
         self.config_stamp = self.config;
         self.acquire(token, ctx, adapter, instance, userd) catch |err| {
@@ -373,6 +388,9 @@ pub const Owner = struct {
             self.commands == null or self.commands.?.info() == null or self.instance.info() == null or self.parent.?.methodStorage(self.config.runqueue) == null) return null;
         if (self.config.system_userd) {
             if (!self.ring.valid() or !self.engine_live or self.config.object_class == 0) return null;
+            if (self.compute_live != (self.config.compute_handle != 0) or self.copy_live != (self.config.copy_handle != 0) or
+                (self.compute_live and self.config.compute_class == 0) or (self.copy_live and self.config.copy_class == 0)) return null;
+            if (self.copy_live and (self.parent.?.info() orelse return null).copy_rm_engine != self.config.copy_rm_engine) return null;
             if (self.config.engine == .graphics and !self.graphics_promoted) return null;
             if (self.config.graphics) |graphics| {
                 if (!std.meta.eql(graphics, self.parent.?.graphicsPromotion() catch return null)) return null;
@@ -421,9 +439,11 @@ pub const Owner = struct {
                 // receives no host methods, and closes before normal work.
                 if (self.golden() and !self.enabled) break :blk .enable;
                 if (self.config.system_userd and !self.engine_live) break :blk if (self.config.engine == .graphics) .allocate_graphics else .allocate_copy;
+                if (self.config.compute_handle != 0 and !self.compute_live) break :blk .allocate_compute;
+                if (self.config.copy_handle != 0 and !self.copy_live) break :blk .allocate_gr_copy;
                 if (!self.enabled and !self.golden()) break :blk .enable;
                 self.state = .ready; return null;
-            } else if (self.enabled) .disable else if (self.engine_live) .free_copy else if (self.live) .free else {
+            } else if (self.enabled) .disable else if (self.copy_live) .free_gr_copy else if (self.compute_live) .free_compute else if (self.engine_live) .free_copy else if (self.live) .free else {
                 if (!self.ring.close()) return error.Retained;
                 var token = try rpc.handoff(self.deadline);
                 try self.commands.?.beginDestroy(&token, self.deadline); self.state = .command_destroying; return null;
@@ -435,6 +455,7 @@ pub const Owner = struct {
         if (!dispatch.response) return dispatch;
         const op = self.operation.?;
         const reply = try wire.decode(self.config, op, rpc.request, dispatch.record);
+        const classes = if (op == .classes and reply == .ok and reply.ok != 0) wire.selectedClasses(self.config, dispatch.record.payload[24..]) else null;
         self.last_status = if (reply == .rejected) reply.rejected else 0;
         try rpc.complete(dispatch.ticket);
         if (reply == .rejected) {
@@ -443,7 +464,10 @@ pub const Owner = struct {
         } else switch (op) {
             .classes => {
                 if (reply.ok == 0) { self.host_rejected = error.Unsupported; self.unwind = true; self.state = .unwinding; }
-                else { self.config.object_class = reply.ok; self.config_stamp = self.config; }
+                else {
+                    self.config.object_class = reply.ok; self.config.compute_class = classes.?.compute;
+                    self.config.copy_class = classes.?.copy; self.config_stamp = self.config;
+                }
             },
             .allocate => { self.live = true; self.cid = reply.ok; },
             .bind => self.bound = true,
@@ -451,9 +475,13 @@ pub const Owner = struct {
             .allocate_copy => self.engine_live = true,
             .promote_graphics => self.graphics_promoted = true,
             .allocate_graphics => { self.engine_live = true; self.engine_caps = reply.ok; self.graphics_initialized = true; },
+            .allocate_compute => self.compute_live = true,
+            .allocate_gr_copy => self.copy_live = true,
             .enable => self.enabled = true,
             .disable => self.enabled = false,
             .free_copy => self.engine_live = false,
+            .free_compute => self.compute_live = false,
+            .free_gr_copy => self.copy_live = false,
             .free => { self.live = false; self.bound = false; },
         }
         self.operation = null; return null;
@@ -504,7 +532,7 @@ pub const Owner = struct {
     }
     fn finish(self: *Owner) Error!void {
         const parent = self.parent;
-        if (self.live or self.enabled or self.engine_live or self.ring.self_address != 0 or !self.releasePrivate()) return error.Retained;
+        if (self.live or self.enabled or self.engine_live or self.compute_live or self.copy_live or self.ring.self_address != 0 or !self.releasePrivate()) return error.Retained;
         if (self.golden() and self.graphics_initialized and !self.unwind) (parent orelse return error.State).golden_complete = true;
         if (self.namespace_live) { try self.session.?.rm_names.retireChildren(self.reservation.?); self.namespace_live = false; }
         self.state = if (self.unwind) .ready else .closed;
@@ -517,6 +545,15 @@ pub const Owner = struct {
         self.exchange = try exchange.Exchange.init(token, deadline); self.deadline = deadline;
         if (!self.namespace_live) { self.unwind = false; self.state = .closed; return; }
         self.unwind = false; self.state = .destroying;
+    }
+    /// A rejected startup has already received every RM/free acknowledgement
+    /// and released private storage before finish retires the namespace. Its
+    /// waiting public job must not prevent retirement of the empty host owner.
+    pub fn allocationReleased(self: *const Owner) bool {
+        self.stable() catch return false;
+        return self.state == .handed_off and self.unwind and !self.namespace_live and
+            !self.live and !self.enabled and !self.engine_live and !self.compute_live and !self.copy_live and
+            self.child == null and self.parent == null and self.ring.self_address == 0;
     }
     pub fn closeAfterReset(self: *Owner, proof: @import("gsp_reset.zig").Quiescence) Error!void {
         if (self.self_address == 0) return;

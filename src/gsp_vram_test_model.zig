@@ -12,6 +12,10 @@ pub const Model = struct {
     pub var budget: a.GfxDeviceBudgetState = .{};
     pub var budget_configurations: u32 = 0;
     pub var import_failure: i32 = 0;
+    pub fn pendingReleases() bool {
+        for (&slots) |*slot| if (slot.live and slot.published and !slot.reference and !slot.imported and !slot.borrowed and slot.gpu.lease.id == 0) return true;
+        return false;
+    }
     var query: *const fn (*a.GfxDriverMemoryApi) callconv(.c) i32 = undefined;
     var fallback_release: u64 = 0;
     var fallback_describe: u64 = 0;

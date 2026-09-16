@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.135; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.136; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -25,7 +25,7 @@ and graph/reset retirement. New VA names bypass the legacy fixed child ledger;
 malformed heap ownership stays retained. The common application/process broker
 and native NVK memory/VA adapters now exist; full Vulkan device/module/submit
 integration remains software work.
-This checkpoint does not expose a Vulkan device or new public features.
+This checkpoint does not expose a Vulkan device or promise Vulkan features.
 Details and physical follow-up: GrafikVulkan07935.txt/.json and OssiGPU.txt /35.
 The existing owner step accepts `unit-test "-Downer-test-filter=GPU virtual"`
 for this focused group alone; omitting the filter retains the full owner step.
@@ -68,18 +68,27 @@ The existing complete-run fixture checks coexistence with the renderer and
 close during context/storage/channel/probe waits. GPU replies remain modeled.
 Native allocation now retries a temporarily borrowed RM channel before reading
 its address-space metadata; deferred cleanup no longer aborts renderer startup.
-Public native queues (0.1.135): each canonical queue/producer owns a regular GR
+Public native queues (0.1.136): each canonical queue/producer owns a regular GR
 context and reuses it across jobs. The existing scheduler copies bounded steps
 of the R4NV version-1 packet and resolves kernel-retained VA snapshots to real RM
 mapping loans. Native operation 10 is advertised only with a ready GR template,
-VA provider and all required queue/lifecycle callbacks. The packet currently
-admits the instantiated GR 3D engine only; this does not qualify a Vulkan queue.
+VA provider and all required queue/lifecycle callbacks. Graphics bit1 is required;
+optional compute bit2 and copy bit4 request actual additional RM engine objects.
+The first job fixes the engine set; later jobs may request subsets. Copy uses
+the CE paired with GR in the paginated firmware runlist table, including COPY10+
+NV2080 numbering. Classes and every allocation must succeed before scheduling.
+Partial allocation unwinds objects in reverse order before channel/storage;
+class IDs alone never qualify a queue. This does not qualify a Vulkan queue.
+The empty host owner of a fully acknowledged startup rollback may retire while
+its requesting job waits; live or uncertain channels retain their busy guard.
 Queue close/producer exit retires an idle context asynchronously; submitted jobs
 retain their context and maps until the physical semaphore or proven reset.
 Malformed input fails before publication; uncertain retirement quarantines.
-Combined NVK 2D/copy/compute objects, NVK submission/sync, Vulkan device admission
-and an installed R4VK provider remain software work. Host models are not physical
-GPU acceptance; see GrafikVulkan07935.json/native_consumer and OssiGPU.txt /35.
+NVK submission/sync, independent headless GR startup, Vulkan device admission
+and an installed R4VK provider remain software work. Optional legacy 2D/M2MF and
+copy-only queues are not admitted by this graphics-queue packet. Host models are
+not physical GPU acceptance; see GrafikVulkan07935.json/native_engines and
+OssiGPU.txt /35.
 
 Generations and adapters (0.79.33): native software now covers GA102/103/104/106/107
 and AD102/103/104/106/107. Each measured chip selects its own firmware family,

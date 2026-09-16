@@ -15,6 +15,7 @@ pub fn check() !void {
     try @import("gsp_copy_test.zig").check();
     try checkGraphics();
     try checkGraphicsContexts();
+    try checkNativeEngines();
     var config: wire.Config = .{ .context = .{ .epoch = 7, .client = 0xc1d00000, .device = 0x10000000, .subdevice = 0x10000001,
         .vaspace = 0x10000006, .group = 0x10000009, .share = 0x1000000a }, .handle = 0x1000000d, .rm_engine = 19, .runqueue = 0,
         .address = 0x600000, .instance = 0x10000000, .userd = 0x20000000, .methods = 0x30000000, .method_bytes = 0x6000 };
@@ -102,6 +103,44 @@ fn checkGraphicsContexts() !void {
     try t.expectError(error.Bounds, gr.Plan.decode(&malformed));
     std.mem.writeInt(u32, malformed[0..4], 0, .little);
     try t.expectError(error.Unsupported, gr.Plan.decode(&malformed));
+}
+
+pub fn checkNativeEngines() !void {
+    var config: wire.Config = .{ .context = .{ .epoch = 7, .client = 1, .device = 2, .subdevice = 3,
+        .vaspace = 4, .group = 5, .share = 6 }, .handle = 7, .rm_engine = 1, .runqueue = 0,
+        .address = 0x50000000, .instance = 0x10000000, .userd = 0x8000004000, .methods = 0x30000000,
+        .method_bytes = 0x6000, .system_userd = true, .engine = .graphics, .object_handle = 8, .object_class = 0xc797,
+        .engine_mask = 7, .compute_handle = 9, .compute_class = 0xc7c0, .copy_handle = 10, .copy_class = 0xc7b5, .copy_rm_engine = 20 };
+    var request: [wire.max_bytes]u8 = undefined;
+    var reply: [wire.max_bytes]u8 = undefined;
+    for ([_]wire.Operation{.allocate_compute,.allocate_gr_copy,.free_gr_copy,.free_compute}) |op| {
+        const data = try wire.encode(config,op,&request);
+        @memcpy(reply[0..data.len],data);
+        var record: message.Record = .{ .shape = .{ .message_bytes = data.len+80, .checksum_bytes = data.len+80, .storage_bytes = 4096, .elements = 1 },
+            .queue_sequence = 0, .rpc = .{ .function = wire.function(op), .result = 0 }, .payload = reply[0..data.len] };
+        try t.expect((try wire.decode(config,op,data,record)) == .ok);
+        reply[8] ^= 1;
+        try t.expectError(error.Unexpected,wire.decode(config,op,data,record));
+        reply[8] ^= 1;
+        if (op == .allocate_gr_copy) {
+            try t.expect(wire.word(data,36) == 0x35);
+            reply[36] ^= 1;
+            try t.expectError(error.Payload,wire.decode(config,op,data,record));
+            reply[36] ^= 1;
+            record.payload = reply[0..32];
+            try t.expectError(error.Payload,wire.decode(config,op,data,record));
+        }
+        std.mem.writeInt(u32,reply[if (wire.function(op) == 103) @as(usize,16) else 12..][0..4],0x51,.little);
+        try t.expect((try wire.decode(config,op,data,record)).rejected == 0x51);
+    }
+    config.copy_handle = config.compute_handle;
+    try t.expectError(error.Handle,wire.encode(config,.allocate_compute,&request));
+    config.copy_handle = 10;
+    config.engine_mask = 6;
+    try t.expectError(error.Unsupported,wire.encode(config,.allocate_compute,&request));
+    config.engine_mask = 7;
+    config.compute_class = 0xc9c0;
+    try t.expectError(error.Unsupported,wire.encode(config,.allocate_compute,&request));
 }
 
 fn checkGraphics() !void {

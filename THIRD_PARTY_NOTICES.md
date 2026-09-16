@@ -1,5 +1,14 @@
 ﻿# Third-Party Notices
 
+Combined native engine objects (0.79.35, NVIDIA 0.1.136): topology fields,
+class IDs and RM allocation layouts use the already attributed NVIDIA570.144
+MIT definitions. Engine/runlist grouping and parameter-free GR allocation
+follow Nouveau MIT rm/r535/fifo.c (Copyright2023 Red Hat Inc.) and rm/engine.c
+(Copyright2025 NVIDIA CORPORATION); Mesa's pinned queue engine selection is
+reference material. No additional upstream implementation is linked. Complete
+originals and hashes: GFX/0.79.35/Evidence/NativeEngines. R4OS scheduling,
+ownership and failure handling remain original Apache-2.0 code.
+
 Native pushbuffer preparation (0.79.35, NVIDIA 0.1.132):
 C56F field definitions and WFI/system-memory-barrier ordering use the already
 attributed MIT NVIDIA 570.144 headers and host HAL. No additional upstream C

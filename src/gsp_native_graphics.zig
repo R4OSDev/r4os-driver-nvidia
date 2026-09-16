@@ -52,6 +52,7 @@ pub const Owner = struct {
     reason: ?anyerror = null,
     rm_status: ?u32 = null,
     method_bytes: u32 = 0,
+    engine_mask: u32 = @import("r4nv_binding").native_engine_graphics,
 
     pub fn request(self: *Owner) !void {
         if (self.self_address != 0) return error.State;
@@ -61,11 +62,15 @@ pub const Owner = struct {
     /// The device's golden owner outlives startup; the RM context acquires an
     /// independent global-storage loan before allocating its channel.
     pub fn requestRegular(self: *Owner, source: *const Owner) !void {
+        return self.requestEngines(source, @import("r4nv_binding").native_engine_graphics);
+    }
+    pub fn requestEngines(self: *Owner, source: *const Owner, engine_mask: u32) !void {
+        if (!@import("gsp_fifo_wire.zig").validGraphicsEngines(engine_mask)) return error.Unsupported;
         if (self.self_address != 0 or source.self_address != @intFromPtr(source) or
             source.phase != .ready or source.closing or source.golden_borrowed or
             source.golden_context == null or source.epoch == 0) return error.State;
         self.* = .{ .self_address = @intFromPtr(self), .phase = .waiting, .regular = true,
-            .golden_context = source.golden_context, .golden_borrowed = true, .epoch = source.epoch };
+            .golden_context = source.golden_context, .golden_borrowed = true, .epoch = source.epoch, .engine_mask = engine_mask };
     }
     /// Request only: an outstanding RM operation or GPU barrier must finish
     /// before its physical owners can be retired. Repeated requests are inert.
@@ -196,7 +201,7 @@ pub const Owner = struct {
                 self.next(self.after_storage);
             },
             .channel_start => {
-                self.channel = try run.createGraphicsChannel(self.context.?, 0, self.storage.?, self.phase_deadline);
+                self.channel = try run.createNativeGraphicsChannel(self.context.?, 0, self.storage.?, self.engine_mask, self.phase_deadline);
                 self.retireStorage(.channel_wait);
             },
             .channel_wait => {
@@ -207,7 +212,7 @@ pub const Owner = struct {
                     self.reason = error.Unsupported; self.rm_status = status.rejected;
                     self.next(.channel_close); return true;
                 };
-                if (info.config.engine != .graphics or info.config.object_class != try run.graphicsClass()) return error.Descriptor;
+                if (info.config.engine != .graphics or info.config.object_class != try run.graphicsClass() or info.config.engine_mask != self.engine_mask) return error.Descriptor;
                 self.next(if (self.regular) .probe_start else .channel_close);
             },
             .probe_start => {

@@ -3071,9 +3071,12 @@ pub const Owner = struct {
         return self.createChannel(context_handle, runqueue, instance, null, .graphics, deadline);
     }
     fn createChannel(self: *Owner, context_handle: ContextHandle, runqueue: u8, instance: BufferHandle, userd: ?BufferHandle, engine: execution_fifo.wire.Engine, deadline: u64) !ChannelHandle {
-        return self.openChannel(context_handle, runqueue, instance, userd, engine, deadline) catch |err| { self.hostRejection(.channel, err); return err; };
+        return self.openChannel(context_handle, runqueue, instance, userd, engine, @import("r4nv_binding").native_engine_graphics, deadline) catch |err| { self.hostRejection(.channel, err); return err; };
     }
-    fn openChannel(self: *Owner, context_handle: ContextHandle, runqueue: u8, instance: BufferHandle, userd: ?BufferHandle, engine: execution_fifo.wire.Engine, deadline: u64) !ChannelHandle {
+    pub fn createNativeGraphicsChannel(self: *Owner, context_handle: ContextHandle, runqueue: u8, instance: BufferHandle, engine_mask: u32, deadline: u64) !ChannelHandle {
+        return self.openChannel(context_handle, runqueue, instance, null, .graphics, engine_mask, deadline) catch |err| { self.hostRejection(.channel, err); return err; };
+    }
+    fn openChannel(self: *Owner, context_handle: ContextHandle, runqueue: u8, instance: BufferHandle, userd: ?BufferHandle, engine: execution_fifo.wire.Engine, engine_mask: u32, deadline: u64) !ChannelHandle {
         _ = try self.now();
         if (self.graph_closing or self.fifo_active != null or self.context_active != null or self.virtuals.active_range != null or self.native_active != null or self.buffer_active != null or self.sequence.self_address != 0 or self.outputs.active()) return error.Busy;
         _ = self.nativeAddressSpace() orelse return error.State;
@@ -3104,7 +3107,7 @@ pub const Owner = struct {
         if (result != r4os.abi.driver_heap_ok) return error.Memory;
         const owner: *execution_fifo.Owner = @ptrFromInt(allocation.cpu_address); owner.* = .{};
         var token = try self.channel.?.handoff(deadline);
-        owner.open(&token, &self.ctx.?, self.adapter_id, self.graph.?.reservation, parent, runqueue, inst, usr, engine, deadline) catch |err| {
+        owner.openEngines(&token, &self.ctx.?, self.adapter_id, self.graph.?.reservation, parent, runqueue, inst, usr, engine, engine_mask, deadline) catch |err| {
             if (owner.failure != null) {
                 retained = true; slot.owner = owner; slot.serial = serial; self.buffer_serial = serial;
                 self.stop(err); return err;
@@ -3463,7 +3466,7 @@ pub const Owner = struct {
         if (self.copy_backend) |backend| if (backend.channel) |channel| if (std.meta.eql(channel, handle)) return error.Busy;
         if (self.presentation) |entry| if (std.meta.eql(entry.channel_handle, handle)) return error.Busy;
         const owner = try self.findChannel(handle);
-        if (self.copyBusy() or (self.hasQueuedWork() and !self.native_queues.retiring(handle))) return error.Busy;
+        if (self.copyBusy() or (self.hasQueuedWork() and !owner.allocationReleased() and !self.native_queues.retiring(handle))) return error.Busy;
         if (self.fifo_active != null or self.context_active != null or self.virtuals.active_range != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or
             self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         var token = try self.channel.?.handoff(deadline);

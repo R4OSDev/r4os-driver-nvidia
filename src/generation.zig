@@ -18,6 +18,9 @@ pub const Profile = struct {
     sm: u16,
     status: Status,
     restriction: []const u8,
+    pub fn computeClass(self: *const Profile) u32 {
+        return switch (self.sm) { 86 => 0xc7c0, 89 => 0xc9c0, else => 0 };
+    }
 };
 fn display(root: u32, window: u32) Display {
     return .{ .root = root | 0x70, .core = root | 0x7d, .window = window | 0x7e,
