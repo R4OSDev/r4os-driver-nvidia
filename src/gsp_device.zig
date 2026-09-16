@@ -704,7 +704,7 @@ pub const Device = struct {
         return .{ .context = self, .generation = generation, .admit = admit, .access = access,
             .retain = retain, .quiesced = quiesced, .log_polling = polling,
             .admit_firmware = admitFirmware, .admit_cold = admitCold, .queue_memory = self.memory,
-            .admit_runtime = admitRuntime, .admit_command = admitCommand, .admit_copy = admitCopy, .admit_graphics = admitGraphics,
+            .admit_runtime = admitRuntime, .admit_command = admitCommand, .admit_copy = admitCopy, .admit_graphics = admitGraphics, .admit_batch = admitBatch,
             .admit_display_retirement = admitDisplayRetirement,
             .admit_display_push = admitDisplayPush,
             .wake_work = wakeWork,
@@ -868,12 +868,35 @@ pub const Device = struct {
             run.self_address != @intFromPtr(run) or run.failure != null or run.sequence.self_address != 0 or run.graph_closing or run.power_active or
             run.fifo_active != null or run.context_active != null or run.virtuals.active_range != null or run.native_active != null or run.buffer_active != null or
             run.outputs.active() or run.display_engine_active or run.display_channel_active != null or run.mode_control_active or
-            run.copy_job != null or run.display_upload_job != null or run.initial_image != null or run.cursor_upload != null or
+            run.batch_work != null or run.copy_job != null or run.display_upload_job != null or run.initial_image != null or run.cursor_upload != null or
             run.display_work != null or run.audio_work != null or run.graphics_upload != null) return error.State;
         const work = if (run.graphics_work) |*value| value else return error.Binding;
         try run.validateGraphicsWork();
         if (work.submitted or work.receipt != null or work.ticket == null or !std.meta.eql(work.ticket.?, ticket) or
             work.deadline != deadline or !fifo.matchesGraphics(ticket, work.command)) return error.Binding;
+        const handle = work.channel_handle;
+        if (handle.epoch != self.epoch or handle.slot >= run.fifos.len or run.fifos[handle.slot].owner != fifo or
+            run.fifos[handle.slot].serial != handle.serial or ticket.epoch != self.epoch) return error.Binding;
+        const rpc = run.activeChannel() orelse return error.State;
+        if (rpc.session != &self.session.? or port.runtime_session != rpc.session or rpc.session.pending != null or
+            rpc.phase != .idle or rpc.pending != null or rpc.in_lockdown) return error.Binding;
+        try rpc.guard(deadline);
+    }
+    fn admitBatch(raw: *anyopaque, port: *const native.Port, fifo: *@import("gsp_fifo.zig").Owner, ticket: @import("gsp_push_ring.zig").Ticket, deadline: u64) !void {
+        const self = from(raw);
+        try self.checkLive(false);
+        const run = &self.running;
+        if (self.phase != .ready or port != &self.port or port.phase != .runtime or self.session == null or self.inLockdown() or
+            run.self_address != @intFromPtr(run) or run.failure != null or run.sequence.self_address != 0 or run.graph_closing or run.power_active or
+            run.fifo_active != null or run.context_active != null or run.virtuals.active_range != null or run.native_active != null or run.buffer_active != null or
+            run.outputs.active() or run.display_engine_active or run.display_channel_active != null or run.mode_control_active or
+            run.copy_job != null or run.queued_render != null or run.display_upload_job != null or run.initial_image != null or run.cursor_upload != null or
+            run.display_work != null or run.audio_work != null or run.monitor_work != null or run.sor_work != null or
+            run.graphics_work != null or run.graphics_upload != null) return error.State;
+        const work = if (run.batch_work) |*value| value else return error.Binding;
+        try run.validatePushBatch();
+        if (work.submitted or work.receipt != null or work.ticket == null or !std.meta.eql(work.ticket.?, ticket) or
+            work.deadline != deadline or !fifo.matchesBatch(ticket, try work.resources.commands())) return error.Binding;
         const handle = work.channel_handle;
         if (handle.epoch != self.epoch or handle.slot >= run.fifos.len or run.fifos[handle.slot].owner != fifo or
             run.fifos[handle.slot].serial != handle.serial or ticket.epoch != self.epoch) return error.Binding;
@@ -888,7 +911,7 @@ pub const Device = struct {
         if (self.phase != .ready or port != &self.port or port.phase != .runtime or self.session == null or self.inLockdown() or
             self.running.self_address != @intFromPtr(&self.running) or self.running.failure != null or self.running.sequence.self_address != 0 or
             self.running.fifo_active != null or self.running.context_active != null or self.running.virtuals.active_range != null or self.running.native_active != null or self.running.buffer_active != null or
-            self.running.outputs.active() or self.running.graph_closing or self.running.power_active or self.running.display_engine_active or self.running.display_channel_active != null or self.running.display_work != null or self.running.mode_control_active or self.running.graphics_work != null) return error.State;
+            self.running.batch_work != null or self.running.outputs.active() or self.running.graph_closing or self.running.power_active or self.running.display_engine_active or self.running.display_channel_active != null or self.running.display_work != null or self.running.mode_control_active or self.running.graphics_work != null) return error.State;
         self.running.validateCopyOverlap() catch return error.Binding;
         const channel_handle = if (self.running.graphics_upload) |*work| blk: {
             const run = &self.running;

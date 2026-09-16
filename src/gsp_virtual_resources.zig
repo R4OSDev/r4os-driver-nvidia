@@ -26,7 +26,9 @@ pub const Binding = struct {
     stamp: a.DriverHeapAllocation = .{},
     value: range.Binding = .{},
     retiring: bool = false,
+    executions: usize = 0,
 };
+pub const ExecutionUse = struct { handle: BindingHandle, mapping: range.wire.Mapping };
 pub const Completion = struct { range: Handle, binding: ?BindingHandle, rejected: ?u32, retired: bool };
 pub const Owner = struct {
     self_address: usize = 0,
@@ -127,6 +129,31 @@ pub const Owner = struct {
             entry.allocation.cpu_address != @intFromPtr(entry)) return error.Descriptor;
         return entry;
     }
+    pub fn executionView(self: *Owner, handle: BindingHandle) Error!ExecutionUse {
+        const parent = try self.find(handle.range);
+        const entry = try self.findBinding(handle);
+        if (parent.retiring or entry.retiring or self.active_range == parent) return error.Busy;
+        const value = if (parent.value) |*v| v else return error.State;
+        return .{ .handle = handle, .mapping = try value.executionMapping(&entry.value) };
+    }
+    pub fn acquireExecution(self: *Owner, handle: BindingHandle) Error!ExecutionUse {
+        const use = try self.executionView(handle);
+        const entry = try self.findBinding(handle);
+        entry.executions = std.math.add(usize, entry.executions, 1) catch return error.Exhausted;
+        return use;
+    }
+    pub fn validateExecution(self: *Owner, use: ExecutionUse) Error!void {
+        if ((try self.findBinding(use.handle)).executions == 0 or
+            !std.meta.eql(use, try self.executionView(use.handle))) return error.Stale;
+    }
+    /// Only the work owner may call this after completion, before submission,
+    /// or with its device-reset proof. No session/firmware access on reset.
+    pub fn releaseExecution(self: *Owner, use: ExecutionUse) Error!void {
+        const entry = try self.findBinding(use.handle);
+        if (entry.executions == 0 or !std.meta.eql(entry.value.mapping, @as(?range.wire.Mapping, use.mapping)) or
+            !std.meta.eql(entry.value.mapping, entry.value.stamp)) return error.Retained;
+        entry.executions -= 1;
+    }
     pub fn first(self: *Owner) Error!?Handle {
         if (self.self_address == 0) return null;
         try self.stable();
@@ -173,7 +200,7 @@ pub const Owner = struct {
     pub fn discardBinding(self: *Owner, handle: BindingHandle) Error!void {
         const parent = try self.find(handle.range);
         const entry = try self.findBinding(handle);
-        if (self.active_binding == entry or entry.value.owner != null or entry.value.mapped or entry.value.source.mapping_owner != null) return error.Busy;
+        if (entry.executions != 0 or self.active_binding == entry or entry.value.owner != null or entry.value.mapped or entry.value.source.mapping_owner != null) return error.Busy;
         if (entry.value.source.self_address != 0) entry.value.source.close(true) catch |err| return self.fail(err);
         try self.removeBinding(parent, entry);
     }
@@ -189,7 +216,7 @@ pub const Owner = struct {
     pub fn beginUnmap(self: *Owner, token: *boot.Handoff, handle: BindingHandle, deadline: u64, quiesced: bool) Error!void {
         const parent = try self.find(handle.range);
         const entry = try self.findBinding(handle);
-        if (self.active_range != null or parent.retiring or entry.retiring) return error.Busy;
+        if (entry.executions != 0 or self.active_range != null or parent.retiring or entry.retiring) return error.Busy;
         const value = if (parent.value) |*v| v else return error.State;
         try value.beginUnmap(token, &entry.value, deadline, quiesced);
         entry.retiring = true;
@@ -238,7 +265,7 @@ pub const Owner = struct {
         return result;
     }
     fn removeBinding(self: *Owner, parent: *Range, entry: *Binding) Error!void {
-        if (entry.value.owner != null or entry.value.source.self_address != 0 or entry.value.mapped or
+        if (entry.executions != 0 or entry.value.owner != null or entry.value.source.self_address != 0 or entry.value.mapped or
             !std.meta.eql(entry.allocation, entry.stamp) or !validAllocation(Binding, entry.allocation)) return self.fail(error.Retained);
         const allocation = entry.allocation;
         var place = parent.bindings.getEntryForExisting(&entry.index);
@@ -270,6 +297,11 @@ pub const Owner = struct {
         if (!std.meta.eql(entry.allocation, entry.stamp) or !validAllocation(Range, entry.allocation) or
             entry.allocation.cpu_address != @intFromPtr(entry)) return error.Retained;
         const value = if (entry.value) |*v| v else return error.Retained;
+        var uses = entry.bindings.inorderIterator();
+        while (uses.next()) |binding_node| {
+            const binding: *Binding = @fieldParentPtr("index", binding_node);
+            if (binding.executions != 0) return error.Retained;
+        }
         if (!try value.closeAfterReset(proof)) return false;
         if (entry.bindings.getMin()) |child_node| {
             const child: *Binding = @fieldParentPtr("index", child_node);

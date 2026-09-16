@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.132; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.133; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -45,17 +45,18 @@ The existing `unit-test` step accepts
 lifecycle group, including the no-output case. It is a host firmware/GPU model,
 not hardware qualification. OssiGPU.txt /35 lists the physical follow-up.
 
-Native pushbuffer preparation (0.79.35): `gsp_push_batch` and the existing
-FIFO/ring owner encode external subroutine entries with SYNC_WAIT/no-prefetch,
-up to 510 pushes per atomic publication. Incomplete method chains stay together;
-the final entry must be complete. A private suffix performs WFI_ALL, SYS_MEMBAR
-and a 32-bit semaphore release. Invalid lists change no DMA-visible bytes.
-The producer drains before switching to a batch and blocks reuse until its
-completion word advances; GP_GET cannot release it. Independent original-header
-vectors, wrap, corruption, empty batches and later ordinary CE use are covered
-by the existing lifecycle case. This is private transport preparation only:
-public submit, authenticated Device doorbell admission, retained VA/BO job
-ownership and NVK context wiring remain open. No new queue operation is exposed.
+Native pushbuffer execution (0.79.35): the private runtime now owns a copied
+external push list and counted references to acknowledged VA bindings, including
+pushes across adjacent mappings. Unmap cannot retire borrowed bindings. The
+Device admits only the exact live work/channel/ticket, rechecks mappings and
+resident ring entries, and publishes through the existing USERD/doorbell owner.
+GP_GET never releases resources; the private WFI_ALL/SYS_MEMBAR/semaphore does.
+Timeout/stop retains the batch until the actual device-reset proof. The existing
+complete-run case covers the real Runtime/Device path with modeled GPU/MMIO,
+plus rejected map gaps, array snapshots, empty batches and subsequent CE work.
+This serialized private producer is not a public raw queue or NVK execution
+context. Canonical common-queue BO execution leases, public submit admission,
+native NVK sync/queues and pipelined submission remain open software work.
 
 Generations and adapters (0.79.33): native software now covers GA102/103/104/106/107
 and AD102/103/104/106/107. Each measured chip selects its own firmware family,

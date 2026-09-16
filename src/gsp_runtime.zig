@@ -173,6 +173,15 @@ pub const GraphicsWork = struct {
     resources: render_job.Owner = .{},
     queued: bool = false,
 };
+pub const batch_job = @import("gsp_batch_job.zig");
+pub const BatchWork = struct {
+    channel_handle: ChannelHandle,
+    deadline: u64,
+    resources: batch_job.Owner = .{},
+    ticket: ?execution_fifo.copy.Ticket = null,
+    submitted: bool = false,
+    receipt: ?GraphicsReceipt = null,
+};
 const ChannelSlot = struct { owner: ?*execution_fifo.Owner = null, allocation: r4os.abi.DriverHeapAllocation = .{}, heap: ?r4os.r4dev.DriverHeapContext = null, serial: u64 = 0 };
 const CopyAddress = struct { address: u64, bytes: u64 };
 pub const present = @import("gsp_present.zig");
@@ -365,6 +374,7 @@ pub const Owner = struct {
     active_work: ?usize = null,
     copy_job: ?*CopyJob = null,
     graphics_work: ?GraphicsWork = null,
+    batch_work: ?BatchWork = null,
     graphics_cache: render_cache.Owner = .{},
     queued_render: ?*render_queue.Owner = null,
     graphics_channel: ?ChannelHandle = null,
@@ -480,6 +490,7 @@ pub const Owner = struct {
                 self.reset_stage = .transfers;
             },
             .transfers => {
+                if (self.batch_work) |*work| { if (!work.resources.closeAfterReset(proof)) return error.Retained; self.batch_work = null; }
                 if (self.graphics_upload) |*work| { if (!work.operation.closeAfterReset(proof)) return error.Retained; self.graphics_upload = null; }
                 if (self.graphics_work) |*work| { if (!work.resources.closeAfterReset(proof)) return error.Retained; self.graphics_work = null; }
                 if (self.display_upload_job) |*work| { if (!work.operation.closeAfterReset(proof)) return error.Retained; self.display_upload_job = null; }
@@ -628,7 +639,7 @@ pub const Owner = struct {
         if (self.graphics_work != null or self.graphics_upload != null) return .render;
         if (self.display_work != null or self.hasDisplayFlips() or
             self.cursor_upload != null or self.cursor_point != null) return .display_channel;
-        if (self.copy_job != null or self.display_upload_job != null or self.initial_image != null) return .submit;
+        if (self.batch_work != null or self.copy_job != null or self.display_upload_job != null or self.initial_image != null) return .submit;
         if (self.queued_render != null) return .render;
         return if (self.graph_closing) .teardown else .event;
     }
@@ -651,6 +662,7 @@ pub const Owner = struct {
         self.memory_inventory.invalidate();
         if (self.graphics_cache.self_address != 0) self.graphics_cache.failed = true;
         if (self.graphics_upload) |*work| work.operation.failed = true;
+        if (self.batch_work) |*work| work.resources.failed = true;
         if (self.graphics_work) |*work| if (work.resources.self_address != 0) { work.resources.failed = true; };
         if (self.display_upload_job) |*work| work.operation.quarantine(err);
         if (self.cursor_upload) |*work| work.operation.quarantine(err);
@@ -2606,7 +2618,7 @@ pub const Owner = struct {
         self.log("NVIDIA gsp-present-image: retired={d} shadow=unmapped,import-released scanout=retained", .{dma});
         return true;
     }
-    fn executionWorkBusy(self: *const Owner) bool { return self.power_active or self.graphics_upload != null or self.graphics_work != null or self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.initial_image != null or self.mode_control_active or self.cursor_upload != null or self.audio_work != null or self.monitor_work != null or self.sor_work != null; }
+    fn executionWorkBusy(self: *const Owner) bool { return self.batch_work != null or self.power_active or self.graphics_upload != null or self.graphics_work != null or self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.initial_image != null or self.mode_control_active or self.cursor_upload != null or self.audio_work != null or self.monitor_work != null or self.sor_work != null; }
     fn engineWorkBusy(self: *const Owner) bool { return self.executionWorkBusy() or self.hasDisplayFlips(); }
     fn deviceWorkBusy(self: *const Owner) bool { return self.engineWorkBusy() or self.queued_render != null; }
     fn copyBusy(self: *const Owner) bool { return self.deviceWorkBusy() or self.frame_ready != null or (self.direct_work != null and !self.direct_step); }
@@ -2622,7 +2634,7 @@ pub const Owner = struct {
         return self.executionAdmissionBusy() or self.queued_render != null;
     }
     fn executionAdmissionBusy(self: *const Owner) bool {
-        return self.power_active or self.powerStopping() or self.direct_work != null or self.cursor_reserving or self.graphics_upload != null or self.graphics_work != null or self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.initial_image != null or self.cursor_upload != null or self.audio_work != null or self.monitor_work != null or self.sor_work != null or
+        return self.batch_work != null or self.power_active or self.powerStopping() or self.direct_work != null or self.cursor_reserving or self.graphics_upload != null or self.graphics_work != null or self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.initial_image != null or self.cursor_upload != null or self.audio_work != null or self.monitor_work != null or self.sor_work != null or
             self.mode_control_active or (self.hasDisplayFlips() and !self.overlapFlip());
     }
     pub fn cursorWorkAvailable(self: *Owner) bool {
@@ -3323,6 +3335,68 @@ pub const Owner = struct {
             self.sequence.self_address != 0 or self.channel.?.phase != .idle or self.channel.?.pending != null) return false;
         work.ticket = try fifo.prepareGraphics(work.command);
         try self.device.?.submitGraphics(fifo, work.ticket.?, work.deadline);
+        work.submitted = true;
+        return true;
+    }
+    /// Private native producer. The future common queue must also retain its
+    /// canonical BO execution leases. This owner retains acknowledged VA maps
+    /// and a metadata snapshot, never caller arrays or instruction shadows.
+    pub fn beginPushBatch(self: *Owner, handle: ChannelHandle, pushes: []const batch_job.batch.Push,
+        bindings: []const VirtualBindingHandle, deadline: u64) !void
+    {
+        const current = try self.now();
+        if (deadline <= current or deadline == std.math.maxInt(u64)) return error.Deadline;
+        if (self.executionAdmissionBusy() or self.queued_render != null or self.graph_closing or self.hasQueuedWork()) return error.Busy;
+        const fifo = try self.findChannel(handle);
+        const info = fifo.info() orelse return error.State;
+        if (info.config.engine == .none or fifo.state != .handed_off or !fifo.ring.idle() or
+            (info.config.graphics != null and info.config.graphics.?.golden)) return error.Unsupported;
+        const space = (self.nativeAddressSpace() orelse return error.State).*;
+        if (info.config.context.vaspace != space.handle) return error.Stale;
+        try self.channel.?.guard(deadline);
+        const heap = self.ctx.?.heap() orelse return error.Api;
+        self.batch_work = .{ .channel_handle = handle, .deadline = deadline };
+        self.batch_work.?.resources.open(heap, &self.virtuals, space, pushes, bindings) catch |err| {
+            if (self.batch_work.?.resources.self_address != 0) self.stop(err) else self.batch_work = null;
+            return err;
+        };
+    }
+    pub fn validatePushBatch(self: *Owner) !void {
+        const work = if (self.batch_work) |*value| value else return error.State;
+        const fifo = try self.findChannel(work.channel_handle);
+        if (work.resources.virtuals != &self.virtuals or work.resources.space.epoch != self.epoch or
+            work.resources.space.handle != fifo.config.context.vaspace or fifo.state != .handed_off or
+            fifo.config.engine == .none or (fifo.config.graphics != null and fifo.config.graphics.?.golden)) return error.Binding;
+        try work.resources.validate();
+    }
+    pub fn receivePushBatch(self: *Owner, handle: ChannelHandle) !?GraphicsReceipt {
+        _ = try self.findChannel(handle);
+        const work = if (self.batch_work) |*value| value else return error.State;
+        if (!std.meta.eql(handle, work.channel_handle)) return error.Stale;
+        const receipt = work.receipt orelse return null;
+        self.batch_work = null;
+        return receipt;
+    }
+    fn advancePushBatch(self: *Owner, current: u64) !bool {
+        const work = if (self.batch_work) |*value| value else return false;
+        if (work.receipt != null) return false;
+        const fifo = try self.findChannel(work.channel_handle);
+        if (work.submitted) {
+            if (try fifo.ring.poll() >= work.ticket.?.point) {
+                if (!work.resources.close(true)) return error.Retained;
+                work.receipt = .{ .channel = work.channel_handle, .point = work.ticket.?.point, .completed_ns = current };
+                return true;
+            }
+            if (current >= work.deadline) return error.Deadline;
+            return false;
+        }
+        try self.validatePushBatch();
+        if (current >= work.deadline) return error.Deadline;
+        if (self.fifo_active != null or self.context_active != null or self.virtuals.active_range != null or self.native_active != null or self.buffer_active != null or
+            self.display_engine_active or self.display_channel_active != null or self.mode_control_active or self.outputs.active() or
+            self.sequence.self_address != 0 or self.channel.?.phase != .idle or self.channel.?.pending != null) return false;
+        work.ticket = try fifo.prepareBatch(try work.resources.commands());
+        try self.device.?.submitBatch(fifo, work.ticket.?, work.deadline);
         work.submitted = true;
         return true;
     }
@@ -5546,6 +5620,7 @@ pub const Owner = struct {
         if (try self.advanceCursorPoint(current)) return .progress;
         if (try self.advanceCopy(current)) return .progress;
         if (try self.advanceGraphics(current)) return .progress;
+        if (try self.advancePushBatch(current)) return .progress;
         if (self.queued_render) |queued| {
             if (queued.phase == .done) { try self.releaseWork(); return .progress; }
             if (try queued.step(self, current)) return .progress;
@@ -5836,7 +5911,7 @@ pub const Owner = struct {
         var published = false;
         for (&self.presentation_slots) |*slot| if (slot.*) |*image| if (image.registered) { published = true; };
         var result: power.policy.Activity = .{
-            .copy = self.copy_job != null,
+            .copy = self.copy_job != null or self.batch_work != null,
             .render = self.queued_render != null or (if (self.graphics_work) |*work| work.queued else false),
             .display_commit = published and (self.display_work != null or self.hasDisplayFlips()),
             .cursor = published and (self.cursor_upload != null or self.cursor_point != null),

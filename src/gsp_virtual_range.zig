@@ -105,6 +105,14 @@ pub const Owner = struct {
             map.memory_bytes != source.allocation_bytes or map.memory_offset != source.offset or
             map.bytes != source.bytes or map.location != source.location) return error.Stale;
     }
+    /// Immutable execution view of an acknowledged mapping. The resident
+    /// resource owner separately prevents unmap while this view is borrowed.
+    pub fn executionMapping(self: *const Owner, binding: *const Binding) Error!wire.Mapping {
+        if (self.info() == null or self.state != .handed_off or !binding.mapped or binding.rejected != null) return error.State;
+        try self.validateBinding(binding);
+        try binding.mapping.?.validate();
+        return binding.mapping.?;
+    }
     fn reclaim(self: *Owner, token: *boot.Handoff, deadline: u64) Error!void {
         try self.stable();
         if (self.info() == null or self.state != .handed_off or token.session != self.exchange.session) return error.State;

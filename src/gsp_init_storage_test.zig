@@ -1652,7 +1652,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         IrqModel.reset();
         target.irq_wake = .{ .context = @intFromPtr(target), .signal = IrqModel.wake };
         const reset_case = case == .gpu_reset_success or case == .gpu_reset_gfw_timeout;
-        const reset_capable = reset_case or case == .context_native_reset or case == .context_native_console or case == .mapping_provider_reset;
+        const reset_capable = reset_case or case == .context_native_reset or case == .context_native_console or case == .context_native_headless or case == .mapping_provider_reset;
         capture.snapshot.?.caps.pcie = if (reset_capable) 0x78 else 0;
         capture.snapshot.?.caps.power_state = if (reset_capable) 0 else null;
         capture.snapshot.?.caps.msi = if (case == .irq_intx) 0 else 0x68;
@@ -2233,11 +2233,12 @@ fn checkDeviceReset(target: *@import("gsp_device.zig").Device, words: []u32, frt
     try t.expect(target.reset_config.valid() and target.reset_config_failure == null);
     const old_epoch = target.epoch;
     // The same logical stop used by failed submissions; Device must preserve
-    // its Timeout cause instead of replacing it with a subsequent State error.
+    // its first cause instead of replacing it with a subsequent State error.
+    const reason = target.running.failure orelse error.Timeout;
     target.running.stop(error.Timeout);
     _ = target.step();
     try t.expect(target.phase == .recovering and target.failure != null and
-        target.failure.? == (if (target.reset_to_console) error.ConsoleRestore else error.Timeout) and target.failed_phase == .ready);
+        target.failure.? == (if (target.reset_to_console) error.ConsoleRestore else reason) and target.failed_phase == .ready);
     var count: usize = 0;
     while (target.phase != .failed and target.phase != .retiring and count < 4000) : (count += 1) {
         clock += std.time.ns_per_ms;
@@ -6833,6 +6834,7 @@ fn checkNativeHeadless(target: *@import("gsp_device.zig").Device) !void {
     try t.expectError(error.Busy, run.beginDestroyGraph(clock + std.time.ns_per_s, true));
     const fifo = run.fifos[handle.slot].owner.?;
     try checkNativeBatchRing(fifo);
+    const batch_mapping = try checkNativeBatchExecution(target, handle);
     const raw: [*]const u8 = @ptrFromInt(target.port.window.cpu_address);
     const mmio = raw[0..@intCast(target.port.window.byte_length)];
     copy.enqueueRows(null, null, 17, 31, 64, 3, 80, 96);
@@ -6888,9 +6890,108 @@ fn checkNativeHeadless(target: *@import("gsp_device.zig").Device) !void {
             run.outputs.data.topology.rejected,run.outputs.data.final_rejection,@tagName(run.activeChannel().?.phase),run.power_active,run.context_active,run.fifo_active,run.native_active});
     try t.expect(resumed);
     try t.expect(target.native_output.phase == .mode_create and run.copy_backend.?.operations == 9 and NativeCommon.commits == 0);
-    _ = target.stop();
+    // An execution timeout retains the mapped BO and all batch metadata.
+    // Only the existing whole-device reset owner may release these holds.
+    const batch_end = clock + std.time.ns_per_s;
+    try run.beginPushBatch(handle, &.{.{ .address = 0x94000000, .bytes = 4 }}, &.{batch_mapping}, batch_end);
+    for (0..8) |_| { _ = try run.step(); if (run.batch_work.?.submitted) break; }
+    try t.expect(run.batch_work.?.submitted and (try run.virtuals.findBinding(batch_mapping)).executions == 1);
+    const unproven: @import("gsp_reset.zig").Quiescence = .{ .owner = &target.gpu_reset, .epoch = run.epoch };
+    try t.expect(!run.batch_work.?.resources.close(false) and !run.batch_work.?.resources.closeAfterReset(unproven));
+    clock = batch_end + 1;
+    try t.expectError(error.Deadline, run.step());
     stage = 7;
-    try t.expect(copy.lost and copy.unregisters == 1 and run.failure.? == error.Stopped);
+    try t.expect(copy.lost and copy.unregisters == 1 and run.failure.? == error.Deadline and
+        run.batch_work != null and (try run.virtuals.findBinding(batch_mapping)).executions == 1);
+    try t.expect(!run.batch_work.?.resources.close(true) and !run.batch_work.?.resources.closeAfterReset(unproven));
+    stage = 8;
+    try checkDeviceReset(target, ResetDeviceModel.words, target.vram.?.plan.?.frts.offset, false);
+    const proof = target.gpu_reset.quiescence() orelse return error.NoResetProof;
+    try t.expect(run.batch_work != null and (try run.virtuals.findBinding(batch_mapping)).executions == 1);
+    const sent = target.session.?.tx_sequence;
+    stage = 9;
+    var cleanup: usize = 0;
+    while (!try run.closeAfterReset(proof)) : (cleanup += 1) try t.expect(cleanup < 500);
+    try t.expect(run.batch_work == null and run.virtuals.ranges.root == null and target.session.?.tx_sequence == sent);
+}
+
+fn checkNativeBatchExecution(target: *@import("gsp_device.zig").Device,
+    handle: @import("gsp_runtime.zig").ChannelHandle) !@import("gsp_runtime.zig").VirtualBindingHandle
+{
+    const run = &target.running;
+    const end = clock + 5 * std.time.ns_per_s;
+    var sources: [2]@import("gsp_runtime.zig").BufferHandle = undefined;
+    for (&sources) |*source| {
+        source.* = try run.allocateNativeBuffer(4096, end);
+        for (0..64) |_| {
+            _ = target.step(); try t.expect(target.phase == .ready);
+            if (run.activeChannel().?.phase == .waiting) try replyNativeProduct(target);
+            if (run.native_active == null) break;
+        }
+        try t.expect(run.native_active == null);
+    }
+    const range = try run.allocateVirtualRange(.{ .bytes = 16384, .fixed_address = 0x94000000 }, end);
+    try finishVirtual(target, false);
+    const first = try run.mapVirtualBuffer(range, .{ .native = sources[0] }, 0, 0, 4096, end);
+    try finishVirtual(target, false);
+    const second = try run.mapVirtualBuffer(range, .{ .native = sources[1] }, 0, 4096, 4096, end);
+    try finishVirtual(target, false);
+    const first_owner = try run.virtuals.findBinding(first.handle);
+    const second_owner = try run.virtuals.findBinding(second.handle);
+    const fifo = run.fifos[handle.slot].owner.?;
+    const ring = &fifo.ring;
+    const bytes: [*]u8 = @ptrFromInt(ring.cpu.cpu_address);
+    const layout = @import("gsp_copy_wire.zig");
+    // Missing mapping, including the second half of a straddling push, must
+    // roll back every borrow without publishing USERD or poisoning runtime.
+    const before = ring.put;
+    var pushes = [_]@import("gsp_push_batch.zig").Push{
+        .{ .address = 0x94000ffc, .bytes = 8, .incomplete = true },
+        .{ .address = 0x94000000, .bytes = 4, .no_prefetch = true },
+    };
+    try t.expectError(error.Bounds, run.beginPushBatch(handle, &pushes, &.{first.handle}, end));
+    try t.expect(run.batch_work == null and first_owner.executions == 0 and ring.put == before and ring.pending == null);
+    var stale = first.handle; stale.serial += 1000;
+    try t.expectError(error.Stale, run.beginPushBatch(handle, &pushes, &.{stale}, end));
+    // The resource list is independent of the push count and may repeat a
+    // reference. Reverse order exercises coverage across adjacent mappings.
+    try run.beginPushBatch(handle, &pushes, &.{second.handle, first.handle, first.handle}, end);
+    try t.expect(first_owner.executions == 2 and second_owner.executions == 1);
+    pushes[0].address = 0; // The worker owns a snapshot, not these arrays.
+    try run.validatePushBatch();
+    try t.expectError(error.Busy, run.unmapVirtualBuffer(first.handle, end, true));
+    try t.expectError(error.Busy, run.beginPushBatch(handle, &.{}, &.{}, end));
+    for (0..16) |_| {
+        _ = target.step(); try t.expect(target.phase == .ready);
+        if (run.batch_work.?.submitted) break;
+    }
+    try t.expect(run.batch_work.?.submitted);
+    const ticket = run.batch_work.?.ticket.?;
+    const mmio: [*]const u8 = @ptrFromInt(target.port.window.cpu_address);
+    try t.expectEqual(ticket.token, std.mem.readInt(u32, mmio[layout.notify..][0..4], .little));
+    try t.expectEqual(ticket.put, std.mem.readInt(u32, bytes[layout.put_offset..][0..4], .little));
+    std.mem.writeInt(u32, bytes[layout.userd_offset+0x88..][0..4], ticket.put, .little);
+    _ = target.step();
+    try t.expect(try run.receivePushBatch(handle) == null and first_owner.executions == 2 and second_owner.executions == 1);
+    // Only this modeled physical release store lets the real runtime drop
+    // mappings and return its receipt. No public Vulkan execution is modeled.
+    std.mem.writeInt(u32, bytes[layout.completion_offset..][0..4], ticket.point, .little);
+    _ = target.step();
+    const receipt = (try run.receivePushBatch(handle)) orelse return error.NoReceipt;
+    try t.expect(receipt.point == ticket.point and first_owner.executions == 0 and second_owner.executions == 0 and ring.idle());
+    try run.unmapVirtualBuffer(second.handle, end, true);
+    try finishVirtual(target, false);
+    try t.expectError(error.Stale, run.virtualBindingStatus(second.handle));
+    // Empty native submissions still execute their real private fence suffix.
+    try run.beginPushBatch(handle, &.{}, &.{}, end);
+    for (0..8) |_| { _ = target.step(); if (run.batch_work.?.submitted) break; }
+    try t.expect(run.batch_work.?.submitted);
+    const empty = run.batch_work.?.ticket.?;
+    std.mem.writeInt(u32, bytes[layout.userd_offset+0x88..][0..4], empty.put, .little);
+    std.mem.writeInt(u32, bytes[layout.completion_offset..][0..4], empty.point, .little);
+    _ = target.step();
+    try t.expect((try run.receivePushBatch(handle)).?.point == empty.point);
+    return first.handle;
 }
 
 // Transport-only extension of the existing native lifecycle case. Actual
