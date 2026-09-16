@@ -18,7 +18,7 @@ pub const Model = struct {
     pub var segments: usize = 0;
     pub var scenario: []const u8 = "";
     const Allocation = struct { bytes: ?[]align(8) u8 = null, handle: u64 = 0 };
-    var allocations: [32]Allocation = @splat(.{}); // Golden + normal GR metadata owners coexist.
+    var allocations: [64]Allocation = @splat(.{}); // Renderer, CE and two application GR contexts coexist.
     var serial: u64 = 0;
     pub var allocation_fault: enum { none, empty, partial, descriptor } = .none;
     pub var release_fault: bool = false;

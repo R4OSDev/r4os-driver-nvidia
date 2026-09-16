@@ -161,6 +161,7 @@ pub const render = @import("r4nv_render");
 pub const render_cache = @import("gsp_render_cache.zig");
 const render_job = @import("gsp_render_job.zig");
 const render_queue = @import("gsp_render_queue.zig");
+const native_queue = @import("gsp_native_queue.zig");
 pub const scheduling = @import("gsp_work_scheduling.zig");
 pub const power = @import("gsp_power.zig");
 pub const GraphicsWork = struct {
@@ -177,6 +178,7 @@ pub const batch_job = @import("gsp_batch_job.zig");
 pub const BatchWork = struct {
     channel_handle: ChannelHandle,
     deadline: u64,
+    native_fence: ?r4os.abi.GfxFence = null,
     resources: batch_job.Owner = .{},
     ticket: ?execution_fifo.copy.Ticket = null,
     submitted: bool = false,
@@ -222,7 +224,7 @@ pub const CopyJob = struct {
     target_presentation: ?*Presentation = null,
     render_read: present.Initial = .{},
 };
-const WorkSlot = union(enum) { free, copy: CopyJob, render: render_queue.Owner };
+const WorkSlot = union(enum) { free, copy: CopyJob, render: render_queue.Owner, native: native_queue.Job };
 pub const execution_context = @import("gsp_context.zig");
 pub const ContextHandle = struct { epoch: u64, serial: u64, slot: u16 };
 pub const ContextStatus = struct { state: execution_context.State, info: ?execution_context.Info, rejected: ?u32, unavailable: ?execution_context.Unavailable };
@@ -377,6 +379,8 @@ pub const Owner = struct {
     batch_work: ?BatchWork = null,
     graphics_cache: render_cache.Owner = .{},
     queued_render: ?*render_queue.Owner = null,
+    queued_native: ?*native_queue.Job = null,
+    native_queues: native_queue.Owner = .{},
     graphics_channel: ?ChannelHandle = null,
     graphics_copy_channel: ?ChannelHandle = null,
     graphics_enabled: bool = false,
@@ -505,6 +509,7 @@ pub const Owner = struct {
                     switch (slot.*) {
                         .free => {},
                         .render => |*work| if (!work.closeAfterReset(proof, self.epoch)) return error.Retained,
+                        .native => |*work| if (!work.closeAfterReset(&self.native_queues, proof, self.epoch)) return error.Retained,
                         .copy => |*work| {
                             if (!std.meta.eql(work.job, work.job_stamp) or !work.render_read.closeAfterReset(proof)) return error.Retained;
                             for (&work.references) |*reference| if (reference.reference.id != 0) {
@@ -515,7 +520,7 @@ pub const Owner = struct {
                     }
                     slot.* = .free; self.reset_cursor += 1; return false;
                 }
-                self.copy_job = null; self.queued_render = null; self.active_work = null;
+                self.copy_job = null; self.queued_render = null; self.queued_native = null; self.active_work = null;
                 self.work_schedule = .{}; self.deferred_presentations = @splat(null);
                 self.reset_stage = .presentations; self.reset_cursor = 0;
             },
@@ -562,6 +567,7 @@ pub const Owner = struct {
                     self.reset_cursor += 1; return false;
                 }
                 for (&self.contexts) |*slot| if (slot.owner != null) { self.reset_cursor = 0; return false; };
+                if (!try self.native_queues.closeAfterReset(proof, self.epoch)) return false;
                 self.reset_stage = .control;
             },
             .control => {
@@ -639,7 +645,7 @@ pub const Owner = struct {
         if (self.graphics_work != null or self.graphics_upload != null) return .render;
         if (self.display_work != null or self.hasDisplayFlips() or
             self.cursor_upload != null or self.cursor_point != null) return .display_channel;
-        if (self.batch_work != null or self.copy_job != null or self.display_upload_job != null or self.initial_image != null) return .submit;
+        if (self.queued_native != null or self.batch_work != null or self.copy_job != null or self.display_upload_job != null or self.initial_image != null) return .submit;
         if (self.queued_render != null) return .render;
         return if (self.graph_closing) .teardown else .event;
     }
@@ -761,6 +767,7 @@ pub const Owner = struct {
                 }
             }
         }
+        if (self.queued_native) |work| record.active_fence = work.job.fence;
         if (self.queued_render) |work| {
             record.active_fence = work.job.fence;
             record.render_phase = switch (work.phase) {
@@ -832,6 +839,9 @@ pub const Owner = struct {
         var record = diagnostics.host(.render,err,false);
         record.kind = .graphics_command;
         try self.recordFault(record);
+    }
+    pub fn nativeRejection(self: *Owner, err: anyerror) !void {
+        try self.recordFault(diagnostics.host(.submit,err,false));
     }
     fn rejection(self: *Owner, operation: diagnostics.Operation, handle: u32, status: ?u32, host: ?anyerror) !void {
         if (status) |code| try self.recordFault(.{ .source = .rm, .kind = diagnostics.rmKind(code), .operation = operation, .rm_handle = handle, .code = code })
@@ -2334,6 +2344,8 @@ pub const Owner = struct {
         const backend = if (self.copy_backend) |*value| value else return -1;
         // Already under the serialized DriverWork owner. Pacing owns waits.
         backend.pending = true;
+        self.native_queues.wake();
+        if (self.queued_native) |work| work.waited = false;
         if (self.presentation) |entry| entry.pending = true;
         if (self.device.?.owner) |io| if (io.wake_work) |wake| wake(io.context);
         return 0;
@@ -2631,7 +2643,7 @@ pub const Owner = struct {
         return found;
     }
     fn copyAdmissionBusy(self: *const Owner) bool {
-        return self.executionAdmissionBusy() or self.queued_render != null;
+        return self.executionAdmissionBusy() or self.queued_render != null or self.queued_native != null;
     }
     fn executionAdmissionBusy(self: *const Owner) bool {
         return self.batch_work != null or self.power_active or self.powerStopping() or self.direct_work != null or self.cursor_reserving or self.graphics_upload != null or self.graphics_work != null or self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.initial_image != null or self.cursor_upload != null or self.audio_work != null or self.monitor_work != null or self.sor_work != null or
@@ -2873,9 +2885,10 @@ pub const Owner = struct {
                     !self.graphics_enabled and !self.direct_enabled and self.presentation_buffers >= 2) {
                     const backend = self.copy_backend orelse return false;
                     if (backend.queue.supportsScanout()) {
-                        const rc = backend.queue.updateOperations(&backend.binding, 13 | 32 | 128);
+                        const operations = (13 | 32 | 128) | (backend.operations & native_queue.operation_bit);
+                        const rc = backend.queue.updateOperations(&backend.binding, operations);
                         if (rc == r4os.abi.gfx_queue_error_busy) return error.Busy;
-                        if (rc == r4os.abi.gfx_queue_ok) { self.copy_backend.?.operations = 13 | 32 | 128; self.direct_enabled = true; return true; }
+                        if (rc == r4os.abi.gfx_queue_ok) { self.copy_backend.?.operations = operations; self.direct_enabled = true; return true; }
                         if (rc != r4os.abi.err_no_fn and rc != r4os.abi.gfx_queue_error_invalid) return error.Queue;
                     }
                 }
@@ -3018,11 +3031,11 @@ pub const Owner = struct {
         return (try self.findContext(context)).graphicsRequirement(index);
     }
     pub fn attachGraphicsContextBuffer(self: *Owner, context: ContextHandle, index: usize, buffer: BufferHandle) !void {
-        if (self.copyAdmissionBusy() or self.context_active != null or self.virtuals.active_range != null or self.native_active != null or self.fifo_active != null or self.graph_closing) return error.Busy;
+        if (self.executionAdmissionBusy() or self.queued_render != null or self.context_active != null or self.virtuals.active_range != null or self.native_active != null or self.fifo_active != null or self.graph_closing) return error.Busy;
         try (try self.findContext(context)).attachGraphics(index, try self.findNativeBuffer(buffer));
     }
     pub fn shareGraphicsContextGlobals(self: *Owner, context: ContextHandle, golden: ContextHandle) !void {
-        if (self.copyAdmissionBusy() or self.context_active != null or self.virtuals.active_range != null or self.native_active != null or self.fifo_active != null or self.graph_closing) return error.Busy;
+        if (self.executionAdmissionBusy() or self.queued_render != null or self.context_active != null or self.virtuals.active_range != null or self.native_active != null or self.fifo_active != null or self.graph_closing) return error.Busy;
         try (try self.findContext(context)).shareGraphicsGlobals(try self.findContext(golden));
     }
     pub fn retireExecutionContext(self: *Owner, handle: ContextHandle, deadline: u64) !void {
@@ -3169,17 +3182,18 @@ pub const Owner = struct {
         const lists = backend.queue.supportsRenderList() and self.graphics_cache.packet.info().?.bytes >= render.packet_capacity_bytes;
         const direct = backend.queue.supportsScanout() and self.presentation != null and self.presentation_buffers >= 2;
         const display_bits: u64 = if (self.presentation != null) 36 else 0; // upload and image-to-output
-        const ordinary: u64 = (if (lists) @as(u64, 89) else 25) | display_bits;
+        const native_bit = backend.operations & native_queue.operation_bit;
+        const ordinary: u64 = (if (lists) @as(u64, 89) else 25) | display_bits | native_bit;
         const grid: u64 = if (lists and backend.queue.supportsRenderGridList()) 256 else 0;
         const color: u64 = if (lists and backend.queue.supportsRenderColorList()) 512 else 0;
         var operations = ordinary | @as(u64, if (direct) 128 else 0) | grid | color;
         var rc = backend.queue.updateOperations(&backend.binding, operations);
         self.direct_enabled = direct and rc == r4os.abi.gfx_queue_ok;
         if ((direct or grid != 0 or color != 0) and rc == r4os.abi.gfx_queue_error_invalid) { operations = ordinary; rc = backend.queue.updateOperations(&backend.binding, operations); }
-        if (rc == r4os.abi.gfx_queue_error_invalid and lists) { operations = 25 | display_bits; rc = backend.queue.updateOperations(&backend.binding, operations); }
+        if (rc == r4os.abi.gfx_queue_error_invalid and lists) { operations = 25 | display_bits | native_bit; rc = backend.queue.updateOperations(&backend.binding, operations); }
         // Earlier common queues can still use offscreen rendering. They
         // never receive the new image-to-output operation.
-        if (rc == r4os.abi.gfx_queue_error_invalid) { operations = 25 | (display_bits & 4); rc = backend.queue.updateOperations(&backend.binding, operations); }
+        if (rc == r4os.abi.gfx_queue_error_invalid) { operations = 25 | (display_bits & 4) | native_bit; rc = backend.queue.updateOperations(&backend.binding, operations); }
         if (rc == r4os.abi.err_no_fn) return error.Unsupported;
         if (rc != r4os.abi.gfx_queue_ok) return error.Queue;
         self.copy_backend.?.operations = operations;
@@ -3338,15 +3352,29 @@ pub const Owner = struct {
         work.submitted = true;
         return true;
     }
-    /// Private native producer. The future common queue must also retain its
-    /// canonical BO execution leases. This owner retains acknowledged VA maps
-    /// and a metadata snapshot, never caller arrays or instruction shadows.
+    /// Private producers and authenticated common-queue jobs share the same
+    /// physical publisher and retain acknowledged VA maps until GPU completion.
     pub fn beginPushBatch(self: *Owner, handle: ChannelHandle, pushes: []const batch_job.batch.Push,
         bindings: []const VirtualBindingHandle, deadline: u64) !void
     {
+        if (self.queued_native != null or self.hasQueuedWork()) return error.Busy;
+        return self.startPushBatch(handle, pushes, bindings, deadline, null);
+    }
+    pub fn beginQueuedPushBatch(self: *Owner, work: *native_queue.Job) !void {
+        const index = self.active_work orelse return error.State;
+        if (self.work_slots[index] != .native or self.queued_native != work or
+            &self.work_slots[index].native != work or work.phase != .submit or self.copy_backend == null or
+            !std.meta.eql(work.binding, self.copy_backend.?.binding)) return error.Stale;
+        try work.validate(self);
+        const deadline = if (work.job.deadline_ns != 0) work.job.deadline_ns else try std.math.add(u64, try self.now(), 3 * std.time.ns_per_s);
+        return self.startPushBatch(try work.channel(), work.pushes(), work.bindings(), deadline, work.job.fence);
+    }
+    fn startPushBatch(self: *Owner, handle: ChannelHandle, pushes: []const batch_job.batch.Push,
+        bindings: []const VirtualBindingHandle, deadline: u64, native_fence: ?r4os.abi.GfxFence) !void
+    {
         const current = try self.now();
         if (deadline <= current or deadline == std.math.maxInt(u64)) return error.Deadline;
-        if (self.executionAdmissionBusy() or self.queued_render != null or self.graph_closing or self.hasQueuedWork()) return error.Busy;
+        if (self.executionAdmissionBusy() or self.queued_render != null or self.graph_closing) return error.Busy;
         const fifo = try self.findChannel(handle);
         const info = fifo.info() orelse return error.State;
         if (info.config.engine == .none or fifo.state != .handed_off or !fifo.ring.idle() or
@@ -3355,7 +3383,7 @@ pub const Owner = struct {
         if (info.config.context.vaspace != space.handle) return error.Stale;
         try self.channel.?.guard(deadline);
         const heap = self.ctx.?.heap() orelse return error.Api;
-        self.batch_work = .{ .channel_handle = handle, .deadline = deadline };
+        self.batch_work = .{ .channel_handle = handle, .deadline = deadline, .native_fence = native_fence };
         self.batch_work.?.resources.open(heap, &self.virtuals, space, pushes, bindings) catch |err| {
             if (self.batch_work.?.resources.self_address != 0) self.stop(err) else self.batch_work = null;
             return err;
@@ -3363,6 +3391,14 @@ pub const Owner = struct {
     }
     pub fn validatePushBatch(self: *Owner) !void {
         const work = if (self.batch_work) |*value| value else return error.State;
+        if (work.native_fence) |fence| {
+            const queued = self.queued_native orelse return error.Binding;
+            const index = self.active_work orelse return error.Binding;
+            if (self.work_slots[index] != .native or &self.work_slots[index].native != queued or
+                queued.phase != .wait or !std.meta.eql(queued.job.fence, fence) or
+                !std.meta.eql(try queued.channel(), work.channel_handle)) return error.Binding;
+            try queued.validate(self);
+        } else if (self.queued_native != null) return error.Binding;
         const fifo = try self.findChannel(work.channel_handle);
         if (work.resources.virtuals != &self.virtuals or work.resources.space.epoch != self.epoch or
             work.resources.space.handle != fifo.config.context.vaspace or fifo.state != .handed_off or
@@ -3427,7 +3463,7 @@ pub const Owner = struct {
         if (self.copy_backend) |backend| if (backend.channel) |channel| if (std.meta.eql(channel, handle)) return error.Busy;
         if (self.presentation) |entry| if (std.meta.eql(entry.channel_handle, handle)) return error.Busy;
         const owner = try self.findChannel(handle);
-        if (self.copyBusy() or self.hasQueuedWork()) return error.Busy;
+        if (self.copyBusy() or (self.hasQueuedWork() and !self.native_queues.retiring(handle))) return error.Busy;
         if (self.fifo_active != null or self.context_active != null or self.virtuals.active_range != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or
             self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         var token = try self.channel.?.handoff(deadline);
@@ -3478,31 +3514,32 @@ pub const Owner = struct {
     /// supply source addresses, completion points or edited job extents.
     pub fn hasQueuedWork(self: *const Owner) bool { return self.work_schedule.count() != 0; }
     fn activateWork(self: *Owner) !bool {
-        if (self.copy_job != null or self.queued_render != null or self.active_work != null) return error.State;
+        if (self.copy_job != null or self.queued_render != null or self.queued_native != null or self.active_work != null) return error.State;
         const index = self.work_schedule.choose() orelse return false;
         self.active_work = index;
         switch (self.work_slots[index]) {
             .copy => |*work| self.copy_job = work,
             .render => |*work| self.queued_render = work,
+            .native => |*work| self.queued_native = work,
             .free => return error.Stale,
         }
         return true;
     }
     fn selectWork(self: *Owner) !void {
         // Only a newly admitted, unsubmitted job may enter this selector.
-        self.copy_job = null; self.queued_render = null; self.active_work = null;
+        self.copy_job = null; self.queued_render = null; self.queued_native = null; self.active_work = null;
         if (!try self.activateWork()) return error.State;
     }
     pub fn yieldWork(self: *Owner) !void {
-        if (self.graphics_upload != null or self.graphics_work != null or
+        if (self.batch_work != null or self.graphics_upload != null or self.graphics_work != null or
             (if (self.copy_job) |work| work.submitted else false)) return error.Busy;
         try self.work_schedule.yield(self.active_work orelse return error.State);
-        self.copy_job = null; self.queued_render = null; self.active_work = null;
+        self.copy_job = null; self.queued_render = null; self.queued_native = null; self.active_work = null;
     }
     fn releaseWork(self: *Owner) !void {
         const index = self.active_work orelse return error.State;
         try self.work_schedule.release(index);
-        self.copy_job = null; self.queued_render = null; self.active_work = null;
+        self.copy_job = null; self.queued_render = null; self.queued_native = null; self.active_work = null;
         self.work_slots[index] = .free;
     }
     pub fn beginCopyWork(self: *Owner, handle: ChannelHandle, binding: r4os.abi.GfxBackendBinding, deadline: u64) !bool {
@@ -3535,6 +3572,19 @@ pub const Owner = struct {
         if (result != a.gfx_queue_ok and result != a.gfx_queue_error_busy and job.fence.timeline == 0) return error.Queue;
         if (self.copy_backend == null) self.copy_backend = .{ .queue = queue, .binding = binding };
         if (result == a.gfx_queue_error_busy and job.fence.timeline == 0) return false;
+        if (result == a.gfx_queue_ok and job.operation == a.gfx_queue_operation_native) {
+            if (self.native_queues.source == null) {
+                if (queue.complete(&job.fence, a.gfx_queue_result_failed, 1) != 1) return error.Retained;
+                return true;
+            }
+            try self.work_schedule.admit(work_slot, job);
+            self.work_slots[work_slot] = .{ .native = .{} };
+            self.active_work = work_slot;
+            self.queued_native = &self.work_slots[work_slot].native;
+            self.queued_native.?.open(self, queue, binding, job) catch |err| { self.stop(err); return err; };
+            try self.selectWork();
+            return true;
+        }
         if (job.deadline_ns != 0) work_deadline = @min(work_deadline, job.deadline_ns);
         if (result == a.gfx_queue_ok and now_ns < work_deadline and try self.presentationWaiting(job)) {
             for (&self.deferred_presentations) |*slot| if (slot.* == null) {
@@ -5630,6 +5680,10 @@ pub const Owner = struct {
         if (try self.advanceCopy(current)) return .progress;
         if (try self.advanceGraphics(current)) return .progress;
         if (try self.advancePushBatch(current)) return .progress;
+        if (self.queued_native) |queued| {
+            if (queued.phase == .done) { try self.releaseWork(); return .progress; }
+            if (try queued.step(self, current)) return .progress;
+        }
         if (self.queued_render) |queued| {
             if (queued.phase == .done) { try self.releaseWork(); return .progress; }
             if (try queued.step(self, current)) return .progress;
@@ -5682,6 +5736,7 @@ pub const Owner = struct {
             // The common broker owns retirement order and its outstanding
             // claims. Do not remove its runtime handles behind the adapter.
             if (!self.virtual_provider.closed()) break :graph_close;
+            if (self.native_queues.count != 0 or self.native_queues.spare.handle != 0) break :graph_close;
             for (&self.fifos, 0..) |*slot, index| if (slot.owner != null) {
                 try self.retireExecutionChannel(.{ .epoch = self.epoch, .serial = slot.serial, .slot = @intCast(index) }, self.close_deadline, true);
                 return .progress;
@@ -5928,7 +5983,7 @@ pub const Owner = struct {
             .stopping = self.graph_closing,
         };
         for (&self.work_slots) |*slot| {
-            if (slot.* == .copy) result.copy = true;
+            if (slot.* == .copy or slot.* == .native) result.copy = true;
             if (slot.* == .render) result.render = true;
         }
         for (&self.display_images) |*image| if (image.* != null) { result.outputs += 1; };

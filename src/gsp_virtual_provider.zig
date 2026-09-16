@@ -1,7 +1,7 @@
 //! Common VA provider, serialized by the existing Device worker. The kernel
 //! owns process lifetime; this adapter owns real RM handles and partial binds.
-//! No execution channel consumes these public VA tokens yet. Submit must add
-//! engine-use retention here before it may make an address GPU-reachable.
+//! Native submissions resolve kernel-retained public bindings here; the batch
+//! owner independently retains each actual RM mapping through GPU completion.
 const std = @import("std");
 const r4os = @import("r4os");
 const a = r4os.abi;
@@ -82,6 +82,19 @@ pub const Owner = struct {
         if (!std.meta.eql(node.allocation, node.stamp) or node.allocation.cpu_address != @intFromPtr(node) or
             !std.meta.eql(node.token(), token)) return error.Descriptor;
         return node;
+    }
+    /// Only call with the canonical snapshot read for an active kernel job.
+    /// Its execution loan prevents public retirement; no application token
+    /// by itself can authorize this private mapping lookup.
+    pub fn executionParts(self: *Owner, epoch: u64, value: a.GfxNativeBinding) ![]const runtime.VirtualBindingHandle {
+        if (self.closing or self.handle.id == 0 or value.version != 1 or value.size < @sizeOf(a.GfxNativeBinding) or
+            value.reserved0 != 0 or value.access > 1) return error.Stale;
+        const node = try self.find(value.token, epoch, 2);
+        if (!node.ready or node.result != 1 or node.waiting != .none or node.used == 0 or node.used > node.capacity or
+            node.mapped != node.request.byte_length or !std.meta.eql(value.binding, node.resource) or
+            value.address != node.address or value.byte_length != node.request.byte_length) return error.Stale;
+        if (self.pending) |pending| if (pending.node == node and pending.job.operation == 1) return error.Retained;
+        return node.parts()[0..node.used];
     }
     fn create(self: *Owner, running: *runtime.Owner, job: a.GfxVirtualJob) !*Node {
         const request = job.request;
@@ -253,10 +266,9 @@ pub const Owner = struct {
             try self.finish(1, node.token(), node.address);
             return true;
         }
-        // Public VA resources have no submit path yet. Consequently none of
-        // these aliases was handed to an engine. The runtime additionally
-        // refuses overlap with active copy/render/display work. Future submit
-        // must pin each node until its actual GPU receipt before this path.
+        // The common queue holds its public execution loan until the driver's
+        // physical completion. The private batch also holds each actual RM
+        // mapping; runtime unmap refuses those uses independently.
         if (node.used != 0) {
             const part = node.parts()[node.used - 1];
             const status = try running.virtualBindingStatus(part);

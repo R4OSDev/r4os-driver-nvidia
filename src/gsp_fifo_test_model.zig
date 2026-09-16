@@ -6,7 +6,7 @@ const bytes = @import("gsp_buffer_wire.zig").bytes;
 pub const Model = struct {
     const Slot = struct { data: [bytes]u8 align(4096) = undefined, active: bool = false, cpu: bool = false, synced: bool = false,
         descriptor: a.GfxBufferDescriptor = .{}, dma: a.GfxDeviceLease = .{}, gpu: a.GfxDeviceLease = .{} };
-    pub var slots: [2]Slot = @splat(.{});
+    pub var slots: [4]Slot = @splat(.{});
     var original: a.GfxDriverMemoryApi = .{};
     var scenario: []const u8 = "";
     pub var released: usize = 0;
@@ -73,7 +73,7 @@ pub const Model = struct {
         return a.gfx_buffer_result_ok;
     }
     fn segment(input: *const a.GfxDeviceLease, offset: u64, out: *a.GfxDmaSegment) callconv(.c) i32 {
-        if (input.lease.id < 941 or input.lease.id > 944) {
+        if (input.lease.id < 941 or input.lease.id >= 941 + 2 * slots.len) {
             const call: *const fn (*const a.GfxDeviceLease, u64, *a.GfxDmaSegment) callconv(.c) i32 = @ptrFromInt(original.device_segment);
             return call(input, offset, out);
         }
@@ -82,7 +82,7 @@ pub const Model = struct {
         out.* = .{ .dma_address = 0x8000000000 + @as(u64, i) * 0x100000 + offset * 2, .byte_length = 4096, .next_offset = offset + 4096 }; return a.gfx_buffer_result_ok;
     }
     fn releaseDevice(input: *const a.GfxDeviceLease, quiesced: u32) callconv(.c) i32 {
-        if (input.lease.id < 941 or input.lease.id > 944) { const call: *const fn (*const a.GfxDeviceLease, u32) callconv(.c) i32 = @ptrFromInt(original.device_release); return call(input, quiesced); }
+        if (input.lease.id < 941 or input.lease.id >= 941 + 2 * slots.len) { const call: *const fn (*const a.GfxDeviceLease, u32) callconv(.c) i32 = @ptrFromInt(original.device_release); return call(input, quiesced); }
         const i = (input.lease.id - 941) / 2; const slot = &slots[i]; std.debug.assert(slot.active and quiesced == 1);
         if (input.access == 3) {
             std.debug.assert(std.meta.eql(input.*, slot.gpu));

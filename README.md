@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.134; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.135; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -54,11 +54,8 @@ GP_GET never releases resources; the private WFI_ALL/SYS_MEMBAR/semaphore does.
 Timeout/stop retains the batch until the actual device-reset proof. The existing
 complete-run case covers the real Runtime/Device path with modeled GPU/MMIO,
 plus rejected map gaps, array snapshots, empty batches and subsequent CE work.
-This serialized private producer is not a public raw queue or NVK execution
-context. R4DRAW now supplies opaque native submissions with canonical BO/VA
-execution ownership. Connecting this NVIDIA producer to those public jobs,
-native NVK sync/queues and pipelined submission remains open software work.
-NVIDIA does not yet advertise the common native-operation bit.
+The public consumer now connects this producer to R4DRAW's canonical BO/VA
+execution ownership; native NVK sync/queues and pipelined submission remain open.
 
 Independent regular GR contexts (0.79.35): the existing graphics startup owner
 can reuse the device's completed golden template for another RM group/channel.
@@ -71,8 +68,18 @@ The existing complete-run fixture checks coexistence with the renderer and
 close during context/storage/channel/probe waits. GPU replies remain modeled.
 Native allocation now retries a temporarily borrowed RM channel before reading
 its address-space metadata; deferred cleanup no longer aborts renderer startup.
-Public queue-to-context ownership, combined NVK engine objects, submission and
-sync integration remain open; no native-operation capability is advertised.
+Public native queues (0.1.135): each canonical queue/producer owns a regular GR
+context and reuses it across jobs. The existing scheduler copies bounded steps
+of the R4NV version-1 packet and resolves kernel-retained VA snapshots to real RM
+mapping loans. Native operation 10 is advertised only with a ready GR template,
+VA provider and all required queue/lifecycle callbacks. The packet currently
+admits the instantiated GR 3D engine only; this does not qualify a Vulkan queue.
+Queue close/producer exit retires an idle context asynchronously; submitted jobs
+retain their context and maps until the physical semaphore or proven reset.
+Malformed input fails before publication; uncertain retirement quarantines.
+Combined NVK 2D/copy/compute objects, NVK submission/sync, Vulkan device admission
+and an installed R4VK provider remain software work. Host models are not physical
+GPU acceptance; see GrafikVulkan07935.json/native_consumer and OssiGPU.txt /35.
 
 Generations and adapters (0.79.33): native software now covers GA102/103/104/106/107
 and AD102/103/104/106/107. Each measured chip selects its own firmware family,

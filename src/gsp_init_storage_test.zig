@@ -7412,6 +7412,7 @@ fn checkDeviceGraphics(target: *@import("gsp_device.zig").Device, table: *a.Driv
         if (native.is("context_graphics")) extra_releases = try checkRegularGraphics(target, &counts, scenario);
         try checkGraphicsRendering(target,table,&counts,scenario);
         if (target.phase != .ready) return;
+        if (native.is("context_graphics")) extra_releases += try checkNativeQueues(target,table,&counts,scenario);
     } else {
         try t.expect(target.native_graphics.phase == .unavailable and target.native_graphics.context == null and
             target.native_graphics.channel == null and target.native_graphics.storage == null and target.native_graphics.receipt == null);
@@ -7638,6 +7639,164 @@ fn checkGraphicsRendering(target: *@import("gsp_device.zig").Device, table: *@im
     try t.expect(receipt.point == 3 and !run.graphics_cache.borrowed and !native.slots[target_native_index].imported and
         native.slots[target_native_index].gpu.lease.id == 0 and run.graphics_work == null and gr_owner.ring.idle());
     try checkQueuedRendering(target,table,counts,scenario,ce);
+}
+fn stepNativeQueues(target: *@import("gsp_device.zig").Device, counts: *FifoCounts, scenario: []const u8, stage: *u32) !bool {
+    const progress = target.step() == .progress;
+    try t.expect(target.phase == .ready);
+    const run = &target.running;
+    if (run.fifo_active != null) try replyDeviceFifo(target,counts,scenario)
+    else if (run.activeChannel().?.phase == .waiting) try replyNativeProduct(target);
+    if (run.graphics_work) |*work| {
+        if (work.submitted and work.receipt == null) try modelGraphicsStep(target,stage);
+    } else stage.* = 0;
+    return progress;
+}
+fn checkNativeQueues(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, counts: *FifoCounts, scenario: []const u8) !usize {
+    const load = @import("gsp_fifo_wire.zig").word;
+    const peer = @import("gsp_native_queue_test_model.zig").Model;
+    const provider = @import("gsp_virtual_provider_test_model.zig").Model;
+    const native = @import("gsp_vram_test_model.zig").Model;
+    const fifo = @import("gsp_fifo_test_model.zig").Model;
+    const layout = @import("gsp_copy_wire.zig");
+    const run = &target.running;
+    var checkpoint: []const u8 = "setup";
+    errdefer |err| std.debug.print("native queue {s}: {s} device={s} failure={?} native={?} nodes={d} jobs={d} batch={}\n",
+        .{checkpoint,@errorName(err),@tagName(target.phase),target.failure,
+        if (run.queued_native) |job| job.phase else null,run.native_queues.count,run.work_schedule.count(),run.batch_work != null});
+    errdefer std.debug.print("native peer completed={d} result={d} claimed={} pending={} heap={d} fault={s} GR={?}\n", .{
+        peer.completed,peer.result,peer.claimed,peer.job != null,@import("gsp_buffer_test_model.zig").Model.heapLive(),
+        if (run.faults.serial != 0) run.faults.records[(run.faults.serial-1)%16].text[0..run.faults.records[(run.faults.serial-1)%16].text_bytes] else "",
+        if (run.queued_native) |job| if (job.node) |node| node.graphics.phase else null else null });
+    const released = fifo.released;
+    const deadline = clock + 60 * std.time.ns_per_s;
+    const ce = run.graphics_copy_channel.?;
+    const original_backend = run.copy_backend;
+    try t.expect(!run.hasQueuedWork() and run.batch_work == null and run.virtual_provider.handle.id == 0);
+    const buffer = try run.allocateNativeBuffer(4096,deadline);
+    try driveRenderSetup(target,counts,scenario);
+    const buffer_index = (try run.nativeBufferStatus(buffer)).info.?.reference.buffer.id - 801;
+    const borrowed = native.borrow(buffer_index,0);
+    try run.releaseNativeBuffer(buffer);
+    provider.install(table); defer provider.dispose(table);
+    try t.expect(try run.virtual_provider.step(run));
+    const range: a.GfxVirtualJob = .{ .resource = .{ .id = 907, .generation = 17 }, .request = .{ .kind = 1,
+        .adapter_id = run.adapter_id, .memory_generation = run.epoch, .location = 1,
+        .byte_length = 4096, .alignment = 4096, .fixed_address = 0x96000000, .deadline_ns = deadline } };
+    provider.submit(range); _ = try driveVirtualProvider(target,.normal);
+    try t.expect(provider.completion.?.result == 1);
+    const bind: a.GfxVirtualJob = .{ .resource = .{ .id = 908, .generation = 17 }, .reference = borrowed,
+        .parent_token = provider.completion.?.token, .request = .{ .kind = 2, .parent = range.resource, .reference = borrowed.reference,
+            .adapter_id = run.adapter_id, .memory_generation = run.epoch, .byte_length = 4096, .deadline_ns = deadline } };
+    provider.submit(bind); _ = try driveVirtualProvider(target,.normal);
+    try t.expect(provider.completion.?.result == 1);
+    const public_binding: a.GfxNativeBinding = .{ .binding = bind.resource, .token = provider.completion.?.token,
+        .address = provider.completion.?.address, .byte_length = 4096 };
+    const mapped = (try run.virtual_provider.executionParts(run.epoch,public_binding))[0];
+    var wrong = public_binding; wrong.binding.generation += 1;
+    try t.expectError(error.Stale,run.virtual_provider.executionParts(run.epoch,wrong));
+    wrong = public_binding; wrong.address += 4096;
+    try t.expectError(error.Stale,run.virtual_provider.executionParts(run.epoch,wrong));
+    try t.expectError(error.Stale,run.virtual_provider.executionParts(run.epoch+1,public_binding));
+    peer.install(table); defer peer.dispose(table);
+    const saved_wake = target.irq_wake; defer target.irq_wake = saved_wake;
+    target.irq_wake = .{ .context = @intFromPtr(target), .signal = peer.wake };
+    peer.resource = public_binding;
+    run.copy_backend = null; // Replace the preceding idle test kernel peer.
+    _ = try run.registerCopyBackend(ce,deadline);
+    try t.expect(try run.native_queues.step(run,&target.native_graphics));
+    try t.expect(peer.operations == 9 | @as(u64,1) << a.gfx_queue_operation_native);
+    var stage: u32 = 0;
+    var first_channel: ?@import("gsp_runtime.zig").ChannelHandle = null;
+    var first_context: ?@import("gsp_runtime.zig").ContextHandle = null;
+    for (0..3) |round| {
+        checkpoint = "submit";
+        peer.enqueue(if (round == 2) 1 else 0,false,0);
+        var steps: usize = 0;
+        while (steps < 700) : (steps += 1) {
+            _ = try stepNativeQueues(target,counts,scenario,&stage);
+            if (peer.completed != round) break;
+            if (run.batch_work != null and run.batch_work.?.submitted) break;
+        }
+        try t.expect(steps < 700 and peer.completed == round and peer.claimed and run.queued_native != null);
+        const work = &run.batch_work.?;
+        const handle = work.channel_handle;
+        const owner = run.fifos[handle.slot].owner.?;
+        const node = run.queued_native.?.node.?;
+        if (round == 0) { first_channel = handle; first_context = node.graphics.context; }
+        if (round == 1) try t.expect(std.meta.eql(handle,first_channel.?) and std.meta.eql(node.graphics.context.?,first_context.?));
+        if (round == 2) try t.expect(!std.meta.eql(handle,first_channel.?) and !std.meta.eql(node.graphics.context.?,first_context.?));
+        const context = run.contexts[node.graphics.context.?.slot].owner.?;
+        try t.expect(!std.meta.eql(handle,target.native_graphics.channel.?) and context.graphics_shared ==
+            run.contexts[target.native_graphics.golden_context.?.slot].owner.? and (try run.virtuals.findBinding(mapped)).executions == 1);
+        const ticket = work.ticket.?;
+        const bytes: [*]u8 = @ptrFromInt(owner.ring.cpu.cpu_address);
+        const gp: usize = @as(usize,(ticket.put + 510) % 512)*8;
+        try t.expect(load(bytes[0..12288],gp) == public_binding.address and load(bytes[0..12288],gp+4) == (1<<31)|(1<<10)|(1<<9));
+        @memset(&peer.command,0xcc); // The real worker already copied every descriptor.
+        try run.validatePushBatch();
+        try t.expectError(error.Busy,run.unmapVirtualBuffer(mapped,deadline,true));
+        checkpoint = "GET without completion";
+        std.mem.writeInt(u32,bytes[layout.userd_offset+0x88..][0..4],ticket.put,.little);
+        var idle: usize = 0;
+        for (0..8) |_| { if (!try stepNativeQueues(target,counts,scenario,&stage)) idle += 1; }
+        try t.expect(idle != 0 and peer.completed == round and work.receipt == null and (try run.virtuals.findBinding(mapped)).executions == 1);
+        if (round == 2) {
+            peer.closed[1] = true; peer.notify();
+            for (0..4) |_| _ = try stepNativeQueues(target,counts,scenario,&stage);
+            try t.expect(node.closing and node.jobs == 1 and node.graphics.phase == .ready and owner.state == .handed_off);
+        }
+        checkpoint = "physical completion";
+        // Model WFI/memory-ordering/release, separately from earlier GET.
+        peer.signaled = true;
+        std.mem.writeInt(u32,bytes[layout.completion_offset..][0..4],ticket.point,.little);
+        for (0..80) |_| { _ = try stepNativeQueues(target,counts,scenario,&stage); if (!run.hasQueuedWork()) break; }
+        try t.expect(peer.completed == round+1 and peer.result == a.gfx_queue_result_complete and !run.hasQueuedWork() and
+            (try run.virtuals.findBinding(mapped)).executions == 0);
+    }
+    checkpoint = "invalid snapshots";
+    for (0..6) |bad| {
+        const before = peer.completed;
+        peer.enqueue(0,false,deadline);
+        switch (bad) {
+            0 => peer.info.interface_id_hi ^= 1,
+            1 => std.mem.writeInt(u32,peer.command[44..48],1,.little), // incomplete last push
+            2 => std.mem.writeInt(u32,peer.command[44..48],4,.little), // unknown flags
+            3 => std.mem.writeInt(u64,peer.command[32..40],public_binding.address+4096,.little),
+            4 => std.mem.writeInt(u32,peer.command[12..16],511,.little),
+            5 => peer.resource.token.opaque1 += 10000,
+            else => unreachable,
+        }
+        for (0..250) |_| { _ = try stepNativeQueues(target,counts,scenario,&stage); if (peer.completed != before and !run.hasQueuedWork()) break; }
+        try t.expect(peer.completed == before+1 and peer.result == a.gfx_queue_result_failed and run.batch_work == null and
+            (try run.virtuals.findBinding(mapped)).executions == 0);
+        peer.resource = public_binding;
+    }
+    checkpoint = "close before context";
+    peer.enqueue(2,true,deadline); peer.closed[2] = true; peer.notify();
+    for (0..100) |_| { _ = try stepNativeQueues(target,counts,scenario,&stage); if (peer.job == null and !run.hasQueuedWork()) break; }
+    try t.expect(peer.job == null and peer.result == a.gfx_queue_result_cancelled);
+    checkpoint = "idle queue retirement";
+    peer.closed[0] = true; peer.notify();
+    for (0..600) |_| { _ = try stepNativeQueues(target,counts,scenario,&stage); if (run.native_queues.count == 0 and run.native_active == null) break; }
+    try t.expect(run.native_queues.count == 0 and run.native_queues.spare.handle == 0 and fifo.released == released+2 and
+        run.fifos[target.native_graphics.channel.?.slot].owner.?.ring.idle());
+    checkpoint = "VA retirement";
+    run.virtual_provider.close();
+    for (0..4) |_| {
+        if (run.virtual_provider.closed()) break;
+        provider.completion = null; _ = try driveVirtualProvider(target,.normal); _ = try run.virtual_provider.step(run);
+    }
+    try t.expect(run.virtual_provider.closed());
+    try t.expect(run.ctx.?.memory().?.bufferRelease(&borrowed.reference) == 1);
+    try driveRenderSetup(target,counts,scenario);
+    const backend = run.copy_backend.?;
+    try t.expect(backend.queue.unregister(&backend.binding,1) == 1);
+    run.copy_backend = null;
+    _ = try run.native_queues.step(run,null);
+    run.copy_backend = original_backend;
+    try t.expect(run.native_queues.source == null and !run.hasQueuedWork());
+    std.debug.print("[nvidia-native-queue] two isolated contexts; reuse; canonical VA; GET retains; semaphore completes; invalid input; active/idle close; no idle spin\n",.{});
+    return fifo.released-released;
 }
 fn checkRenderWarmup(target: *@import("gsp_device.zig").Device, table: *a.DriverApi,
     ce: @import("gsp_runtime.zig").ChannelHandle, image_index: usize, output: []u8) !void
