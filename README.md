@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.133; original R4OS code is
+NVIDIA display driver for R4OS, passive by default. Module 0.1.134; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -59,6 +59,20 @@ context. R4DRAW now supplies opaque native submissions with canonical BO/VA
 execution ownership. Connecting this NVIDIA producer to those public jobs,
 native NVK sync/queues and pipelined submission remains open software work.
 NVIDIA does not yet advertise the common native-operation bit.
+
+Independent regular GR contexts (0.79.35): the existing graphics startup owner
+can reuse the device's completed golden template for another RM group/channel.
+Each regular context owns its mutable buffers; counted global-buffer loans keep
+the template alive without permitting another channel in its GR group. Close
+is asynchronous and idempotent, including partially completed startup. It waits
+for pending RM work and actual barrier completion, then retires the channel
+before its context; a borrowed golden owner is never freed by the borrower.
+The existing complete-run fixture checks coexistence with the renderer and
+close during context/storage/channel/probe waits. GPU replies remain modeled.
+Native allocation now retries a temporarily borrowed RM channel before reading
+its address-space metadata; deferred cleanup no longer aborts renderer startup.
+Public queue-to-context ownership, combined NVK engine objects, submission and
+sync integration remain open; no native-operation capability is advertised.
 
 Generations and adapters (0.79.33): native software now covers GA102/103/104/106/107
 and AD102/103/104/106/107. Each measured chip selects its own firmware family,

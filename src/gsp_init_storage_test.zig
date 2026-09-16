@@ -2985,7 +2985,7 @@ fn checkDeviceDisplayEngine(target: *@import("gsp_device.zig").Device, scenario:
         if (prior) |old| { try t.expect(old.root != handle.root); try t.expectError(error.Stale, running.displayEngineStatus(old)); }
         var forged = handle; forged.epoch += 1; try t.expectError(error.Stale, running.displayEngineStatus(forged));
         try t.expectError(error.Busy, running.createDisplayEngine(deadline));
-        try t.expectError(error.State, running.allocateNativeBuffer(4096, deadline));
+        try t.expectError(error.Busy, running.allocateNativeBuffer(4096, deadline));
         var retiring = false; var requests: [5]u32 = @splat(0); var interleaved = false;
         var steps: usize = 0;
         while (target.phase == .ready and steps < 80) : (steps += 1) {
@@ -7342,6 +7342,7 @@ fn checkDeviceGraphics(target: *@import("gsp_device.zig").Device, table: *a.Driv
     run.receiver_events = .{ .epoch = run.epoch, .not_before_ns = clock + 60 * std.time.ns_per_s };
     try target.native_graphics.request();
     var counts: FifoCounts = .{};
+    var extra_releases: usize = 0;
     var stages: u32 = 0;
     var steps: usize = 0;
     errdefer |err| std.debug.print("graphics {s}: {s} phase={s} owner={s}/{?} failure={?} context={?} fifo={?} native={?} stage={d} context-op={?}\n",
@@ -7408,6 +7409,7 @@ fn checkDeviceGraphics(target: *@import("gsp_device.zig").Device, table: *a.Driv
         for (0..3) |_| { try modelGraphicsStep(target, &stages); _ = target.step(); }
         const second = (try run.receiveGraphics(handle)).?;
         try t.expect(second.point == 2 and run.graphics_work == null and owner.ring.idle());
+        if (native.is("context_graphics")) extra_releases = try checkRegularGraphics(target, &counts, scenario);
         try checkGraphicsRendering(target,table,&counts,scenario);
         if (target.phase != .ready) return;
     } else {
@@ -7440,9 +7442,94 @@ fn checkDeviceGraphics(target: *@import("gsp_device.zig").Device, table: *a.Driv
         std.mem.writeInt(u32, backing.?[init.queues_offset + init.status_offset + 64..][0..4], session.tx_write, .little);
         try nativeReply(session, rpc.function, 0, response[0..rpc.request.len]);
     }
-    try t.expect(steps < 500 and target.phase == .recovering and target.failure.? == error.RmClosed and native.charged == 0 and fifo_model.released == if (native.is("context_graphics")) @as(usize, 3) else 1);
+    try t.expect(steps < 500 and target.phase == .recovering and target.failure.? == error.RmClosed and native.charged == 0 and
+        fifo_model.released == (if (native.is("context_graphics")) @as(usize, 3) else 1) + extra_releases);
     for (&run.fifos) |*slot| try t.expect(slot.owner == null);
     for (&run.contexts) |*slot| try t.expect(slot.owner == null);
+}
+
+// Extend the existing real Device/RM fixture: a second regular context must
+// coexist with the renderer and abort safely at each asynchronous boundary.
+fn checkRegularGraphics(target: *@import("gsp_device.zig").Device, counts: *FifoCounts, scenario: []const u8) !usize {
+    const graphics = @import("gsp_native_graphics.zig");
+    const fifo_model = @import("gsp_fifo_test_model.zig").Model;
+    const run = &target.running;
+    const source = &target.native_graphics;
+    const golden = run.contexts[source.golden_context.?.slot].owner.?;
+    const renderer = run.contexts[source.context.?.slot].owner.?;
+    const renderer_channel = source.channel.?;
+    const releases = fifo_model.released;
+    var empty: graphics.Owner = .{};
+    try t.expectError(error.State, empty.requestRegular(&empty));
+    try empty.requestRegular(source);
+    try empty.requestClose(); try empty.requestClose();
+    try t.expect(empty.phase == .closed and empty.context == null and empty.golden_context == null);
+    for ([_]graphics.Phase{ .ready, .context_wait, .storage_wait, .channel_wait, .probe_wait }) |stop| {
+        var clone: graphics.Owner = .{};
+        try clone.requestRegular(source);
+        var stage: u32 = 0;
+        var steps: usize = 0;
+        errdefer |err| std.debug.print("regular graphics stop={s} phase={s} err={s} runtime={?}\n",
+            .{@tagName(stop),@tagName(clone.phase),@errorName(err),run.failure});
+        while (clone.phase != stop and steps < 600) : (steps += 1) {
+            _ = target.step(); try t.expect(target.phase == .ready);
+            _ = try clone.step(run, true);
+            if (run.fifo_active != null) try replyDeviceFifo(target, counts, scenario)
+            else if (run.activeChannel().?.phase == .waiting) try replyNativeProduct(target);
+            if (run.graphics_work) |*work| if (work.submitted and work.receipt == null) try modelGraphicsStep(target, &stage);
+        }
+        try t.expect(steps < 600 and clone.phase == stop);
+        if (stop == .storage_wait) {
+            const deadline = clock + std.time.ns_per_s;
+            const serial = run.buffer_serial;
+            try t.expect(run.native_active != null);
+            try t.expectError(error.Busy, run.allocateNativeBuffer(4096, deadline));
+            try t.expectError(error.Busy, run.allocateNativeStorage(4096, deadline));
+            const surface: @import("gsp_surface_layout.zig").Request = .{ .width = 16, .height = 16, .format = .argb8888, .usage = 28 };
+            try t.expectError(error.Busy, run.allocateNativeSurface(surface, deadline));
+            try t.expectError(error.Busy, run.allocateDisplaySurface(surface, deadline));
+            try t.expect(run.buffer_serial == serial and run.failure == null);
+        }
+        if (stop == .ready) {
+            const context = run.contexts[clone.context.?.slot].owner.?;
+            try t.expect(clone.regular and clone.golden_borrowed and context != renderer and
+                context.binding.group != renderer.binding.group and context.graphics_shared == golden and
+                context.graphics_shared_child.?.serial != renderer.graphics_shared_child.?.serial and
+                !std.meta.eql(clone.channel.?, renderer_channel));
+            const own = try context.graphicsPromotion(); const other = try renderer.graphicsPromotion();
+            try t.expect(own.count == other.count and !own.golden);
+            for (own.entries[0..own.count], other.entries[0..other.count]) |left, right| {
+                try t.expect(left.id == right.id);
+                if (left.id == 0 or left.id == 2) try t.expect(left.address != right.address)
+                else try t.expect(left.address == right.address);
+            }
+            try t.expectError(error.Busy, run.retainExecutionContext(source.golden_context.?));
+            try t.expectError(error.Busy, run.retainExecutionContext(clone.context.?));
+            try t.expectError(error.Retained, run.retireExecutionContext(source.golden_context.?, clock + std.time.ns_per_s));
+        }
+        if (stop == .probe_wait) {
+            for (0..30) |_| { _ = target.step(); if (run.graphics_work.?.submitted) break; }
+            try t.expect(run.graphics_work.?.submitted and run.graphics_work.?.receipt == null);
+        }
+        try clone.requestClose(); try clone.requestClose();
+        const before_close = counts.frees;
+        steps = 0;
+        while (clone.phase != .closed and steps < 600) : (steps += 1) {
+            _ = target.step(); try t.expect(target.phase == .ready);
+            _ = try clone.step(run, true);
+            if (run.fifo_active != null) try replyDeviceFifo(target, counts, scenario)
+            else if (run.activeChannel().?.phase == .waiting) try replyNativeProduct(target);
+            if (run.graphics_work) |*work| if (work.submitted and work.receipt == null) {
+                if (steps < 3) try t.expect(clone.phase == .probe_wait and counts.frees == before_close)
+                else try modelGraphicsStep(target, &stage);
+            };
+        }
+        try t.expect(steps < 600 and clone.context == null and clone.channel == null and clone.storage == null and
+            clone.golden_context == null and source.phase == .ready and golden.held() and
+            renderer.graphics_shared == golden and (try run.executionChannelStatus(renderer_channel)).info != null);
+        try driveRenderSetup(target, counts, scenario);
+    }
+    return fifo_model.released - releases;
 }
 
 fn driveRenderSetup(target: *@import("gsp_device.zig").Device, counts: *FifoCounts, scenario: []const u8) !void {
@@ -8076,17 +8163,21 @@ fn modelGraphicsStep(target: *@import("gsp_device.zig").Device, stage: *u32) !vo
     const fifo_model = @import("gsp_fifo_test_model.zig").Model;
     const work = &target.running.graphics_work.?;
     const owner = target.running.fifos[work.channel_handle.slot].owner.?;
-    const bytes = &fifo_model.slots[0].data;
+    const index = owner.commands.?.backing.reference.reference.id - 901;
+    const base = fifo_model.address(index);
+    const bytes = &fifo_model.slots[index].data;
     const ticket = work.ticket.?;
     const load = @import("gsp_fifo_wire.zig").word;
     try t.expect(work.submitted and work.receipt == null and owner.ring.issued == ticket.point and owner.ring.completed == ticket.point - 1);
     try t.expect(load(bytes, 0x208c) == ticket.put);
     const gp_index: usize = (ticket.put + 511) % 512;
-    try t.expect(load(bytes, gp_index * 8) == 0x50001000 and load(bytes, gp_index * 8 + 4) == 11 << 10);
+    try t.expect(load(bytes, gp_index * 8) == base + 4096 and load(bytes, gp_index * 8 + 4) == 11 << 10);
     const mmio: [*]volatile u32 = @ptrFromInt(target.port.window.cpu_address);
     try t.expect(mmio[@import("gsp_copy_wire.zig").notify / 4] == ticket.token);
     var expected = @embedFile("fixtures/graphics-570.144.bin")[16..60].*;
     std.mem.writeInt(u32, expected[4..8], @import("generation.zig").get(target.display.?.chip.?.id).?.render, .little);
+    std.mem.writeInt(u32, expected[28..32], @intCast((base + 0x2200) >> 32), .little);
+    std.mem.writeInt(u32, expected[32..36], @truncate(base + 0x2200), .little);
     std.mem.writeInt(u32, expected[36..40], ticket.point, .little);
     try t.expectEqualSlices(u8, &expected, bytes[4096..][0..44]);
     try t.expect((try target.running.receiveGraphics(work.channel_handle)) == null);
@@ -8099,8 +8190,8 @@ fn modelGraphicsStep(target: *@import("gsp_device.zig").Device, stage: *u32) !vo
     } else if (stage.* == 2) {
         // Decode the one-word release address/payload from fetched commands.
         const semaphore_address = (@as(u64, load(bytes, 4096 + 7 * 4)) << 32) | load(bytes, 4096 + 8 * 4);
-        try t.expect(semaphore_address == 0x50002200 and load(bytes, 4096 + 10 * 4) == 0x1000f010);
-        std.mem.writeInt(u32, bytes[@intCast(semaphore_address - 0x50000000)..][0..4], load(bytes, 4096 + 9 * 4), .little);
+        try t.expect(semaphore_address == base + 0x2200 and load(bytes, 4096 + 10 * 4) == 0x1000f010);
+        std.mem.writeInt(u32, bytes[@intCast(semaphore_address - base)..][0..4], load(bytes, 4096 + 9 * 4), .little);
     } else return error.Unexpected;
     stage.* += 1;
 }
@@ -8133,7 +8224,7 @@ fn checkDeviceContexts(target: *@import("gsp_device.zig").Device, table: *a.Driv
         handles[index] = try running.createExecutionContext(19, deadline);
         var forged = handles[index]; forged.serial += 1;
         try t.expectError(error.Stale, running.executionContextStatus(forged));
-        try t.expectError(error.State, running.allocateNativeBuffer(4096, deadline));
+        try t.expectError(error.Busy, running.allocateNativeBuffer(4096, deadline));
         var steps: usize = 0;
         while (target.phase == .ready and running.context_active != null and steps < 100) : (steps += 1) {
             _ = target.step();

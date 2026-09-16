@@ -312,6 +312,7 @@ pub const Unavailable = enum { classes, engine, context_buffers };
 pub const Info = struct { binding: wire.Binding, rm_engine: u32, nv_engine: u32, engine: wire.Engine, method_bytes: u32, subcontext: u32,
     timeslice_requested_us: u64 = 0, timeslice_rejection: ?u32 = null };
 pub const Child = struct { epoch: u64, group: u32, serial: u64 };
+const ChildUse = struct { serial: u64 = 0, globals: bool = false };
 pub const Owner = struct {
     self_address: usize = 0,
     exchange: exchange.Exchange,
@@ -331,7 +332,7 @@ pub const Owner = struct {
     timeslice_rejection: ?u32 = null,
     share_live: bool = false,
     child_serial: u64 = 0,
-    children: [64]u64 = @splat(0),
+    children: [64]ChildUse = @splat(.{}),
     methods: [2]vram.storage.Use = @splat(.{}),
     graphics_plan: ?wire.graphics.Plan = null,
     graphics_buffers: [wire.graphics.max_buffers]vram.storage.Use = @splat(.{}),
@@ -379,11 +380,17 @@ pub const Owner = struct {
             .timeslice_rejection = self.timeslice_rejection };
     }
     pub fn retainChild(self: *Owner) Error!Child {
+        return self.retainUse(false);
+    }
+    fn retainUse(self: *Owner, globals: bool) Error!Child {
         if (self.info() == null or self.state != .handed_off) return error.State;
-        if (self.rm_engine == 1 and self.held()) return error.Busy;
-        for (&self.children) |*slot| if (slot.* == 0) {
+        if (globals) {
+            if (self.rm_engine != 1 or !self.graphics_golden or !self.golden_complete) return error.State;
+            for (&self.children) |*slot| if (slot.serial != 0 and !slot.globals) return error.Busy;
+        } else if (self.rm_engine == 1 and self.held()) return error.Busy;
+        for (&self.children) |*slot| if (slot.serial == 0) {
             self.child_serial = std.math.add(u64, self.child_serial, 1) catch return error.Exhausted;
-            slot.* = self.child_serial;
+            slot.* = .{ .serial = self.child_serial, .globals = globals };
             return .{ .epoch = self.binding.epoch, .group = self.binding.group, .serial = self.child_serial };
         };
         return error.Exhausted;
@@ -433,7 +440,9 @@ pub const Owner = struct {
             if (!requirement.global or requirement.id == 11) continue;
             _ = source.graphics_buffers[index].info() orelse return error.State;
         }
-        self.graphics_shared_child = try source.retainChild();
+        // Many independent GR contexts share the golden global buffers. This
+        // is a lifetime loan, not another channel in the source GR group.
+        self.graphics_shared_child = try source.retainUse(true);
         self.graphics_shared = source;
     }
     pub fn graphicsPromotion(self: *const Owner) Error!wire.graphics.Promotion {
@@ -457,23 +466,23 @@ pub const Owner = struct {
     pub fn releaseChild(self: *Owner, child: Child, quiesced: bool) Error!void {
         try self.stable();
         if (self.state != .handed_off or child.epoch != self.binding.epoch or child.group != self.binding.group or child.serial == 0) return error.Stale;
-        for (&self.children) |*slot| if (slot.* == child.serial) {
+        for (&self.children) |*slot| if (slot.serial == child.serial) {
             if (!quiesced) return error.Retained;
-            slot.* = 0; return;
+            slot.* = .{}; return;
         };
         return error.Stale;
     }
     pub fn releaseChildAfterReset(self: *Owner, child: Child, proof: @import("gsp_reset.zig").Quiescence) Error!void {
         if (self.self_address != @intFromPtr(self) or !proof.valid(self.binding.epoch) or
             child.epoch != self.binding.epoch or child.group != self.binding.group or child.serial == 0) return error.Stale;
-        for (&self.children) |*slot| if (slot.* == child.serial) { slot.* = 0; return; };
+        for (&self.children) |*slot| if (slot.serial == child.serial) { slot.* = .{}; return; };
         return error.Stale;
     }
     pub fn closeAfterReset(self: *Owner, proof: @import("gsp_reset.zig").Quiescence) Error!bool {
         if ((self.self_address != 0 and self.self_address != @intFromPtr(self)) or
             !proof.valid(self.binding.epoch) or self.exchange.session.epoch != self.binding.epoch) return error.Stale;
         if (self.namespace_live) try self.exchange.session.rm_names.validateChildrenAfterReset(self.reservation, proof);
-        for (self.children) |child| if (child != 0) return false;
+        for (&self.children) |*child| if (child.serial != 0) return false;
         for (&self.methods) |*storage| if (!storage.closeAfterReset(proof)) return error.Retained;
         for (&self.graphics_buffers) |*storage| if (!storage.closeAfterReset(proof)) return error.Retained;
         if (self.graphics_shared) |owner| {
@@ -579,7 +588,7 @@ pub const Owner = struct {
     pub fn beginDestroy(self: *Owner, token: *boot.Handoff, deadline: u64) Error!void {
         try self.stable();
         if (self.state != .handed_off or token.session != self.exchange.session) return error.State;
-        for (&self.children) |child| if (child != 0) return error.Retained;
+        for (&self.children) |*child| if (child.serial != 0) return error.Retained;
         self.exchange = try exchange.Exchange.init(token, deadline); self.deadline = deadline; self.state = .destroying;
     }
     pub fn handoff(self: *Owner) Error!boot.Handoff {
@@ -589,7 +598,7 @@ pub const Owner = struct {
         self.state = if (self.state == .closed) .finished else .handed_off; return token;
     }
     pub fn held(self: *const Owner) bool {
-        for (&self.children) |child| if (child != 0) return true;
+        for (&self.children) |*child| if (child.serial != 0) return true;
         return false;
     }
     pub fn matches(self: *const Owner, channel: *const exchange.Exchange, deadline: u64) bool {

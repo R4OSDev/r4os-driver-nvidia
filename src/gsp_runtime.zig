@@ -5145,12 +5145,12 @@ pub const Owner = struct {
     /// borrowed driver reference only after RM allocation/map ACKs and common
     /// commit. Consumers import that reference through the common API.
     pub fn allocateNativeBuffer(self: *Owner, bytes: u64, deadline: u64) !BufferHandle {
-        if (self.power_active or self.powerStopping()) return error.Busy;
+        try self.admitNativeAllocation();
         const space = (self.nativeAddressSpace() orelse return error.State).*;
         return self.allocateNativePlan(try vram.surface.raw(self.adapter_id, space, bytes), deadline);
     }
     pub fn allocateNativeSurface(self: *Owner, request: vram.surface.Request, deadline: u64) !BufferHandle {
-        if (self.power_active or self.powerStopping()) return error.Busy;
+        try self.admitNativeAllocation();
         const space = (self.nativeAddressSpace() orelse return error.State).*;
         const caps = self.nativeMemoryCapabilities() orelse return error.State;
         return self.allocateNativePlan(try vram.surface.create(self.adapter_id, space, caps, request), deadline);
@@ -5158,7 +5158,7 @@ pub const Owner = struct {
     /// Own scanout requires a verified contiguous physical extent in the
     /// display DMA context, while retaining the common native BO descriptor.
     pub fn allocateDisplaySurface(self: *Owner, request: vram.surface.Request, deadline: u64) !BufferHandle {
-        if (self.power_active or self.powerStopping()) return error.Busy;
+        try self.admitNativeAllocation();
         const space = (self.nativeAddressSpace() orelse return error.State).*;
         const caps = self.nativeMemoryCapabilities() orelse return error.State;
         const summary = self.nativeMemory() orelse return error.State;
@@ -5177,7 +5177,7 @@ pub const Owner = struct {
         return self.allocatePrivateStorage(requirement.bytes, requirement.alignment, true, requirement.readonly, deadline);
     }
     fn allocatePrivateStorage(self: *Owner, bytes: u64, alignment: u64, privileged: bool, readonly: bool, deadline: u64) !BufferHandle {
-        if (self.power_active or self.powerStopping()) return error.Busy;
+        try self.admitNativeAllocation();
         const space = (self.nativeAddressSpace() orelse return error.State).*;
         const caps = self.nativeMemoryCapabilities() orelse return error.State;
         const memory_summary = self.nativeMemory() orelse return error.State;
@@ -5193,11 +5193,8 @@ pub const Owner = struct {
         return self.openNativeBuffer(plan, policy, deadline) catch |err| { self.hostRejection(.native_buffer, err); return err; };
     }
     fn openNativeBuffer(self: *Owner, plan: vram.surface.Plan, policy: ?vram.storage.Policy, deadline: u64) !BufferHandle {
-        _ = try self.now();
-        if (self.power_active or self.powerStopping()) return error.Busy;
-        if (self.graph_closing or self.fifo_active != null or self.context_active != null or self.virtuals.active_range != null or self.native_active != null or self.buffer_active != null or self.sequence.self_address != 0 or self.outputs.active()) return error.Busy;
+        try self.admitNativeAllocation();
         const space = (self.nativeAddressSpace() orelse return error.State).*;
-        if (self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         try self.channel.?.guard(deadline);
         try self.memory_admission.admit(self, plan.allocation_bytes, policy != null);
         const serial = try std.math.add(u64, self.buffer_serial, 1);
@@ -5227,6 +5224,18 @@ pub const Owner = struct {
         owner.* = value; slot.owner = owner; slot.serial = serial;
         self.buffer_serial = serial; self.native_active = index;
         return .{ .epoch = self.epoch, .serial = serial, .slot = index };
+    }
+    // Address-space lookup intentionally hides a currently loaned RM channel.
+    // Check transient ownership first, so a concurrent allocation retries
+    // instead of treating ordinary buffer reclamation as device corruption.
+    fn admitNativeAllocation(self: *Owner) !void {
+        _ = try self.now();
+        if (self.power_active or self.powerStopping()) return error.Busy;
+        if (self.graph_closing or self.fifo_active != null or self.context_active != null or self.virtuals.active_range != null or self.native_active != null or self.buffer_active != null or self.sequence.self_address != 0 or self.outputs.active()) return error.Busy;
+        if (self.display_upload_job != null or self.display_work != null or self.cursor_point != null or self.cursor_upload != null or
+            self.audio_work != null or self.monitor_work != null or self.sor_work != null) return error.Busy;
+        const channel = if (self.channel) |*value| value else return error.State;
+        if (self.activeChannel() != channel or channel.phase != .idle or channel.pending != null or channel.in_lockdown) return error.Busy;
     }
     fn findNativeBuffer(self: *Owner, handle: BufferHandle) !*vram.Owner {
         _ = try self.now();
