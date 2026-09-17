@@ -3190,7 +3190,15 @@ pub const Owner = struct {
         const grid: u64 = if (lists and backend.queue.supportsRenderGridList()) 256 else 0;
         const color: u64 = if (lists and backend.queue.supportsRenderColorList()) 512 else 0;
         var operations = ordinary | @as(u64, if (direct) 128 else 0) | grid | color;
+        const combined: u64 = if (grid != 0 and color != 0) @as(u64, 1) << r4os.abi.gfx_queue_operation_render_color_grid_list else 0;
+        operations |= combined;
         var rc = backend.queue.updateOperations(&backend.binding, operations);
+        // Old kernels can retain their separate color/grid operations. Never
+        // advertise fused sampling just because both older bits are present.
+        if (combined != 0 and rc == r4os.abi.gfx_queue_error_invalid) {
+            operations &= ~combined;
+            rc = backend.queue.updateOperations(&backend.binding, operations);
+        }
         self.direct_enabled = direct and rc == r4os.abi.gfx_queue_ok;
         if ((direct or grid != 0 or color != 0) and rc == r4os.abi.gfx_queue_error_invalid) { operations = ordinary; rc = backend.queue.updateOperations(&backend.binding, operations); }
         if (rc == r4os.abi.gfx_queue_error_invalid and lists) { operations = 25 | display_bits | native_bit; rc = backend.queue.updateOperations(&backend.binding, operations); }
@@ -3627,7 +3635,7 @@ pub const Owner = struct {
                 .channel = current.channel_handle, .window = current.window, .deadline = work_deadline };
             return true;
         }
-        if (result == a.gfx_queue_ok and (job.operation == a.gfx_queue_operation_render or job.operation == a.gfx_queue_operation_render_list or job.operation == a.gfx_queue_operation_render_grid_list or job.operation == a.gfx_queue_operation_render_color_list)) {
+        if (result == a.gfx_queue_ok and (job.operation == a.gfx_queue_operation_render or job.operation == a.gfx_queue_operation_render_list or job.operation == a.gfx_queue_operation_render_grid_list or job.operation == a.gfx_queue_operation_render_color_list or job.operation == a.gfx_queue_operation_render_color_grid_list)) {
             try self.work_schedule.admit(work_slot, job);
             self.work_slots[work_slot] = .{ .render = .{} };
             self.active_work = work_slot;

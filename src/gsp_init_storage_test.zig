@@ -6832,7 +6832,7 @@ fn checkNativeHeadless(target: *@import("gsp_device.zig").Device, table: *a.Driv
     }
     stage = 1;
     try t.expect(before_display and target.native_graphics.phase == .ready and target.render_startup.phase == .ready and
-        run.graphics_enabled and run.native_copy.phase == .ready and run.copy_backend != null and run.copy_backend.?.operations == 857 and
+        run.graphics_enabled and run.native_copy.phase == .ready and run.copy_backend != null and run.copy_backend.?.operations == 2905 and
         run.presentation == null and target.native_output.phase == .receiver_wait and
         copy.shadow_creates == 0 and NativeCommon.prepares == 0 and NativeCommon.commits == 0);
     const graphics_handle = target.native_graphics.channel.?;
@@ -6904,7 +6904,7 @@ fn checkNativeHeadless(target: *@import("gsp_device.zig").Device, table: *a.Driv
         .{run.nativeOutputs() != null,run.nativeObject() != null,run.outputs.data.count,run.outputs.data.topology.count,run.outputs.data.coherent,
             run.outputs.data.topology.rejected,run.outputs.data.final_rejection,@tagName(run.activeChannel().?.phase),run.power_active,run.context_active,run.fifo_active,run.native_active});
     try t.expect(resumed);
-    try t.expect(target.native_output.phase == .mode_create and run.copy_backend.?.operations == 857 and NativeCommon.commits == 0);
+    try t.expect(target.native_output.phase == .mode_create and run.copy_backend.?.operations == 2905 and NativeCommon.commits == 0);
     // An execution timeout retains the mapped BO and all batch metadata.
     // Only the existing whole-device reset owner may release these holds.
     const batch_end = clock + std.time.ns_per_s;
@@ -7911,7 +7911,7 @@ fn checkRenderWarmup(target: *@import("gsp_device.zig").Device, table: *a.Driver
     checkpoint = 4;
     try checkRenderUpload(target,ce,output);
     for (0..16) |_| { try stepQueuedRendering(target); if (target.render_startup.phase == .ready) break; }
-    try t.expect(target.render_startup.phase == .ready and !run.graphics_starting and run.graphics_enabled and model.render_operations == 857 and
+    try t.expect(target.render_startup.phase == .ready and !run.graphics_starting and run.graphics_enabled and model.render_operations == 2905 and
         run.graphics_cache.program_uploads == 1 and run.graphics_cache.packet_uploads == 0 and run.graphics_cache.uploaded_bytes == output.len);
     var bounded: cache.Owner = .{}; try bounded.initialize(run.epoch);
     try t.expectError(error.Exhausted,bounded.admitStorage(.programs,cache.slot_budget_bytes+1));
@@ -8006,13 +8006,13 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
     try t.expect(!try run.beginCopyWork(ce,model.binding,deadline));
     if (!run.graphics_enabled) try run.enableGraphicsQueue(target.native_graphics.channel.?,ce)
     // Reinstalling a fresh host memory view does not re-register the runtime.
-    else model.render_operations = 857;
-    try t.expect(model.render_operations == 857 and run.graphics_enabled);
+    else model.render_operations = 2905;
+    try t.expect(model.render_operations == 2905 and run.graphics_enabled);
     if (scene_index == 11 and !graphicsFaultScenario(scenario)) {
         try checkQueuedSlices(target,ce,native_index,target_image,deadline);
         table.gfx_memory_query = old_memory; table.gfx_queue_query = old_queue;
         model.installRender(table,native_index);
-        model.render_operations = 857;
+        model.render_operations = 2905;
         before = run.graphics_completed;
         @memset(target_data,0xcc);
         for (0..24) |y| @memcpy(target_data[y*target_image.pitch..][0..128],target_pixels[y*128..][0..128]);
@@ -8060,13 +8060,14 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
         try t.expect(rejected.source == .host and rejected.kind == .graphics_command and rejected.render_phase == .admission and
             !rejected.fatal and rejected.shader == .none and std.meta.eql(rejected.active_fence,model.job.fence));
     }
-    const rounds: usize = if (scene.solid and !graphicsFaultScenario(scenario)) 2 else 1;
     const gridded = scene_index == 0 and !graphicsFaultScenario(scenario);
     const colored = scene_index == 8 and !graphicsFaultScenario(scenario);
+    const rounds: usize = if ((scene.solid or colored) and !graphicsFaultScenario(scenario)) 2 else 1;
     const batched = gridded or colored or scene_index == 3 or graphicsFaultScenario(scenario);
     var packet_storage: [render.packet_capacity_bytes]u8 = undefined;
     const packet = packet_storage[0..if (batched) render.packet_capacity_bytes else render.packet_bytes];
     for (0..rounds) |round| {
+        const combined = colored and round == 1;
         const completed_copy = model.completed;
         const last = round+1 == rounds;
         const ce_put = run.fifos[ce.slot].owner.?.ring.put;
@@ -8090,9 +8091,9 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
                     .width = clip[0] + (clip[2] - clip[0]) * @as(u32, @intCast(index % 4 + 1)) / 4 - x,
                     .height = clip[1] + (clip[3] - clip[1]) * @as(u32, @intCast(index / 4 + 1)) / 4 - y };
             }
-            if (colored) {
+            if (colored and !combined) {
                 model.enqueueRenderColorList(native_index,source_index.?,&commands,.{ .words = queuedSrgbProgram().words },deadline);
-            } else if (gridded) {
+            } else if (gridded or combined) {
                 // At scale60 each native center is logical2*x+1. A doubled
                 // viewport reproduces the existing frozen nearest oracle,
                 // through the actual grid job, CE packet and GR receipt.
@@ -8102,20 +8103,21 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
                     .viewport_width = scene.destination.width * 2, .viewport_height = scene.destination.height * 2,
                     .guest_width = scene.source_rect.width, .guest_height = scene.source_rect.height,
                 });
-                model.enqueueRenderGridList(native_index, source_index, &commands, &grids, deadline);
+                if (combined) model.enqueueRenderColorGridList(native_index, source_index.?, &commands, &grids, .{ .words = queuedSrgbProgram().words }, deadline)
+                else model.enqueueRenderGridList(native_index, source_index, &commands, &grids, deadline);
             } else model.enqueueRenderList(native_index, source_index, &commands, deadline);
         } else model.enqueueRender(native_index, source_index, command, deadline);
         try t.expect(try run.beginCopyWork(ce,model.binding,deadline));
         try t.expect(model.active and run.copy_job == null and run.queued_render != null);
         if (batched) model.render_list.commands[15].opacity ^= 1; // Driver owns its copied list.
-        if (gridded) model.render_grids[15].scale = 0;
+        if (gridded or combined) model.render_grids[15].scale = 0;
         if (colored) model.render_color.words[32] = @bitCast(std.math.nan(f32)); // Retained copy must stay valid.
         if (last) {
             try run.releaseNativeBuffer(buffer);
             if (source_buffer) |value| try run.releaseNativeBuffer(value);
         }
         const load = @import("gsp_fifo_wire.zig").word;
-        if (round == 0) {
+        if (round == 0 or combined) {
             for (0..20) |_| {
                 try stepQueuedRendering(target);
                 if (target.phase != .ready) return error.RenderQueue;
@@ -8123,7 +8125,7 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
             }
             try t.expect(run.graphics_upload != null);
             try checkRenderUpload(target,ce,packet);
-            if (gridded) {
+            if (gridded or combined) {
                 try t.expect(load(packet, 15 * render.packet_bytes + 544) == 1 and
                     load(packet, 15 * render.packet_bytes + 552) == 60);
             }

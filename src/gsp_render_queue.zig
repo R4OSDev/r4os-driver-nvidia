@@ -43,15 +43,15 @@ pub const Owner = struct {
         self.* = .{ .self_address = @intFromPtr(self), .queue = queue, .memory = memory, .pixel_limit = pixel_limit,
             .binding = binding, .job = job, .stamp = job, .deadline = job.deadline_ns };
         if (job.version != 1 or job.size < @offsetOf(a.GfxDriverJob, "producer_kind") or
-            (job.operation != a.gfx_queue_operation_render and job.operation != a.gfx_queue_operation_render_list and job.operation != a.gfx_queue_operation_render_grid_list and job.operation != a.gfx_queue_operation_render_color_list) or
+            (job.operation != a.gfx_queue_operation_render and job.operation != a.gfx_queue_operation_render_list and job.operation != a.gfx_queue_operation_render_grid_list and job.operation != a.gfx_queue_operation_render_color_list and job.operation != a.gfx_queue_operation_render_color_grid_list) or
             job.reserved0 != 0 or job.reserved1 != 0 or job.source_offset != 0 or job.target_offset != 0 or job.byte_length != 0 or
             job.row_count != 0 or job.source_pitch != 0 or job.target_pitch != 0 or job.render.reserved0 != 0 or
             job.fence.timeline == 0 or job.fence.point == 0 or job.fence.adapter_id != binding.adapter_id or
             job.fence.device_generation != binding.device_generation or job.fence.reset_generation != binding.reset_generation) {
             self.failed = true; return error.Descriptor;
         }
-        if (job.operation == a.gfx_queue_operation_render_list or job.operation == a.gfx_queue_operation_render_grid_list or job.operation == a.gfx_queue_operation_render_color_list) {
-            if (job.operation == a.gfx_queue_operation_render_color_list) {
+        if (job.operation == a.gfx_queue_operation_render_list or job.operation == a.gfx_queue_operation_render_grid_list or job.operation == a.gfx_queue_operation_render_color_list or job.operation == a.gfx_queue_operation_render_color_grid_list) {
+            if (job.operation == a.gfx_queue_operation_render_color_list or job.operation == a.gfx_queue_operation_render_color_grid_list) {
                 var mapped: a.GfxRenderColorList = .{};
                 if (queue.readRenderColorList(&job.fence, &mapped) != a.gfx_queue_ok or mapped.version != 1 or
                     mapped.size != @sizeOf(a.GfxRenderColorList) or mapped.reserved0 != 0 or mapped.program.version != 1 or
@@ -61,12 +61,15 @@ pub const Owner = struct {
                 const color: render.ColorProgram = .{ .words = mapped.program.words };
                 color.validate() catch { self.failed = true; return error.Descriptor; };
                 self.list = .{ .count = mapped.count, .commands = mapped.commands }; self.color = color;
-            } else if (job.operation == a.gfx_queue_operation_render_grid_list) {
+            }
+            if (job.operation == a.gfx_queue_operation_render_grid_list or job.operation == a.gfx_queue_operation_render_color_grid_list) {
                 var mapped: a.GfxRenderGridList = .{};
                 if (queue.readRenderGridList(&job.fence, &mapped) != a.gfx_queue_ok or mapped.version != 1 or
                     mapped.size != @sizeOf(a.GfxRenderGridList) or mapped.reserved0 != 0) { self.failed = true; return error.Descriptor; }
-                self.list = .{ .count = mapped.count, .commands = mapped.commands }; self.grids = mapped.grids;
-            } else if (queue.readRenderList(&job.fence, &self.list) != a.gfx_queue_ok) { self.failed = true; return error.Descriptor; }
+                const list: a.GfxRenderList = .{ .count = mapped.count, .commands = mapped.commands };
+                if (self.color != null and !std.meta.eql(self.list, list)) { self.failed = true; return error.Descriptor; }
+                self.list = list; self.grids = mapped.grids;
+            } else if (self.color == null and queue.readRenderList(&job.fence, &self.list) != a.gfx_queue_ok) { self.failed = true; return error.Descriptor; }
             if (self.list.version != 1 or self.list.size < @sizeOf(a.GfxRenderList) or self.list.reserved0 != 0 or
                 self.list.count == 0 or self.list.count > render.batch_capacity or
                 !std.meta.eql(self.list.commands[0], job.render)) { self.failed = true; return error.Descriptor; }
