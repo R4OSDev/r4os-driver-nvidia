@@ -23,7 +23,7 @@ const Node = struct {
     closing: bool = false,
 
     fn mask(self: *const Node) u32 {
-        return switch (self.engine) { .graphics => |*owner| owner.engine_mask, .video => nv.native_engine_video };
+        return switch (self.engine) { .graphics => |*owner| owner.engine_mask, .video => |*owner| owner.mask() };
     }
     fn requestClose(self: *Node) !void {
         switch (self.engine) { inline else => |*owner| try owner.requestClose() }
@@ -104,7 +104,7 @@ pub const Owner = struct {
             return false;
         }
         if (run.epoch != self.epoch or run.copy_backend == null or !std.meta.eql(run.copy_backend.?.binding, self.binding)) return error.Stale;
-        // NVDEC can start without a GR golden context. A later ready renderer
+        // NVDEC/NVENC can start without a GR golden context. A later ready renderer
         // supplies the template only for subsequent graphics queue creation.
         if (self.source == null) if (source) |template| {
             if (template.phase == .ready and !template.closing) {
@@ -173,9 +173,9 @@ pub const Owner = struct {
         }
         const node: *Node = @ptrFromInt(self.spare.cpu_address);
         node.* = .{ .allocation = self.spare, .stamp = self.spare, .producer = identity, .jobs = 1 };
-        const start = if (engine_mask == nv.native_engine_video) blk: {
+        const start = if (engine_mask == nv.native_engine_video or engine_mask == nv.native_engine_encode) blk: {
             node.engine = .{ .video = .{} };
-            break :blk node.engine.video.request();
+            break :blk node.engine.video.requestKind(if (engine_mask == nv.native_engine_encode) .encode else .decode);
         } else if (self.source) |template| node.engine.graphics.requestEngines(template, engine_mask) else error.Unsupported;
         start catch |err| {
             try self.releaseSpare();

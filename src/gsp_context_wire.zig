@@ -360,10 +360,15 @@ pub const CopyTopology = struct {
 pub const Reply = union(enum) { rejected: u32, ok: []const u8 };
 pub fn nvEngine(rm: u32) Error!u32 {
     return if (rm >= 1 and rm <= 18) rm else if (rm >= 19 and rm <= 28) rm - 19 + 0x34
-        else if (rm >= 29 and rm <= 36) rm - 29 + 0x13 else error.Unsupported;
+        else if (rm >= 29 and rm <= 36) rm - 29 + 0x13
+        else if (rm >= 37 and rm <= 39) rm - 37 + 0x1b
+        else if (rm == 40) 0x3f else error.Unsupported;
 }
 pub fn nvdecInstance(rm: u32) Error!u32 {
     return if (rm >= 29 and rm <= 36) rm - 29 else error.Unsupported;
+}
+pub fn nvencInstance(rm: u32) Error!u32 {
+    return if (rm >= 37 and rm <= 40) rm - 37 else error.Unsupported;
 }
 pub fn function(op: Operation) u32 { return switch (op) { .classes, .engines, .method_size, .graphics_info, .timeslice => 76, .group, .share => 103, .free_share, .free_group => 10 }; }
 pub fn command(op: Operation) u32 { return switch (op) { .classes => 0x800292, .engines => 0x20801112, .method_size => 0x20802a08, .graphics_info => 0x20800a32, .timeslice => timeslice.command, else => 0 }; }

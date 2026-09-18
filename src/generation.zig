@@ -26,6 +26,11 @@ pub const Profile = struct {
     pub fn nvdecClass(self: *const Profile) u32 {
         return switch (self.family) { .turing => 0xc4b0, .ampere => 0xc7b0, .ada => 0xc9b0, .blackwell => 0xcfb0 };
     }
+    /// Separate NVENC object class, not a codec or bootstrap capability.
+    /// Nouveau generation tables, pinned in GFX/0.79.41/SourceIndex.json.
+    pub fn nvencClass(self: *const Profile) u32 {
+        return switch (self.family) { .turing => 0xc4b7, .ampere => 0xc7b7, .ada => 0xc9b7, .blackwell => 0xcfb7 };
+    }
 };
 fn display(root: u32, window: u32) Display {
     return .{ .root = root | 0x70, .core = root | 0x7d, .window = window | 0x7e,

@@ -1,9 +1,11 @@
 // Copyright 2026 R4. SPDX-License-Identifier: Apache-2.0
-//! Per-decoder RM context/channel lifecycle. Runtime owns physical resources;
+//! Per-video-engine RM context/channel lifecycle. Runtime owns physical resources;
 //! this worker retains handles through every pending operation and close.
 const std = @import("std");
 const runtime = @import("gsp_runtime.zig");
 const context_wire = @import("gsp_context_wire.zig");
+const nv = @import("r4nv_binding");
+pub const Kind = enum { decode, encode };
 pub const Phase = enum {
     detached, waiting, context_start, context_wait, methods_allocate, methods_attach,
     instance_allocate, storage_wait, storage_release, channel_start, channel_wait,
@@ -16,6 +18,7 @@ pub const Owner = struct {
     context: ?runtime.ContextHandle = null,
     channel: ?runtime.ChannelHandle = null,
     storage: ?runtime.BufferHandle = null,
+    kind: Kind = .decode,
     rm_engine: u32 = 29,
     method_bytes: u32 = 0,
     epoch: u64 = 0,
@@ -28,8 +31,15 @@ pub const Owner = struct {
     rm_status: ?u32 = null,
 
     pub fn request(self: *Owner) !void {
+        return self.requestKind(.decode);
+    }
+    pub fn requestKind(self: *Owner, kind: Kind) !void {
         if (self.self_address != 0) return error.State;
-        self.* = .{ .self_address = @intFromPtr(self), .phase = .waiting };
+        self.* = .{ .self_address = @intFromPtr(self), .phase = .waiting, .kind = kind,
+            .rm_engine = if (kind == .encode) 37 else 29 };
+    }
+    pub fn mask(self: *const Owner) u32 {
+        return if (self.kind == .encode) nv.native_engine_encode else nv.native_engine_video;
     }
     pub fn requestClose(self: *Owner) !void {
         if (self.self_address != @intFromPtr(self)) return error.State;
@@ -90,7 +100,7 @@ pub const Owner = struct {
         };
         switch (self.phase) {
             .context_start => {
-                _ = try context_wire.nvdecInstance(self.rm_engine);
+                _ = if (self.kind == .encode) try context_wire.nvencInstance(self.rm_engine) else try context_wire.nvdecInstance(self.rm_engine);
                 self.context = try run.createExecutionContext(self.rm_engine, self.phase_deadline);
                 self.next(.context_wait);
             },
@@ -101,7 +111,7 @@ pub const Owner = struct {
                 const info = status.info orelse {
                     // Only an absent enumerated engine advances discovery.
                     // Class/allocation/transport rejection never substitutes it.
-                    self.next_engine = status.rejected == null and status.unavailable == .engine and self.rm_engine < 36;
+                    self.next_engine = status.rejected == null and status.unavailable == .engine and self.rm_engine < @as(u32, if (self.kind == .encode) 40 else 36);
                     self.reason = error.Unsupported; self.rm_status = status.rejected;
                     self.next(.context_close); return true;
                 };
@@ -130,7 +140,9 @@ pub const Owner = struct {
                 self.storage = null; self.next(self.after_storage);
             },
             .channel_start => {
-                self.channel = try run.createNvdecChannel(self.context.?, 0, self.storage.?, self.phase_deadline);
+                self.channel = if (self.kind == .encode)
+                    try run.createNvencChannel(self.context.?, 0, self.storage.?, self.phase_deadline)
+                else try run.createNvdecChannel(self.context.?, 0, self.storage.?, self.phase_deadline);
                 self.retireStorage(.channel_wait);
             },
             .channel_wait => {
@@ -141,11 +153,13 @@ pub const Owner = struct {
                     self.reason = status.host_rejected orelse error.Unsupported; self.rm_status = status.rejected;
                     self.next(.channel_close); return true;
                 };
-                if (info.config.engine != .nvdec or info.config.rm_engine != self.rm_engine or
-                    info.config.object_class != try run.nvdecClass() or info.config.graphics != null or
-                    info.config.engine_mask != @import("r4nv_binding").native_engine_video) return error.Descriptor;
-                // Ready means RM channel allocation only. It is no decoder
-                // success receipt: each picture must inspect NVDEC status.
+                const expected_engine: @import("gsp_fifo_wire.zig").Engine = if (self.kind == .encode) .nvenc else .nvdec;
+                const expected_class = if (self.kind == .encode) try run.nvencClass() else try run.nvdecClass();
+                if (info.config.engine != expected_engine or info.config.rm_engine != self.rm_engine or
+                    info.config.object_class != expected_class or info.config.graphics != null or
+                    info.config.engine_mask != self.mask()) return error.Descriptor;
+                // Ready means RM channel allocation only. Each codec must
+                // independently validate its picture status and output bounds.
                 self.next(.ready);
             },
             .channel_close => {

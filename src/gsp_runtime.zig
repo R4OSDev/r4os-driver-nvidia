@@ -3070,6 +3070,11 @@ pub const Owner = struct {
     pub fn createNvdecChannel(self: *Owner, context_handle: ContextHandle, runqueue: u8, instance: BufferHandle, deadline: u64) !ChannelHandle {
         return self.createChannel(context_handle, runqueue, instance, null, .nvdec, deadline);
     }
+    /// NVENC owns a separate engine context; allocation is not a successful
+    /// encoding receipt. The producer must inspect per-picture status/length.
+    pub fn createNvencChannel(self: *Owner, context_handle: ContextHandle, runqueue: u8, instance: BufferHandle, deadline: u64) !ChannelHandle {
+        return self.createChannel(context_handle, runqueue, instance, null, .nvenc, deadline);
+    }
     /// Pinned C797 graphics channel, separate from CE but using the same RM
     /// ownership, private USERD and protected submission transport.
     pub fn createGraphicsChannel(self: *Owner, context_handle: ContextHandle, runqueue: u8, instance: BufferHandle, deadline: u64) !ChannelHandle {
@@ -3142,6 +3147,12 @@ pub const Owner = struct {
         const session = device.runtime_session orelse return error.State;
         if (session.epoch != self.epoch) return error.Stale;
         return (@import("generation.zig").get(session.profile.chip_id) orelse return error.Unsupported).nvdecClass();
+    }
+    pub fn nvencClass(self: *const Owner) !u32 {
+        const device = self.device orelse return error.State;
+        const session = device.runtime_session orelse return error.State;
+        if (session.epoch != self.epoch) return error.Stale;
+        return (@import("generation.zig").get(session.profile.chip_id) orelse return error.Unsupported).nvencClass();
     }
     pub fn attachGraphicsCache(self: *Owner, kind: render_cache.Kind, buffer: BufferHandle) !void {
         _ = try self.now();

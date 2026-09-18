@@ -336,6 +336,7 @@ pub const Owner = struct {
             .copy => if (parent_info.rm_engine < 9 or parent_info.rm_engine > 28) return error.Unsupported,
             .graphics => if (parent_info.rm_engine != 1) return error.Unsupported,
             .nvdec => { _ = try context.wire.nvdecInstance(parent_info.rm_engine); },
+            .nvenc => { _ = try context.wire.nvencInstance(parent_info.rm_engine); },
         }
         const graphics = if (engine == .graphics) try parent.graphicsPromotion() else null;
         if (graphics != null and graphics.?.golden and engine_mask != nv.native_engine_graphics) return error.Unsupported;
@@ -440,7 +441,7 @@ pub const Owner = struct {
                 // receives no host methods, and closes before normal work.
                 if (self.golden() and !self.enabled) break :blk .enable;
                 if (self.config.system_userd and !self.engine_live) break :blk switch (self.config.engine) {
-                    .graphics => .allocate_graphics, .copy => .allocate_copy, .nvdec => .allocate_nvdec, .none => return error.State,
+                    .graphics => .allocate_graphics, .copy => .allocate_copy, .nvdec => .allocate_nvdec, .nvenc => .allocate_nvenc, .none => return error.State,
                 };
                 if (self.config.compute_handle != 0 and !self.compute_live) break :blk .allocate_compute;
                 if (self.config.copy_handle != 0 and !self.copy_live) break :blk .allocate_gr_copy;
@@ -475,7 +476,7 @@ pub const Owner = struct {
             .allocate => { self.live = true; self.cid = reply.ok; },
             .bind => self.bound = true,
             .token => self.work_submit_token = reply.ok,
-            .allocate_copy, .allocate_nvdec => self.engine_live = true,
+            .allocate_copy, .allocate_nvdec, .allocate_nvenc => self.engine_live = true,
             .promote_graphics => self.graphics_promoted = true,
             .allocate_graphics => { self.engine_live = true; self.engine_caps = reply.ok; self.graphics_initialized = true; },
             .allocate_compute => self.compute_live = true,
@@ -492,7 +493,7 @@ pub const Owner = struct {
     fn prepareCommands(self: *Owner) Error!void {
         try wire.validate(self.config);
         if (self.config.system_userd) try self.ring.openKind(&self.commands.?.backing, self.config.address, switch (self.config.engine) {
-            .graphics => .graphics, .copy => .copy, .nvdec => .nvdec, .none => return error.State,
+            .graphics => .graphics, .copy => .copy, .nvdec => .nvdec, .nvenc => .nvenc, .none => return error.State,
         });
     }
     pub fn prepareCopy(self: *Owner, transfer: copy.wire.Transfer) Error!copy.Ticket {

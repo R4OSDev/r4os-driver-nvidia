@@ -145,7 +145,7 @@ pub const wire = @import("gsp_copy_wire.zig");
 pub const graphics = @import("gsp_gr_wire.zig");
 pub const batch = @import("gsp_push_batch.zig");
 pub const Error = wire.Error || graphics.Error || storage.Error || error{ Stale, State, Exhausted, Completion, Retained };
-pub const Kind = enum { copy, graphics, nvdec };
+pub const Kind = enum { copy, graphics, nvdec, nvenc };
 // C56F transport length is independent of the CE encoder's admitted packet
 // lengths. The private command page bounds both engine producers to 4 KB.
 fn entryWords(address: u64, count: u32) Error![2]u32 {

@@ -80,7 +80,7 @@ pub const Model = struct {
         return a.gfx_buffer_result_ok;
     }
     fn create(input: *const a.GfxBufferDescriptor, out: *a.GfxBufferReference) callconv(.c) i32 {
-        // The ordinary control fixture owns its five-page allocation only.
+        // The ordinary control fixture owns the renderer-sized allocation only.
         // The dedicated power fixture supplies an independent DMA page.
         if (input.byte_length == storage.shared_page_bytes) return power.create(input, out);
         std.debug.assert(!active and input.byte_length == storage.bytes and input.alignment == 4096);

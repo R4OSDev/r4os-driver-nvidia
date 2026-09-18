@@ -5,6 +5,16 @@ depth/stencil attribute selection follow NVIDIA570.144 nvos.h, TU102 dev_mmu.h
 and mem_mgr_tu102.c (MIT). Complete source notices accompany the encoder;
 the memory-manager notice is added to the packaged/image runtime license.
 
+NVENC channel metadata (0.79.41): NVIDIA570.144 nvos.h,
+gpu_engine_type.h and cl2080_notification.h define the allocation layout
+and four RM/NV2080 identities, including the NVENC3 numbering gap. Their
+complete original MIT notices are already retained in the runtime license
+and context/FIFO wire sources. Nouveau generation tables and r535/nvenc.c
+retain their existing Red Hat/NVIDIA MIT notices. The original-header C
+fixture and input hashes are in src/fixtures/nvenc-allocation-570.144.json.
+No new firmware or upstream implementation is linked. R4OS video-engine
+lifecycle and resource ownership remain Apache-2.0.
+
 NVDEC channel metadata (0.79.40): allocation fields use NVIDIA570.144 nvos.h;
 engine IDs and generation classes follow the pinned Nouveau RM tables and
 r535/nvdec.c (MIT). Original NVIDIA and Red Hat notices are already retained
