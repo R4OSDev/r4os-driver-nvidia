@@ -18,7 +18,13 @@ pub fn check() !void {
     const types = @embedFile("fixtures/context-engines-570.144.bin");
     for (0..28) |i| try t.expectEqual(wire.word(types, i * 8 + 4), try wire.nvEngine(wire.word(types, i * 8)));
     try t.expectError(error.Unsupported, wire.nvEngine(0));
-    try t.expectError(error.Unsupported, wire.nvEngine(29));
+    for (0..8) |i| {
+        try t.expectEqual(@as(u32, @intCast(0x13 + i)), try wire.nvEngine(@intCast(29 + i)));
+        try t.expectEqual(@as(u32, @intCast(i)), try wire.nvdecInstance(@intCast(29 + i)));
+    }
+    try t.expectError(error.Unsupported, wire.nvEngine(37));
+    try t.expectError(error.Unsupported, wire.nvdecInstance(28));
+    try t.expectError(error.Unsupported, wire.nvdecInstance(37));
     var request: [wire.max_bytes]u8 = undefined;
     var reply: [wire.max_bytes]u8 = undefined;
     // NVA06C_CTRL_CMD_SET_TIMESLICE / NVA06C_CTRL_TIMESLICE_PARAMS from

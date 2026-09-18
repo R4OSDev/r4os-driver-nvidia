@@ -7,6 +7,7 @@ const a = r4os.abi;
 const nv = @import("r4nv_binding");
 const runtime = @import("gsp_runtime.zig");
 const graphics = @import("gsp_native_graphics.zig");
+const video = @import("gsp_native_video.zig");
 const batch = @import("gsp_push_batch.zig");
 const Tree = std.Treap(u64, std.math.order);
 pub const operation_bit: u64 = @as(u64, 1) << a.gfx_queue_operation_native;
@@ -17,9 +18,33 @@ const Node = struct {
     allocation: a.DriverHeapAllocation,
     stamp: a.DriverHeapAllocation,
     producer: @import("gsp_work_scheduling.zig").Producer,
-    graphics: graphics.Owner = .{},
+    engine: union(enum) { graphics: graphics.Owner, video: video.Owner } = .{ .graphics = .{} },
     jobs: usize = 0,
     closing: bool = false,
+
+    fn mask(self: *const Node) u32 {
+        return switch (self.engine) { .graphics => |*owner| owner.engine_mask, .video => nv.native_engine_video };
+    }
+    fn requestClose(self: *Node) !void {
+        switch (self.engine) { inline else => |*owner| try owner.requestClose() }
+    }
+    fn step(self: *Node, run: *runtime.Owner) !bool {
+        return switch (self.engine) { .graphics => |*owner| owner.step(run, true), .video => |*owner| owner.step(run) };
+    }
+    fn done(self: *const Node) bool {
+        return switch (self.engine) { inline else => |*owner| owner.phase == .closed or owner.phase == .unavailable };
+    }
+    fn channel(self: *const Node) !runtime.ChannelHandle {
+        return switch (self.engine) { inline else => |*owner| blk: {
+            if (owner.phase != .ready) return error.Busy;
+            break :blk owner.channel orelse error.State;
+        } };
+    }
+    fn retiring(self: *const Node, handle: runtime.ChannelHandle) bool {
+        if (!self.closing or self.jobs != 0) return false;
+        return switch (self.engine) { inline else => |*owner| owner.channel != null and
+            std.meta.eql(owner.channel.?, handle) and owner.phase == .channel_close };
+    }
 };
 fn validAllocation(value: a.DriverHeapAllocation, bytes: usize, alignment: usize) bool {
     return value.version == 1 and value.size >= @sizeOf(a.DriverHeapAllocation) and value.handle != 0 and value.reserved == 0 and
@@ -51,21 +76,23 @@ pub const Owner = struct {
     pub fn wake(self: *Owner) void {
         self.dirty = true;
     }
+    pub fn ready(self: *const Owner) bool {
+        return self.heap != null;
+    }
 
     pub fn step(self: *Owner, run: *runtime.Owner, source: ?*const graphics.Owner) !bool {
         if (run.failure != null) return false;
-        if (self.source == null) {
-            const template = source orelse return false;
+        if (!self.ready()) {
             const backend = if (run.copy_backend) |*value| value else return false;
             const table = backend.queue.table;
-            if (run.graph_closing or template.phase != .ready or template.closing or run.virtual_provider.handle.id == 0 or
+            if (run.graph_closing or run.virtual_provider.handle.id == 0 or
                 table.size < @sizeOf(a.GfxDriverQueueApi) or table.read_native_info == 0 or table.read_native_data == 0 or
                 table.read_native_binding == 0 or table.queue_owner_info == 0) return false;
             const rc = backend.queue.updateOperations(&backend.binding, backend.operations | operation_bit);
             if (rc == a.gfx_queue_error_busy) return false;
             if (rc != 1) return error.Queue;
             backend.operations |= operation_bit;
-            self.source = template;
+            self.source = if (source) |template| if (template.phase == .ready and !template.closing) template else null else null;
             self.epoch = run.epoch;
             self.binding = backend.binding;
             self.queue = backend.queue;
@@ -77,6 +104,14 @@ pub const Owner = struct {
             return false;
         }
         if (run.epoch != self.epoch or run.copy_backend == null or !std.meta.eql(run.copy_backend.?.binding, self.binding)) return error.Stale;
+        // NVDEC can start without a GR golden context. A later ready renderer
+        // supplies the template only for subsequent graphics queue creation.
+        if (self.source == null) if (source) |template| {
+            if (template.phase == .ready and !template.closing) {
+                self.source = template;
+                return true;
+            }
+        };
         if (self.dirty) {
             self.scan_remaining = self.count;
             self.dirty = false;
@@ -92,10 +127,10 @@ pub const Owner = struct {
             node.closing = node.closing or info.closing == 1;
         } else return error.Queue;
         if (run.graph_closing) node.closing = true;
-        if (node.closing and node.jobs == 0) try node.graphics.requestClose();
-        const progress = try node.graphics.step(run, true);
+        if (node.closing and node.jobs == 0) try node.requestClose();
+        const progress = try node.step(run);
         if (progress) self.scan_remaining = self.count;
-        if (node.jobs == 0 and (node.graphics.phase == .closed or node.graphics.phase == .unavailable)) {
+        if (node.jobs == 0 and node.done()) {
             try self.remove(node);
             return true;
         }
@@ -111,7 +146,8 @@ pub const Owner = struct {
         self.spare_valid = false;
     }
     fn acquire(self: *Owner, run: *runtime.Owner, job: a.GfxDriverJob, engine_mask: u32) !*Node {
-        if (self.source == null or self.epoch != run.epoch or self.spare.handle != 0) return error.Unsupported;
+        if (!self.ready() or self.epoch != run.epoch or self.spare.handle != 0 or
+            !@import("gsp_fifo_wire.zig").validNativeEngines(engine_mask)) return error.Unsupported;
         const identity = producer(job);
         var info: a.GfxQueueOwnerInfo = .{};
         const rc = self.queue.queueOwnerInfo(&self.binding, job.fence.timeline, &info);
@@ -122,8 +158,8 @@ pub const Owner = struct {
             const node: *Node = @fieldParentPtr("index", index);
             try self.validate(node);
             if (!std.meta.eql(node.producer, identity)) return error.Stale;
-            if (engine_mask & ~node.graphics.engine_mask != 0) return error.Unsupported;
-            if (node.closing or node.graphics.phase == .closed or node.graphics.phase == .unavailable) return error.Cancelled;
+            if (engine_mask & ~node.mask() != 0) return error.Unsupported;
+            if (node.closing or node.done()) return error.Cancelled;
             node.jobs = try std.math.add(usize, node.jobs, 1);
             return node;
         }
@@ -137,7 +173,11 @@ pub const Owner = struct {
         }
         const node: *Node = @ptrFromInt(self.spare.cpu_address);
         node.* = .{ .allocation = self.spare, .stamp = self.spare, .producer = identity, .jobs = 1 };
-        node.graphics.requestEngines(self.source.?, engine_mask) catch |err| {
+        const start = if (engine_mask == nv.native_engine_video) blk: {
+            node.engine = .{ .video = .{} };
+            break :blk node.engine.video.request();
+        } else if (self.source) |template| node.engine.graphics.requestEngines(template, engine_mask) else error.Unsupported;
+        start catch |err| {
             try self.releaseSpare();
             return err;
         };
@@ -173,14 +213,13 @@ pub const Owner = struct {
     }
     pub fn retiring(self: *const Owner, handle: runtime.ChannelHandle) bool {
         var node = self.head;
-        while (node) |value| : (node = value.next) if (value.closing and value.jobs == 0 and value.graphics.channel != null and
-            std.meta.eql(value.graphics.channel.?, handle) and value.graphics.phase == .channel_close) return true;
+        while (node) |value| : (node = value.next) if (value.retiring(handle)) return true;
         return false;
     }
     /// Runtime calls this only after all physical contexts/channels have
     /// consumed the same reset proof; these are now merely host descriptors.
     pub fn closeAfterReset(self: *Owner, proof: @import("gsp_reset.zig").Quiescence, epoch: u64) !bool {
-        if (self.source == null and self.head == null and self.spare.handle == 0) return true;
+        if (!self.ready() and self.head == null and self.spare.handle == 0) return true;
         if (!proof.valid(epoch) or epoch != self.epoch) return error.Stale;
         if (self.spare.handle != 0) {
             try self.releaseSpare();
@@ -242,8 +281,7 @@ pub const Job = struct {
     }
     pub fn channel(self: *const Job) !runtime.ChannelHandle {
         const node = self.node orelse return error.State;
-        if (node.graphics.phase != .ready) return error.Busy;
-        return node.graphics.channel orelse error.State;
+        return node.channel();
     }
     pub fn validate(self: *const Job, run: *const runtime.Owner) !void {
         if (self.self_address != @intFromPtr(self) or !std.meta.eql(self.job, self.stamp) or self.epoch != run.epoch or
@@ -294,7 +332,7 @@ pub const Job = struct {
                     self.info.revision != 1 or self.info.command_bytes < @sizeOf(nv.R4NvNativeSubmitHeader)) return error.Unsupported;
                 try self.read(0, std.mem.asBytes(&self.header));
                 if (self.header.version != nv.native_submit_version or self.header.size != @sizeOf(nv.R4NvNativeSubmitHeader) or
-                    !@import("gsp_fifo_wire.zig").validGraphicsEngines(self.header.engine_mask) or self.header.reserved0 != 0 or self.header.reserved1 != 0 or
+                    !@import("gsp_fifo_wire.zig").validNativeEngines(self.header.engine_mask) or self.header.reserved0 != 0 or self.header.reserved1 != 0 or
                     self.header.push_count > batch.capacity or self.info.command_bytes != @sizeOf(nv.R4NvNativeSubmitHeader) +
                     self.header.push_count * @sizeOf(nv.R4NvNativePush)) return error.Unsupported;
                 self.phase = .count_bindings;
@@ -350,7 +388,7 @@ pub const Job = struct {
             .context => {
                 if (self.node == null) self.node = try run.native_queues.acquire(run, self.job, self.header.engine_mask);
                 if (self.node.?.closing) return error.Cancelled;
-                if (self.node.?.graphics.phase == .unavailable or self.node.?.graphics.phase == .closed) return error.Unsupported;
+                if (self.node.?.done()) return error.Unsupported;
                 _ = try self.channel();
                 self.phase = .submit;
             },

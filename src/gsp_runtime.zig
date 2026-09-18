@@ -3065,13 +3065,18 @@ pub const Owner = struct {
     pub fn createCopyChannel(self: *Owner, context_handle: ContextHandle, runqueue: u8, instance: BufferHandle, deadline: u64) !ChannelHandle {
         return self.createChannel(context_handle, runqueue, instance, null, .copy, deadline);
     }
+    /// Decoder object under an actually enumerated NVDEC context. This does
+    /// not advertise codecs; picture/status and output admission are separate.
+    pub fn createNvdecChannel(self: *Owner, context_handle: ContextHandle, runqueue: u8, instance: BufferHandle, deadline: u64) !ChannelHandle {
+        return self.createChannel(context_handle, runqueue, instance, null, .nvdec, deadline);
+    }
     /// Pinned C797 graphics channel, separate from CE but using the same RM
     /// ownership, private USERD and protected submission transport.
     pub fn createGraphicsChannel(self: *Owner, context_handle: ContextHandle, runqueue: u8, instance: BufferHandle, deadline: u64) !ChannelHandle {
         return self.createChannel(context_handle, runqueue, instance, null, .graphics, deadline);
     }
     fn createChannel(self: *Owner, context_handle: ContextHandle, runqueue: u8, instance: BufferHandle, userd: ?BufferHandle, engine: execution_fifo.wire.Engine, deadline: u64) !ChannelHandle {
-        return self.openChannel(context_handle, runqueue, instance, userd, engine, @import("r4nv_binding").native_engine_graphics, deadline) catch |err| { self.hostRejection(.channel, err); return err; };
+        return self.openChannel(context_handle, runqueue, instance, userd, engine, execution_fifo.wire.defaultEngineMask(engine), deadline) catch |err| { self.hostRejection(.channel, err); return err; };
     }
     pub fn createNativeGraphicsChannel(self: *Owner, context_handle: ContextHandle, runqueue: u8, instance: BufferHandle, engine_mask: u32, deadline: u64) !ChannelHandle {
         return self.openChannel(context_handle, runqueue, instance, null, .graphics, engine_mask, deadline) catch |err| { self.hostRejection(.channel, err); return err; };
@@ -3131,6 +3136,12 @@ pub const Owner = struct {
         const session = device.runtime_session orelse return error.State;
         if (session.epoch != self.epoch) return error.Stale;
         return (@import("generation.zig").get(session.profile.chip_id) orelse return error.Unsupported).render;
+    }
+    pub fn nvdecClass(self: *const Owner) !u32 {
+        const device = self.device orelse return error.State;
+        const session = device.runtime_session orelse return error.State;
+        if (session.epoch != self.epoch) return error.Stale;
+        return (@import("generation.zig").get(session.profile.chip_id) orelse return error.Unsupported).nvdecClass();
     }
     pub fn attachGraphicsCache(self: *Owner, kind: render_cache.Kind, buffer: BufferHandle) !void {
         _ = try self.now();
@@ -3584,7 +3595,7 @@ pub const Owner = struct {
         if (self.copy_backend == null) self.copy_backend = .{ .queue = queue, .binding = binding };
         if (result == a.gfx_queue_error_busy and job.fence.timeline == 0) return false;
         if (result == a.gfx_queue_ok and job.operation == a.gfx_queue_operation_native) {
-            if (self.native_queues.source == null) {
+            if (!self.native_queues.ready()) {
                 if (queue.complete(&job.fence, a.gfx_queue_result_failed, 1) != 1) return error.Retained;
                 return true;
             }

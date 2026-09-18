@@ -350,8 +350,8 @@ const context = @import("gsp_context_wire.zig");
 const exchange = @import("gsp_exchange.zig");
 const nv = @import("r4nv_binding");
 pub const Error = context.Error;
-pub const Operation = enum { classes, allocate, bind, token, promote_graphics, allocate_copy, allocate_graphics, allocate_compute, allocate_gr_copy, enable, disable, free_gr_copy, free_compute, free_copy, free };
-pub const Engine = enum { none, copy, graphics };
+pub const Operation = enum { classes, allocate, bind, token, promote_graphics, allocate_copy, allocate_graphics, allocate_compute, allocate_gr_copy, allocate_nvdec, enable, disable, free_gr_copy, free_compute, free_copy, free };
+pub const Engine = enum { none, copy, graphics, nvdec };
 pub const max_bytes: usize = 584;
 pub const entries: u32 = 512;
 pub const Config = struct {
@@ -378,11 +378,20 @@ pub const Config = struct {
     method_bytes: u32,
 };
 pub const Reply = union(enum) { rejected: u32, ok: u32 };
-pub fn function(op: Operation) u32 { return switch (op) { .allocate, .allocate_copy, .allocate_graphics, .allocate_compute, .allocate_gr_copy => 103, .free, .free_copy, .free_compute, .free_gr_copy => 10, else => 76 }; }
+pub fn function(op: Operation) u32 { return switch (op) { .allocate, .allocate_copy, .allocate_graphics, .allocate_compute, .allocate_gr_copy, .allocate_nvdec => 103, .free, .free_copy, .free_compute, .free_gr_copy => 10, else => 76 }; }
 pub fn command(op: Operation) u32 { return switch (op) { .bind => 0xa06f0104, .token => 0xc36f0108, .promote_graphics => 0x2080012b, .enable, .disable => 0xa06f0103, else => 0 }; }
-pub fn length(op: Operation) usize { return switch (op) { .classes => 428, .allocate => 400, .allocate_copy, .allocate_gr_copy => 40, .allocate_graphics => 48, .allocate_compute => 32, .promote_graphics => 584, .free, .free_copy, .free_compute, .free_gr_copy => 16, .enable, .disable => 26, else => 28 }; }
+pub fn length(op: Operation) usize { return switch (op) { .classes => 428, .allocate => 400, .allocate_copy, .allocate_gr_copy => 40, .allocate_graphics => 48, .allocate_compute => 32, .allocate_nvdec => 44, .promote_graphics => 584, .free, .free_copy, .free_compute, .free_gr_copy => 16, .enable, .disable => 26, else => 28 }; }
 pub fn validGraphicsEngines(mask: u32) bool {
     return mask & nv.native_engine_graphics != 0 and mask & ~(nv.native_engine_graphics | nv.native_engine_compute | nv.native_engine_copy) == 0;
+}
+pub fn validNativeEngines(mask: u32) bool {
+    return mask == nv.native_engine_video or validGraphicsEngines(mask);
+}
+pub fn defaultEngineMask(engine: Engine) u32 {
+    return if (engine == .nvdec) nv.native_engine_video else nv.native_engine_graphics;
+}
+pub fn validChannelEngines(engine: Engine, mask: u32) bool {
+    return if (engine == .graphics) validGraphicsEngines(mask) else mask == defaultEngineMask(engine);
 }
 pub const Classes = struct { primary: u32, compute: u32, copy: u32 };
 /// Only consume the class payload after context.decode has validated its bounds.
@@ -394,6 +403,7 @@ pub fn selectedClasses(config: Config, payload: []const u8) Classes {
         .primary = switch (config.engine) {
             .none => 0, .copy => copy,
             .graphics => if (context.supports(payload, profile.render)) profile.render else 0,
+            .nvdec => if (context.supports(payload, profile.nvdecClass())) profile.nvdecClass() else 0,
         },
         .compute = if (config.compute_handle != 0 and context.supports(payload, profile.computeClass())) profile.computeClass() else 0,
         .copy = if (config.copy_handle != 0) copy else 0,
@@ -418,7 +428,7 @@ pub fn validate(config: Config) Error!void {
             (config.compute_class != 0 and config.compute_class != profile.computeClass()))) return error.Unsupported;
         if (config.copy_handle != 0 and (config.copy_rm_engine < 9 or config.copy_rm_engine > 28 or
             (config.copy_class != 0 and config.copy_class != profile.copy[0] and config.copy_class != profile.copy[1]))) return error.Unsupported;
-    } else if (config.engine_mask != nv.native_engine_graphics or config.compute_handle != 0 or config.copy_handle != 0) return error.Unsupported;
+    } else if (!validChannelEngines(config.engine, config.engine_mask) or config.compute_handle != 0 or config.copy_handle != 0) return error.Unsupported;
     if ((config.compute_handle == 0 and config.compute_class != 0) or
         (config.copy_handle == 0 and (config.copy_class != 0 or config.copy_rm_engine != 0))) return error.Handle;
     const objects = [_]u32{config.object_handle, config.compute_handle, config.copy_handle};
@@ -446,8 +456,12 @@ pub fn validate(config: Config) Error!void {
         if (config.userd > (@as(u64, 1) << 40) - 4096 or config.object_handle == 0) return error.Bounds;
         switch (config.engine) {
             .none => return error.Unsupported,
-            .copy => if (config.rm_engine < 9 or (config.object_class != 0 and config.object_class != profile.copy[0] and config.object_class != profile.copy[1])) return error.Unsupported,
+            .copy => if (config.rm_engine < 9 or config.rm_engine > 28 or (config.object_class != 0 and config.object_class != profile.copy[0] and config.object_class != profile.copy[1])) return error.Unsupported,
             .graphics => if (config.rm_engine != 1 or (config.object_class != 0 and config.object_class != profile.render)) return error.Unsupported,
+            .nvdec => {
+                _ = try context.nvdecInstance(config.rm_engine);
+                if (config.object_class != 0 and config.object_class != profile.nvdecClass()) return error.Unsupported;
+            },
         }
         for ([_]u32{config.handle, config.context.client,config.context.device,config.context.subdevice,config.context.vaspace,config.context.group,config.context.share}) |handle|
             if (config.object_handle == handle) return error.Handle;
@@ -503,6 +517,14 @@ pub fn encode(config: Config, op: Operation, output: []u8) Error![]const u8 {
             // nvos.h NV_GR_ALLOCATION_PARAMETERS: version, flags, size, caps.
             // Caps is RM output; it never changes the admitted class/profile.
             put(out, 32, 2); put(out, 40, 16);
+        },
+        .allocate_nvdec => {
+            if (!config.system_userd or config.engine != .nvdec or config.object_class == 0) return error.Unsupported;
+            put(out, 4, config.handle); put(out, 8, config.object_handle); put(out, 12, config.object_class); put(out, 20, 12);
+            // nvos.h NV_BSP_ALLOCATION_PARAMETERS: size, prohibitMultipleInstances,
+            // engineInstance. Instance is the selected RM NVDEC index, not its
+            // RM engine number or the NV2080 engine type used by channel bind.
+            put(out, 32, 12); put(out, 40, try context.nvdecInstance(config.rm_engine));
         },
         .allocate_compute => {
             if (!config.system_userd or config.engine != .graphics or config.compute_handle == 0 or config.compute_class == 0) return error.Unsupported;

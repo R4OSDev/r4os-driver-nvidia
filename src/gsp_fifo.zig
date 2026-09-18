@@ -305,14 +305,14 @@ pub const Owner = struct {
     pub fn open(self: *Owner, token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext, adapter: u32, graph: names.Lease,
         parent: *context.Owner, runqueue: u8, instance: *vram.Owner, userd: ?*vram.Owner, engine: wire.Engine, deadline: u64) Error!void
     {
-        return self.openEngines(token, ctx, adapter, graph, parent, runqueue, instance, userd, engine, @import("r4nv_binding").native_engine_graphics, deadline);
+        return self.openEngines(token, ctx, adapter, graph, parent, runqueue, instance, userd, engine, wire.defaultEngineMask(engine), deadline);
     }
     pub fn openEngines(self: *Owner, token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext, adapter: u32, graph: names.Lease,
         parent: *context.Owner, runqueue: u8, instance: *vram.Owner, userd: ?*vram.Owner, engine: wire.Engine, engine_mask: u32, deadline: u64) Error!void
     {
         const nv = @import("r4nv_binding");
         if (self.self_address != 0) return error.State;
-        if (!wire.validGraphicsEngines(engine_mask) or (engine != .graphics and engine_mask != nv.native_engine_graphics)) return error.Unsupported;
+        if (!wire.validChannelEngines(engine, engine_mask)) return error.Unsupported;
         const compute = engine_mask & nv.native_engine_compute != 0;
         const paired_copy = engine_mask & nv.native_engine_copy != 0;
         if ((userd != null) != (engine == .none)) return error.Unsupported;
@@ -333,8 +333,9 @@ pub const Owner = struct {
             userd_address = (usr.physical orelse return error.State).base;
         } else switch (engine) {
             .none => return error.Unsupported,
-            .copy => if (parent_info.rm_engine < 9) return error.Unsupported,
+            .copy => if (parent_info.rm_engine < 9 or parent_info.rm_engine > 28) return error.Unsupported,
             .graphics => if (parent_info.rm_engine != 1) return error.Unsupported,
+            .nvdec => { _ = try context.wire.nvdecInstance(parent_info.rm_engine); },
         }
         const graphics = if (engine == .graphics) try parent.graphicsPromotion() else null;
         if (graphics != null and graphics.?.golden and engine_mask != nv.native_engine_graphics) return error.Unsupported;
@@ -438,7 +439,9 @@ pub const Owner = struct {
                 // RM's golden initializer needs a schedulable channel. It
                 // receives no host methods, and closes before normal work.
                 if (self.golden() and !self.enabled) break :blk .enable;
-                if (self.config.system_userd and !self.engine_live) break :blk if (self.config.engine == .graphics) .allocate_graphics else .allocate_copy;
+                if (self.config.system_userd and !self.engine_live) break :blk switch (self.config.engine) {
+                    .graphics => .allocate_graphics, .copy => .allocate_copy, .nvdec => .allocate_nvdec, .none => return error.State,
+                };
                 if (self.config.compute_handle != 0 and !self.compute_live) break :blk .allocate_compute;
                 if (self.config.copy_handle != 0 and !self.copy_live) break :blk .allocate_gr_copy;
                 if (!self.enabled and !self.golden()) break :blk .enable;
@@ -472,7 +475,7 @@ pub const Owner = struct {
             .allocate => { self.live = true; self.cid = reply.ok; },
             .bind => self.bound = true,
             .token => self.work_submit_token = reply.ok,
-            .allocate_copy => self.engine_live = true,
+            .allocate_copy, .allocate_nvdec => self.engine_live = true,
             .promote_graphics => self.graphics_promoted = true,
             .allocate_graphics => { self.engine_live = true; self.engine_caps = reply.ok; self.graphics_initialized = true; },
             .allocate_compute => self.compute_live = true,
@@ -488,7 +491,9 @@ pub const Owner = struct {
     }
     fn prepareCommands(self: *Owner) Error!void {
         try wire.validate(self.config);
-        if (self.config.system_userd) try self.ring.openKind(&self.commands.?.backing, self.config.address, if (self.config.engine == .graphics) .graphics else .copy);
+        if (self.config.system_userd) try self.ring.openKind(&self.commands.?.backing, self.config.address, switch (self.config.engine) {
+            .graphics => .graphics, .copy => .copy, .nvdec => .nvdec, .none => return error.State,
+        });
     }
     pub fn prepareCopy(self: *Owner, transfer: copy.wire.Transfer) Error!copy.Ticket {
         const value = self.info() orelse return error.State;

@@ -5,11 +5,17 @@ const std = @import("std");
 const r4os = @import("r4os");
 const a = r4os.abi;
 const wire = @import("gsp_buffer_wire.zig");
-// One bounded CE upload can carry all16 descriptor/vertex/color packets. FIFO storage
-// keeps the independent three-page wire default.
-pub const bytes: usize = 20 * 1024;
+// One bounded CE upload carries either all fixed shaders or all16 draw packets.
+// Derive its page-rounded size from the canonical renderer; FIFO storage keeps
+// the independent three-page wire default.
+const render = @import("r4nv_render");
+pub const bytes: usize = std.mem.alignForward(usize, @max(render.max_shader_bytes, render.packet_capacity_bytes), 4096);
 pub const shared_page_bytes: usize = 4096;
 pub const page_count = bytes / 4096;
+comptime {
+    if (56 + page_count * 8 > wire.max_request_bytes)
+        @compileError("control storage exceeds its bounded RM registration request");
+}
 pub const Error = error{ Busy, Api, Memory, Descriptor, Map, Synchronization };
 const ok = a.gfx_buffer_result_ok;
 const dma_mask = (@as(u64, 1) << 47) - 1;

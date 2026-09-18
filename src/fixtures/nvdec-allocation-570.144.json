@@ -1,0 +1,82 @@
+{
+  "schema": 1,
+  "purpose": "NVDEC allocation parameters and NV2080 engine IDs for eight instances",
+  "pin": "NVIDIA 570.144",
+  "generator": "Temp/gfx-video07940/NvdecChannel/Reference.c",
+  "generator_sha256": "8096e4714f05f3fc5169e47a8e31b6282e0f3aff4942be8c5baa9b352a7384a2",
+  "fixture_sha256": "561af45db1e844b29dd41d253fb258eda58e828bcebeff2b81c84ae00ad28740",
+  "bytes": 128,
+  "layout": "Eight records: little-endian NV2080 engine u32, original NV_BSP_ALLOCATION_PARAMETERS (12 bytes)",
+  "sources": [
+    {
+      "path": "src/common/sdk/nvidia/inc/nvos.h",
+      "sha256": "9e878195c522919f133c497aefbc3f4c076aae8bda25d4c7915e8981bb43563a",
+      "bytes": 146013
+    },
+    {
+      "path": "src/common/sdk/nvidia/inc/nvstatus.h",
+      "sha256": "e8267172a1f7a56420d612c6734b3554b9ff6a3d33fdda21b1371ff4ce4b8675",
+      "bytes": 4565
+    },
+    {
+      "path": "src/common/sdk/nvidia/inc/nvtypes.h",
+      "sha256": "3fd5e2c20b1432421a214b12e52778f48f7914b87645d4736cf55324d25c9d3c",
+      "bytes": 25775
+    },
+    {
+      "path": "src/common/sdk/nvidia/inc/cpuopsys.h",
+      "sha256": "92114293c250b87a0c78d1bbfe52c3c132eba1c03ceef110a0e8b0ba6a80aca1",
+      "bytes": 11619
+    },
+    {
+      "path": "src/common/sdk/nvidia/inc/nvstatuscodes.h",
+      "sha256": "cad1684cc2fafaeb8def4289ab107d7a21706425781af8e96865b850c15f4205",
+      "bytes": 15580
+    },
+    {
+      "path": "src/common/sdk/nvidia/inc/nvgputypes.h",
+      "sha256": "dcb4bf6a0eae9883ef36438dac4765a47a90555a01e887c380caf0690c7be08d",
+      "bytes": 7866
+    },
+    {
+      "path": "src/common/sdk/nvidia/inc/rs_access.h",
+      "sha256": "ee3174aa565a08594f66c325b06d24bd8e798d933bf74ff12c803cf3614bb117",
+      "bytes": 9561
+    },
+    {
+      "path": "src/common/sdk/nvidia/inc/nvmisc.h",
+      "sha256": "707e5a739d9b8781c05003188d6e64888303c84039e4f2ecc0810b8411669248",
+      "bytes": 42112
+    },
+    {
+      "path": "src/common/sdk/nvidia/inc/nvcfg_sdk.h",
+      "sha256": "cb9b9ddf1d9d55527e182c1864fb45dcc7331e6de1498a71814cfc5bbe0c62c8",
+      "bytes": 1304
+    },
+    {
+      "path": "src/common/sdk/nvidia/inc/alloc/alloc_channel.h",
+      "sha256": "f0211fbc8bf3f80841f699bf4ccb776d32517308782dfb3c8e99c7652986b5ab",
+      "bytes": 14980
+    },
+    {
+      "path": "src/common/sdk/nvidia/inc/nvlimits.h",
+      "sha256": "7c7bf27c5360464b459f6069d2e72f6070bb3fdd0862baccf6c7aa71da67c593",
+      "bytes": 1967
+    },
+    {
+      "path": "src/common/sdk/nvidia/inc/class/cl9010.h",
+      "sha256": "f388882c995687540d7515e25f68613e3f8a67a35add99d761afd005656a49c7",
+      "bytes": 1971
+    },
+    {
+      "path": "src/common/sdk/nvidia/inc/class/cl9010_callback.h",
+      "sha256": "2571a29472ad80a60c60f2bcaedc8354179b45c6248c98792503349dae419ba8",
+      "bytes": 1308
+    },
+    {
+      "path": "src/common/sdk/nvidia/inc/class/cl2080_notification.h",
+      "sha256": "d8ca340a170461423cf8f969dd8c3ee5cb2c599d311b78bab3ce5c0abe96c3cf",
+      "bytes": 35740
+    }
+  ]
+}

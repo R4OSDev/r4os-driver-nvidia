@@ -106,6 +106,7 @@ fn checkGraphicsContexts() !void {
 }
 
 pub fn checkNativeEngines() !void {
+    try checkNvdec();
     var config: wire.Config = .{ .context = .{ .epoch = 7, .client = 1, .device = 2, .subdevice = 3,
         .vaspace = 4, .group = 5, .share = 6 }, .handle = 7, .rm_engine = 1, .runqueue = 0,
         .address = 0x50000000, .instance = 0x10000000, .userd = 0x8000004000, .methods = 0x30000000,
@@ -141,6 +142,73 @@ pub fn checkNativeEngines() !void {
     config.engine_mask = 7;
     config.compute_class = 0xc9c0;
     try t.expectError(error.Unsupported,wire.encode(config,.allocate_compute,&request));
+}
+
+fn checkNvdec() !void {
+    const reference = @embedFile("fixtures/nvdec-allocation-570.144.bin");
+    var config: wire.Config = .{ .context = .{ .epoch = 7, .client = 1, .device = 2, .subdevice = 3,
+        .vaspace = 4, .group = 5, .share = 6 }, .handle = 7, .rm_engine = 29, .runqueue = 0,
+        .address = 0x50000000, .instance = 0x10000000, .userd = 0x8000004000, .methods = 0x30000000,
+        .method_bytes = 0x6000, .system_userd = true, .engine = .nvdec, .engine_mask = 8, .object_handle = 8 };
+    var request: [wire.max_bytes]u8 = undefined;
+    var reply: [wire.max_bytes]u8 = undefined;
+    for (@import("generation.zig").profiles) |profile| {
+        config.chip_id = profile.id;
+        config.object_class = 0;
+        const query = try wire.encode(config, .classes, &request);
+        @memcpy(reply[0..query.len], query);
+        std.mem.writeInt(u32, reply[24..28], 1, .little);
+        std.mem.writeInt(u32, reply[28..32], profile.render, .little);
+        var classes: message.Record = .{ .shape = .{ .message_bytes = query.len + 80, .checksum_bytes = query.len + 80, .storage_bytes = 4096, .elements = 1 },
+            .queue_sequence = 0, .rpc = .{ .function = 76, .result = 0 }, .payload = reply[0..query.len] };
+        try t.expectEqual(@as(u32, 0), (try wire.decode(config, .classes, query, classes)).ok);
+        std.mem.writeInt(u32, reply[28..32], profile.nvdecClass(), .little);
+        config.object_class = (try wire.decode(config, .classes, query, classes)).ok;
+        try t.expect(config.object_class == profile.nvdecClass());
+        classes.payload = reply[0..32];
+        try t.expectError(error.Payload, wire.decode(config, .classes, query, classes));
+        for (0..8) |instance| {
+            config.rm_engine = @intCast(29 + instance);
+            const data = try wire.encode(config, .allocate_nvdec, &request);
+            try t.expect(data.len == 44 and wire.word(data, 0) == config.context.client and wire.word(data, 4) == config.handle and
+                wire.word(data, 8) == config.object_handle and wire.word(data, 12) == config.object_class and wire.word(data, 20) == 12);
+            try t.expectEqualSlices(u8, reference[instance * 16 + 4..][0..12], data[32..44]);
+            @memcpy(reply[0..data.len], data);
+            var record: message.Record = .{ .shape = .{ .message_bytes = 124, .checksum_bytes = 124, .storage_bytes = 4096, .elements = 1 },
+                .queue_sequence = 0, .rpc = .{ .function = 103, .result = 0 }, .payload = reply[0..data.len] };
+            try t.expect((try wire.decode(config, .allocate_nvdec, data, record)) == .ok);
+            reply[40] ^= 1;
+            try t.expectError(error.Payload, wire.decode(config, .allocate_nvdec, data, record));
+            reply[40] ^= 1; reply[8] ^= 1;
+            try t.expectError(error.Unexpected, wire.decode(config, .allocate_nvdec, data, record));
+            reply[8] ^= 1;
+            record.payload = reply[0..32];
+            try t.expectError(error.Payload, wire.decode(config, .allocate_nvdec, data, record));
+            std.mem.writeInt(u32, reply[16..20], 0x51, .little);
+            try t.expectEqual(@as(u32, 0x51), (try wire.decode(config, .allocate_nvdec, data, record)).rejected);
+            const bind = try wire.encode(config, .bind, &request);
+            try t.expectEqual(wire.word(reference, instance * 16), wire.word(bind, 24));
+            const channel = try wire.encode(config, .allocate, &request);
+            try t.expectEqual(wire.word(reference, instance * 16), wire.word(channel, 160));
+            const free = try wire.encode(config, .free_copy, &request);
+            try t.expect(wire.word(free, 8) == config.object_handle);
+        }
+        config.object_class = profile.render;
+        try t.expectError(error.Unsupported, wire.encode(config, .allocate_nvdec, &request));
+    }
+    config.chip_id = 0x176; config.object_class = 0xc7b0;
+    for ([_]u32{ 0, 1, 9, 28, 37, 0xffffffff }) |engine| {
+        config.rm_engine = engine;
+        try t.expectError(error.Unsupported, wire.encode(config, .allocate_nvdec, &request));
+    }
+    config.rm_engine = 29;
+    try t.expectError(error.Unsupported, wire.encode(config, .allocate_copy, &request));
+    try t.expectError(error.Unsupported, wire.encode(config, .allocate_graphics, &request));
+    config.engine_mask = 1;
+    config.engine = .copy; config.object_class = 0xc7b5;
+    try t.expectError(error.Unsupported, wire.encode(config, .allocate_copy, &request));
+    config.engine = .graphics; config.object_class = 0xc797;
+    try t.expectError(error.Unsupported, wire.encode(config, .allocate_graphics, &request));
 }
 
 fn checkGraphics() !void {

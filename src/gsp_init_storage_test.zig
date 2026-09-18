@@ -2785,7 +2785,7 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
             try t.expect(address_space.handle == graph.base.plan.handles.vaspace and address_space.base == 0x200000);
             try t.expect(address_space.bytes == 0x100000000 and address_space.big_page_bytes == 65536);
             if (running.nativeControlBuffer()) |info| {
-                try t.expect(info.address == 0x600000 and info.bytes == 20480 and info.epoch == session.epoch and buffer_requests == 3);
+                try t.expect(info.address == 0x600000 and info.bytes == @import("gsp_control_storage.zig").bytes and info.epoch == session.epoch and buffer_requests == 3);
                 const caps = running.nativeMemoryCapabilities() orelse return error.MissingCapabilities;
                 try t.expect(caps_requests == 1 and caps.binding.epoch == session.epoch and caps.binding.device == graph.base.plan.handles.device);
                 const present = scenario != .memory_caps_none;
@@ -7123,7 +7123,10 @@ fn replyNativeProduct(target: *@import("gsp_device.zig").Device) !void {
         const bytes = @import("gsp_context_test.zig").response(vector);
         const header: usize = if (rpc.function == 76) 24 else if (rpc.function == 103) 32 else 16;
         @memcpy(response[header..rpc.request.len], bytes[header..]);
-        if (owner.rm_engine == 1) {
+        if (owner.rm_engine >= 29 and owner.rm_engine <= 36) {
+            if (op == .engines and owner.base == 32) outputWord(&response, 44, if (NvdecPeer.mode == .absent) 19 else 31);
+            if (op == .group or op == .share) @memcpy(response[32..rpc.request.len], rpc.request[32..]);
+        } else if (owner.rm_engine == 1) {
             if (op == .engines and owner.base == 0) {
                 @memset(response[120..136], 0); @memcpy(response[120..123], "GR0");
             }
@@ -7689,6 +7692,87 @@ fn stepNativeQueues(target: *@import("gsp_device.zig").Device, counts: *FifoCoun
     } else stage.* = 0;
     return progress;
 }
+const NvdecPeer = struct {
+    const Mode = enum { success, absent, missing_class, rejected, close_context, close_storage, close_channel };
+    var mode: Mode = .success;
+    var allocations: usize = 0;
+    var frees: usize = 0;
+};
+fn checkNvdecChannels(target: *@import("gsp_device.zig").Device, counts: *FifoCounts, scenario: []const u8) !usize {
+    const video = @import("gsp_native_video.zig");
+    const fifo = @import("gsp_fifo_test_model.zig").Model;
+    const native = @import("gsp_vram_test_model.zig").Model;
+    const heap_model = @import("gsp_buffer_test_model.zig").Model;
+    const run = &target.running;
+    const released = fifo.released;
+    // Earlier renderer cases return BO references asynchronously. Establish
+    // the baseline only after those pre-existing retirements have completed.
+    var stage: u32 = 0;
+    for (0..200) |_| {
+        if (run.native_active == null and run.context_active == null and run.fifo_active == null and !native.pendingReleases()) break;
+        _ = try stepNativeQueues(target, counts, scenario, &stage);
+    }
+    try t.expect(run.native_active == null and run.context_active == null and run.fifo_active == null and !native.pendingReleases());
+    for (std.enums.values(NvdecPeer.Mode)) |mode| {
+        NvdecPeer.mode = mode; NvdecPeer.allocations = 0; NvdecPeer.frees = 0;
+        var owner: video.Owner = .{};
+        const before_heap = heap_model.heapLive();
+        const before_bytes = native.charged;
+        try owner.request();
+        const stop: video.Phase = switch (mode) {
+            .success => .ready, .absent, .missing_class, .rejected => .unavailable,
+            .close_context => .context_wait, .close_storage => .storage_wait, .close_channel => .channel_wait,
+        };
+        var steps: usize = 0;
+        errdefer |err| std.debug.print("NVDEC mode={s} phase={s} engine={d} error={s} runtime={?}\n",
+            .{@tagName(mode),@tagName(owner.phase),owner.rm_engine,@errorName(err),run.failure});
+        while (owner.phase != stop and steps < 1100) : (steps += 1) {
+            _ = target.step(); try t.expect(target.phase == .ready);
+            _ = try owner.step(run);
+            if (run.fifo_active != null) try replyDeviceFifo(target, counts, scenario)
+            else if (run.activeChannel().?.phase == .waiting) try replyNativeProduct(target);
+        }
+        try t.expect(steps < 1100);
+        var moved = owner;
+        try t.expectError(error.State, moved.requestClose());
+        if (mode == .success) {
+            const channel = run.fifos[owner.channel.?.slot].owner.?;
+            const info = (try run.executionChannelStatus(owner.channel.?)).info.?;
+            const context = run.contexts[owner.context.?.slot].owner.?;
+            try t.expect(owner.rm_engine == 31 and info.config.engine == .nvdec and info.config.object_class == try run.nvdecClass() and
+                channel.engine_live and channel.enabled and !channel.graphics_promoted and !channel.compute_live and !channel.copy_live and
+                channel.ring.kind == .nvdec and channel.ring.idle() and context.graphics_plan == null and context.graphics_shared == null);
+            try t.expectError(error.Retained, run.retireExecutionContext(owner.context.?, clock + std.time.ns_per_s));
+            try t.expectError(error.State, channel.prepareGraphics(.barrier));
+            try t.expect(!try owner.step(run));
+        } else if (stop == .unavailable) {
+            try t.expect(owner.context == null and owner.channel == null and owner.storage == null);
+            try t.expect(owner.rm_engine == (if (mode == .absent) @as(u32, 36) else 31));
+            try t.expect((owner.rm_status == 0x51) == (mode == .rejected));
+        }
+        const old_context = owner.context;
+        const old_channel = owner.channel;
+        try owner.requestClose(); try owner.requestClose();
+        steps = 0;
+        while (steps < 800) : (steps += 1) {
+            _ = target.step(); try t.expect(target.phase == .ready);
+            _ = try owner.step(run);
+            if (run.fifo_active != null) try replyDeviceFifo(target, counts, scenario)
+            else if (run.activeChannel().?.phase == .waiting) try replyNativeProduct(target);
+            if (owner.phase == .closed and run.native_active == null and !native.pendingReleases()) break;
+        }
+        try t.expect(steps < 800 and owner.context == null and owner.channel == null and owner.storage == null and run.failure == null);
+        try t.expectEqual(NvdecPeer.allocations, NvdecPeer.frees);
+        try t.expectEqual(before_heap, heap_model.heapLive());
+        try t.expectEqual(before_bytes, native.charged);
+        if (old_context) |handle| try t.expectError(error.Stale, run.executionContextStatus(handle));
+        if (old_channel) |handle| try t.expectError(error.Stale, run.executionChannelStatus(handle));
+        try t.expect(!try owner.step(run));
+    }
+    NvdecPeer.mode = .success;
+    std.debug.print("[nvidia-nvdec-channel] sparse engine discovery; class/instance allocation; rejected/missing engines; close during context/storage/channel; exact RM/BO retirement\n", .{});
+    return fifo.released - released;
+}
 fn checkNativeQueues(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, counts: *FifoCounts, scenario: []const u8) anyerror!usize {
     const load = @import("gsp_fifo_wire.zig").word;
     const peer = @import("gsp_native_queue_test_model.zig").Model;
@@ -7706,8 +7790,9 @@ fn checkNativeQueues(target: *@import("gsp_device.zig").Device, table: *a.Driver
     errdefer std.debug.print("native peer completed={d} result={d} claimed={} pending={} heap={d} fault={s} GR={?}\n", .{
         peer.completed,peer.result,peer.claimed,peer.job != null,@import("gsp_buffer_test_model.zig").Model.heapLive(),
         if (run.faults.serial != 0) run.faults.records[(run.faults.serial-1)%16].text[0..run.faults.records[(run.faults.serial-1)%16].text_bytes] else "",
-        if (run.queued_native) |job| if (job.node) |node| node.graphics.phase else null else null });
+        if (run.queued_native) |job| if (job.node) |node| std.meta.activeTag(node.engine) else null else null });
     const released = fifo.released;
+    const nvdec_releases = try checkNvdecChannels(target, counts, scenario);
     const deadline = clock + 60 * std.time.ns_per_s;
     const ce = run.graphics_copy_channel.?;
     const original_backend = run.copy_backend;
@@ -7774,10 +7859,10 @@ fn checkNativeQueues(target: *@import("gsp_device.zig").Device, table: *a.Driver
         const handle = work.channel_handle;
         const owner = run.fifos[handle.slot].owner.?;
         const node = run.queued_native.?.node.?;
-        if (round == 0) { first_channel = handle; first_context = node.graphics.context; }
-        if (round == 1) try t.expect(std.meta.eql(handle,first_channel.?) and std.meta.eql(node.graphics.context.?,first_context.?));
-        if (round == 2) try t.expect(!std.meta.eql(handle,first_channel.?) and !std.meta.eql(node.graphics.context.?,first_context.?));
-        const context = run.contexts[node.graphics.context.?.slot].owner.?;
+        if (round == 0) { first_channel = handle; first_context = node.engine.graphics.context; }
+        if (round == 1) try t.expect(std.meta.eql(handle,first_channel.?) and std.meta.eql(node.engine.graphics.context.?,first_context.?));
+        if (round == 2) try t.expect(!std.meta.eql(handle,first_channel.?) and !std.meta.eql(node.engine.graphics.context.?,first_context.?));
+        const context = run.contexts[node.engine.graphics.context.?.slot].owner.?;
         try t.expect(owner.config.engine_mask == 7 and owner.compute_live and owner.copy_live and
             owner.config.compute_class == @import("generation.zig").get(target.display.?.chip.?.id).?.computeClass() and
             owner.config.copy_rm_engine == 20 and context.info().?.copy_rm_engine == 20);
@@ -7798,7 +7883,7 @@ fn checkNativeQueues(target: *@import("gsp_device.zig").Device, table: *a.Driver
         if (round == 2) {
             peer.closed[1] = true; peer.notify();
             for (0..4) |_| _ = try stepNativeQueues(target,counts,scenario,&stage);
-            try t.expect(node.closing and node.jobs == 1 and node.graphics.phase == .ready and owner.state == .handed_off);
+            try t.expect(node.closing and node.jobs == 1 and node.engine.graphics.phase == .ready and owner.state == .handed_off);
         }
         checkpoint = "physical completion";
         // Model WFI/memory-ordering/release, separately from earlier GET.
@@ -7809,7 +7894,7 @@ fn checkNativeQueues(target: *@import("gsp_device.zig").Device, table: *a.Driver
             (try run.virtuals.findBinding(mapped)).executions == 0);
     }
     checkpoint = "invalid snapshots";
-    for (0..8) |bad| {
+    for (0..9) |bad| {
         const before = peer.completed;
         peer.enqueue(0,false,deadline);
         switch (bad) {
@@ -7819,8 +7904,9 @@ fn checkNativeQueues(target: *@import("gsp_device.zig").Device, table: *a.Driver
             3 => std.mem.writeInt(u64,peer.command[32..40],public_binding.address+4096,.little),
             4 => std.mem.writeInt(u32,peer.command[12..16],511,.little),
             5 => peer.resource.token.opaque1 += 10000,
-            6 => std.mem.writeInt(u32,peer.command[8..12],8,.little),
+            6 => std.mem.writeInt(u32,peer.command[8..12],9,.little), // GR+video cannot share a channel
             7 => std.mem.writeInt(u32,peer.command[8..12],6,.little),
+            8 => std.mem.writeInt(u32,peer.command[8..12],8,.little), // Existing GR queue cannot change to video.
             else => unreachable,
         }
         for (0..250) |_| { _ = try stepNativeQueues(target,counts,scenario,&stage); if (peer.completed != before and !run.hasQueuedWork()) break; }
@@ -7835,7 +7921,7 @@ fn checkNativeQueues(target: *@import("gsp_device.zig").Device, table: *a.Driver
     checkpoint = "idle queue retirement";
     peer.closed[0] = true; peer.notify();
     for (0..600) |_| { _ = try stepNativeQueues(target,counts,scenario,&stage); if (run.native_queues.count == 0 and run.native_active == null and !native.pendingReleases()) break; }
-    try t.expect(run.native_queues.count == 0 and run.native_queues.spare.handle == 0 and fifo.released == released+2 and
+    try t.expect(run.native_queues.count == 0 and run.native_queues.spare.handle == 0 and fifo.released == released+nvdec_releases+2 and
         run.fifos[target.native_graphics.channel.?.slot].owner.?.ring.idle());
     try t.expectEqualSlices(usize,&.{2,2},&peer.engine_allocations);
     try t.expectEqualSlices(usize,&peer.engine_allocations,&peer.engine_frees);
@@ -7863,6 +7949,8 @@ fn checkNativeQueues(target: *@import("gsp_device.zig").Device, table: *a.Driver
         try t.expectEqualSlices(usize,&peer.engine_allocations,&peer.engine_frees);
     }
     peer.engine_fault = .none;
+    checkpoint = "public video queues";
+    try checkPublicNvdecQueues(target, counts, scenario, mapped);
     checkpoint = "VA retirement";
     run.virtual_provider.close();
     for (0..4) |_| {
@@ -7880,6 +7968,104 @@ fn checkNativeQueues(target: *@import("gsp_device.zig").Device, table: *a.Driver
     try t.expect(run.native_queues.source == null and !run.hasQueuedWork());
     std.debug.print("[nvidia-native-queue] two GR+compute+paired-CE contexts; subset reuse; canonical VA; GET retains; semaphore completes; invalid masks; active/idle close; missing topology/classes and partial RM unwind; no idle spin\n",.{});
     return fifo.released-released;
+}
+fn checkPublicNvdecQueues(target: *@import("gsp_device.zig").Device, counts: *FifoCounts, scenario: []const u8,
+    mapped: @import("gsp_runtime.zig").VirtualBindingHandle) !void
+{
+    const peer = @import("gsp_native_queue_test_model.zig").Model;
+    const native = @import("gsp_vram_test_model.zig").Model;
+    const heap_model = @import("gsp_buffer_test_model.zig").Model;
+    const layout = @import("gsp_copy_wire.zig");
+    const run = &target.running;
+    // Register the actual public dispatcher without a ready GR template.
+    // Existing renderer resources stay owned by their separate test fixture.
+    const gr_phase = target.native_graphics.phase;
+    defer target.native_graphics.phase = gr_phase;
+    target.native_graphics.phase = .unavailable;
+    const backend = run.copy_backend.?;
+    try t.expect(backend.queue.unregister(&backend.binding, 1) == 1);
+    run.copy_backend = null;
+    _ = try run.native_queues.step(run, null);
+    _ = try run.registerCopyBackend(run.graphics_copy_channel.?, clock + std.time.ns_per_s);
+    try t.expect(try run.native_queues.step(run, null));
+    try t.expect(run.native_queues.ready() and run.native_queues.source == null);
+    const before_heap = heap_model.heapLive();
+    const before_bytes = native.charged;
+    var stage: u32 = 0;
+    var first: ?@import("gsp_runtime.zig").ChannelHandle = null;
+    NvdecPeer.mode = .success; NvdecPeer.allocations = 0; NvdecPeer.frees = 0;
+    for (0..3) |round| {
+        const index: usize = if (round < 2) 8 else 9;
+        const completed = peer.completed;
+        peer.enqueue(index, false, 0);
+        std.mem.writeInt(u32, peer.command[8..12], 8, .little);
+        for (0..1100) |_| {
+            _ = try stepNativeQueues(target, counts, scenario, &stage);
+            if (run.batch_work != null and run.batch_work.?.submitted) break;
+            if (peer.completed != completed) return error.VideoQueueRejected;
+        }
+        try t.expect(run.batch_work != null and run.batch_work.?.submitted and run.native_queues.source == null);
+        const work = &run.batch_work.?;
+        const channel = work.channel_handle;
+        const owner = run.fifos[channel.slot].owner.?;
+        const node = run.queued_native.?.node.?;
+        const context = run.contexts[node.engine.video.context.?.slot].owner.?;
+        try t.expect(node.engine == .video and owner.config.engine == .nvdec and owner.config.engine_mask == 8 and
+            owner.ring.kind == .nvdec and context.graphics_shared == null and context.graphics_plan == null and node.jobs == 1);
+        if (round == 0) first = channel else try t.expect(std.meta.eql(first.?, channel) == (round == 1));
+        try t.expect((try run.virtuals.findBinding(mapped)).executions == 1);
+        try t.expectError(error.Busy, run.unmapVirtualBuffer(mapped, clock + std.time.ns_per_s, true));
+        const ticket = work.ticket.?;
+        const bytes: [*]u8 = @ptrFromInt(owner.ring.cpu.cpu_address);
+        @memset(&peer.command, 0xcc);
+        try run.validatePushBatch();
+        std.mem.writeInt(u32, bytes[layout.userd_offset + 0x88..][0..4], ticket.put, .little);
+        if (round == 2) { peer.closed[index] = true; peer.notify(); }
+        for (0..8) |_| _ = try stepNativeQueues(target, counts, scenario, &stage);
+        try t.expect(peer.completed == completed and node.jobs == 1 and owner.state == .handed_off and
+            (try run.virtuals.findBinding(mapped)).executions == 1 and run.batch_work.?.receipt == null);
+        if (round == 2) try t.expect(node.closing and node.engine.video.phase == .ready);
+        peer.signaled = true;
+        std.mem.writeInt(u32, bytes[layout.completion_offset..][0..4], ticket.point, .little);
+        for (0..80) |_| { _ = try stepNativeQueues(target, counts, scenario, &stage); if (!run.hasQueuedWork()) break; }
+        try t.expect(peer.completed == completed + 1 and peer.result == a.gfx_queue_result_complete and
+            !run.hasQueuedWork() and (try run.virtuals.findBinding(mapped)).executions == 0);
+    }
+    // An existing video's timeline can never become a graphics channel.
+    const before_switch = peer.completed;
+    peer.enqueue(8, true, 0);
+    for (0..150) |_| { _ = try stepNativeQueues(target, counts, scenario, &stage); if (!run.hasQueuedWork() and peer.job == null) break; }
+    try t.expect(peer.completed == before_switch + 1 and peer.result == a.gfx_queue_result_failed and run.failure == null);
+    peer.closed[8] = true; peer.notify();
+    for (0..800) |_| {
+        _ = try stepNativeQueues(target, counts, scenario, &stage);
+        if (run.native_queues.count == 0 and run.native_active == null and !native.pendingReleases()) break;
+    }
+    try t.expect(run.native_queues.count == 0 and NvdecPeer.allocations == 2 and NvdecPeer.frees == 2);
+    for ([_]NvdecPeer.Mode{ .missing_class, .rejected, .absent }, 10..) |mode, index| {
+        NvdecPeer.mode = mode;
+        const completed = peer.completed;
+        peer.enqueue(index, true, 0);
+        std.mem.writeInt(u32, peer.command[8..12], 8, .little);
+        for (0..1400) |_| {
+            _ = try stepNativeQueues(target, counts, scenario, &stage);
+            if (!run.hasQueuedWork() and peer.job == null and run.native_queues.count == 0 and run.native_active == null and !native.pendingReleases()) break;
+        }
+        try t.expect(peer.completed == completed + 1 and peer.result == a.gfx_queue_result_failed and
+            run.native_queues.count == 0 and run.batch_work == null and run.failure == null);
+        peer.closed[index] = true; peer.notify();
+    }
+    NvdecPeer.mode = .success;
+    // A new graphics request still requires its own ready GR template.
+    const before_gr = peer.completed;
+    peer.enqueue(13, true, 0);
+    for (0..150) |_| { _ = try stepNativeQueues(target, counts, scenario, &stage); if (!run.hasQueuedWork() and peer.job == null) break; }
+    try t.expect(peer.completed == before_gr + 1 and peer.result == a.gfx_queue_result_failed and run.failure == null and
+        run.native_queues.source == null and run.native_queues.count == 0 and run.native_queues.spare.handle == 0);
+    peer.closed[13] = true; peer.notify();
+    try t.expectEqual(before_heap, heap_model.heapLive());
+    try t.expectEqual(before_bytes, native.charged);
+    std.debug.print("[nvidia-video-queue] public bit8 without ready GR; isolated/reused NVDEC contexts; canonical VA retained after GET; HOST semaphore completion; active close; cross-family rejection; absent/class/allocation rollback; exact resources\n", .{});
 }
 fn checkRenderWarmup(target: *@import("gsp_device.zig").Device, table: *a.DriverApi,
     ce: @import("gsp_runtime.zig").ChannelHandle, image_index: usize, output: []u8) !void
@@ -9758,7 +9944,12 @@ fn replyDeviceFifo(target: *@import("gsp_device.zig").Device, counts: *FifoCount
                         outputWord(&response, 40, if (peer.engine_fault == .copy_class) 0 else 0xc6b5);
                     }
                 } else {
-                    outputWord(&response, 24, if (model.is("context_copy_class")) 0 else 2); outputWord(&response, 28, 0xc6b5); outputWord(&response, 32, 0xc7b5);
+                    if (owner.config.engine == .nvdec) {
+                        outputWord(&response, 24, 1);
+                        outputWord(&response, 28, if (NvdecPeer.mode == .missing_class) 0 else try running.nvdecClass());
+                    } else {
+                        outputWord(&response, 24, if (model.is("context_copy_class")) 0 else 2); outputWord(&response, 28, 0xc6b5); outputWord(&response, 32, 0xc7b5);
+                    }
                 }
             },
             .allocate => {
@@ -9770,6 +9961,11 @@ fn replyDeviceFifo(target: *@import("gsp_device.zig").Device, counts: *FifoCount
             .bind => try t.expect(owner.live and !owner.bound and !owner.enabled),
             .token => { try t.expect(owner.bound and !owner.enabled); outputWord(&response, 24, 0x13572468); },
             .allocate_copy => try t.expect(owner.bound and !owner.engine_live and !owner.enabled),
+            .allocate_nvdec => {
+                try t.expect(owner.config.engine == .nvdec and owner.bound and !owner.engine_live and !owner.enabled and !owner.graphics_promoted);
+                try t.expectEqualSlices(u8, @embedFile("fixtures/nvdec-allocation-570.144.bin")[2 * 16 + 4..][0..12], channel.request[32..44]);
+                if (NvdecPeer.mode == .rejected) outputWord(&response, 16, 0x51) else NvdecPeer.allocations += 1;
+            },
             .promote_graphics => {
                 const promotion = owner.config.graphics.?;
                 try t.expect(owner.bound and !owner.graphics_promoted and !owner.engine_live and !owner.enabled and
@@ -9805,7 +10001,10 @@ fn replyDeviceFifo(target: *@import("gsp_device.zig").Device, counts: *FifoCount
             },
             .enable => { counts.enables += 1; try t.expect(owner.work_submit_token != null and !owner.enabled); },
             .disable => { counts.disables += 1; try t.expect(owner.enabled); },
-            .free_copy => try t.expect(owner.engine_live and !owner.compute_live and !owner.copy_live and !owner.enabled and owner.ring.idle()),
+            .free_copy => {
+                try t.expect(owner.engine_live and !owner.compute_live and !owner.copy_live and !owner.enabled and owner.ring.idle());
+                if (owner.config.engine == .nvdec) NvdecPeer.frees += 1;
+            },
             .free_compute, .free_gr_copy => {
                 const peer = @import("gsp_native_queue_test_model.zig").Model;
                 const compute = op == .free_compute;

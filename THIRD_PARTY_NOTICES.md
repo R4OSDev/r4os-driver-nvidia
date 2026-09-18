@@ -4,6 +4,14 @@ Native image page layouts (0.79.35, NVIDIA 0.1.139): uncompressed kind IDs and
 depth/stencil attribute selection follow NVIDIA570.144 nvos.h, TU102 dev_mmu.h
 and mem_mgr_tu102.c (MIT). Complete source notices accompany the encoder;
 the memory-manager notice is added to the packaged/image runtime license.
+
+NVDEC channel metadata (0.79.40): allocation fields use NVIDIA570.144 nvos.h;
+engine IDs and generation classes follow the pinned Nouveau RM tables and
+r535/nvdec.c (MIT). Original NVIDIA and Red Hat notices are already retained
+in Licenses/NVIDIA-GSP-RUNTIME-LICENSE.txt and the affected wire source files.
+The parameter fixture is exported from original headers; its exact input
+hashes are in src/fixtures/nvdec-allocation-570.144.json. R4OS discovery,
+lifecycle and resource ownership code remains Apache-2.0. No new firmware.
 Original headers, independent C vectors and hashes are archived in
 GFX/0.79.35/Evidence/NvkImageLayout. R4OS broker and lifetime code is Apache-2.0.
 

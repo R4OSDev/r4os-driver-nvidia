@@ -91,13 +91,14 @@ The existing complete-run fixture checks coexistence with the renderer and
 close during context/storage/channel/probe waits. GPU replies remain modeled.
 Native allocation now retries a temporarily borrowed RM channel before reading
 its address-space metadata; deferred cleanup no longer aborts renderer startup.
-Public native queues (0.1.136): each canonical queue/producer owns a regular GR
+Public native queues: each canonical queue/producer owns its GR or NVDEC
 context and reuses it across jobs. The existing scheduler copies bounded steps
 of the R4NV version-1 packet and resolves kernel-retained VA snapshots to real RM
-mapping loans. Native operation 10 is advertised only with a ready GR template,
-VA provider and all required queue/lifecycle callbacks. Graphics bit1 is required;
+mapping loans. Native operation 10 requires the CE backend, VA provider and all
+required queue/lifecycle callbacks. Graphics bit1 requires a ready GR template;
 optional compute bit2 and copy bit4 request actual additional RM engine objects.
-The first job fixes the engine set; later jobs may request subsets. Copy uses
+Video bit8 alone creates an independent NVDEC context without a GR template.
+The first job fixes the engine family/set; later graphics jobs may request subsets. Copy uses
 the CE paired with GR in the paginated firmware runlist table, including COPY10+
 NV2080 numbering. Classes and every allocation must succeed before scheduling.
 Partial allocation unwinds objects in reverse order before channel/storage;
@@ -107,6 +108,18 @@ its requesting job waits; live or uncertain channels retain their busy guard.
 Queue close/producer exit retires an idle context asynchronously; submitted jobs
 retain their context and maps until the physical semaphore or proven reset.
 Malformed input fails before publication; uncertain retirement quarantines.
+NVDEC channel foundation (0.79.40, work in progress): `gsp_native_video` owns
+bounded discovery of RM NVDEC0..7, a separate context and channel, and pending
+close/retirement. It requires the actual engine/runlist and offered generation
+class before allocating the twelve-byte BSP object. Missing engines are skipped;
+class or allocation failures unwind without substituting another engine. Video
+rings accept generic HOST-completed batches, never the CE or GR direct encoders.
+The existing transport and complete-run tests cover original-header parameters,
+sparse discovery, missing/rejected objects, asynchronous close and exact resource
+return. Public routing additionally checks video queue reuse, active close, VA
+retention until HOST completion, cross-family rejection and startup rollback.
+Codec/status integration is still open; no NVDEC decoding capability or physical
+hardware qualification is advertised.
 NVK submission/sync and Vulkan device admission
 and an installed R4VK provider remain software work. Optional legacy 2D/M2MF and
 copy-only queues are not admitted by this graphics-queue packet. Host models are

@@ -145,7 +145,7 @@ pub const wire = @import("gsp_copy_wire.zig");
 pub const graphics = @import("gsp_gr_wire.zig");
 pub const batch = @import("gsp_push_batch.zig");
 pub const Error = wire.Error || graphics.Error || storage.Error || error{ Stale, State, Exhausted, Completion, Retained };
-pub const Kind = enum { copy, graphics };
+pub const Kind = enum { copy, graphics, nvdec };
 // C56F transport length is independent of the CE encoder's admitted packet
 // lengths. The private command page bounds both engine producers to 4 KB.
 fn entryWords(address: u64, count: u32) Error![2]u32 {
@@ -199,8 +199,8 @@ pub const Ring = struct {
     }
     fn word(self: *const Ring, offset: usize) *volatile u32 { return @ptrFromInt(self.cpu.cpu_address + offset); }
     pub fn fence() void { asm volatile ("mfence" ::: .{ .memory = true }); }
-    fn capacity(self: *const Ring) u32 { return if (self.kind == .graphics) 1 else wire.capacity; }
-    fn slotBytes(self: *const Ring) u32 { return if (self.kind == .graphics) 4096 else wire.slot_bytes; }
+    fn capacity(self: *const Ring) u32 { return if (self.kind == .copy) wire.capacity else 1; }
+    fn slotBytes(self: *const Ring) u32 { return if (self.kind == .copy) wire.slot_bytes else 4096; }
     fn pushOffset(self: *const Ring) usize { return wire.push_offset + (self.issued % self.capacity()) * self.slotBytes(); }
     fn nextPoint(self: *const Ring) Error!u32 {
         if (!self.valid()) return error.Stale;
