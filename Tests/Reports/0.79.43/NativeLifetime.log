@@ -1,0 +1,121 @@
+info: fork /root/Projekte/R4OS/Repositories/SDK matched 1 r4os_sdk packages
+info: fork /root/Projekte/R4OS/Repositories/Contract matched 1 r4os_contract packages
+info: fork /root/Projekte/R4OS/Repositories/Libraries matched 1 r4os_libraries packages
+NVIDIA generation boot bundles: exact original files, licenses and aligned ranges verified.
+NVIDIA module package: pinned 570.144, original GSP/boot/Booter files with complete licenses verified.
+unit-test
++- run test w
+[nvidia-slices] CE6+GR6; exact semaphores; one public fence each; retained mappings/cache; cursor admission between slices
+queued render reference solid-replace: draws=1 max=0/0 LSB one fence
+queued render reference solid-replace: draws=1 max=0/0 LSB one fence
+queued render reference bilinear-over-scissor: draws=16 max=1/3 LSB one fence
+queued render reference srgb-encode-over: draws=1 max=0/1 LSB one fence
+[nvidia-video-channel] NVDEC/NVENC; sparse engine discovery; class/instance allocation; rejected/missing engines; close during context/storage/channel; exact RM/BO retirement
+[nvidia-video-queue] kind=decode mask=8; no GR template; isolated/reused contexts; canonical VA retained after GET; HOST semaphore completion; active close; cross-family rejection; absent/class/allocation rollback; exact resources
+[nvidia-video-queue] kind=encode mask=16; no GR template; isolated/reused contexts; canonical VA retained after GET; HOST semaphore completion; active close; cross-family rejection; absent/class/allocation rollback; exact resources
+[nvidia-native-queue] two GR+compute+paired-CE contexts; subset reuse; canonical VA; GET retains; semaphore completes; invalid masks; active/idle close; missing topology/classes and partial RM unwind; no idle spin
+[nvidia-direct] two whole scanout images; BEGUN holds sources; FINISHED/table ACK retires; close restores via CE; CPU shadow unchanged
+[nvidia-video-channel] NVDEC/NVENC; sparse engine discovery; class/instance allocation; rejected/missing engines; close during context/storage/channel; exact RM/BO retirement
+[nvidia-video-queue] kind=decode mask=8; no GR template; isolated/reused contexts; canonical VA retained after GET; HOST semaphore completion; active close; cross-family rejection; absent/class/allocation rollback; exact resources
+[nvidia-video-queue] kind=encode mask=16; no GR template; isolated/reused contexts; canonical VA retained after GET; HOST semaphore completion; active close; cross-family rejection; absent/class/allocation rollback; exact resources
+[nvidia-native-queue] two GR+compute+paired-CE contexts; subset reuse; canonical VA; GET retains; semaphore completes; invalid masks; active/idle close; missing topology/classes and partial RM unwind; no idle spin
+[nvidia-headless-graphics] CE/GR/cache precede display; native queues without receiver; 180-second wait preserves contexts; late route reuses GPU; reset retires owners
+NVIDIA gsp-start: failed=runtime phase=ready reason=Timeout effects=true memory-retained=true
+NVIDIA gpu-reset: attempt=1 scope=selected-NVIDIA-Fn0 epoch=1 original-phase=ready driver=0.1.144 firmware=570.144 resources=held display=held
+NVIDIA gpu-reset: FLR=complete epoch=1 DMA=stopped bus-master=off resources=held display=unrestored
+NVIDIA gpu-reset: restart epoch=2 display-generation=10 boot-hold=9 renderer=software DMA=new-generation
+NVIDIA gsp-start: failed=runtime phase=ready reason=ConsoleRestore effects=true memory-retained=true
+NVIDIA gsp-start: failed=teardown phase=ready reason=Stale effects=true memory-retained=true
+NVIDIA gpu-reset: attempt=1 scope=selected-NVIDIA-Fn0 epoch=2 original-phase=ready driver=0.1.144 firmware=570.144 resources=held display=held
+NVIDIA gpu-reset: FLR=complete epoch=2 DMA=stopped bus-master=off resources=held display=unrestored
+NVIDIA gpu-reset: restart epoch=3 display-generation=11 boot-hold=9 renderer=software DMA=new-generation
+[nvidia-slices] CE6+GR6; exact semaphores; one public fence each; retained mappings/cache; cursor admission between slices
+queued render reference solid-replace: draws=1 max=0/0 LSB one fence
+queued render reference solid-replace: draws=1 max=0/0 LSB one fence
+queued render reference bilinear-over-scissor: draws=16 max=1/3 LSB one fence
+queued render reference srgb-encode-over: draws=1 max=0/1 LSB one fence
+[nvidia-video-channel] NVDEC/NVENC; sparse engine discovery; class/instance allocation; rejected/missing engines; close during context/storage/channel; exact RM/BO retirement
+[nvidia-video-queue] kind=decode mask=8; no GR template; isolated/reused contexts; canonical VA retained after GET; HOST semaphore completion; active close; cross-family rejection; absent/class/allocation rollback; exact resources
+[nvidia-video-queue] kind=encode mask=16; no GR template; isolated/reused contexts; canonical VA retained after GET; HOST semaphore completion; active close; cross-family rejection; absent/class/allocation rollback; exact resources
+[nvidia-native-queue] two GR+compute+paired-CE contexts; subset reuse; canonical VA; GET retains; semaphore completes; invalid masks; active/idle close; missing topology/classes and partial RM unwind; no idle spin
+[nvidia-slices] CE6+GR6; exact semaphores; one public fence each; retained mappings/cache; cursor admission between slices
+queued render reference solid-replace: draws=1 max=0/0 LSB one fence
+queued render reference solid-replace: draws=1 max=0/0 LSB one fence
+queued render reference bilinear-over-scissor: draws=16 max=1/3 LSB one fence
+queued render reference srgb-encode-over: draws=1 max=0/1 LSB one fence
+[nvidia-video-channel] NVDEC/NVENC; sparse engine discovery; class/instance allocation; rejected/missing engines; close during context/storage/channel; exact RM/BO retirement
+[nvidia-video-queue] kind=decode mask=8; no GR template; isolated/reused contexts; canonical VA retained after GET; HOST semaphore completion; active close; cross-family rejection; absent/class/allocation rollback; exact resources
+[nvidia-video-queue] kind=encode mask=16; no GR template; isolated/reused contexts; canonical VA retained after GET; HOST semaphore completion; active close; cross-family rejection; absent/class/allocation rollback; exact resources
+[nvidia-native-queue] two GR+compute+paired-CE contexts; subset reuse; canonical VA; GET retains; semaphore completes; invalid masks; active/idle close; missing topology/classes and partial RM unwind; no idle spin
+[nvidia-slices] CE6+GR6; exact semaphores; one public fence each; retained mappings/cache; cursor admission between slices
+queued render reference solid-replace: draws=1 max=0/0 LSB one fence
+queued render reference solid-replace: draws=1 max=0/0 LSB one fence
+queued render reference bilinear-over-scissor: draws=16 max=1/3 LSB one fence
+queued render reference srgb-encode-over: draws=1 max=0/1 LSB one fence
+[nvidia-video-channel] NVDEC/NVENC; sparse engine discovery; class/instance allocation; rejected/missing engines; close during context/storage/channel; exact RM/BO retirement
+[nvidia-video-queue] kind=decode mask=8; no GR template; isolated/reused contexts; canonical VA retained after GET; HOST semaphore completion; active close; cross-family rejection; absent/class/allocation rollback; exact resources
+[nvidia-video-queue] kind=encode mask=16; no GR template; isolated/reused contexts; canonical VA retained after GET; HOST semaphore completion; active close; cross-family rejection; absent/class/allocation rollback; exact resources
+[nvidia-native-queue] two GR+compute+paired-CE contexts; subset reuse; canonical VA; GET retains; semaphore completes; invalid masks; active/idle close; missing topology/classes and partial RM unwind; no idle spin
+[nvidia-slices] CE6+GR6; exact semaphores; one public fence each; retained mappings/cache; cursor admission between slices
+queued render reference solid-replace: draws=1 max=0/0 LSB one fence
+queued render reference solid-replace: draws=1 max=0/0 LSB one fence
+queued render reference bilinear-over-scissor: draws=16 max=1/3 LSB one fence
+queued render reference srgb-encode-over: draws=1 max=0/1 LSB one fence
+[nvidia-video-channel] NVDEC/NVENC; sparse engine discovery; class/instance allocation; rejected/missing engines; close during context/storage/channel; exact RM/BO retirement
+[nvidia-video-queue] kind=decode mask=8; no GR template; isolated/reused contexts; canonical VA retained after GET; HOST semaphore completion; active close; cross-family rejection; absent/class/allocation rollback; exact resources
+[nvidia-video-queue] kind=encode mask=16; no GR template; isolated/reused contexts; canonical VA retained after GET; HOST semaphore completion; active close; cross-family rejection; absent/class/allocation rollback; exact resources
+[nvidia-native-queue] two GR+compute+paired-CE contexts; subset reuse; canonical VA; GET retains; semaphore completes; invalid masks; active/idle close; missing topology/classes and partial RM unwind; no idle spin
+[nvidia-slices] CE6+GR6; exact semaphores; one public fence each; retained mappings/cache; cursor admission between slices
+queued render reference solid-replace: draws=1 max=0/0 LSB one fence
+queued render reference solid-replace: draws=1 max=0/0 LSB one fence
+queued render reference bilinear-over-scissor: draws=16 max=1/3 LSB one fence
+queued render reference srgb-encode-over: draws=1 max=0/1 LSB one fence
+[nvidia-video-channel] NVDEC/NVENC; sparse engine discovery; class/instance allocation; rejected/missing engines; close during context/storage/channel; exact RM/BO retirement
+[nvidia-video-queue] kind=decode mask=8; no GR template; isolated/reused contexts; canonical VA retained after GET; HOST semaphore completion; active close; cross-family rejection; absent/class/allocation rollback; exact resources
+[nvidia-video-queue] kind=encode mask=16; no GR template; isolated/reused contexts; canonical VA retained after GET; HOST semaphore completion; active close; cross-family rejection; absent/class/allocation rollback; exact resources
+[nvidia-native-queue] two GR+compute+paired-CE contexts; subset reuse; canonical VA; GET retains; semaphore completes; invalid masks; active/idle close; missing topology/classes and partial RM unwind; no idle spin
+[nvidia-slices] CE6+GR6; exact semaphores; one public fence each; retained mappings/cache; cursor admission between slices
+queued render reference solid-replace: draws=1 max=0/0 LSB one fence
+queued render reference solid-replace: draws=1 max=0/0 LSB one fence
+queued render reference bilinear-over-scissor: draws=16 max=1/3 LSB one fence
+queued render reference srgb-encode-over: draws=1 max=0/1 LSB one fence
+[nvidia-video-channel] NVDEC/NVENC; sparse engine discovery; class/instance allocation; rejected/missing engines; close during context/storage/channel; exact RM/BO retirement
+[nvidia-video-queue] kind=decode mask=8; no GR template; isolated/reused contexts; canonical VA retained after GET; HOST semaphore completion; active close; cross-family rejection; absent/class/allocation rollback; exact resources
+[nvidia-video-queue] kind=encode mask=16; no GR template; isolated/reused contexts; canonical VA retained after GET; HOST semaphore completion; active close; cross-family rejection; absent/class/allocation rollback; exact resources
+[nvidia-native-queue] two GR+compute+paired-CE contexts; subset reuse; canonical VA; GET retains; semaphore completes; invalid masks; active/idle close; missing topology/classes and partial RM unwind; no idle spin
+[nvidia-slices] CE6+GR6; exact semaphores; one public fence each; retained mappings/cache; cursor admission between slices
+queued render reference solid-replace: draws=1 max=0/0 LSB one fence
+queued render reference solid-replace: draws=1 max=0/0 LSB one fence
+queued render reference bilinear-over-scissor: draws=16 max=1/3 LSB one fence
+queued render reference srgb-encode-over: draws=1 max=0/1 LSB one fence
+[nvidia-video-channel] NVDEC/NVENC; sparse engine discovery; class/instance allocation; rejected/missing engines; close during context/storage/channel; exact RM/BO retirement
+[nvidia-video-queue] kind=decode mask=8; no GR template; isolated/reused contexts; canonical VA retained after GET; HOST semaphore completion; active close; cross-family rejection; absent/class/allocation rollback; exact resources
+[nvidia-video-queue] kind=encode mask=16; no GR template; isolated/reused contexts; canonical VA retained after GET; HOST semaphore completion; active close; cross-family rejection; absent/class/allocation rollback; exact resources
+[nvidia-native-queue] two GR+compute+paired-CE contexts; subset reuse; canonical VA; GET retains; semaphore completes; invalid masks; active/idle close; missing topology/classes and partial RM unwind; no idle spin
+[nvidia-slices] CE6+GR6; exact semaphores; one public fence each; retained mappings/cache; cursor admission between slices
+queued render reference solid-replace: draws=1 max=0/0 LSB one fence
+queued render reference solid-replace: draws=1 max=0/0 LSB one fence
+queued render reference bilinear-over-scissor: draws=16 max=1/3 LSB one fence
+queued render reference srgb-encode-over: draws=1 max=0/1 LSB one fence
+[nvidia-video-channel] NVDEC/NVENC; sparse engine discovery; class/instance allocation; rejected/missing engines; close during context/storage/channel; exact RM/BO retirement
+[nvidia-video-queue] kind=decode mask=8; no GR template; isolated/reused contexts; canonical VA retained after GET; HOST semaphore completion; active close; cross-family rejection; absent/class/allocation rollback; exact resources
+[nvidia-video-queue] kind=encode mask=16; no GR template; isolated/reused contexts; canonical VA retained after GET; HOST semaphore completion; active close; cross-family rejection; absent/class/allocation rollback; exact resources
+[nvidia-native-queue] two GR+compute+paired-CE contexts; subset reuse; canonical VA; GET retains; semaphore completes; invalid masks; active/idle close; missing topology/classes and partial RM unwind; no idle spin
+[nvidia-slices] CE6+GR6; exact semaphores; one public fence each; retained mappings/cache; cursor admission between slices
+queued render reference solid-replace: draws=1 max=0/0 LSB one fence
+queued render reference solid-replace: draws=1 max=0/0 LSB one fence
+queued render reference bilinear-over-scissor: draws=16 max=1/3 LSB one fence
+queued render reference srgb-encode-over: draws=1 max=0/1 LSB one fence
+[nvidia-video-channel] NVDEC/NVENC; sparse engine discovery; class/instance allocation; rejected/missing engines; close during context/storage/channel; exact RM/BO retirement
+[nvidia-video-queue] kind=decode mask=8; no GR template; isolated/reused contexts; canonical VA retained after GET; HOST semaphore completion; active close; cross-family rejection; absent/class/allocation rollback; exact resources
+[nvidia-video-queue] kind=encode mask=16; no GR template; isolated/reused contexts; canonical VA retained after GET; HOST semaphore completion; active close; cross-family rejection; absent/class/allocation rollback; exact resources
+[nvidia-native-queue] two GR+compute+paired-CE contexts; subset reuse; canonical VA; GET retains; semaphore completes; invalid masks; active/idle close; missing topology/classes and partial RM unwind; no idle spin
+failed command: ./.zig-cache/o/d395ba0ef9ab3d5b87b29da52ae523b6/test --cache-dir=./.zig-cache --seed=0x820896c1 --listen=-
+
+Build Summary: 5/5 steps succeeded; 1/1 tests passed
+unit-test success
++- run test 1 pass (1 total) 7s MaxRSS:40M
+   +- compile test ReleaseSafe native success 1m MaxRSS:1G
+      +- WriteFile GSP-570.144-GA102-BLOAD-IMAGE.bin cached
+         +- run pwsh success 934ms
+

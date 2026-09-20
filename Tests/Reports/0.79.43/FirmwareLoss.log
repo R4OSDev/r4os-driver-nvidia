@@ -1,0 +1,12 @@
+info: fork /root/Projekte/R4OS/Repositories/SDK matched 1 r4os_sdk packages
+info: fork /root/Projekte/R4OS/Repositories/Contract matched 1 r4os_contract packages
+info: fork /root/Projekte/R4OS/Repositories/Libraries matched 1 r4os_libraries packages
+NVIDIA generation boot bundles: exact original files, licenses and aligned ranges verified.
+NVIDIA module package: pinned 570.144, original GSP/boot/Booter files with complete licenses verified.
+Build Summary: 5/5 steps succeeded; 1/1 tests passed
+unit-test success
++- run test 1 pass (1 total) 403ms MaxRSS:66M
+   +- compile test ReleaseSafe native success 20s MaxRSS:494M
+      +- WriteFile GSP-570.144-GA102-BLOAD-IMAGE.bin cached
+         +- run pwsh success 1s
+
