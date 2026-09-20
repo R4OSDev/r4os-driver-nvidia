@@ -81,7 +81,25 @@ pub export fn nvidia_init(api: *const a.DriverApi) callconv(.c) i32 {
     rm_log.bind(&ctx);
     const mode = std.mem.span(ctx.getOption("NVIDIA", "mode"));
     const check_firmware = std.ascii.eqlIgnoreCase(mode, "firmware-check");
-    starting_native = std.ascii.eqlIgnoreCase(mode, "native");
+    const automatic = mode.len == 0 or std.ascii.eqlIgnoreCase(mode, "auto");
+    // Read the kernel's effective policy, including the one-shot boot-menu
+    // override, before resources, PCI snapshots or any GPU aperture access.
+    // An explicit native option must never bypass Software Graphics.
+    const boot_policy: ?u32 = blk: {
+        const display = ctx.graphicsDisplay() orelse break :blk null;
+        var boot: a.GfxNativeBootInfo = .{};
+        if (display.bootInfo(&boot) != a.gfx_output_ok or boot.version != 1 or boot.size < @sizeOf(a.GfxNativeBootInfo)) break :blk null;
+        break :blk boot.policy;
+    };
+    if (boot_policy != null and boot_policy.? != 0) {
+        ctx.logInfo("NVIDIA bind: software-policy native-writes=disabled firmware-execution=disabled fallback=preserved");
+        return 0;
+    }
+    starting_native = automatic or std.ascii.eqlIgnoreCase(mode, "native");
+    if (boot_policy == null and (starting_native or std.ascii.eqlIgnoreCase(mode, "gsp-start") or std.ascii.eqlIgnoreCase(mode, "boot-check"))) {
+        ctx.logError("NVIDIA bind: boot-policy-unavailable native-writes=disabled fallback=preserved");
+        return -11;
+    }
     if (starting_native) {
         const buffers = std.mem.span(ctx.getOption("NVIDIA", "buffers"));
         native_frame_count = @import("gsp_native_output.zig").frameCount(buffers) catch {

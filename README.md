@@ -1,18 +1,24 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS, passive by default. Module 0.1.138; original R4OS code is
+NVIDIA display driver for R4OS. Module 0.1.144; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
-subsystem 1458:4074, VBIOS 94.06.2f.00.d6. Software implementation through 0.79.33 is documented; physical native qualification remains separate.
-The default path inventories NVIDIA display functions once through
+subsystem 1458:4074, VBIOS 94.06.2f.00.d6. Software integration through 0.79.42 is documented; physical native qualification remains separate.
+The automatic path inventories NVIDIA display functions once through
 the kernel PCI inventory. Explicit diagnostic/start modes are described below.
 Starting with R4OS 0.79.9, `IMAGE_SCOPE=slim` includes the current module in
-Slim and Full. The standard configuration selects `mode=passive`; no GPU
-firmware is executed. The boot framebuffer and existing display owner remain
-in control. Full includes DISPLAYD for subsequent hardware diagnostics.
+Slim and Full. Since 0.79.42 the standard configuration selects `mode=auto`.
+Auto (also an absent mode option) follows the native start path only after
+the effective boot policy, measured boot adapter, chip/board and pinned local
+firmware checks succeed. Unknown/ambiguous hardware preserves the fallback.
+GRAPHICS=SOFTWARE and the one-shot software boot override every mode before
+resource, PCI or GPU access. Explicit mode=passive remains a diagnostic choice.
+Native graphics are experimental until the separate physical acceptance.
+Full includes DISPLAYD for subsequent hardware diagnostics. The manifest's
+firmware.version is checked against the pinned package during every build.
 
-Independent GPU VA foundation (0.79.35, in progress): `gsp_virtual_range`
+Historical GPU VA foundation (0.79.35): `gsp_virtual_range`
 owns separately aligned/fixed RM virtual allocations and exact map/unmap
 receipts. Resident bindings borrow the original system-RAM registrations or
 native VRAM object; no copied staging buffer or second registration is needed.

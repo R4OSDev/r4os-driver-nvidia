@@ -1,5 +1,6 @@
 param(
     [Parameter(Mandatory)][string]$LockPath,
+    [string]$ManifestPath = (Join-Path $PSScriptRoot '../module.R4MF'),
     [Parameter(Mandatory)][string]$LicensePath,
     [Parameter(Mandatory)][string]$Ga10xPath,
     [Parameter(Mandatory)][string]$Tu10xPath,
@@ -14,6 +15,10 @@ Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'FirmwarePackage.ps1')
 $pin=Get-Content -Raw -LiteralPath $LockPath|ConvertFrom-Json
 if($pin.schema -ne 1 -or $pin.firmware.Count -ne 2){throw 'Unsupported firmware package schema.'}
+$declared = @(Get-Content -LiteralPath $ManifestPath | Where-Object { $_.StartsWith('META=firmware.version=') })
+if ($declared.Count -ne 1 -or $declared[0] -cne "META=firmware.version=$($pin.rm_version)") {
+    throw 'Declared firmware bundle version differs from the verified package lock.'
+}
 Test-NvidiaFirmwareArtifact $LicensePath $pin.license
 Test-NvidiaFirmwareArtifact $Ga10xPath $pin.firmware[0]
 Test-NvidiaFirmwareArtifact $Tu10xPath $pin.firmware[1]
