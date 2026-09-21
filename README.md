@@ -18,6 +18,35 @@ Native graphics are experimental until the separate physical acceptance.
 Full includes DISPLAYD for subsequent hardware diagnostics. The manifest's
 firmware.version is checked against the pinned package during every build.
 
+Current software scope (0.79.45)
+------------------------------
+GA10x/AD10x native startup, memory/VA, CE/GR queues, scanout/pageflip,
+HDMI/DP audio handoff, hotplug, multi-output, SDR/HDR, VRR, bounded advanced
+links, telemetry and reset are integrated. NVDEC/NVENC channels connect to
+R4VIDEO/R4ENC. Public Vulkan/WSI and optional OpenGL use R4VK/R4GL; software
+OpenGL and the bootfb Desktop remain independent of native NVIDIA admission.
+These are software/model results, not physical NVIDIA qualification.
+
+Turing/Blackwell native bootstrap/display, secondary non-boot NVIDIA startup,
+automatic hybrid composition and system S3/S4/S0ix are unavailable. Compiler
+profiles and firmware files do not implement those missing paths. Capability
+details and evidence: workspace Docs/Deployment/GrafikFreigabe07945.txt/.json,
+Docs/SupportedHardware.txt and Docs/Drivers/GrafikGenerationen07933.txt.
+Reproduce the current bounded native-owner model with
+`./Build.sh unit-test "-Dstorage-test-filter=complete run lease" --summary all`;
+Windows uses Build.bat. Existing 0.79.43 owner logs and 0.79.44 integration
+evidence are reused; a Windows-host run and physical GPU execution stay open
+in workspace ExFiles/Reports/OssiGPU.txt.
+
+Historical implementation notes
+-------------------------------
+The remaining checkpoint notes preserve source/provisioning details and their
+original limitations. Statements such as "work in progress", "not supplied"
+or "passive default" describe that checkpoint, not the current status above.
+Use the current module manifest, build scripts and capability matrix for
+present versions and supported operations. Do not replay historical hardware
+register state or use an old partial-start recipe as the normal native path.
+
 Historical GPU VA foundation (0.79.35): `gsp_virtual_range`
 owns separately aligned/fixed RM virtual allocations and exact map/unmap
 receipts. Resident bindings borrow the original system-RAM registrations or
