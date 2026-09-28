@@ -111,8 +111,8 @@ pub export fn nvidia_init(api: *const a.DriverApi) callconv(.c) i32 {
     checking_boot = starting_gsp or std.ascii.eqlIgnoreCase(mode, "boot-check");
     boot_checked = false;
     checking_runtime = std.ascii.eqlIgnoreCase(mode, "runtime-check");
-    if (starting_gsp and ctx.apiVersion() < a.driver_api_thread_work_version) {
-        ctx.logError("NVIDIA gsp-start: rejected reason=kernel-work-or-shutdown-contract firmware-execution=disabled");
+    if (starting_gsp and !@import("gsp_start_work.zig").supported(&ctx)) {
+        ctx.logError("NVIDIA gsp-start: rejected reason=kernel-owned-work-contract firmware-execution=disabled fallback=preserved");
         return -12;
     }
     if (mode.len != 0 and !std.ascii.eqlIgnoreCase(mode, "passive") and !check_firmware and !checking_runtime and !checking_boot) {

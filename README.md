@@ -1,6 +1,6 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS. Module 0.1.144; original R4OS code is
+NVIDIA display driver for R4OS. Module 0.1.145; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
@@ -17,6 +17,19 @@ resource, PCI or GPU access. Explicit mode=passive remains a diagnostic choice.
 Native graphics are experimental until the separate physical acceptance.
 Full includes DISPLAYD for subsequent hardware diagnostics. The manifest's
 firmware.version is checked against the pinned package during every build.
+
+Boot owner correction (0.1.145, 2026-09-28): native startup requires the
+complete DriverApi36 owned-work entrypoint (Kernel 0.1.212 or newer). The
+dedicated task submits each bounded device slice with `workSubmitOwned`;
+ordinary Work has no lifecycle guard for boot-display/MMIO calls. On OssiPC,
+0.1.144 otherwise failed its first FRTS display check before firmware effects
+and retained the boot hold, leaving the desktop invisible. Busy ownership is
+retried after releasing the exact completion, with a five-second/4096-retry
+bound. Pending completion wake publication retains the ticket for bounded
+release retry. All waits stay outside the lifecycle owner. Missing version,
+size or callback is rejected before resources or the boot hold are acquired.
+The existing lifecycle test group covers these paths; hardware qualification
+remains separate from the host result.
 
 Current software scope (0.79.45)
 ------------------------------

@@ -517,8 +517,22 @@ test "NVIDIA actual driver lifecycle verifies loaded lock before PCI and binds f
     try t.expectEqual(@as(usize, 0), state.enumerate_count);
     try t.expectEqual(@as(i32, 0), driver.nvidia_shutdown());
     api.gfx_display_query = policyDisplay;
+    // Reject incomplete owned-work contracts before firmware, PCI or a boot
+    // hold can be acquired. Passive and software boots retain old prefixes.
+    for (0..3) |missing| {
+        state = .{ .selected_mode = "auto", .present = false };
+        api.version = if (missing == 0) a.driver_api_thread_work_version else a.driver_api_owned_work_version;
+        api.size = if (missing == 1) @offsetOf(a.DriverApi, "driver_work_submit_owned") else @sizeOf(a.DriverApi);
+        api.driver_work_submit_owned = if (missing == 2) null else WorkFixture.submit;
+        try t.expectEqual(@as(i32, -12), driver.nvidia_init(&api));
+        try t.expectEqual(@as(usize, 0), state.enumerate_count);
+        try t.expect(!state.lock_verified and !state.mapping);
+        try t.expectEqual(@as(i32, 0), driver.nvidia_shutdown());
+    }
     state = .{ .selected_mode = "auto", .present = false };
-    api.version = a.driver_api_thread_work_version;
+    api.version = a.driver_api_owned_work_version;
+    api.size = @sizeOf(a.DriverApi);
+    api.driver_work_submit_owned = WorkFixture.submit;
     try t.expectEqual(@as(i32, -4), driver.nvidia_init(&api));
     try t.expect(state.lock_verified and state.enumerate_count == 1);
     try t.expectEqual(@as(i32, 0), driver.nvidia_shutdown());
@@ -558,6 +572,140 @@ fn policyDisplay(out: *a.GfxDriverDisplayApi) callconv(.c) i32 {
 }
 fn policyBootInfo(out: *a.GfxNativeBootInfo) callconv(.c) i32 {
     out.* = .{ .generation = 1, .policy = state.boot_policy, .state = a.display_state_bootfb }; return a.gfx_output_ok;
+}
+
+// Exercise the actual pacing task and its hardware slice, with separate task,
+// lifecycle-owner and completion-publication contexts. Plain Work is forbidden.
+const WorkFixture = struct {
+    var task: a.DriverThreadRequest = .{};
+    var ticks: u64 = 0;
+    var owner = false;
+    var busy: u32 = 0;
+    var release_busy: u32 = 0;
+    var submits: u32 = 0;
+    var releases: u32 = 0;
+    var callbacks: u32 = 0;
+    var active: u32 = 0;
+    var result: i32 = 0;
+    var cancelled = false;
+    fn reset() void {
+        task = .{}; ticks = 0; owner = false; busy = 0; release_busy = 0;
+        submits = 0; releases = 0; callbacks = 0; active = 0; result = 0; cancelled = false;
+    }
+    fn threads(out: *a.DriverThreadApi) callconv(.c) i32 {
+        out.* = .{ .start = @intFromPtr(&start) }; return 0;
+    }
+    fn start(request: *const a.DriverThreadRequest, out: *u64) callconv(.c) i32 {
+        task = request.*; out.* = 7; return 0;
+    }
+    fn semaphores(out: *a.DriverSemaphoreApi) callconv(.c) i32 {
+        out.* = .{ .create = @intFromPtr(&create), .acquire = @intFromPtr(&acquire) }; return 0;
+    }
+    fn create(initial: u32, maximum: u32, out: *u64) callconv(.c) i32 {
+        std.debug.assert(initial == 0 and maximum == 1); out.* = 9; return 0;
+    }
+    fn acquire(handle: u64, timeout: u64) callconv(.c) i32 {
+        std.debug.assert(handle == 9 and active == 0 and !owner);
+        wait(timeout); return a.driver_semaphore_error_timeout;
+    }
+    fn submit(handler: a.DriverWorkHandler, raw: usize, out: *u32) callconv(.c) i32 {
+        std.debug.assert(active == 0 and out.* == 0 and !owner);
+        submits += 1; active = submits; out.* = active;
+        if (cancelled) result = -7 else if (busy != 0) {
+            busy -= 1; result = a.driver_work_owner_busy;
+        } else {
+            owner = true; callbacks += 1;
+            result = handler(raw);
+            owner = false;
+        }
+        return 0;
+    }
+    fn status(handle: u32, out: *a.DriverCompletionStatus) callconv(.c) i32 {
+        std.debug.assert(handle == active and !owner);
+        out.* = .{ .state = if (cancelled) a.driver_work_state_cancelled else a.driver_work_state_completed, .result = result };
+        return 0;
+    }
+    fn release(handle: u32) callconv(.c) i32 {
+        std.debug.assert(handle == active and !owner);
+        if (release_busy != 0) { release_busy -= 1; return -2; }
+        active = 0; releases += 1; return 0;
+    }
+    fn tick() callconv(.c) u64 { return ticks; }
+    fn frequency() callconv(.c) u32 { return 10; }
+    fn wait(count_ticks: u64) callconv(.c) void {
+        std.debug.assert(!owner); ticks += count_ticks;
+    }
+    fn clock() callconv(.c) u64 {
+        // The real slice's first device operation must run with the guard.
+        std.debug.assert(owner); return ticks * std.time.ns_per_ms;
+    }
+    fn resources(out: *a.DriverResourceApi) callconv(.c) i32 {
+        out.* = .{ .now_ns = @intFromPtr(&clock) }; return 0;
+    }
+    fn table() a.DriverApi {
+        var api = apiTable();
+        api.version = a.driver_api_owned_work_version;
+        api.thread_query = threads; api.semaphore_query = semaphores;
+        api.driver_work_submit_owned = submit;
+        api.driver_completion_status = status; api.driver_completion_release = release;
+        api.tick_count = tick; api.timer_frequency = frequency; api.wait_ticks = wait;
+        api.resource_query = WorkFixture.resources;
+        return api;
+    }
+    fn run() i32 {
+        const handler: a.DriverWorkHandler = @ptrFromInt(task.handler);
+        return handler(task.context);
+    }
+};
+test "NVIDIA actual driver lifecycle paces hardware under owned work and retains incomplete tickets" {
+    const worker = @import("gsp_start_work.zig");
+    const target = try t.allocator.create(@import("gsp_device.zig").Device);
+    defer t.allocator.destroy(target);
+    target.* = .{ .self_address = @intFromPtr(target), .stopped = true };
+    var api = WorkFixture.table();
+    const ctx = r4os.r4dev.DriverContext.init(&api);
+    for (0..4) |scenario| {
+        WorkFixture.reset();
+        var work: worker.Work = .{};
+        try work.start(&ctx, target);
+        switch (scenario) {
+            0 => { WorkFixture.busy = 2; WorkFixture.release_busy = 2; },
+            1 => WorkFixture.busy = 100,
+            2 => WorkFixture.release_busy = 100,
+            3 => WorkFixture.cancelled = true,
+            else => unreachable,
+        }
+        const result = WorkFixture.run();
+        switch (scenario) {
+            0 => {
+                try t.expectEqual(@as(i32, 0), result);
+                try t.expectEqual(@as(u32, 3), WorkFixture.submits);
+                try t.expectEqual(@as(u32, 1), WorkFixture.callbacks);
+                try t.expectEqual(@as(u32, 3), WorkFixture.releases);
+                try t.expectEqual(@as(u32, 0), work.completion);
+            },
+            1 => {
+                try t.expectEqual(a.driver_work_owner_busy, result);
+                try t.expectEqual(@as(u32, 0), WorkFixture.callbacks);
+                try t.expectEqual(WorkFixture.submits, WorkFixture.releases);
+                try t.expectEqual(@as(u32, 0), work.completion);
+            },
+            2 => {
+                try t.expectEqual(@as(i32, -1), result);
+                try t.expectEqual(@as(u32, 1), WorkFixture.submits);
+                try t.expectEqual(@as(u32, 0), WorkFixture.releases);
+                try t.expectEqual(@as(u32, 1), work.completion);
+            },
+            3 => {
+                try t.expectEqual(@as(i32, -7), result);
+                try t.expectEqual(@as(u32, 0), WorkFixture.callbacks);
+                try t.expectEqual(@as(u32, 1), WorkFixture.releases);
+                try t.expectEqual(@as(u32, 0), work.completion);
+            },
+            else => unreachable,
+        }
+    }
+    target.irq_wake = null;
 }
 fn count() callconv(.c) u32 {
     state.enumerate_count += 1;

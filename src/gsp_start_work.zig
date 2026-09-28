@@ -1,9 +1,14 @@
 //! A dedicated pacing task owns waits; short serialized DriverWork callbacks
-//! alone mutate the native device. Exactly one outstanding work completion.
+//! under the lifecycle owner alone mutate the native device. Exactly one
+//! outstanding work completion; waits never hold the lifecycle owner.
 const std = @import("std");
 const r4os = @import("r4os");
 const a = r4os.abi;
 const device = @import("gsp_device.zig");
+pub fn supported(ctx: *const r4os.r4dev.DriverContext) bool {
+    return ctx.supportsDriverApi(a.driver_api_owned_work_version, @offsetOf(a.DriverApi, "driver_work_submit_owned") + 8) and
+        ctx.api.driver_work_submit_owned != null;
+}
 pub const Work = struct {
     self_address: usize = 0,
     ctx: ?r4os.r4dev.DriverContext = null,
@@ -17,7 +22,7 @@ pub const Work = struct {
 
     pub fn start(self: *Work, ctx: *const r4os.r4dev.DriverContext, target: *device.Device) !void {
         if (self.self_address != 0 or target.self_address != @intFromPtr(target)) return error.State;
-        if (ctx.apiVersion() < a.driver_api_thread_work_version) return error.Api;
+        if (!supported(ctx)) return error.Api;
         const service = ctx.threads() orelse return error.Api;
         const semaphores = ctx.semaphores() orelse return error.Api;
         self.self_address = @intFromPtr(self);
@@ -76,8 +81,12 @@ pub const Work = struct {
         const self = from(raw);
         if (self.self_address != raw or self.ctx == null or self.threads == null) return -1;
         const ctx = self.ctx.?;
+        var owner_wait_started = ctx.tickCount();
+        var owner_retries: u32 = 0;
         while (@atomicLoad(u32, &self.stopping, .acquire) == 0) {
-            if (ctx.workSubmit(slice, raw, 0, &self.completion) != 0) {
+            // Ordinary Work carries a driver identity but no lifecycle guard;
+            // it cannot query the boot hold or perform display/MMIO operations.
+            if (self.completion != 0 or ctx.workSubmitOwned(slice, raw, &self.completion) != 0 or self.completion == 0) {
                 ctx.logError("NVIDIA gsp-start: pacing=failed reason=work-admission device=retained");
                 return -1;
             }
@@ -87,7 +96,19 @@ pub const Work = struct {
                 return -1;
             }
             if (result == 1) return 0;
-            if (result < 0) return result;
+            if (result == a.driver_work_owner_busy) {
+                // No callback ran. Its ticket has been released by finish;
+                // retry only after pacing, without retaining the shared lane.
+                owner_retries += 1;
+                if (owner_retries >= 4096 or ctx.tickCount() -% owner_wait_started >= 5 * @as(u64, @max(ctx.timerFrequency(), 1))) {
+                    ctx.logError("NVIDIA gsp-start: pacing=failed reason=owner-deadline device=retained");
+                    return result;
+                }
+            } else {
+                if (result < 0) return result;
+                owner_wait_started = ctx.tickCount();
+                owner_retries = 0;
+            }
             // Sleeping here releases the dedicated task's owner context.
             // No shared worker, MMIO callback or device lock spans this wait.
             // A GSP IRQ supplies a permit immediately; the finite timeout
@@ -110,12 +131,16 @@ pub const Work = struct {
             var status: a.DriverCompletionStatus = .{};
             if (ctx.completionStatus(self.completion, &status) != 0) return false;
             if (status.state == a.driver_work_state_completed or status.state == a.driver_work_state_cancelled) {
-                result.* = status.result;
-                if (ctx.completionRelease(self.completion) != 0) return false;
-                self.completion = 0;
-                return true;
-            }
-            if (status.state != a.driver_work_state_queued and status.state != a.driver_work_state_running) return false;
+                const released = ctx.completionRelease(self.completion);
+                if (released == 0) {
+                    result.* = status.result;
+                    self.completion = 0;
+                    return true;
+                }
+                // Final status can precede wake publication. Keep the exact
+                // ticket until release succeeds or this bounded wait expires.
+                if (released != -2) return false;
+            } else if (status.state != a.driver_work_state_queued and status.state != a.driver_work_state_running) return false;
             if (@atomicLoad(u32, &self.stopping, .acquire) != 0 and status.state == a.driver_work_state_queued) _ = ctx.workCancel(self.completion);
             if (ctx.tickCount() -% started_at >= bound) return false;
             ctx.waitTicks(1);
