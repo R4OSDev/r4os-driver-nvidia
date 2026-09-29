@@ -356,6 +356,9 @@ pub const Owner = struct {
     cursor_reserving: bool = false,
     rm_rejection: ?u32 = null,
     outputs: outputs.Owner = .{},
+    // Headless execution retains GSP/RM/IRQ and GPU engines, but performs no
+    // connector probing, EDID/DDC, AUX or link training, including on HPD.
+    discover_receivers: bool = true,
     receiver_events: hotplug.Work = .{},
     output_generation: u64 = 0,
     buffers: ResourceSlots.Pool(BufferSlot) = .{},
@@ -410,7 +413,10 @@ pub const Owner = struct {
     contexts: [64]ContextSlot = @splat(.{}),
     context_active: ?u16 = null,
     graph_closing: bool = false,
+    shutdown_closing: bool = false,
+    memory_api: ?r4os.driver_memory.Context = null,
     close_deadline: u64 = 0,
+    unload: @import("gsp_unload.zig").Owner = .{},
     reset_stage: enum { loss, queue, transfers, work, presentations, fifos, display_channels, display_resources,
         contexts, control, virtuals, mappings, virtual_provider, native, done } = .loss,
     reset_cursor: usize = 0,
@@ -427,6 +433,7 @@ pub const Owner = struct {
             reservation.backing != reader.memory.?.boot_storage) return error.Binding;
         self.self_address = @intFromPtr(self);
         self.ctx = ctx.*;
+        self.memory_api = ctx.memory() orelse return error.Api;
         self.device = device;
         self.reader = reader;
         self.reservation = reservation;
@@ -455,6 +462,37 @@ pub const Owner = struct {
         self.last_clock = current;
         return current;
     }
+    pub fn clock(self: *const Owner) ?r4os.r4dev.DriverResourceContext {
+        const device = self.device orelse return null;
+        return device.clock;
+    }
+    /// Kernel terminal admission has already closed new common work. Keep
+    /// existing engine/RM receipts live while the physical work drains.
+    pub fn beginShutdown(self: *Owner) !void {
+        if (self.shutdown_closing) return;
+        _ = try self.now();
+        if (self.nativeObject() == null or self.display_engine_owner != null or self.mode_control_owner != null or
+            self.presentation != null or self.allocations.pending != null or self.native_copy.phase != .ready)
+            return error.ShutdownStartup;
+        const memory = self.memory_api orelse return error.Api;
+        if (memory.deviceLost(self.adapter_id, self.epoch, false) != r4os.abi.gfx_buffer_result_ok) return error.Retained;
+        self.shutdown_closing = true;
+        self.allocations.close();
+        self.virtual_provider.close();
+    }
+    pub fn shutdownGraph(self: *Owner, deadline: u64) !bool {
+        if (!self.shutdown_closing) return error.State;
+        if (self.graph_closing) return true;
+        if (self.copyBusy() or self.hasQueuedWork() or self.cursor_point != null) return false;
+        // This removes only the admission handle. The actual FIFO/context
+        // owners remain in the graph and must acknowledge their retirement.
+        if (self.copy_backend) |*backend| backend.channel = null;
+        self.beginDestroyGraph(deadline, true) catch |err| {
+            if (err == error.Busy) return false;
+            return err;
+        };
+        return true;
+    }
     pub fn step(self: *Owner) !Progress {
         if (self.self_address == 0 or self.self_address != @intFromPtr(self) or self.failure != null) return error.State;
         return self.advance() catch |err| {
@@ -475,7 +513,7 @@ pub const Owner = struct {
             return true;
         }
         if (self.self_address != @intFromPtr(self) or self.failure == null or !proof.valid(self.epoch)) return error.Stale;
-        const memory = self.ctx.?.memory() orelse return error.Api;
+        const memory = self.memory_api orelse return error.Api;
         switch (self.reset_stage) {
             .loss => {
                 if (memory.deviceLost(self.adapter_id, self.epoch, true) != r4os.abi.gfx_buffer_result_ok) return error.Retained;
@@ -656,11 +694,11 @@ pub const Owner = struct {
         self.logResidency();
         self.allocations.close();
         self.virtual_provider.close();
-        if (self.ctx) |ctx| if (ctx.memory()) |memory| {
+        if (self.memory_api) |memory| {
             const result = memory.deviceLost(self.adapter_id, self.epoch, false);
             if (result != r4os.abi.gfx_buffer_result_ok and result != r4os.abi.err_no_fn)
                 self.log("NVIDIA gsp-quarantine: native-buffers={d} epoch={d}", .{result, self.epoch});
-        };
+        }
         if (self.power_owner) |*owner| owner.deviceLost(self.last_clock);
         if (self.faults.first_fatal == null and err != error.Stopped and err != error.RmClosed)
             self.recordFault(diagnostics.host(self.failureOperation(), err, true)) catch {};
@@ -677,6 +715,9 @@ pub const Owner = struct {
                 .{@errorName(err), self.cursor_upload != null, if (self.display_work) |work| work.cursor != null else false});
         if (self.display_resources_slot.owner) |owner| owner.quarantine();
         self.failure = err;
+        if (self.unload.self_address != 0) self.log("NVIDIA gsp-unload: end={s} phase={s} reply={?x} payload-bytes={d} mailbox={?x} polls={d} resources=held",
+            .{ @errorName(err), @tagName(self.unload.phase), if (self.unload.reply) |reply| @as(?u32, reply.result) else null,
+                self.unload.reply_bytes, self.unload.last_mailbox, self.unload.observations });
         // unregister(false) terminalizes the common queue as device-lost but
         // retains reachable jobs. complete(device_lost, false) is not that API.
         // Keep this binding even between jobs and attempt retirement only once.
@@ -996,22 +1037,36 @@ pub const Owner = struct {
     pub fn validateModeQuery(self: *Owner, root: DisplayEngineHandle, plan: boot_mode.Plan) !void {
         const expected = try self.displayColorModePlan(root, plan.window, plan.receiver_mode_id, plan.color, plan.color_pipeline);
         if (!std.meta.eql(expected, plan)) return error.Stale;
-        _ = try display_link.derive(expected, self.display_object.?, self.outputs.snapshot().?);
+        try display_link.validate(expected, self.display_object.?, self.outputs.snapshot().?);
     }
     pub fn modeTopology(self: *const Owner, candidate: boot_mode.Plan) !mode_control.Topology {
         var result = mode_control.Topology.single(candidate);
-        for (&self.display_images) |*entry| if (entry.*) |active| {
-            const current = active.boot_mode orelse return error.Unsupported;
+        for (&self.display_images) |*entry| if (entry.*) |*active| {
+            const current = if (active.boot_mode) |*value| value else return error.Unsupported;
             if (current.head == candidate.head and current.window == candidate.window) continue;
-            try result.append(current);
+            try result.append(current.*);
         };
         return result;
     }
-    pub fn validateModeTopology(self: *Owner, root: DisplayEngineHandle, plan: boot_mode.Plan, topology: mode_control.Topology) !void {
+    pub fn validateModeTopology(self: *Owner, root: DisplayEngineHandle, plan: boot_mode.Plan, topology: *const mode_control.Topology) !void {
         try self.validateModeQuery(root, plan);
         // A completed query is valid only for this complete active set.
         // Ordinary flips change images/receipts, never the bandwidth inputs.
-        if (!std.meta.eql(topology, try self.modeTopology(plan))) return error.Stale;
+        // Compare the resident entries directly: materializing another eight
+        // plans and using array-value equality consumes the 64-KB task stack.
+        if (topology.count == 0 or topology.count > topology.plans.len or
+            topology.plans[0] == null or !std.meta.eql(topology.plans[0].?, plan)) return error.Stale;
+        var count: usize = 1;
+        for (&self.display_images) |*entry| if (entry.*) |*active| {
+            const current = if (active.boot_mode) |*value| value else return error.Unsupported;
+            if (current.head == plan.head and current.window == plan.window) continue;
+            try topology.validateNext(count, current);
+            if (count >= topology.count or topology.plans[count] == null or
+                !std.meta.eql(topology.plans[count].?, current.*)) return error.Stale;
+            count += 1;
+        };
+        if (count != topology.count) return error.Stale;
+        for (topology.plans[count..]) |*entry| if (entry.* != null) return error.Stale;
     }
     pub fn createModeControl(self: *Owner, root: DisplayEngineHandle, plan: boot_mode.Plan, deadline: u64) !ModeControlHandle {
         _ = try self.now();
@@ -1038,7 +1093,7 @@ pub const Owner = struct {
         const owner = try self.findModeControl(handle);
         // Cancellation has no fresh receiver timing to validate. Preserve
         // the query identity/state while info() withholds its obsolete proof.
-        if (!owner.obsolete) try self.validateModeTopology(self.mode_control_root.?, owner.mode, owner.topology);
+        if (!owner.obsolete) try self.validateModeTopology(self.mode_control_root.?, owner.mode, &owner.topology);
         return .{ .state = owner.state, .info = owner.info(), .rejected = owner.rejected, .unavailable = owner.unavailable };
     }
     pub fn cancelModeQuery(self: *Owner) !void {
@@ -1328,7 +1383,7 @@ pub const Owner = struct {
         const staging = if (self.graph.?.control_buffer) |*value| value else return error.State;
         if (staging.binding.space.handle != fifo.config.context.vaspace or staging.binding.space.client != root.binding.client) return error.Stale;
         try self.channel.?.guard(deadline);
-        const input_memory = self.ctx.?.memory() orelse return error.Api;
+        const input_memory = self.memory_api orelse return error.Api;
         self.cursor_upload = .{ .channel = channel, .slot = slot };
         self.cursor_upload.?.operation.open(input_memory, source, plan, staging, target, @as(u64, slot) * cursor_image.max_bytes, deadline) catch |err| {
             if (self.cursor_upload.?.operation.failure != null) self.stop(err) else self.cursor_upload = null;
@@ -1628,13 +1683,13 @@ pub const Owner = struct {
             plan.signal.dp_vsc = plan.displayPort() and @import("gsp_color_signal.zig").needsVsc(signal);
         } else if (pipeline.linear_composition or pipeline.output_transform or pipeline.opaque_output) return error.Descriptor;
         const current_outputs = self.outputs.snapshot() orelse return error.Stale;
-        if (plan.signal.mst != null) _ = try @import("gsp_mst_mode.zig").admit(plan, current_outputs);
+        if (plan.signal.mst != null) try @import("gsp_mst_mode.zig").validate(plan, current_outputs);
         for (current_outputs.receivers[0..current_outputs.count]) |*receiver| if (receiver.display_id == plan.signal.display_id) {
             plan = try @import("gsp_frl_link.zig").select(plan, &receiver.report);
             plan = try @import("gsp_dp_mode.zig").select(plan,receiver);
             break;
         };
-        _ = try display_link.derive(plan, self.display_object.?, self.outputs.snapshot().?);
+        try display_link.validate(plan, self.display_object.?, self.outputs.snapshot().?);
         return plan;
     }
     fn outputRouteClaims(self: *Owner, snapshot: *const outputs.Snapshot) ![8]?output_route.Claim {
@@ -1765,18 +1820,24 @@ pub const Owner = struct {
     /// Only capture generations change. Existing command/visibility receipts
     /// stay attached to their actual image; no setter or new mode proof occurs.
     pub fn refreshDisplayMetadata(self: *Owner, base: boot_mode.Plan, link: display_link.Plan) !RefreshedDisplay {
+        var refreshed: RefreshedDisplay = undefined;
+        try self.refreshDisplayMetadataInPlace(&refreshed, base, link);
+        return refreshed;
+    }
+    // Build one caller-owned unpublished result. Keeping active, next and
+    // returned whole-image copies simultaneously exhausts the task stack.
+    pub noinline fn refreshDisplayMetadataInPlace(self: *Owner, refreshed: *RefreshedDisplay, base: boot_mode.Plan, link: display_link.Plan) !void {
         if (!self.cursorWorkAvailable() or self.mode_control_active or self.outputPaused(base.window) or base.window >= 8) return error.Busy;
         const snapshot = self.nativeOutputs() orelse return error.Busy;
-        const active = self.display_images[base.window] orelse return error.Stale;
+        const active = if (self.display_images[base.window]) |*value| value else return error.Stale;
         if (active.boot_mode == null or active.link == null or !active.link.?.complete() or
             active.core_point == 0 or active.window_point == 0 or !std.meta.eql(base, link.mode)) return error.Stale;
-        const next_base = try refreshPlan(base, snapshot);
-        const next_link = try refreshLink(link, next_base, snapshot);
-        var next = active;
-        next.boot_mode = try refreshPlan(active.boot_mode.?, snapshot);
-        next.link.?.plan = try refreshLink(active.link.?.plan, next.boot_mode.?, snapshot);
-        self.display_images[base.window] = next;
-        return .{ .mode = next_base, .link = next_link, .image = next };
+        refreshed.mode = try refreshPlan(base, snapshot);
+        refreshed.link = try refreshLink(link, refreshed.mode, snapshot);
+        refreshed.image = active.*;
+        refreshed.image.boot_mode = try refreshPlan(active.boot_mode.?, snapshot);
+        refreshed.image.link.?.plan = try refreshLink(active.link.?.plan, refreshed.image.boot_mode.?, snapshot);
+        self.display_images[base.window] = refreshed.image;
     }
     fn advanceSorAssignment(self: *Owner, current: u64) !Progress {
         const work = &self.sor_work.?;
@@ -1825,7 +1886,7 @@ pub const Owner = struct {
             snapshot, &occupied, display_id, mode_id);
         const slot = chosen.claim.window;
         if (self.display_images[slot] != null or self.display_channels[slot + 1] != null or self.display_channels[slot + 9] != null) return error.Busy;
-        _ = try display_link.derive(chosen.plan, self.display_object.?, snapshot);
+        try display_link.validate(chosen.plan, self.display_object.?, snapshot);
         if (chosen.claim.mst) |stamp| try self.outputs.mst_store.registry.holdRoute(stamp.handle,
             .{ .head = chosen.claim.head, .window = slot });
         self.output_claims[slot] = chosen.claim;
@@ -1897,13 +1958,13 @@ pub const Owner = struct {
         if (self.display_link_failures[plan.window] != null) return error.Busy;
         const link = try display_link.derive(plan, self.display_object.?, self.outputs.snapshot().?);
         const receipt = try self.modeAdmission(root, plan);
-        var link_work = display_link.Work.init(link);
+        var clear_previous: ?display_link.Plan = null;
         var clear_dsc = false;
-        if (self.display_images[plan.window]) |prior| if (prior.link) |previous_link| {
+        if (self.display_images[plan.window]) |*prior| if (prior.link) |*previous_link| {
             clear_dsc = previous_link.plan.mode.signal.dp_dsc != null or previous_link.plan.mode.signal.hdmi_dsc != null;
             if (clear_dsc or (!plan.signal.hdmi_frl and previous_link.plan.mode.signal.hdmi_frl)) {
                 if (!previous_link.complete()) return error.Stale;
-                try link_work.clearPrevious(previous_link.plan);
+                clear_previous = previous_link.plan;
             }
         };
         const resources = self.display_resources_slot.owner orelse return error.State;
@@ -1918,7 +1979,11 @@ pub const Owner = struct {
         try self.commitPositionedDisplayImage(core_handle, window_handle,
             .{ .epoch = self.epoch, .handle = position.config.handle, .slot = @intCast(slot) }, image_handle, plan.head, .{}, deadline);
         errdefer self.display_work = null;
-        try link_work.reserveMst(self.outputs.snapshot().?, &self.outputs.mst_store, deadline);
+        self.display_work.?.link = @as(display_link.Work, undefined);
+        const link_work = &self.display_work.?.link.?;
+        link_work.initInPlace(link);
+        if (clear_previous) |previous| try link_work.clearPrevious(previous);
+        try @call(.never_inline, display_link.Work.reserveMst, .{ link_work, self.outputs.snapshot().?, &self.outputs.mst_store, deadline });
         self.display_work.?.core.config.signal = plan.signal;
         self.display_work.?.core.config.mst_sor_control = shared_sor;
         self.display_work.?.core.config.preserve_windows = peer_windows;
@@ -1926,7 +1991,6 @@ pub const Owner = struct {
         self.display_work.?.core.config.cursor_usage = plan.cursor_size;
         self.display_work.?.boot_mode = plan;
         self.display_work.?.mode_receipt = receipt;
-        self.display_work.?.link = link_work;
         self.display_work.?.admission = .{ .mode = plan, .link = link, .receipt = receipt, .receiver_sequence = self.receiver_events.sequence };
     }
     fn modeAdmission(self: *Owner, root: DisplayEngineHandle, plan: boot_mode.Plan) !u64 {
@@ -1934,26 +1998,26 @@ pub const Owner = struct {
         if (self.mode_control_active) return error.Busy;
         const owner = if (self.mode_control_owner) |*value| value else return error.State;
         if (self.mode_control_root == null or !std.meta.eql(self.mode_control_root.?, root)) return error.Stale;
-        const result = owner.info() orelse return error.Busy;
+        const result = owner.infoRef() orelse return error.Busy;
         if (!std.meta.eql(result.mode, plan) or !result.possible or result.over_clock or result.receipt == 0) return error.Unsupported;
         if (plan.signal.hdmi_frl != (result.frl_capacity != null)) return error.Unsupported;
         if (result.frl_capacity) |capacity| if (!std.meta.eql(capacity.compressed, plan.signal.hdmi_dsc) or
             capacity.capacity_receipt == 0 or capacity.capacity_receipt >= result.receipt) return error.Stale;
         if (!plan.sameIntent(owner.mode)) return error.Stale;
-        try self.validateModeTopology(root, owner.mode, owner.topology);
-        if (self.display_images[plan.window]) |prior| if (result.receipt <= prior.mode_receipt) return error.Stale;
+        try self.validateModeTopology(root, owner.mode, &owner.topology);
+        if (self.display_images[plan.window]) |*prior| if (result.receipt <= prior.mode_receipt) return error.Stale;
         return result.receipt;
     }
     fn admittedDisplayMode(self: *Owner, root: DisplayEngineHandle, intent: boot_mode.Plan) !boot_mode.Plan {
         if (!intent.signal.hdmi_frl) return intent;
         const owner = if (self.mode_control_owner) |*value| value else return error.State;
         if (self.mode_control_active or self.mode_control_root == null or !std.meta.eql(self.mode_control_root.?, root)) return error.Busy;
-        const result = owner.info() orelse return error.Busy;
+        const result = owner.infoRef() orelse return error.Busy;
         if (!intent.sameIntent(result.mode)) return error.Stale;
         _ = try self.modeAdmission(root, result.mode);
         return result.mode;
     }
-    pub fn commitPositionedDisplayImage(self: *Owner, core_handle: DisplayChannelHandle, window_handle: DisplayChannelHandle,
+    pub noinline fn commitPositionedDisplayImage(self: *Owner, core_handle: DisplayChannelHandle, window_handle: DisplayChannelHandle,
         immediate_handle: DisplayChannelHandle, image_handle: u32, head: u32, point: display_channel.push.commands.Point, deadline: u64) !void
     {
         const window = try self.findDisplayChannel(window_handle);
@@ -2218,7 +2282,7 @@ pub const Owner = struct {
             if (backend.channel == null or !std.meta.eql(backend.channel.?, handle)) return error.Stale;
             return backend.binding;
         }
-        const queue = self.ctx.?.graphicsQueue() orelse return error.Api;
+        const queue = (if (self.copy_backend) |backend| @as(?r4os.driver_queue.Context, backend.queue) else self.ctx.?.graphicsQueue()) orelse return error.Api;
         if (queue.table.unregister_backend == 0 or queue.table.update_operations == 0) return error.Api;
         const nv = @import("r4nv_binding");
         const details: nv.R4NvDriverProfile = .{ .version = 1, .size = @sizeOf(nv.R4NvDriverProfile), .vendor_id = 0x10de,
@@ -2263,7 +2327,7 @@ pub const Owner = struct {
         const target = resources.publishedStorage(window.slot, dma) orelse return error.State;
         if (fifo.config.context.vaspace != self.nativeAddressSpace().?.handle) return error.Stale;
         try self.channel.?.guard(deadline);
-        const memory = self.ctx.?.memory() orelse return error.Api;
+        const memory = self.memory_api orelse return error.Api;
         for (&self.presentation_slots) |*slot| if (slot.* != null) return error.Retained;
         const binding = try self.registerCopyBackend(handle, deadline);
         const backend = &self.copy_backend.?;
@@ -2319,7 +2383,7 @@ pub const Owner = struct {
         const resources = self.display_resources_slot.owner orelse return error.State;
         const image = resources.publishedImage(window.slot, dma) orelse return error.Stale;
         const storage = resources.publishedStorage(window.slot, dma) orelse return error.Stale;
-        const memory = self.ctx.?.memory() orelse return error.Api;
+        const memory = self.memory_api orelse return error.Api;
         const index: usize = blk: {
             for (&self.presentation_slots, 0..) |*slot, i| if (slot.* == null) break :blk i;
             return error.Busy;
@@ -3301,7 +3365,7 @@ pub const Owner = struct {
     pub fn beginQueuedGraphicsDraw(self: *Owner, input: *render_queue.Owner) !void {
         try self.validateQueuedGraphics(input);
         if (input.phase != .draw or !(try self.graphics_cache.binding()).matches(input.commands())) return error.Binding;
-        const memory = self.ctx.?.memory() orelse return error.Api;
+        const memory = self.memory_api orelse return error.Api;
         const target = try self.queuedGraphicsResource(input.references[1]);
         const source = if (input.draws[0].source != null) try self.queuedGraphicsResource(input.references[0]) else null;
         try self.startGraphicsBarrier(self.graphics_channel.?, input.deadline, true);
@@ -3314,7 +3378,7 @@ pub const Owner = struct {
         work.command = .{ .draw = work.resources.command.? };
     }
     pub fn beginGraphicsDraw(self: *Owner, handle: ChannelHandle, target: BufferHandle, source: ?BufferHandle, deadline: u64) !void {
-        const memory = self.ctx.?.memory() orelse return error.Api;
+        const memory = self.memory_api orelse return error.Api;
         const dst = try self.graphicsResource(target);
         const src = if (source) |value| try self.graphicsResource(value) else null;
         try self.beginGraphicsBarrier(handle,deadline);
@@ -3588,8 +3652,8 @@ pub const Owner = struct {
         const a = r4os.abi;
         if (binding.version != 1 or binding.size < @sizeOf(a.GfxBackendBinding) or binding.adapter_id != self.adapter_id or
             binding.milestone != a.gfx_queue_milestone_device_execution or binding.device_generation == 0 or binding.reset_generation == 0) return error.Descriptor;
-        const queue = self.ctx.?.graphicsQueue() orelse return error.Api;
-        const memory = self.ctx.?.memory() orelse return error.Api;
+        const queue = (if (self.copy_backend) |backend| @as(?r4os.driver_queue.Context, backend.queue) else self.ctx.?.graphicsQueue()) orelse return error.Api;
+        const memory = self.memory_api orelse return error.Api;
         if (queue.table.version != 1 or queue.table.size < @offsetOf(a.GfxDriverQueueApi, "unregister_backend") + 8 or
             queue.table.unregister_backend == 0) return error.Api;
         if (self.copy_backend) |*backend| {
@@ -4116,8 +4180,8 @@ pub const Owner = struct {
     /// Only an already admitted transaction may drain with its old signal.
     /// New commits continue to require a fresh receiver and IMP admission.
     pub fn displayWorkPlan(self: *Owner, root: DisplayEngineHandle, window: u32) !boot_mode.Plan {
-        const work = self.display_work orelse return error.State;
-        const admitted = work.admission orelse return error.State;
+        const work = if (self.display_work) |*value| value else return error.State;
+        const admitted = if (work.admission) |*value| value else return error.State;
         if (root.epoch != self.epoch or admitted.mode.epoch != self.epoch or admitted.mode.window != window or
             work.boot_mode == null or !std.meta.eql(work.boot_mode.?, admitted.mode) or work.mode_receipt != admitted.receipt or
             work.link == null or !std.meta.eql(work.link.?.plan, admitted.link)) return error.Stale;
@@ -4128,12 +4192,17 @@ pub const Owner = struct {
         if (!std.meta.eql(expected, admitted.mode) or admitted.receipt != try self.modeAdmission(root, expected)) return error.Stale;
         return expected;
     }
+    noinline fn validateDisplayLinkPlan(self: *Owner, expected: boot_mode.Plan) !void {
+        const work = &self.display_work.?;
+        const planned = if (self.displayWorkObsolete()) work.admission.?.link else try display_link.derive(expected, self.display_object.?, self.outputs.snapshot().?);
+        if (!std.meta.eql(work.link.?.plan, planned)) return error.Stale;
+    }
     pub fn validateDisplayLink(self: *Owner) !void {
         const work = if (self.display_work) |*value| value else return error.State;
         if (work.link_restore) |*restore| if (restore.control.mst_rebuild != null) return self.validateMstLinkRecovery();
         if (work.link_stop) |*cleanup| {
             try self.validateDisplayDetach();
-            const previous = work.detach.?;
+            const previous = &work.detach.?;
             if (work.link_restore != null or !cleanup.stop_only or previous.link == null or
                 !std.meta.eql(cleanup.plan, previous.link.?.plan) or work.core.phase != .complete or
                 work.window.?.phase != .complete) return error.Stale;
@@ -4147,15 +4216,15 @@ pub const Owner = struct {
         if (actual.parent != core.parent or actual.config.kind != .window or work.boot_mode == null) return error.Stale;
         const root: DisplayEngineHandle = .{ .epoch = self.epoch, .root = core.parent.binding.root };
         const expected = try self.displayWorkPlan(root, actual.config.index);
-        const planned = if (self.displayWorkObsolete()) work.admission.?.link else try display_link.derive(expected, self.display_object.?, self.outputs.snapshot().?);
-        const previous_dsc = if (self.display_images[expected.window]) |previous| if (previous.boot_mode) |mode|
+        try self.validateDisplayLinkPlan(expected);
+        const previous_dsc = if (self.display_images[expected.window]) |*previous| if (previous.boot_mode) |*mode|
             mode.signal.dp_dsc != null or mode.signal.hdmi_dsc != null else false else false;
         if (work.core.config.clear_dsc != previous_dsc or window.config.clear_dsc or position.config.clear_dsc) return error.Stale;
         if (work.core.config.mst_sor_control != try @import("gsp_mst_sor.zig").control(expected, &self.display_images, false) or
             window.config.mst_sor_control != null or position.config.mst_sor_control != null) return error.Stale;
         if (work.core.config.preserve_windows != try self.displayPeerWindows(expected.window) or
             window.config.preserve_windows != 0 or position.config.preserve_windows != 0) return error.Stale;
-        if (!std.meta.eql(link.plan, planned) or !std.meta.eql(work.boot_mode.?, expected) or
+        if (!std.meta.eql(work.boot_mode.?, expected) or
             !std.meta.eql(work.core.config.signal, @as(?boot_mode.Signal, expected.signal)) or
             window.config.scanout == null or window.config.scanout.?.width != expected.width or window.config.scanout.?.height != expected.height or
             !std.meta.eql(work.core.config.route, @as(?display_channel.push.commands.Route, .{ .head = expected.head, .window = expected.window }))) return error.Stale;
@@ -4167,10 +4236,10 @@ pub const Owner = struct {
                 !std.meta.eql(restore.failure.previous, self.display_images[expected.window]) or
                 (restore.failure.previous == null and !std.meta.eql(restore.failure.retired, self.display_retired[expected.window]))) return error.Stale;
             if (restore.control.stop_only) {
-                const cleanup = if (link.plan.extended()) link.plan else if (restore.failure.previous) |previous| previous.link.?.plan else return error.Stale;
-                if (!std.meta.eql(cleanup, restore.control.plan)) return error.Stale;
+                const cleanup = if (link.plan.extended()) &link.plan else if (restore.failure.previous) |*previous| &previous.link.?.plan else return error.Stale;
+                if (!std.meta.eql(cleanup.*, restore.control.plan)) return error.Stale;
             } else {
-                const previous = restore.failure.previous orelse return error.Stale;
+                const previous = if (restore.failure.previous) |*value| value else return error.Stale;
                 if (previous.link == null or !previous.link.?.complete() or !std.meta.eql(previous.link.?.plan, restore.control.plan)) return error.Stale;
             }
             return;
@@ -4181,14 +4250,15 @@ pub const Owner = struct {
             .scanout => {},
         }
     }
-    fn finishDisplayLinkFailure(self: *Owner, failed: DisplayLinkFailure) !void {
+    fn finishDisplayLinkFailure(self: *Owner, failed: *const DisplayLinkFailure) !void {
         if (self.display_link_failures[failed.mode.window] != null) return error.State;
-        self.display_link_failures[failed.mode.window] = failed;
+        self.display_link_failures[failed.mode.window] = failed.*;
+        const published = &self.display_link_failures[failed.mode.window].?;
         self.display_work = null;
         self.log("NVIDIA link: candidate={d} rejected={s} old-image=retained reply={d} restored={d}",
-            .{failed.candidate,@errorName(failed.reason),failed.receipt,failed.restored_receipt});
+            .{published.candidate,@errorName(published.reason),published.receipt,published.restored_receipt});
     }
-    fn rollbackMstDisplayLink(self: *Owner, reason: anyerror) anyerror!void {
+    noinline fn rollbackMstDisplayLink(self: *Owner, reason: anyerror) anyerror!void {
         const work = &self.display_work.?;
         const link = &work.link.?;
         const value = if (link.mst) |*item| item else return reason;
@@ -4203,8 +4273,8 @@ pub const Owner = struct {
             work.core.ticket.?.point != value.core_point or work.window.?.ticket.?.point != value.window_point) return reason;
         const failed: DisplayLinkFailure = .{ .mode = mode, .candidate = work.window.?.config.scanout.?.dma,
             .reason = reason, .receipt = link.last_receipt, .previous = self.display_images[mode.window], .retired = self.display_retired[mode.window] };
-        if (failed.previous) |previous| {
-            const old = previous.link orelse return reason;
+        if (failed.previous) |*previous| {
+            const old = if (previous.link) |*value_link| value_link else return reason;
             if (!old.complete() or old.mst == null or previous.boot_mode == null or previous.position == null or
                 previous.head != mode.head or !std.meta.eql(old.plan.mode.signal.mst, mode.signal.mst) or
                 !std.meta.eql(old.plan.object, link.plan.object)) return error.Stale;
@@ -4212,11 +4282,13 @@ pub const Owner = struct {
         if (!link.mutated) {
             try link.cancelUnsubmitted();
             if (self.displayWorkObsolete()) { self.display_work = null; self.display_cancelled +|= 1; }
-            else try self.finishDisplayLinkFailure(failed);
+            else try self.finishDisplayLinkFailure(&failed);
             return;
         }
         value.failure = reason;
-        work.link_restore = .{ .control = try display_link.Work.restoreMst(link, work.deadline), .failure = failed };
+        work.link_restore = .{ .control = undefined, .failure = failed };
+        errdefer work.link_restore = null;
+        try work.link_restore.?.control.restoreMstInPlace(link, work.deadline);
         self.log("NVIDIA MST: candidate={d} rejected={s} restore=pending core={d} window={d}",
             .{ failed.candidate, @errorName(reason), value.core_point, value.window_point });
     }
@@ -4291,7 +4363,7 @@ pub const Owner = struct {
         if (restore.control.phase != .scanout and (work.core.phase != .complete or work.window.?.phase != .complete or
             (if (work.position) |part| part.phase != .complete else false))) return error.Stale;
     }
-    fn advanceMstLinkRecovery(self: *Owner, current: u64) !Progress {
+    noinline fn advanceMstLinkRecovery(self: *Owner, current: u64) !Progress {
         const work = &self.display_work.?;
         const restore = &work.link_restore.?;
         const link = &restore.control;
@@ -4338,7 +4410,7 @@ pub const Owner = struct {
             return .progress;
         }
         if (link.phase != .complete or rebuild.stage != .complete) return error.State;
-        var failed = restore.failure;
+        const failed = &restore.failure;
         for (&self.display_images, 0..) |*slot, index| if (slot.*) |*image| {
             if (image.link == null or image.link.?.mst == null or image.link.?.plan.transport.mst.root() != rebuild.token.root) continue;
             var updated = image.*;
@@ -4359,7 +4431,7 @@ pub const Owner = struct {
     }
     /// A known reply before any channel submission may unwind its link
     /// setters. Transport uncertainty and failed restoration remain faults.
-    fn rollbackDisplayLink(self: *Owner, reason: anyerror) anyerror!void {
+    noinline fn rollbackDisplayLink(self: *Owner, reason: anyerror) anyerror!void {
         const work = &self.display_work.?;
         const link = &work.link.?;
         if (link.operation == .mst) return self.rollbackMstDisplayLink(reason);
@@ -4373,8 +4445,8 @@ pub const Owner = struct {
                 reason != error.Aux and reason != error.RetryExhausted and reason != error.Stale and reason != error.Pps)) return reason;
         const failed: DisplayLinkFailure = .{ .mode = mode, .candidate = work.window.?.config.scanout.?.dma,
             .reason = reason, .receipt = link.last_receipt, .previous = self.display_images[mode.window], .retired = self.display_retired[mode.window] };
-        if (failed.previous) |previous| {
-            const old = previous.link orelse return reason;
+        if (failed.previous) |*previous| {
+            const old = if (previous.link) |*value_link| value_link else return reason;
             if (!old.complete() or previous.core_point == 0 or previous.window_point == 0 or previous.boot_mode == null or
                 previous.boot_mode.?.epoch != self.epoch or std.meta.activeTag(old.plan.transport) != std.meta.activeTag(link.plan.transport) or
                 old.plan.mode.output_generation != mode.output_generation or old.plan.mode.head != mode.head or old.plan.mode.window != mode.window or
@@ -4382,24 +4454,25 @@ pub const Owner = struct {
                 !std.meta.eql(old.plan.object, link.plan.object)) return reason;
             if (!self.displayWorkObsolete() and !std.meta.eql(old.plan,
                 try display_link.derive(previous.boot_mode.?, self.display_object.?, self.outputs.snapshot().?))) return error.Stale;
-        } else if (failed.retired) |retired| {
+        } else if (failed.retired) |*retired| {
             if (retired.epoch != self.epoch or retired.core_point == 0 or retired.window_point == 0) return reason;
         } else return reason;
         if (!link.mutated) {
             if (self.displayWorkObsolete()) { self.display_work = null; self.display_cancelled +|= 1; }
-            else try self.finishDisplayLinkFailure(failed);
+            else try self.finishDisplayLinkFailure(&failed);
             return;
         }
-        const clear = if (link.plan.extended()) link.plan else failed.previous.?.link.?.plan;
+        const clear = if (link.plan.extended()) &link.plan else &failed.previous.?.link.?.plan;
         const abandoned = self.displayWorkObsolete();
-        var control = if (!abandoned and failed.previous != null) display_link.Work.init(failed.previous.?.link.?.plan)
-            else try display_link.Work.stopExtended(clear, !abandoned);
-        if (!control.stop_only) try control.clearPrevious(clear);
-        work.link_restore = .{ .control = control, .failure = failed, .abandoned = abandoned };
+        work.link_restore = .{ .control = undefined, .failure = failed, .abandoned = abandoned };
+        errdefer work.link_restore = null;
+        const control = &work.link_restore.?.control;
+        if (!abandoned and failed.previous != null) control.initInPlace(failed.previous.?.link.?.plan)
+        else try control.stopExtendedInPlace(clear.*, !abandoned);
+        if (!control.stop_only) try control.clearPrevious(clear.*);
         self.log("NVIDIA link: candidate={d} rejected={s} restore=pending channels=unsubmitted", .{failed.candidate,@errorName(reason)});
     }
-    fn advanceDisplayLinkRecovery(self: *Owner) !Progress {
-        try self.validateDisplayLink();
+    noinline fn advanceDisplayLinkRecovery(self: *Owner) !Progress {
         const work = &self.display_work.?;
         const restore = &work.link_restore.?;
         const link = &restore.control;
@@ -4413,7 +4486,7 @@ pub const Owner = struct {
         }
         if (link.phase != .complete) return error.State;
         if (restore.abandoned) { self.display_work = null; self.display_cancelled +|= 1; return .progress; }
-        var failed = restore.failure;
+        const failed = &restore.failure;
         if (failed.previous) |*previous| {
             const proof: DisplayLink = .{ .plan = link.plan, .acknowledged = link.acknowledged, .receipt = link.last_receipt,
                 .dp = link.dpResult(), .frl = link.frlResult() };
@@ -4431,7 +4504,7 @@ pub const Owner = struct {
             return err;
         };
     }
-    fn advanceDisplayLinkInner(self: *Owner, current: u64) anyerror!Progress {
+    noinline fn advanceDisplayLinkInner(self: *Owner, current: u64) anyerror!Progress {
         const work = &self.display_work.?;
         var link = work.linkControl() orelse return error.State;
         const channel = &self.channel.?;
@@ -4444,8 +4517,8 @@ pub const Owner = struct {
         if (work.link_restore) |*restore| if (restore.control.operation != .mst and self.displayWorkObsolete() and !restore.abandoned) {
             if (link.pending and channel.phase == .prepared) { try channel.cancelPrepared(); link.pending = false; }
             if (!link.pending) {
-                const clear = if (work.link.?.plan.extended()) work.link.?.plan else restore.failure.previous.?.link.?.plan;
-                restore.control = try display_link.Work.stopExtended(clear, false);
+                const clear = if (work.link.?.plan.extended()) &work.link.?.plan else &restore.failure.previous.?.link.?.plan;
+                try restore.control.stopExtendedInPlace(clear.*, false);
                 restore.abandoned = true; link = &restore.control;
             }
         };
@@ -4453,12 +4526,15 @@ pub const Owner = struct {
             if (prior.receiver_present and (self.outputs.invalidated or self.receiver_events.pending or self.receiver_events.capturing)) {
                 if (cleanup.pending and channel.phase == .prepared) { try channel.cancelPrepared(); cleanup.pending = false; }
                 if (!cleanup.pending) {
-                    cleanup.* = try display_link.Work.stopExtended(cleanup.plan, false);
+                    try cleanup.stopExtendedInPlace(cleanup.plan, false);
                     link = cleanup;
                 }
             }
         };
-        if (work.link_restore != null and (link.phase == .scanout or link.phase == .complete)) return self.advanceDisplayLinkRecovery();
+        if (work.link_restore != null and (link.phase == .scanout or link.phase == .complete)) {
+            try self.validateDisplayLink();
+            return self.advanceDisplayLinkRecovery();
+        }
         if (work.link_stop != null and link.operation == .mst and link.phase == .scanout) {
             try link.rebuildScanout(.{ .attached = false, .core_point = work.core.ticket.?.point, .window_point = work.window.?.ticket.?.point });
             return .progress;
@@ -4480,12 +4556,19 @@ pub const Owner = struct {
                 return .progress;
             }
             if (!link.ready(current)) return .idle;
-            if (!try link.prepare(current)) return .idle;
-            link.length = try link.encode(&link.request);
+            if (!try @call(.never_inline, display_link.Work.prepare, .{ link, current })) return .idle;
+            link.length = try @call(.never_inline, display_link.Work.encode, .{ link, &link.request });
             try channel.begin(display_link.function, link.request[0..link.length], work.deadline);
             link.pending = true;
             return .progress;
         }
+        return self.receiveDisplayLink(link, current);
+    }
+    // The ACK payload copy is only live while consuming this reply, never
+    // while revalidating the complete output/mode topology above.
+    noinline fn receiveDisplayLink(self: *Owner, link: *display_link.Work, current: u64) !Progress {
+        const work = &self.display_work.?;
+        const channel = &self.channel.?;
         const received = try channel.poll(work.deadline);
         if (channel.phase == .waiting) try link.submitted();
         if (received) |dispatch| {
@@ -4515,7 +4598,7 @@ pub const Owner = struct {
         }
         return if (channel.phase == .waiting) .idle else .progress;
     }
-    fn advanceAdaptiveControl(self: *Owner, current: u64) !Progress {
+    noinline fn advanceAdaptiveControl(self: *Owner, current: u64) !Progress {
         try self.validateAdaptiveRefresh();
         const work = &self.display_work.?;
         const refresh = &work.refresh.?;
@@ -4612,52 +4695,8 @@ pub const Owner = struct {
             try refresh.control.completed(work.core.ticket.?.point);
             return true;
         }
-        if (work.detach) |previous| {
-            const window = work.window.?;
-            const mode = previous.boot_mode.?;
-            const resources = self.display_resources_slot.owner.?;
-            if (!try resources.imageFinished(window.handle.slot, previous.image.dma)) return progressed;
-            const core = try self.findDisplayChannel(work.core.handle);
-            if (!try self.device.?.readDisplayDetached(core, mode, work.core.config.mst_sor_control, work.deadline)) return progressed;
-            if (previous.link.?.plan.extended()) {
-                if (work.link_stop == null) {
-                    // An HPD notification invalidates receiver identity. The
-                    // stopped Core and source FEC-off ACK still retire the
-                    // old route; its DSC setter must not touch a new sink.
-                    if (previous.link.?.mst) |proof| {
-                        work.link_stop = try display_link.Work.stopMst(previous.link.?.plan, proof,
-                            .{ .head = mode.head, .window = mode.window, .dma = previous.image.dma,
-                                .core_point = previous.core_point, .window_point = previous.window_point }, &self.outputs.mst_store, work.deadline);
-                    } else work.link_stop = try display_link.Work.stopExtended(previous.link.?.plan,
-                        !self.outputs.invalidated and !self.receiver_events.pending and !self.receiver_events.capturing);
-                    return true;
-                }
-                const cleanup = &work.link_stop.?;
-                if (!cleanup.stop_only or cleanup.phase != .complete or cleanup.pending or !cleanup.cleared()) return error.Completion;
-                if (cleanup.mst_rebuild) |*rebuilt| if (!rebuilt.disconnected) { for (&self.display_images, 0..) |*slot, index| if (slot.*) |*image| {
-                    if (index == mode.window or image.link == null or image.link.?.mst == null or
-                        image.link.?.plan.transport.mst.root() != rebuilt.token.root) continue;
-                    image.link.?.mst = try rebuilt.restoredImage(image.link.?.plan.transport.mst, image.core_point, image.window_point);
-                    image.link.?.receipt = rebuilt.completion_receipt;
-                    if (!image.link.?.complete()) return error.Completion;
-                }; };
-            }
-            if (self.cursor_storage) |*storage| {
-                if (storage.head == previous.head) {
-                    storage.active = null;
-                    storage.control = .{ .head = previous.head, .visible = false };
-                }
-            }
-            self.display_retired[mode.window] = .{ .epoch = self.epoch, .image = previous,
-                .core_point = work.core.ticket.?.point, .window_point = window.ticket.?.point, .observed_ns = current,
-                .link_stop_receipt = if (work.link_stop) |cleanup| cleanup.clear_receipt else 0 };
-            if (mode.signal.mst) |stamp| try self.outputs.mst_store.registry.detached(stamp.handle, self.display_retired[mode.window].?);
-            self.display_images[mode.window] = null;
-            self.display_link_failures[mode.window] = null;
-            self.display_work = null;
-            self.log("NVIDIA output-detach: head={d} window={d} previous={d} proof=Core,Window-FINISHED,ARM shadow=retained", .{previous.head,mode.window,previous.image.dma});
-            return true;
-        }
+        if (work.detach != null) return self.completeDisplayDetach(current, progressed);
+
         if (work.cursor) |*cursor| {
             try self.validateCursorCommit();
             if (self.display_paused) {
@@ -4686,30 +4725,13 @@ pub const Owner = struct {
             }
             try link.scanoutCompleted(work.core.ticket.?.point, work.window.?.ticket.?.point); return true;
         };
-        if (work.window) |window| {
-            const route = window.config.route.?;
-            var mode = work.boot_mode;
-            var link: ?DisplayLink = if (work.link) |value| .{ .plan = value.plan, .acknowledged = value.acknowledged, .receipt = value.last_receipt,
-                .dp = value.dpResult(), .frl = value.frlResult(), .mst = value.mstResult() } else null;
-            var position: ?DisplayPosition = if (work.position) |value| .{ .handle = value.handle,
-                .point = value.config.position.?, .sequence = value.ticket.?.point } else null;
-            if (mode) |plan| {
+        if (work.window) |*window| {
+            if (work.boot_mode) |*plan| {
                 const core = try self.findDisplayChannel(work.core.handle);
-                const expected = try self.displayWorkPlan(.{ .epoch = self.epoch, .root = core.parent.binding.root }, route.window);
-                if (!std.meta.eql(plan, expected) or !std.meta.eql(work.core.config.signal, @as(?boot_mode.Signal, expected.signal))) return error.Stale;
-            } else if (self.display_images[route.window]) |prior| {
-                if (prior.head == route.head and prior.image.width == window.config.scanout.?.width and prior.image.height == window.config.scanout.?.height) {
-                    mode = prior.boot_mode;
-                    link = prior.link;
-                    if (position == null) position = prior.position;
-                }
+                const expected = try self.displayWorkPlan(.{ .epoch = self.epoch, .root = core.parent.binding.root }, window.config.route.?.window);
+                if (!std.meta.eql(plan.*, expected) or !std.meta.eql(work.core.config.signal, @as(?boot_mode.Signal, expected.signal))) return error.Stale;
             }
-            self.display_images[route.window] = .{ .image = window.config.scanout.?, .head = route.head,
-                .core_point = work.core.ticket.?.point, .window_point = window.ticket.?.point, .boot_mode = mode,
-                .mode_receipt = if (work.mode_receipt != 0) work.mode_receipt else if (self.display_images[route.window]) |prior| prior.mode_receipt else 0,
-                .position = position, .link = link };
-            try self.retainMstImage(self.display_images[route.window].?);
-            self.display_retired[route.window] = null;
+            try self.publishCompletedDisplayImage();
         }
         if (work.link) |*link| if (link.dpResult()) |proof| {
             self.log("NVIDIA gsp-dp: display={x} head={d} lanes={d} rate={x} source-max={x} sink-max={x} enhanced={} attempts={d} TU=64 watermark={d} hblank={d} vblank={d} audio48k={} receipt={d}",
@@ -4719,6 +4741,81 @@ pub const Owner = struct {
             self.logBytes("dp-lanes", link.plan.mode.signal.display_id, &proof.lane_status);
         };
         self.display_work = null; return true;
+    }
+    // Completion snapshots are only needed after both display channels
+    // finish; they must not occupy the stack during admission revalidation.
+    noinline fn completeDisplayDetach(self: *Owner, current: u64, progressed: bool) !bool {
+        const work = &self.display_work.?;
+        const previous = work.detach.?;
+        const window = work.window.?;
+        const mode = previous.boot_mode.?;
+        const resources = self.display_resources_slot.owner.?;
+        if (!try resources.imageFinished(window.handle.slot, previous.image.dma)) return progressed;
+        const core = try self.findDisplayChannel(work.core.handle);
+        if (!try self.device.?.readDisplayDetached(core, mode, work.core.config.mst_sor_control, work.deadline)) return progressed;
+        if (previous.link.?.plan.extended()) {
+            if (work.link_stop == null) {
+                // An HPD notification invalidates receiver identity. The
+                // stopped Core and source FEC-off ACK still retire the
+                // old route; its DSC setter must not touch a new sink.
+                work.link_stop = @as(display_link.Work, undefined);
+                errdefer work.link_stop = null;
+                if (previous.link.?.mst) |proof| {
+                    try work.link_stop.?.stopMstInPlace(previous.link.?.plan, proof,
+                        .{ .head = mode.head, .window = mode.window, .dma = previous.image.dma,
+                            .core_point = previous.core_point, .window_point = previous.window_point }, &self.outputs.mst_store, work.deadline);
+                } else try work.link_stop.?.stopExtendedInPlace(previous.link.?.plan,
+                    !self.outputs.invalidated and !self.receiver_events.pending and !self.receiver_events.capturing);
+                return true;
+            }
+            const cleanup = &work.link_stop.?;
+            if (!cleanup.stop_only or cleanup.phase != .complete or cleanup.pending or !cleanup.cleared()) return error.Completion;
+            if (cleanup.mst_rebuild) |*rebuilt| if (!rebuilt.disconnected) { for (&self.display_images, 0..) |*slot, index| if (slot.*) |*image| {
+                if (index == mode.window or image.link == null or image.link.?.mst == null or
+                    image.link.?.plan.transport.mst.root() != rebuilt.token.root) continue;
+                image.link.?.mst = try rebuilt.restoredImage(image.link.?.plan.transport.mst, image.core_point, image.window_point);
+                image.link.?.receipt = rebuilt.completion_receipt;
+                if (!image.link.?.complete()) return error.Completion;
+            }; };
+        }
+        if (self.cursor_storage) |*storage| {
+            if (storage.head == previous.head) {
+                storage.active = null;
+                storage.control = .{ .head = previous.head, .visible = false };
+            }
+        }
+        self.display_retired[mode.window] = .{ .epoch = self.epoch, .image = previous,
+            .core_point = work.core.ticket.?.point, .window_point = window.ticket.?.point, .observed_ns = current,
+            .link_stop_receipt = if (work.link_stop) |*cleanup| cleanup.clear_receipt else 0 };
+        if (mode.signal.mst) |stamp| try self.outputs.mst_store.registry.detached(stamp.handle, self.display_retired[mode.window].?);
+        self.display_images[mode.window] = null;
+        self.display_link_failures[mode.window] = null;
+        self.display_work = null;
+        self.log("NVIDIA output-detach: head={d} window={d} previous={d} proof=Core,Window-FINISHED,ARM shadow=retained", .{previous.head,mode.window,previous.image.dma});
+        return true;
+    }
+    noinline fn publishCompletedDisplayImage(self: *Owner) !void {
+        const work = &self.display_work.?;
+        const window = &work.window.?;
+        const route = window.config.route.?;
+        var mode = work.boot_mode;
+        var link: ?DisplayLink = if (work.link) |*value| .{ .plan = value.plan, .acknowledged = value.acknowledged, .receipt = value.last_receipt,
+            .dp = value.dpResult(), .frl = value.frlResult(), .mst = value.mstResult() } else null;
+        var position: ?DisplayPosition = if (work.position) |value| .{ .handle = value.handle,
+            .point = value.config.position.?, .sequence = value.ticket.?.point } else null;
+        if (mode == null) if (self.display_images[route.window]) |*prior| {
+            if (prior.head == route.head and prior.image.width == window.config.scanout.?.width and prior.image.height == window.config.scanout.?.height) {
+                mode = prior.boot_mode;
+                link = prior.link;
+                if (position == null) position = prior.position;
+            }
+        };
+        self.display_images[route.window] = .{ .image = window.config.scanout.?, .head = route.head,
+            .core_point = work.core.ticket.?.point, .window_point = window.ticket.?.point, .boot_mode = mode,
+            .mode_receipt = if (work.mode_receipt != 0) work.mode_receipt else if (self.display_images[route.window]) |prior| prior.mode_receipt else 0,
+            .position = position, .link = link };
+        try self.retainMstImage(self.display_images[route.window].?);
+        self.display_retired[route.window] = null;
     }
     fn advanceDisplayFlip(self: *Owner, current: u64) !bool {
         const start = self.flip_cursor;
@@ -4875,7 +4972,7 @@ pub const Owner = struct {
             self.fifo_active != null or self.context_active != null or self.outputs.active() or self.sequence.self_address != 0 or
             self.channel.?.phase != .idle or self.channel.?.pending != null) return false;
         const backend = self.copy_backend orelse return false;
-        const memory = self.ctx.?.memory() orelse return error.Api;
+        const memory = self.memory_api orelse return error.Api;
         const resources = self.display_resources_slot.owner orelse return false;
         for (&self.presentation_slots) |*slot| if (slot.*) |*entry| if (entry.direct) |direct| {
             const dma = entry.surface.scanout.?.dma;
@@ -5043,7 +5140,7 @@ pub const Owner = struct {
     /// grant public access and are deliberately outside this sharing domain.
     pub fn mapVirtualReference(self: *Owner, reference: r4os.abi.GfxBufferReference, deadline: u64) !BufferHandle {
         try self.admitVirtual(deadline, false);
-        const memory = self.ctx.?.memory() orelse return error.Api;
+        const memory = self.memory_api orelse return error.Api;
         self.public_import.acquire(memory, self.epoch, reference) catch |err| {
             if (!self.public_import.empty()) self.stop(err);
             return err;
@@ -5075,7 +5172,7 @@ pub const Owner = struct {
         const serial = try std.math.add(u64, self.buffer_serial, 1);
         const heap = self.ctx.?.heap() orelse return error.Api;
         const index = self.buffers.acquire(heap) catch |err| { if (err != error.Memory and err != error.Exhausted) self.stop(err); return err; };
-        const memory = self.ctx.?.memory() orelse return error.Api;
+        const memory = self.memory_api orelse return error.Api;
         const slot = &self.buffers.items()[index];
         slot.heap = heap;
         const result = heap.allocate(@sizeOf(BufferStorage), @alignOf(BufferStorage), &slot.allocation);
@@ -5097,7 +5194,7 @@ pub const Owner = struct {
         const source = &slot.pending_source;
         const status = switch (request) {
             .queue => |job| blk: {
-                const queue = self.ctx.?.graphicsQueue() orelse return error.Api;
+                const queue = (if (self.copy_backend) |backend| @as(?r4os.driver_queue.Context, backend.queue) else self.ctx.?.graphicsQueue()) orelse return error.Api;
                 break :blk queue.retainResource(&job.fence, job.which, source);
             },
             .initial_image => blk: {
@@ -5489,20 +5586,15 @@ pub const Owner = struct {
         // exchange. The subscription owner still rejects a pending receipt.
         return graph.takeChanges(try std.math.add(u64, current, std.time.ns_per_s));
     }
-    fn advance(self: *Owner) !Progress {
+    // DriverWork runs on the shared 64 KB task stack. Keep independently
+    // selected phase buffers in their own frames; inlining all branches here
+    // reserves their combined high-water mark even during the first RM poll.
+    noinline fn advance(self: *Owner) !Progress {
         const current = try self.now();
-        if (self.power_owner) |*owner| {
-            owner.observeActivity(current, self.powerActivity());
-            owner.sample(current) catch |err| {
-                if (owner.host_failure == null) self.log("NVIDIA telemetry: read-unavailable={s}", .{@errorName(err)});
-                owner.host_failure = err;
-            };
-            owner.exchangeCommon(current) catch |err| {
-                if (owner.host_failure == null) self.log("NVIDIA telemetry: common-unavailable={s}", .{@errorName(err)});
-                owner.host_failure = err;
-            };
+        if (self.unload.self_address == 0 and !self.shutdown_closing) {
+            self.observePower(current);
+            self.observeAdaptiveRefresh(current);
         }
-        self.observeAdaptiveRefresh(current);
         const channel = self.activeChannel() orelse return error.State;
         self.snapshot.polls +|= 1;
         self.snapshot.last_poll_ns = current;
@@ -5515,117 +5607,13 @@ pub const Owner = struct {
             }
             return .progress;
         }
-        if (self.power_active) {
-            const owner = if (self.power_owner) |*value| value else return error.State;
-            if (owner.completed) {
-                const deadline = owner.deadline;
-                const operation = owner.operation orelse return error.State;
-                self.log("NVIDIA power: control={x} status={?x} telemetry={s} poll-mask={x} policy={s} requested-level={d}",
-                    .{power.wire.command(operation),owner.last_status,@tagName(owner.status),owner.active_mask,
-                    @tagName(owner.performance.reason),owner.performance.accepted_level});
-                var token = try owner.handoff(deadline);
-                self.channel = try exchange.Exchange.init(&token, deadline);
-                self.power_active = false;
-                return .progress;
-            }
-            if (try owner.poll(current)) |dispatch| {
-                try self.notification(&owner.active.?, dispatch, current);
-                return .progress;
-            }
-            return if (owner.active.?.phase == .waiting) .idle else .progress;
-        }
-        if (self.display_channel_active) |index| {
-            const owner = if (self.display_channels[index]) |*value| value else return error.State;
-            if (owner.state == .ready or owner.state == .closed) {
-                if (owner.state == .ready) try self.rejection(.display_channel, owner.config.handle, owner.rejected, owner.host_rejected);
-                if (owner.info()) |value| self.log("NVIDIA gsp-display-channel: handle={x} class={x} index={d} physical={x} bytes={d} methods=empty",
-                    .{value.config.handle,display_channel.wire.classFor(value.config.root,value.config.kind),value.config.index,value.config.physical,@as(u32, if (value.config.kind == .cursor) 0 else 4096)});
-                const deadline = owner.deadline; var token = try owner.handoff(); const finished = owner.state == .finished;
-                self.channel = try exchange.Exchange.init(&token, deadline);
-                if (finished) self.display_channels[index] = null;
-                self.display_channel_active = null; return .progress;
-            }
-            if (owner.retirementPending()) {
-                // Already queued faults/events take priority over physical
-                // retirement, just as they do over CE completion.
-                if (owner.exchange.poll(owner.deadline) catch |err| { owner.quarantine(err); return err; }) |dispatch| { try self.notification(&owner.exchange, dispatch, current); return .progress; }
-                self.device.?.observeDisplayRetirement(owner, owner.deadline) catch |err| { owner.quarantine(err); return err; };
-                if (!owner.hardware_retired) return .idle;
-            }
-            if (owner.poll() catch |err| { self.rmFailure(.display_channel, owner.config.handle, owner.last_status); return err; }) |dispatch| {
-                try self.notification(&owner.exchange, dispatch, current); return .progress;
-            }
-            return if (owner.exchange.phase == .waiting) .idle else .progress;
-        }
-        if (self.mode_control_active) {
-            const owner = if (self.mode_control_owner) |*value| value else return error.State;
-            if (owner.state == .ready or owner.state == .closed) {
-                if (owner.state == .ready) {
-                    try self.rejection(.display_engine, owner.binding.control, owner.rejected, null);
-                    if (!owner.obsolete) try self.validateModeQuery(self.mode_control_root.?, owner.mode);
-                }
-                if (owner.info()) |value| self.log("NVIDIA gsp-mode-query: handle={x} possible={} over-clock={} source-hz={d} bandwidth-kbps={d} floor-kbps={d} receipt={d} reservation=no",
-                    .{owner.binding.control,value.possible,value.over_clock,value.source_clock_hz,value.min_bandwidth_kbps,value.floor_bandwidth_kbps,value.receipt});
-                const deadline = owner.deadline; var token = try owner.handoff();
-                const finished = owner.state == .finished;
-                self.channel = try exchange.Exchange.init(&token, deadline);
-                if (finished) { self.mode_control_owner = null; self.mode_control_root = null; }
-                self.mode_control_active = false; return .progress;
-            }
-            if (owner.poll() catch |err| { self.rmFailure(.display_engine, owner.binding.control, owner.last_status); return err; }) |dispatch| {
-                try self.notification(&owner.exchange, dispatch, current); return .progress;
-            }
-            return if (owner.exchange.phase == .waiting) .idle else .progress;
-        }
-        if (self.display_engine_active) {
-            const owner = if (self.display_engine_owner) |*value| value else return error.State;
-            if (owner.state == .ready or owner.state == .closed) {
-                if (owner.state == .ready) try self.rejection(.display_engine, owner.binding.root, owner.rejected, null);
-                if (owner.info()) |value| self.log("NVIDIA gsp-display-engine: root={x} class=c670 heads={d} windows={x} channels={d} instance={} scanout=unbound",
-                    .{value.binding.root,value.hardware.heads,value.hardware.windows,value.hardware.channels,value.instance_bound});
-                const deadline = owner.deadline; var token = try owner.handoff();
-                const finished = owner.state == .finished;
-                self.channel = try exchange.Exchange.init(&token, deadline);
-                if (finished) self.display_engine_owner = null;
-                self.display_engine_active = false; return .progress;
-            }
-            if (owner.poll() catch |err| { self.rmFailure(.display_engine, owner.binding.root, owner.last_status); return err; }) |dispatch| {
-                try self.notification(&owner.exchange, dispatch, current); return .progress;
-            }
-            return if (owner.exchange.phase == .waiting) .idle else .progress;
-        }
-        if (self.fifo_active) |index| {
-            const owner = self.fifos[index].owner orelse return error.State;
-            if (owner.state == .ready or owner.state == .closed) {
-                if (owner.state == .ready) try self.rejection(.channel, owner.config.handle, owner.rejected, owner.host_rejected);
-                if (owner.info()) |fifo_info| self.log("NVIDIA gsp-fifo: channel={x} cid={d} engine={x} scheduled=yes object-class={x}",
-                    .{fifo_info.config.handle,fifo_info.cid,fifo_info.config.rm_engine,fifo_info.config.object_class});
-                const deadline = owner.deadline; var token = try owner.handoff();
-                self.channel = try exchange.Exchange.init(&token, deadline);
-                if (owner.state == .finished) try self.freeChannelSlot(index);
-                self.fifo_active = null; return .progress;
-            }
-            if (owner.poll() catch |err| { self.rmFailure(.channel, owner.config.handle, owner.last_status); return err; }) |dispatch| {
-                try self.notification(owner.channel().?, dispatch, current); return .progress;
-            }
-            return if (owner.channel().?.phase == .waiting) .idle else .progress;
-        }
-        if (self.context_active) |index| {
-            const owner = self.contexts[index].owner orelse return error.State;
-            if (owner.state == .ready or owner.state == .closed) {
-                if (owner.state == .ready) try self.rejection(.context, owner.binding.group, owner.rejected, null);
-                if (owner.info()) |info| self.log("NVIDIA gsp-context: group={x} share={x} engine={x} runlist={d} timeslice-request-us={d} rejection={?x} commands=bounded fifo=unallocated",
-                    .{info.binding.group, info.binding.share, info.nv_engine, info.engine.data[3],info.timeslice_requested_us,info.timeslice_rejection});
-                const deadline = owner.deadline; var token = try owner.handoff();
-                self.channel = try exchange.Exchange.init(&token, deadline);
-                if (owner.state == .finished) try self.freeContextSlot(index);
-                self.context_active = null; return .progress;
-            }
-            if (owner.poll() catch |err| { self.rmFailure(.context, owner.binding.group, owner.last_status); return err; }) |dispatch| {
-                try self.notification(&owner.exchange, dispatch, current); return .progress;
-            }
-            return if (owner.exchange.phase == .waiting) .idle else .progress;
-        }
+        if (self.unload.self_address != 0) return self.advanceUnload(current);
+        if (self.power_active) return self.advancePowerOwner(current);
+        if (self.display_channel_active) |index| return self.advanceDisplayChannelOwner(current, index);
+        if (self.mode_control_active) return self.advanceModeControlOwner(current);
+        if (self.display_engine_active) return self.advanceDisplayEngineOwner(current);
+        if (self.fifo_active) |index| return self.advanceFifoOwner(current, index);
+        if (self.context_active) |index| return self.advanceContextOwner(current, index);
         if (self.virtuals.active()) |owner| {
             if (owner.state == .ready or owner.state == .closed) {
                 if (owner.state == .ready) try self.rejection(.mapping, owner.plan.object, owner.rejected, null);
@@ -5635,54 +5623,14 @@ pub const Owner = struct {
                 _ = try self.virtuals.complete();
                 return .progress;
             }
-            if (owner.poll() catch |err| { self.rmFailure(.mapping, owner.plan.object, owner.rejected); return err; }) |dispatch| {
+            if (@call(.never_inline, @TypeOf(owner.*).poll, .{owner}) catch |err| { self.rmFailure(.mapping, owner.plan.object, owner.rejected); return err; }) |dispatch| {
                 try self.notification(&owner.exchange, dispatch, current);
                 return .progress;
             }
             return if (owner.exchange.phase == .waiting) .idle else .progress;
         }
-        if (self.native_active) |index| {
-            const owner = self.native_buffers.items()[index].owner orelse return error.State;
-            if (owner.state == .ready or owner.state == .closed) {
-                if (owner.state == .ready) try self.rejection(.native_buffer, owner.binding.memory, owner.rejected, null);
-                if (owner.state == .ready) if (owner.host_rejected) |status| try self.recordFault(.{ .source = .host,
-                    .kind = if (status == r4os.abi.gfx_buffer_error_oom or status == r4os.abi.gfx_buffer_error_budget or status == r4os.abi.gfx_buffer_error_capacity) .resource else .unknown,
-                    .operation = .native_buffer, .rm_handle = owner.binding.memory, .code = @as(u32, @bitCast(status)) });
-                const deadline = owner.deadline;
-                var token = try owner.handoff();
-                self.channel = try exchange.Exchange.init(&token, deadline);
-                if (owner.state == .finished) try self.freeNativeSlot(index);
-                self.native_active = null;
-                return .progress;
-            }
-            if (owner.poll() catch |err| { self.rmFailure(.native_buffer, owner.binding.memory, owner.last_status); return err; }) |dispatch| {
-                try self.notification(&owner.exchange, dispatch, current);
-                return .progress;
-            }
-            return if (owner.exchange.phase == .waiting) .idle else .progress;
-        }
-        if (self.buffer_active) |index| {
-            const slot = &self.buffers.items()[index];
-            const owner = slot.owner orelse return error.State;
-            if (owner.state == .ready or owner.state == .closed) {
-                if (owner.state == .ready) try self.rejection(.mapping, owner.reservation.object(0) catch 0, owner.rejected, owner.host_rejected);
-                var token = try owner.handoff(owner.deadline);
-                self.channel = try exchange.Exchange.init(&token, owner.deadline);
-                if (owner.state == .finished) {
-                    const heap = slot.heap orelse return error.Api;
-                    if (heap.release(slot.allocation.handle) != r4os.abi.driver_heap_ok) return error.Retained;
-                    if (slot.evicting) self.mapping_evictions +|= 1;
-                    slot.* = .{};
-                }
-                self.buffer_active = null;
-                return .progress;
-            }
-            if (owner.poll() catch |err| { self.rmFailure(.mapping, owner.reservation.object(0) catch 0, owner.last_status); return err; }) |dispatch| {
-                try self.notification(&owner.exchange, dispatch, current);
-                return .progress;
-            }
-            return if (owner.exchange.phase == .waiting) .idle else .progress;
-        }
+        if (self.native_active) |index| return self.advanceNativeBufferOwner(current, index);
+        if (self.buffer_active) |index| return self.advanceBufferOwner(current, index);
         // The display transaction owns these setter replies. Do not let the
         // generic graph/query dispatcher consume or acknowledge them.
         if (self.display_work) |*work| if (work.refresh) |*refresh| {
@@ -5692,9 +5640,9 @@ pub const Owner = struct {
             if (work.link_restore != null or link.phase == .before_scanout or link.phase == .after_scanout or
                 (link.mst_rebuild != null and link.phase == .scanout)) return self.advanceDisplayLink(current);
         };
-        if (self.audio_work != null) return self.advanceDisplayAudio(current);
-        if (self.monitor_work != null) return self.advanceMonitorPower(current);
-        if (self.sor_work != null) return self.advanceSorAssignment(current);
+        if (self.audio_work != null) return @call(.never_inline, advanceDisplayAudio, .{ self, current });
+        if (self.monitor_work != null) return @call(.never_inline, advanceMonitorPower, .{ self, current });
+        if (self.sor_work != null) return @call(.never_inline, advanceSorAssignment, .{ self, current });
         // Drain an already observable GSP fault before publishing CE success.
         // Active RPC owners above already receive before sending their work.
         if ((self.copyBusy() or self.cursor_point != null) and channel.phase == .idle) {
@@ -5703,31 +5651,31 @@ pub const Owner = struct {
                 try self.notification(channel, dispatch, current); return .progress;
             }
         }
-        if (try self.advanceCursorUpload(current)) return .progress;
-        if (try self.advanceGraphicsUpload(current)) return .progress;
-        if (try self.advanceDisplayUpload(current)) return .progress;
-        if (try self.advanceInitialImage(current)) return .progress;
-        if (try self.advanceDisplay(current)) return .progress;
-        if (try self.advanceDisplayFlip(current)) return .progress;
-        if (try self.advanceCursorPoint(current)) return .progress;
-        if (try self.advanceCopy(current)) return .progress;
-        if (try self.advanceGraphics(current)) return .progress;
-        if (try self.advancePushBatch(current)) return .progress;
+        if (try @call(.never_inline, advanceCursorUpload, .{ self, current })) return .progress;
+        if (try @call(.never_inline, advanceGraphicsUpload, .{ self, current })) return .progress;
+        if (try @call(.never_inline, advanceDisplayUpload, .{ self, current })) return .progress;
+        if (try @call(.never_inline, advanceInitialImage, .{ self, current })) return .progress;
+        if (try @call(.never_inline, advanceDisplay, .{ self, current })) return .progress;
+        if (try @call(.never_inline, advanceDisplayFlip, .{ self, current })) return .progress;
+        if (try @call(.never_inline, advanceCursorPoint, .{ self, current })) return .progress;
+        if (try @call(.never_inline, advanceCopy, .{ self, current })) return .progress;
+        if (try @call(.never_inline, advanceGraphics, .{ self, current })) return .progress;
+        if (try @call(.never_inline, advancePushBatch, .{ self, current })) return .progress;
         if (self.queued_native) |queued| {
             if (queued.phase == .done) { try self.releaseWork(); return .progress; }
-            if (try queued.step(self, current)) return .progress;
+            if (try @call(.never_inline, @TypeOf(queued.*).step, .{ queued, self, current })) return .progress;
         }
         if (self.queued_render) |queued| {
             if (queued.phase == .done) { try self.releaseWork(); return .progress; }
-            if (try queued.step(self, current)) return .progress;
+            if (try @call(.never_inline, @TypeOf(queued.*).step, .{ queued, self, current })) return .progress;
         }
-        if (try self.advancePresentFrame(current)) return .progress;
-        if (try self.advanceDirect(current)) return .progress;
+        if (try @call(.never_inline, advancePresentFrame, .{ self, current })) return .progress;
+        if (try @call(.never_inline, advanceDirect, .{ self, current })) return .progress;
         // A due receiver batch gets the idle RM channel before another
         // queued frame. A continuously repainting desktop must not starve HPD.
-        if (self.outputs.state != .detached and try self.beginReceiverRefresh(current)) return .progress;
+        if (!self.shutdown_closing and self.outputs.state != .detached and try self.beginReceiverRefresh(current)) return .progress;
         if (try self.beginPower(current)) return .progress;
-        if (self.copy_backend) |backend| copy_admission: {
+        if (!self.shutdown_closing) if (self.copy_backend) |backend| copy_admission: {
             if (self.copyAdmissionBusy()) break :copy_admission;
             const handle = if (self.presentation) |entry| blk: {
                 if (!entry.pending or (!self.display_paused and !self.presentationValid())) break :copy_admission;
@@ -5744,7 +5692,7 @@ pub const Owner = struct {
                     if (err == error.Busy) break :blk false; return err;
                 }) return .progress;
             }
-            const taken: ?bool = self.beginCopyWork(handle, backend.binding, copy_deadline) catch |err| blk: {
+            const taken: ?bool = @call(.never_inline, beginCopyWork, .{ self, handle, backend.binding, copy_deadline }) catch |err| blk: {
                 if (err == error.Busy) break :blk null; return err;
             };
             if (taken) |claimed| {
@@ -5754,7 +5702,7 @@ pub const Owner = struct {
             }
             // A pending frame must not starve an output query or other
             // runtime owner that currently prevents taking the queue job.
-        }
+        };
         // A physical slice completion returned through the outer device loop,
         // giving cursor/output owners one admission opportunity. Retained jobs
         // now resume by producer turn even when no new queue wake is pending.
@@ -5865,6 +5813,197 @@ pub const Owner = struct {
             if (self.outputs.waiting()) return .idle;
             return if ((self.activeChannel() orelse return error.State).phase == .waiting) .idle else .progress;
         }
+        return self.advanceStartup(current, channel);
+    }
+    noinline fn advancePowerOwner(self: *Owner, current: u64) !Progress {
+        const owner = if (self.power_owner) |*value| value else return error.State;
+        if (owner.completed) {
+            const deadline = owner.deadline;
+            const operation = owner.operation orelse return error.State;
+            self.log("NVIDIA power: control={x} status={?x} telemetry={s} poll-mask={x} policy={s} requested-level={d}",
+                .{power.wire.command(operation),owner.last_status,@tagName(owner.status),owner.active_mask,
+                @tagName(owner.performance.reason),owner.performance.accepted_level});
+            var token = try owner.handoff(deadline);
+            self.channel = try exchange.Exchange.init(&token, deadline);
+            self.power_active = false;
+            return .progress;
+        }
+        if (try @call(.never_inline, @TypeOf(owner.*).poll, .{ owner, current })) |dispatch| {
+            try self.notification(&owner.active.?, dispatch, current);
+            return .progress;
+        }
+        return if (owner.active.?.phase == .waiting) .idle else .progress;
+    }
+    noinline fn advanceDisplayChannelOwner(self: *Owner, current: u64, index: anytype) !Progress {
+        const owner = if (self.display_channels[index]) |*value| value else return error.State;
+        if (owner.state == .ready or owner.state == .closed) {
+            if (owner.state == .ready) try self.rejection(.display_channel, owner.config.handle, owner.rejected, owner.host_rejected);
+            if (owner.info()) |value| self.log("NVIDIA gsp-display-channel: handle={x} class={x} index={d} physical={x} bytes={d} methods=empty",
+                .{value.config.handle,display_channel.wire.classFor(value.config.root,value.config.kind),value.config.index,value.config.physical,@as(u32, if (value.config.kind == .cursor) 0 else 4096)});
+            const deadline = owner.deadline; var token = try owner.handoff(); const finished = owner.state == .finished;
+            self.channel = try exchange.Exchange.init(&token, deadline);
+            if (finished) self.display_channels[index] = null;
+            self.display_channel_active = null; return .progress;
+        }
+        if (owner.retirementPending()) {
+            // Already queued faults/events take priority over physical
+            // retirement, just as they do over CE completion.
+            if (owner.exchange.poll(owner.deadline) catch |err| { owner.quarantine(err); return err; }) |dispatch| { try self.notification(&owner.exchange, dispatch, current); return .progress; }
+            self.device.?.observeDisplayRetirement(owner, owner.deadline) catch |err| { owner.quarantine(err); return err; };
+            if (!owner.hardware_retired) return .idle;
+        }
+        if (@call(.never_inline, @TypeOf(owner.*).poll, .{owner}) catch |err| { self.rmFailure(.display_channel, owner.config.handle, owner.last_status); return err; }) |dispatch| {
+            try self.notification(&owner.exchange, dispatch, current); return .progress;
+        }
+        return if (owner.exchange.phase == .waiting) .idle else .progress;
+    }
+    noinline fn advanceModeControlOwner(self: *Owner, current: u64) !Progress {
+        const owner = if (self.mode_control_owner) |*value| value else return error.State;
+        if (owner.state == .ready or owner.state == .closed) {
+            if (owner.state == .ready) {
+                try self.rejection(.display_engine, owner.binding.control, owner.rejected, null);
+                if (!owner.obsolete) try self.validateModeQuery(self.mode_control_root.?, owner.mode);
+            }
+            if (owner.info()) |value| self.log("NVIDIA gsp-mode-query: handle={x} possible={} over-clock={} source-hz={d} bandwidth-kbps={d} floor-kbps={d} receipt={d} reservation=no",
+                .{owner.binding.control,value.possible,value.over_clock,value.source_clock_hz,value.min_bandwidth_kbps,value.floor_bandwidth_kbps,value.receipt});
+            const deadline = owner.deadline; var token = try owner.handoff();
+            const finished = owner.state == .finished;
+            self.channel = try exchange.Exchange.init(&token, deadline);
+            if (finished) { self.mode_control_owner = null; self.mode_control_root = null; }
+            self.mode_control_active = false; return .progress;
+        }
+        if (@call(.never_inline, mode_control.Owner.poll, .{owner}) catch |err| { self.rmFailure(.display_engine, owner.binding.control, owner.last_status); return err; }) |dispatch| {
+            try self.notification(&owner.exchange, dispatch, current); return .progress;
+        }
+        return if (owner.exchange.phase == .waiting) .idle else .progress;
+    }
+    noinline fn advanceDisplayEngineOwner(self: *Owner, current: u64) !Progress {
+        const owner = if (self.display_engine_owner) |*value| value else return error.State;
+        if (owner.state == .ready or owner.state == .closed) {
+            if (owner.state == .ready) try self.rejection(.display_engine, owner.binding.root, owner.rejected, null);
+            if (owner.info()) |value| self.log("NVIDIA gsp-display-engine: root={x} class=c670 heads={d} windows={x} channels={d} instance={} scanout=unbound",
+                .{value.binding.root,value.hardware.heads,value.hardware.windows,value.hardware.channels,value.instance_bound});
+            const deadline = owner.deadline; var token = try owner.handoff();
+            const finished = owner.state == .finished;
+            self.channel = try exchange.Exchange.init(&token, deadline);
+            if (finished) self.display_engine_owner = null;
+            self.display_engine_active = false; return .progress;
+        }
+        if (@call(.never_inline, @TypeOf(owner.*).poll, .{owner}) catch |err| { self.rmFailure(.display_engine, owner.binding.root, owner.last_status); return err; }) |dispatch| {
+            try self.notification(&owner.exchange, dispatch, current); return .progress;
+        }
+        return if (owner.exchange.phase == .waiting) .idle else .progress;
+    }
+    noinline fn advanceFifoOwner(self: *Owner, current: u64, index: anytype) !Progress {
+        const owner = self.fifos[index].owner orelse return error.State;
+        if (owner.state == .ready or owner.state == .closed) {
+            if (owner.state == .ready) try self.rejection(.channel, owner.config.handle, owner.rejected, owner.host_rejected);
+            if (owner.info()) |fifo_info| self.log("NVIDIA gsp-fifo: channel={x} cid={d} engine={x} scheduled=yes object-class={x}",
+                .{fifo_info.config.handle,fifo_info.cid,fifo_info.config.rm_engine,fifo_info.config.object_class});
+            const deadline = owner.deadline; var token = try owner.handoff();
+            self.channel = try exchange.Exchange.init(&token, deadline);
+            if (owner.state == .finished) try self.freeChannelSlot(index);
+            self.fifo_active = null; return .progress;
+        }
+        if (@call(.never_inline, @TypeOf(owner.*).poll, .{owner}) catch |err| { self.rmFailure(.channel, owner.config.handle, owner.last_status); return err; }) |dispatch| {
+            try self.notification(owner.channel().?, dispatch, current); return .progress;
+        }
+        return if (owner.channel().?.phase == .waiting) .idle else .progress;
+    }
+    noinline fn advanceContextOwner(self: *Owner, current: u64, index: anytype) !Progress {
+        const owner = self.contexts[index].owner orelse return error.State;
+        if (owner.state == .ready or owner.state == .closed) {
+            if (owner.state == .ready) try self.rejection(.context, owner.binding.group, owner.rejected, null);
+            if (owner.info()) |info| self.log("NVIDIA gsp-context: group={x} share={x} engine={x} runlist={d} timeslice-request-us={d} rejection={?x} commands=bounded fifo=unallocated",
+                .{info.binding.group, info.binding.share, info.nv_engine, info.engine.data[3],info.timeslice_requested_us,info.timeslice_rejection});
+            const deadline = owner.deadline; var token = try owner.handoff();
+            self.channel = try exchange.Exchange.init(&token, deadline);
+            if (owner.state == .finished) try self.freeContextSlot(index);
+            self.context_active = null; return .progress;
+        }
+        if (@call(.never_inline, @TypeOf(owner.*).poll, .{owner}) catch |err| { self.rmFailure(.context, owner.binding.group, owner.last_status); return err; }) |dispatch| {
+            try self.notification(&owner.exchange, dispatch, current); return .progress;
+        }
+        return if (owner.exchange.phase == .waiting) .idle else .progress;
+    }
+    noinline fn advanceNativeBufferOwner(self: *Owner, current: u64, index: anytype) !Progress {
+        const owner = self.native_buffers.items()[index].owner orelse return error.State;
+        if (owner.state == .ready or owner.state == .closed) {
+            if (owner.state == .ready) try self.rejection(.native_buffer, owner.binding.memory, owner.rejected, null);
+            if (owner.state == .ready) if (owner.host_rejected) |status| try self.recordFault(.{ .source = .host,
+                .kind = if (status == r4os.abi.gfx_buffer_error_oom or status == r4os.abi.gfx_buffer_error_budget or status == r4os.abi.gfx_buffer_error_capacity) .resource else .unknown,
+                .operation = .native_buffer, .rm_handle = owner.binding.memory, .code = @as(u32, @bitCast(status)) });
+            const deadline = owner.deadline;
+            var token = try owner.handoff();
+            self.channel = try exchange.Exchange.init(&token, deadline);
+            if (owner.state == .finished) try self.freeNativeSlot(index);
+            self.native_active = null;
+            return .progress;
+        }
+        if (@call(.never_inline, @TypeOf(owner.*).poll, .{owner}) catch |err| { self.rmFailure(.native_buffer, owner.binding.memory, owner.last_status); return err; }) |dispatch| {
+            try self.notification(&owner.exchange, dispatch, current);
+            return .progress;
+        }
+        return if (owner.exchange.phase == .waiting) .idle else .progress;
+    }
+    noinline fn advanceBufferOwner(self: *Owner, current: u64, index: anytype) !Progress {
+        const slot = &self.buffers.items()[index];
+        const owner = slot.owner orelse return error.State;
+        if (owner.state == .ready or owner.state == .closed) {
+            if (owner.state == .ready) try self.rejection(.mapping, owner.reservation.object(0) catch 0, owner.rejected, owner.host_rejected);
+            var token = try owner.handoff(owner.deadline);
+            self.channel = try exchange.Exchange.init(&token, owner.deadline);
+            if (owner.state == .finished) {
+                const heap = slot.heap orelse return error.Api;
+                if (heap.release(slot.allocation.handle) != r4os.abi.driver_heap_ok) return error.Retained;
+                if (slot.evicting) self.mapping_evictions +|= 1;
+                slot.* = .{};
+            }
+            self.buffer_active = null;
+            return .progress;
+        }
+        if (@call(.never_inline, @TypeOf(owner.*).poll, .{owner}) catch |err| { self.rmFailure(.mapping, owner.reservation.object(0) catch 0, owner.last_status); return err; }) |dispatch| {
+            try self.notification(&owner.exchange, dispatch, current);
+            return .progress;
+        }
+        return if (owner.exchange.phase == .waiting) .idle else .progress;
+    }
+    noinline fn observePower(self: *Owner, current: u64) void {
+        if (self.power_owner) |*owner| {
+            owner.observeActivity(current, self.powerActivity());
+            owner.sample(current) catch |err| {
+                if (owner.host_failure == null) self.log("NVIDIA telemetry: read-unavailable={s}", .{@errorName(err)});
+                owner.host_failure = err;
+            };
+            owner.exchangeCommon(current) catch |err| {
+                if (owner.host_failure == null) self.log("NVIDIA telemetry: common-unavailable={s}", .{@errorName(err)});
+                owner.host_failure = err;
+            };
+        }
+    }
+    noinline fn advanceUnload(self: *Owner, current: u64) !Progress {
+        const owner = &self.unload;
+        if (!self.graph_closing or self.graph == null or self.graph.?.state != .finished or
+            self.activeChannel() != &self.channel.? or owner.channel != &self.channel.? or
+            owner.deadline != self.close_deadline) return error.Binding;
+        switch (owner.phase) {
+            .request => {
+                if (try owner.poll()) |dispatch| try self.notification(&self.channel.?, dispatch, current);
+                return if (owner.phase == .request) .idle else .progress;
+            },
+            .processor_wait => {
+                const mailbox = try self.device.?.readProcessorSuspend(owner, owner.deadline);
+                if (!try owner.observe(mailbox)) return .idle;
+                self.log("NVIDIA gsp-unload: RPC=acked processor=suspended mailbox={x} epoch={d} firmware-teardown=next resources=held", .{mailbox,self.epoch});
+                // Existing Device teardown follows. Keep its conservative
+                // retention until the separate full shutdown path proves DMA
+                // and display retirement; this is not a resource-release token.
+                return error.RmClosed;
+            },
+            else => return error.State,
+        }
+    }
+    noinline fn advanceStartup(self: *Owner, current: u64, channel: *exchange.Exchange) !Progress {
         if (self.graph) |*graph| {
             switch (graph.state) {
                 .ready => {
@@ -5908,10 +6047,13 @@ pub const Owner = struct {
                 .closed => {
                     var token = try graph.finish(graph.deadline);
                     self.channel = try exchange.Exchange.init(&token, graph.deadline);
-                    return if (self.graph_closing) error.RmClosed else error.RmRejected; // Object frees do not stop GPU DMA.
+                    if (!self.graph_closing) return error.RmRejected;
+                    try self.unload.open(&self.channel.?, self.close_deadline);
+                    self.log("NVIDIA gsp-unload: RM-objects=closed request=47 epoch={d} resources=held", .{self.epoch});
+                    return .progress;
                 },
                 .base_creating, .i2c_creating, .vaspace_creating, .control_creating, .events_creating, .events_destroying, .control_destroying, .vaspace_destroying, .i2c_destroying, .base_destroying => {
-                    if (try graph.poll()) |dispatch| {
+                    if (try @call(.never_inline, rm.Owner.poll, .{graph})) |dispatch| {
                         try self.notification(self.activeChannel() orelse return error.State, dispatch, current);
                         return .progress;
                     }
@@ -5959,7 +6101,9 @@ pub const Owner = struct {
             var token = try channel.handoff(end);
             // Nouveau r570's kernel client uses processID=~0 and an empty
             // name. This is not a fabricated R4OS program or host pointer.
-            self.graph = try rm.Owner.init(&token, std.math.maxInt(u32), "", end);
+            self.graph = @as(rm.Owner, undefined);
+            errdefer self.graph = null;
+            try self.graph.?.initInPlace(&token, std.math.maxInt(u32), "", end);
             self.graph.?.control_context = self.ctx;
             self.graph.?.control_adapter = self.adapter_id;
             self.log("NVIDIA gsp-rm: creating client={x} deadline-ns={d}", .{self.graph.?.reservation.client, end});
@@ -5975,6 +6119,7 @@ pub const Owner = struct {
         return .idle;
     }
     fn beginReceiverRefresh(self: *Owner, current: u64) !bool {
+        if (self.shutdown_closing or !self.discover_receivers) return false;
         if (self.anyAdaptiveRefresh() or self.refresh_quiescing) return false;
         const channel = if (self.channel) |*value| value else return false;
         if (self.graph_closing or self.graph == null or self.graph.?.state != .loaned or channel.phase != .idle or channel.in_lockdown or
@@ -6013,7 +6158,7 @@ pub const Owner = struct {
             .display_commit = published and (self.display_work != null or self.hasDisplayFlips()),
             .cursor = published and (self.cursor_upload != null or self.cursor_point != null),
             .fullscreen = self.direct_work != null,
-            .stopping = self.graph_closing,
+            .stopping = self.graph_closing or self.shutdown_closing,
         };
         for (&self.work_slots) |*slot| {
             if (slot.* == .copy or slot.* == .native) result.copy = true;
@@ -6027,7 +6172,11 @@ pub const Owner = struct {
             self.cursor_reserving or self.fifo_active != null or self.context_active != null or self.virtuals.active_range != null or self.native_active != null or
             self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or self.graph_closing or
             self.nativeObject() == null or self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return false;
-        const owner = (try self.ensurePower()) orelse return false;
+        // Shutdown may drain an already attached RUSD/boost owner, but must
+        // not create a telemetry owner after kernel admission has closed.
+        const owner = if (self.shutdown_closing)
+            (if (self.power_owner) |*value| value else return false)
+        else (try self.ensurePower()) orelse return false;
         const operation = (try owner.choose(current, self.powerActivity())) orelse return false;
         const deadline = current +| std.time.ns_per_s;
         var token = try self.channel.?.handoff(deadline);
@@ -6041,7 +6190,7 @@ pub const Owner = struct {
         const owner = (try self.ensurePower()) orelse return error.Unsupported;
         try owner.demand(current, mask);
     }
-    fn ensurePower(self: *Owner) !?*power.Owner {
+    noinline fn ensurePower(self: *Owner) !?*power.Owner {
         if (!self.power_enabled or !self.rm_enabled or self.nativeObject() == null) return null;
         if (self.power_owner == null) {
             const ctx = self.ctx orelse return null;

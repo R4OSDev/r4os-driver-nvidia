@@ -61,7 +61,7 @@ pub const Owner = struct {
             return true;
         }
         const request = pending.job.allocation;
-        const clock = running.ctx.?.resources() orelse return error.Api;
+        const clock = running.clock() orelse return error.Api;
         const instant = clock.nowNs();
         if (instant >= request.deadline_ns) {
             if (memory.nativeComplete(&self.handle, &pending.job.request, a.gfx_queue_error_wait_timeout, &.{}) != 1) return error.Retained;

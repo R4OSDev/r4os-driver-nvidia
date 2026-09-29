@@ -23,6 +23,7 @@ _Static_assert(offsetof(msgqTxHeader, rxHdrOff) == 24 && offsetof(msgqTxHeader, 
 static int init_compared;
 static unsigned rings_compared;
 extern int r4nv_gsp_message_abi_complete(void);
+extern int r4nv_gsp_unload_abi_complete(void);
 extern int r4nv_gsp_event_abi_complete(void);
 extern int r4nv_gsp_sequence_abi_complete(void);
 
@@ -199,7 +200,9 @@ int r4nv_fwsec_abi_check(const unsigned char *sb, size_t sb_len, unsigned sb_id,
     meta.sysmemAddrOfCrashReportQueue = 0x300007000ULL;
     meta.sizeOfCrashReportQueue = 16384;
     if (wpr_len != sizeof(meta) || memcmp(wpr, &meta, sizeof(meta))) return 3;
+    if (!r4nv_gsp_unload_abi_complete()) return 1;
     puts("{\"schema\":1,\"original_typedefs\":true,\"zig_c_byte_comparison\":true,"
+         "\"gsp_unload_original_comparison\":true,\"gsp_unload_payload_bytes\":8,"
          "\"interface_header_bytes\":4,\"interface_entry_bytes\":8,\"mapper_bytes\":64,"
          "\"init_command_offset\":44,\"sb_bytes\":24,\"frts_region_bytes\":20,"
          "\"frts_region_offset\":24,\"frts_bytes\":48,\"frts_padding_zero\":true,"

@@ -70,7 +70,7 @@ pub const Owner = struct {
         }
     }
     fn deadline(running: *runtime.Owner) !u64 {
-        const clock = running.ctx.?.resources() orelse return error.Api;
+        const clock = running.clock() orelse return error.Api;
         const instant = clock.nowNs();
         if (instant == 0 or instant == std.math.maxInt(u64)) return error.Clock;
         return std.math.add(u64, instant, 5 * std.time.ns_per_s);

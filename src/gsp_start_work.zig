@@ -42,6 +42,14 @@ pub const Work = struct {
         if (self.self_address != @intFromPtr(self)) return false;
         @atomicStore(u32, &self.stopping, 1, .release);
         if (!self.device.?.stop()) return false;
+        return self.pause() and self.finishPause();
+    }
+    /// Drain the pacing Task without poisoning the resident device or
+    /// destroying the semaphore still reachable from a live IRQ callback.
+    pub fn pause(self: *Work) bool {
+        if (self.self_address == 0) return true;
+        if (self.self_address != @intFromPtr(self)) return false;
+        @atomicStore(u32, &self.stopping, 1, .release);
         if (self.wake_semaphore != 0) _ = wake(self.self_address);
         if (self.task != 0) {
             const service = self.threads.?;
@@ -61,11 +69,19 @@ pub const Work = struct {
             }
             self.task = 0;
         }
+        return self.completion == 0;
+    }
+    pub fn finishPause(self: *Work) bool {
+        if (self.self_address == 0) return true;
+        if (self.self_address != @intFromPtr(self) or self.task != 0 or self.completion != 0 or
+            @atomicLoad(u32, &self.stopping, .acquire) == 0) return false;
+        const target = self.device orelse return false;
+        if (target.interrupts.self_address != 0 and !target.interrupts.closed) return false;
         if (self.wake_semaphore != 0) {
             if (self.semaphores.?.destroy(self.wake_semaphore) != 0) return false;
             self.wake_semaphore = 0;
         }
-        self.device.?.irq_wake = null;
+        target.irq_wake = null;
         self.* = .{};
         return true;
     }

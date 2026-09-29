@@ -207,7 +207,9 @@ const QueueNative = struct {
     log_calls: usize = 0,
     logs_enabled: bool = true,
     lockdown: bool = false,
-    recovery_case: enum { success, skip, sb_error, unload_error, timeout, dma_timeout, clock_regression, stale, mapping, mmio, plan, posted, denied } = .success,
+    recovery_case: enum { success, skip, sb_protection, sb_progress, sb_error, sb_then_unload_error,
+        sb_stale_after, sb_deadline_after, sb_unavailable, unload_error, timeout, dma_timeout,
+        clock_regression, stale, mapping, mmio, plan, posted, denied } = .success,
     recovery_epoch: u64 = 0,
     recovery_writes: usize = 0,
     sec_writes: usize = 0,
@@ -277,7 +279,7 @@ const QueueNative = struct {
             if (self.recovery_case == .clock_regression) clock = 100;
         }
         if (kind == .read and address_value == core.reg.sec_mailbox0) {
-            self.words[address_value / 4] = if (self.recovery_case == .unload_error) 7 else 0;
+            self.words[address_value / 4] = if (self.recovery_case == .unload_error or self.recovery_case == .sb_then_unload_error) 7 else 0;
             self.words[0x1fa828 / 4] = 0;
         }
         if (self.recovery_case == .posted and kind == .read and address_value == 0 and self.recovery_writes != 0) self.words[0] = 0;
@@ -338,8 +340,9 @@ fn checkNativeTeardown(memory: *@import("gsp_run_memory.zig").Lease, ctx: *const
             words[(base + 0x108) / 4] = 0x20100;
             words[(base + hs.reg.cpu_control) / 4] = hs.bits.cpu_alias | hs.bits.cpu_halted;
         }
-        words[0x118128 / 4] = 1;
-        words[0x118234 / 4] = 0xff;
+        const sb_progress = case == .sb_progress or case == .sb_then_unload_error or case == .sb_stale_after or case == .sb_deadline_after;
+        words[0x118128 / 4] = if (case == .sb_protection) 0 else if (case == .sb_unavailable) 0xffffffff else if (sb_progress) 0x8b8f else 1;
+        words[0x118234 / 4] = if (sb_progress) 0x301 else 0xff;
         words[0x1454 / 4] = if (case == .sb_error) 1 else 0;
         words[0x1fa828 / 4] = if (case == .skip) 0 else 0x500000;
         var fixture: QueueNative = .{ .memory = memory, .words = words, .case = .success,
@@ -385,6 +388,10 @@ fn checkNativeTeardown(memory: *@import("gsp_run_memory.zig").Lease, ctx: *const
                 for (0..10000) |_| {
                     const done = recovery.step() catch |err| break :blk err;
                     if (done) break :blk null;
+                    if (recovery.phase == .unload and fixture.sec_writes == 0) {
+                        if (case == .sb_stale_after) fixture.recovery_epoch += 1;
+                        if (case == .sb_deadline_after) clock = 100000000;
+                    }
                     clock += 1000;
                 }
                 return error.Unbounded;
@@ -393,20 +400,46 @@ fn checkNativeTeardown(memory: *@import("gsp_run_memory.zig").Lease, ctx: *const
                 .success, .skip => {
                     try t.expect(result == null and recovery.report != null and recovery.phase == .complete);
                     try t.expectEqual(case == .skip, recovery.report.?.unload.booter.?.skipped);
-                    try t.expect(recovery.report.?.sb.fwsec.?.command == .sb and !reader.enabled);
+                    try t.expect(recovery.report.?.sb == .complete and recovery.report.?.sb.complete.fwsec.?.command == .sb and !reader.enabled);
                     try t.expect((fixture.sec_writes == 0) == (case == .skip));
                 },
-                .sb_error, .unload_error, .timeout, .dma_timeout, .clock_regression, .stale, .mapping, .mmio, .plan, .posted => {
+                .sb_protection, .sb_progress, .sb_error => {
+                    try t.expect(result == null and recovery.report != null and recovery.phase == .complete);
+                    try t.expect(recovery.report.?.sb == .rejected and recovery.failure == null and port.recovery_failure == null);
+                    const rejected = recovery.report.?.sb.rejected;
+                    try t.expectEqual(@as(anyerror, switch (case) {
+                        .sb_protection => error.SbProtection, .sb_progress => error.SbProgress, .sb_error => error.SbError,
+                        else => unreachable,
+                    }), rejected.reason);
+                    const count: usize = switch (case) { .sb_protection => 1, .sb_progress => 2, .sb_error => 3, else => unreachable };
+                    try t.expectEqual(count, rejected.observation.observed);
+                    const raw = [_]u32{ words[0x118128 / 4], words[0x118234 / 4], words[0x1454 / 4] };
+                    try t.expectEqualSlices(u32, raw[0..count], rejected.observation.raw[0..count]);
+                    try t.expect(rejected.halt.blocks != 0 and fixture.sec_writes != 0 and !reader.enabled);
+                    try t.expect(!recovery.report.?.unload.booter.?.skipped and recovery.report.?.unload.booter.?.wpr_hi_after == 0);
+                    const writes = fixture.recovery_writes;
+                    try t.expect(try recovery.step());
+                    try t.expectEqual(writes, fixture.recovery_writes);
+                },
+                .sb_then_unload_error, .sb_stale_after, .sb_deadline_after, .sb_unavailable,
+                .unload_error, .timeout, .dma_timeout, .clock_regression, .stale, .mapping, .mmio, .plan, .posted => {
                     try t.expectEqual(@as(?anyerror, switch (case) {
-                        .sb_error => error.SbError, .unload_error => error.BooterError,
-                        .timeout, .dma_timeout => error.Deadline, .clock_regression => error.Clock,
-                        .stale, .mapping, .mmio => error.Stale, .plan => error.Binding,
+                        .sb_then_unload_error, .unload_error => error.BooterError,
+                        .timeout, .dma_timeout, .sb_deadline_after => error.Deadline, .clock_regression => error.Clock,
+                        .stale, .mapping, .mmio, .sb_stale_after => error.Stale, .plan => error.Binding,
+                        .sb_unavailable => error.RegisterUnavailable,
                         .posted => error.IdentityChanged, else => unreachable,
                     }), result);
                     const writes = fixture.recovery_writes;
                     try t.expectError(error.State, recovery.step());
                     try t.expect(recovery.report == null and writes == fixture.recovery_writes);
-                    if (case == .sb_error) try t.expect(fixture.sec_writes == 0);
+                    if (sb_progress) {
+                        try t.expect(recovery.sb_result != null and recovery.sb_result.? == .rejected);
+                        try t.expectEqual(error.SbProgress, recovery.sb_result.?.rejected.reason);
+                        try t.expectEqual(@as(u32, 0x301), recovery.sb_result.?.rejected.observation.raw[1]);
+                        try t.expect((fixture.sec_writes != 0) == (case == .sb_then_unload_error));
+                    }
+                    if (case == .sb_unavailable) try t.expect(fixture.sec_writes == 0 and recovery.sb_result == null);
                 },
                 .denied => unreachable,
             }
@@ -534,6 +567,14 @@ fn nativeReply(session: *transport.Session, function: u32, result: u32, payload:
     const start = status + 4096 + @as(usize, cursor) * 4096;
     _ = try transport.message.encode(session.profile, session.rx_sequence, .{ .function = function, .result = result }, payload, backing.?[start..][0..4096]);
     std.mem.writeInt(u32, backing.?[status + 16 ..][0..4], (cursor + 1) % 63, .little);
+    if (function == @import("gsp_unload.zig").function and result == 0) {
+        // The peer fixture supplies the processor observation independently
+        // of host ACK/graph state. UnloadFixture overrides it for delayed and
+        // invalid observations; no production path fabricates this register.
+        const port: *QueueNative.native.Port = @ptrCast(@alignCast(session.port.context));
+        const registers: [*]volatile u32 = @ptrFromInt(port.window.cpu_address);
+        registers[@import("gsp_core.zig").reg.mailbox0 / 4] = @import("gsp_unload.zig").suspended;
+    }
 }
 
 fn checkRuntimeHandoff(port: *QueueNative.native.Port, session: *transport.Session, fixture: *QueueNative) !void {
@@ -1354,6 +1395,11 @@ test "firmware CPU storage GSP init owns bidirectional logs and queues with exac
 const DeviceModel = struct {
     var boot_info: a.GfxNativeBootInfo = .{};
     fn bootInfo(out: *a.GfxNativeBootInfo) callconv(.c) i32 { out.* = boot_info; return a.gfx_output_ok; }
+    fn terminalUnavailable(_: *const a.GfxBackendBinding, _: u64, _: *a.GfxNativeState) callconv(.c) i32 {
+        // Ordinary fixtures expose the capability but never manufacture a
+        // completed reset or terminal-release receipt.
+        return a.gfx_output_error_stale;
+    }
     var receiver_logs: usize = 0;
     var ddc_logs: usize = 0;
     var aux_logs: usize = 0;
@@ -1543,7 +1589,8 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         boot_mapping.surface_bytes = 0;
         boot_mapping.framebuffer_bytes = 0;
     }
-    capture.boot.display = .{ .table = .{ .boot_info = @intFromPtr(&DeviceModel.bootInfo) } };
+    capture.boot.display = .{ .table = .{ .boot_info = @intFromPtr(&DeviceModel.bootInfo),
+        .terminal_release = @intFromPtr(&DeviceModel.terminalUnavailable) } };
     try capture.registers.open(ctx, &snapshot, chip);
     try capture.register_access.acquire(&capture.registers, ctx, &snapshot, chip);
     defer {
@@ -1578,6 +1625,8 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         vram_surface_linear, vram_surface_tiled, vram_surface_changed, vram_surface_contiguity,
         vram_storage, vram_storage_bounds, vram_storage_contiguity, vram_storage_acquire, vram_storage_descriptor, vram_storage_no_clear,
         context_success, context_classes, context_engine, context_query_reject, context_page, context_duplicate,
+        context_unload, context_unload_empty, context_unload_rejected, context_unload_ack,
+        context_unload_deadline, context_unload_unavailable, context_unload_stale,
         context_group_reject, context_share_reject, context_share_changed, context_ack, context_timeout, context_free,
         context_methods, context_methods_acquire, context_methods_free, context_methods_release,
         context_fifo_success, context_fifo_allocate, context_fifo_bind, context_fifo_token, context_fifo_enable,
@@ -1599,7 +1648,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         context_display_present, context_display_present_timeout, context_display_present_fault,
         context_display_present_initial_timeout, context_display_present_initial_fault, context_display_present_initial_release,
         context_display_present_initial_acquire, context_display_present_initial_retry,
-        context_native_unknown, context_native_headless, context_native_reset, context_native_console, context_native_connected, context_native_connected_primary_timeout, context_native_dp, context_native_jobs, context_native_job_timeout, context_native_prepare_reject,
+        context_native_unknown, context_native_headless, context_native_terminal, context_native_reset, context_native_console, context_native_connected, context_native_connected_primary_timeout, context_native_dp, context_native_jobs, context_native_job_timeout, context_native_prepare_reject,
         context_native_flip_irq_timeout, context_native_flip_notifier_timeout, context_native_flip_release_timeout,
         context_native_frame_timeout,
         context_native_cursor_timeout, context_native_cursor_reject,
@@ -1652,7 +1701,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         IrqModel.reset();
         target.irq_wake = .{ .context = @intFromPtr(target), .signal = IrqModel.wake };
         const reset_case = case == .gpu_reset_success or case == .gpu_reset_gfw_timeout;
-        const reset_capable = reset_case or case == .context_native_reset or case == .context_native_console or case == .context_native_headless or case == .mapping_provider_reset;
+        const reset_capable = reset_case or case == .context_native_reset or case == .context_native_console or case == .context_native_headless or case == .context_native_terminal or case == .mapping_provider_reset;
         capture.snapshot.?.caps.pcie = if (reset_capable) 0x78 else 0;
         capture.snapshot.?.caps.power_state = if (reset_capable) 0 else null;
         capture.snapshot.?.caps.msi = if (case == .irq_intx) 0 else 0x68;
@@ -1750,7 +1799,24 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
                     try nativeEvent(&target.session.?, 0x101c, &.{1});
                     boot_lockdown = true;
                 } else {
-                    try nativeEvent(&target.session.?, if (case == .unknown_event) 0xdead else 0x1001, &.{ 0, 0, 0, 0 });
+                    if (case == .success) {
+                        // Reproduce the first real GA106 boot notification:
+                        // an oversized-placeholder NOCAT journal before ready.
+                        var journal: [1212]u8 = @splat(0);
+                        // Real records carry source/engine names and binary
+                        // diagnostics. Exercise full 16-byte log chunks and
+                        // the partial tail, not just an empty journal.
+                        @memset(journal[24..89], 's');
+                        @memset(journal[104..169], 'e');
+                        std.mem.writeInt(u32, journal[176..180], 44, .little);
+                        for (journal[180..224], 0..) |*byte, index| byte.* = @intCast(index);
+                        @memset(journal[1208..], 0xa5);
+                        try nativeEvent(&target.session.?, 0x1020, &journal);
+                        try t.expect(target.step() == .progress and target.phase == .notifications);
+                        try t.expect(target.boot.?.handled_events == 1 and target.session.?.pending == null);
+                    }
+                    try nativeEvent(&target.session.?, if (case == .unknown_event) 0xdead else 0x1001,
+                        if (case == .success) &.{} else &.{ 0, 0, 0, 0 });
                     notified = true;
                 }
             }
@@ -1764,7 +1830,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         try t.expect(steps < 12000 and target.port.effects_possible and lease.retained and capture.firmware_owner == @intFromPtr(target));
         if (boot_success) {
             try t.expect(target.phase == .ready and target.handoff != null and target.frts_result != null and target.load_result != null);
-            try t.expect(target.boot.?.handled_events == @as(u64, if (boot_lockdown) 2 else 1) and target.session.?.pending == null and target.port.phase == .runtime);
+            try t.expect(target.boot.?.handled_events == @as(u64, if (boot_lockdown or case == .success) 2 else 1) and target.session.?.pending == null and target.port.phase == .runtime);
             try t.expect(session.tx_sequence == 2 and session.tx_write == 2 and session.tx_peer_read == 2);
             if (case == .success) {
                 var foreign = try transport.Session.init(session.port, session.profile, session.epoch, &target.tx, &target.rx);
@@ -1794,8 +1860,16 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
             CatalogModel.active = false; CatalogModel.count = 0;
             try t.expect(target.catalog.close() and target.catalog.last_status == a.gfx_output_error_stale and lease.retained);
         }
-        try t.expect(!target.closeBeforeSubmission() and !capture.close() and !lease.releaseBeforeSubmission());
-        try t.expect(!CatalogModel.active and CatalogModel.count == 0 and lease.retained);
+        if (case == .context_native_terminal) {
+            try t.expect(target.terminal_retired and !target.closeBeforeSubmission() and !capture.close() and lease.self_address == 0);
+            // Reacquire fixture backing for the following independent case;
+            // the production terminal path never resumes DMA or restarts.
+            try lease.acquire(ctx, TerminalFixture.boot.?, TerminalFixture.init_storage.?, TerminalFixture.frts.?,
+                TerminalFixture.sb.?, TerminalFixture.booters.?);
+        } else {
+            try t.expect(!target.closeBeforeSubmission() and !capture.close() and !lease.releaseBeforeSubmission());
+            try t.expect(!CatalogModel.active and CatalogModel.count == 0 and lease.retained);
+        }
         if (case == .gpu_reset_success) {
             const proof = target.gpu_reset.quiescence() orelse return error.NoResetProof;
             var reset_slices: usize = 0;
@@ -3100,13 +3174,17 @@ fn createTestDisplayRoot(target: *@import("gsp_device.zig").Device, deadline: u6
     return root_handle;
 }
 fn checkDeviceDisplayChannels(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, words: []u32, scenario: []const u8) !void {
+    // Host fixtures replace providers mid-run; production tables stay bound.
+    defer target.running.memory_api = target.ctx.?.memory();
     const runtime = @import("gsp_runtime.zig");
     const native_model = @import("gsp_vram_test_model.zig").Model;
     const model = @import("gsp_display_test_model.zig").Model;
     const running = &target.running; const session = &target.session.?;
     const deadline = clock + 5 * std.time.ns_per_s;
     native_model.install(table, scenario); defer native_model.dispose(table);
+    target.running.memory_api = target.ctx.?.memory();
     model.install(table, scenario, words);
+    target.running.memory_api = target.ctx.?.memory();
     errdefer |err| std.debug.print("display DMA {s}: {s} phase={s} failure={?} root-active={} channel-active={?}\n",
         .{scenario,@errorName(err),@tagName(target.phase),target.failure,running.display_engine_active,running.display_channel_active});
     const root_handle = try createTestDisplayRoot(target, deadline, false);
@@ -3439,6 +3517,11 @@ const NativeCommon = struct {
         if (is("context_native_reset")) {
             out.device_reset = @intFromPtr(&deviceReset);
             out.prepare_reset = @intFromPtr(&prepareReset);
+        }
+        if (is("context_native_terminal")) {
+            out.device_reset = @intFromPtr(&TerminalFixture.deviceReset);
+            out.prepare_reset = @intFromPtr(&prepareReset); // Present contract, forbidden terminal branch.
+            out.terminal_release = @intFromPtr(&TerminalFixture.release);
         }
         if (is("context_native_connected")) { out.size = 64; out.presentation_stats = 0; }
         if (is("context_native_cursor_common")) {
@@ -3789,6 +3872,8 @@ const NativeCommon = struct {
     }
 };
 fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, scenario: []const u8) !void {
+    // Host fixtures replace providers mid-run; production tables stay bound.
+    defer target.running.memory_api = target.ctx.?.memory();
     const native = @import("gsp_vram_test_model.zig").Model;
     const fifo = @import("gsp_fifo_test_model.zig").Model;
     const display = @import("gsp_display_test_model.zig").Model;
@@ -3809,12 +3894,18 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
     var console_pages: [6 * 4096]u8 align(4) = @splat(0);
     const saved_table = table.*;
     native.install(table, scenario);
+    target.running.memory_api = target.ctx.?.memory();
     defer { native.dispose(table); table.* = saved_table; }
     fifo.install(table, scenario);
+    target.running.memory_api = target.ctx.?.memory();
     const raw: [*]u32 = @ptrFromInt(target.port.window.cpu_address);
     display.install(table, scenario, raw[0..@intCast(target.port.window.byte_length / 4)]);
-    if (std.mem.eql(u8, scenario, "context_native_headless")) copy.installHeadless(table, 3) else copy.installProduct(table, 3);
+    target.running.memory_api = target.ctx.?.memory();
+    if (std.mem.eql(u8, scenario, "context_native_headless") or std.mem.eql(u8, scenario, "context_native_terminal"))
+        copy.installHeadless(table, 3) else copy.installProduct(table, 3);
+    target.running.memory_api = target.ctx.?.memory();
     @import("gsp_cursor_test_model.zig").Model.install(table);
+    target.running.memory_api = target.ctx.?.memory();
     target.irq_wake = .{ .context = @intFromPtr(target), .signal = copy.wakePresentation };
     NativeCommon.target = target; NativeCommon.scenario = scenario;
     NativeCommon.prepares = 0; NativeCommon.commits = 0; NativeCommon.restores = 0; NativeCommon.published = false; NativeCommon.registration = .{};
@@ -3892,7 +3983,7 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
     if (NativeCommon.is("context_native_connected") or NativeCommon.is("context_native_dp") or NativeCommon.hasModes()) try @import("gsp_receiver_mode_test.zig").install(&run.outputs.data.receivers[0]);
     if (NativeCommon.is("context_native_dp")) @import("gsp_dp_link_test.zig").receiver(&run.outputs.data);
     if (NativeCommon.is("context_native_connected") or NativeCommon.hasModes()) installFrlReceiver(&run.outputs.data.receivers[0].report);
-    if (NativeCommon.is("context_native_headless")) return checkNativeHeadless(target,table);
+    if (NativeCommon.is("context_native_headless") or NativeCommon.is("context_native_terminal")) return checkNativeHeadless(target,table);
     try target.native_output.request(&target.ctx.?, run, captured);
     if (NativeCommon.is("context_native_connected") or NativeCommon.is("context_native_dp")) {
         @import("gsp_display_audio_test.zig").install(&run.outputs.data.receivers[0].report);
@@ -6804,6 +6895,141 @@ fn pumpResetNativeOutput(target: *@import("gsp_device.zig").Device) !void {
 }
 // Existing lifecycle fixture: actual CE startup, queue worker and retirement;
 // only firmware replies, MMIO and GPU stores are supplied by the host model.
+const TerminalFixture = struct {
+    var boot: ?*@import("gsp_boot_storage.zig").Storage = null;
+    var init_storage: ?*Storage = null;
+    var frts: ?*@import("fwsec_storage.zig").Storage = null;
+    var sb: ?*@import("fwsec_storage.zig").Storage = null;
+    var booters: ?*@import("booter_storage.zig").Pair = null;
+    var query_attempts: usize = 0;
+    var reset_calls: u32 = 0;
+    var reset_busy: [2]bool = .{ false, false };
+    var terminal_calls: u32 = 0;
+    var release_case: enum { busy, malformed, complete } = .busy;
+    fn denyMemory(_: *a.GfxDriverMemoryApi) callconv(.c) i32 { query_attempts += 1; return a.err_no_fn; }
+    fn denyDisplay(_: *a.GfxDriverDisplayApi) callconv(.c) i32 { query_attempts += 1; return a.err_no_fn; }
+    fn denyQueue(_: *a.GfxDriverQueueApi) callconv(.c) i32 { query_attempts += 1; return a.err_no_fn; }
+    fn denyResources(_: *a.DriverResourceApi) callconv(.c) i32 { query_attempts += 1; return a.err_no_fn; }
+    fn deviceReset(binding: *const a.GfxBackendBinding, generation: u64, quiesced: u32, out: *a.GfxNativeState) callconv(.c) i32 {
+        const target = NativeCommon.target;
+        std.debug.assert(target.terminal_requested and quiesced <= 1 and
+            std.meta.eql(binding.*, @import("gsp_copy_test_model.zig").Model.binding));
+        if (!reset_busy[quiesced]) {
+            reset_busy[quiesced] = true;
+            // Failure may leave arbitrary output bytes. Only a successful
+            // validated acknowledgement may become the resident receipt.
+            out.* = .{ .generation = 0x12345, .state = a.display_state_recovering,
+                .outcome = a.gfx_output_outcome_lost, .retained = 1 };
+            return a.gfx_output_error_busy;
+        }
+        if (quiesced == 0) {
+            std.debug.assert(reset_calls == 0 and target.gpu_reset.self_address == 0 and
+                generation == target.display_epoch and target.running.failure.? == error.RmClosed);
+            DeviceModel.boot_info.generation = generation + 1;
+            DeviceModel.boot_info.state = a.display_state_recovering;
+        } else {
+            std.debug.assert(reset_calls == 1 and generation == DeviceModel.boot_info.generation and
+                target.gpu_reset.quiescence() != null and target.running.reset_stage == .done and
+                @import("gsp_copy_test_model.zig").Model.heldReferences() == 0);
+            @import("gsp_copy_test_model.zig").Model.retireReset(target.gpu_reset.quiescence().?);
+            @import("gsp_vram_test_model.zig").Model.retireReset(target.gpu_reset.quiescence().?);
+        }
+        reset_calls += 1;
+        out.* = .{ .generation = DeviceModel.boot_info.generation, .state = a.display_state_recovering,
+            .outcome = a.gfx_output_outcome_lost, .retained = 1 };
+        return a.gfx_output_ok;
+    }
+    fn release(binding: *const a.GfxBackendBinding, generation: u64, out: *a.GfxNativeState) callconv(.c) i32 {
+        const target = NativeCommon.target;
+        std.debug.assert(reset_calls == 2 and target.terminal_retired and target.gpu_reset.quiescence() != null and
+            generation == target.reset_display.generation and std.meta.eql(binding.*, target.reset_binding));
+        terminal_calls += 1;
+        if (release_case == .busy) return a.gfx_output_error_busy;
+        out.* = .{ .generation = generation + @as(u64, @intFromBool(release_case == .malformed)),
+            .state = a.display_state_unavailable, .outcome = a.gfx_output_outcome_lost, .retained = 0 };
+        return a.gfx_output_ok;
+    }
+    fn check(target: *@import("gsp_device.zig").Device, table: *a.DriverApi) !void {
+        const run = &target.running;
+        const lease = target.memory.?;
+        boot = lease.boot_storage; init_storage = lease.init_storage; frts = lease.fwsec_storage;
+        sb = lease.fwsec_sb_storage; booters = lease.booter_storage;
+        query_attempts = 0; reset_calls = 0; reset_busy = .{ false, false }; terminal_calls = 0; release_case = .busy;
+        const saved_table = table.*;
+        defer table.* = saved_table;
+        // The kernel closes these new-table admissions before calling the
+        // synchronous driver shutdown. Previously bound cleanup remains legal.
+        table.resource_query = denyResources; table.gfx_memory_query = denyMemory;
+        table.gfx_display_query = denyDisplay; table.gfx_queue_query = denyQueue;
+        errdefer std.debug.print("terminal admission: output={s} gr={s} render={s} native={} display={} mode={} presentation={} allocation={} ce={s} closed={}\n",
+            .{@tagName(target.native_output.phase),@tagName(target.native_graphics.phase),@tagName(target.render_startup.phase),
+                run.nativeObject() != null,run.display_engine_owner != null,run.mode_control_owner != null,
+                run.presentation != null,run.allocations.pending != null,@tagName(run.native_copy.phase),run.shutdown_closing});
+        try target.requestShutdown();
+        try t.expect(run.shutdown_closing and run.failure == null and target.terminal_requested and !target.stopped);
+        const original_deadline = target.terminal_deadline;
+        try target.requestShutdown();
+        try t.expect(target.terminal_deadline == original_deadline and reset_calls == 0);
+        var count: usize = 0;
+        var fifo_counts: FifoCounts = .{};
+        var unloading: UnloadFixture = .{};
+        errdefer |err| std.debug.print("terminal step={d} phase={s} failure={?}/{?} runtime={?} retire={s} graph={} fifo={?} context={?} query_attempts={d} error={s}\n",
+            .{count,@tagName(target.phase),target.failure,target.recovery_failure,run.failure,@tagName(target.reset_retire_stage),
+                run.graph_closing,run.fifo_active,run.context_active,query_attempts,@errorName(err)});
+        while (!target.terminal_retired) : (count += 1) {
+            try t.expect(count < 6000 and target.phase != .failed);
+            clock += std.time.ns_per_ms;
+            if (target.phase == .ready) {
+                if (!try unloading.step(target, "context_unload")) {
+                    if (run.fifo_active != null) {
+                        try replyDeviceFifo(target, &fifo_counts, "context_native_terminal");
+                    } else if (run.activeChannel()) |channel| if (channel.phase == .waiting) {
+                        // After graph close, only retirement replies remain.
+                        // FIFO and RPC47 use the independent existing peers;
+                        // RM free/unmap replies preserve the exact request.
+                        try t.expect(run.graph_closing);
+                        if (run.context_active) |index| try t.expect(run.contexts[index].owner.?.state == .destroying);
+                        const session = &target.session.?;
+                        std.mem.writeInt(u32, backing.?[init.queues_offset + init.status_offset + 64..][0..4], session.tx_write, .little);
+                        try nativeReply(session, channel.function, 0, channel.request);
+                    };
+                }
+            } else if (target.phase == .recovering) {
+                DeviceModel.tick(ResetDeviceModel.words, target.vram.?.plan.?.frts.offset, false);
+            } else if (target.phase == .resetting) {
+                ResetDeviceModel.words[@import("gsp_core.zig").reg.cpuctl / 4] = @import("gsp_core.zig").bits.halted;
+                ResetDeviceModel.words[0x118128 / 4] = 1; ResetDeviceModel.words[0x118234 / 4] = 0xff;
+            }
+            _ = target.step();
+        }
+        const proof = target.gpu_reset.quiescence() orelse return error.NoResetProof;
+        try t.expect(target.failure.? == error.RmClosed and run.unload.phase == .complete and
+            target.recovery.report != null and reset_calls == 2 and ResetDeviceModel.triggers == 1 and
+            !target.gpu_reset.resumed and target.port.self_address == 0 and lease.self_address == 0 and
+            target.reader.?.self_address == 0 and target.interrupts.closed and query_attempts == 0);
+        try t.expect(ControlModel.reset_losses == 3 and run.native_queues.count == 0 and run.copy_backend == null and
+            run.virtuals.ranges.root == null and run.reset_stage == .done and !target.finishTerminal());
+        const capture = target.display.?;
+        // CPU/VRAM borrowers still exist in this outer storage fixture. Even
+        // actual modeled FLR plus common retirement cannot release them early.
+        try t.expect(!capture.closeAfterReset(proof, target.self_address, &target.reset_binding, target.reset_display.generation));
+        try t.expect(terminal_calls == 0 and capture.firmware_owner == target.self_address);
+        const snapshot = capture.boot;
+        defer capture.boot = snapshot; // Receipt-model disposal, no CPU lease was freed.
+        try t.expectError(error.Hold, capture.boot.releaseTerminal(&target.reset_binding, target.reset_display.generation));
+        try t.expect(capture.boot.held_generation == snapshot.held_generation and capture.boot.recovery_required);
+        release_case = .malformed;
+        try t.expectError(error.Hold, capture.boot.releaseTerminal(&target.reset_binding, target.reset_display.generation));
+        try t.expect(capture.boot.native_adopted and capture.boot.native_generation == snapshot.native_generation);
+        release_case = .complete;
+        try capture.boot.releaseTerminal(&target.reset_binding, target.reset_display.generation);
+        try t.expect(terminal_calls == 3 and capture.boot.held_generation == 0 and !capture.boot.native_adopted and
+            !capture.boot.recovery_required and NativeCommon.restores == 0 and NativeCommon.commits == 0 and query_attempts == 0);
+        try t.expect(target.step() == .stopped and proof.valid(target.epoch));
+        std.debug.print("[nvidia-terminal] CE/GR drained; RPC47+suspend; SB/Unload; FLR once; DMA retired without restart; cached cleanup; borrowed capture retained; exact terminal receipt\n", .{});
+    }
+};
+
 fn checkNativeHeadless(target: *@import("gsp_device.zig").Device, table: *a.DriverApi) !void {
     const copy = @import("gsp_copy_test_model.zig").Model;
     const run = &target.running;
@@ -6813,11 +7039,18 @@ fn checkNativeHeadless(target: *@import("gsp_device.zig").Device, table: *a.Driv
         .{stage,@errorName(err),@tagName(target.phase),target.failure,@tagName(run.native_copy.phase),@tagName(target.native_output.phase),
             run.copy_job != null,copy.completed,copy.result});
     const snapshot = run.outputs.data;
+    const terminal = NativeCommon.is("context_native_terminal");
     run.outputs.data.count = 0;
     run.outputs.data.topology.count = 0;
-    run.receiver_events.not_before_ns = clock + 600 * std.time.ns_per_s;
-    try target.native_output.request(&target.ctx.?,run,target.display.?);
-    try target.native_graphics.request();
+    const output_generation = run.output_generation;
+    run.discover_receivers = false;
+    // A due refresh/HPD must not start EDID/DDC/AUX while explicitly running
+    // headless. Keep the existing real RM/CE/GR fixture and make the query
+    // due now instead of hiding it behind a long debounce deadline.
+    try run.receiver_events.refresh(run.epoch, clock);
+    run.receiver_events.not_before_ns = clock;
+    if (!terminal) try target.native_output.request(&target.ctx.?,run,target.display.?);
+    try target.requestGraphics();
     var counts: FifoCounts = .{};
     var graphics_stage: u32 = 0;
     var before_display = false;
@@ -6825,16 +7058,16 @@ fn checkNativeHeadless(target: *@import("gsp_device.zig").Device, table: *a.Driv
     for (0..1200) |_| {
         _ = try stepNativeQueues(target,&counts,"context_native_headless",&graphics_stage);
         if (target.native_graphics.phase != .ready or target.render_startup.phase != .ready)
-            try t.expect(run.display_engine_owner == null and target.native_output.phase == .waiting);
+            try t.expect(run.display_engine_owner == null and target.native_output.phase == @as(@import("gsp_native_output.zig").Phase, if (terminal) .detached else .waiting));
         if (run.graphics_upload != null)
             try checkRenderUpload(target,run.native_copy.channel.?,shaders[0..try @import("r4nv_render").shaderBytesFor(try run.graphicsClass())]);
         if (target.render_startup.phase == .ready and run.display_engine_owner == null) before_display = true;
-        if (target.native_output.phase == .receiver_wait) break;
+        if (if (terminal) target.render_startup.phase == .ready else target.native_output.phase == .receiver_wait) break;
     }
     stage = 1;
     try t.expect(before_display and target.native_graphics.phase == .ready and target.render_startup.phase == .ready and
         run.graphics_enabled and run.native_copy.phase == .ready and run.copy_backend != null and run.copy_backend.?.operations == 2905 and
-        run.presentation == null and target.native_output.phase == .receiver_wait and
+        run.presentation == null and target.native_output.phase == @as(@import("gsp_native_output.zig").Phase, if (terminal) .detached else .receiver_wait) and
         copy.shadow_creates == 0 and NativeCommon.prepares == 0 and NativeCommon.commits == 0);
     const graphics_handle = target.native_graphics.channel.?;
     const graphics_context = target.native_graphics.context.?;
@@ -6874,13 +7107,13 @@ fn checkNativeHeadless(target: *@import("gsp_device.zig").Device, table: *a.Driv
     stage = 4;
     for (0..3) |row| try t.expectEqualSlices(u8, copy.host[0][17 + row * 80..][0..64], copy.host[1][31 + row * 96..][0..64]);
     // Receiver waiting consumes no modeset deadline or GPU execution owner.
-    for (0..100) |_| {
+    if (!terminal) for (0..100) |_| {
         _ = target.step();
         try t.expect(target.phase == .ready);
         if (run.activeChannel().?.phase == .waiting) try replyNativeProduct(target);
         if (target.native_output.phase == .receiver_wait) break;
-    }
-    try t.expect(target.native_output.phase == .receiver_wait);
+    };
+    try t.expect(target.native_output.phase == @as(@import("gsp_native_output.zig").Phase, if (terminal) .detached else .receiver_wait));
     for (0..32) |_| {
         if (run.nativeOutputs() != null and run.activeChannel().?.phase == .idle) break;
         _ = target.step();
@@ -6898,6 +7131,10 @@ fn checkNativeHeadless(target: *@import("gsp_device.zig").Device, table: *a.Driv
     try t.expect(run.failure == null and run.presentation == null and copy.shadow_creates == 0 and
         std.meta.eql(run.copy_backend.?.binding, binding) and std.meta.eql(run.native_copy.channel.?, handle) and
         std.meta.eql(target.native_graphics.channel.?,graphics_handle) and std.meta.eql(target.native_graphics.context.?,graphics_context));
+    try t.expect(run.output_generation == output_generation and !run.outputs.active() and !run.receiver_events.capturing);
+    if (NativeCommon.is("context_native_terminal")) return TerminalFixture.check(target, table);
+    run.discover_receivers = true;
+    run.receiver_events.not_before_ns = clock + 600 * std.time.ns_per_s;
     run.outputs.data = snapshot;
     stage = 6;
     const resumed = try target.native_output.step();
@@ -7371,11 +7608,15 @@ fn replyNativeProduct(target: *@import("gsp_device.zig").Device) !void {
 }
 
 fn checkDeviceGraphics(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, scenario: []const u8) !void {
+    // Host fixtures replace providers mid-run; production tables stay bound.
+    defer target.running.memory_api = target.ctx.?.memory();
     const native = @import("gsp_vram_test_model.zig").Model;
     const fifo_model = @import("gsp_fifo_test_model.zig").Model;
     const run = &target.running;
     native.install(table, scenario); defer native.dispose(table);
+    target.running.memory_api = target.ctx.?.memory();
     fifo_model.install(table, scenario);
+    target.running.memory_api = target.ctx.?.memory();
     // Use the existing completed receiver fixture; this case owns GR RPCs,
     // not a second copy of the unrelated initial connector discovery.
     run.outputs.self_address = @intFromPtr(&run.outputs); run.outputs.state = .returned; run.outputs.graph = &run.graph.?;
@@ -7781,6 +8022,8 @@ fn checkVideoChannels(target: *@import("gsp_device.zig").Device, counts: *FifoCo
     return fifo.released - released;
 }
 fn checkNativeQueues(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, counts: *FifoCounts, scenario: []const u8) anyerror!usize {
+    // Host fixtures replace providers mid-run; production tables stay bound.
+    defer target.running.memory_api = target.ctx.?.memory();
     const load = @import("gsp_fifo_wire.zig").word;
     const peer = @import("gsp_native_queue_test_model.zig").Model;
     const provider = @import("gsp_virtual_provider_test_model.zig").Model;
@@ -7822,6 +8065,7 @@ fn checkNativeQueues(target: *@import("gsp_device.zig").Device, table: *a.Driver
     const borrowed = native.borrow(buffer_index,0);
     try run.releaseNativeBuffer(buffer);
     provider.install(table); defer provider.dispose(table);
+    target.running.memory_api = target.ctx.?.memory();
     try t.expect(try run.virtual_provider.step(run));
     const range: a.GfxVirtualJob = .{ .resource = .{ .id = 907, .generation = 17 }, .request = .{ .kind = 1,
         .adapter_id = run.adapter_id, .memory_generation = run.epoch, .location = 1,
@@ -7842,6 +8086,7 @@ fn checkNativeQueues(target: *@import("gsp_device.zig").Device, table: *a.Driver
     try t.expectError(error.Stale,run.virtual_provider.executionParts(run.epoch,wrong));
     try t.expectError(error.Stale,run.virtual_provider.executionParts(run.epoch+1,public_binding));
     peer.install(table); defer peer.dispose(table);
+    target.running.memory_api = target.ctx.?.memory();
     const saved_wake = target.irq_wake; defer target.irq_wake = saved_wake;
     target.irq_wake = .{ .context = @intFromPtr(target), .signal = peer.wake };
     peer.resource = public_binding;
@@ -8086,6 +8331,8 @@ fn checkPublicVideoQueues(target: *@import("gsp_device.zig").Device, counts: *Fi
 fn checkRenderWarmup(target: *@import("gsp_device.zig").Device, table: *a.DriverApi,
     ce: @import("gsp_runtime.zig").ChannelHandle, image_index: usize, output: []u8) !void
 {
+    // Host fixtures replace providers mid-run; production tables stay bound.
+    defer target.running.memory_api = target.ctx.?.memory();
     const model = @import("gsp_copy_test_model.zig").Model;
     const cache = @import("gsp_render_cache.zig");
     const run = &target.running;
@@ -8096,6 +8343,7 @@ fn checkRenderWarmup(target: *@import("gsp_device.zig").Device, table: *a.Driver
     const old_memory = table.gfx_memory_query; const old_queue = table.gfx_queue_query;
     defer { table.gfx_memory_query = old_memory; table.gfx_queue_query = old_queue; }
     model.installRender(table,image_index);
+    target.running.memory_api = target.ctx.?.memory();
     try t.expect(!try run.beginCopyWork(ce,model.binding,clock+std.time.ns_per_s));
     checkpoint = 1;
     // No presentation object is fabricated. The actual startup state machine
@@ -8165,6 +8413,8 @@ fn graphicsFaultScenario(scenario: []const u8) bool {
 }
 fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("r4os").abi.DriverApi, counts: *FifoCounts,
     scenario: []const u8, ce: @import("gsp_runtime.zig").ChannelHandle, scene_index: usize) !void {
+    // Host fixtures replace providers mid-run; production tables stay bound.
+    defer target.running.memory_api = target.ctx.?.memory();
     const render = @import("r4nv_render");
     const reference = render.reference_model;
     const scene = reference.cases.scenes[scene_index];
@@ -8199,6 +8449,7 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
     const old_memory = table.gfx_memory_query; const old_queue = table.gfx_queue_query;
     defer { table.gfx_memory_query = old_memory; table.gfx_queue_query = old_queue; }
     model.installRender(table,native_index);
+    target.running.memory_api = target.ctx.?.memory();
     var source_pixels: [reference.cases.source_bytes]u8 = undefined;
     var target_pixels: [reference.cases.target_bytes]u8 = undefined;
     reference.cases.initialize(scene,&source_pixels,&target_pixels);
@@ -8214,6 +8465,7 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
         try checkQueuedSlices(target,ce,native_index,target_image,deadline);
         table.gfx_memory_query = old_memory; table.gfx_queue_query = old_queue;
         model.installRender(table,native_index);
+        target.running.memory_api = target.ctx.?.memory();
         model.render_operations = 2905;
         before = run.graphics_completed;
         @memset(target_data,0xcc);
@@ -8643,7 +8895,79 @@ fn modelGraphicsStep(target: *@import("gsp_device.zig").Device, stage: *u32) !vo
     stage.* += 1;
 }
 
+const UnloadFixture = struct {
+    notified: bool = false,
+    fn step(self: *UnloadFixture, target: *@import("gsp_device.zig").Device, scenario: []const u8) !bool {
+        const wire = @import("gsp_unload.zig");
+        const owner = &target.running.unload;
+        if (owner.self_address == 0) return false;
+        const channel = target.running.activeChannel().?;
+        const session = &target.session.?;
+        const registers: [*]volatile u32 = @ptrFromInt(target.port.window.cpu_address);
+        const mailbox = @import("gsp_core.zig").reg.mailbox0 / 4;
+        const deadline = owner.deadline;
+        try t.expect(target.running.graph.?.state == .finished and target.memory.?.retained and target.display.?.firmware_owner != 0);
+        if (channel.phase == .prepared) {
+            try t.expect(owner.matches(channel, deadline));
+            const sent = session.tx_sequence;
+            var copied = owner.*;
+            try t.expectError(error.State, copied.poll());
+            const request = channel.request;
+            channel.request = &copied.request;
+            try t.expectError(error.Binding, target.port.owner.?.admit_command.?(target.port.owner.?.context, &target.port, deadline));
+            channel.request = request;
+            owner.request[0] = 1;
+            try t.expectError(error.Binding, target.port.owner.?.admit_command.?(target.port.owner.?.context, &target.port, deadline));
+            owner.request[0] = 0;
+            try target.port.owner.?.admit_command.?(target.port.owner.?.context, &target.port, deadline);
+            try t.expect(session.tx_sequence == sent and owner.reply == null);
+            return true;
+        }
+        if (channel.phase == .waiting) {
+            try t.expect(channel.function == wire.function and channel.request.len == wire.payload_bytes and std.mem.allEqual(u8, channel.request, 0));
+            if (!self.notified) {
+                var print: [9]u8 = @splat(0); print[4] = 1; print[8] = 'U';
+                try nativeEvent(session, 0x100c, &print); _ = target.step();
+                try t.expect(owner.phase == .request and owner.reply == null and channel.phase == .waiting and channel.deadline == deadline);
+                self.notified = true;
+                return true;
+            }
+            const status = init.queues_offset + init.status_offset;
+            std.mem.writeInt(u32, backing.?[status + 64..][0..4], session.tx_write, .little);
+            const rejected = std.mem.eql(u8, scenario, "context_unload_rejected");
+            try nativeReply(session, wire.function, if (rejected) 0x57 else 0,
+                if (std.mem.eql(u8, scenario, "context_unload_empty")) &.{} else channel.request);
+            registers[mailbox] = 0;
+            if (std.mem.eql(u8, scenario, "context_unload_ack")) range_failure_call = range_calls + 4;
+            _ = target.step(); range_failure_call = 0;
+            if (target.phase != .ready) {
+                try t.expect(owner.phase == .request and owner.reply != null and session.pending != null);
+                return true;
+            }
+            try t.expect(owner.phase == .processor_wait and channel.phase == .idle and session.pending == null and owner.reply.?.result == 0);
+            var copied = owner.*;
+            try t.expectError(error.Binding, target.port.readProcessorSuspend(&copied, deadline));
+            try t.expect(owner.observations == 0);
+            if (std.mem.eql(u8, scenario, "context_unload_deadline")) clock = deadline;
+            if (std.mem.eql(u8, scenario, "context_unload_unavailable")) registers[mailbox] = 0xffffffff;
+            if (std.mem.eql(u8, scenario, "context_unload_stale")) {
+                const epoch = session.epoch; session.epoch += 1;
+                _ = target.step(); session.epoch = epoch;
+                try t.expect(target.phase == .recovering and owner.observations == 0);
+            }
+            return true;
+        }
+        try t.expect(owner.phase == .processor_wait and owner.observations > 0);
+        // A nonzero value and even the suspend bit plus another bit must not
+        // pass the original exact-value condition. Each sample is one slice.
+        registers[mailbox] = switch (owner.observations) { 1 => 0x80000001, 2 => 0x40000000, else => wire.suspended };
+        return true;
+    }
+};
+
 fn checkDeviceContexts(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, scenario: []const u8) !void {
+    // Host fixtures replace providers mid-run; production tables stay bound.
+    defer target.running.memory_api = target.ctx.?.memory();
     if (std.mem.startsWith(u8, scenario, "context_graphics")) return checkDeviceGraphics(target, table, scenario);
     if (std.mem.startsWith(u8, scenario, "context_native_")) return checkNativeProduct(target, table, scenario);
     const model = @import("gsp_vram_test_model.zig").Model;
@@ -8656,6 +8980,7 @@ fn checkDeviceContexts(target: *@import("gsp_device.zig").Device, table: *a.Driv
     const command = init.queues_offset + init.command_offset;
     const status = init.queues_offset + init.status_offset;
     model.install(table, scenario); defer model.dispose(table);
+    target.running.memory_api = target.ctx.?.memory();
     const copy_case = std.mem.startsWith(u8, scenario, "context_copy") or std.mem.startsWith(u8, scenario, "context_upload") or std.mem.startsWith(u8, scenario, "context_display");
     const fifo = std.mem.startsWith(u8, scenario, "context_fifo") or copy_case;
     const methods = std.mem.startsWith(u8, scenario, "context_methods") or fifo;
@@ -8664,6 +8989,7 @@ fn checkDeviceContexts(target: *@import("gsp_device.zig").Device, table: *a.Driv
     var held: ?runtime.execution_context.Child = null;
     var allocations: usize = 0;
     var frees: usize = 0;
+    var unload_fixture: UnloadFixture = .{};
     var interleaved = false;
     errdefer |err| std.debug.print("context {s}: {s} phase={s} failure={?} active={?} alloc={d} free={d}\n",
         .{scenario,@errorName(err),@tagName(target.phase),target.failure,running.context_active,allocations,frees});
@@ -8774,6 +9100,7 @@ fn checkDeviceContexts(target: *@import("gsp_device.zig").Device, table: *a.Driv
         while (target.phase == .ready and steps < 180) : (steps += 1) {
             _ = target.step();
             if (target.phase != .ready) break;
+            if (try unload_fixture.step(target, scenario)) continue;
             if (success and frees == 2 and running.context_active == null and held != null) {
                 try t.expect(running.contexts[1].owner == null and running.contexts[0].owner.?.held());
                 try t.expectError(error.Retained, running.releaseExecutionContextChild(handles[0], held.?, false));
@@ -8802,6 +9129,19 @@ fn checkDeviceContexts(target: *@import("gsp_device.zig").Device, table: *a.Driv
         }
         try t.expect(steps < 180);
     }
+    if (std.mem.startsWith(u8, scenario, "context_unload")) {
+        const unload_failed = model.is("context_unload_rejected") or model.is("context_unload_ack") or model.is("context_unload_deadline") or model.is("context_unload_unavailable") or model.is("context_unload_stale");
+        try t.expect(target.phase == .recovering and target.failure != null and target.memory.?.retained and target.display.?.firmware_owner != 0);
+        try t.expect((target.failure.? == error.RmClosed) != unload_failed);
+        try t.expect((running.unload.phase == .complete) != unload_failed);
+        try t.expect(running.graph.?.state == .finished and !target.closeBeforeSubmission() and target.gpu_reset.quiescence() == null);
+        if (!unload_failed) {
+            try t.expect(running.unload.observations == 4 and running.unload.last_mailbox == @import("gsp_unload.zig").suspended);
+            try t.expect(running.unload.reply_bytes == if (model.is("context_unload_empty")) @as(usize, 0) else 8);
+        }
+        if (model.is("context_unload_rejected")) try t.expect(target.failure.? == error.UnloadRejected and running.unload.reply.?.result == 0x57);
+        return;
+    }
     const uncertain = model.is("context_page") or model.is("context_duplicate") or model.is("context_share_changed") or model.is("context_ack") or model.is("context_timeout") or model.is("context_free") or
         model.is("context_methods_free") or model.is("context_methods_release");
     try t.expect(target.phase == .recovering and target.failure != null);
@@ -8818,6 +9158,8 @@ fn checkDeviceContexts(target: *@import("gsp_device.zig").Device, table: *a.Driv
     }
 }
 fn checkDeviceDisplayUpload(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, handle: @import("gsp_runtime.zig").ChannelHandle, deadline: u64, scenario: []const u8) !void {
+    // Host fixtures replace providers mid-run; production tables stay bound.
+    defer target.running.memory_api = target.ctx.?.memory();
     const runtime = @import("gsp_runtime.zig");
     const model = @import("gsp_vram_test_model.zig").Model;
     const wire = @import("gsp_copy_wire.zig");
@@ -8847,6 +9189,7 @@ fn checkDeviceDisplayUpload(target: *@import("gsp_device.zig").Device, table: *a
     if (display_case) {
         const words: [*]u32 = @ptrFromInt(target.port.window.cpu_address);
         @import("gsp_display_test_model.zig").Model.install(table, scenario, words[0..@intCast(target.port.window.byte_length / 4)]);
+        target.running.memory_api = target.ctx.?.memory();
         if (model.is("context_display_map")) {
             try t.expectError(error.Retained, running.createDisplayNotifier(root, .core, 0)); _ = target.step();
             try t.expect(target.phase == .recovering and running.display_resources_slot.owner.?.notifiers[0].failed); return;
@@ -9239,6 +9582,8 @@ fn checkInitialPresentation(target: *@import("gsp_device.zig").Device, table: *a
     core_handle: @import("gsp_runtime.zig").DisplayChannelHandle, window_handle: @import("gsp_runtime.zig").DisplayChannelHandle,
     dma: u32, deadline: u64, scenario: []const u8) !bool
 {
+    // Host fixtures replace providers mid-run; production tables stay bound.
+    defer target.running.memory_api = target.ctx.?.memory();
     const model = @import("gsp_copy_test_model.zig").Model;
     const native_model = @import("gsp_vram_test_model.zig").Model;
     const running = &target.running;
@@ -9249,6 +9594,7 @@ fn checkInitialPresentation(target: *@import("gsp_device.zig").Device, table: *a
         scenario,@errorName(err),@tagName(target.phase),target.failure,running.initial_image != null,
         if(running.initial_image)|work|work.operation.submitted else false,model.initial_read.lease.id != 0,running.presentation.?.initial_point });
     model.installPresentation(table, source_index, 65, 20);
+    target.running.memory_api = target.ctx.?.memory();
     target.irq_wake = .{ .context = @intFromPtr(target), .signal = model.wakePresentation };
     const binding = try running.registerDisplayPresentation(handle, root, window_handle, dma, model.shadowReference(), deadline);
     try t.expect(std.meta.eql(binding, model.binding) and running.presentation.?.surface.valid());
@@ -9617,6 +9963,8 @@ fn replyCopyMapping(target: *@import("gsp_device.zig").Device) !void {
 fn checkDeviceCopies(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, scenario: []const u8,
     context_handle: @import("gsp_runtime.zig").ContextHandle, deadline: u64) !void
 {
+    // Host fixtures replace providers mid-run; production tables stay bound.
+    defer target.running.memory_api = target.ctx.?.memory();
     const model = @import("gsp_copy_test_model.zig").Model;
     const vram_model = @import("gsp_vram_test_model.zig").Model;
     const fifo_model = @import("gsp_fifo_test_model.zig").Model;
@@ -9627,6 +9975,7 @@ fn checkDeviceCopies(target: *@import("gsp_device.zig").Device, table: *a.Driver
           running.copy_completed,running.outputs.active(),if(running.activeChannel())|rpc|@tagName(rpc.phase) else "none"});
     const instance = try allocateContextStorage(target, 4096, deadline);
     fifo_model.install(table, scenario);
+    target.running.memory_api = target.ctx.?.memory();
     const handle = try running.createCopyChannel(context_handle, 0, instance, deadline);
     try running.releaseNativeBuffer(instance);
     try driveDeviceFifo(target, &counts, scenario);
@@ -9642,6 +9991,7 @@ fn checkDeviceCopies(target: *@import("gsp_device.zig").Device, table: *a.Driver
         const data_handle = try allocateContextBuffer(target, 8191, deadline, false);
         const data_info = (try running.nativeBufferStatus(data_handle)).info.?;
         model.install(table, data_info.reference.buffer.id - 801);
+        target.running.memory_api = target.ctx.?.memory();
         for (&model.host[0], 0..) |*v, i| v.* = @truncate(i * 37 + 11);
         const raw: [*]const u8 = @ptrFromInt(target.port.window.cpu_address);
         const mmio = raw[0..@intCast(target.port.window.byte_length)];
@@ -10067,6 +10417,8 @@ fn driveDeviceFifo(target: *@import("gsp_device.zig").Device, counts: *FifoCount
 fn checkDeviceFifos(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, scenario: []const u8,
     context_handle: @import("gsp_runtime.zig").ContextHandle, deadline: u64) !void
 {
+    // Host fixtures replace providers mid-run; production tables stay bound.
+    defer target.running.memory_api = target.ctx.?.memory();
     const model = @import("gsp_vram_test_model.zig").Model;
     const fifo_model = @import("gsp_fifo_test_model.zig").Model;
     const running = &target.running; const session = &target.session.?;
@@ -10075,6 +10427,7 @@ fn checkDeviceFifos(target: *@import("gsp_device.zig").Device, table: *a.DriverA
     var handles: [2]@import("gsp_runtime.zig").ChannelHandle = undefined;
     var counts: FifoCounts = .{};
     fifo_model.install(table, scenario);
+    target.running.memory_api = target.ctx.?.memory();
     errdefer |err| std.debug.print("fifo {s}: {s} phase={s} failure={?} active={?} alloc={d} free={d}\n",
         .{scenario,@errorName(err),@tagName(target.phase),target.failure,running.fifo_active,counts.allocations,counts.frees});
     for (0..count) |i| {
@@ -10152,6 +10505,8 @@ fn checkDeviceFifos(target: *@import("gsp_device.zig").Device, table: *a.DriverA
 }
 
 fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, scenario: []const u8) !void {
+    // Host fixtures replace providers mid-run; production tables stay bound.
+    defer target.running.memory_api = target.ctx.?.memory();
     const model = @import("gsp_vram_test_model.zig").Model;
     const runtime = @import("gsp_runtime.zig");
     const running = &target.running;
@@ -10160,6 +10515,7 @@ fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverAp
     const command = init.queues_offset + init.command_offset;
     const status = init.queues_offset + init.status_offset;
     model.install(table, scenario);
+    target.running.memory_api = target.ctx.?.memory();
     defer model.dispose(table);
     var handles: [2]runtime.BufferHandle = undefined;
     var messages: usize = 0;
@@ -10597,10 +10953,13 @@ fn driveVirtualProvider(target: *@import("gsp_device.zig").Device, mode: Provide
     return .{ .maps = bind_count, .unmaps = unbind_count };
 }
 fn checkNativeVirtualProvider(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, borrowed: a.GfxBufferReference) !void {
+    // Host fixtures replace providers mid-run; production tables stay bound.
+    defer target.running.memory_api = target.ctx.?.memory();
     const peer = @import("gsp_virtual_provider_test_model.zig").Model;
     const model = @import("gsp_vram_test_model.zig").Model;
     const running = &target.running;
     peer.install(table); defer peer.dispose(table);
+    target.running.memory_api = target.ctx.?.memory();
     try t.expect(try running.virtual_provider.step(running));
     const range: a.GfxVirtualJob = .{ .resource = .{ .id = 905, .generation = 17 }, .request = .{ .kind = 1,
         .adapter_id = running.adapter_id, .memory_generation = running.epoch, .location = 1,
@@ -10624,6 +10983,8 @@ fn checkNativeVirtualProvider(target: *@import("gsp_device.zig").Device, table: 
     try t.expect(running.virtual_provider.closed());
 }
 fn checkVirtualProvider(target: *@import("gsp_device.zig").Device, table: *a.DriverApi) !void {
+    // Host fixtures replace providers mid-run; production tables stay bound.
+    defer target.running.memory_api = target.ctx.?.memory();
     const model = @import("gsp_buffer_test_model.zig").Model;
     const peer = @import("gsp_virtual_provider_test_model.zig").Model;
     const running = &target.running;
@@ -10636,6 +10997,7 @@ fn checkVirtualProvider(target: *@import("gsp_device.zig").Device, table: *a.Dri
         .{checkpoint,@errorName(err),@tagName(target.phase),target.failure,model.heapLive(),model.refs,peer.completion});
     const heap_before = model.heapLive();
     peer.install(table); defer peer.dispose(table);
+    target.running.memory_api = target.ctx.?.memory();
     try t.expect(try running.virtual_provider.step(running));
     const end = clock + 5 * std.time.ns_per_s;
     const range_job: a.GfxVirtualJob = .{ .resource = .{ .id = 901, .generation = 12 },
@@ -10781,11 +11143,14 @@ fn fillLegacyNames(ledger: *@import("gsp_rm_names.zig").Ledger, parent: @import(
 }
 
 fn checkVirtualProviderReset(target: *@import("gsp_device.zig").Device, table: *a.DriverApi) !void {
+    // Host fixtures replace providers mid-run; production tables stay bound.
+    defer target.running.memory_api = target.ctx.?.memory();
     const model = @import("gsp_buffer_test_model.zig").Model;
     const peer = @import("gsp_virtual_provider_test_model.zig").Model;
     const running = &target.running;
     const heap_before = model.heapLive();
     peer.install(table); defer peer.dispose(table);
+    target.running.memory_api = target.ctx.?.memory();
     try t.expect(try running.virtual_provider.step(running));
     const range: a.GfxVirtualJob = .{ .resource = .{ .id = 910, .generation = 31 }, .request = .{ .kind = 1,
         .adapter_id = running.adapter_id, .memory_generation = running.epoch, .byte_length = 8192,
@@ -10825,6 +11190,8 @@ fn checkVirtualProviderReset(target: *@import("gsp_device.zig").Device, table: *
 }
 
 fn checkDeviceMappings(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, scenario: []const u8) !void {
+    // Host fixtures replace providers mid-run; production tables stay bound.
+    defer target.running.memory_api = target.ctx.?.memory();
     const model = @import("gsp_buffer_test_model.zig").Model;
     const runtime = @import("gsp_runtime.zig");
     const ex = @import("gsp_exchange.zig");
@@ -10836,6 +11203,7 @@ fn checkDeviceMappings(target: *@import("gsp_device.zig").Device, table: *a.Driv
     const transmitted = try t.allocator.alloc(u8, 65536);
     defer t.allocator.free(transmitted);
     model.install(table, scenario);
+    target.running.memory_api = target.ctx.?.memory();
     defer model.dispose(table);
     if (model.is("mapping_provider_reset")) return checkVirtualProviderReset(target, table);
     if (model.is("mapping_success")) try checkVirtualProvider(target, table);
@@ -11114,6 +11482,10 @@ fn checkDevicePower(target: *@import("gsp_device.zig").Device) !void {
     }
     // Parent destruction must wait for exact RUSD detach and queue ACK.
     checkpoint = "detach";
+    // Exercise the same closing admission as terminal shutdown: suppress
+    // new telemetry/receiver work while still draining the attached owner.
+    run.shutdown_closing = true;
+    defer run.shutdown_closing = false;
     const deadline = clock + 5 * std.time.ns_per_s;
     try t.expectError(error.Busy, run.beginDestroyGraph(deadline, true));
     try t.expect(!run.graph_closing and owner.stopping and model.releases == 0);

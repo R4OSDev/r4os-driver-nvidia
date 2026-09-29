@@ -483,6 +483,12 @@ fn badBootEvent(model: *Model, rpc: message.Rpc, payload: []const u8, expected: 
     try t.expectEqual(expected, boot.failure.?.reason);
     try t.expectEqualDeep(rpc, boot.failure.?.rpc.?);
     try t.expectEqualDeep(session.pending.?, boot.failure.?.ticket.?);
+    try t.expectEqual(payload.len, boot.failure.?.payload.?.length);
+    const count = @min(payload.len, boot.failure.?.payload.?.prefix.len);
+    // Recovery may reuse receive scratch. The failed message must remain a
+    // stable, bounded diagnostic without allowing an ACK or more device I/O.
+    @memset(&model.rx, 0xa5);
+    try t.expectEqualSlices(u8, payload[0..count], boot.failure.?.payload.?.prefix[0..count]);
     try t.expectEqual(@as(u32, 0), model.peerWord(session.link.?.status_read));
     const calls = model.count;
     try t.expectError(error.State, boot.poll());
@@ -526,11 +532,19 @@ test "GSP boot events require explicit handling, valid original payloads and an 
     try t.expectError(error.State, boot.poll());
     try t.expectEqual(before, model.count);
 
+    boot = try startBoot(model, &session);
+    try model.replyRpc(&session, .{ .function = 0x1001, .result = 0 }, &.{});
+    event = (try boot.poll()).?;
+    try t.expect(event.event == .init_done and boot.state == .dispatching);
+    try boot.complete(event.ticket);
+    try t.expect(boot.state == .init_done and boot.handled_events == 1);
+
     for ([_]u32{ 79, 0x1000, 0x1021, 0xffffffff }) |function|
         try badBootEvent(model, .{ .function = function }, "unknown", error.UnknownEvent);
     try badBootEvent(model, .{ .function = 0x1001, .result = 0, .cpu_rm_gfid = 1 }, &.{ 0, 0, 0, 0 }, error.Guest);
     for ([_]u32{ message.pending, 0x65, 0x12345678 }) |result|
         try badBootEvent(model, .{ .function = 0x1001, .result = result, .result_private = 0x1122 }, &.{ 0, 0, 0, 0 }, error.FirmwareResult);
+    try badBootEvent(model, .{ .function = 0x1001, .result = 0x65 }, &.{}, error.FirmwareResult);
     var bytes: [1212]u8 = @splat(0);
     const Invalid = struct { function: u32, length: usize };
     for ([_]Invalid{
@@ -543,7 +557,20 @@ test "GSP boot events require explicit handling, valid original payloads and an 
     try badBootEvent(model, .{ .function = 0x101c }, &.{2}, error.Payload);
     put(&bytes, 176, 1025);
     try badBootEvent(model, .{ .function = 0x1020 }, bytes[0..1208], error.Payload);
+    try badBootEvent(model, .{ .function = 0x1020 }, bytes[0..1212], error.Payload);
     put(&bytes, 176, 0);
+    // The actual GA106 firmware counts the four-byte RPC placeholder in its
+    // extent. Both forms contain the same original 1208-byte record at zero;
+    // bytes after that record are opaque, never part of diagnostic data.
+    @memset(bytes[1208..], 0xa5);
+    for ([_]usize{ 1208, 1212 }) |length| {
+        boot = try startBoot(model, &session);
+        try model.replyRpc(&session, .{ .function = 0x1020 }, bytes[0..length]);
+        event = (try boot.poll()).?;
+        try t.expect(event.event == .nocat and event.event.nocat.diagnostic.len == 0);
+        try boot.complete(event.ticket);
+        try t.expect(boot.state == .waiting and boot.handled_events == 1);
+    }
     put(&bytes, 4, 0xffffffff);
     try badBootEvent(model, .{ .function = 0x100c }, bytes[0..9], error.Payload);
 
@@ -584,7 +611,7 @@ test "GSP boot events require explicit handling, valid original payloads and an 
     try t.expectEqual(@as(u32, 16), session.rx_read);
     model.now = deadline;
     try t.expectError(error.Deadline, boot.poll());
-    try t.expect(boot.failure.?.rpc == null and boot.failure.?.ticket == null);
+    try t.expect(boot.failure.?.rpc == null and boot.failure.?.ticket == null and boot.failure.?.payload == null);
 
     // Delayed handler, lifetime change and ambiguous acknowledgements cannot
     // report INIT_DONE or cause handler replay, even if the cursor was written.

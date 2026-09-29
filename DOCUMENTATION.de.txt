@@ -1,7 +1,67 @@
 ﻿NVIDIA: nativer Grafik- und Displaybesitzer
 =========================================
 
-Stand: 16.09.2026, NVIDIA 0.1.126. Der Unterbau fuer unabhaengige GPU-VA-
+Stand: 29.09.2026, Roadmap 0.82.1 in Arbeit. NVIDIA 0.1.154 und Kernel
+0.1.232 sind lokal gebaut, geprueft und als getrennte Updatepakete
+vorbereitet. Kein Upload und keine Installation dieses Kandidaten auf OssiPC.
+Letzter unabhaengig bestaetigter geladener Treiber: 0.1.147. Der Zustand
+nach dem unterbrochenen 148-Update bleibt ungeprueft. Der PC war laut User
+eingeschaltet und nicht mehr responsive; ein neuer lesender 120-Sekunden-
+SSH-Versuch blieb erfolglos. Software-Graphics-Rettungsboot weiter angefragt.
+
+154 verbindet System-Shutdown mit dem endlichen Treiberabbau. Der Worker
+wird pausiert und gejoint; Device, Ruhenachweis und IRQ-Wecksemaphore bleiben
+bis zum jeweiligen Besitzerabbau bestehen. Der gesunde Headless-Pfad sperrt
+neue Arbeit und leert bestehende CE-/GR-Auftraege und angehaengte Telemetrie.
+Danach folgen RM-Graphabbau, RPC47/Prozessorsuspend, FWSEC-SB/Booter Unload
+und ein bestaetigter FLR. Erst dessen DMA-Ruhenachweis erlaubt den Runtime-
+und gemeinsamen Displayabbau. Der terminale Pfad startet keine GPU neu.
+Capture-/Boot-RAM wird erst nach exakter Kernel232-terminal_release-Quittung
+freigegeben. Fehlende Quittungen, fremde Bindungen und geliehene Referenzen
+halten Ressourcen; CPU-Abbaufehler behalten die genaue Wiederholungsidentitaet.
+Alle dazu benoetigten API-Tabellen sind vor dem Schliessen neuer Abfragen
+gehalten. Ein weiterer behobener Startfehler: Headless fordert jetzt neben
+GR auch CE an; zuvor geschah das nur ueber den nativen Ausgabestart.
+
+Kernel232 liefert den optionalen terminal_release-Slot (Wire1, Layout7/144,
+alter136-Byte-Praefix erhalten). Freigabe nur bei System-Shutdown nach exakt
+abgeschlossenem quiesced-device_reset, ohne Restore, Pixelkopie oder erneut
+geoeffnete Bildschreiber. Die vorherigen Kernel-/SDK-/Contract- und SMP4-
+Besitzerpruefungen sind in 20260929-terminal/Kernel232.json dokumentiert.
+Das gesunde geordnete Schliessen ist in154 fuer Headless geprueft; aktive
+Displayengines sowie unvollstaendige/fehlerhafte Starts verwenden weiterhin
+den konservativen Firmware-/Resetpfad. Kein Firmwareerfolg allein gilt als
+DMA-Stillstand oder als physischer Neustartnachweis.
+
+Finale Pruefungen: Modulbuild7/7, bestehende volle Geraetegruppe5/5 (1/1),
+Lifecycle4/4 (10/10) und originaler C-ABI-/Quellkatalogabgleich PASS. Die
+Geraetegruppe deckt CE/GR-Abbau, RPC47/Suspend, SB/Unload, genau einen FLR,
+unverwertbare Busy-Ausgaben, gesperrte neue API-Abfragen und den terminalen
+Abschluss ab. Capturefaelle pruefen falsche Identitaet, Borrower und Retry.
+Frischer SMP4/KVM-CPU-Lauf: PASS, 60.64s, NVIDIA154/Kernel232.
+Hostmodelle und dieser CPU-Lauf beweisen keine reale GPU-Funktion.
+Statische Frames Shutdown776/Runtime4632/Device5736/Retire25640 Bytes;
+direktes Screening Init44456/Shutdown57864/Work57160. Kein vollstaendiger
+Stacknachweis: Pushes, indirekte/Tail-Aufrufe und Kernel/IRQ fehlen.
+
+Naechste Hardwarefolge: stabiler Software-Graphics-Boot, unterbrochenen
+Updatezustand pruefen, Kernel232 separat per SYSUPD aktivieren und in
+Softwaregrafik bestaetigen, erst dann NVIDIA154-Headless. Dessen Paket
+verlangt aktiven Kernel>=232. Release bleibt0.81.29. Echte GSP/RM-/IRQ-
+Bereitschaft, FRTS/Stale-/SB-Gegenproben, CE-/GR-Readbacks, Ressourcenabbau
+und zwei normale Warmstarts bleiben in .1 offen; bestanden:0. Keine
+Unterversion abgeschlossen. Auftrag durch .36, ohne .37/38; TV im Standby.
+Aktuelle Belege: ExFiles/Reports/OssiGPU/20260929-terminal/Candidate154.json.
+Vorherige Teilbelege: 20260928-foundation/ und 20260929-stack/.
+
+OPTION NVIDIA mode=headless startet seit 0.1.146 GSP/RM; seit 0.1.154 werden CE und GR explizit gestartet
+ohne nativen Ausgabeverbraucher und ohne Empfaengerabfragen (EDID/DDC/AUX).
+Dieser Modus benoetigt GRAPHICS=AUTO; die persistente oder einmalige
+Softwaregrafik-Policy verhindert weiterhin saemtliche Firmwareausfuehrung.
+Headless-Bereitschaft entsteht erst durch echte INIT_DONE-/RM-/IRQ- und
+GPU-Abschlussquittungen. Der Modus selbst ist kein Hardware-Erfolgsnachweis.
+
+Historischer Stand vom 16.09.2026, NVIDIA 0.1.126: Der Unterbau fuer unabhaengige GPU-VA-
 Reservierungen und RAM-/VRAM-Aliase ist im Device-Worker mit dynamischer
 Verwaltung, Befehlspruefung und Graph-/Reset-Abbau hostseitig geprueft. Die Anbindung an
 native NVK-Auftraege und deren Prozesslebensdauer bleibt in 0.79.35 offen.
@@ -74,7 +134,7 @@ mode_product_checkpoint und mode_diagnostics_checkpoint.
 Physische Abnahmen: ExFiles/Reports/OssiGPU.txt.
 Die folgenden aelteren Abschnitte beschreiben ihren damaligen Stand.
 
-Einmaliger Firmware-Abbau nach Fehlern (NVIDIA 0.1.51)
+Historisch: Einmaliger Firmware-Abbau nach Fehlern (NVIDIA 0.1.51)
 ----------------------------------------------------
 Der native Port kann einen bereits gehaltenen Lauf einmalig in einen eigenen,
 endlich befristeten Wiederherstellungspfad uebergeben. Der alte Fehler und
@@ -85,7 +145,7 @@ Libos-Leser bleiben Voraussetzung jeder weiteren Operation.
 Der Abbau fuehrt FWSEC-SB und danach normalen Booter Unload ueber die
 vorhandenen Reset-/Upload-/Halt- und Ergebnispruefungen aus. Beide Abbilder
 stammen aus genau diesem gehaltenen Lauf. WPR-down darf Unload ueberspringen;
-ein SB- oder Unload-Fehler stoppt weitere Schritte ohne Wiederholung. Der
+damals stoppte jeder SB- oder Unload-Fehler weitere Schritte. Seit 0.1.152 erlaubt ein bestaetigter SB-Statusfehler den einmaligen Booter-Unload (siehe aktuellen Stand oben). Der
 Leser bleibt pausiert. Firmware-Ergebnisse allein geben weder Speicher noch
 Displaybesitz frei und behaupten keine wiederhergestellte Anzeige.
 

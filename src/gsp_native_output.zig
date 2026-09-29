@@ -112,7 +112,7 @@ pub const Owner = struct {
         self.last_clock = now;
         if (self.phase != .active and self.phase != .console_active and self.phase != .waiting and self.phase != .receiver_wait and
             (now >= self.deadline or now >= self.phase_deadline)) return error.Deadline;
-        return self.advance() catch |err| {
+        return (if (self.phase == .active) self.advanceActive() else self.advance()) catch |err| {
             if (err == error.Busy) return false;
             self.quarantine(err);
             return err;
@@ -163,11 +163,18 @@ pub const Owner = struct {
         self.next_phase = then;
         self.next(.storage_release);
     }
-    fn advance(self: *Owner) !bool {
+    noinline fn advance(self: *Owner) !bool {
+        switch (self.phase) {
+            inline else => |phase| return self.advancePhase(phase),
+        }
+    }
+    // Only one startup phase runs per worker slice; its snapshot storage
+    // must not remain live across unrelated initialization calls.
+    noinline fn advancePhase(self: *Owner, comptime phase: Phase) !bool {
         const run = self.running.?;
         const held = self.captured.?;
         const boot = held.original_boot.?;
-        switch (self.phase) {
+        switch (phase) {
             .waiting => {
                 if (run.native_copy.phase != .ready or run.nativeObject() == null) return false;
                 self.copy = run.native_copy.channel orelse return error.State;
@@ -448,40 +455,43 @@ pub const Owner = struct {
                 self.ctx.?.logInfo("NVIDIA console: original-BAR1=verified scanout=C67D-confirmed bootfb=restored firmware-and-console-reservation=resident");
             },
             .console_active => return false,
-            .active => {
-                if (try self.refresh.step(self)) return true;
-                if (self.refresh.busy()) return false;
-                if (self.reportOutputFault()) return true;
-                if (try self.additional.failedJobs(self)) return true;
-                if (run.output_faults[self.mode.?.window]) |err| {
-                    if (try self.modes.failedJobs(self, err)) return true;
-                    return self.additional.step(self);
-                }
-                const changed = try self.hotplug.step(self);
-                if (changed) return true;
-                if (self.hotplug.phase != .online or self.hotplug.refreshing) return self.additional.step(self);
-                if (self.color.step(self)) return true;
-                // The additional owner must consume its completed SOR work
-                // before an idle-only primary route query can succeed.
-                if (self.additional.hardwareBusy()) return self.additional.step(self);
-                try self.validateRoute();
-                if (run.frame_setup != null) return run.prepareFramePool();
-                if (try self.cursor.step(self)) return true;
-                if (self.cursor.busy()) return false;
-                if (try self.audio.step(self)) return true;
-                if (self.audio.busy()) return false;
-                if (self.modes.phase == .idle or self.modes.phase == .unavailable or self.modes.phase == .decision) {
-                    if (try self.additional.step(self)) return true;
-                    if (self.additional.hardwareBusy()) return false;
-                }
-                if (try self.modes.step(self)) return true;
-                if (self.modes.phase == .idle or self.modes.phase == .decision or self.modes.phase == .unavailable)
-                    return run.prepareFramePool();
-                return false;
-            },
-            .detached, .failed => return error.State,
+            .detached, .active, .failed => return error.State,
         }
         return true;
+    }
+    // The active output dispatch must not retain initialization buffers while
+    // invoking the independent mode/hotplug/additional-output owners.
+    noinline fn advanceActive(self: *Owner) !bool {
+        const run = self.running.?;
+        if (try @call(.never_inline, @TypeOf(self.refresh).step, .{ &self.refresh, self })) return true;
+        if (self.refresh.busy()) return false;
+        if (self.reportOutputFault()) return true;
+        if (try self.additional.failedJobs(self)) return true;
+        if (run.output_faults[self.mode.?.window]) |err| {
+            if (try self.modes.failedJobs(self, err)) return true;
+            return self.additional.step(self);
+        }
+        const changed = try @call(.never_inline, @TypeOf(self.hotplug).step, .{ &self.hotplug, self });
+        if (changed) return true;
+        if (self.hotplug.phase != .online or self.hotplug.refreshing) return self.additional.step(self);
+        if (@call(.never_inline, @TypeOf(self.color).step, .{ &self.color, self })) return true;
+        // The additional owner must consume its completed SOR work
+        // before an idle-only primary route query can succeed.
+        if (self.additional.hardwareBusy()) return self.additional.step(self);
+        try self.validateRoute();
+        if (run.frame_setup != null) return run.prepareFramePool();
+        if (try @call(.never_inline, @TypeOf(self.cursor).step, .{ &self.cursor, self })) return true;
+        if (self.cursor.busy()) return false;
+        if (try @call(.never_inline, @TypeOf(self.audio).step, .{ &self.audio, self })) return true;
+        if (self.audio.busy()) return false;
+        if (self.modes.phase == .idle or self.modes.phase == .unavailable or self.modes.phase == .decision) {
+            if (try self.additional.step(self)) return true;
+            if (self.additional.hardwareBusy()) return false;
+        }
+        if (try @call(.never_inline, @TypeOf(self.modes).step, .{ &self.modes, self })) return true;
+        if (self.modes.phase == .idle or self.modes.phase == .decision or self.modes.phase == .unavailable)
+            return run.prepareFramePool();
+        return false;
     }
 
     fn reportOutputFault(self: *Owner) bool {

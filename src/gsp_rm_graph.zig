@@ -30,6 +30,13 @@ pub const Owner = struct {
     /// The handoff and session must be retained at a stable address. This
     /// value may be moved only before its first poll; no live owner copies.
     pub fn init(runtime: *boot.Handoff, process_id: u32, process_name: []const u8, deadline: u64) Error!Owner {
+        var result: Owner = undefined;
+        try result.initInPlace(runtime, process_id, process_name, deadline);
+        return result;
+    }
+    /// Initialize the reserved graph at its final address. Runtime callers
+    /// must not stage the complete graph on the small driver task stack.
+    pub noinline fn initInPlace(self: *Owner, runtime: *boot.Handoff, process_id: u32, process_name: []const u8, deadline: u64) Error!void {
         if (runtime.claimed or runtime.session.state != .active or runtime.session.pending != null) return error.State;
         try runtime.session.guard(deadline);
         // Reject bad caller inputs before consuming any names or queue token.
@@ -44,7 +51,7 @@ pub const Owner = struct {
             .i2c = try reservation.object(5),
             .vaspace = try reservation.object(6),
         }, process_id, process_name);
-        return .{ .reservation = reservation, .base = try objects.Owner.init(runtime, plan, deadline), .deadline = deadline };
+        self.* = .{ .reservation = reservation, .base = try objects.Owner.init(runtime, plan, deadline), .deadline = deadline };
     }
     fn session(self: *Owner) *exchange.transport.Session {
         return self.base.exchange.session;

@@ -112,11 +112,19 @@ pub const Owner = struct {
         };
     }
     fn advance(self: *Owner, product: anytype) !bool {
-        const run = product.running.?;
         const now = product.last_clock;
         if (self.phase != .detached and self.phase != .idle and self.phase != .decision and self.phase != .reply and
             now >= self.deadline) return error.Deadline;
         switch (self.phase) {
+            inline else => |phase| return self.advancePhase(product, phase),
+        }
+    }
+    // Each phase owns only its own temporary results. In particular, commit
+    // must not carry the large completion/rollback snapshot on its stack.
+    noinline fn advancePhase(self: *Owner, product: anytype, comptime phase: Phase) !bool {
+        const run = product.running.?;
+        const now = product.last_clock;
+        switch (phase) {
             .detached => {
                 if (!product.outputs.?.supportsModes() or product.receiver.flags & a.gfx_output_flag_connected == 0 or
                     product.receiver.flags & (a.gfx_output_flag_receiver_incomplete | a.gfx_output_flag_edid_invalid | a.gfx_output_flag_edid_missing) != 0) {

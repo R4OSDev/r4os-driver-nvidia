@@ -26,6 +26,11 @@ pub fn derive(saved: boot.Plan, object: display.Object, snapshot: *const outputs
         .transport = if (saved.signal.mst != null) .{ .mst = try mst.derive(saved, object, snapshot) } else if (saved.displayPort())
         .{ .dp = try dp.derive(saved, object, snapshot) } else .{ .hdmi = try hdmi.derive(saved, object, snapshot) } };
 }
+/// Admission-only callers must perform all the same checks without holding
+/// an unused full link plan alongside their enclosing mode snapshots.
+pub noinline fn validate(saved: boot.Plan, object: display.Object, snapshot: *const outputs.Snapshot) !void {
+    _ = try derive(saved, object, snapshot);
+}
 pub const Work = struct {
     plan: Plan,
     phase: Phase = .before_scanout,
@@ -48,12 +53,19 @@ pub const Work = struct {
     request: [max_bytes]u8 = @splat(0),
     length: usize = 0,
     pub fn init(plan: Plan) Work {
-        return switch (plan.transport) {
-            .hdmi => |value| .{ .plan = plan, .operation = .hdmi, .hdmi = .{ .plan = value },
+        var result: Work = undefined;
+        result.initInPlace(plan);
+        return result;
+    }
+    /// Initialize resident, unsubmitted work without a full temporary copy.
+    /// The protocol buffers together exceed a safe DriverWork stack frame.
+    pub noinline fn initInPlace(self: *Work, plan: Plan) void {
+        switch (plan.transport) {
+            .hdmi => |value| self.* = .{ .plan = plan, .operation = .hdmi, .hdmi = .{ .plan = value },
                 .frl = if (plan.frl) |native| .{ .plan = native } else null },
-            .dp => |value| .{ .plan = plan, .operation = .dp, .dp = .{ .plan = value } },
-            .mst => .{ .plan = plan, .operation = .mst },
-        };
+            .dp => |value| self.* = .{ .plan = plan, .operation = .dp, .dp = .{ .plan = value } },
+            .mst => self.* = .{ .plan = plan, .operation = .mst },
+        }
     }
     /// Reserve only after the ordinary image/channel preflight succeeded.
     /// The work may move until prepare pins its resident address.
@@ -63,16 +75,28 @@ pub const Work = struct {
         self.mst = try mst.Work.init(self.plan.transport.mst, snapshot, store, deadline);
     }
     pub fn restoreMst(failed: *const Work, deadline: u64) !Work {
+        var result: Work = undefined;
+        try result.restoreMstInPlace(failed, deadline);
+        return result;
+    }
+    pub noinline fn restoreMstInPlace(self: *Work, failed: *const Work, deadline: u64) !void {
         if (failed.operation != .mst or failed.pending or failed.mst_rebuild != null) return error.State;
         const source = if (failed.mst) |*value| value else return error.State;
-        return .{ .plan = failed.plan, .operation = .mst, .last_receipt = failed.last_receipt,
+        self.* = .{ .plan = failed.plan, .operation = .mst, .last_receipt = failed.last_receipt,
             .mst_rebuild = try mst_restore.Work.init(source, deadline) };
     }
     pub fn stopMst(plan: Plan, proof: mst.Result, image: @import("gsp_mst_registry.zig").Image,
         store: *@import("gsp_mst_discovery.zig").Store, deadline: u64) !Work
     {
+        var result: Work = undefined;
+        try result.stopMstInPlace(plan, proof, image, store, deadline);
+        return result;
+    }
+    pub noinline fn stopMstInPlace(self: *Work, plan: Plan, proof: mst.Result, image: @import("gsp_mst_registry.zig").Image,
+        store: *@import("gsp_mst_discovery.zig").Store, deadline: u64) !void
+    {
         if (plan.transport != .mst) return error.Descriptor;
-        return .{ .plan = plan, .operation = .mst, .stop_only = true,
+        self.* = .{ .plan = plan, .operation = .mst, .stop_only = true,
             .mst_rebuild = try mst_restore.Work.initStop(plan.transport.mst, proof, image, store, deadline) };
     }
     pub fn prepare(self: *Work, now: u64) !bool {
@@ -108,9 +132,19 @@ pub const Work = struct {
         return false;
     }
     pub fn stopExtended(plan: Plan, receiver_present: bool) !Work {
-        if (plan.frl != null) return stopFrl(plan);
+        var result: Work = undefined;
+        try result.stopExtendedInPlace(plan, receiver_present);
+        return result;
+    }
+    /// Reject the descriptor before changing the unsubmitted destination.
+    pub noinline fn stopExtendedInPlace(self: *Work, plan: Plan, receiver_present: bool) !void {
+        if (plan.frl) |prior| {
+            self.* = .{ .plan = plan, .operation = .hdmi, .stop_only = true,
+                .clear_frl = .{ .plan = prior, .stage = .disable } };
+            return;
+        }
         if (plan.mode.signal.dp_dsc == null or plan.transport != .dp) return error.Descriptor;
-        return .{ .plan = plan, .operation = .dp, .stop_only = true,
+        self.* = .{ .plan = plan, .operation = .dp, .stop_only = true,
             .clear_dp = .{ .plan = plan.transport.dp, .receiver_present = receiver_present } };
     }
     pub fn clearPrevious(self: *Work, previous: Plan) !void {

@@ -277,10 +277,17 @@ pub const Topology = struct {
     }
     pub fn append(self: *Topology, plan: modes.Plan) Error!void {
         if (self.count == 0 or self.count >= self.plans.len) return error.Bounds;
+        try self.validateNext(self.count, &plan);
+        self.plans[self.count] = plan; self.count += 1;
+    }
+    /// Check an existing prefix without building a second complete topology
+    /// on the driver's task stack.
+    pub fn validateNext(self: *const Topology, count: usize, plan: *const modes.Plan) Error!void {
+        if (count == 0 or count >= self.plans.len) return error.Bounds;
         // One independent Window per Head. Verified virtual leaves of the
         // same MST root may share its physical SOR and protocol.
-        for (self.plans[0..self.count]) |entry| {
-            const prior = entry orelse return error.Descriptor;
+        for (self.plans[0..count]) |*entry| {
+            const prior = if (entry.*) |*value| value else return error.Descriptor;
             if (prior.head == plan.head or prior.window == plan.window or
                 prior.signal.display_id == plan.signal.display_id) return error.Routing;
             if (prior.signal.sor == plan.signal.sor) {
@@ -291,17 +298,15 @@ pub const Topology = struct {
                     (prior.signal.sor_control & ~@as(u32, 255)) != (plan.signal.sor_control & ~@as(u32, 255))) return error.Routing;
             }
         }
-        self.plans[self.count] = plan; self.count += 1;
     }
-    fn validate(self: Topology, binding: Binding, candidate: modes.Plan) Error!void {
+    fn validate(self: *const Topology, binding: Binding, candidate: modes.Plan) Error!void {
         if (self.count == 0 or self.count > self.plans.len or self.plans[0] == null or
             !std.meta.eql(self.plans[0].?, candidate)) return error.Descriptor;
-        var checked = Topology.single(candidate);
-        for (self.plans, 0..) |entry, index| {
-            if (index >= self.count) { if (entry != null) return error.Descriptor; continue; }
-            const plan = entry orelse return error.Descriptor;
-            try validateMode(binding, plan);
-            if (index != 0) try checked.append(plan);
+        for (&self.plans, 0..) |*entry, index| {
+            if (index >= self.count) { if (entry.* != null) return error.Descriptor; continue; }
+            const plan = if (entry.*) |*value| value else return error.Descriptor;
+            try validateMode(binding, plan.*);
+            if (index != 0) try self.validateNext(index, plan);
         }
     }
 };
@@ -461,10 +466,15 @@ pub const Owner = struct {
         if (self.namespace_live) try self.exchange.session.rm_names.validateChildren(self.reservation);
     }
     pub fn info(self: *const Owner) ?Result {
+        return (self.infoRef() orelse return null).*;
+    }
+    /// The serialized runtime may borrow the result for pure revalidation.
+    /// Do not retain this pointer across a mode-owner mutation.
+    pub fn infoRef(self: *const Owner) ?*const Result {
         self.stable() catch return null;
         if (self.self_address != @intFromPtr(self) or !self.live or self.obsolete or self.exchange.session.state != .active or
             (self.state != .ready and self.state != .handed_off)) return null;
-        return self.result;
+        return if (self.result) |*result| result else null;
     }
     pub fn poll(self: *Owner) Error!?exchange.Dispatch {
         try self.stable();

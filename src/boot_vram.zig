@@ -37,6 +37,9 @@ pub const Capture = struct {
     self_address: usize = 0,
     effects_latched: bool = false,
     firmware_owner: usize = 0,
+    terminal_epoch: u64 = 0,
+    terminal_owner: usize = 0,
+    terminal_generation: u64 = 0,
     firmware_restore_generation: u64 = 0,
     firmware_recovery: ?display.Recovery = null,
     window_writes: u32 = 0,
@@ -128,8 +131,9 @@ pub const Capture = struct {
         return raw;
     }
     fn checkScanout(self: *Capture) !void {
-        const original = self.scanout_original orelse return error.State;
-        if (!std.meta.eql(original, try self.readScanout())) return error.ScanoutChanged;
+        const original = if (self.scanout_original) |*value| value else return error.State;
+        const current = try self.readScanout();
+        if (!original.same(&current)) return error.ScanoutChanged;
     }
 
     fn cast(raw: *anyopaque) *Capture { return @ptrCast(@alignCast(raw)); }
@@ -213,7 +217,8 @@ pub const Capture = struct {
     }
 
     /// Called by the serialized native owner before its first possible effect.
-    /// This is a permanent retention latch, not a replacement recovery proof.
+    /// Only a whole-device stop proof plus terminal display acknowledgement
+    /// may remove this retention latch; a restore request cannot remove it.
     /// The existing PRAMIN-only callback can no longer authorize pixel copy,
     /// MMIO teardown or bootfb access after a firmware/DMA operation.
     pub fn retainForFirmware(self: *Capture, owner: usize, epoch: u64) !void {
@@ -255,5 +260,27 @@ pub const Capture = struct {
         if (!self.registers.close()) { self.last_status = self.registers.last_status; return false; }
         self.* = .{ .registers = .{ .serial = self.registers.serial } };
         return true;
+    }
+
+    pub fn closeAfterReset(self: *Capture, proof: @import("gsp_reset.zig").Quiescence, firmware_owner: usize,
+        binding: *const a.GfxBackendBinding, reset_generation: u64) bool
+    {
+        if (self.self_address == 0) return true;
+        if (self.self_address != @intFromPtr(self) or firmware_owner == 0 or !proof.valid(proof.epoch) or
+            self.borrower != 0 or self.mapping_owner != 0 or self.context_owner != 0 or reset_generation == 0) return false;
+        if (firmware_owner != (if (self.firmware_owner != 0) self.firmware_owner else self.terminal_owner)) return false;
+        const device: *const @import("gsp_device.zig").Device = @ptrFromInt(firmware_owner);
+        if (device.self_address != firmware_owner or device.display != self or !device.terminal_requested or
+            !device.terminal_retired or proof.owner != &device.gpu_reset or proof.epoch != device.epoch or
+            reset_generation != device.reset_display.generation or !std.meta.eql(binding.*, device.reset_binding)) return false;
+        if (self.terminal_epoch == 0) {
+            if (self.firmware_owner != firmware_owner) return false;
+            self.boot.releaseTerminal(binding, reset_generation) catch return false;
+            self.terminal_epoch = proof.epoch;
+            self.terminal_owner = firmware_owner;
+            self.terminal_generation = reset_generation;
+            self.firmware_owner = 0;
+        } else if (self.firmware_owner != 0 or self.terminal_epoch != proof.epoch or self.terminal_generation != reset_generation) return false;
+        return self.close();
     }
 };

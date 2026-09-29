@@ -129,6 +129,26 @@ _Static_assert(offsetof(GSP_MSG_QUEUE_ELEMENT, elemCount) == 40, "element count"
 _Static_assert(offsetof(rpc_message_header_v, rpc_message_data) == 32, "payload");
 _Static_assert(GSP_MSG_QUEUE_ELEMENT_SIZE_MIN == 4096, "queue element");
 _Static_assert(GSP_MSG_QUEUE_ELEMENT_SIZE_MAX == 65536, "maximum frame");
+_Static_assert(sizeof(rpc_unloading_guest_driver_v1F_07) == 8, "unload payload extent");
+_Static_assert(offsetof(rpc_unloading_guest_driver_v1F_07, bInPMTransition) == 0, "unload PM flag");
+_Static_assert(offsetof(rpc_unloading_guest_driver_v1F_07, bGc6Entering) == 1, "unload GC6 flag");
+_Static_assert(offsetof(rpc_unloading_guest_driver_v1F_07, newLevel) == 4, "unload PM level");
+
+static unsigned unload_compared;
+int r4nv_gsp_unload_abi_complete(void) { return unload_compared == 1; }
+int r4nv_gsp_unload_abi_check(unsigned function, const unsigned char *actual, size_t count, unsigned mailbox)
+{
+    rpc_unloading_guest_driver_v1F_07 expected;
+    memset(&expected, 0, sizeof(expected));
+    expected.bInPMTransition = NV_FALSE;
+    expected.bGc6Entering = NV_FALSE;
+    expected.newLevel = 0;
+    const int different = function != NV_VGPU_MSG_FUNCTION_UNLOADING_GUEST_DRIVER ||
+           mailbox != NV_PGSP_FALCON_MAILBOX0 || count != sizeof(expected) ||
+           memcmp(actual, &expected, sizeof(expected)) != 0;
+    if (!different) unload_compared = 1;
+    return different;
+}
 static unsigned compared;
 
 /* Keep the original checked-build assertion enabled. Any assertion/debug
@@ -207,7 +227,9 @@ size_t r4nv_gsp_event_abi_fixture(unsigned fixture, unsigned char *output, size_
         rpc_init_done_v *p = (void *)rpc->rpc_message_data;
         rpc->function = NV_VGPU_MSG_EVENT_GSP_INIT_DONE;
         p->not_used = 0x7ac0ffee;
-        payload_len = sizeof(*p);
+        /* Actual GA106/570.144 event: the original handler needs only the
+         * status in the common header, with no unused parameter word. */
+        payload_len = 0;
         break;
     }
     case 1: {
@@ -257,7 +279,10 @@ size_t r4nv_gsp_event_abi_fixture(unsigned fixture, unsigned char *output, size_
         p->errorCode = 0xfedcba9876543210ULL;
         memcpy(p->faultingEngine, "gsp", 4); p->tdrReason = 12;
         p->diagBufferLen = 5; memcpy(p->diagBuffer, "\xde\xad\xbe\xef\x79", 5);
-        payload_len = sizeof(*p);
+        /* GA106/570.144 observed wire extent includes the four-byte RPC
+         * placeholder as well. The record starts at &rpc_p->data, not +4. */
+        memset((unsigned char *)p + sizeof(*p), 0x5a, sizeof(*rpc_p));
+        payload_len = sizeof(*rpc_p) + sizeof(*p);
         break;
     }
     }

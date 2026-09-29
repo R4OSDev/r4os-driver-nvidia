@@ -504,7 +504,7 @@ test "NVIDIA actual driver lifecycle verifies loaded lock before PCI and binds f
     api.gfx_display_query = policyDisplay;
     // Both persistent and one-shot software override even an explicit native
     // mode and a corrupt firmware package before PCI/MMIO/resource admission.
-    for ([_]u32{ 1, 2 }) |software| for ([_][*:0]const u8{ "auto", "native", "gsp-start", "boot-check", "passive" }) |mode| {
+    for ([_]u32{ 1, 2 }) |software| for ([_][*:0]const u8{ "auto", "native", "headless", "gsp-start", "boot-check", "passive" }) |mode| {
         state = .{ .boot_policy = software, .selected_mode = mode, .resource_fault = .wrong };
         try t.expectEqual(@as(i32, 0), driver.nvidia_init(&api));
         try t.expectEqual(@as(usize, 0), state.enumerate_count);
@@ -588,18 +588,42 @@ const WorkFixture = struct {
     var active: u32 = 0;
     var result: i32 = 0;
     var cancelled = false;
+    var join_result: i32 = 0;
+    var task_release_busy: u32 = 0;
+    var semaphore_destroy_result: i32 = 0;
+    var semaphore_destroys: u32 = 0;
+    var task_releases: u32 = 0;
     fn reset() void {
         task = .{}; ticks = 0; owner = false; busy = 0; release_busy = 0;
         submits = 0; releases = 0; callbacks = 0; active = 0; result = 0; cancelled = false;
+        join_result = 0; task_release_busy = 0; semaphore_destroy_result = 0;
+        semaphore_destroys = 0; task_releases = 0;
     }
     fn threads(out: *a.DriverThreadApi) callconv(.c) i32 {
-        out.* = .{ .start = @intFromPtr(&start) }; return 0;
+        out.* = .{ .start = @intFromPtr(&start), .stop = @intFromPtr(&stopTask),
+            .join = @intFromPtr(&joinTask), .release = @intFromPtr(&releaseTask) }; return 0;
     }
     fn start(request: *const a.DriverThreadRequest, out: *u64) callconv(.c) i32 {
         task = request.*; out.* = 7; return 0;
     }
     fn semaphores(out: *a.DriverSemaphoreApi) callconv(.c) i32 {
-        out.* = .{ .create = @intFromPtr(&create), .acquire = @intFromPtr(&acquire) }; return 0;
+        out.* = .{ .create = @intFromPtr(&create), .acquire = @intFromPtr(&acquire),
+            .release = @intFromPtr(&wake), .destroy = @intFromPtr(&destroy) }; return 0;
+    }
+    fn stopTask(handle: u64) callconv(.c) i32 { std.debug.assert(handle == 7); return 0; }
+    fn joinTask(handle: u64, _: u64, out: *i32) callconv(.c) i32 {
+        std.debug.assert(handle == 7); out.* = 0; return join_result;
+    }
+    fn releaseTask(handle: u64) callconv(.c) i32 {
+        std.debug.assert(handle == 7);
+        if (task_release_busy != 0) { task_release_busy -= 1; return a.driver_thread_error_busy; }
+        task_releases += 1; return 0;
+    }
+    fn wake(handle: u64) callconv(.c) i32 { std.debug.assert(handle == 9 and semaphore_destroys == 0); return 0; }
+    fn destroy(handle: u64) callconv(.c) i32 {
+        std.debug.assert(handle == 9 and semaphore_destroys == 0 and task_releases == 1);
+        if (semaphore_destroy_result != 0) return semaphore_destroy_result;
+        semaphore_destroys += 1; return 0;
     }
     fn create(initial: u32, maximum: u32, out: *u64) callconv(.c) i32 {
         std.debug.assert(initial == 0 and maximum == 1); out.* = 9; return 0;
@@ -706,6 +730,40 @@ test "NVIDIA actual driver lifecycle paces hardware under owned work and retains
         }
     }
     target.irq_wake = null;
+    // Pacing joins while the live device and IRQ wake callback retain their
+    // identity. Failed joins/ticket releases must not free its semaphore.
+    for (0..4) |scenario| {
+        WorkFixture.reset();
+        target.* = .{ .self_address = @intFromPtr(target), .epoch = 37 };
+        target.interrupts.self_address = @intFromPtr(&target.interrupts);
+        var work: worker.Work = .{};
+        try work.start(&ctx, target);
+        switch (scenario) {
+            0 => WorkFixture.join_result = -7,
+            1 => WorkFixture.task_release_busy = 100,
+            2 => work.completion = 23,
+            3 => {},
+            else => unreachable,
+        }
+        try t.expectEqual(scenario == 3, work.pause());
+        try t.expect(!target.stopped and target.epoch == 37 and target.failure == null and
+            target.irq_wake != null and work.wake_semaphore == 9 and WorkFixture.semaphore_destroys == 0);
+        try t.expect(!work.finishPause());
+        try t.expectEqual(@as(i32, 0), target.irq_wake.?.signal(target.irq_wake.?.context));
+        WorkFixture.join_result = 0; WorkFixture.task_release_busy = 2;
+        // Complete the host fixture's deliberately retained ticket before
+        // retry; production has no shortcut that clears an incomplete ticket.
+        work.completion = 0;
+        try t.expect(work.pause() and work.task == 0 and WorkFixture.task_releases == 1);
+        try t.expect(!work.finishPause());
+        target.interrupts.closed = true;
+        WorkFixture.semaphore_destroy_result = -7;
+        try t.expect(!work.finishPause() and work.wake_semaphore == 9 and target.irq_wake != null);
+        WorkFixture.semaphore_destroy_result = 0;
+        try t.expect(work.finishPause() and work.self_address == 0 and target.irq_wake == null and
+            !target.stopped and target.epoch == 37 and WorkFixture.semaphore_destroys == 1);
+        try t.expect(work.finishPause());
+    }
 }
 fn count() callconv(.c) u32 {
     state.enumerate_count += 1;
@@ -1078,6 +1136,9 @@ const BootVramFixture = struct {
     var fail_unmap = false;
     var fail_map = false;
     var fail_asset_unmap = false;
+    var terminal_busy = false;
+    var terminal_calls: usize = 0;
+    var terminal_device: ?*@import("gsp_device.zig").Device = null;
     fn info() a.GfxNativeBootInfo {
         return .{ .generation = 7, .physical_address = 0xd0000000, .byte_length = 16384,
             .width = 64, .height = 64, .pitch = 256, .state = if (held) 2 else 1 };
@@ -1089,7 +1150,19 @@ const BootVramFixture = struct {
         return a.gfx_buffer_result_ok;
     }
     fn displayQuery(out: *a.GfxDriverDisplayApi) callconv(.c) i32 {
-        out.* = .{ .boot_info = @intFromPtr(&bootInfo), .boot_hold = @intFromPtr(&bootHold), .boot_finish = @intFromPtr(&bootFinish) };
+        out.* = .{ .boot_info = @intFromPtr(&bootInfo), .boot_hold = @intFromPtr(&bootHold), .boot_finish = @intFromPtr(&bootFinish),
+            .terminal_release = @intFromPtr(&terminalRelease) };
+        return a.gfx_output_ok;
+    }
+    fn terminalRelease(binding: *const a.GfxBackendBinding, generation: u64, out: *a.GfxNativeState) callconv(.c) i32 {
+        const target = terminal_device.?;
+        std.debug.assert(held and target.terminal_retired and target.gpu_reset.quiescence() != null and
+            std.meta.eql(binding.*, target.reset_binding) and generation == target.reset_display.generation);
+        terminal_calls += 1;
+        if (terminal_busy) return a.gfx_output_error_busy;
+        held = false;
+        out.* = .{ .generation = generation, .state = a.display_state_unavailable,
+            .outcome = a.gfx_output_outcome_lost, .retained = 0 };
         return a.gfx_output_ok;
     }
     fn resourcesQuery(out: *a.DriverResourceApi) callconv(.c) i32 { out.* = .{ .now_ns = @intFromPtr(&now) }; return a.driver_resource_ok; }
@@ -2075,4 +2148,66 @@ fn checkBootVramOwner() !void {
     try t.expectError(error.Control, display_decoder.instance(0x11, 0, 0));
     try t.expectError(error.Control, display_decoder.instance(1, 0x80000000, 0));
     try t.expect((try display_decoder.instance(3, 0x7fffffff, 0)) == null);
+    try checkTerminalCapture(&ctx, &snapshot, chip);
+}
+
+fn checkTerminalCapture(ctx: *const r4os.r4dev.DriverContext, snapshot: *const @import("identity.zig").Snapshot,
+    chip: @import("identity.zig").Chip) !void
+{
+    const f = BootVramFixture;
+    f.setupScanout();
+    var capture: @import("boot_vram.zig").Capture = .{};
+    _ = try capture.capture(ctx, snapshot, chip);
+    defer _ = capture.close();
+    const device = try t.allocator.create(@import("gsp_device.zig").Device);
+    defer t.allocator.destroy(device);
+    var run_memory: @import("gsp_run_memory.zig").Lease = .{};
+    var model = @import("gsp_reset_test.zig").Model.init();
+    device.* = .{ .self_address = @intFromPtr(device), .display = &capture, .memory = &run_memory,
+        .terminal_requested = true, .epoch = model.epoch,
+        .reset_binding = .{ .adapter_id = 0x01000900, .device_generation = 37, .reset_generation = 41 },
+        .reset_display = .{ .generation = capture.boot.held_generation + 1, .state = a.display_state_recovering,
+            .outcome = a.gfx_output_outcome_lost, .retained = 1 } };
+    // This case starts with an executed-owner identity; the Device group
+    // separately drives startup/CE/GR/firmware retirement. Reset itself runs
+    // the existing register model, not a fabricated complete-phase flag.
+    capture.firmware_owner = device.self_address;
+    try capture.boot.adoptReset(device.reset_display);
+    f.terminal_device = device; f.terminal_calls = 0; f.terminal_busy = true;
+    defer f.terminal_device = null;
+    try device.reset_config.capture(&model.snapshot(), 0xb76000a1, 0, model.io());
+    try device.gpu_reset.open(&device.reset_config, model.epoch, model.io());
+    const unproven: @import("gsp_reset.zig").Quiescence = .{ .owner = &device.gpu_reset, .epoch = model.epoch };
+    try t.expect(!capture.closeAfterReset(unproven, device.self_address, &device.reset_binding, device.reset_display.generation));
+    try model.drive(&device.gpu_reset);
+    const proof = device.gpu_reset.quiescence() orelse return error.NoProof;
+    try t.expect(!capture.closeAfterReset(proof, device.self_address, &device.reset_binding, device.reset_display.generation));
+    device.terminal_retired = true;
+    var wrong_binding = device.reset_binding; wrong_binding.device_generation += 1;
+    var stale = proof; stale.epoch += 1;
+    try t.expect(!capture.closeAfterReset(stale, device.self_address, &device.reset_binding, device.reset_display.generation));
+    try t.expect(!capture.closeAfterReset(proof, 1, &device.reset_binding, device.reset_display.generation));
+    try t.expect(!capture.closeAfterReset(proof, device.self_address, &wrong_binding, device.reset_display.generation));
+    try t.expect(!capture.closeAfterReset(proof, device.self_address, &device.reset_binding, device.reset_display.generation + 1));
+    inline for (.{ "borrower", "mapping_owner", "context_owner" }) |field| {
+        @field(capture, field) = 1;
+        try t.expect(!capture.closeAfterReset(proof, device.self_address, &device.reset_binding, device.reset_display.generation));
+        @field(capture, field) = 0;
+    }
+    try t.expect(f.terminal_calls == 0 and f.held and capture.firmware_owner == device.self_address);
+    try t.expect(!capture.closeAfterReset(proof, device.self_address, &device.reset_binding, device.reset_display.generation));
+    try t.expect(f.terminal_calls == 1 and f.held and capture.terminal_epoch == 0 and f.leases[0] and f.leases[1]);
+    f.terminal_busy = false; f.fail_unmap = true;
+    try t.expect(!capture.closeAfterReset(proof, device.self_address, &device.reset_binding, device.reset_display.generation));
+    try t.expect(f.terminal_calls == 2 and !f.held and capture.firmware_owner == 0 and capture.terminal_epoch == proof.epoch and
+        capture.terminal_owner == device.self_address and f.buffers[0] == null and f.buffers[1] == null and !device.finishTerminal());
+    // CPU release can fail after the acknowledged terminal transition. The
+    // exact proof/owner/generation must still gate that same retained mapping.
+    try t.expect(!capture.closeAfterReset(stale, device.self_address, &device.reset_binding, device.reset_display.generation));
+    try t.expect(!capture.closeAfterReset(proof, device.self_address, &wrong_binding, device.reset_display.generation));
+    f.fail_unmap = false;
+    try t.expect(capture.closeAfterReset(proof, device.self_address, &device.reset_binding, device.reset_display.generation));
+    try t.expect(f.terminal_calls == 2 and capture.self_address == 0 and std.mem.allEqual(bool, &f.mapped, false) and
+        std.mem.allEqual(bool, &f.leases, false) and model.triggers == 1 and !device.gpu_reset.resumed);
+    try t.expect(device.finishTerminal() and device.self_address == 0);
 }

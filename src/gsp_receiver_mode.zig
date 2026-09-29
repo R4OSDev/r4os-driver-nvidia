@@ -72,7 +72,7 @@ pub fn select(saved: boot.Plan, snapshot: *const outputs.Snapshot, id: u32) !boo
             result.signal.min_frame_idle = pair(v_end, value.v_start - value.height);
             try boot.validate(result.signal, result.head);
             if (result.signal.mst != null) {
-                _ = try @import("gsp_mst_mode.zig").admit(result, snapshot);
+                try @import("gsp_mst_mode.zig").validate(result, snapshot);
                 return result;
             }
             return try @import("gsp_dp_mode.zig").select(try @import("gsp_frl_link.zig").select(result, report), capture);

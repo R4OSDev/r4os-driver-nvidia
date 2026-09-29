@@ -84,9 +84,10 @@ pub fn decode(record: message.Record) Error!Event {
     if (bytes.len > message.max_payload_bytes) return error.Payload;
     switch (kind) {
         .init_done => {
-            // The original rpc_init_done_v17_00 has one unused u32. Neither
-            // its value nor C padding is a version/firmware-identity field.
-            if (bytes.len != 4) return error.Payload;
+            // The original type has one unused u32, but its handler consumes
+            // only the RPC status. GA106/570.144 sends no payload at all.
+            // Neither that optional word nor padding conveys firmware identity.
+            if (bytes.len != 0 and bytes.len != 4) return error.Payload;
             if (record.rpc.result != 0) return error.FirmwareResult;
             return .init_done;
         },
@@ -105,7 +106,11 @@ pub fn decode(record: message.Record) Error!Event {
         .nocat => {
             // data is an inline NV2080CtrlNocatJournalInsertRecord, not the
             // four-byte placeholder's size and not a pointer to guest memory.
-            if (bytes.len != 1208 or word(bytes, 176) > 1024) return error.Payload;
+            // GA106/570.144 also includes the RPC's four-byte placeholder in
+            // its declared extent (1212 bytes). The original handler still
+            // reads the record at &rpc_params->data, offset zero. Its four
+            // trailing bytes are outside the record, not an extra prefix.
+            if ((bytes.len != 1208 and bytes.len != 1212) or word(bytes, 176) > 1024) return error.Payload;
             return .{ .nocat = .{
                 .flags = word(bytes, 0),
                 .timestamp = std.mem.readInt(u64, bytes[8..16], .little),
@@ -138,7 +143,20 @@ pub fn decode(record: message.Record) Error!Event {
 
 pub const State = enum { waiting, dispatching, init_done, handed_off, failed };
 pub const Dispatch = struct { ticket: transport.Ticket, rpc: message.Rpc, event: Event };
-pub const Failure = struct { reason: Error, rpc: ?message.Rpc, ticket: ?transport.Ticket };
+/// A bounded copy of an admitted CPU record. It survives scratch reuse during
+/// recovery and never retains a borrowed payload or a live DMA pointer.
+pub const PayloadSnapshot = struct {
+    length: usize,
+    prefix: [48]u8 = @splat(0),
+
+    fn capture(bytes: []const u8) PayloadSnapshot {
+        var value: PayloadSnapshot = .{ .length = bytes.len };
+        const count = @min(bytes.len, value.prefix.len);
+        @memcpy(value.prefix[0..count], bytes[0..count]);
+        return value;
+    }
+};
+pub const Failure = struct { reason: Error, rpc: ?message.Rpc, ticket: ?transport.Ticket, payload: ?PayloadSnapshot = null };
 /// Sole post-boot queue owner. The RM object allocator can drive this session
 /// and handle notifications (updating lockdown) before the next owner claims
 /// it. Do not copy this token or drive its session after claimed becomes true.
@@ -150,6 +168,7 @@ pub const Boot = struct {
     state: State = .waiting,
     pending: ?Dispatch = null,
     last_rpc: ?message.Rpc = null,
+    last_payload: ?PayloadSnapshot = null,
     failure: ?Failure = null,
     in_lockdown: bool = false,
     handled_events: u64 = 0,
@@ -165,7 +184,12 @@ pub const Boot = struct {
     fn fail(self: *Boot, reason: Error) Error {
         // An idle/link/framing failure has no admitted current RPC. Never
         // attribute it to the previous successfully acknowledged message.
-        self.failure = .{ .reason = reason, .rpc = if (self.session.pending != null) self.last_rpc else null, .ticket = self.session.pending };
+        self.failure = .{
+            .reason = reason,
+            .rpc = if (self.session.pending != null) self.last_rpc else null,
+            .ticket = self.session.pending,
+            .payload = if (self.session.pending != null) self.last_payload else null,
+        };
         self.state = .failed;
         self.session.stop();
         return reason;
@@ -203,6 +227,7 @@ pub const Boot = struct {
             return self.fail(err);
         } orelse return null;
         self.last_rpc = received.record.rpc;
+        self.last_payload = PayloadSnapshot.capture(received.record.payload);
         const event = decode(received.record) catch |err| return self.fail(err);
         // Engaging blocks register access as soon as the notice is admitted.
         // Disengaging only clears this conservative flag after a successful

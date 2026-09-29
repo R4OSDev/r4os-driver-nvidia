@@ -27,7 +27,7 @@ pub fn derive(mode: boot.Plan, object: display.Object, snapshot: *const outputs.
     if (object.epoch == 0 or object.epoch != mode.epoch or object.client == 0 or object.display == 0 or
         object.client != snapshot.topology.client) return error.Stale;
     const stamp = mode.signal.mst orelse return error.Descriptor;
-    _ = try @import("gsp_mst_mode.zig").admit(mode, snapshot);
+    try @import("gsp_mst_mode.zig").validate(mode, snapshot);
     const view = try binding.derive(snapshot, stamp.display_id);
     return .{ .object = object, .mode = mode, .root_resource = view.root.resource.?,
         .root_source = view.root.source.?, .root_dpcd = view.root.dpcd, .root_guid = view.slot.key.root_guid,

@@ -92,6 +92,16 @@ pub fn validateTable(table: *const Table, epoch: u64, root: u32, link: payload.L
 pub fn plan(graph: *const topology.Graph, state: *const State, captured: *const Table,
     link: payload.Link, replacement: Entry) !Budget
 {
+    var result: Budget = undefined;
+    try planInPlace(&result, graph, state, captured, link, replacement);
+    return result;
+}
+
+/// The destination is caller-owned scratch, distinct from live/captured
+/// state. Failed planning leaves it unpublished and must discard it.
+pub noinline fn planInPlace(result: *Budget, graph: *const topology.Graph, state: *const State, captured: *const Table,
+    link: payload.Link, replacement: Entry) !void
+{
     if (!graph.coherent or graph.epoch == 0 or graph.root == 0 or graph.generation == 0 or graph.completion_receipt == 0 or
         graph.edge_count > topology.max_edges or graph.branch_count > topology.max_branches or
         (state.epoch != 0 and (state.epoch != graph.epoch or state.root != graph.root)) or state.revision == std.math.maxInt(u64)) return error.Stale;
@@ -117,7 +127,7 @@ pub fn plan(graph: *const topology.Graph, state: *const State, captured: *const 
         const available = @min(limit, @as(u32, resources.free_pbn) + owned);
         quotas[index] = .{ .total_pbn = limit, .free_pbn = @intCast(available - owned), .owned_pbn = @intCast(owned) };
     }
-    var result: Budget = .{ .link = link, .table = .{} };
+    result.* = .{ .link = link, .table = .{} };
     var wanted: [8]payload.Wanted = undefined;
     const previous = state.table.find(replacement.allocation.display_id);
     if (previous) |old| if (old.allocation.head != replacement.allocation.head or old.window != replacement.window or
@@ -148,7 +158,6 @@ pub fn plan(graph: *const topology.Graph, state: *const State, captured: *const 
     result.table.slots = allocation.slots; result.table.used_pbn = allocation.used_pbn;
     for (result.table.entries[0..result.table.count], allocation.allocations[0..allocation.count]) |*entry, item| entry.allocation = item;
     try validateTable(&result.table, graph.epoch, graph.root, link);
-    return result;
 }
 
 /// Receiver deletion compacts the remaining streams without changing their

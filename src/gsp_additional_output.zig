@@ -89,16 +89,25 @@ pub const Output = struct {
         if (self.phase == .unused) return false;
         if (self.phase == .failed) return self.modes.failedJobs(self, self.failure orelse error.DeviceLost);
         if (self.phase == .active) {
-            const changed = try self.hotplug.step(self);
+            const changed = try @call(.never_inline, @TypeOf(self.hotplug).step, .{ &self.hotplug, self });
             if (changed or self.hotplug.phase != .online or self.hotplug.refreshing) return changed;
-            if (self.color.step(self)) return true;
-            if (try self.modes.step(self)) return true;
+            if (@call(.never_inline, @TypeOf(self.color).step, .{ &self.color, self })) return true;
+            if (try @call(.never_inline, @TypeOf(self.modes).step, .{ &self.modes, self })) return true;
             if (self.modes.phase == .idle or self.modes.phase == .decision or self.modes.phase == .unavailable)
                 return run.prepareOutputFramePool(self.mode.?.window);
             return false;
         }
+        return self.advanceStartup(product);
+    }
+    noinline fn advanceStartup(self: *Output, product: anytype) !bool {
         if (product.last_clock >= self.deadline) return error.Deadline;
         switch (self.phase) {
+            inline else => |phase| return self.advanceStartupPhase(product, phase),
+        }
+    }
+    noinline fn advanceStartupPhase(self: *Output, product: anytype, comptime phase: Phase) !bool {
+        const run = product.running.?;
+        switch (phase) {
             .assign => {
                 if (!run.requirePrivatePresentation()) return false;
                 const snapshot = run.nativeOutputs() orelse return false;

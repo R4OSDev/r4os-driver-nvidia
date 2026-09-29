@@ -5,7 +5,7 @@ const core = @import("gsp_core.zig");
 const identity = @import("identity.zig");
 const boot0: u32 = 0xb76000a1;
 const word: u32 = 0x250410de;
-const Model = struct {
+pub const Model = struct {
     clock: u64 = 1000000,
     epoch: u64 = 7,
     config: [1024]u32 = @splat(0),
@@ -24,7 +24,7 @@ const Model = struct {
     posted_trigger: bool = false,
     fail_resume: bool = false,
     writes_to_sibling: u32 = 0,
-    fn init() Model {
+    pub fn init() Model {
         var self: Model = .{};
         self.config[0] = word;
         self.config[1] = 7 | (0xab00 << 16); // status must not be echoed
@@ -37,7 +37,7 @@ const Model = struct {
         self.config[0xb0 / 4] = 0x11; // disabled MSI-X capability
         return self;
     }
-    fn snapshot(self: *const Model) identity.Snapshot {
+    pub fn snapshot(self: *const Model) identity.Snapshot {
         var value: identity.Snapshot = .{
             .pci = .{ .bus_kind = 2, .bus = 1, .vendor_id = 0x10de, .device_id = 0x2504, .class_code = 3 },
             .command = 7, .caps = .{ .pcie = 0x78, .power_state = 0, .msi = 0x60, .msix = 0xb0 },
@@ -115,11 +115,11 @@ const Model = struct {
         self.config[offset / 4] = value;
         self.mirror_writes += 1;
     }
-    fn io(self: *Model) reset.Io {
+    pub fn io(self: *Model) reset.Io {
         return .{ .context = self, .generation = generation, .now_ns = now, .admit = admit,
             .pci_read = pciRead, .pci_write = pciWrite, .read32 = read, .write32 = write };
     }
-    fn drive(self: *Model, operation: *reset.Reset) !void {
+    pub fn drive(self: *Model, operation: *reset.Reset) !void {
         for (0..1200) |_| {
             if (try operation.step()) return;
             self.clock += if (operation.phase == .quiet) reset.quiet_ns / 4 else 5 * std.time.ns_per_ms;

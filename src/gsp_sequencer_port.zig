@@ -132,6 +132,7 @@ const display_rpc = @import("gsp_display_rpc.zig");
 pub const command_queue_head: u32 = 0x110c00;
 pub const Access = enum { read, write };
 pub const Phase = enum { boot, runtime, recovery };
+pub const GenerationFailure = enum { state, mapping, runtime, memory, owner };
 const Scope = union(enum) { boot: void, request: u64 };
 pub const RecoveryOwner = struct {
     // Independent of the failed queue epoch: the actual attached device and
@@ -182,6 +183,7 @@ pub const Owner = struct {
     // Only the bound queue sender may ring queue0. This admission is separate
     // from CPU-sequencer register access and runs before TX and before MMIO.
     admit_command: ?*const fn (*anyopaque, *const Port, u64) anyerror!void = null,
+    admit_unload: ?*const fn (*anyopaque, *const Port, *const @import("gsp_unload.zig").Owner, u64) anyerror!void = null,
     admit_copy: ?*const fn (*anyopaque, *const Port, *@import("gsp_fifo.zig").Owner, @import("gsp_push_ring.zig").Ticket, u64) anyerror!void = null,
     admit_graphics: ?*const fn (*anyopaque, *const Port, *@import("gsp_fifo.zig").Owner, @import("gsp_push_ring.zig").Ticket, u64) anyerror!void = null,
     admit_batch: ?*const fn (*anyopaque, *const Port, *@import("gsp_fifo.zig").Owner, @import("gsp_push_ring.zig").Ticket, u64) anyerror!void = null,
@@ -192,6 +194,7 @@ pub const Owner = struct {
 };
 pub const Run = struct { epoch: u64, deadline_ns: u64, resume_args: ?core.Resume = null };
 pub const Port = struct {
+    first_generation_failure: ?GenerationFailure = null,
     memory: ?r4os.driver_memory.Context = null,
     clock: ?r4os.r4dev.DriverResourceContext = null,
     owner: ?Owner = null,
@@ -484,12 +487,20 @@ pub const Port = struct {
     }
     fn generation(p: *anyopaque) u64 {
         const self = cast(p);
-        if (self.phase == .recovery or self.self_address != @intFromPtr(self) or !self.ready or self.failure != null or !self.mappingValid() or !self.runtimeValid()) return 0;
-        const owner = self.owner orelse return 0;
+        if (self.phase == .recovery or self.self_address != @intFromPtr(self) or !self.ready or self.failure != null) return self.generationFailed(.state);
+        if (!self.mappingValid()) return self.generationFailed(.mapping);
+        if (!self.runtimeValid()) return self.generationFailed(.runtime);
+        const owner = self.owner orelse return self.generationFailed(.owner);
         if (owner.queue_memory) |memory| {
-            if (memory.generation() != self.run.epoch) return 0;
+            if (memory.generation() != self.run.epoch) return self.generationFailed(.memory);
         }
-        return owner.generation(owner.context);
+        const current = owner.generation(owner.context);
+        if (current != self.run.epoch) _ = self.generationFailed(.owner);
+        return current;
+    }
+    fn generationFailed(self: *Port, reason: GenerationFailure) u64 {
+        if (self.first_generation_failure == null) self.first_generation_failure = reason;
+        return 0;
     }
     fn nowNs(p: *anyopaque) u64 {
         const self = cast(p);
@@ -503,11 +514,12 @@ pub const Port = struct {
         if (self.phase == .recovery) return error.Phase;
         if (scope == .boot and self.phase != .boot) return error.Phase;
         if (self.self_address != @intFromPtr(self) or self.failure != null or self.owner == null or self.clock == null) return error.State;
-        if (!self.mappingValid() or !self.runtimeValid()) return error.Stale;
+        if (!self.mappingValid()) { _ = self.generationFailed(.mapping); return error.Stale; }
+        if (!self.runtimeValid()) { _ = self.generationFailed(.runtime); return error.Stale; }
         const owner = self.owner.?;
-        if (owner.generation(owner.context) != self.run.epoch) return error.Stale;
+        if (owner.generation(owner.context) != self.run.epoch) { _ = self.generationFailed(.owner); return error.Stale; }
         if (owner.queue_memory) |memory| {
-            if (memory.generation() != self.run.epoch) return error.Stale;
+            if (memory.generation() != self.run.epoch) { _ = self.generationFailed(.memory); return error.Stale; }
         }
         const now = self.clock.?.nowNs();
         if (now == std.math.maxInt(u64) or now < self.last_clock) return error.Clock;
@@ -613,6 +625,17 @@ pub const Port = struct {
         self.pointer(offset).* = value;
         fence();
         if (try self.readFor(scope, 0) != self.boot0) return error.IdentityChanged;
+    }
+    /// Read only the fixed GSP mailbox, after the actual RM unload owner has
+    /// ACKed RPC47 and its graph is closed. No arbitrary runtime register API.
+    pub fn readProcessorSuspend(self: *Port, unload: *const @import("gsp_unload.zig").Owner, deadline: u64) !u32 {
+        try self.guardFor(.{ .request = deadline });
+        const channel = unload.channel orelse return error.Binding;
+        if (self.phase != .runtime or self.runtime_sequence != null or channel.session != self.runtime_session or
+            !unload.waitingForSuspend(channel, deadline)) return error.Binding;
+        const owner = self.owner orelse return error.State;
+        try (owner.admit_unload orelse return error.Unsupported)(owner.context, self, unload, deadline);
+        return self.readFor(.{ .request = deadline }, core.reg.mailbox0);
     }
     /// Separate engine producer gates. Sequencers retain their existing register
     /// policy and cannot write this doorbell, USERD or a caller-selected token.

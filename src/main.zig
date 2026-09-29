@@ -35,6 +35,7 @@ const a = r4os.abi;
 var driver_api: ?*const a.DriverApi = null;
 var window: a.GfxMmioWindow = .{};
 var mapping_cleanup_needed = false;
+var identity_memory: ?r4os.driver_memory.Context = null;
 var firmware_cpu: firmware_storage.Storage = .{};
 var gsp_image: gsp_dma.Storage = .{};
 var boot_inputs: boot_resources.Inputs = .{};
@@ -56,10 +57,14 @@ var init_excluded: [gsp_init.max_excluded]gsp_init.Span = undefined;
 var checking_boot = false;
 var starting_gsp = false;
 var starting_native = false;
+var starting_headless = false;
 var native_frame_count: u8 = 2;
 var boot_checked = false;
 var checking_runtime = false;
 var board_rom: vbios_probe.Capture = .{};
+// Driver init is serialized. Retain parsed tables beside their PROM owner
+// instead of carrying them through the complete firmware/bootstrap stack.
+var board_tables: vbios.Result = undefined;
 var security_fuses: fwsec_probe.Capture = .{};
 var fwsec_cpu: fwsec_storage.Storage = .{};
 var fwsec_frts: fwsec_storage.Storage = .{};
@@ -96,7 +101,8 @@ pub export fn nvidia_init(api: *const a.DriverApi) callconv(.c) i32 {
         return 0;
     }
     starting_native = automatic or std.ascii.eqlIgnoreCase(mode, "native");
-    if (boot_policy == null and (starting_native or std.ascii.eqlIgnoreCase(mode, "gsp-start") or std.ascii.eqlIgnoreCase(mode, "boot-check"))) {
+    starting_headless = std.ascii.eqlIgnoreCase(mode, "headless");
+    if (boot_policy == null and (starting_native or starting_headless or std.ascii.eqlIgnoreCase(mode, "gsp-start") or std.ascii.eqlIgnoreCase(mode, "boot-check"))) {
         ctx.logError("NVIDIA bind: boot-policy-unavailable native-writes=disabled fallback=preserved");
         return -11;
     }
@@ -107,7 +113,7 @@ pub export fn nvidia_init(api: *const a.DriverApi) callconv(.c) i32 {
             return -2;
         };
     }
-    starting_gsp = starting_native or std.ascii.eqlIgnoreCase(mode, "gsp-start");
+    starting_gsp = starting_native or starting_headless or std.ascii.eqlIgnoreCase(mode, "gsp-start");
     checking_boot = starting_gsp or std.ascii.eqlIgnoreCase(mode, "boot-check");
     boot_checked = false;
     checking_runtime = std.ascii.eqlIgnoreCase(mode, "runtime-check");
@@ -228,6 +234,7 @@ pub export fn nvidia_init(api: *const a.DriverApi) callconv(.c) i32 {
         return -11;
     }
     if (starting_gsp) {
+        if (starting_headless) ctx.logInfo("NVIDIA headless: receiver-discovery=off native-output=off graphics=requested");
         ctx.logInfo(if (starting_native) "NVIDIA bind: gsp-start=scheduled firmware=570.144 display=held native-output=requested" else
             "NVIDIA bind: gsp-start=scheduled firmware=570.144 display=held native-output=unavailable");
     } else if (checking_boot) {
@@ -239,12 +246,14 @@ pub export fn nvidia_init(api: *const a.DriverApi) callconv(.c) i32 {
 pub export fn nvidia_shutdown() callconv(.c) i32 {
     const api = driver_api orelse return 0;
     const ctx = r4os.r4dev.DriverContext.init(api);
+    const native_effects = boot_vram.firmware_owner != 0 or native_device.terminal_requested;
     if (!wait_probe.shutdown(&ctx)) return -1;
     if (!native_probe.shutdown(&ctx)) return -1;
     if (!rm_semaphore_probe.shutdown(&ctx)) return -1;
     if (!semaphore_probe.shutdown(&ctx)) return -1;
     if (!thread_probe.shutdown(&ctx)) return -1;
     if (!runtime_probe.shutdown(&ctx)) return -1;
+    if (!shutdownNative(&ctx)) return -1;
     if (closeBootPreparation()) |phase| {
         logBootCleanup(phase);
         return -1;
@@ -255,7 +264,9 @@ pub export fn nvidia_shutdown() callconv(.c) i32 {
     if (!fwsec_cpu.close()) return -1;
     if (!board_rom.close()) return -1;
     if (!releaseWindow(&ctx)) return -1;
-    if (checking_runtime) {
+    if (native_effects) {
+        ctx.logInfo("NVIDIA unbind: OK resources=0 native-DMA=stopped terminal-display=released");
+    } else if (checking_runtime) {
         ctx.logInfo("NVIDIA unbind: driver-state=closed cpu-owner-cleanup=pending native-writes=disabled fallback=preserved");
     } else if (checking_boot) {
         ctx.logInfo("NVIDIA unbind: OK resources=0 firmware-execution=disabled fallback=preserved");
@@ -330,6 +341,7 @@ fn readIdentity(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.
     // display-engine compatibility follows from this bootstrap mapping.
     const request = a.GfxMmioRequest{ .resource_base = snapshot.bars[0].base, .resource_bytes = 4096, .byte_length = 4096, .cache_policy = a.gfx_buffer_cache_uncached };
     // Failed maps can retain private partial mappings without a public handle.
+    identity_memory = memory;
     mapping_cleanup_needed = true;
     if (memory.mmioMap(&request, &window) != a.gfx_buffer_result_ok) {
         ctx.logInfo("NVIDIA chip=unmeasured reason=identity-map-unavailable");
@@ -354,6 +366,13 @@ fn readIdentity(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.
     return releaseWindow(ctx);
 }
 
+noinline fn parseVbiosTables(bytes: []const u8, device_id: u16) !void {
+    board_tables = try vbios.parse(bytes, device_id);
+}
+noinline fn diagnoseVbios(bytes: []const u8) void {
+    var diagnostic: VbiosDiagnostic = .{};
+    @import("vbios_diagnostic.zig").inspect(bytes, &diagnostic);
+}
 fn readVbios(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, chip: identity.Chip) bool {
     const bytes = board_rom.read(ctx, snapshot, chip) catch |err| {
         log("NVIDIA vbios: rejected phase=read reason={s} source=PROM native-writes=disabled fallback=preserved", .{@errorName(err)});
@@ -369,13 +388,13 @@ fn readVbios(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Sna
         _ = board_rom.close();
         return false;
     };
-    const result = vbios.parse(bytes[start.offset..], snapshot.pci.device_id) catch |err| {
+    parseVbiosTables(bytes[start.offset..], snapshot.pci.device_id) catch |err| {
         log("NVIDIA vbios: rejected phase=tables reason={s} offset={x} ifr={d} fallback=preserved", .{ @errorName(err), start.offset, start.ifr_version });
-        var diagnostic: VbiosDiagnostic = .{};
-        @import("vbios_diagnostic.zig").inspect(bytes[start.offset..], &diagnostic);
+        diagnoseVbios(bytes[start.offset..]);
         _ = board_rom.close();
         return false;
     };
+    const result = &board_tables;
     std.crypto.hash.sha2.Sha256.hash(bytes[start.offset..][0..result.rom_bytes], &digest, .{});
     const rom_hex = std.fmt.bytesToHex(digest, .lower);
     log("NVIDIA vbios: verified source=PROM offset={x} ifr={d} bytes={d} images={d} sha256={s} hardware-bound=yes gpu-authentication=unverified", .{ start.offset, start.ifr_version, result.rom_bytes, result.image_count, rom_hex });
@@ -430,7 +449,7 @@ fn readVbios(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Sna
             });
         }
     }
-    if (!inspectFwsec(ctx, snapshot, chip, bytes[start.offset..][0..result.rom_bytes], &result)) return false;
+    if (!inspectFwsec(ctx, snapshot, chip, bytes[start.offset..][0..result.rom_bytes], result)) return false;
     if (!board_rom.close()) return false;
     ctx.logInfo("NVIDIA vbios: cleanup=OK resources=0 PROM-writes=disabled fallback=preserved");
     return true;
@@ -786,12 +805,13 @@ fn checkBoot(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Sna
             log("NVIDIA gsp-start: rejected phase=owner reason={s} firmware-execution=disabled", .{@errorName(err)});
             return false;
         };
+        native_device.running.discover_receivers = !starting_headless;
         if (starting_native) native_device.native_output.request(ctx, &native_device.running, &boot_vram) catch |err| {
             log("NVIDIA native-output: rejected phase=owner reason={s} firmware-execution=disabled", .{@errorName(err)});
             return false;
         };
         if (starting_native) native_device.native_output.frame_count = native_frame_count;
-        if (starting_native) native_device.native_graphics.request() catch |err| {
+        if (starting_native or starting_headless) native_device.requestGraphics() catch |err| {
             log("NVIDIA graphics-engine: rejected phase=owner reason={s}", .{@errorName(err)});
             return false;
         };
@@ -898,12 +918,34 @@ fn stageBootInit(ctx: *const r4os.r4dev.DriverContext, chip_id: u16) bool {
 }
 
 fn closeBootInit() bool {
-    if (!native_work.stop()) return false;
-    if (!native_device.closeBeforeSubmission()) return false;
+    if (native_device.terminal_retired) {
+        if (!native_work.finishPause()) return false;
+    } else {
+        if (!native_work.stop()) return false;
+        if (!native_device.closeBeforeSubmission()) return false;
+    }
     if (!firmware_logs.close()) return false;
     if (!run_memory.releaseBeforeSubmission()) return false;
     if (!init_storage.close()) return false;
     return booters.close();
+}
+
+fn shutdownNative(ctx: *const r4os.r4dev.DriverContext) bool {
+    if (native_device.self_address == 0 or (!native_device.port.effects_possible and boot_vram.firmware_owner == 0 and
+        !native_device.terminal_requested)) return true;
+    if (!native_work.pause()) return false;
+    native_device.requestShutdown() catch |err| {
+        log("NVIDIA shutdown: retained reason={s}", .{@errorName(err)});
+        return false;
+    };
+    const start = ctx.tickCount();
+    const bound = 120 * @as(u64, @max(ctx.timerFrequency(), 1));
+    while (!native_device.terminal_retired) {
+        if (native_device.step() == .stopped) return false;
+        if (ctx.tickCount() -% start >= bound) return false;
+        ctx.waitTicks(1);
+    }
+    return native_work.finishPause();
 }
 
 /// Shared by successful boot-check completion and shutdown. The display
@@ -914,8 +956,8 @@ pub fn closeBootMappings(context: *@import("boot_context.zig").Capture, mapping:
 }
 
 /// One dependency order for successful preparation, init failure and
-/// shutdown. Every release is restricted to the unsubmitted preparation;
-/// uncertainty retains the exact owners and prevents kernel resource reuse.
+/// shutdown. Submitted owners first require the live device-reset proof and
+/// exact terminal display receipt; uncertainty preserves their retry state.
 fn closeBootPreparation() ?[]const u8 {
     if (!closeBootInit()) return "init";
     if (!security_fuses.close()) return "fuses";
@@ -923,7 +965,13 @@ fn closeBootPreparation() ?[]const u8 {
     if (boot_vram_lease.self_address != 0 and !fwsec_cpu.close()) return "sb";
     if (!boot_vram_lease.releaseBeforeSubmission()) return "vram-reservation";
     if (!boot_storage.close()) return "boot-storage";
-    if (!closeBootSnapshots(&boot_context, &boot_mapping, &boot_vram)) return "snapshots";
+    if (native_device.terminal_retired) {
+        const proof = native_device.gpu_reset.quiescence() orelse return "reset-proof";
+        if (!closeBootMappings(&boot_context, &boot_mapping)) return "snapshots";
+        if (!boot_vram.closeAfterReset(proof, native_device.self_address, &native_device.reset_binding,
+            native_device.reset_display.generation)) return "terminal-display";
+        if (!native_device.finishTerminal()) return "terminal-owner";
+    } else if (!closeBootSnapshots(&boot_context, &boot_mapping, &boot_vram)) return "snapshots";
     boot_inputs.close();
     return null;
 }
@@ -961,8 +1009,9 @@ const VbiosDiagnostic = struct {
 };
 
 fn releaseWindow(ctx: *const r4os.r4dev.DriverContext) bool {
+    _ = ctx;
     if (window.handle.id == 0 and !mapping_cleanup_needed) return true;
-    const memory = ctx.memory() orelse return false;
+    const memory = identity_memory orelse return false;
     // No DMA or callbacks were admitted. All reads from this CPU map ended.
     if (window.handle.id != 0) {
         if (memory.mmioUnmap(&window.handle, 1) != a.gfx_buffer_result_ok) return false;
@@ -970,6 +1019,7 @@ fn releaseWindow(ctx: *const r4os.r4dev.DriverContext) bool {
     }
     if (memory.collect() != a.gfx_buffer_result_ok) return false;
     mapping_cleanup_needed = false;
+    identity_memory = null;
     return true;
 }
 const ConfigReader = struct {

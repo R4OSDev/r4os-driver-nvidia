@@ -74,32 +74,7 @@ pub const Owner = struct {
         if (self.phase == .online and !affected and idle_modes and
             (self.refreshing or (notified and self.route != null and self.observation != null)))
         {
-            self.sequence = run.receiver_events.sequence;
-            self.refreshing = true;
-            if (run.outputs.invalidated or run.outputs.snapshot() == null or run.outputs.data.generation <= self.generation) return false;
-            const snapshot = run.outputs.snapshot().?;
-            const seen = try receiver.observe(snapshot, product.mode.?.signal.display_id);
-            const physical = runtime.output_route.identify(product.mode.?, snapshot) catch null;
-            const unchanged = seen.state == .connected and self.observation.?.state == .connected and
-                seen.fingerprint != null and std.meta.eql(seen.fingerprint, self.observation.?.fingerprint) and
-                physical != null and std.meta.eql(physical.?, self.route.?);
-            if (unchanged) {
-                if (product.audio.busy() or product.cursor.busy()) return false;
-                const updated: ?runtime.Owner.RefreshedDisplay = run.refreshDisplayMetadata(product.mode.?, product.link.?) catch |err| blk: {
-                    if (err == error.Busy) return false;
-                    break :blk null;
-                };
-                if (updated) |value| {
-                    product.mode = value.mode; product.link = value.link; product.confirmed_image = value.image;
-                    self.generation = snapshot.generation; self.observation = seen; self.route = physical;
-                    self.refreshing = false;
-                    product.ctx.?.logInfo("NVIDIA hotplug: unrelated receiver refresh confirmed own route, timing and image unchanged");
-                    return true;
-                }
-            }
-            self.refreshing = false;
-            // Changed or incomplete evidence follows ordinary physical
-            // retirement. A notification's mask never proves continuity.
+            if (try self.refreshUnchanged(product)) |progressed| return progressed;
         }
         const changed = self.sequence != run.receiver_events.sequence or
             (self.phase == .online and (run.outputs.invalidated or run.output_generation != self.generation)) or
@@ -125,10 +100,49 @@ pub const Owner = struct {
             return err;
         };
     }
-    fn advance(self: *Owner, product: anytype) !bool {
+    // A refresh carries a complete confirmed image. Keep that scratch off
+    // the ordinary hotplug dispatch and mode-drain call chain.
+    noinline fn refreshUnchanged(self: *Owner, product: anytype) !?bool {
+        const run = product.running.?;
+        self.sequence = run.receiver_events.sequence;
+        self.refreshing = true;
+        if (run.outputs.invalidated or run.outputs.snapshot() == null or run.outputs.data.generation <= self.generation) return false;
+        const snapshot = run.outputs.snapshot().?;
+        const seen = try receiver.observe(snapshot, product.mode.?.signal.display_id);
+        const physical = runtime.output_route.identify(product.mode.?, snapshot) catch null;
+        const unchanged = seen.state == .connected and self.observation.?.state == .connected and
+            seen.fingerprint != null and std.meta.eql(seen.fingerprint, self.observation.?.fingerprint) and
+            physical != null and std.meta.eql(physical.?, self.route.?);
+        if (unchanged) {
+            if (product.audio.busy() or product.cursor.busy()) return false;
+            var updated: runtime.Owner.RefreshedDisplay = undefined;
+            run.refreshDisplayMetadataInPlace(&updated, product.mode.?, product.link.?) catch |err| {
+                if (err == error.Busy) return false;
+                self.refreshing = false;
+                return null;
+            };
+            product.mode = updated.mode; product.link = updated.link; product.confirmed_image = updated.image;
+            self.generation = snapshot.generation; self.observation = seen; self.route = physical;
+            self.refreshing = false;
+            product.ctx.?.logInfo("NVIDIA hotplug: unrelated receiver refresh confirmed own route, timing and image unchanged");
+            return true;
+        }
+        self.refreshing = false;
+        // Changed or incomplete evidence follows ordinary physical
+        // retirement. A notification's mask never proves continuity.
+        return null;
+    }
+    noinline fn advance(self: *Owner, product: anytype) !bool {
+        switch (self.phase) {
+            inline else => |phase| return self.advancePhase(product, phase),
+        }
+    }
+    // Do not retain reconnect/publication snapshots while another phase
+    // drains the independent mode or cursor owners.
+    noinline fn advancePhase(self: *Owner, product: anytype, comptime phase: Phase) !bool {
         const run = product.running.?;
         const window = product.mode.?.window;
-        switch (self.phase) {
+        switch (phase) {
             .online => return false,
             .power_quiesce => {
                 if (run.anyAdaptiveRefresh() or run.refresh_quiescing) return false;
@@ -152,7 +166,7 @@ pub const Owner = struct {
                 if (!run.cursorWorkAvailable() or run.native_active != null or run.buffer_active != null or
                     run.display_channel_active != null or run.display_engine_active) return false;
                 if (product.primaryOutput()) run.cursor_reserving = false;
-                if (run.display_images[window]) |image| {
+                if (run.display_images[window]) |*image| {
                     self.previous = image.boot_mode orelse return error.State;
                     self.phase = if (self.previous.?.hasAudio()) .mute else .detach;
                 } else if (run.display_retired[window] != null) self.phase = .settle else return error.State;
@@ -498,7 +512,7 @@ pub const Owner = struct {
         product.ctx.?.logInfo("NVIDIA screen: wake=unavailable image=retained system=running retry=new-request");
         return true;
     }
-    fn pollPower(self: *Owner, product: anytype) !void {
+    noinline fn pollPower(self: *Owner, product: anytype) !void {
         const outputs = product.outputs orelse return;
         if (!outputs.supportsPower() or product.output.connection_generation == 0 or product.mode == null) return;
         const run = product.running.?;
@@ -508,10 +522,10 @@ pub const Owner = struct {
             self.power_intent = .{ .identity = product.output };
             self.power_attempted = 0;
         }
-        const active = run.display_images[window];
-        const retired = run.display_retired[window];
-        const image = active orelse (if (retired) |value| value.image else return);
-        const link = image.link orelse return;
+        const active = if (run.display_images[window]) |*value| value else null;
+        const retired = if (run.display_retired[window]) |*value| value else null;
+        const image = active orelse (if (retired) |value| &value.image else return);
+        const link = if (image.link) |*value| value else return;
         if (!link.complete()) return;
         const phase: u32 = if (self.phase == .power_failed) a.gfx_power_phase_unavailable else
             if (self.phase == .power_asleep) a.gfx_power_phase_off else

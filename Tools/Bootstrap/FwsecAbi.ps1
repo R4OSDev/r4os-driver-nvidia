@@ -64,6 +64,7 @@ function Confirm-FwsecAbi([string]$Compiler,[string]$Source,[string]$Run,[string
     $result=Invoke-RmNative -Executable $exe -Arguments @() -WorkingDirectory $Run -LogPath (Join-Path $Stage 'fwsec-abi.json') -TimeoutSeconds 20
     if($result -ne 0){throw 'Zig firmware command, memory or message bytes differ from original NVIDIA C structures'}
     $abi=Get-Content -Raw (Join-Path $Stage 'fwsec-abi.json')|ConvertFrom-Json
+    if(!$abi.gsp_unload_original_comparison -or $abi.gsp_unload_payload_bytes -ne 8){throw 'GSP orderly unload ABI comparison incomplete'}
     if(!$abi.gsp_boot_event_original_comparison -or $abi.gsp_boot_event_fixtures -ne 6){throw 'GSP boot event comparison incomplete'}
     if(!$abi.gsp_sequencer_original_comparison -or $abi.gsp_sequencer_opcodes -ne 9){throw 'GSP sequencer comparison incomplete'}
     if(!$abi.gsp_core_register_original_comparison -or $abi.gsp_core_register_values -ne 39){throw 'GA106 GSP/SEC2 core register comparison incomplete'}

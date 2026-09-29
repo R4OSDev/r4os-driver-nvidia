@@ -96,6 +96,24 @@ pub const Snapshot = struct {
         self.native_generation = state.generation;
     }
 
+    /// Release only the kernel's display hold after its exact reset receipt.
+    /// The caller separately proves DMA stop and keeps every CPU lease until
+    /// this acknowledgement. close() then retires our own RAM references.
+    pub fn releaseTerminal(self: *Snapshot, binding: *const a.GfxBackendBinding, reset_generation: u64) Error!void {
+        if (!self.native_adopted or !self.recovery_required or self.console_active or self.held_generation == 0 or
+            reset_generation == 0 or self.native_generation != reset_generation) return error.Hold;
+        const service = self.display orelse return error.Unsupported;
+        var state: a.GfxNativeState = .{};
+        self.last_status = service.releaseTerminal(binding, reset_generation, &state);
+        if (self.last_status != a.gfx_output_ok or state.version != 1 or state.size < @sizeOf(a.GfxNativeState) or
+            state.reserved0 != 0 or state.retained != 0 or state.state != a.display_state_unavailable or
+            state.generation != reset_generation or state.outcome != a.gfx_output_outcome_lost) return error.Hold;
+        self.native_adopted = false;
+        self.native_generation = 0;
+        self.held_generation = 0;
+        self.recovery_required = false;
+    }
+
     // The actual descriptor remains in this resident owner on every failed
     // cleanup. Shutdown retries this same order through the cached tables.
     pub fn close(self: *Snapshot) bool {

@@ -6,6 +6,19 @@ const binding = @import("gsp_mst_binding.zig");
 const budget = @import("gsp_mst_budget.zig");
 const color = @import("gsp_color_signal.zig");
 pub fn admit(plan: boot.Plan, snapshot: *const @import("gsp_outputs.zig").Snapshot) !budget.Budget {
+    var result: budget.Budget = undefined;
+    try admitInPlace(&result, plan, snapshot);
+    return result;
+}
+
+/// Revalidation needs the same full-root admission, but must not force each
+/// enclosing timing/link checker to reserve another payload table.
+pub noinline fn validate(plan: boot.Plan, snapshot: *const @import("gsp_outputs.zig").Snapshot) !void {
+    var scratch: budget.Budget = undefined;
+    try admitInPlace(&scratch, plan, snapshot);
+}
+
+pub noinline fn admitInPlace(result: *budget.Budget, plan: boot.Plan, snapshot: *const @import("gsp_outputs.zig").Snapshot) !void {
     const stamp = plan.signal.mst orelse return error.Descriptor;
     try boot.validate(plan.signal, plan.head);
     try color.validate(plan);
@@ -31,10 +44,9 @@ pub fn admit(plan: boot.Plan, snapshot: *const @import("gsp_outputs.zig").Snapsh
             .total = plan.signal.total & 0xffff, .bpc = plan.signal.bpc },
         .allocation = .{ .display_id = stamp.display_id, .head = @intCast(plan.head) } };
     for (view.sink.path[0..view.sink.path_count], 0..) |edge, index| entry.path[index] = try budget.Edge.capture(&view.root.graph, edge);
-    const result = try budget.plan(&view.root.graph, &view.root.live, &view.root.captured_table, link, entry);
+    try budget.planInPlace(result, &view.root.graph, &view.root.live, &view.root.captured_table, link, entry);
     // Shared color admission still enforces the app's signal contract. MST
     // HDR/VSC/DSC are explicitly unsupported by this RGB pipeline.
     _ = try color.admit(plan, &view.sink.report, .{ .displayport = .{
         .payload_bits_per_second = try color.links.dp8b10bPayload(link.rate, link.lanes), .vsc = false, .hdr_sdp = false } });
-    return result;
 }

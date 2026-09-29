@@ -18,7 +18,11 @@ extern fn r4nv_gsp_message_abi_check([*]const u8, usize, c_uint) c_int;
 extern fn r4nv_gsp_ring_abi_check([*]const u32, usize, c_uint) c_int;
 extern fn r4nv_gsp_event_abi_fixture(c_uint, [*]u8, usize) usize;
 extern fn r4nv_gsp_sequence_abi_fixture([*]u8, usize) usize;
+extern fn r4nv_gsp_unload_abi_check(c_uint, [*]const u8, usize, c_uint) c_int;
 pub fn main() !void {
+    const unload = @import("gsp_unload.zig");
+    const request: unload.Owner = .{};
+    if (r4nv_gsp_unload_abi_check(unload.function, &request.request, request.request.len, core.reg.mailbox0) != 0) return error.OriginalUnloadMismatch;
     const r = core.reg;
     const b = core.bits;
     const core_values = [_]u32{

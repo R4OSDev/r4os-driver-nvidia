@@ -86,7 +86,7 @@ pub const Owner = struct {
         if (self.phase == .detached or self.phase == .closed or self.phase == .unavailable) return false;
         if (self.self_address != @intFromPtr(self) or self.phase == .failed) return error.State;
         if (self.phase == .ready and !self.closing) return false;
-        const now = (run.ctx.?.resources() orelse return error.Api).nowNs();
+        const now = (run.clock() orelse return error.Api).nowNs();
         if (now == 0 or now == std.math.maxInt(u64) or now < self.last_clock) return error.Clock;
         self.last_clock = now;
         if (self.phase == .ready) {

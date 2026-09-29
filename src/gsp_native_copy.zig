@@ -36,7 +36,7 @@ pub const Owner = struct {
             if (self.epoch != run.epoch) return error.Stale;
             return false;
         }
-        const now = (run.ctx.?.resources() orelse return error.Api).nowNs();
+        const now = (run.clock() orelse return error.Api).nowNs();
         if (now == 0 or now == std.math.maxInt(u64) or now < self.last_clock) return error.Clock;
         self.last_clock = now;
         if (self.phase == .waiting) {

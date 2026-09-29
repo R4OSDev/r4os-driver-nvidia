@@ -29,8 +29,15 @@ const memory = @import("gsp_run_memory.zig");
 const logs = @import("gsp_logs.zig");
 const firmware = @import("falcon_run.zig");
 const booter = @import("booter_result.zig");
+const security = @import("fwsec_result.zig");
 pub const Phase = enum { sb, unload, complete };
-pub const Report = struct { sb: firmware.Result, unload: firmware.Result };
+pub const SbRejection = struct {
+    reason: security.Error,
+    observation: security.Observer,
+    halt: @import("falcon_hs.zig").Result,
+};
+pub const SbResult = union(enum) { complete: firmware.Result, rejected: SbRejection };
+pub const Report = struct { sb: SbResult, unload: firmware.Result };
 pub const Recovery = struct {
     self_address: usize = 0,
     device: ?*native.Port = null,
@@ -41,7 +48,7 @@ pub const Recovery = struct {
     phase: Phase = .sb,
     options: [2]firmware.Options = undefined,
     operation: ?firmware.Operation = null,
-    sb_result: ?firmware.Result = null,
+    sb_result: ?SbResult = null,
     report: ?Report = null,
     failure: ?anyerror = null,
 
@@ -115,15 +122,23 @@ pub const Recovery = struct {
         const operation = if (self.operation) |*value| value else return error.State;
         const index: usize = if (self.phase == .sb) 0 else 1;
         if (!std.meta.eql(operation.options, self.options[index])) return error.Binding;
-        if (!try operation.step(.{ .context = self, .generation = generation, .now_ns = now,
-            .admit = admit, .read32 = read, .write32 = write, .log_polling = polling })) return false;
+        const done = operation.step(.{ .context = self, .generation = generation, .now_ns = now,
+            .admit = admit, .read32 = read, .write32 = write, .log_polling = polling }) catch |err| {
+            switch (err) {
+                error.SbProtection, error.SbProgress, error.SbError => {
+                    try self.rejectSb(operation, @errorCast(err));
+                    return false;
+                },
+                else => return err,
+            }
+        };
+        if (!done) return false;
         const result = operation.result orelse return error.State;
         try self.check();
         if (self.phase == .sb) {
             if (result.fwsec == null or result.fwsec.?.command != .sb) return error.State;
-            self.sb_result = result;
-            self.operation = try firmware.Operation.init(self.options[1]);
-            self.phase = .unload;
+            self.sb_result = .{ .complete = result };
+            try self.beginUnload();
             return false;
         }
         if (result.booter == null or result.booter.?.command != .normal_unload) return error.State;
@@ -132,6 +147,31 @@ pub const Recovery = struct {
         // Keep the final operation, all DMA backing, mapping and display
         // owners. Neither WPR-down nor a Falcon halt makes them reusable.
         return true;
+    }
+    fn beginUnload(self: *Recovery) !void {
+        if (self.phase != .sb or self.sb_result == null) return error.State;
+        self.operation = try firmware.Operation.init(self.options[1]);
+        self.phase = .unload;
+    }
+    /// TU102 teardown still executes Booter Unload after a rejected SB
+    /// result. Only a completed reset/upload/start/halt and an actual FWSEC
+    /// status rejection reach this path. Broken admission, DMA, MMIO, clocks
+    /// or deadlines remain terminal and never acquire a fresh retry budget.
+    fn rejectSb(self: *Recovery, operation: *const firmware.Operation, reason: security.Error) !void {
+        if (self.phase != .sb or self.sb_result != null or operation != &self.operation.? or
+            operation.self_address != @intFromPtr(operation) or operation.phase != .fwsec_result or
+            operation.failure == null or operation.failure.? != reason or operation.result != null or operation.options.fwsec == null or
+            operation.options.fwsec.? != .sb or operation.hs_operation == null or
+            operation.hs_operation.?.phase != .complete or operation.hs_operation.?.failure != null) return error.State;
+        const observed = operation.fwsec_check orelse return error.State;
+        const halt = operation.halt_result orelse return error.State;
+        if (observed.command != .sb or observed.failure == null or observed.failure.? != reason or
+            observed.observed == 0 or observed.observed > 3) return error.State;
+        // Revalidate the same live port and retained images before advancing
+        // to the distinct SEC2 command. Preserve the failed raw observation.
+        try self.check();
+        self.sb_result = .{ .rejected = .{ .reason = reason, .observation = observed, .halt = halt } };
+        try self.beginUnload();
     }
     fn from(raw: *anyopaque) *Recovery { return @ptrCast(@alignCast(raw)); }
     fn generation(raw: *anyopaque) u64 {

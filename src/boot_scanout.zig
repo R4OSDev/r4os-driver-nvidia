@@ -267,6 +267,21 @@ pub const Raw = struct {
     heads: [max_heads]Head = @splat(.{}),
     sors: [max_sors]u32 = @splat(0),
     windows: [max_windows]Window = @splat(.{}),
+    /// Compare every register without copying the complete head/window
+    /// arrays into std.meta.eql's by-value array iteration.
+    pub fn same(self: *const Raw, other: *const Raw) bool {
+        inline for (std.meta.fields(Raw)) |field| {
+            const left = &@field(self.*, field.name);
+            const right = &@field(other.*, field.name);
+            switch (@typeInfo(field.type)) {
+                .array => {
+                    for (left, right) |*a, *b| if (!std.meta.eql(a.*, b.*)) return false;
+                },
+                else => if (!std.meta.eql(left.*, right.*)) return false,
+            }
+        }
+        return true;
+    }
     pub fn headMask(self: *const Raw) u8 {
         return @truncate(self.capabilities);
     }
@@ -387,7 +402,7 @@ pub const Capture = struct {
         try self.access.acquire(shared, ctx, snapshot, chip);
         try self.observe(&self.first, chip);
         try self.observe(&self.second, chip);
-        if (!std.meta.eql(self.first, self.second)) return error.Unstable;
+        if (!self.first.same(&self.second)) return error.Unstable;
         try self.guard();
         return self.first;
     }

@@ -17,6 +17,7 @@ pub const demand_ns = 10 * std.time.ns_per_s;
 pub const Owner = struct {
     self_address: usize = 0,
     ctx: r4os.r4dev.DriverContext,
+    memory_api: ?r4os.driver_memory.Context = null,
     adapter: u32,
     binding: wire.Binding,
     shared_binding: wire.Binding,
@@ -62,7 +63,7 @@ pub const Owner = struct {
         _ = try wire.encode(binding, .detach, &check);
         _ = try wire.encode(shared_binding, .detach, &check);
         if (adapter == 0 or binding.epoch != shared_binding.epoch) return error.Parameter;
-        return .{ .ctx = ctx, .adapter = adapter, .binding = binding, .shared_binding = shared_binding };
+        return .{ .ctx = ctx, .memory_api = ctx.memory(), .adapter = adapter, .binding = binding, .shared_binding = shared_binding };
     }
     pub fn observeActivity(self: *Owner, now: u64, activity: policy.Activity) void {
         if (activity.copy or activity.render or activity.compute or activity.video or activity.display_commit or activity.cursor) {
@@ -124,6 +125,7 @@ pub const Owner = struct {
         if (now < self.common_next) return;
         self.common_next = now +| sample_period_ns;
         const memory = self.ctx.memory() orelse return;
+        self.memory_api = memory;
         const state = self.publicState(now);
         var wanted: a.GfxTelemetryDemand = .{};
         const rc = memory.telemetryExchange(&state, &wanted);
@@ -152,7 +154,7 @@ pub const Owner = struct {
         self.demanded_mask = 0; self.demanded_until = 0; self.timing_until = 0;
         self.common_next = 0;
         if (now == 0 or now == std.math.maxInt(u64)) return;
-        const memory = self.ctx.memory() orelse return;
+        const memory = self.memory_api orelse return;
         var state: a.GfxTelemetryState = .{ .adapter_id = self.adapter, .memory_generation = self.binding.epoch,
             .sampled_ns = now, .valid_until_ns = now, .source = 1, .state = @intFromEnum(self.status) };
         var ignored: a.GfxTelemetryDemand = .{};
