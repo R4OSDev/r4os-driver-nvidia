@@ -14,6 +14,7 @@ pub const Source = struct {
     offset: u64,
     bytes: u64,
     location: wire.Location,
+    host: ?@import("gsp_host_vm.zig").Source = null,
 };
 pub const Set = struct {
     self_address: usize = 0,

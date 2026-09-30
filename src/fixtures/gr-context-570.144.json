@@ -3,7 +3,7 @@
   "purpose": "GR0 context sizing, golden/regular promotion, allocation and mapping flags",
   "pin": "NVIDIA 570.144",
   "generator": "Temp/gfx-gr-engine-20260913/GraphicsReference.c",
-  "fixture_sha256": "8e23acc3bfc7724762946d8315cdce0d4c90c4894252cdf8ce8ed296e3aad4f1",
+  "fixture_sha256": "02975ea12531970e3b1d56f1b90d41086cf1bf3f0ff7450344b8aad5193e96c3",
   "sources": [
     {
       "sha256": "9e878195c522919f133c497aefbc3f4c076aae8bda25d4c7915e8981bb43563a",
@@ -41,5 +41,6 @@
       "sha256": "13b89002722ec063bdd0a6047664a140f0aaf3f336a4a13118a5ea75b4171214",
       "path": "src/nvidia/generated/g_kernel_channel_nvoc.h"
     }
-  ]
+  ],
+  "revision_validation": "0.1.168: only normal/golden allocation flags changed to host-owned hardware CHID8/private USERD page. Existing Tools/Bootstrap/GspMessageAbi.c original-C comparison independently validates both changed flag words; all context layout/promotion vectors retained."
 }

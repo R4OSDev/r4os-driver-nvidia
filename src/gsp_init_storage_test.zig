@@ -314,6 +314,15 @@ const QueueNative = struct {
         return a.gfx_buffer_result_ok;
     }
     fn collect() callconv(.c) i32 {
+        // The real common collector cannot finish while a native BO still
+        // needs the driver's RM destruction, even after its last ref closes.
+        if (TerminalFixture.enforce_collection) TerminalFixture.collection_calls += 1;
+        if (TerminalFixture.enforce_collection and @import("gsp_vram_test_model.zig").Model.pendingReleases()) {
+            TerminalFixture.blocked_collections += 1;
+            return a.gfx_buffer_error_busy;
+        }
+        const pages = @import("gsp_host_vm_memory_test.zig").Model;
+        if (pages.enabled) return pages.collect(ControlModel.active);
         return a.gfx_buffer_result_ok;
     }
 };
@@ -1414,6 +1423,8 @@ const DeviceModel = struct {
     var mode_result_logs: usize = 0;
     var mode_overflow_logs: usize = 0;
     var restore_logs: usize = 0;
+    var nocat_data_logs: usize = 0;
+    var nocat_tail_logs: usize = 0;
     fn log(text: [*:0]const u8) callconv(.c) void {
         const line = std.mem.span(text);
         if ((ControlModel.is("context_native_reset") or ControlModel.is("context_native_console")) and
@@ -1433,6 +1444,11 @@ const DeviceModel = struct {
         if (std.mem.startsWith(u8, line, "NVIDIA mode-result:")) mode_result_logs += 1;
         if (std.mem.startsWith(u8, line, "NVIDIA mode-diagnostic:")) mode_overflow_logs += 1;
         if (std.mem.startsWith(u8, line, "NVIDIA native-restore:")) restore_logs += 1;
+        if (std.mem.startsWith(u8, line, "NVIDIA gsp-nocat-data:")) {
+            nocat_data_logs += 1;
+            if (std.mem.indexOf(u8, line, "bytes=1024 captured=1024 offset=992 hex=" ++ ("5a" ** 31) ++ "a5") != null)
+                nocat_tail_logs += 1;
+        }
     }
     fn tick(words: []u32, frts: u64, bad_frts: bool) void {
         const core = @import("gsp_core.zig");
@@ -1610,7 +1626,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
     const command = init.queues_offset + init.command_offset;
     const status = init.queues_offset + init.status_offset;
     const header = backing.?[command..][0..32].*;
-    const Case = enum { success, old_api, preboot_partial, frts_error, timeout, stolen_display, unknown_event,
+    const Case = enum { success, host_mmu_native, old_api, preboot_partial, frts_error, timeout, stolen_display, unknown_event,
         static_bad_region, static_ack_failure, static_timeout,
         post_control_error, post_wrong_gpc, post_bad_vector, post_ack_failure, post_timeout,
         irq_intx, irq_register_error, irq_msi_uncertain, irq_cause, irq_wake_failure, irq_close_busy, irq_unregister_failure,
@@ -1624,12 +1640,14 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         vram_success, vram_budget, vram_physical_reject, vram_virtual_reject, vram_map_reject, vram_commit, vram_size, vram_ack, vram_timeout, vram_free, vram_finish,
         vram_surface_linear, vram_surface_tiled, vram_surface_changed, vram_surface_contiguity,
         vram_storage, vram_storage_bounds, vram_storage_contiguity, vram_storage_acquire, vram_storage_descriptor, vram_storage_no_clear,
-        context_success, context_classes, context_engine, context_query_reject, context_page, context_duplicate,
+        vram_storage_gsp_clear, vram_storage_gsp_clear_reject, vram_storage_gsp_clear_ack, vram_storage_gsp_clear_changed,
+        context_success, context_classes, context_classes_ack, context_engine, context_query_reject, context_page, context_duplicate,
+        context_caps_changed, context_caps_ack, context_caps_reject,
         context_unload, context_unload_empty, context_unload_rejected, context_unload_ack,
         context_unload_deadline, context_unload_unavailable, context_unload_stale,
         context_group_reject, context_share_reject, context_share_changed, context_ack, context_timeout, context_free,
         context_methods, context_methods_acquire, context_methods_free, context_methods_release,
-        context_fifo_success, context_fifo_allocate, context_fifo_bind, context_fifo_token, context_fifo_enable,
+        context_fifo_success, context_fifo_allocate, context_fifo_bind, context_fifo_hardware_changed, context_fifo_enable,
         context_fifo_changed, context_fifo_ack, context_fifo_timeout, context_fifo_disable, context_fifo_free, context_fifo_dma,
         context_graphics, context_graphics_missing, context_graphics_reject, context_graphics_timeout,
         context_graphics_command_fault, context_graphics_shader_fault,
@@ -1670,13 +1688,13 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         // Existing GA106 fault coverage exercises the shared code once.
         // Every added ASIC runs the native success paths of each subsystem.
         if (chip_id != 0x176) switch (case) {
-            .success, .power_success, .mapping_success, .vram_success,
+            .success, .host_mmu_native, .power_success, .mapping_success, .vram_success,
             .context_graphics, .context_native_connected, .gpu_reset_success => {},
             else => continue,
         };
         ControlModel.reset(@tagName(case));
         const exercise_runtime = @intFromEnum(case) >= @intFromEnum(Case.runtime_healthy);
-        const boot_success = case == .success or @intFromEnum(case) >= @intFromEnum(Case.static_bad_region);
+        const boot_success = case == .success or case == .host_mmu_native or @intFromEnum(case) >= @intFromEnum(Case.static_bad_region);
         errdefer |err| std.debug.print("native device startup chip={x} {s}: {s}\n", .{ chip_id, @tagName(case), @errorName(err) });
         @memset(words, 0);
         words[0] = boot0;
@@ -1772,8 +1790,21 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         try t.expect(std.mem.readInt(u64, system_message.payload[64..72], .little) == 0x10000);
         try t.expect(std.mem.readInt(u64, system_message.payload[72..80], .little) == 0x800000000000);
         try t.expect(std.mem.readInt(u64, system_message.payload[920..928], .little) == 4096 and system_message.payload[896] == 1);
-        try t.expect(std.mem.readInt(u32, registry_message.payload[4..8], .little) == 3);
-        try t.expect(std.mem.indexOf(u8, registry_message.payload, "RMForcePcieConfigSave\x00") != null);
+        const registry = registry_message.payload;
+        try t.expect(std.mem.readInt(u32, registry[0..4], .little) == registry.len);
+        try t.expect(std.mem.readInt(u32, registry[4..8], .little) == 4);
+        var name_offset: usize = 8 + 4 * 16;
+        inline for (.{ "RMSecBusResetEnable", "RMForcePcieConfigSave", "RMDevidCheckIgnore", "RMSplitVasMgmtServerClientRm" }, 0..) |name, index| {
+            const at = 8 + index * 16;
+            try t.expect(std.mem.readInt(u32, registry[at..][0..4], .little) == name_offset);
+            try t.expect(registry[at + 4] == 1 and std.mem.allEqual(u8, registry[at + 5 .. at + 8], 0));
+            try t.expect(std.mem.readInt(u32, registry[at + 8 ..][0..4], .little) == @as(u32, if (index == 3) 0 else 1));
+            try t.expect(std.mem.readInt(u32, registry[at + 12 ..][0..4], .little) == 4);
+            try t.expectEqualStrings(name, registry[name_offset..][0..name.len]);
+            try t.expect(registry[name_offset + name.len] == 0);
+            name_offset += name.len + 1;
+        }
+        try t.expect(name_offset == registry.len);
         const original_epoch = capture.boot.held_generation;
         var injected = false;
         var notified = false;
@@ -1841,14 +1872,17 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
             if (target.phase == .ready) try checkDevicePostInit(target, words, held.plan.?.frts.offset, case);
             if (target.phase == .ready) try checkDeviceIrq(target, words, held.plan.?.frts.offset, case);
             if (reset_case) try checkDeviceReset(target, words, held.plan.?.frts.offset, case == .gpu_reset_gfw_timeout);
-            if (target.phase == .ready and !target.stopped) try checkDeviceRm(target, words, held.plan.?.frts.offset, case);
+            if (target.phase == .ready and !target.stopped) {
+                if (case == .host_mmu_native) try checkDeviceHostMmu(target, words, table)
+                else try checkDeviceRm(target, words, held.plan.?.frts.offset, case);
+            }
             if (target.phase == .ready and std.mem.startsWith(u8, @tagName(case), "power_")) try checkDevicePower(target);
             if (target.phase == .ready and std.mem.startsWith(u8, @tagName(case), "mapping_")) try checkDeviceMappings(target, table, @tagName(case));
             if (target.phase == .ready and std.mem.startsWith(u8, @tagName(case), "vram_")) try checkDeviceVram(target, table, @tagName(case));
             if (target.phase == .ready and std.mem.startsWith(u8, @tagName(case), "context_")) try checkDeviceContexts(target, table, @tagName(case));
             if (target.phase == .ready and std.mem.startsWith(u8, @tagName(case), "display_root_")) try checkDeviceDisplayEngine(target, @tagName(case));
             if (target.phase == .ready and std.mem.startsWith(u8, @tagName(case), "display_dma_")) try checkDeviceDisplayChannels(target, table, words, @tagName(case));
-            if (target.phase == .ready and !target.stopped and !std.mem.startsWith(u8, @tagName(case), "power_")) try checkDeviceOutputs(target, words, held.plan.?.frts.offset, case);
+            if (target.phase == .ready and !target.stopped and case != .host_mmu_native and !std.mem.startsWith(u8, @tagName(case), "power_")) try checkDeviceOutputs(target, words, held.plan.?.frts.offset, case);
             if (exercise_runtime) try checkDeviceRuntime(target, words, held.plan.?.frts.offset, case);
         } else {
             try t.expect(target.phase == .failed and target.failure != null);
@@ -1985,6 +2019,9 @@ fn checkDeviceStatic(target: *@import("gsp_device.zig").Device, words: []u32, fr
     std.mem.writeInt(u64, response[1224..1232], physical, .little);
     std.mem.writeInt(u64, response[1536..1544], physical - 65536, .little);
     std.mem.writeInt(u64, response[1544..1552], physical - 131072, .little);
+    // Preserve and report the firmware observation independently of our
+    // requested mode. Host models do not qualify real RPC14 support.
+    response[static.split_vas_offset] = @intFromBool(scenario == .success);
     std.mem.writeInt(u64, response[1640..1648], target.vram.?.plan.?.non_wpr_heap.offset, .little);
     std.mem.writeInt(u64, response[1648..1656], target.vram.?.plan.?.frts.offset, .little);
     for ([_]u32{0xcaf00001, 0xcaf00002, 0xcaf00003}, 0..) |value, index|
@@ -2009,6 +2046,7 @@ fn checkDeviceStatic(target: *@import("gsp_device.zig").Device, words: []u32, fr
         const info = target.running.static_info orelse return error.MissingStaticInfo;
         try t.expect(channel.phase == .idle and channel.deadline == null and session.pending == null);
         try t.expect(info.client == 0xcaf00001 and info.device == 0xcaf00002 and info.subdevice == 0xcaf00003);
+        try t.expect(info.split_vas == (scenario == .success));
         try t.expect(info.fb_bytes == physical and info.region_count == 2 and info.regions[1].protected and info.regions[1].reserved == 4096);
         try t.expect(info.regions[0].iso and info.regions[0].compressed and info.regions[0].bytes == physical / 2);
         const memory = target.running.nativeMemory() orelse return error.MissingMemoryInventory;
@@ -2603,6 +2641,125 @@ fn devicePostMasks(target: *@import("gsp_device.zig").Device, dp: bool, foreign:
     try nativeEvent(&target.session.?, 0x1003, bytes[0..if (dp) @as(usize, 36) else 40]);
 }
 
+fn checkDeviceHostMmu(target: *@import("gsp_device.zig").Device, words: []u32, table: *a.DriverApi) !void {
+    const pages = @import("gsp_host_vm_memory_test.zig").Model;
+    const tlb = @import("gsp_host_tlb.zig");
+    const vm_wire = @import("gsp_host_vm_wire.zig");
+    const caps = @import("gsp_memory_caps.zig");
+    const heap_model = @import("gsp_buffer_test_model.zig").Model;
+    heap_model.install(table, "host_mmu_native");
+    defer heap_model.dispose(table);
+    const running = &target.running;
+    const session = &target.session.?;
+    const command = init.queues_offset + init.command_offset;
+    const status = init.queues_offset + init.status_offset;
+    var bound: u64 = 0;
+    var binds: usize = 0;
+    var unbinds: usize = 0;
+    var invalidates: usize = 0;
+    var checked = false;
+    var deferred_checked = false;
+    var steps: usize = 0;
+    errdefer |err| std.debug.print("external PDB actual Device error={s} phase={s} failure={?}/{?} graph={s} steps={d} binds={d} unbinds={d} invalidates={d} pages={d}\n",
+        .{@errorName(err), @tagName(target.phase), target.failure, running.failure,
+            if (running.graph) |*graph| @tagName(graph.state) else "none", steps, binds, unbinds, invalidates, pages.count});
+    while (steps < 2000) : (steps += 1) {
+        clock += 1000;
+        if (words[tlb.invalidate / 4] & tlb.trigger != 0) {
+            try t.expect(words[tlb.invalidate / 4] == tlb.command and bound != 0);
+            const pdb_words = try tlb.words(bound);
+            try t.expect(words[tlb.pdb_low / 4] == pdb_words[0] and words[tlb.pdb_high / 4] == pdb_words[1]);
+            // Model hardware retirement only after the exact command was
+            // observed. Until now the runtime has retained every table BO.
+            words[tlb.invalidate / 4] = 0;
+            invalidates += 1;
+        }
+        _ = target.step();
+        try t.expect(target.phase == .ready and running.failure == null);
+        if (pages.deferred_collects != 0 and ControlModel.active) {
+            const storage = &running.graph.?.address_space.?.host_storage;
+            try t.expect(storage.deferred_pages != 0 and pages.count == 5 and pages.released == 0);
+            try t.expect(heap_model.heapLive() >= pages.count);
+            try t.expectError(error.Retained, storage.closeEmpty());
+            deferred_checked = true;
+        }
+        if (running.graph) |*graph| if (graph.state == .finished) break;
+        if (!checked) if (running.nativeControlBuffer()) |control| {
+            const space = running.nativeAddressSpace() orelse return error.MissingAddressSpace;
+            try t.expect(space.host != null and space.host.? == &running.graph.?.address_space.?.host_vm);
+            try t.expect(control.address == ControlModel.gpu_address and binds == 1 and invalidates == 1 and unbinds == 0);
+            try t.expect(pages.count == 5 and pages.released == 0);
+            for (ControlModel.pages, 0..) |physical, i| {
+                try t.expectEqual((physical >> 4) | @as(u64, 13), try pages.walk(bound, control.address + i * 4096));
+            }
+            // Read-only identity admission rejects a copied VM before MMIO.
+            var copy = space.host.?.*;
+            const port_owner = target.port.owner.?;
+            try t.expectError(error.Binding, port_owner.admit_host_mmu.?(port_owner.context, &target.port, &copy, clock + 1000000000));
+            checked = true;
+            // The common collector covers the entire driver epoch. A native
+            // backing being destroyed can keep it busy until this VM unmap
+            // has completed. Table metadata must survive deferred collection
+            // without blocking the owning RM destruction on that same barrier.
+            pages.defer_collection = true;
+            try running.beginDestroyGraph(clock + 1000000000, true);
+            continue;
+        };
+        const channel = running.activeChannel() orelse return error.MissingChannel;
+        if (channel.phase != .waiting) continue;
+        const cursor = (session.tx_write + 62) % 63;
+        const request = try transport.message.decode(session.profile,
+            backing.?[command + 4096 + @as(usize, cursor) * 4096 ..][0..4096], session.tx_sequence - 1);
+        const function = request.rpc.function;
+        try t.expect(function != 14 and function != 15); // No map-DMA RPC fallback.
+        var response: [@import("gsp_buffer_wire.zig").max_request_bytes]u8 = undefined;
+        try t.expect(request.payload.len <= response.len);
+        @memcpy(response[0..request.payload.len], request.payload);
+        var length = request.payload.len;
+        std.mem.writeInt(u32, backing.?[status + 64 ..][0..4], session.tx_write, .little);
+        if (function == 103) {
+            const class = std.mem.readInt(u32, response[12..16], .little);
+            try t.expect(class != 0x50a0); // VA allocation belongs to the host.
+            if (class == 0x90f1) {
+                try t.expect(length == 80 and std.mem.readInt(u32, response[36..40], .little) == 8 and
+                    std.mem.readInt(u64, response[72..80], .little) == 4096);
+                std.mem.writeInt(u64, response[40..48], (@as(u64, 1) << 49) - 4096, .little);
+            } else length = 32;
+            std.mem.writeInt(u32, response[16..20], 0, .little);
+        } else if (function == 76) {
+            const cmd = std.mem.readInt(u32, response[8..12], .little);
+            if (cmd == vm_wire.command(.bind)) {
+                try t.expect(bound == 0 and length == 56 and pages.count == 1);
+                bound = std.mem.readInt(u64, response[24..32], .little);
+                try t.expect(bound == try running.graph.?.address_space.?.host_vm.rootAddress());
+                try t.expect(std.mem.readInt(u32, response[32..36], .little) == 4 and std.mem.readInt(u32, response[36..40], .little) == 9);
+                binds += 1;
+            } else if (cmd == vm_wire.command(.unbind)) {
+                try t.expect(checked and bound != 0 and length == 32 and pages.count == 1 and invalidates == 2);
+                try t.expect(try pages.walk(bound, ControlModel.gpu_address) == 0 and !ControlModel.active);
+                unbinds += 1;
+                bound = 0;
+            } else if (cmd == caps.command) {
+                try t.expect(length == caps.bytes);
+                response[24..27].* = .{ 0x0f, 0x81, 0x12 };
+            } else {
+                try t.expect(length == 44);
+                response[32] = 1;
+                std.mem.writeInt(u32, response[36..40], 0xdeadbeef, .little);
+            }
+            std.mem.writeInt(u32, response[12..16], 0, .little);
+        } else if (function == 10) std.mem.writeInt(u32, response[12..16], 0, .little)
+        else try t.expect(function == 4);
+        try nativeEvent(session, function, response[0..length]);
+    }
+    try t.expect(steps < 2000 and checked and binds == 1 and unbinds == 1 and invalidates == 2 and bound == 0);
+    try t.expect(pages.count == 0 and pages.allocated == pages.released and !ControlModel.active and ControlModel.releases == 1);
+    try t.expect(deferred_checked and pages.deferred_collects >= 4);
+    try t.expect(running.graph.?.address_space.?.host_storage.self_address == 0 and running.graph.?.address_space.?.host_vm.self_address == 0);
+    try t.expect(heap_model.heapLive() == 0);
+    try t.expect(target.catalog.close());
+}
+
 fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: u64, scenario: anytype) !void {
     const objects = @import("gsp_objects.zig");
     const rm_names = @import("gsp_rm_names.zig");
@@ -2634,6 +2791,10 @@ fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: 
     while (target.phase == .ready and running.nativeObject() == null and steps < 90) : (steps += 1) {
         _ = target.step();
         if (target.phase != .ready) break;
+        // These retained historical RPC fixtures exercise the RM-managed
+        // codecs and their rejected/ambiguous responses. The external-PDB
+        // production branch has its own actual-Device case below.
+        if (running.graph) |*graph| if (graph.address_space == null) { graph.host_mmu_io = null; };
         const channel = running.activeChannel().?;
         if (channel.phase != .waiting) continue;
         const graph = &running.graph.?;
@@ -6893,9 +7054,49 @@ fn pumpResetNativeOutput(target: *@import("gsp_device.zig").Device) !void {
     }
     return error.NativeReconstructionTimeout;
 }
+// The kernel may reap an empty native provider between driver shutdown
+// admission and nativeUnregister. Stale then confirms only its old handle;
+// an outstanding allocation claim must still retain all driver metadata.
+const AllocationRetirementFixture = struct {
+    const handle: a.GfxBufferHandle = .{ .id = 3, .generation = 17 };
+    var status: i32 = a.gfx_buffer_error_stale;
+    var calls: usize = 0;
+    fn unregister(input: *const a.GfxBufferHandle) callconv(.c) i32 {
+        std.debug.assert(std.meta.eql(input.*, handle));
+        calls += 1;
+        return status;
+    }
+    fn complete(_: *const a.GfxBufferHandle, _: *const a.GfxBufferHandle, _: i32, _: *const a.GfxBufferHandle) callconv(.c) i32 {
+        return a.gfx_buffer_error_stale;
+    }
+    fn memory() r4os.driver_memory.Context {
+        return .{ .table = .{ .native_unregister = @intFromPtr(&unregister), .native_complete = @intFromPtr(&complete) } };
+    }
+    fn guards() !void {
+        for ([_]i32{ a.gfx_buffer_error_busy, a.gfx_buffer_error_closed, a.err_no_fn }) |rc| {
+            var owner: @import("gsp_allocation.zig").Owner = .{ .handle = handle, .memory = memory() };
+            status = rc; owner.close();
+            try t.expect(owner.closing and std.meta.eql(owner.handle, handle));
+        }
+        status = a.gfx_buffer_error_stale;
+        for ([_]bool{ false, true }) |allocated| {
+            var owner: @import("gsp_allocation.zig").Owner = .{ .handle = handle, .memory = memory(),
+                .pending = .{ .job = .{}, .buffer = if (allocated) .{ .epoch = 1, .serial = 1, .slot = 0 } else null } };
+            owner.close();
+            try t.expect(owner.pending != null and std.meta.eql(owner.handle, handle));
+        }
+        var acknowledged: @import("gsp_allocation.zig").Owner = .{ .handle = handle, .memory = memory() };
+        status = a.gfx_buffer_result_ok; acknowledged.close();
+        try t.expect(acknowledged.handle.id == 0);
+        status = a.gfx_buffer_error_stale; calls = 0;
+    }
+};
 // Existing lifecycle fixture: actual CE startup, queue worker and retirement;
 // only firmware replies, MMIO and GPU stores are supplied by the host model.
 const TerminalFixture = struct {
+    var enforce_collection = false;
+    var collection_calls: usize = 0;
+    var blocked_collections: usize = 0;
     var boot: ?*@import("gsp_boot_storage.zig").Storage = null;
     var init_storage: ?*Storage = null;
     var frts: ?*@import("fwsec_storage.zig").Storage = null;
@@ -6955,6 +7156,37 @@ const TerminalFixture = struct {
         boot = lease.boot_storage; init_storage = lease.init_storage; frts = lease.fwsec_storage;
         sb = lease.fwsec_sb_storage; booters = lease.booter_storage;
         query_attempts = 0; reset_calls = 0; reset_busy = .{ false, false }; terminal_calls = 0; release_case = .busy;
+        // The physical CE/GR consumer has closed its explicit VA bindings
+        // before shutdown. Leaving the earlier raw-push fixture's range here
+        // accidentally yields a turn between cache close and system unmap,
+        // hiding the pending native-BO collection dependency.
+        var virtual_steps: usize = 0;
+        while (try run.virtuals.first()) |handle| : (virtual_steps += 1) {
+            try t.expect(virtual_steps < 16);
+            const end = clock + std.time.ns_per_s;
+            if (try run.virtuals.firstBinding(handle)) |binding| {
+                if ((try run.virtualBindingStatus(binding)).mapped) {
+                    try run.unmapVirtualBuffer(binding, end, true);
+                    try finishVirtual(target, false);
+                } else try run.discardVirtualBinding(binding);
+            } else {
+                try run.retireVirtualRange(handle, end, true);
+                try finishVirtual(target, false);
+            }
+        }
+        enforce_collection = true;
+        collection_calls = 0; blocked_collections = 0;
+        defer enforce_collection = false;
+        var mapping_count: usize = 0;
+        for (run.buffers.items()) |*slot| if (slot.owner != null) { mapping_count += 1; };
+        try t.expect(mapping_count >= 2 and run.graphics_cache.reservedBytes() != 0);
+        std.debug.print("[nvidia-terminal] mapped-system={d} render-cache={d} native-pending={}\n", .{
+            mapping_count,run.graphics_cache.reservedBytes(),@import("gsp_vram_test_model.zig").Model.pendingReleases()});
+        defer std.debug.print("[nvidia-terminal] collection calls={d} blocked={d}\n", .{collection_calls,blocked_collections});
+        try AllocationRetirementFixture.guards();
+        try t.expect(run.allocations.handle.id == 0 and run.allocations.pending == null);
+        run.allocations.memory = AllocationRetirementFixture.memory();
+        run.allocations.handle = AllocationRetirementFixture.handle;
         const saved_table = table.*;
         defer table.* = saved_table;
         // The kernel closes these new-table admissions before calling the
@@ -7001,7 +7233,14 @@ const TerminalFixture = struct {
                 ResetDeviceModel.words[0x118128 / 4] = 1; ResetDeviceModel.words[0x118234 / 4] = 0xff;
             }
             _ = target.step();
+            if (run.failure) |err| if (err != error.RmClosed) {
+                std.debug.print("[nvidia-terminal] premature failure={s} mapping={?} native={?} pending-native={} collect-blocked={d}\n", .{
+                    @errorName(err),run.buffer_active,run.native_active,@import("gsp_vram_test_model.zig").Model.pendingReleases(),blocked_collections});
+                return @as(anyerror!void, err);
+            };
         }
+        try t.expect(AllocationRetirementFixture.calls == 1 and run.allocations.handle.id == 0);
+        try t.expect(collection_calls != 0 and blocked_collections == 0);
         const proof = target.gpu_reset.quiescence() orelse return error.NoResetProof;
         try t.expect(target.failure.? == error.RmClosed and run.unload.phase == .complete and
             target.recovery.report != null and reset_calls == 2 and ResetDeviceModel.triggers == 1 and
@@ -7069,6 +7308,8 @@ fn checkNativeHeadless(target: *@import("gsp_device.zig").Device, table: *a.Driv
         run.graphics_enabled and run.native_copy.phase == .ready and run.copy_backend != null and run.copy_backend.?.operations == 2905 and
         run.presentation == null and target.native_output.phase == @as(@import("gsp_native_output.zig").Phase, if (terminal) .detached else .receiver_wait) and
         copy.shadow_creates == 0 and NativeCommon.prepares == 0 and NativeCommon.commits == 0);
+    try t.expect(run.native_copy.rm_engine == 11 and run.fifos[run.native_copy.channel.?.slot].owner.?.config.rm_engine == 11);
+    try t.expect(run.contexts[run.native_copy.context.?.slot].owner.?.copy_caps.?.standalone());
     const graphics_handle = target.native_graphics.channel.?;
     const graphics_context = target.native_graphics.context.?;
     // Exercise the existing public consumer while the display waits for a
@@ -7122,17 +7363,32 @@ fn checkNativeHeadless(target: *@import("gsp_device.zig").Device, table: *a.Driv
     }
     try t.expect(run.nativeOutputs() != null and run.activeChannel().?.phase == .idle);
     stage = 5;
+    // Keep the terminal regression's real cached mappings alive. The separate
+    // headless scenario below checks expiry while the initialized GPU is idle.
+    if (terminal) return TerminalFixture.check(target, table);
+    const evictions_before_idle = run.mapping_evictions;
+    std.debug.print("[nvidia-idle-mappings] before refs={d} evictions={d} pending={} time={d}\n", .{
+        copy.heldReferences(), run.mapping_evictions,run.copy_backend.?.pending,clock});
+    try t.expect(copy.heldReferences() == 2);
+    try t.expect(!try run.prepareCopyMappings(2, 128 * 1024 * 1024, clock + std.time.ns_per_s));
     clock += 180 * std.time.ns_per_s;
     try t.expect(!try target.native_output.step());
     for (0..64) |_| {
         const progress = try stepNativeQueues(target,&counts,"context_native_headless",&graphics_stage);
-        if (!progress and run.activeChannel().?.phase == .idle) break;
+        if (!progress and run.activeChannel().?.phase == .idle and run.buffer_active == null) break;
     }
+    std.debug.print("[nvidia-idle-mappings] after refs={d} evictions={d} active={?} pending={} time={d}\n", .{
+        copy.heldReferences(),run.mapping_evictions,run.buffer_active,run.copy_backend.?.pending,clock});
+    try t.expect(run.buffer_active == null and copy.heldReferences() == 0 and
+        run.mapping_evictions == evictions_before_idle + 2);
+    std.debug.print("[nvidia-idle-mappings] cached refs2->0; confirmed evictions=2; no new queue job or shutdown\n", .{});
+    // Idle expiry must preserve the explicit public VA mapping used by the
+    // raw-push consumer, as well as the still-live channel and render cache.
+    try t.expect((try run.virtualBindingStatus(batch_mapping)).mapped);
     try t.expect(run.failure == null and run.presentation == null and copy.shadow_creates == 0 and
         std.meta.eql(run.copy_backend.?.binding, binding) and std.meta.eql(run.native_copy.channel.?, handle) and
         std.meta.eql(target.native_graphics.channel.?,graphics_handle) and std.meta.eql(target.native_graphics.context.?,graphics_context));
     try t.expect(run.output_generation == output_generation and !run.outputs.active() and !run.receiver_events.capturing);
-    if (NativeCommon.is("context_native_terminal")) return TerminalFixture.check(target, table);
     run.discover_receivers = true;
     run.receiver_events.not_before_ns = clock + 600 * std.time.ns_per_s;
     run.outputs.data = snapshot;
@@ -7164,13 +7420,22 @@ fn checkNativeHeadless(target: *@import("gsp_device.zig").Device, table: *a.Driv
     const sent = target.session.?.tx_sequence;
     stage = 9;
     var cleanup: usize = 0;
-    errdefer std.debug.print("headless reset slices={d} phase={s} cursor={d} gr-requested={} tx={d}/{d}\n", .{
-        cleanup,@tagName(run.reset_stage),run.reset_cursor,target.reset_graphics_requested,target.session.?.tx_sequence,sent });
+    // A fault bypasses ordinary graph destruction. The real collector still
+    // covers native BOs whose final references are dropped during retirement.
+    TerminalFixture.enforce_collection = true;
+    TerminalFixture.collection_calls = 0; TerminalFixture.blocked_collections = 0;
+    defer TerminalFixture.enforce_collection = false;
+    errdefer std.debug.print("headless reset slices={d} phase={s} cursor={d} gr-requested={} tx={d}/{d} pending-native={} collect-blocked={d}\n", .{
+        cleanup,@tagName(run.reset_stage),run.reset_cursor,target.reset_graphics_requested,target.session.?.tx_sequence,sent,
+        @import("gsp_vram_test_model.zig").Model.pendingReleases(),TerminalFixture.blocked_collections });
     // GR global/context/cache storage is retired one acknowledged BO per
     // slice, using the same bound as the existing virtual-resource reset case.
     while (!try run.closeAfterReset(proof)) : (cleanup += 1) try t.expect(cleanup < 2000);
     try t.expect(run.batch_work == null and run.virtuals.ranges.root == null and target.session.?.tx_sequence == sent);
     try t.expect(target.reset_graphics_requested);
+    try t.expect(TerminalFixture.collection_calls != 0 and !@import("gsp_vram_test_model.zig").Model.pendingReleases());
+    std.debug.print("[nvidia-fault-retirement] collections={d} busy={d}; native BOs retired; no post-reset RPC\n", .{
+        TerminalFixture.collection_calls,TerminalFixture.blocked_collections});
     std.debug.print("[nvidia-headless-graphics] CE/GR/cache precede display; native queues without receiver; 180-second wait preserves contexts; late route reuses GPU; reset retires owners\n",.{});
 }
 
@@ -7356,11 +7621,29 @@ fn replyNativeProduct(target: *@import("gsp_device.zig").Device) !void {
         if (op == .graphics_info) {
             try t.expect(owner.rm_engine == 1 and @import("gsp_context_wire.zig").word(rpc.request, 0) == run.static_info.?.client and @import("gsp_context_wire.zig").word(rpc.request, 4) == run.static_info.?.subdevice);
             @memcpy(response[24..1688], @embedFile("fixtures/gr-context-570.144.bin")[0..1664]);
+        } else if (op == .copy_caps) {
+            const wire = @import("gsp_context_wire.zig");
+            try t.expect(wire.word(rpc.request, 0) == run.static_info.?.client and
+                wire.word(rpc.request, 4) == run.static_info.?.subdevice and wire.word(rpc.request, 8) == 0x20802a07);
+            response[28] = if (owner.rm_engine == 9) 0x21 else if (owner.rm_engine == 10) 0 else 0x20;
         } else if (op != .timeslice) {
-        const vector: usize = switch (op) { .classes => 0, .engines => if (owner.base == 0) 1 else 2, .method_size => 3, .group => 4, .share => 5, .free_share => 6, .free_group => 7, .graphics_info, .timeslice => unreachable };
+        const vector: usize = switch (op) { .classes => 0, .engines => if (owner.base == 0) 1 else 2, .method_size => 3, .group => 4, .share => 5, .free_share => 6, .free_group => 7, .graphics_info, .copy_caps, .timeslice => unreachable };
         const bytes = @import("gsp_context_test.zig").response(vector);
         const header: usize = if (rpc.function == 76) 24 else if (rpc.function == 103) 32 else 16;
         @memcpy(response[header..rpc.request.len], bytes[header..]);
+        if (run.native_copy.context) |copy_context| if (copy_context.slot == index) {
+            // COPY0 is GRCE; COPY1 lacks SYSMEM. Only COPY2 is suitable for
+            // independent upload/readback. None of COPY10..19 is available.
+            if (op == .engines and owner.base == 32) {
+                outputWord(&response, 28, 3);
+                @memcpy(response[136..236], response[36..136]);
+                @memcpy(response[236..336], response[36..136]);
+                outputWord(&response, 44, 9);
+                outputWord(&response, 144, 10);
+                outputWord(&response, 244, 11);
+            }
+            if (op == .group or op == .share) @memcpy(response[32..rpc.request.len], rpc.request[32..]);
+        };
         if (owner.rm_engine >= 29 and owner.rm_engine <= 40) {
             if (op == .engines and owner.base == 32) outputWord(&response, 44, if (VideoPeer.mode == .absent) 19 else if (owner.rm_engine >= 37) 39 else 31);
             if (op == .group or op == .share) @memcpy(response[32..rpc.request.len], rpc.request[32..]);
@@ -7928,7 +8211,9 @@ fn stepNativeQueues(target: *@import("gsp_device.zig").Device, counts: *FifoCoun
     try t.expect(target.phase == .ready);
     const run = &target.running;
     if (run.fifo_active != null) try replyDeviceFifo(target,counts,scenario)
-    else if (run.activeChannel().?.phase == .waiting) try replyNativeProduct(target);
+    else if (run.activeChannel().?.phase == .waiting) {
+        if (run.buffer_active != null) try replyCopyMapping(target) else try replyNativeProduct(target);
+    }
     if (run.graphics_work) |*work| {
         if (work.submitted and work.receipt == null) try modelGraphicsStep(target,stage);
     } else stage.* = 0;
@@ -9006,11 +9291,14 @@ fn checkDeviceContexts(target: *@import("gsp_device.zig").Device, table: *a.Driv
             const channel = running.activeChannel().?;
             if (channel.phase != .waiting) continue;
             const op = owner.operation.?;
-            const vector_index: usize = switch (op) { .classes => 0, .engines => if (owner.base == 0) 1 else 2, .method_size => 3, .group => 4, .share => 5, .free_share => 6, .free_group => 7, .timeslice => 0, .graphics_info => unreachable };
+            const vector_index: usize = switch (op) { .classes => 0, .engines => if (owner.base == 0) 1 else 2, .method_size => 3, .group => 4, .share => 5, .free_share => 6, .free_group => 7, .timeslice, .copy_caps => 0, .graphics_info => unreachable };
             const cursor = (session.tx_write + 62) % 63;
             const record = try transport.message.decode(session.profile, backing.?[command + 4096 + cursor * 4096..][0..4096], session.tx_sequence - 1);
             try t.expectEqualSlices(u8, channel.request, record.payload);
             try t.expect(owner.info() == null);
+            if (op == .classes) try t.expect(!owner.discovery.classes_acked and owner.discovery.class_count == 0);
+            if (op == .copy_caps) try t.expect(owner.copy_caps == null and wire.word(channel.request, 0) == running.static_info.?.client and
+                wire.word(channel.request, 4) == running.static_info.?.subdevice and wire.word(channel.request, 8) == 0x20802a07);
             channel.phase = .prepared;
             try target.port.owner.?.admit_command.?(target.port.owner.?.context, &target.port, deadline);
             var moved = owner.*; try t.expect(!moved.matches(channel, deadline)); try t.expectError(error.Stale, moved.poll());
@@ -9021,7 +9309,10 @@ fn checkDeviceContexts(target: *@import("gsp_device.zig").Device, table: *a.Driv
             var response: [wire.max_bytes]u8 = @splat(0);
             @memcpy(response[0..channel.request.len], channel.request);
             const header: usize = if (wire.function(op) == 76) 24 else if (wire.function(op) == 103) 32 else 16;
-            if (op != .timeslice) @memcpy(response[header..channel.request.len], vectors.response(vector_index)[header..]);
+            if (op == .copy_caps) response[28] = 0x20
+            else if (op != .timeslice) @memcpy(response[header..channel.request.len], vectors.response(vector_index)[header..]);
+            if (op == .copy_caps and model.is("context_caps_changed")) response[24] ^= 1;
+            if (op == .copy_caps and model.is("context_caps_reject")) outputWord(&response, 12, 0x57);
             if (op == .timeslice and index == 1) outputWord(&response, 12, 0x56); // NV_ERR_NOT_SUPPORTED: bounded fallback.
             if (wire.function(op) == 103) allocations += 1;
             if (wire.function(op) == 10) frees += 1;
@@ -9042,14 +9333,37 @@ fn checkDeviceContexts(target: *@import("gsp_device.zig").Device, table: *a.Driv
             if (op == .share and model.is("context_share_changed")) response[36] ^= 1;
             if (op == .share and model.is("context_timeout")) clock = deadline else {
                 try nativeReply(session, channel.function, 0, response[0..channel.request.len]);
-                if (op == .share and model.is("context_ack")) range_failure_call = range_calls + 4;
+                if ((op == .share and model.is("context_ack")) or (op == .classes and model.is("context_classes_ack")) or
+                    (op == .copy_caps and model.is("context_caps_ack"))) range_failure_call = range_calls + 4;
             }
             _ = target.step(); range_failure_call = 0;
+            if (op == .copy_caps) {
+                if (model.is("context_caps_ack") or model.is("context_caps_changed") or model.is("context_caps_reject"))
+                    try t.expect(owner.copy_caps == null)
+                else try t.expect(owner.copy_caps.?.standalone());
+            }
+            if (op == .classes) {
+                if (model.is("context_classes_ack")) {
+                    try t.expect(!owner.discovery.classes_acked and owner.discovery.class_count == 0);
+                } else {
+                    try t.expect(owner.discovery.classes_acked and owner.discovery.class_count == wire.word(response[24..], 0));
+                    for (0..owner.discovery.class_count) |i| try t.expectEqual(wire.word(response[24..], 4 + i * 4), owner.discovery.class_ids[i]);
+                    try t.expect(owner.discovery.required_classes == @as(u8, if (model.is("context_classes")) 0 else 7));
+                }
+            }
         }
         try t.expect(steps < 100);
         if (target.phase != .ready) break;
         const result = try running.executionContextStatus(handles[index]);
         try t.expect(result.state == .handed_off);
+        const discovery = &running.contexts[handles[index].slot].owner.?.discovery;
+        if (model.is("context_classes")) {
+            try t.expect(discovery.classes_acked and discovery.engine_pages == 0);
+        } else {
+            const copy_rm: u6 = if (model.is("context_engine")) 20 else 19;
+            try t.expect(discovery.engine_pages == 2 and discovery.engine_rows == 2 and discovery.other_engines == 0);
+            try t.expect(discovery.engine_mask[0] == (@as(u64, 1) << 1 | @as(u64, 1) << copy_rm));
+        }
         if (result.info) |info| {
             try t.expect(info.binding.client == running.graph.?.reservation.client and info.rm_engine == 19 and info.nv_engine == 0x34);
             try t.expect(info.engine.data[3] == 7 and info.method_bytes == 0x6000 and info.subcontext == 0);
@@ -9142,7 +9456,8 @@ fn checkDeviceContexts(target: *@import("gsp_device.zig").Device, table: *a.Driv
         if (model.is("context_unload_rejected")) try t.expect(target.failure.? == error.UnloadRejected and running.unload.reply.?.result == 0x57);
         return;
     }
-    const uncertain = model.is("context_page") or model.is("context_duplicate") or model.is("context_share_changed") or model.is("context_ack") or model.is("context_timeout") or model.is("context_free") or
+    const uncertain = model.is("context_caps_ack") or model.is("context_caps_changed") or
+        model.is("context_page") or model.is("context_duplicate") or model.is("context_share_changed") or model.is("context_ack") or model.is("context_classes_ack") or model.is("context_timeout") or model.is("context_free") or
         model.is("context_methods_free") or model.is("context_methods_release");
     try t.expect(target.phase == .recovering and target.failure != null);
     if (uncertain) try t.expect(running.contexts[0].owner.?.namespace_live and running.contexts[0].owner.?.failure != null) else {
@@ -10320,12 +10635,19 @@ fn replyDeviceFifo(target: *@import("gsp_device.zig").Device, counts: *FifoCount
             },
             .allocate => {
                 counts.allocations += 1; outputWord(&response, 164, @intCast(37 + counts.allocations));
+                const channel_wire = @import("gsp_fifo_wire.zig");
+                const hardware = owner.config.hardware_channel;
+                try t.expect(hardware == try channel_wire.hardwareChannelForSlot(running.fifo_active.?));
+                try t.expect(channel_wire.word(channel.request, 52) == try channel_wire.allocationFlags(hardware, owner.config.runqueue, (if (owner.config.graphics) |graphics| graphics.golden else false)));
+                try t.expect(owner.work_submit_token == null);
+                for (&running.fifos) |*other| if (other.owner) |held| {
+                    if (held != owner) try t.expect(held.config.hardware_channel != hardware);
+                };
                 try t.expect(@import("gsp_fifo_wire.zig").word(response[0..], 4) == owner.config.context.group);
                 try t.expect(@import("gsp_fifo_wire.zig").word(response[0..], 56) == owner.config.context.share);
                 try t.expect(@import("gsp_fifo_wire.zig").word(response[0..], 60) == 0);
             },
-            .bind => try t.expect(owner.live and !owner.bound and !owner.enabled),
-            .token => { try t.expect(owner.bound and !owner.enabled); outputWord(&response, 24, 0x13572468); },
+            .bind => try t.expect(owner.live and !owner.bound and !owner.enabled and owner.work_submit_token == null),
             .allocate_copy => try t.expect(owner.bound and !owner.engine_live and !owner.enabled),
             .allocate_nvdec, .allocate_nvenc => {
                 try t.expect(owner.config.engine == (if (op == .allocate_nvenc) @import("gsp_fifo_wire.zig").Engine.nvenc else .nvdec) and owner.bound and !owner.engine_live and !owner.enabled and !owner.graphics_promoted);
@@ -10383,10 +10705,11 @@ fn replyDeviceFifo(target: *@import("gsp_device.zig").Device, counts: *FifoCount
             .free => { counts.frees += 1; try t.expect(owner.live and !owner.enabled); },
         }
         if ((op == .allocate and model.is("context_fifo_allocate")) or (op == .bind and model.is("context_fifo_bind")) or
-            (op == .token and model.is("context_fifo_token")) or (op == .enable and model.is("context_fifo_enable")) or
+            (op == .enable and model.is("context_fifo_enable")) or
             (op == .disable and model.is("context_fifo_disable")) or (op == .free and model.is("context_fifo_free")))
             outputWord(&response, if (op == .allocate) 16 else 12, 0x57);
         if (op == .allocate and model.is("context_fifo_changed")) response[56] ^= 1;
+        if (op == .allocate and model.is("context_fifo_hardware_changed")) response[53] ^= 0x10;
         if (op == .allocate_copy and model.is("context_copy_allocate")) outputWord(&response, 16, 0x57);
         if (op == .allocate_copy and model.is("context_copy_oom")) outputWord(&response, 16, 0x51);
         if (op == .allocate_copy and model.is("context_copy_invalid")) outputWord(&response, 16, 0x21);
@@ -10447,13 +10770,15 @@ fn checkDeviceFifos(target: *@import("gsp_device.zig").Device, table: *a.DriverA
         try t.expect(result.state == .handed_off);
         if (result.info) |fifo_info| {
             try t.expect(fifo_info.config.context.group == parent.binding.group and fifo_info.config.context.share == parent.binding.share);
-            try t.expect(fifo_info.work_submit_token == 0x13572468 and fifo_info.config.address == fifo_model.address(i));
+            try t.expect(fifo_info.work_submit_token == ((fifo_info.config.runlist << 16) | fifo_info.config.hardware_channel) and fifo_info.config.address == fifo_model.address(i));
+            try t.expect(fifo_info.config.hardware_channel == (i + 1) * 8 and fifo_info.cid != fifo_info.config.hardware_channel);
             try t.expect(fifo_model.slots[i].active and fifo_model.slots[i].synced and parent.held());
             try t.expectError(error.Retained, running.retireExecutionContext(context_handle, deadline));
             try t.expectError(error.Retained, running.retireExecutionChannel(handles[i], deadline, false));
             if (i == 1) {
                 const previous = (try running.executionChannelStatus(handles[0])).info.?;
-                try t.expect(previous.config.handle != fifo_info.config.handle and previous.config.instance != fifo_info.config.instance and
+                try t.expect(previous.config.hardware_channel != fifo_info.config.hardware_channel and
+                    previous.config.handle != fifo_info.config.handle and previous.config.instance != fifo_info.config.instance and
                     previous.config.userd != fifo_info.config.userd and previous.config.address != fifo_info.config.address and previous.config.methods == fifo_info.config.methods);
             }
         } else try t.expect(result.rejected.? == 0x57 and !parent.held() and fifo_model.released == 1);
@@ -10486,7 +10811,7 @@ fn checkDeviceFifos(target: *@import("gsp_device.zig").Device, table: *a.DriverA
         }
         try t.expect(steps < 300);
     }
-    const uncertain = model.is("context_fifo_changed") or model.is("context_fifo_ack") or model.is("context_fifo_timeout") or
+    const uncertain = model.is("context_fifo_changed") or model.is("context_fifo_hardware_changed") or model.is("context_fifo_ack") or model.is("context_fifo_timeout") or
         model.is("context_fifo_disable") or model.is("context_fifo_free") or model.is("context_fifo_dma");
     try t.expect(target.phase == .recovering and target.failure != null);
     if (uncertain) {
@@ -10525,7 +10850,11 @@ fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverAp
     const private_storage = std.mem.startsWith(u8, scenario, "vram_storage");
     var storage_use: runtime.vram.storage.Use = .{};
     var alias_use: runtime.vram.alias.Use = .{};
-    const success = model.is("vram_success") or model.is("vram_surface_linear") or model.is("vram_surface_tiled") or model.is("vram_storage");
+    const explicit_clear = std.mem.startsWith(u8, scenario, "vram_storage_gsp_clear");
+    const saved_caps = running.graph.?.control_buffer.?.caps.?;
+    defer running.graph.?.control_buffer.?.caps = saved_caps;
+    if (explicit_clear) running.graph.?.control_buffer.?.caps.?.raw[2] &= ~@as(u8, 2);
+    const success = model.is("vram_success") or model.is("vram_surface_linear") or model.is("vram_surface_tiled") or model.is("vram_storage") or model.is("vram_storage_gsp_clear");
     const layout: surface.Layout = if (model.is("vram_surface_linear")) .linear else .blocklinear;
     const requests = [_]surface.Request{
         if (model.is("vram_surface_contiguity")) .{ .width = 1920, .height = 1080, .usage = 44, .layout = layout }
@@ -10538,7 +10867,8 @@ fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverAp
         const caps = &running.graph.?.control_buffer.?.caps.?;
         const original = caps.*; caps.raw[2] &= ~@as(u8, 2);
         const sent = session.tx_sequence;
-        try t.expectError(error.Unsupported, running.allocateNativeStorage(4096, deadline));
+        const unsupported: runtime.vram.storage.Policy = .{ .capabilities = caps.*, .physical_bytes = 64 * 1024 * 1024 };
+        try t.expectError(error.Unsupported, unsupported.validate(running.nativeAddressSpace().?.*, 65536));
         try t.expect(sent == session.tx_sequence and running.native_active == null and model.charged == 0);
         caps.* = original;
     }
@@ -10565,6 +10895,29 @@ fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverAp
             const channel = running.activeChannel().?;
             if (channel.phase != .waiting) continue;
             const owner = running.native_buffers.items()[running.native_active.?].owner.?;
+            if (owner.clear_active) {
+                const clear = @import("gsp_memory_clear.zig");
+                try t.expect(explicit_clear and owner.physical and !owner.cleared and !owner.virtual and !owner.mapped and !owner.committed and owner.info() == null);
+                try t.expect(clear.matches(.{ .epoch = running.epoch, .client = running.static_info.?.client, .subdevice = running.static_info.?.subdevice },
+                    (owner.storage_policy.?.physical_bytes / 4 * (index + 1)) & ~@as(u64, 65535), owner.bytes, channel.request));
+                var response: [clear.bytes]u8 = undefined;
+                @memcpy(&response, channel.request);
+                channel.phase = .prepared;
+                try target.port.owner.?.admit_command.?(target.port.owner.?.context, &target.port, deadline);
+                owner.clear_request[72] ^= 1;
+                try t.expectError(error.Binding, target.port.owner.?.admit_command.?(target.port.owner.?.context, &target.port, deadline));
+                owner.clear_request[72] ^= 1; channel.phase = .waiting;
+                if (model.is("vram_storage_gsp_clear_reject")) outputWord(&response, 12, 0x56);
+                if (model.is("vram_storage_gsp_clear_changed")) response[104] ^= 1;
+                std.mem.writeInt(u32, backing.?[status + 64..][0..4], session.tx_write, .little);
+                try nativeReply(session, clear.function, 0, &response);
+                if (model.is("vram_storage_gsp_clear_ack")) range_failure_call = range_calls + 4;
+                _ = target.step(); range_failure_call = 0;
+                try t.expect(owner.cleared == model.is("vram_storage_gsp_clear"));
+                try t.expect(!owner.committed and !owner.mapped and !model.slots[index].published);
+                messages += 1;
+                continue;
+            }
             const op = owner.operation.?;
             const cursor = (session.tx_write + 62) % 63;
             const record = try transport.message.decode(session.profile, backing.?[command + 4096 + cursor * 4096 ..][0..4096], session.tx_sequence - 1);
@@ -10594,6 +10947,14 @@ fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverAp
                     try t.expect(((attr >> 27) & 3) == 2 and std.mem.readInt(u32, response[36..40], .little) == 0 and
                         std.mem.readInt(u32, response[40..44], .little) & 0x1000 != 0 and owner.physical_extent == null);
                     std.mem.writeInt(u64, response[112..120], (policy.physical_bytes / 4 * (index + 1)) & ~@as(u64, 65535), .little);
+                    if (explicit_clear) {
+                        // Physical161 RM reply normalization precedes the
+                        // explicit clear; ACK still owns publication.
+                        outputWord(&response, 40, std.mem.readInt(u32, response[40..44], .little) | 1);
+                        outputWord(&response, 60, 5);
+                        outputWord(&response, 64, 6);
+                        std.mem.writeInt(u64, response[88..96], policy.physical_bytes - 1, .little);
+                    }
                     if (model.is("vram_storage_bounds")) std.mem.writeInt(u64, response[112..120], policy.physical_bytes, .little);
                     if (model.is("vram_storage_contiguity")) response[59] ^= 0x18;
                 }
@@ -10767,7 +11128,7 @@ fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverAp
         try t.expect(steps < 160);
     }
     const uncertain = model.is("vram_size") or model.is("vram_ack") or model.is("vram_timeout") or model.is("vram_free") or model.is("vram_finish") or model.is("vram_surface_changed") or model.is("vram_surface_contiguity") or
-        model.is("vram_storage_bounds") or model.is("vram_storage_contiguity") or model.is("vram_storage_descriptor");
+        model.is("vram_storage_bounds") or model.is("vram_storage_contiguity") or model.is("vram_storage_descriptor") or (explicit_clear and !success);
     try t.expect(target.phase == .recovering and target.failure != null);
     if (uncertain) {
         try t.expect(model.charged == full and model.slots[0].live and running.native_buffers.items()[0].owner != null);
@@ -11294,6 +11655,8 @@ fn checkDeviceMappings(target: *@import("gsp_device.zig").Device, table: *a.Driv
             try t.expect(info.address == model.address(count) and info.logical_bytes == model.rounded[count] - 5 and info.mapped_bytes == model.rounded[count]);
             try t.expect(info.parts == @as(u16, if (count == 0) 3 else 1));
             try t.expect(model.refs[count] and model.dma[count].lease.id != 0 and model.gpu[count].lease.id != 0);
+            try t.expectEqual(info.logical_bytes, model.gpu[count].byte_length);
+            try t.expectEqual(info.mapped_bytes, model.dma[count].byte_length);
             try t.expectError(error.Busy, running.retireBuffer(handles[count], deadline, false));
             if (model.is("mapping_success") and count == 0) {
                 const owner = running.buffers.items()[handles[0].slot].owner.?;
@@ -11480,11 +11843,39 @@ fn checkDevicePower(target: *@import("gsp_device.zig").Device) !void {
         try t.expect(timed.flags == 1 and timed.values[1] == std.time.ns_per_s and timed.values[3] >= timed.values[2]);
         try t.expect(owner.timing_until == model.wanted_until);
     }
-    // Parent destruction must wait for exact RUSD detach and queue ACK.
+    if (model.is("power_success")) {
+        // The original physical RM owns this page for its firmware lifetime.
+        // Terminal unload drains polling/boost and keeps the DMA lease until
+        // reset; it must not re-initialize that global mapping with address0.
+        checkpoint = "terminal firmware lifetime";
+        run.shutdown_closing = true;
+        defer run.shutdown_closing = false;
+        const end = clock + 5 * std.time.ns_per_s;
+        try t.expectError(error.Busy, run.beginDestroyGraph(end, true));
+        for (0..30) |_| {
+            try stepDevicePower(target);
+            run.beginDestroyGraph(end, true) catch |err| {
+                if (err == error.Busy) continue; return @as(anyerror!void, err);
+            };
+            break;
+        }
+        try t.expect(run.graph_closing and !run.power_active and owner.active == null and
+            owner.active_mask == 0 and owner.detach_rejection == null and
+            owner.performance.pending == null and owner.performance.accepted_level == 0);
+        try t.expect(!owner.closed() and owner.attached and owner.possibly_attached and
+            owner.backing.retained and owner.backing.valid() and model.active and model.mapped and
+            model.attached and model.releases == 0 and !owner.backing.close());
+        const unproven: @import("gsp_reset.zig").Quiescence = .{ .owner = &target.gpu_reset, .epoch = run.epoch };
+        try t.expect(!owner.backing.closeAfterReset(unproven) and model.releases == 0);
+        const controls = owner.controls;
+        for (0..3) |_| try t.expect((try owner.choose(clock, .{})) == null);
+        try t.expect(owner.controls == controls);
+        std.debug.print("[nvidia-terminal-rusd] poll/boost drained; no address0 init RPC; page retained until physical reset proof\n", .{});
+        return;
+    }
+    // Ordinary graph destruction still requires exact RUSD detach and ACK.
     checkpoint = "detach";
-    // Exercise the same closing admission as terminal shutdown: suppress
-    // new telemetry/receiver work while still draining the attached owner.
-    run.shutdown_closing = true;
+    run.shutdown_closing = false;
     defer run.shutdown_closing = false;
     const deadline = clock + 5 * std.time.ns_per_s;
     try t.expectError(error.Busy, run.beginDestroyGraph(deadline, true));
@@ -11496,9 +11887,41 @@ fn checkDevicePower(target: *@import("gsp_device.zig").Device) !void {
         try t.expect(owner.attached and owner.possibly_attached and model.active and model.mapped and model.releases == 0);
         try t.expect(!owner.backing.close());
         const controls = owner.controls;
-        // A matched unsupported detach stays retained without an RPC loop.
+        // A matched rejected detach stays retained without an RPC loop.
         for (0..3) |_| try t.expect((try owner.choose(clock, .{})) == null);
         try t.expect(owner.controls == controls and !owner.closed());
+        // The rejection loop observed the ACK; finish its ownership handoff
+        // before checking the later graph admission.
+        try stepDevicePower(target);
+        try t.expect(!run.power_active and owner.active == null and !owner.completed);
+        // Terminal graph teardown may retain an acknowledged, still attached
+        // RUSD page through firmware unload/FLR. It must never claim detach
+        // success or free that page just because its de-init was rejected.
+        checkpoint = "terminal retained telemetry";
+        run.shutdown_closing = false;
+        try t.expectError(error.Busy, run.beginDestroyGraph(deadline, true));
+        run.shutdown_closing = true;
+        owner.active_mask = 1;
+        try t.expectError(error.Busy, run.beginDestroyGraph(deadline, true));
+        owner.active_mask = 0;
+        const accepted_level = owner.performance.accepted_level;
+        const accepted_until = owner.performance.accepted_until;
+        owner.performance.accepted_level = 1;
+        owner.performance.accepted_until = clock + std.time.ns_per_s;
+        try t.expectError(error.Busy, run.beginDestroyGraph(deadline, true));
+        owner.performance.accepted_level = accepted_level;
+        owner.performance.accepted_until = accepted_until;
+        owner.backing.retained = false;
+        try t.expectError(error.Busy, run.beginDestroyGraph(deadline, true));
+        owner.backing.retained = true;
+        const dma_stamp = owner.backing.dma_stamp;
+        owner.backing.dma_stamp.lease.generation += 1;
+        try t.expectError(error.Busy, run.beginDestroyGraph(deadline, true));
+        owner.backing.dma_stamp = dma_stamp;
+        try run.beginDestroyGraph(deadline, true);
+        try t.expect(run.graph_closing and !owner.closed() and owner.attached and owner.possibly_attached);
+        try t.expect(owner.backing.retained and owner.backing.valid() and !owner.backing.close());
+        try t.expect(model.active and model.mapped and model.attached and model.releases == 0 and owner.controls == controls);
     } else {
         try t.expect(owner.closed() and !model.active and !model.mapped and model.releases == 1);
         try t.expect(ControlModel.active and ControlModel.releases == 0);
@@ -11531,8 +11954,9 @@ fn stepDevicePower(target: *@import("gsp_device.zig").Device) !void {
     } else if (operation == .poll) {
         if (model.is("power_poll_reject")) outputWord(&response, 12, 0x56);
     } else if (operation == .detach) {
+        if (model.is("power_success") and run.shutdown_closing) return error.TerminalRusdReinitialization;
         try t.expect(owner.stopping and model.attached and !owner.backing.close());
-        if (model.is("power_detach_reject")) outputWord(&response, 12, 0x56) else model.attached = false;
+        if (model.is("power_detach_reject")) outputWord(&response, 12, 0x1f) else model.attached = false;
     } else if (operation == .timer) {
         std.mem.writeInt(u64, response[24..32], 1_790_000_000_000_000_000 + clock, .little);
     }
@@ -12825,9 +13249,15 @@ fn checkDeviceRuntime(target: *@import("gsp_device.zig").Device, words: []u32, f
             @memcpy(xid[12..16], "diag");
             try nativeEvent(&target.session.?, 0x1006, &xid);
             try t.expect(target.step() == .progress and target.running.snapshot.xid_count == 1 and target.running.snapshot.last_xid == 23);
-            const nocat: [1208]u8 = @splat(0);
+            var nocat: [1208]u8 = @splat(0);
+            std.mem.writeInt(u32, nocat[176..180], 1024, .little);
+            @memset(nocat[180..1204], 0x5a);
+            nocat[1203] = 0xa5;
+            const data_logs = DeviceModel.nocat_data_logs;
+            const tail_logs = DeviceModel.nocat_tail_logs;
             try nativeEvent(&target.session.?, 0x1020, &nocat);
-            try t.expect(target.step() == .progress and target.running.snapshot.nocat_count == 1);
+            try t.expect(target.step() == .progress and target.running.snapshot.nocat_count == 1 and target.running.channel.?.pending == null);
+            try t.expect(DeviceModel.nocat_data_logs == data_logs + 32 and DeviceModel.nocat_tail_logs == tail_logs + 1);
             try deviceSequence(target, &.{ 0, core.reg.mailbox0, 0x7979, 4, core.reg.mailbox0, 0 });
             try t.expect(target.step() == .progress and target.running.sequence.self_address != 0);
             var count: usize = 0;

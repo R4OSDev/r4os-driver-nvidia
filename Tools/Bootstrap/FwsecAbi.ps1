@@ -64,6 +64,12 @@ function Confirm-FwsecAbi([string]$Compiler,[string]$Source,[string]$Run,[string
     $result=Invoke-RmNative -Executable $exe -Arguments @() -WorkingDirectory $Run -LogPath (Join-Path $Stage 'fwsec-abi.json') -TimeoutSeconds 20
     if($result -ne 0){throw 'Zig firmware command, memory or message bytes differ from original NVIDIA C structures'}
     $abi=Get-Content -Raw (Join-Path $Stage 'fwsec-abi.json')|ConvertFrom-Json
+    if(!$abi.gsp_host_channel_original_comparison -or $abi.gsp_host_channel_cases -ne 768){throw 'Host channel binding/token original-C comparison incomplete'}
+    if(!$abi.gsp_copy_caps_original_comparison -or $abi.gsp_copy_caps_cases -ne 80){throw 'Standalone CE capability original-C comparison incomplete'}
+    if(!$abi.gsp_host_mmu_original_comparison -or $abi.gsp_host_mmu_pte_cases -ne 672){throw 'Host MMU original-C comparison incomplete'}
+    if(!$abi.gsp_memory_clear_original_comparison -or $abi.gsp_memory_clear_cases -ne 6){throw 'Explicit VRAM clear original-C comparison incomplete'}
+    if(!$abi.gsp_memory_owner_original_comparison -or $abi.gsp_memory_owner_packets -ne 54){throw 'RM memory-owner comparison incomplete'}
+    if(!$abi.gsp_preboot_registry_original_comparison -or $abi.gsp_preboot_registry_entries -ne 4 -or $abi.gsp_static_original_bytes -ne 1656 -or $abi.gsp_static_split_vas_offset -ne 1565){throw 'Preboot registry/static mode comparison incomplete'}
     if(!$abi.gsp_unload_original_comparison -or $abi.gsp_unload_payload_bytes -ne 8){throw 'GSP orderly unload ABI comparison incomplete'}
     if(!$abi.gsp_boot_event_original_comparison -or $abi.gsp_boot_event_fixtures -ne 6){throw 'GSP boot event comparison incomplete'}
     if(!$abi.gsp_sequencer_original_comparison -or $abi.gsp_sequencer_opcodes -ne 9){throw 'GSP sequencer comparison incomplete'}

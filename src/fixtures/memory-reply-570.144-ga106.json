@@ -1,0 +1,14 @@
+{
+  "source": "OssiPC GA106; NVIDIA570.144; physical runtime capture, 2026-09-29",
+  "driver": "0.1.156",
+  "kernel": "0.1.232",
+  "release": "0.82.0",
+  "archive": "ExFiles/Reports/OssiGPU/20260929-newssd/native156/NewSSDHeadless156A-Receipt.txt",
+  "capture_sha256": "b0f4df09385988a6c8f856d81a5a14ff5902fce7671cad9a5466e110776adb2c",
+  "bytes": 320,
+  "sha256": "3234fa2b1062b756b1a3ce3dd4cc5588345ee295780eea25fbee4026a12244ae",
+  "layout": "160-byte request followed by160-byte reply; RPC103, sequence16 decimal, outer/inner status0",
+  "scope": "Successful RM allocation reply; driver rejected normalized fields. No mapping, GPU execution or clean teardown proven.",
+  "interpretation": "NVIDIA570.144 mem_utils.c, virtual_mem.c, vaspace.c, mem_mgr_gm107.c and mem_mgr_tu102.c",
+  "source_commit": "8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f"
+}

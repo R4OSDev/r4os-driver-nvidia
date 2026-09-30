@@ -69,15 +69,20 @@
 //  * DEALINGS IN THE SOFTWARE.
 //  */
 //! FERMI_VASPACE_A lifetime under the one actual RM graph and RPC token.
-//! RM creates/manages page tables. This object alone maps no app buffer and
-//! provides no CPU pointer, externally owned PDB or GPU completion guarantee.
+//! The native runtime requests external ownership and binds held host page
+//! tables before publishing Info. Legacy wire fixtures can still describe the
+//! original RM-managed contract without being selected by the native graph.
 const std = @import("std");
 const objects = @import("gsp_objects.zig");
 const exchange = @import("gsp_exchange.zig");
 const boot = @import("gsp_boot_events.zig");
-pub const Error = objects.Error;
+const host_vm = @import("gsp_host_vm.zig");
+const host_storage = @import("gsp_host_vm_storage.zig");
+const host_wire = @import("gsp_host_vm_wire.zig");
+pub const Error = objects.Error || host_vm.Error;
 pub const State = enum { creating, ready, handed_off, destroying, closed, finished, failed };
-pub const Info = struct { epoch: u64, client: u32, device: u32, handle: u32, base: u64, bytes: u64, big_page_bytes: u32 };
+pub const Info = struct { epoch: u64, client: u32, device: u32, handle: u32, base: u64, bytes: u64, big_page_bytes: u32,
+    host: ?*host_vm.Owner = null };
 
 /// Pinned570.144 vaspaceapiConstruct_IMPL returns vaBase and a BYTE LENGTH
 /// (limit - base + 1). The nvos.h comment describes an exclusive limit; the
@@ -85,8 +90,9 @@ pub const Info = struct { epoch: u64, client: u32, device: u32, handle: u32, bas
 pub fn decodeInfo(plan: *const objects.Plan, bytes: []const u8) Error!Info {
     if (bytes.len != 80) return error.Payload;
     const params = bytes[32..];
-    for ([_]usize{ 0, 4, 16, 20, 24, 28, 36 }) |at|
+    for ([_]usize{ 0, 16, 20, 24, 28, 36 }) |at|
         if (std.mem.readInt(u32, params[at..][0..4], .little) != 0) return error.Payload;
+    if (std.mem.readInt(u32, params[4..8], .little) != @as(u32, if (plan.external_vaspace) host_wire.external_vaspace_flags else 0)) return error.Payload;
     const big_page = std.mem.readInt(u32, params[32..36], .little);
     const base = std.mem.readInt(u64, params[40..48], .little);
     const length = std.mem.readInt(u64, params[8..16], .little);
@@ -103,14 +109,60 @@ pub const Owner = struct {
     state: State = .creating,
     info: ?Info = null,
     rejected: ?u32 = null,
+    protocol_failure: ?exchange.Error = null,
     outstanding: ?objects.Operation = null,
     request: [80]u8 = undefined,
     self_address: usize = 0,
+    host_vm: host_vm.Owner = .{},
+    host_storage: host_storage.Owner = .{},
+    host_io: ?host_vm.tlb.Io = null,
+    host_control: ?host_wire.Operation = null,
 
     pub fn init(token: *boot.Handoff, plan: objects.Plan, deadline: u64) Error!Owner {
         try plan.validate();
         if (plan.handles.vaspace == 0 or plan.epoch != token.session.epoch) return error.Handle;
         return .{ .exchange = try exchange.Exchange.init(token, deadline), .plan = plan, .deadline = deadline };
+    }
+    pub fn configureHost(self: *Owner, ctx: *const @import("r4os").r4dev.DriverContext, adapter: u32, io: host_vm.tlb.Io) Error!void {
+        if (self.self_address != 0 or self.state != .creating or !self.plan.external_vaspace or self.host_io != null) return error.State;
+        try self.host_storage.configure(ctx, adapter, self.plan.epoch);
+        self.host_io = io;
+    }
+    fn hostBinding(self: *Owner) Error!host_wire.Binding {
+        return .{ .epoch = self.plan.epoch, .client = self.plan.handles.client, .device = self.plan.handles.device,
+            .vaspace = self.plan.handles.vaspace, .root_dma = try self.host_vm.rootAddress() };
+    }
+    fn pollHost(self: *Owner) Error!?exchange.Dispatch {
+        if (self.host_vm.self_address == 0) {
+            const info = self.info orelse return error.State;
+            try self.host_vm.prepare(self.plan.epoch, info.base, info.bytes, try self.host_storage.backend(), self.host_io orelse return error.State);
+            return null;
+        }
+        if (self.host_control == null) {
+            const operation: host_wire.Operation = if (self.state == .creating) .bind else .unbind;
+            if (operation == .unbind and (self.host_vm.ranges != null or self.host_vm.work != null)) return error.Busy;
+            const request = try host_wire.encode(try self.hostBinding(), operation, &self.request);
+            try self.exchange.begin(host_wire.function, request, self.deadline);
+            if (operation == .bind) try self.host_vm.bindSubmitted();
+            self.host_control = operation;
+        }
+        const dispatch = (try self.exchange.poll(self.deadline)) orelse return null;
+        if (!dispatch.response) return dispatch;
+        const operation = self.host_control.?;
+        const reply = try host_wire.decode(try self.hostBinding(), operation, dispatch.record);
+        try self.exchange.complete(dispatch.ticket);
+        if (reply == .rejected) { self.rejected = reply.rejected; return error.FirmwareResult; }
+        self.host_control = null;
+        if (operation == .bind) {
+            try self.host_vm.bindConfirmed();
+            self.info.?.host = &self.host_vm;
+            self.state = .ready;
+        } else {
+            try self.host_vm.unbindConfirmed();
+            try self.host_vm.close();
+            try self.host_storage.closeEmpty();
+        }
+        return null;
     }
     fn stable(self: *Owner) Error!void {
         if (self.self_address != 0 and self.self_address != @intFromPtr(self)) return error.Stale;
@@ -118,7 +170,8 @@ pub const Owner = struct {
     }
     fn fail(self: *Owner, reason: Error) Error {
         self.state = .failed;
-        return self.exchange.fail(reason);
+        self.protocol_failure = self.exchange.fail(error.Handler);
+        return reason;
     }
     pub fn poll(self: *Owner) Error!?exchange.Dispatch {
         try self.stable();
@@ -126,6 +179,9 @@ pub const Owner = struct {
         self.self_address = @intFromPtr(self);
         self.exchange.guard(self.deadline) catch |err| return self.fail(err);
         if (self.exchange.pending != null) return error.Pending;
+        if (self.plan.external_vaspace and self.info != null and
+            ((self.state == .creating) or self.host_vm.attached))
+            return self.pollHost() catch |err| return self.fail(err);
         if (self.outstanding == null) {
             if (self.state == .destroying and self.info == null) {
                 self.state = .closed;
@@ -151,7 +207,7 @@ pub const Owner = struct {
         if (operation == .allocate) {
             self.info = info;
             if (reply == .rm_error) self.rejected = reply.rm_error;
-            self.state = .ready;
+            if (!self.plan.external_vaspace or info == null) self.state = .ready;
         } else {
             self.info = null;
             self.state = .closed;
@@ -173,6 +229,13 @@ pub const Owner = struct {
         self.state = .destroying;
     }
     pub fn matches(self: *const Owner, current: *const exchange.Exchange, deadline: u64) bool {
+        if (self.self_address == @intFromPtr(self) and self.host_control != null and self.outstanding == null and
+            (self.state == .creating or self.state == .destroying)) {
+            return current == &self.exchange and current.phase == .prepared and current.pending == null and
+                current.deadline == deadline and self.deadline == deadline and current.session.epoch == self.plan.epoch and
+                current.request.ptr == self.request[0..].ptr and current.request.len == host_wire.length(self.host_control.?) and
+                current.function == host_wire.function;
+        }
         if (self.self_address != @intFromPtr(self) or self.outstanding == null or
             (self.state != .creating and self.state != .destroying)) return false;
         const allocate = self.outstanding.? == .allocate;

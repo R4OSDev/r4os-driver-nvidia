@@ -7,11 +7,13 @@ const boot = @import("gsp_boot_events.zig");
 const exchange = @import("gsp_exchange.zig");
 const names = @import("gsp_rm_names.zig");
 const vaspace = @import("gsp_vaspace.zig");
+const host_vm = @import("gsp_host_vm.zig");
+const clear = @import("gsp_memory_clear.zig");
 pub const wire = @import("gsp_vram_wire.zig");
 pub const surface = @import("gsp_surface_layout.zig");
 pub const storage = @import("gsp_native_backing.zig");
 pub const alias = @import("gsp_memory_alias.zig");
-pub const Error = wire.Error || names.Error || surface.Error || storage.Error || error{ Api, Descriptor, Memory, Busy, Retained };
+pub const Error = wire.Error || names.Error || surface.Error || storage.Error || host_vm.Error || error{ Api, Descriptor, Memory, Busy, Retained };
 pub const State = enum { creating, unwinding, ready, handed_off, destroying, closed, finished, failed };
 pub const Info = struct { reference: a.GfxBufferReference, address: u64, logical_bytes: u64, allocation_bytes: u64, epoch: u64, surface: surface.Plan, physical: ?storage.Physical = null };
 pub const Owner = struct {
@@ -39,6 +41,9 @@ pub const Owner = struct {
     closing: bool = false,
     release: a.GfxOwnedBufferRelease = .{},
     physical: bool = false,
+    cleared: bool = false,
+    clear_active: bool = false,
+    clear_request: [clear.bytes]u8 = undefined,
     virtual: bool = false,
     mapped: bool = false,
     address: u64 = 0,
@@ -51,6 +56,10 @@ pub const Owner = struct {
     host_rejected: ?i32 = null,
     failure: ?Error = null,
     protocol_failure: ?exchange.Error = null,
+    host_range: host_vm.Range = .{},
+    host_binding: host_vm.Binding = .{},
+    host_active: bool = false,
+    host_physical: ?u64 = null,
 
     pub fn init(token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext, adapter: u32, space: vaspace.Info,
         parent: names.Lease, logical_bytes: u64, deadline: u64) Error!Owner
@@ -146,8 +155,12 @@ pub const Owner = struct {
         if (reference.flags != 0) return error.Unsupported;
         if (self.storage_policy != null or self.layout.privileged or self.layout.readonly) return error.Unsupported;
         if (bytes == 0 or (offset | bytes) & 4095 != 0 or bytes > self.logical_bytes or offset > self.logical_bytes - bytes) return error.Bounds;
+        var host_source = self.hostSource();
+        host_source.offset = offset;
+        host_source.bytes = bytes;
         try self.aliases.acquire(use, .{ .space = self.binding.space, .object = self.binding.memory,
-            .allocation_bytes = self.bytes, .offset = offset, .bytes = bytes, .location = .video });
+            .allocation_bytes = self.bytes, .offset = offset, .bytes = bytes, .location = .video,
+            .host = if (self.binding.space.host != null) host_source else null });
         use.retainReference(self.memory, reference.reference, self.reservation.buffer) catch |err| {
             if (err != error.Descriptor and err != error.Retained) { try use.close(true); return err; }
             // A partial/invalid returned import is retained, never dropped or
@@ -216,10 +229,20 @@ pub const Owner = struct {
     fn advance(self: *Owner) Error!?exchange.Dispatch {
         try self.exchange.guard(self.deadline);
         if (self.exchange.pending != null) return error.Pending;
+        if (self.clear_active) return self.advanceClear();
         if (self.operation == null) {
             if (self.state == .creating and !self.common_live) { try self.reserve(); return null; }
             const op: wire.Operation = if (self.state == .creating) blk: {
                 if (!self.physical) break :blk .allocate_memory;
+                if (!self.cleared) {
+                    const policy = self.storage_policy orelse return error.State;
+                    const target = policy.clear orelse return error.Unsupported;
+                    const physical = self.physical_extent orelse return error.State;
+                    const data = try clear.encode(target, physical.base, self.bytes, &self.clear_request);
+                    try self.exchange.begin(clear.function, data, self.deadline);
+                    self.clear_active = true; self.last_status = null;
+                    return self.advanceClear();
+                }
                 if (!self.virtual) break :blk .allocate_virtual;
                 if (!self.mapped) break :blk .map;
                 try self.publish(); return null;
@@ -233,8 +256,14 @@ pub const Owner = struct {
                 self.state = if (self.state == .unwinding) .ready else .closed;
                 return null;
             };
+            if (self.binding.space.host) |host| if (op != .allocate_memory and op != .free_memory) {
+                if (try self.exchange.poll(self.deadline)) |dispatch| return dispatch;
+                if (self.exchange.in_lockdown) return null;
+                try self.advanceHost(host, op);
+                return null;
+            };
             const encoded = try wire.encodeLayout(self.binding, self.bytes, .{ .blocklinear = self.layout.blocklinear(), .scanout = self.layout.scanout(),
-                .contiguous = self.storage_policy != null, .granule = self.layout.descriptor.alignment,
+                .contiguous = self.storage_policy != null or self.binding.space.host != null, .granule = self.layout.descriptor.alignment,
                 .privileged = self.layout.privileged, .readonly = self.layout.readonly }, op, self.address, &self.request);
             try self.exchange.begin(encoded.function, encoded.bytes, self.deadline);
             self.operation = op; self.request_bytes = encoded.bytes.len;
@@ -254,16 +283,92 @@ pub const Owner = struct {
         } else switch (op) {
             .allocate_memory => {
                 self.physical = true;
+                self.cleared = if (self.storage_policy) |policy| policy.capabilities.vidmemCleared() else true;
+                if (self.binding.space.host != null) {
+                    // The original allocation request and strict decoder
+                    // require PHYSICALITY_CONTIGUOUS for this host walk.
+                    // Never infer a complete extent from a discontiguous RM
+                    // allocation's first returned physical page.
+                    if (reply.ok >= host_vm.page.video_limit or self.bytes > host_vm.page.video_limit - reply.ok) return error.Bounds;
+                    self.host_physical = reply.ok;
+                }
                 if (self.storage_policy != null) self.physical_extent = .{ .base = reply.ok, .bytes = self.bytes };
             },
             .allocate_virtual => { self.virtual = true; self.address = reply.ok; },
             .map => self.mapped = true,
             .unmap => self.mapped = false,
             .free_virtual => { self.virtual = false; self.address = 0; },
-            .free_memory => { self.physical = false; self.physical_extent = null; },
+            .free_memory => { self.physical = false; self.cleared = false; self.physical_extent = null; self.host_physical = null; },
         }
         self.operation = null;
         return null;
+    }
+    fn advanceClear(self: *Owner) Error!?exchange.Dispatch {
+        const dispatch = (try self.exchange.poll(self.deadline)) orelse return null;
+        if (!dispatch.response) return dispatch;
+        const target = self.storage_policy.?.clear.?;
+        const reply = try clear.decode(target, self.physical_extent.?.base, self.bytes, &self.clear_request, dispatch.record);
+        self.last_status = if (reply == .rejected) reply.rejected else 0;
+        try self.exchange.complete(dispatch.ticket);
+        // A timeout/rejection may leave a partial or uncertain firmware
+        // write. Keep the private extent until independent reset quiescence.
+        if (reply == .rejected) { self.rejected = reply.rejected; return error.FirmwareResult; }
+        self.cleared = true; self.clear_active = false;
+        return null;
+    }
+    fn hostSource(self: *const Owner) host_vm.Source {
+        return .{ .context = self, .valid = hostValid, .physical = hostPhysical, .bytes = self.bytes,
+            .policy = .{ .aperture = .video, .kind = if (self.layout.blocklinear()) 6 else 0, .cached = true,
+                .read_only = self.layout.readonly, .privileged = self.layout.privileged, .atomic = true } };
+    }
+    fn hostValid(raw: *const anyopaque, epoch: u64) bool {
+        const self: *const Owner = @ptrCast(@alignCast(raw));
+        self.stable() catch return false;
+        return self.self_address == @intFromPtr(self) and self.binding.space.epoch == epoch and self.physical and self.host_physical != null;
+    }
+    fn hostPhysical(raw: *const anyopaque, offset: u64) host_vm.Error!u64 {
+        const self: *const Owner = @ptrCast(@alignCast(raw));
+        if (!hostValid(raw, self.binding.space.epoch)) return error.Stale;
+        if (offset >= self.bytes or offset & 4095 != 0) return error.Bounds;
+        return self.host_physical.? + offset;
+    }
+    fn advanceHost(self: *Owner, host: *host_vm.Owner, op: wire.Operation) Error!void {
+        self.last_status = null;
+        switch (op) {
+            .allocate_virtual => {
+                self.address = try host.reserve(&self.host_range, self.bytes, self.layout.descriptor.alignment, 0);
+                self.virtual = true;
+            },
+            .map => {
+                if (!self.host_active) {
+                    try host.beginMap(&self.host_range, &self.host_binding, 0, self.hostSource(), self.deadline);
+                    self.host_active = true;
+                    return;
+                }
+                if (!try host.poll(&self.host_binding)) return;
+                self.host_active = false;
+                self.mapped = true;
+            },
+            .unmap => {
+                if (!self.host_active) {
+                    if (!self.aliases.empty()) return error.Busy;
+                    // A common last-use release ticket or unpublished unwind
+                    // already excludes every executing consumer here.
+                    try host.beginUnmap(&self.host_binding, self.deadline, true);
+                    self.host_active = true;
+                    return;
+                }
+                if (!try host.poll(&self.host_binding)) return;
+                self.host_active = false;
+                self.mapped = false;
+            },
+            .free_virtual => {
+                try host.releaseRange(&self.host_range);
+                self.virtual = false;
+                self.address = 0;
+            },
+            .allocate_memory, .free_memory => return error.State,
+        }
     }
     // Closing the initial reference is a logical operation. Imports, queue
     // leases and execution uses can independently keep the allocation alive.
@@ -336,6 +441,15 @@ pub const Owner = struct {
     }
     pub fn matches(self: *const Owner, channel: *const exchange.Exchange, deadline: u64) bool {
         self.stable() catch return false;
+        if (self.clear_active) {
+            const policy = self.storage_policy orelse return false;
+            const target = policy.clear orelse return false;
+            const physical = self.physical_extent orelse return false;
+            return self.self_address == @intFromPtr(self) and channel == &self.exchange and channel.deadline == deadline and self.deadline == deadline and
+                self.state == .creating and self.physical and !self.cleared and !self.virtual and !self.mapped and self.operation == null and
+                target.epoch == self.binding.space.epoch and physical.bytes == self.bytes and channel.function == clear.function and
+                channel.request.ptr == self.clear_request[0..].ptr and clear.matches(target, physical.base, self.bytes, channel.request);
+        }
         const op = self.operation orelse return false;
         return self.self_address == @intFromPtr(self) and channel == &self.exchange and channel.deadline == deadline and self.deadline == deadline and
             channel.function == wire.function(op) and channel.request.ptr == self.request[0..].ptr and channel.request.len == self.request_bytes and

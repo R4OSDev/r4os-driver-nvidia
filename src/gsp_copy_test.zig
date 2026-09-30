@@ -13,7 +13,7 @@ fn record(function: u32, payload: []const u8) message.Record {
 pub fn check() !void {
     try checkScheduling();
     var config: fifo.Config = .{ .context = .{ .epoch = 7, .client = 0xc1d00000, .device = 0x10000000, .subdevice = 0x10000001,
-        .vaspace = 0x10000006, .group = 0x10000009, .share = 0x1000000a }, .handle = 0x1000000d, .rm_engine = 19, .runqueue = 0,
+        .vaspace = 0x10000006, .group = 0x10000009, .share = 0x1000000a }, .handle = 0x1000000d, .rm_engine = 19, .runqueue = 0, .hardware_channel = 8, .runlist = 0,
         .address = 0x600000, .instance = 0x10000000, .userd = 0x8000004000, .methods = 0x30000000, .method_bytes = 0x6000,
         .system_userd = true, .engine = .copy, .object_handle = 0x1000000e, .object_class = 0xc7b5 };
     try t.expect(golden.len == 1196);

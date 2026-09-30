@@ -327,11 +327,20 @@ const std = @import("std");
 const exchange = @import("gsp_exchange.zig");
 pub const Error = exchange.Error || error{Unsupported};
 pub const graphics = @import("gsp_gr_context.zig");
-pub const Operation = enum { classes, engines, method_size, graphics_info, group, timeslice, share, free_share, free_group };
+pub const Operation = enum { classes, engines, copy_caps, method_size, graphics_info, group, timeslice, share, free_share, free_group };
 pub const timeslice = @import("gsp_timeslice.zig");
 pub const max_bytes: usize = 3236;
 pub const Binding = struct { epoch: u64, client: u32, device: u32, subdevice: u32, vaspace: u32, group: u32, share: u32, internal_client: u32 = 0, internal_subdevice: u32 = 0 };
 pub const Engine = struct { data: [16]u32, pbdma: [2]u32, faults: [2]u32, count: u32, name: [16]u8 };
+/// ctrl2080ce.h / kceGetDeviceCaps_IMPL: physical firmware capabilities.
+/// GRCE is synchronous with GR; SYSMEM admits system-memory transfers.
+/// The public GET_CAPS_V2 is host implemented, not a GSP control endpoint.
+pub const CopyCaps = struct {
+    bytes: [2]u8,
+    pub fn grce(self: CopyCaps) bool { return self.bytes[0] & 0x01 != 0; }
+    pub fn sysmem(self: CopyCaps) bool { return self.bytes[0] & 0x20 != 0; }
+    pub fn standalone(self: CopyCaps) bool { return !self.grce() and self.sysmem(); }
+};
 /// RM 570 has COPY0..COPY19. Only a CE on GR's actual runlist may be
 /// instantiated on its channel (Nouveau r535/fifo.c). Enumeration order and
 /// the NV2080 numbering gap at COPY10 must not choose the engine for us.
@@ -370,9 +379,9 @@ pub fn nvdecInstance(rm: u32) Error!u32 {
 pub fn nvencInstance(rm: u32) Error!u32 {
     return if (rm >= 37 and rm <= 40) rm - 37 else error.Unsupported;
 }
-pub fn function(op: Operation) u32 { return switch (op) { .classes, .engines, .method_size, .graphics_info, .timeslice => 76, .group, .share => 103, .free_share, .free_group => 10 }; }
-pub fn command(op: Operation) u32 { return switch (op) { .classes => 0x800292, .engines => 0x20801112, .method_size => 0x20802a08, .graphics_info => 0x20800a32, .timeslice => timeslice.command, else => 0 }; }
-pub fn length(op: Operation) usize { return switch (op) { .classes => 428, .engines => max_bytes, .method_size => 28, .graphics_info => 24 + graphics.info_bytes, .timeslice => 32, .group => 52, .share => 44, .free_share, .free_group => 16 }; }
+pub fn function(op: Operation) u32 { return switch (op) { .classes, .engines, .copy_caps, .method_size, .graphics_info, .timeslice => 76, .group, .share => 103, .free_share, .free_group => 10 }; }
+pub fn command(op: Operation) u32 { return switch (op) { .classes => 0x800292, .engines => 0x20801112, .copy_caps => 0x20802a07, .method_size => 0x20802a08, .graphics_info => 0x20800a32, .timeslice => timeslice.command, else => 0 }; }
+pub fn length(op: Operation) usize { return switch (op) { .classes => 428, .engines => max_bytes, .copy_caps => 32, .method_size => 28, .graphics_info => 24 + graphics.info_bytes, .timeslice => 32, .group => 52, .share => 44, .free_share, .free_group => 16 }; }
 pub fn word(data: []const u8, at: usize) u32 { return std.mem.readInt(u32, data[at..][0..4], .little); }
 fn put(out: []u8, at: usize, value: u32) void { std.mem.writeInt(u32, out[at..][0..4], value, .little); }
 pub fn validate(binding: Binding) Error!void {
@@ -394,6 +403,12 @@ pub fn encode(binding: Binding, rm_engine: u32, base: u32, op: Operation, output
             put(out, 4, if (op == .classes) binding.device else binding.subdevice);
             put(out, 8, command(op)); put(out, 16, @intCast(out.len - 24));
             if (op == .engines) put(out, 24, base);
+        },
+        .copy_caps => {
+            if (rm_engine < 9 or rm_engine > 28) return error.Unsupported;
+            if (binding.internal_client == 0 or binding.internal_subdevice == 0 or binding.internal_client == binding.client) return error.Handle;
+            put(out, 0, binding.internal_client); put(out, 4, binding.internal_subdevice);
+            put(out, 8, command(op)); put(out, 16, 8); put(out, 24, engine_type);
         },
         .graphics_info => {
             if (rm_engine != 1 or binding.internal_client == 0 or binding.internal_subdevice == 0 or binding.internal_client == binding.client) return error.Handle;
@@ -440,6 +455,7 @@ pub fn decode(binding: Binding, rm_engine: u32, base: u32, op: Operation, reques
             for (0..count) |i| if (word(payload, 12 + i * 100 + 80) > 2) return error.Bounds;
         },
         .method_size => if (word(payload, 0) == 0) return error.Bounds,
+        .copy_caps => if (rm_engine < 9 or rm_engine > 28 or word(payload, 0) != try nvEngine(rm_engine)) return error.Payload,
         .graphics_info => {}, // The context owner validates the bounded GR0 plan before ACK.
         .group, .timeslice => if (!std.mem.eql(u8, payload, request[header..])) return error.Payload,
         .share => {

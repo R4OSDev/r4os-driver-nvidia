@@ -28,6 +28,7 @@ const console = @import("boot_console.zig");
 
 pub const Phase = enum { detached, frts, prepare, load, start, notifications, ready, recovering, resetting, retiring, failed };
 pub const Progress = enum { progress, idle, stopped };
+const LiveCheck = enum { state, binding, inputs, frts, display };
 pub const RecoveryHooks = struct {
     context: usize = 0,
     // CPU-only restaging after old Port/Reader/RunMemory ownership retired.
@@ -58,6 +59,19 @@ pub const Device = struct {
     recovery_failure: ?anyerror = null,
     first_live_failure: ?anyerror = null,
     live_failure_epoch: u64 = 0,
+    live_check: LiveCheck = .state,
+    live_detail: struct {
+        check: LiveCheck = .state,
+        memory_valid: bool = false,
+        memory_failed: bool = false,
+        recovery_owner: usize = 0,
+        queue_epoch: u64 = 0,
+        queue_failed: bool = false,
+        queue_status: i32 = 0,
+        log_status: i32 = 0,
+        reader_error: ?anyerror = null,
+        frts_error: ?anyerror = null,
+    } = .{},
     failed_boot_info_status: i32 = std.math.minInt(i32),
     failed_boot_info: a.GfxNativeBootInfo = .{},
     frts_result: ?firmware.Result = null,
@@ -689,6 +703,13 @@ pub const Device = struct {
         return true;
     }
     fn resetFailed(self: *Device, err: anyerror) void {
+        // Retained owner metadata only. No fresh GPU or API query after a
+        // failed reset; identify the exact bounded retirement stage.
+        @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,
+            "NVIDIA reset-retirement: phase={s} stage={s} runtime={s} cursor={d} backend={} allocation={} provider={} result={s}",
+            .{ @tagName(self.phase), @tagName(self.reset_retire_stage), @tagName(self.running.reset_stage),
+                self.running.reset_cursor, self.running.copy_backend != null, self.running.allocations.pending != null,
+                self.running.virtual_provider.handle.id, @errorName(err) });
         if (self.boot_console.self_address != 0) self.boot_console.invalidate();
         self.recovery_failure = err;
         self.phase = .failed;
@@ -806,12 +827,32 @@ pub const Device = struct {
             if (self.first_live_failure == null) {
                 self.first_live_failure = err;
                 self.live_failure_epoch = self.epoch;
+                // Capture the cause before quarantine invalidates the run.
+                // These are held CPU metadata only, no query/MMIO/RPC/retry.
+                self.live_detail.check = self.live_check;
+                if (self.memory) |backing| {
+                    self.live_detail.memory_valid = backing.ownershipValid();
+                    self.live_detail.memory_failed = backing.failed;
+                    self.live_detail.recovery_owner = backing.recovery_owner;
+                    self.live_detail.queue_epoch = backing.queue.epoch;
+                    self.live_detail.queue_failed = backing.queue.failed;
+                    self.live_detail.queue_status = backing.queue.last_status;
+                    self.live_detail.log_status = backing.last_log_status;
+                }
+                if (self.reader) |reader| self.live_detail.reader_error = reader.last_error;
+                if (self.vram) |reservation| {
+                    if (reservation.binding(.frts)) |_| {} else |cause| {
+                        self.live_detail.frts_error = cause;
+                    }
+                }
             }
             return err;
         };
     }
     fn validateLive(self: *Device, recovering: bool) !void {
+        self.live_check = .state;
         if (self.self_address == 0 or self.self_address != @intFromPtr(self) or self.stopped) return error.State;
+        self.live_check = .binding;
         const display = self.display orelse return error.Binding;
         const backing = self.memory orelse return error.Binding;
         const reservation = self.vram orelse return error.Binding;
@@ -819,10 +860,13 @@ pub const Device = struct {
             display.context.?.api != self.ctx.?.api or display.boot.held_generation != self.display_epoch or
             display.borrower != @intFromPtr(reservation) or !display.register_access.valid() or
             (display.firmware_owner != 0 and display.firmware_owner != self.self_address)) return error.Binding;
+        self.live_check = .inputs;
         const inputs = if (recovering)
             (if (backing.recovery_owner == 0) try backing.retainedInputs() else try backing.recoveryInputs(backing.recovery_owner))
             else try backing.inputs();
+        self.live_check = .frts;
         if (backing.queue.epoch != self.epoch or inputs.frts == null or !reservation.validates(inputs.frts.?)) return error.Stale;
+        self.live_check = .display;
         const original = display.original_boot orelse return error.Binding;
         var current: a.GfxNativeBootInfo = .{};
         const status = display.boot.display.?.bootInfo(&current);
@@ -846,7 +890,7 @@ pub const Device = struct {
             .retain = retain, .quiesced = quiesced, .log_polling = polling,
             .admit_firmware = admitFirmware, .admit_cold = admitCold, .queue_memory = self.memory,
             .admit_runtime = admitRuntime, .admit_command = admitCommand, .admit_copy = admitCopy, .admit_graphics = admitGraphics, .admit_batch = admitBatch,
-            .admit_unload = admitUnload,
+            .admit_unload = admitUnload, .admit_host_mmu = admitHostMmu,
             .admit_display_retirement = admitDisplayRetirement,
             .admit_display_push = admitDisplayPush,
             .wake_work = wakeWork,
@@ -1004,6 +1048,22 @@ pub const Device = struct {
             !run.graph_closing or run.graph == null or run.graph.?.state != .finished or unload != &run.unload or
             run.activeChannel() != &run.channel.? or port.runtime_session != &self.session.? or
             !unload.waitingForSuspend(&run.channel.?, deadline)) return error.Binding;
+    }
+    fn admitHostMmu(raw: *anyopaque, port: *const native.Port, vm: *@import("gsp_host_vm.zig").Owner, deadline: u64) !void {
+        const self = from(raw);
+        try self.checkLive(false);
+        const run = &self.running;
+        if (self.phase != .ready or port != &self.port or port.phase != .runtime or self.session == null or self.inLockdown() or
+            run.self_address != @intFromPtr(run) or run.failure != null or run.sequence.self_address != 0 or run.graph == null or
+            run.graph.?.address_space == null or vm != &run.graph.?.address_space.?.host_vm or vm.epoch != run.epoch or
+            port.runtime_session != &self.session.? or self.session.?.pending != null) return error.Binding;
+        const channel = run.activeChannel() orelse return error.State;
+        if (channel.session != &self.session.? or channel.phase != .idle or channel.pending != null or
+            channel.request.len != 0) return error.Binding;
+        if (channel.deadline) |limit| if (limit != deadline) return error.Binding;
+        const operation = try vm.invalidation();
+        if (operation.deadline != deadline or operation.root_dma != try vm.rootAddress()) return error.Binding;
+        try channel.guard(deadline);
     }
     fn admitDisplayRetirement(raw: *anyopaque, port: *const native.Port, display_dma: *@import("gsp_display_channel.zig").Owner, deadline: u64) !void {
         const self = from(raw);
@@ -1378,11 +1438,33 @@ pub const Device = struct {
             .{ if (self.first_live_failure) |reason| @errorName(reason) else "none", self.live_failure_epoch,
                 if (self.port.first_generation_failure) |reason| @tagName(reason) else "none",
                 self.failed_boot_info_status, self.failed_boot_info.state, self.failed_boot_info.generation });
+        if (self.first_live_failure != null) {
+            @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,
+            "NVIDIA admission-detail: check={s} memory-valid={} failed={} recovery={x} queue-epoch={d} queue-failed={}",
+            .{ @tagName(self.live_detail.check), self.live_detail.memory_valid, self.live_detail.memory_failed,
+                self.live_detail.recovery_owner, self.live_detail.queue_epoch, self.live_detail.queue_failed });
+            @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,
+            "NVIDIA admission-io: queue-status={d} log-status={d} reader={s} frts={s}",
+            .{ self.live_detail.queue_status, self.live_detail.log_status,
+                if (self.live_detail.reader_error) |reason| @errorName(reason) else "none",
+                if (self.live_detail.frts_error) |reason| @errorName(reason) else "none" });
+        }
         if (self.port.firmware_operation) |*operation| {
             @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,
                 "NVIDIA falcon-failure: phase={s} engine={s} epoch={d} last-address={?x} last-value={?x} nested={s}",
                 .{ @tagName(operation.phase), @tagName(operation.options.engine), operation.options.epoch,
                     operation.last_address, operation.last_value, if (operation.hs_operation) |*hs_operation| @tagName(hs_operation.phase) else "none" });
+        }
+        if (self.recovery.operation) |*operation| {
+            @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,
+                "NVIDIA teardown-operation: phase={s} engine={s} operation={s} nested={s} last-address={?x} last-value={?x}",
+                .{ @tagName(self.recovery.phase), @tagName(operation.options.engine), @tagName(operation.phase),
+                    if (operation.hs_operation) |*nested| @tagName(nested.phase) else "none", operation.last_address, operation.last_value });
+            @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,
+                "NVIDIA teardown-clock: last={d} deadline={d} operation-last={d} nested-last={d} port-error={s}",
+                .{ self.port.recovery_last_clock, self.recovery.deadline, operation.last_clock,
+                    if (operation.hs_operation) |*nested| nested.last_clock else 0,
+                    if (self.port.recovery_failure) |failure| @errorName(failure) else "none" });
         }
         if (self.recovery.operation) |*operation| if (operation.fwsec_check) |check| {
             @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,

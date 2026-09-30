@@ -125,10 +125,15 @@ pub const Policy = struct {
     capabilities: caps.Info,
     physical_bytes: u64,
     role: enum { control, scanout } = .control,
+    clear: ?@import("gsp_memory_clear.zig").Binding = null,
     pub fn validate(self: Policy, space: vaspace.Info, bytes: u64) Error!void {
         const binding = self.capabilities.binding;
         if (binding.epoch != space.epoch or binding.client != space.client or binding.device != space.device) return error.Stale;
-        if (!self.capabilities.vidmemCleared()) return error.Unsupported;
+        if (!self.capabilities.vidmemCleared()) {
+            const target = self.clear orelse return error.Unsupported;
+            if (target.epoch != space.epoch) return error.Stale;
+            @import("gsp_memory_clear.zig").validate(target) catch return error.Descriptor;
+        }
         if (bytes == 0 or bytes > self.physical_bytes) return error.Bounds;
     }
 };

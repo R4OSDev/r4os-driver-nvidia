@@ -229,6 +229,7 @@ pub const Plan = struct {
     handles: Handles,
     process_id: u32,
     process_name: [100]u8,
+    external_vaspace: bool = false,
 
     /// Names must already be reserved in the caller's RM namespace. Validate
     /// local uniqueness, never allocate a global name from PCI/BDF/DCB indices.
@@ -337,7 +338,13 @@ pub fn encode(plan: *const Plan, operation: Operation, output: []u8) Error!Encod
                 // A new private RM-managed VA space, default base/size and
                 // explicit GA106 64-KB big pages. No external page directory,
                 // ATS, shared management, faulting or caller address.
-                .vaspace => put(params, 32, 65536),
+                .vaspace => {
+                    put(params, 32, 65536);
+                    if (plan.external_vaspace) {
+                        put(params, 4, @import("gsp_host_vm_wire.zig").external_vaspace_flags);
+                        std.mem.writeInt(u64, params[40..48], 4096, .little);
+                    }
+                },
             }
             return .{ .function = 103, .bytes = bytes };
         },

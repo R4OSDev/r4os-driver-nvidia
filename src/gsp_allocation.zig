@@ -109,7 +109,13 @@ pub const Owner = struct {
         if (self.pending) |pending| if (pending.buffer == null) {
             if (memory.nativeComplete(&self.handle, &pending.job.request, a.gfx_queue_error_device_lost, &.{}) == 1) self.pending = null;
         };
-        if (self.handle.id != 0 and memory.nativeUnregister(&self.handle) == 1) self.handle = .{};
+        if (self.handle.id != 0) {
+            const result = memory.nativeUnregister(&self.handle);
+            // Driver close may let the kernel reap an empty provider first.
+            // Its old handle is then stale, but a pending allocation claim
+            // still requires its own completion and retained BO retirement.
+            if (result == 1 or (result == a.gfx_buffer_error_stale and self.pending == null)) self.handle = .{};
+        }
     }
 
     pub fn closeAfterReset(self: *Owner, proof: @import("gsp_reset.zig").Quiescence, epoch: u64) bool {

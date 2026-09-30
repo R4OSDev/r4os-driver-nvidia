@@ -1,0 +1,10 @@
+{
+  "source_sha256": "b3c38f9f68ceb6afed4be84d678bc743bf01a2711b4081cda96ed4927e8411f3",
+  "meaning": "Successful firmware physical allocation; driver stopped decoding before explicit clear, VA mapping, CE or GR. Not GPU execution evidence.",
+  "source": "OssiPC NVIDIA0.1.161; 2026-09-29",
+  "sequence": 27,
+  "rpc": 103,
+  "sha256": "66702c1b7247d49e020643384470d8a95824fcf543018c5c9833a742b5111f17",
+  "request_bytes": 160,
+  "reply_bytes": 160
+}

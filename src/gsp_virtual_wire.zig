@@ -1,3 +1,72 @@
+// src/nvidia/src/kernel/gpu/mem_mgr/arch/maxwell/mem_mgr_gm107.c
+// /*
+//  * SPDX-FileCopyrightText: Copyright (c) 2006-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//  * SPDX-License-Identifier: MIT
+//  *
+//  * Permission is hereby granted, free of charge, to any person obtaining a
+//  * copy of this software and associated documentation files (the "Software"),
+//  * to deal in the Software without restriction, including without limitation
+//  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//  * and/or sell copies of the Software, and to permit persons to whom the
+//  * Software is furnished to do so, subject to the following conditions:
+//  *
+//  * The above copyright notice and this permission notice shall be included in
+//  * all copies or substantial portions of the Software.
+//  *
+//  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+//  * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+//  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+//  * DEALINGS IN THE SOFTWARE.
+//  */
+// src/nvidia/src/kernel/mem_mgr/vaspace.c
+// /*
+//  * SPDX-FileCopyrightText: Copyright (c) 2013-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//  * SPDX-License-Identifier: MIT
+//  *
+//  * Permission is hereby granted, free of charge, to any person obtaining a
+//  * copy of this software and associated documentation files (the "Software"),
+//  * to deal in the Software without restriction, including without limitation
+//  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//  * and/or sell copies of the Software, and to permit persons to whom the
+//  * Software is furnished to do so, subject to the following conditions:
+//  *
+//  * The above copyright notice and this permission notice shall be included in
+//  * all copies or substantial portions of the Software.
+//  *
+//  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+//  * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+//  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+//  * DEALINGS IN THE SOFTWARE.
+//  */
+// src/nvidia/src/kernel/gpu/mem_mgr/mem_utils.c
+// /*
+//  * SPDX-FileCopyrightText: Copyright (c) 2020-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//  * SPDX-License-Identifier: MIT
+//  *
+//  * Permission is hereby granted, free of charge, to any person obtaining a
+//  * copy of this software and associated documentation files (the "Software"),
+//  * to deal in the Software without restriction, including without limitation
+//  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//  * and/or sell copies of the Software, and to permit persons to whom the
+//  * Software is furnished to do so, subject to the following conditions:
+//  *
+//  * The above copyright notice and this permission notice shall be included in
+//  * all copies or substantial portions of the Software.
+//  *
+//  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+//  * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+//  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+//  * DEALINGS IN THE SOFTWARE.
+//  */
 // src/nvidia/src/kernel/gpu/mem_mgr/arch/turing/mem_mgr_tu102.c
 // /*
 //  * SPDX-FileCopyrightText: Copyright (c) 2017-2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
@@ -339,8 +408,12 @@ pub fn allocate(value: Allocation, output: []u8) Error!Encoded {
     put(out, 20, 128);
     const p = out[32..];
     const image = try layout(value.blocklinear, value.pte_kind);
+    // NVIDIA570.144 g_heap_nvoc.h: HEAP_OWNER_RM_CLIENT_GENERIC. This is
+    // allocation accounting, not an RM handle. stdmemValidateParams rejects
+    // zero, ~0 and internal scratch owners, and adds MAP_NOT_REQUIRED.
+    put(p, 0, 0xdeaf000c);
     put(p, 4, image.memory_type);
-    put(p, 8, 0x80100 | @as(u32, if (value.fixed_address != 0) 0x10 else 0) |
+    put(p, 8, 0x88100 | @as(u32, if (value.fixed_address != 0) 0x10 else 0) |
         @as(u32, if (value.privileged) 0x08000000 else 0));
     put(p, 24, @as(u32, if (value.location == .system) system_attributes else 0x00800000) |
         image.attributes);
@@ -394,18 +467,70 @@ fn receipt(record: exchange.message.Record, request: Encoded, status_at: usize, 
     }
     return word(data, status_at);
 }
+/// NV_MEMORY_ALLOCATION_PARAMS contains IN/OUT fields, not an echoed request.
+/// NVIDIA570.144 mem_utils.c clears virtual LOCATION to ANY; virtual_mem.c
+/// reports contiguous VA. mem_mgr_gm107.c reports PREFER_NO_ZBC for these
+/// uncompressed kinds; memmgrChooseKind_TU102 selects GENERIC_MEMORY (6)
+/// for IMAGE/DMA/PRIMARY. All cache, page, layout and compression bits stay
+/// exact. A physical allocation must retain its requested memory location.
+pub fn allocationAttributes(request: []const u8, response: []const u8, is_virtual: bool) Error!void {
+    if (request.len != 128 or response.len != 128) return error.Payload;
+    const before = word(request, 24);
+    const after = word(response, 24);
+    const physicality_mask: u32 = 3 << 27;
+    const location_mask: u32 = 3 << 25;
+    const allowed = physicality_mask | if (is_virtual) location_mask else @as(u32, 0);
+    if (before & ~allowed != after & ~allowed) return error.Payload;
+    const physicality = after & physicality_mask;
+    if (is_virtual) {
+        if (after & location_mask != before & location_mask and after & location_mask != location_mask) return error.Payload;
+        if (physicality != before & physicality_mask and physicality != 2 << 27) return error.Payload;
+    } else if ((physicality != 1 << 27 and physicality != 2 << 27) or
+        (before & physicality_mask == 2 << 27 and physicality != 2 << 27)) return error.Payload;
+    const attr2_before = word(request, 28);
+    const attr2_after = word(response, 28);
+    if (attr2_after != attr2_before and !(attr2_before & 3 == 0 and attr2_after == attr2_before | 1)) return error.Payload;
+    const kind_before = word(request, 32);
+    const kind_after = word(response, 32);
+    const memory_type = word(request, 4);
+    if (kind_after != kind_before and !(kind_before == 0 and kind_after == 6 and
+        before & (3 << 12) == 0 and (memory_type == 0 or memory_type == 6 or memory_type == 8))) return error.Payload;
+}
+
+/// Validate one successful virtual-allocation parameter block. The returned
+/// offset is always bounded by the separately acknowledged VAS. rangeLo/Hi
+/// may remain unspecified (zero/zero), or RM may fill a page-aligned subset
+/// of that VAS (vaspaceFillAllocParams_IMPL); fixed requests keep their exact
+/// extent. Neither a range nor attribute normalization changes our ownership.
+pub fn allocationParameters(space: vaspace.Info, request: []const u8, response: []const u8) Error!u64 {
+    try allocationAttributes(request, response, true);
+    for (response, 0..) |v, i| {
+        if ((i >= 24 and i < 36) or (i >= 48 and i < 64) or (i >= 80 and i < 96)) continue;
+        if (v != request[i]) return error.Payload;
+    }
+    const bytes = long(request, 64);
+    const alignment = long(request, 72);
+    const address = long(response, 80);
+    if (bytes == 0 or bytes > space.bytes or alignment < 4096 or !std.math.isPowerOfTwo(alignment) or
+        long(response, 88) != bytes - 1 or address < space.base or address % alignment != 0 or
+        address - space.base > space.bytes - bytes) return error.Bounds;
+    const fixed = word(request, 8) & 0x10 != 0;
+    if (fixed and address != long(request, 80)) return error.Bounds;
+    const lo = long(response, 48);
+    const hi = long(response, 56);
+    if (lo != 0 or hi != 0) {
+        if (lo < space.base or lo > address or lo & 4095 != 0 or hi & 4095 != 4095 or
+            hi < address or hi - address < bytes - 1 or hi - space.base >= space.bytes or
+            (fixed and (lo != address or hi - address != bytes - 1))) return error.Bounds;
+    }
+    return address;
+}
 pub fn allocated(value: Allocation, record: exchange.message.Record) Error!Reply {
     var request: [160]u8 = undefined;
     const status = try receipt(record, try allocate(value, &request), 16, true);
     if (status != 0) return .{ .rejected = status };
     if (record.payload.len != 160) return error.Payload;
-    const p = record.payload[32..];
-    for (p, 0..) |v, i| {
-        if (i >= 80 and i < 96) continue; // Returned offset and limit only.
-        if (v != request[32 + i]) return error.Payload;
-    }
-    if (long(p, 88) != value.bytes - 1) return error.Bounds;
-    const address = long(p, 80);
+    const address = try allocationParameters(value.space, request[32..], record.payload[32..]);
     try value.validateAddress(address);
     return .{ .ok = address };
 }

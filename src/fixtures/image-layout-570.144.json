@@ -1,8 +1,8 @@
 {
   "reference": "NVIDIA Open Kernel Modules 570.144",
-  "generator": "ExFiles/Reference/GFX/0.79.35/Evidence/NvkImageLayout/image_reference.c",
+  "generator": "Temp/Ossi08200/Memory155/image-layout.c",
   "bytes": 5184,
-  "sha256": "1925a7dfc1d15c66eb58d5284f52fc27fb4390eda5ce41e43efcfd893cbdbe38",
+  "sha256": "81be0a36d2f14f452a86846384b26357c4f1c71fdbe01295d6e9bf9c6f770b1a",
   "records": "system then video; kind1..6; allocation request160/reply160, map request56/reply56",
   "sources": [
     {
@@ -21,5 +21,15 @@
       "path": "src/nvidia/src/kernel/mem_mgr/virtual_mem.c",
       "sha256": "d3d9311c355e9b210c84b588d8a3a0448a2f6132c834705368990aac7856927b"
     }
-  ]
+  ],
+  "owner_contract": {
+    "validation_sha256": "8e84b2a2641e580721ddccebc1c1a064e84b46614d7d65ae0022408224a995ee",
+    "header_sha256": "8d16bfd6f3a91f3e991f3c8458668bd21559cb59f9eb46a0921e8ec1271bae80",
+    "memory_owner": "HEAP_OWNER_RM_CLIENT_GENERIC (0xdeaf000c)",
+    "normalized_flags": "NVOS32_ALLOC_FLAGS_MAP_NOT_REQUIRED",
+    "original_generator": "ExFiles/Reference/GFX/0.79.35/Evidence/NvkImageLayout/image_reference.c",
+    "regression": "GspMessageAbi.c reads complete original RPC/SDK/heap headers; old zero-owner fixtures rejected.",
+    "header": "src/nvidia/generated/g_heap_nvoc.h",
+    "validation_source": "src/nvidia/src/kernel/mem_mgr/standard_mem.c"
+  }
 }

@@ -2,14 +2,14 @@
   "source": "NVIDIA Open GPU Kernel Modules 570.144",
   "commit": "8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f",
   "bytes": 896,
-  "sha256": "d9f4b7368af9c506dbe866b7dbebf788fc36a321d9d7c0c376d30e808ce5ae53",
+  "sha256": "629eac0d0f3d1a8aae4a9dfed6efab1a11c884ea90457aecdb9c9c30f80aa5a0",
   "pairs": 6,
   "virtual_bytes": 67108864,
   "allocation_alignment": 65536,
   "gpu_page_bytes": 4096,
   "physical_class": "NV01_MEMORY_LOCAL_USER (0x40)",
   "virtual_class": "NV50_MEMORY_VIRTUAL (0x50a0)",
-  "producer": "Temp/gfx-owned-vram-20260912/Vram-ABI.c; Vector.ps1",
+  "producer": "Temp/Ossi08200/Memory155/vram.c",
   "sources": [
     {
       "path": "ExFiles/Reference/GFX/Nvidia/OpenKernelModules-570.144/src/common/sdk/nvidia/inc/nvos.h",
@@ -27,5 +27,16 @@
       "path": "ExFiles/Reference/GFX/Nvidia/OpenKernelModules-570.144/src/nvidia-modeset/kapi/src/nvkms-kapi.c",
       "sha256": "6a4b72ce4dd6ae31998cf8ecf5997991b82f21b232c913b99f54d127e9f4b000"
     }
-  ]
+  ],
+  "generator": "Temp/Ossi08200/Memory155/vram.c",
+  "owner_contract": {
+    "validation_sha256": "8e84b2a2641e580721ddccebc1c1a064e84b46614d7d65ae0022408224a995ee",
+    "header_sha256": "8d16bfd6f3a91f3e991f3c8458668bd21559cb59f9eb46a0921e8ec1271bae80",
+    "memory_owner": "HEAP_OWNER_RM_CLIENT_GENERIC (0xdeaf000c)",
+    "normalized_flags": "NVOS32_ALLOC_FLAGS_MAP_NOT_REQUIRED",
+    "original_generator": "Temp/gfx-owned-vram-20260912/Vram-ABI.c",
+    "regression": "GspMessageAbi.c reads complete original RPC/SDK/heap headers; old zero-owner fixtures rejected.",
+    "header": "src/nvidia/generated/g_heap_nvoc.h",
+    "validation_source": "src/nvidia/src/kernel/mem_mgr/standard_mem.c"
+  }
 }

@@ -237,7 +237,19 @@ pub const VirtualStatus = struct { state: virtual_resources.range.State, info: ?
 pub const VirtualBindingStatus = struct { mapped: bool, bytes: u64, rejected: ?u32 };
 pub const VirtualSource = union(enum) { system: BufferHandle, native: BufferHandle, native_reference: r4os.abi.GfxBufferReference };
 pub const BufferStatus = struct { state: buffer_mapping.State, info: ?buffer_mapping.Info, rejected: ?u32, host_rejected: ?buffer_mapping.Error };
-const BufferSlot = struct { owner: ?*buffer_mapping.Owner = null, allocation: r4os.abi.DriverHeapAllocation = .{}, heap: ?r4os.r4dev.DriverHeapContext = null, serial: u64 = 0, pending_source: r4os.abi.GfxBufferReference = .{}, cacheable: bool = false, last_used: u64 = 0, evicting: bool = false, public_users: u64 = 0 };
+const copy_mapping_idle_ns = 250 * std.time.ns_per_ms;
+const BufferSlot = struct {
+    owner: ?*buffer_mapping.Owner = null,
+    allocation: r4os.abi.DriverHeapAllocation = .{},
+    heap: ?r4os.r4dev.DriverHeapContext = null,
+    serial: u64 = 0,
+    pending_source: r4os.abi.GfxBufferReference = .{},
+    cacheable: bool = false,
+    last_used: u64 = 0,
+    last_used_ns: u64 = 0,
+    evicting: bool = false,
+    public_users: u64 = 0,
+};
 pub const NativeBufferStatus = struct { state: vram.State, info: ?vram.Info, rejected: ?u32, host_rejected: ?i32 };
 const NativeBufferSlot = struct { owner: ?*vram.Owner = null, allocation: r4os.abi.DriverHeapAllocation = .{}, heap: ?r4os.r4dev.DriverHeapContext = null, serial: u64 = 0 };
 const ResourceSlots = @import("gsp_resource_slots.zig");
@@ -372,7 +384,7 @@ pub const Owner = struct {
     virtuals: virtual_resources.Owner = .{},
     allocations: @import("gsp_allocation.zig").Owner = .{},
     virtual_provider: @import("gsp_virtual_provider.zig").Owner = .{},
-    fifos: [64]ChannelSlot = @splat(.{}),
+    fifos: [execution_fifo.wire.host_channel_slots]ChannelSlot = @splat(.{}),
     fifo_active: ?u16 = null,
     work_slots: [scheduling.capacity]WorkSlot = @splat(.free),
     work_schedule: scheduling.Owner = .{},
@@ -470,13 +482,16 @@ pub const Owner = struct {
     /// existing engine/RM receipts live while the physical work drains.
     pub fn beginShutdown(self: *Owner) !void {
         if (self.shutdown_closing) return;
-        _ = try self.now();
+        const current = try self.now();
         if (self.nativeObject() == null or self.display_engine_owner != null or self.mode_control_owner != null or
             self.presentation != null or self.allocations.pending != null or self.native_copy.phase != .ready)
             return error.ShutdownStartup;
         const memory = self.memory_api orelse return error.Api;
         if (memory.deviceLost(self.adapter_id, self.epoch, false) != r4os.abi.gfx_buffer_result_ok) return error.Retained;
         self.shutdown_closing = true;
+        // Set the firmware-lifetime policy before another Work slice can
+        // choose telemetry teardown while outstanding GPU work drains.
+        if (self.power_owner) |*owner| _ = try owner.stopForFirmwareUnload(current);
         self.allocations.close();
         self.virtual_provider.close();
     }
@@ -514,6 +529,12 @@ pub const Owner = struct {
         }
         if (self.self_address != @intFromPtr(self) or self.failure == null or !proof.valid(self.epoch)) return error.Stale;
         const memory = self.memory_api orelse return error.Api;
+        // Closing a consumer can make a native BO's exact release ticket
+        // ready. The common collector covers the whole driver epoch, so drain
+        // one such ticket before retrying a child storage's collection barrier.
+        // No command is sent to the stopped GPU and no consumer lease is cut.
+        if (self.reset_stage != .loss and self.reset_stage != .queue and self.reset_stage != .done and
+            try self.collectNativeAfterReset(proof)) return false;
         switch (self.reset_stage) {
             .loss => {
                 if (memory.deviceLost(self.adapter_id, self.epoch, true) != r4os.abi.gfx_buffer_result_ok) return error.Retained;
@@ -574,7 +595,10 @@ pub const Owner = struct {
             .fifos => {
                 if (self.reset_cursor < self.fifos.len) {
                     const slot = &self.fifos[self.reset_cursor];
-                    if (slot.owner) |owner| try owner.closeAfterReset(proof);
+                    if (slot.owner) |owner| owner.closeAfterReset(proof) catch |err| {
+                        if (err == error.Retained and owner.awaitingCollection()) return false;
+                        return err;
+                    };
                     if (slot.allocation.handle != 0) try self.freeChannelSlot(self.reset_cursor);
                     self.reset_cursor += 1; return false;
                 }
@@ -610,11 +634,17 @@ pub const Owner = struct {
             },
             .control => {
                 if (self.power_owner) |*owner| {
-                    if (!owner.backing.closeAfterReset(proof)) return error.Retained;
+                    if (!owner.backing.closeAfterReset(proof)) {
+                        if (owner.backing.awaitingCollection()) return false;
+                        return error.Retained;
+                    }
                     self.power_owner = null;
                 }
                 if (self.graph) |*graph| if (graph.control_buffer) |*owner| {
-                    if (!owner.backing.closeAfterReset(proof)) return error.Retained;
+                    if (!owner.backing.closeAfterReset(proof)) {
+                        if (owner.backing.awaitingCollection()) return false;
+                        return error.Retained;
+                    }
                 };
                 self.reset_stage = .virtuals;
             },
@@ -662,12 +692,42 @@ pub const Owner = struct {
                     return error.Descriptor;
                 };
                 try self.native_buffers.closeEmpty();
+                if (self.graph) |*graph| if (graph.address_space) |*space| {
+                    if (!try space.host_storage.closeAfterReset(proof)) return false;
+                    space.host_vm = .{};
+                };
                 if (memory.collect() != r4os.abi.gfx_buffer_result_ok) return error.Retained;
                 self.reset_stage = .done;
             },
             .done => return true,
         }
         return false;
+    }
+    /// Retire only an already issued, identity-matched common release. The
+    /// normal native stage still closes producer references and waits for any
+    /// remaining aliases/consumers; this helper does not bypass those owners.
+    fn collectNativeAfterReset(self: *Owner, proof: @import("gsp_reset.zig").Quiescence) !bool {
+        const memory = self.memory_api orelse return error.Api;
+        var eligible = false;
+        for (self.native_buffers.items(), 0..) |*slot, index| if (slot.owner) |owner| {
+            if (!owner.closing or !owner.common_live) continue;
+            eligible = true;
+            if (owner.release.attempt == 0 or !owner.aliases.empty()) continue;
+            if (!try owner.closeAfterReset(proof)) return error.Retained;
+            try self.freeNativeSlot(index);
+            return true;
+        };
+        if (!eligible) return false;
+        var ticket: r4os.abi.GfxOwnedBufferRelease = .{};
+        const result = memory.bufferTakeRelease(self.adapter_id, self.epoch, &ticket);
+        if (result == r4os.abi.gfx_buffer_error_busy) return false;
+        if (result != r4os.abi.gfx_buffer_result_ok) return error.Retained;
+        for (self.native_buffers.items()) |*slot| if (slot.owner) |owner| {
+            if (owner.release.attempt != 0 or !owner.acceptsAfterReset(ticket)) continue;
+            owner.release = ticket;
+            return true; // Preserve the receipt until the next bounded slice.
+        };
+        return error.Descriptor; // Unknown issued ticket stays held.
     }
     fn failureOperation(self: *const Owner) diagnostics.Operation {
         // This is retained owner metadata, never a fault-time device probe.
@@ -715,6 +775,16 @@ pub const Owner = struct {
                 .{@errorName(err), self.cursor_upload != null, if (self.display_work) |work| work.cursor != null else false});
         if (self.display_resources_slot.owner) |owner| owner.quarantine();
         self.failure = err;
+        // Retained CPU-side ownership only; no new query or cleanup action.
+        // A graph deadline must identify the broker that still blocks FIFO
+        // retirement even when the subsequent reset also fails.
+        self.log("NVIDIA gsp-close: shutdown={} graph={} deadline={d} now={d} native-queues={d} queue-spare={d}",
+            .{self.shutdown_closing, self.graph_closing, self.close_deadline, self.last_clock,
+                self.native_queues.count, self.native_queues.spare.handle});
+        self.log("NVIDIA gsp-close-virtual: provider={d} closing={} requested={} pending={} nodes={} spare={d} closed={}",
+            .{self.virtual_provider.handle.id, self.virtual_provider.closing, self.virtual_provider.requested,
+                self.virtual_provider.pending != null, self.virtual_provider.nodes.root != null,
+                self.virtual_provider.spare.handle, self.virtual_provider.closed()});
         if (self.unload.self_address != 0) self.log("NVIDIA gsp-unload: end={s} phase={s} reply={?x} payload-bytes={d} mailbox={?x} polls={d} resources=held",
             .{ @errorName(err), @tagName(self.unload.phase), if (self.unload.reply) |reply| @as(?u32, reply.result) else null,
                 self.unload.reply_bytes, self.unload.last_mailbox, self.unload.observations });
@@ -735,6 +805,15 @@ pub const Owner = struct {
             channel.session.stop();
             if (channel.last_rpc) |rpc| self.log("NVIDIA gsp-runtime: failed={s} last-rpc={x} sequence={d} result={x} receipt={s}",
                 .{@errorName(err), rpc.function, rpc.sequence, rpc.result, if (channel.session.pending != null) @as([]const u8, "retained") else "none"});
+            // The failed exchange retains its CPU receive buffer and exact
+            // request. Observe those bytes without ACK, MMIO or a new query;
+            // firmware success alone does not authorize a malformed receipt.
+            if (channel.pending) |dispatch| if (dispatch.response) {
+                self.log("NVIDIA gsp-receipt: function={x} sequence={d} request-bytes={d} response-bytes={d} retained=yes",
+                    .{dispatch.record.rpc.function, dispatch.record.rpc.sequence, channel.request.len, dispatch.record.payload.len});
+                self.logRpcBytes("request", channel.request);
+                self.logRpcBytes("response", dispatch.record.payload);
+            };
             if (self.post.self_address != 0 and self.post.state != .complete)
                 self.log("NVIDIA gsp-postinit: failed={s} command={x} status={x} replies={d}",
                     .{@errorName(err), @intFromEnum(self.post.command), self.post.last_status orelse exchange.message.pending, self.post.replies});
@@ -743,11 +822,28 @@ pub const Owner = struct {
             if (graph.state != .finished) graph.base.exchange.session.rm_names.retain(graph.reservation) catch {};
             self.log("NVIDIA gsp-rm: failed={s} state={s} client={x} rejection={?}",
                 .{@errorName(err), @tagName(graph.state), graph.reservation.client, self.rm_rejection});
+            if (graph.address_space) |*space| if (space.plan.external_vaspace) {
+                const vm = &space.host_vm;
+                self.log("NVIDIA gsp-host-mmu: control={s} reply={?} root={x} attached={} phase={s} offset={d} tlb={s} failure={?} retained=yes",
+                    .{ if (space.host_control) |op| @tagName(op) else "none", space.rejected,
+                        if (vm.root) |root| root.dma else 0, vm.attached,
+                        if (vm.work) |work| @tagName(work.phase) else "none",
+                        if (vm.work) |work| work.offset else 0,
+                        if (vm.work) |work| if (work.invalidate) |op| @tagName(op.phase) else "none" else "none", vm.failure });
+                const pages = &space.host_storage;
+                self.log("NVIDIA gsp-host-pages: deferred={d} release={s} status={d} backing-step={s} failure={?}",
+                    .{pages.deferred_pages, @tagName(pages.last_operation), pages.last_status, pages.last_backing_step, pages.failure});
+            };
             if (graph.control_buffer) |*owner|
                 self.log("NVIDIA gsp-control: failed={s} operation={s} reply={?} registered={} allocated={} mapped={} retained={}",
                     .{@errorName(err), if (owner.caps_active) "memory-caps" else if (owner.operation) |operation| @tagName(operation) else "none", owner.last_status,
                         owner.registered, owner.allocated, owner.mapped, owner.backing.retained});
         }
+        if (self.native_copy.self_address != 0)
+            self.log("NVIDIA gsp-native-ce: failed={s} phase={s} rm-engine={d} context={} channel={} storage={} retained=yes",
+                .{@errorName(err), @tagName(self.native_copy.phase), self.native_copy.rm_engine,
+                    self.native_copy.context != null, self.native_copy.channel != null, self.native_copy.storage != null});
+        for (&self.contexts) |*slot| if (slot.owner) |owner| self.logContextDiscovery(owner);
         if (self.display_engine_owner) |*owner| self.log("NVIDIA gsp-display-engine: failed={s} root={x} operation={s} status={?} confirmed={} possible={} boot=retained",
             .{@errorName(err),owner.binding.root,if (owner.operation) |op| @tagName(op) else "none",owner.last_status,owner.live,owner.allocation_possible});
         if (self.mode_control_owner) |*owner| self.log("NVIDIA gsp-mode-query: failed={s} handle={x} operation={s} status={?} clock-limit-hz={d} control-live={} resources=retained",
@@ -777,7 +873,12 @@ pub const Owner = struct {
         // RM allocation cid and opaque submit tokens are not hardware CHIDs.
         // Engine/runlist and GPU-VA observations identify candidates only.
         for (&self.fifos) |*slot| if (slot.owner) |owner| {
-            if (!owner.live or owner.config_stamp == null or owner.config.context.epoch != self.epoch) continue;
+            if (owner.config_stamp == null or owner.config.context.epoch != self.epoch) continue;
+            self.log("NVIDIA gsp-fifo-failure: channel={x} state={s} op={s} rejection={?x} host={s} last-status={?x} hw-chid={d} runlist={d} bound={} token={?x}",
+                .{owner.config.handle, @tagName(owner.state), if (owner.operation) |op| @tagName(op) else "none",
+                    owner.rejected, if (owner.host_rejected) |err| @errorName(err) else "none", owner.last_status,
+                    owner.config.hardware_channel, owner.config.runlist, owner.bound, owner.work_submit_token});
+            if (!owner.live) continue;
             const parent = owner.parent orelse continue;
             const selected = parent.selected orelse continue;
             if (record.runlist) |runlist| if (runlist != selected.data[3]) continue;
@@ -875,6 +976,13 @@ pub const Owner = struct {
                 .{kept.programs_address,kept.packet_address,kept.programs_address_match,kept.packet_address_match});
         }
         if (kept.text_bytes != 0) self.logBytes("fault-text", @truncate(kept.code), kept.text[0..kept.text_bytes]);
+        if (kept.fatal and self.faults.first_fatal != null and self.faults.first_fatal.?.serial == kept.serial) self.logExecutionRings();
+    }
+    noinline fn logExecutionRings(self: *Owner) void {
+        for (&self.fifos) |*slot| if (slot.owner) |owner| {
+            if (!owner.live or owner.config_stamp == null or owner.config.context.epoch != self.epoch) continue;
+            owner.ring.logDiagnostic(&self.ctx.?, owner.config.handle, owner.cid, owner.work_submit_token orelse 0);
+        };
     }
     pub fn renderRejection(self: *Owner, err: anyerror) !void {
         var record = diagnostics.host(.render,err,false);
@@ -3025,7 +3133,8 @@ pub const Owner = struct {
     }
     fn createContext(self: *Owner, rm_engine: u32, deadline: u64) !ContextHandle {
         _ = try self.now();
-        if (rm_engine == 1 and self.static_info == null) return error.State;
+        const internal_query = rm_engine == 1 or (rm_engine >= 9 and rm_engine <= 28);
+        if (internal_query and self.static_info == null) return error.State;
         if (self.graph_closing or self.fifo_active != null or self.context_active != null or self.virtuals.active_range != null or self.native_active != null or self.buffer_active != null or self.sequence.self_address != 0 or self.outputs.active()) return error.Busy;
         const space = (self.nativeAddressSpace() orelse return error.State).*;
         const subdevice = self.graph.?.base.plan.handles.subdevice;
@@ -3054,7 +3163,7 @@ pub const Owner = struct {
         var value = execution_context.Owner.init(&token, self.graph.?.reservation, space, subdevice, rm_engine, deadline) catch |err| {
             self.channel = exchange.Exchange.init(&token, deadline) catch |restore| { self.stop(restore); return restore; }; return err;
         };
-        if (rm_engine == 1) {
+        if (internal_query) {
             value.binding.internal_client = self.static_info.?.client;
             value.binding.internal_subdevice = self.static_info.?.subdevice;
         }
@@ -3181,7 +3290,8 @@ pub const Owner = struct {
         if (result != r4os.abi.driver_heap_ok) return error.Memory;
         const owner: *execution_fifo.Owner = @ptrFromInt(allocation.cpu_address); owner.* = .{};
         var token = try self.channel.?.handoff(deadline);
-        owner.openEngines(&token, &self.ctx.?, self.adapter_id, self.graph.?.reservation, parent, runqueue, inst, usr, engine, engine_mask, deadline) catch |err| {
+        owner.openEngines(&token, &self.ctx.?, self.adapter_id, self.graph.?.reservation, parent, runqueue,
+            try execution_fifo.wire.hardwareChannelForSlot(index), inst, usr, engine, engine_mask, deadline) catch |err| {
             if (owner.failure != null) {
                 retained = true; slot.owner = owner; slot.serial = serial; self.buffer_serial = serial;
                 self.stop(err); return err;
@@ -3899,6 +4009,7 @@ pub const Owner = struct {
             for (self.buffers.items()) |*slot| if (slot.owner) |owner| {
                 if (owner.info()) |value| if (std.meta.eql(value.buffer, reference.buffer) and value.epoch == self.epoch and owner.space.handle == fifo.config.context.vaspace) {
                     slot.last_used = self.copy_completed +| 1;
+                    slot.last_used_ns = current;
                     work.addresses[i] = .{ .address = value.address, .bytes = value.logical_bytes }; break;
                 };
             };
@@ -5164,7 +5275,7 @@ pub const Owner = struct {
     }
     const MappingSource = union(enum) { queue: struct { fence: r4os.abi.GfxFence, which: u32 }, initial_image, public_import };
     fn mapBuffer(self: *Owner, request: MappingSource, deadline: u64) !BufferHandle {
-        _ = try self.now();
+        const current = try self.now();
         if (self.graph_closing or self.fifo_active != null or self.context_active != null or self.virtuals.active_range != null or self.native_active != null or self.buffer_active != null or self.sequence.self_address != 0 or self.outputs.active()) return error.Busy;
         const space = (self.nativeAddressSpace() orelse return error.State).*;
         if (self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
@@ -5243,6 +5354,7 @@ pub const Owner = struct {
         slot.cacheable = request == .queue;
         slot.public_users = if (request == .public_import) 1 else 0;
         slot.last_used = self.copy_completed +| 1;
+        slot.last_used_ns = current;
         self.buffer_serial = serial;
         self.buffer_active = index;
         return .{ .epoch = self.epoch, .serial = serial, .slot = index };
@@ -5260,8 +5372,11 @@ pub const Owner = struct {
     /// Make room for future canonical copy resources. No queued job is taken
     /// and no current copy/flip/cursor mapping may be touched. One idle cache
     /// entry starts real RM retirement per call; completion frees its slot.
+    /// Unused mapping-only entries also expire after a short idle interval,
+    /// so closing a producer does not require a future submission or shutdown
+    /// to release its pinned backing. Active, public and scanout uses survive.
     pub fn prepareCopyMappings(self: *Owner, needed: usize, byte_limit: u64, deadline: u64) !bool {
-        _ = try self.now();
+        const current = try self.now();
         if (needed > std.math.maxInt(u32)) return error.Bounds;
         if (self.copyBusy() or self.hasQueuedWork() or self.cursor_point != null or self.cursor_reserving or self.graph_closing or self.buffer_active != null or
             self.fifo_active != null or self.virtuals.active_range != null or self.native_active != null or self.context_active != null or self.outputs.active() or self.sequence.self_address != 0 or
@@ -5269,10 +5384,11 @@ pub const Owner = struct {
         var available: usize = 0;
         var cached_bytes: u64 = 0;
         var oldest: ?usize = null;
+        var expired: ?usize = null;
         next: for (self.buffers.items(), 0..) |*slot, index| {
             if (slot.allocation.handle == 0) { available += 1; continue; }
             const owner = slot.owner orelse continue;
-            if (!slot.cacheable or slot.evicting or owner.state != .handed_off or owner.info() == null or
+            if (!slot.cacheable or slot.evicting or slot.public_users != 0 or owner.state != .handed_off or owner.info() == null or
                 owner.source.flags != r4os.abi.gfx_buffer_reference_mapping_only) continue;
             for (&self.presentation_slots) |*presentation_slot| if (presentation_slot.*) |*entry| {
                 if (std.meta.eql(entry.surface.shadow.buffer, owner.source.buffer)) continue :next;
@@ -5280,9 +5396,11 @@ pub const Owner = struct {
             cached_bytes +|= owner.mapped_bytes;
             if (!owner.aliases.empty()) continue;
             if (oldest == null or slot.last_used < self.buffers.items()[oldest.?].last_used) oldest = index;
+            if (current -| slot.last_used_ns >= copy_mapping_idle_ns and
+                (expired == null or slot.last_used_ns < self.buffers.items()[expired.?].last_used_ns)) expired = index;
         }
-        if (available >= needed and cached_bytes <= byte_limit) return false;
-        const index = oldest orelse return false; // Existing mappings may still satisfy a queued copy.
+        const pressure = available < needed or cached_bytes > byte_limit;
+        const index = (if (pressure) oldest else expired) orelse return false;
         const slot = &self.buffers.items()[index];
         try self.retireBuffer(.{ .epoch = self.epoch, .serial = slot.serial, .slot = @intCast(index) }, deadline, true);
         slot.evicting = true;
@@ -5344,12 +5462,16 @@ pub const Owner = struct {
         const summary = self.nativeMemory() orelse return error.State;
         const plan = try vram.surface.create(self.adapter_id, space, caps, request);
         _ = try display_resources.image.create(plan, 1, 1);
-        const policy: vram.storage.Policy = .{ .capabilities = caps, .physical_bytes = @min(summary.physical_bytes, summary.reported_bytes), .role = .scanout };
+        const policy: vram.storage.Policy = .{ .capabilities = caps, .physical_bytes = @min(summary.physical_bytes, summary.reported_bytes), .role = .scanout, .clear = self.memoryClearBinding() };
         try policy.validate(space, plan.allocation_bytes);
         return self.allocateNativePlanStorage(plan, policy, deadline);
     }
-    /// Private instance/USERD/method backing: RM must guarantee initial
-    /// clearing and confirm a contiguous extent. Ordinary BOs stay opaque.
+    fn memoryClearBinding(self: *const Owner) ?@import("gsp_memory_clear.zig").Binding {
+        const info = self.static_info orelse return null;
+        return .{ .epoch = self.epoch, .client = info.client, .subdevice = info.subdevice };
+    }
+    /// Private instance/USERD/method backing must be initially cleared, by
+    /// the advertised RM guarantee or an acknowledged explicit GSP memset.
     pub fn allocateNativeStorage(self: *Owner, bytes: u64, deadline: u64) !BufferHandle {
         return self.allocatePrivateStorage(bytes, 65536, false, false, deadline);
     }
@@ -5361,7 +5483,7 @@ pub const Owner = struct {
         const space = (self.nativeAddressSpace() orelse return error.State).*;
         const caps = self.nativeMemoryCapabilities() orelse return error.State;
         const memory_summary = self.nativeMemory() orelse return error.State;
-        const policy: vram.storage.Policy = .{ .capabilities = caps, .physical_bytes = @min(memory_summary.physical_bytes, memory_summary.reported_bytes) };
+        const policy: vram.storage.Policy = .{ .capabilities = caps, .physical_bytes = @min(memory_summary.physical_bytes, memory_summary.reported_bytes), .clear = self.memoryClearBinding() };
         const plan = try vram.surface.rawPrivate(self.adapter_id, space, bytes, alignment, privileged, readonly);
         try policy.validate(space, plan.allocation_bytes);
         return self.allocateNativePlanStorage(plan, policy, deadline);
@@ -5570,11 +5692,17 @@ pub const Owner = struct {
         if (!quiesced or self.graph_closing or self.fifo_active != null or self.context_active != null or self.virtuals.active_range != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or
             self.sequence.self_address != 0 or self.nativeObject() == null or self.channel.?.phase != .idle) return error.Busy;
         try self.channel.?.guard(deadline);
-        if (self.power_owner) |*owner| if (!try owner.stop(current)) return error.Busy;
+        if (self.power_owner) |*owner| {
+            const ready = if (self.shutdown_closing) try owner.stopForFirmwareUnload(current) else try owner.stop(current);
+            if (!ready) return error.Busy;
+        }
         for (self.native_buffers.items(), 0..) |*slot, index| if (slot.owner != null) {
             try self.releaseNativeBuffer(.{ .epoch = self.epoch, .serial = slot.serial, .slot = @intCast(index) });
         };
         self.graph_closing = true;
+        if (self.power_owner) |*owner| if (!owner.closed())
+            self.log("NVIDIA power: terminal-page=retained lifetime=firmware-unload detach-rejected={?x} poll-mask={x} release=after-confirmed-reset",
+                .{owner.detach_rejection, owner.active_mask});
         self.virtual_provider.close();
         self.close_deadline = deadline;
     }
@@ -5712,6 +5840,16 @@ pub const Owner = struct {
             self.sequence.self_address == 0 and self.channel.?.phase == .idle and self.channel.?.pending == null and
             self.channel.?.in_lockdown == false and try self.activateWork()) return .progress;
         if (self.nativeObject() != null and try self.collectNativeBuffer(if (self.graph_closing) self.close_deadline else try std.math.add(u64, current, 5 * std.time.ns_per_s))) return .progress;
+        // Admission above handles pressure. Once the queue is empty, let
+        // idle mappings retire through the same confirmed RM unmap path.
+        // Native BO retirement must run first: system mapping cleanup also
+        // invokes the common collector and cannot drive native RM work.
+        if (!self.shutdown_closing and !self.graph_closing and !self.powerStopping()) if (self.copy_backend) |backend| {
+            if (!backend.pending and (self.prepareCopyMappings(0, std.math.maxInt(u64),
+                try std.math.add(u64, current, 3 * std.time.ns_per_s)) catch |err| blk: {
+                if (err == error.Busy) break :blk false; return err;
+            })) return .progress;
+        };
         if (self.graph_closing and self.graph.?.state == .loaned) graph_close: {
             try channel.guard(self.close_deadline);
             // The common broker owns retirement order and its outstanding
@@ -5730,6 +5868,10 @@ pub const Owner = struct {
             };
             for (&self.contexts) |*slot| if (slot.owner != null) break :graph_close;
             if (!self.graphics_cache.close(true)) return error.Retained;
+            // Closing the cache can release the last native BO references
+            // after this turn's earlier collection pass. Drain those RM
+            // owners before a system mapping waits on common collection.
+            if (try self.collectNativeBuffer(self.close_deadline)) return .progress;
             if (try self.virtuals.first()) |handle| {
                 if (try self.virtuals.firstBinding(handle)) |binding| {
                     if ((try self.virtualBindingStatus(binding)).mapped) try self.unmapVirtualBuffer(binding, self.close_deadline, true)
@@ -5898,8 +6040,9 @@ pub const Owner = struct {
         const owner = self.fifos[index].owner orelse return error.State;
         if (owner.state == .ready or owner.state == .closed) {
             if (owner.state == .ready) try self.rejection(.channel, owner.config.handle, owner.rejected, owner.host_rejected);
-            if (owner.info()) |fifo_info| self.log("NVIDIA gsp-fifo: channel={x} cid={d} engine={x} scheduled=yes object-class={x}",
-                .{fifo_info.config.handle,fifo_info.cid,fifo_info.config.rm_engine,fifo_info.config.object_class});
+            if (owner.info()) |fifo_info| self.log("NVIDIA gsp-fifo: channel={x} cid={d} hw-chid={d} runlist={d} token={x} engine={x} scheduled=yes object-class={x}",
+                .{fifo_info.config.handle,fifo_info.cid,fifo_info.config.hardware_channel,fifo_info.config.runlist,
+                    fifo_info.work_submit_token,fifo_info.config.rm_engine,fifo_info.config.object_class});
             const deadline = owner.deadline; var token = try owner.handoff();
             self.channel = try exchange.Exchange.init(&token, deadline);
             if (owner.state == .finished) try self.freeChannelSlot(index);
@@ -5913,6 +6056,7 @@ pub const Owner = struct {
     noinline fn advanceContextOwner(self: *Owner, current: u64, index: anytype) !Progress {
         const owner = self.contexts[index].owner orelse return error.State;
         if (owner.state == .ready or owner.state == .closed) {
+            if (owner.state == .ready) self.logContextDiscovery(owner);
             if (owner.state == .ready) try self.rejection(.context, owner.binding.group, owner.rejected, null);
             if (owner.info()) |info| self.log("NVIDIA gsp-context: group={x} share={x} engine={x} runlist={d} timeslice-request-us={d} rejection={?x} commands=bounded fifo=unallocated",
                 .{info.binding.group, info.binding.share, info.nv_engine, info.engine.data[3],info.timeslice_requested_us,info.timeslice_rejection});
@@ -6013,8 +6157,8 @@ pub const Owner = struct {
                     self.log("NVIDIA gsp-rm: objects=ready client={x} device={x} subdevice={x} display={x} events=HPD,DP native-output=unavailable",
                         .{graph.base.plan.handles.client, graph.base.plan.handles.device, graph.base.plan.handles.subdevice, loan.object.display});
                     if (self.nativeAddressSpace()) |info|
-                        self.log("NVIDIA gsp-vaspace: handle={x} base={x} bytes={x} big-page={d} page-tables=RM app-mappings=none",
-                            .{info.handle, info.base, info.bytes, info.big_page_bytes})
+                        self.log("NVIDIA gsp-vaspace: handle={x} base={x} bytes={x} big-page={d} page-tables={s} app-mappings=none",
+                            .{info.handle, info.base, info.bytes, info.big_page_bytes, if (info.host != null) @as([]const u8, "host-external") else "RM"})
                     else self.log("NVIDIA gsp-vaspace: unavailable rm={?} receiver-inventory=available", .{graph.address_space.?.rejected});
                     if (self.nativeMemoryCapabilities()) |caps|
                         self.log("NVIDIA gsp-memory-caps: raw={x},{x},{x} system-render={} system-scanout={} gpu-cache={} blocklinear={} gob-bytes={d} generic-kind={x} engines=unqualified",
@@ -6090,6 +6234,7 @@ pub const Owner = struct {
                 try self.memory_inventory.publish();
                 self.log("NVIDIA gsp-static: client={x} device={x} subdevice={x} fb-bytes={d} regions={d} bar1-pdb={x} bar2-pdb={x}",
                     .{info.client, info.device, info.subdevice, info.fb_bytes, info.region_count, info.bar1_pdb, info.bar2_pdb});
+                self.log("NVIDIA gsp-static: split-vas={any} requested-split-vas=false mapping=awaiting-receipt", .{info.split_vas});
                 self.logMemory();
                 return .progress;
             }
@@ -6106,6 +6251,8 @@ pub const Owner = struct {
             try self.graph.?.initInPlace(&token, std.math.maxInt(u32), "", end);
             self.graph.?.control_context = self.ctx;
             self.graph.?.control_adapter = self.adapter_id;
+            self.graph.?.host_mmu_io = .{ .context = self, .generation = hostMmuGeneration, .now_ns = hostMmuNow,
+                .read32 = hostMmuRead, .write32 = hostMmuWrite };
             self.log("NVIDIA gsp-rm: creating client={x} deadline-ns={d}", .{self.graph.?.reservation.client, end});
             return .progress;
         }
@@ -6117,6 +6264,26 @@ pub const Owner = struct {
             try self.captureLog(deadline);
         }
         return .idle;
+    }
+    fn hostMmuOwner(raw: *anyopaque) *Owner { return @ptrCast(@alignCast(raw)); }
+    fn hostMmuGeneration(raw: *anyopaque) u64 {
+        const self = hostMmuOwner(raw);
+        return if (self.self_address == @intFromPtr(self) and self.failure == null) self.epoch else 0;
+    }
+    fn hostMmuNow(raw: *anyopaque) u64 {
+        const self = hostMmuOwner(raw);
+        const device = self.device orelse return std.math.maxInt(u64);
+        return if (device.clock) |timer| timer.nowNs() else std.math.maxInt(u64);
+    }
+    fn hostMmuRead(raw: *anyopaque, address: u32) !u32 {
+        const self = hostMmuOwner(raw);
+        const vm = if (self.graph) |*graph| if (graph.address_space) |*space| &space.host_vm else return error.State else return error.State;
+        return (self.device orelse return error.State).hostMmuRead(vm, address);
+    }
+    fn hostMmuWrite(raw: *anyopaque, address: u32, value: u32) !void {
+        const self = hostMmuOwner(raw);
+        const vm = if (self.graph) |*graph| if (graph.address_space) |*space| &space.host_vm else return error.State else return error.State;
+        return (self.device orelse return error.State).hostMmuWrite(vm, address, value);
     }
     fn beginReceiverRefresh(self: *Owner, current: u64) !bool {
         if (self.shutdown_closing or !self.discover_receivers) return false;
@@ -6305,6 +6472,7 @@ pub const Owner = struct {
                     .{v.flags, v.record_type, v.bugcheck, v.subsystem, v.error_code, v.tdr_reason, v.diagnostic.len});
                 self.logBytes("nocat-source", v.subsystem, v.source);
                 self.logBytes("nocat-engine", v.subsystem, v.engine);
+                self.logNocatBytes(v.diagnostic);
             },
             else => return error.Unsupported,
         }
@@ -6331,10 +6499,63 @@ pub const Owner = struct {
         const line = std.fmt.bufPrintZ(&buffer, format, args) catch return;
         self.ctx.?.logInfo(line);
     }
+    noinline fn logContextDiscovery(self: *Owner, owner: *const execution_context.Owner) void {
+        const data = &owner.discovery;
+        if (owner.copy_caps) |caps| self.log("NVIDIA gsp-context-copy: rm-engine={d} caps={x}/{x} grce={} sysmem={} standalone={}",
+            .{owner.rm_engine, caps.bytes[0], caps.bytes[1], caps.grce(), caps.sysmem(), caps.standalone()});
+        self.log("NVIDIA gsp-context-discovery: rm-engine={d} state={s} operation={s} unavailable={s} rejection={?x} classes-acked={} count={d} required={x}",
+            .{owner.rm_engine, @tagName(owner.state), if (owner.operation) |op| @tagName(op) else "none",
+                if (owner.unavailable) |reason| @tagName(reason) else "none", owner.rejected,
+                data.classes_acked, data.class_count, data.required_classes});
+        self.log("NVIDIA gsp-context-engines: acked-pages={d} rows={d} mask={x}/{x}/{x}/{x} other={d} selected={} method-bytes={d}",
+            .{data.engine_pages, data.engine_rows, data.engine_mask[0], data.engine_mask[1], data.engine_mask[2], data.engine_mask[3],
+                data.other_engines, owner.selected != null, owner.method_bytes});
+        if (!data.classes_acked or owner.unavailable != .classes) return;
+        var offset: usize = 0;
+        while (offset < data.class_count) {
+            const count: usize = @min(8, data.class_count - offset);
+            var buffer: [120]u8 = undefined;
+            var used: usize = 0;
+            for (data.class_ids[offset..][0..count]) |class| {
+                const word = std.fmt.bufPrint(buffer[used..], " {x}", .{class}) catch return;
+                used += word.len;
+            }
+            self.log("NVIDIA gsp-context-classes: offset={d} ids={s}", .{offset, buffer[0..used]});
+            offset += count;
+        }
+    }
     fn logBytes(self: *Owner, kind: []const u8, source: u32, bytes: []const u8) void {
         var escaped: [160]u8 = undefined;
         const count = @min(bytes.len, escaped.len);
         for (bytes[0..count], escaped[0..count]) |byte, *out| out.* = if (byte >= 32 and byte < 127) byte else '.';
         self.log("NVIDIA gsp-runtime: {s} source={d} bytes={d} text={s}", .{kind, source, bytes.len, escaped[0..count]});
+    }
+    noinline fn logRpcBytes(self: *Owner, kind: []const u8, bytes: []const u8) void {
+        const count: usize = @min(bytes.len, 160);
+        var offset: usize = 0;
+        while (offset < count) {
+            const part: usize = @min(count - offset, 32);
+            var block: [32]u8 = @splat(0);
+            @memcpy(block[0..part], bytes[offset..][0..part]);
+            const hex = std.fmt.bytesToHex(block, .lower);
+            self.log("NVIDIA gsp-rpc-data: kind={s} bytes={d} captured={d} offset={d} hex={s}",
+                .{kind, bytes.len, count, offset, hex[0 .. part * 2]});
+            offset += part;
+        }
+    }
+    noinline fn logNocatBytes(self: *Owner, bytes: []const u8) void {
+        // The decoded journal owns at most 1024 inline bytes. Preserve binary
+        // diagnostics before its normal ACK, without new MMIO/RPC or storage.
+        const count: usize = @min(bytes.len, 1024);
+        var offset: usize = 0;
+        while (offset < count) {
+            const part: usize = @min(count - offset, 32);
+            var block: [32]u8 = @splat(0);
+            @memcpy(block[0..part], bytes[offset..][0..part]);
+            const hex = std.fmt.bytesToHex(block, .lower);
+            self.log("NVIDIA gsp-nocat-data: epoch={d} event={d} bytes={d} captured={d} offset={d} hex={s}",
+                .{self.epoch, self.snapshot.nocat_count, bytes.len, count, offset, hex[0 .. part * 2]});
+            offset += part;
+        }
     }
 };

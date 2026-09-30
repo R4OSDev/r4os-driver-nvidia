@@ -354,15 +354,8 @@ pub fn decodePart(binding: Binding, part: Part, operation: Operation, request: [
     if (status != 0) return .{ .rejected = status };
     if (operation == .allocate) {
         if (data.len != 160) return error.Payload;
-        const p = data[32..];
-        // The caller requested one exact linear uncompressed system range.
-        // Unexpected attribute/layout/pointer changes remain retained.
-        for (p, 0..) |value, i| {
-            if (i >= 80 and i < 96) continue; // Returned VA and byte limit.
-            if (value != request[32 + i]) return error.Payload;
-        }
-        if (long(p, 88) != part.total_bytes - 1) return error.Bounds;
-        const returned = long(p, 80);
+        const returned = try virtual.allocationParameters(binding.space, request[32..], data[32..]);
+        if (long(data, 96) != part.total_bytes) return error.Bounds;
         try addressValidPart(binding, part, returned);
         return .{ .ok = returned };
     }

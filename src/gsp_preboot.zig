@@ -1,3 +1,49 @@
+// src/nvidia/src/kernel/gpu/gpu_registry.c
+// /*
+//  * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//  * SPDX-License-Identifier: MIT
+//  *
+//  * Permission is hereby granted, free of charge, to any person obtaining a
+//  * copy of this software and associated documentation files (the "Software"),
+//  * to deal in the Software without restriction, including without limitation
+//  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//  * and/or sell copies of the Software, and to permit persons to whom the
+//  * Software is furnished to do so, subject to the following conditions:
+//  *
+//  * The above copyright notice and this permission notice shall be included in
+//  * all copies or substantial portions of the Software.
+//  *
+//  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+//  * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+//  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+//  * DEALINGS IN THE SOFTWARE.
+//  */
+// src/nvidia/interface/nvrm_registry.h
+// /*
+//  * SPDX-FileCopyrightText: Copyright (c) 1997-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//  * SPDX-License-Identifier: MIT
+//  *
+//  * Permission is hereby granted, free of charge, to any person obtaining a
+//  * copy of this software and associated documentation files (the "Software"),
+//  * to deal in the Software without restriction, including without limitation
+//  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//  * and/or sell copies of the Software, and to permit persons to whom the
+//  * Software is furnished to do so, subject to the following conditions:
+//  *
+//  * The above copyright notice and this permission notice shall be included in
+//  * all copies or substantial portions of the Software.
+//  *
+//  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+//  * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+//  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+//  * DEALINGS IN THE SOFTWARE.
+//  */
 // GSP preboot source notices (NVIDIA0.1.54)
 //
 // NVIDIA570.144/src/nvidia/inc/kernel/gpu/gsp/gsp_static_config.h
@@ -274,8 +320,22 @@ const std = @import("std");
 const identity = @import("identity.zig");
 const firmware = @import("firmware.zig");
 pub const system_bytes = 928;
-pub const registry_bytes = 8 + 3 * 16 + "RMSecBusResetEnable".len + 1 +
-    "RMForcePcieConfigSave".len + 1 + "RMDevidCheckIgnore".len + 1;
+pub const registry_header_bytes = 8;
+pub const registry_entry_bytes = 16;
+pub const registry_entries = .{
+    .{ "RMSecBusResetEnable", @as(u32, 1) },
+    .{ "RMForcePcieConfigSave", @as(u32, 1) },
+    .{ "RMDevidCheckIgnore", @as(u32, 1) },
+    // The current mapping owner asks RM to manage the complete VA tree.
+    // GSP defaults to split host/server management. Explicitly request the
+    // documented server-owned mode; only real replies can qualify support.
+    .{ "RMSplitVasMgmtServerClientRm", @as(u32, 0) },
+};
+pub const registry_bytes = blk: {
+    var size = registry_header_bytes + registry_entries.len * registry_entry_bytes;
+    for (registry_entries) |entry| size += entry[0].len + 1;
+    break :blk size;
+};
 pub const config_mirror_base = 0x88000;
 pub const config_mirror_bytes = 0x1000;
 // R4OS uses four-level x86_64 paging. RM's osGetCpuVaAddrShift adds the
@@ -334,13 +394,14 @@ pub fn encode(snapshot: *const identity.Snapshot, console_bytes: u64, out: *Payl
     // Firmware retains its normal thermal/performance policy.
     const registry = &out.registry;
     put32(registry, 0, registry.len);
-    put32(registry, 4, 3);
-    var offset: usize = 8 + 3 * 16;
-    inline for (.{ "RMSecBusResetEnable", "RMForcePcieConfigSave", "RMDevidCheckIgnore" }, 0..) |name, index| {
-        const entry = 8 + index * 16;
+    put32(registry, 4, registry_entries.len);
+    var offset: usize = registry_header_bytes + registry_entries.len * registry_entry_bytes;
+    inline for (registry_entries, 0..) |setting, index| {
+        const name = setting[0];
+        const entry = registry_header_bytes + index * registry_entry_bytes;
         put32(registry, entry, @intCast(offset));
         registry[entry + 4] = 1; // REGISTRY_TABLE_ENTRY_TYPE_DWORD.
-        put32(registry, entry + 8, 1);
+        put32(registry, entry + 8, setting[1]);
         put32(registry, entry + 12, 4);
         @memcpy(registry[offset..][0..name.len], name);
         offset += name.len + 1;

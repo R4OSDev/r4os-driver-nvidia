@@ -5,8 +5,13 @@
 #include <string.h>
 #include "core/core.h"
 #include "os/os.h"
+#include "nvrm_registry.h"
+#include "gpu/gsp/gsp_static_config.h"
 #include "vgpu/rpc_headers.h"
 #include "gpu/mem_mgr/virt_mem_allocator_common.h"
+#include "gpu/mem_mgr/heap.h"
+#include "class/cl50a0.h"
+#include "class/cl0040.h"
 #define RPC_STRUCTURES
 #define RPC_GENERIC_UNION
 #include "g_rpc-structures.h"
@@ -32,6 +37,240 @@
 #include "published/ampere/ga102/dev_riscv_pri.h"
 #include "published/ampere/ga102/dev_gc6_island.h"
 #include "published/ampere/ga102/dev_gc6_island_addendum.h"
+#include "published/pascal/gp100/dev_mmu.h"
+#include "published/turing/tu102/dev_vm.h"
+#include "ctrl/ctrl0080/ctrl0080dma.h"
+#include "class/cl90f1.h"
+#include "gpu/mem_mgr/mem_desc.h"
+#include "os/nv_memory_type.h"
+#include "ctrl/ctrl2080/ctrl2080ce.h"
+#include "class/cl2080_notification.h"
+#include "alloc/alloc_channel.h"
+#include "published/ampere/ga100/dev_ctrl.h"
+
+int r4nv_gsp_host_channel_abi_check(NvU32 chid, NvU32 runlist, NvU32 runqueue,
+                                  NvU32 golden, NvU32 flags, NvU32 token)
+{
+    NvU32 expected = 0;
+    NvU32 doorbell = 0;
+    if (sizeof(NV_CHANNEL_ALLOC_PARAMS) != 368 || offsetof(NV_CHANNEL_ALLOC_PARAMS, flags) != 20 ||
+        chid == 0 || chid > 512 || chid % 8 || runlist > 127 || runqueue > 1 || golden > 1) return 1;
+    expected = FLD_SET_DRF(OS04, _FLAGS, _DELAY_CHANNEL_SCHEDULING, _TRUE, expected);
+    expected = FLD_SET_DRF(OS04, _FLAGS, _CHANNEL_DENY_PHYSICAL_MODE_CE, _TRUE, expected);
+    expected = FLD_SET_DRF_NUM(OS04, _FLAGS, _GROUP_CHANNEL_RUNQUEUE, runqueue, expected);
+    if (golden) expected = FLD_SET_DRF(OS04, _FLAGS, _PRIVILEGED_CHANNEL, _TRUE, expected);
+    expected = FLD_SET_DRF(OS04, _FLAGS, _CHANNEL_USERD_INDEX_FIXED, _FALSE, expected);
+    expected = FLD_SET_DRF(OS04, _FLAGS, _CHANNEL_USERD_INDEX_PAGE_FIXED, _TRUE, expected);
+    expected = FLD_SET_DRF_NUM(OS04, _FLAGS, _CHANNEL_USERD_INDEX_VALUE, chid % 8, expected);
+    expected = FLD_SET_DRF_NUM(OS04, _FLAGS, _CHANNEL_USERD_INDEX_PAGE_VALUE, chid / 8, expected);
+    doorbell = FLD_SET_DRF_NUM(_CTRL, _VF_DOORBELL, _VECTOR, chid, doorbell);
+    doorbell = FLD_SET_DRF_NUM(_CTRL, _VF_DOORBELL, _RUNLIST_ID, runlist, doorbell);
+    return flags != expected || token != doorbell;
+}
+
+int r4nv_gsp_copy_caps_abi_check(const unsigned char *bytes, size_t length,
+                               unsigned ce, unsigned flags, unsigned char *reply)
+{
+    rpc_gsp_rm_control_v03_00 header = {0};
+    NV2080_CTRL_CE_GET_PHYSICAL_CAPS_PARAMS params = {0};
+    if (ce >= 20 || flags >= 4 || sizeof(header) != 24 || sizeof(params) != 8 ||
+        offsetof(NV2080_CTRL_CE_GET_PHYSICAL_CAPS_PARAMS, capsTbl) != 4 ||
+        NV2080_CTRL_CE_CAPS_TBL_SIZE != 2 || length != sizeof(header) + sizeof(params)) return 1;
+    /* kceGetDeviceCaps_IMPL uses the internal client/subdevice and physical
+     * control, never the host-only public GET_CAPS_V2 (0x20802a03). */
+    header.hClient = 0x2222;
+    header.hObject = 0x3333;
+    header.cmd = NV2080_CTRL_CMD_CE_GET_PHYSICAL_CAPS;
+    header.paramsSize = sizeof(params);
+    params.ceEngineType = NV2080_ENGINE_TYPE_COPY(ce);
+    if (memcmp(bytes, &header, sizeof(header)) || memcmp(bytes + sizeof(header), &params, sizeof(params))) return 2;
+    if (flags & 1) params.capsTbl[(1 ? NV2080_CTRL_CE_CAPS_CE_GRCE)] |= (0 ? NV2080_CTRL_CE_CAPS_CE_GRCE);
+    if (flags & 2) params.capsTbl[(1 ? NV2080_CTRL_CE_CAPS_CE_SYSMEM)] |= (0 ? NV2080_CTRL_CE_CAPS_CE_SYSMEM);
+    memcpy(reply, &header, sizeof(header));
+    memcpy(reply + sizeof(header), &params, sizeof(params));
+    return 0;
+}
+
+int r4nv_gsp_memory_clear_abi_check(const unsigned char *bytes, size_t length, NvU64 base, NvU64 size)
+{
+    rpc_gsp_rm_control_v03_00 header;
+    NV2080_CTRL_INTERNAL_MEMMGR_MEMORY_TRANSFER_WITH_GSP_PARAMS params;
+    NV2080_CTRL_INTERNAL_MEMMGR_MEMORY_TRANSFER_WITH_GSP_PARAMS expected = {0};
+    if (sizeof(header) != 24 || sizeof(params) != 96 || length != sizeof(header) + sizeof(params)) return 1;
+    memcpy(&header, bytes, sizeof(header));
+    memcpy(&params, bytes + sizeof(header), sizeof(params));
+    if (header.hClient != 0x1234 || header.hObject != 0x5678 || header.status || header.flags ||
+        header.cmd != NV2080_CTRL_CMD_INTERNAL_MEMMGR_MEMORY_TRANSFER_WITH_GSP || header.paramsSize != sizeof(params)) return 2;
+    expected.dst.baseAddr = base;
+    expected.dst.size = size;
+    expected.dst.aperture = ADDR_FBMEM;
+    expected.dst.cpuCacheAttrib = NV_MEMORY_UNCACHED;
+    expected.transferSize = size;
+    expected.memop = NV2080_CTRL_MEMMGR_MEMORY_OP_MEMSET;
+    return memcmp(&params, &expected, sizeof(params)) != 0;
+}
+
+int r4nv_gsp_host_vaspace_abi_check(const unsigned char *bytes, size_t length)
+{
+    rpc_gsp_rm_alloc_v03_00 header;
+    NV_VASPACE_ALLOCATION_PARAMETERS params;
+    NV_VASPACE_ALLOCATION_PARAMETERS expected = {0};
+    if (length != sizeof(header) + sizeof(params)) return 1;
+    memcpy(&header, bytes, sizeof(header));
+    memcpy(&params, bytes + sizeof(header), sizeof(params));
+    if (header.hClient != 0xc1d00000 || header.hParent != 0x10000000 || header.hObject != 0x10000006 ||
+        header.hClass != FERMI_VASPACE_A || header.paramsSize != sizeof(params)) return 2;
+    expected.flags = NV_VASPACE_ALLOCATION_FLAGS_IS_EXTERNALLY_OWNED;
+    expected.bigPageSize = 65536;
+    expected.vaBase = 4096;
+    return memcmp(&params, &expected, sizeof(params)) != 0;
+}
+
+/* The external PDB is distinct from the server RM walker's root. Compare
+ * byte layouts and PF invalidate fields against the complete original C
+ * headers; this does not claim hardware execution or register completion. */
+int r4nv_gsp_host_mmu_abi_check(const unsigned *actual, size_t count,
+                               const unsigned char *bytes, size_t length,
+                               unsigned bind, NvU64 physical)
+{
+    const NvU32 base = DRF_BASE(NV_VIRTUAL_FUNCTION_FULL_PHYS_OFFSET);
+    const NvU32 expected[] = {
+        NV_VASPACE_ALLOCATION_FLAGS_IS_EXTERNALLY_OWNED,
+        sizeof(rpc_gsp_rm_control_v03_00),
+        sizeof(NV0080_CTRL_DMA_SET_PAGE_DIRECTORY_PARAMS),
+        sizeof(NV0080_CTRL_DMA_UNSET_PAGE_DIRECTORY_PARAMS),
+        NV0080_CTRL_CMD_DMA_SET_PAGE_DIRECTORY, NV0080_CTRL_CMD_DMA_UNSET_PAGE_DIRECTORY,
+        NV_MMU_VER2_PDE__SIZE, NV_MMU_VER2_DUAL_PDE__SIZE, NV_MMU_VER2_PTE__SIZE,
+        base, base + NV_VIRTUAL_FUNCTION_PRIV_MMU_INVALIDATE_PDB,
+        base + NV_VIRTUAL_FUNCTION_PRIV_MMU_INVALIDATE_UPPER_PDB,
+        base + NV_VIRTUAL_FUNCTION_PRIV_MMU_INVALIDATE,
+        DRF_DEF(_VIRTUAL_FUNCTION_PRIV, _MMU_INVALIDATE, _TRIGGER, _TRUE),
+        DRF_DEF(_VIRTUAL_FUNCTION_PRIV, _MMU_INVALIDATE, _TRIGGER, _TRUE) |
+        DRF_DEF(_VIRTUAL_FUNCTION_PRIV, _MMU_INVALIDATE, _ALL_VA, _TRUE) |
+        DRF_DEF(_VIRTUAL_FUNCTION_PRIV, _MMU_INVALIDATE, _SYS_MEMBAR, _TRUE) |
+        DRF_DEF(_VIRTUAL_FUNCTION_PRIV, _MMU_INVALIDATE, _ACK, _GLOBALLY),
+        DRF_NUM(_VIRTUAL_FUNCTION_PRIV, _MMU_INVALIDATE_PDB, _ADDR,
+                (NvU32)(physical >> NV_VIRTUAL_FUNCTION_PRIV_MMU_INVALIDATE_PDB_ADDR_ALIGNMENT)) |
+        DRF_DEF(_VIRTUAL_FUNCTION_PRIV, _MMU_INVALIDATE_PDB, _APERTURE, _SYS_MEM),
+        DRF_NUM(_VIRTUAL_FUNCTION_PRIV, _MMU_INVALIDATE_UPPER_PDB, _ADDR,
+                (NvU32)((physical >> NV_VIRTUAL_FUNCTION_PRIV_MMU_INVALIDATE_PDB_ADDR_ALIGNMENT) >>
+                        DRF_SIZE(NV_VIRTUAL_FUNCTION_PRIV_MMU_INVALIDATE_PDB_ADDR)))
+    };
+    rpc_gsp_rm_control_v03_00 header;
+    if (count != sizeof(expected) / sizeof(expected[0]) || memcmp(actual, expected, sizeof(expected))) return 1;
+    if (length < sizeof(header)) return 2;
+    memcpy(&header, bytes, sizeof(header));
+    if (header.hClient != 0xc1d00000 || header.hObject != 0x10000000 ||
+        header.status != 0 || header.flags != 0) return 3;
+    if (bind) {
+        NV0080_CTRL_DMA_SET_PAGE_DIRECTORY_PARAMS params;
+        NV0080_CTRL_DMA_SET_PAGE_DIRECTORY_PARAMS expected_params = {0};
+        if (header.cmd != NV0080_CTRL_CMD_DMA_SET_PAGE_DIRECTORY ||
+            header.paramsSize != sizeof(params) || length != sizeof(header) + sizeof(params)) return 4;
+        expected_params.physAddress = physical;
+        expected_params.numEntries = 4;
+        expected_params.flags = DRF_DEF(0080, _CTRL_DMA_SET_PAGE_DIRECTORY, _FLAGS_APERTURE, _SYSMEM_COH) |
+                                DRF_DEF(0080, _CTRL_DMA_SET_PAGE_DIRECTORY, _FLAGS_ALL_CHANNELS, _TRUE);
+        expected_params.hVASpace = 0x10000006;
+        memcpy(&params, bytes + sizeof(header), sizeof(params));
+        if (memcmp(&params, &expected_params, sizeof(params))) return 5;
+    } else {
+        NV0080_CTRL_DMA_UNSET_PAGE_DIRECTORY_PARAMS params;
+        if (header.cmd != NV0080_CTRL_CMD_DMA_UNSET_PAGE_DIRECTORY ||
+            header.paramsSize != sizeof(params) || length != sizeof(header) + sizeof(params)) return 6;
+        memcpy(&params, bytes + sizeof(header), sizeof(params));
+        if (params.hVASpace != 0x10000006 || params.subDeviceId != 0) return 7;
+    }
+    return 0;
+}
+
+NvU64 r4nv_gsp_host_page_word(NvU64 physical, unsigned directory,
+                             unsigned system, unsigned kind,
+                             unsigned cached, unsigned read_only, unsigned atomic, unsigned privileged)
+{
+    if (directory == 1)
+        return DRF_NUM64(_MMU, _VER2_PDE, _ADDRESS_SYS, physical >> NV_MMU_VER2_PDE_ADDRESS_SHIFT) |
+            DRF_NUM64(_MMU, _VER2_PDE, _APERTURE, NV_MMU_PDE_APERTURE_BIG_SYSTEM_COHERENT_MEMORY) |
+            DRF_DEF64(_MMU, _VER2_PDE, _VOL, _TRUE);
+    if (directory == 2)
+        /* DRF_NUM64 places the small half at its position modulo64. The
+         * caller separately verifies the big half remains zero. */
+        return DRF_NUM64(_MMU, _VER2_DUAL_PDE, _ADDRESS_SMALL_SYS, physical >> NV_MMU_VER2_DUAL_PDE_ADDRESS_SHIFT) |
+            DRF_NUM64(_MMU, _VER2_DUAL_PDE, _APERTURE_SMALL, NV_MMU_PDE_APERTURE_BIG_SYSTEM_COHERENT_MEMORY) |
+            DRF_DEF64(_MMU, _VER2_DUAL_PDE, _VOL_SMALL, _TRUE);
+    return (system ? DRF_NUM64(_MMU, _VER2_PTE, _ADDRESS_SYS, physical >> NV_MMU_VER2_PTE_ADDRESS_SHIFT) :
+                     DRF_NUM64(_MMU, _VER2_PTE, _ADDRESS_VID, physical >> NV_MMU_VER2_PTE_ADDRESS_SHIFT)) |
+        DRF_DEF64(_MMU, _VER2_PTE, _VALID, _TRUE) |
+        DRF_NUM64(_MMU, _VER2_PTE, _APERTURE, system ? NV_MMU_PTE_APERTURE_SYSTEM_COHERENT_MEMORY : NV_MMU_PTE_APERTURE_VIDEO_MEMORY) |
+        DRF_NUM64(_MMU, _VER2_PTE, _VOL, !cached) |
+        DRF_NUM64(_MMU, _VER2_PTE, _READ_ONLY, read_only) |
+        DRF_NUM64(_MMU, _VER2_PTE, _PRIVILEGE, privileged) |
+        DRF_NUM64(_MMU, _VER2_PTE, _ATOMIC_DISABLE, !atomic) |
+        DRF_NUM64(_MMU, _VER2_PTE, _KIND, kind);
+}
+
+int r4nv_gsp_preboot_abi_check(const unsigned *actual, size_t count,
+                              const unsigned char *bytes, size_t length)
+{
+    const NvU32 expected[] = {
+        sizeof(PACKED_REGISTRY_TABLE), sizeof(PACKED_REGISTRY_ENTRY),
+        offsetof(PACKED_REGISTRY_ENTRY, nameOffset),
+        offsetof(PACKED_REGISTRY_ENTRY, type),
+        offsetof(PACKED_REGISTRY_ENTRY, data),
+        offsetof(PACKED_REGISTRY_ENTRY, length),
+        sizeof(GspStaticConfigInfo),
+        offsetof(GspStaticConfigInfo, bSplitVasBetweenServerClientRm),
+        sizeof(((GspStaticConfigInfo *)0)->bSplitVasBetweenServerClientRm)
+    };
+    const char *names[] = {
+        NV_REG_STR_SECONDARY_BUS_RESET_ENABLED,
+        NV_REG_STR_FORCE_PCIE_CONFIG_SAVE,
+        "RMDevidCheckIgnore",
+        NV_REG_STR_RM_SPLIT_VAS_MGMT_SERVER_CLIENT_RM
+    };
+    const NvU32 values[] = { 1, 1, 1, NV_REG_STR_RM_SPLIT_VAS_MGMT_SERVER_CLIENT_RM_DISABLED };
+    PACKED_REGISTRY_TABLE table;
+    size_t i, at = sizeof(table) + 4 * sizeof(PACKED_REGISTRY_ENTRY);
+    if (count != sizeof(expected) / sizeof(expected[0]) ||
+        memcmp(actual, expected, sizeof(expected)) != 0 || length < at) return 1;
+    memcpy(&table, bytes, sizeof(table));
+    if (table.size != length || table.numEntries != 4) return 2;
+    for (i = 0; i < 4; i++) {
+        PACKED_REGISTRY_ENTRY entry;
+        size_t name_bytes = strlen(names[i]) + 1;
+        memcpy(&entry, bytes + sizeof(table) + i * sizeof(entry), sizeof(entry));
+        if (entry.nameOffset != at || entry.type != REGISTRY_TABLE_ENTRY_TYPE_DWORD ||
+            entry.data != values[i] || entry.length != sizeof(NvU32) ||
+            name_bytes > length - at || memcmp(bytes + at, names[i], name_bytes)) return 3;
+        at += name_bytes;
+    }
+    return at != length;
+}
+
+/* stdmemValidateParams rejects zero, ~0 and the internal scratch interval.
+ * Read the real RPC/SDK layouts, independently of the Zig encoder and the
+ * fixture generators. Both virtual and local-video allocations use this
+ * owner namespace; it is not an RM object/client handle. */
+int r4nv_gsp_memory_owner_abi_check(const unsigned char *bytes, size_t length)
+{
+    rpc_gsp_rm_alloc_v03_00 header;
+    NV_MEMORY_ALLOCATION_PARAMS params;
+    if (length != sizeof(header) + sizeof(params)) return 1;
+    memcpy(&header, bytes, sizeof(header));
+    memcpy(&params, bytes + sizeof(header), sizeof(params));
+    if (header.paramsSize != sizeof(params) ||
+        (header.hClass != NV50_MEMORY_VIRTUAL &&
+         header.hClass != NV01_MEMORY_LOCAL_USER)) return 2;
+    if (params.owner != HEAP_OWNER_RM_CLIENT_GENERIC ||
+        params.owner == 0 || params.owner == 0xffffffffU ||
+        (params.owner >= HEAP_OWNER_RM_SCRATCH_BEGIN &&
+         params.owner <= HEAP_OWNER_RM_SCRATCH_END)) return 3;
+    /* The standard allocator normalizes these flags before constructing an
+     * object. Request their final state so the echoed receipt stays exact. */
+    if (!(params.flags & NVOS32_ALLOC_FLAGS_MAP_NOT_REQUIRED) ||
+        (params.flags & NVOS32_ALLOC_FLAGS_KERNEL_MAPPING_MAP)) return 4;
+    return 0;
+}
 
 int r4nv_falcon_hs_abi_check(const unsigned *actual, size_t count)
 {

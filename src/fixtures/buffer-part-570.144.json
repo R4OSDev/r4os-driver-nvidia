@@ -7,9 +7,20 @@
     2124
   ],
   "bytes": 736,
-  "sha256": "5b04adf17290648b0c4e04079f04af9eef4f56aff0b8bc4911c5a5d5ca97ec29",
+  "sha256": "bd984403d31979654732b0e411d18834958946956a7bfb4d7133a2960ead3640",
   "pairs": 6,
   "virtual_bytes": 83886080,
   "part_offset": 33484800,
-  "part_bytes": 12288
+  "part_bytes": 12288,
+  "generator": "Temp/Ossi08200/Memory155/buffer-part.c",
+  "owner_contract": {
+    "validation_sha256": "8e84b2a2641e580721ddccebc1c1a064e84b46614d7d65ae0022408224a995ee",
+    "header_sha256": "8d16bfd6f3a91f3e991f3c8458668bd21559cb59f9eb46a0921e8ec1271bae80",
+    "memory_owner": "HEAP_OWNER_RM_CLIENT_GENERIC (0xdeaf000c)",
+    "normalized_flags": "NVOS32_ALLOC_FLAGS_MAP_NOT_REQUIRED",
+    "original_generator": "Temp/gfx-native-buffer-20260912/Buffer-Part-ABI.c",
+    "regression": "GspMessageAbi.c reads complete original RPC/SDK/heap headers; old zero-owner fixtures rejected.",
+    "header": "src/nvidia/generated/g_heap_nvoc.h",
+    "validation_source": "src/nvidia/src/kernel/mem_mgr/standard_mem.c"
+  }
 }

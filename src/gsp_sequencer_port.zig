@@ -147,6 +147,7 @@ pub const RecoveryOwner = struct {
 pub const DisplayAccess = enum { read, publish };
 pub const Owner = struct {
     context: *anyopaque,
+    admit_host_mmu: ?*const fn (*anyopaque, *const Port, *@import("gsp_host_vm.zig").Owner, u64) anyerror!void = null,
     generation: *const fn (*anyopaque) u64,
     // Pure whole-command admission, including the command's implicit core
     // accesses. The owner must hold VRAM/VGA/display recovery and the exact
@@ -636,6 +637,49 @@ pub const Port = struct {
         const owner = self.owner orelse return error.State;
         try (owner.admit_unload orelse return error.Unsupported)(owner.context, self, unload, deadline);
         return self.readFor(.{ .request = deadline }, core.reg.mailbox0);
+    }
+    fn admitHostMmu(self: *Port, vm: *@import("gsp_host_vm.zig").Owner, offset: u32) !u64 {
+        const tlb = @import("gsp_host_tlb.zig");
+        if (offset != tlb.pdb_low and offset != tlb.pdb_high and offset != tlb.invalidate) return error.Register;
+        const operation = try vm.invalidation();
+        const deadline = operation.deadline;
+        try self.guardFor(.{ .request = deadline });
+        if (self.phase != .runtime or self.runtime_sequence != null or !self.retained or !self.supports(.read, offset) or
+            operation.epoch != self.run.epoch or operation.root_dma != try vm.rootAddress()) return error.Binding;
+        const owner = self.owner orelse return error.State;
+        try (owner.admit_host_mmu orelse return error.Unsupported)(owner.context, self, vm, deadline);
+        return deadline;
+    }
+    pub fn hostMmuRead(self: *Port, vm: *@import("gsp_host_vm.zig").Owner, offset: u32) !u32 {
+        errdefer |err| self.recordFailure(err);
+        const deadline = try self.admitHostMmu(vm, offset);
+        fence();
+        const result = self.pointer(offset).*;
+        fence();
+        try self.guardFor(.{ .request = deadline });
+        _ = try self.admitHostMmu(vm, offset);
+        return result;
+    }
+    pub fn hostMmuWrite(self: *Port, vm: *@import("gsp_host_vm.zig").Owner, offset: u32, value: u32) !void {
+        errdefer |err| self.recordFailure(err);
+        const tlb = @import("gsp_host_tlb.zig");
+        const deadline = try self.admitHostMmu(vm, offset);
+        const operation = try vm.invalidation();
+        const address = try tlb.words(operation.root_dma);
+        const expected: u32 = switch (operation.phase) {
+            .low => if (offset == tlb.pdb_low) address[0] else return error.Register,
+            .high => if (offset == tlb.pdb_high) address[1] else return error.Register,
+            .publish => if (offset == tlb.invalidate) tlb.command else return error.Register,
+            else => return error.Phase,
+        };
+        if (value != expected or !operation.effects_possible) return error.Binding;
+        if (try self.readFor(.{ .request = deadline }, 0) != self.boot0) return error.IdentityChanged;
+        _ = try self.admitHostMmu(vm, offset);
+        fence();
+        self.pointer(offset).* = value;
+        fence();
+        if (try self.readFor(.{ .request = deadline }, 0) != self.boot0) return error.IdentityChanged;
+        _ = try self.admitHostMmu(vm, offset);
     }
     /// Separate engine producer gates. Sequencers retain their existing register
     /// policy and cannot write this doorbell, USERD or a caller-selected token.

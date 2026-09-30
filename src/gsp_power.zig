@@ -26,6 +26,7 @@ pub const Owner = struct {
     attached: bool = false,
     possibly_attached: bool = false,
     stopping: bool = false,
+    firmware_unloading: bool = false,
     active: ?exchange.Exchange = null,
     operation: ?wire.Operation = null,
     request: [wire.max_bytes]u8 = @splat(0),
@@ -210,7 +211,7 @@ pub const Owner = struct {
             self.performance_request = request;
             return .{ .boost = .{ .level = request.level, .seconds = request.seconds } };
         }
-        if (self.stopping and self.attached and self.detach_rejection == null) return .detach;
+        if (self.stopping and !self.firmware_unloading and self.attached and self.detach_rejection == null) return .detach;
         if (self.stopping and !self.possibly_attached and self.backing.close()) self.status = .closed;
         if (!self.stopping and self.timer.rejected == null and !self.timer.faulted and now < self.timing_until and now >= self.timer_next) return .timer;
         return null;
@@ -221,7 +222,7 @@ pub const Owner = struct {
         const encoded = try wire.encode(self.controlBinding(operation), operation, &self.request);
         switch (operation) {
             .attach => |address| if (self.status != .unprobed or self.possibly_attached or !self.backing.valid() or self.backing.pages[0] != address) return error.Binding,
-            .detach => if (!self.stopping or !self.attached or !self.possibly_attached) return error.State,
+            .detach => if (!self.stopping or self.firmware_unloading or !self.attached or !self.possibly_attached) return error.State,
             .poll => |value| {
                 if (!self.attached or !self.possibly_attached) return error.State;
                 // Baseline before enabling the poll; pre-existing values must
@@ -263,7 +264,8 @@ pub const Owner = struct {
         if (!self.started) {
             if (operation == .attach) {
                 // Publication can be ambiguous. Only a matched rejection or
-                // an acknowledged detach may release this physical page.
+                // an acknowledged detach (or the terminal physical reset
+                // proof) may release this physical page.
                 self.possibly_attached = true;
                 self.backing.retained = true;
             }
@@ -345,6 +347,21 @@ pub const Owner = struct {
         if (self.active == null and !self.possibly_attached and self.performance.pending == null and
             (self.performance.accepted_level == 0 or now >= self.performance.accepted_until) and self.backing.close()) self.status = .closed;
         return self.closed();
+    }
+    /// Terminal shutdown may destroy the application's RM graph while GSP
+    /// still owns its internal RUSD page. The original physical RM retains
+    /// that page for its firmware lifetime; address0 re-initialization is
+    /// rejected by the physical 570.144 GSP. Drain poll/boost controls, then
+    /// keep the exact page/lease pinned through firmware unload and the
+    /// existing FLR-proved closeAfterReset path. This is not a detach receipt.
+    pub fn stopForFirmwareUnload(self: *Owner, now: u64) !bool {
+        try self.stable();
+        self.firmware_unloading = true;
+        if (try self.stop(now)) return true;
+        return self.active == null and self.operation == null and !self.started and !self.completed and
+            self.attached and self.possibly_attached and self.active_mask == 0 and
+            self.performance.pending == null and (self.performance.accepted_level == 0 or now >= self.performance.accepted_until) and
+            self.backing.retained and self.backing.valid();
     }
     fn map(self: *Owner) !Reader {
         if (!self.backing.valid()) return error.State;

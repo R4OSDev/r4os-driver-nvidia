@@ -1,15 +1,22 @@
 {
   "source_pin": "NVIDIA 570.144 / 8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f",
   "vector": {
-    "path": "Temp/gfx-surface-layout-20260912/surface-rm-570.144.bin",
+    "path": "Temp/Ossi08200/Memory155/surface-rm-570.144.bin",
     "bytes": 2560,
-    "sha256": "805cba6b8567f876af3101bad15db0b0aafda317f8b2001c347c7a71858ab7d7"
+    "sha256": "637f51123392e3fa6d52d5c5009e7fbe22611044b424e15aa87e5dc4117fbbfc"
   },
-  "generator": {
-    "path": "Temp/gfx-surface-layout-20260912/Surface-ABI.c",
-    "bytes": 13191,
-    "sha256": "07464d43e8d48274d65dacf4b3dda54c0f46538dbc032bf0f1af2c0d3e3c7328"
-  },
+  "generator": "Temp/Ossi08200/Memory155/surface-rm.c",
   "scope": "Original height-selection function, modifier/alignment macros and RM C structs; documented 64x8 GOB geometry; no physical hardware execution",
-  "reference_discrepancy": "GetLog2GobsPerBlock passes alignment masks to NV_ALIGN_UP, whose pinned nvmisc.h definition takes granules. The fixture retains the original macro and passes actual GOB dimensions."
+  "reference_discrepancy": "GetLog2GobsPerBlock passes alignment masks to NV_ALIGN_UP, whose pinned nvmisc.h definition takes granules. The fixture retains the original macro and passes actual GOB dimensions.",
+  "sha256": "637f51123392e3fa6d52d5c5009e7fbe22611044b424e15aa87e5dc4117fbbfc",
+  "owner_contract": {
+    "validation_sha256": "8e84b2a2641e580721ddccebc1c1a064e84b46614d7d65ae0022408224a995ee",
+    "header_sha256": "8d16bfd6f3a91f3e991f3c8458668bd21559cb59f9eb46a0921e8ec1271bae80",
+    "memory_owner": "HEAP_OWNER_RM_CLIENT_GENERIC (0xdeaf000c)",
+    "normalized_flags": "NVOS32_ALLOC_FLAGS_MAP_NOT_REQUIRED",
+    "original_generator": "Temp/gfx-surface-layout-20260912/Surface-ABI.c",
+    "regression": "GspMessageAbi.c reads complete original RPC/SDK/heap headers; old zero-owner fixtures rejected.",
+    "header": "src/nvidia/generated/g_heap_nvoc.h",
+    "validation_source": "src/nvidia/src/kernel/mem_mgr/standard_mem.c"
+  }
 }

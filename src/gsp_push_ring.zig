@@ -319,6 +319,42 @@ pub const Ring = struct {
         return point;
     }
     pub fn idle(self: *const Ring) bool { return self.valid() and self.pending == null and self.issued == self.completed; }
+    pub noinline fn logDiagnostic(self: *const Ring, ctx: *const r4os.r4dev.DriverContext, channel: u32, cid: u32, token: u32) void {
+        const log = @import("gsp_mode_diagnostics.zig").write;
+        // Already held CPU mappings only. GPU-owned fields can change between
+        // samples; none of these values retires work or proves quiescence.
+        if (!self.valid()) {
+            log(ctx, "NVIDIA gsp-ring: channel={x} cid={d} valid=false", .{channel, cid});
+            return;
+        }
+        fence();
+        log(ctx, "NVIDIA gsp-ring: channel={x} cid={d} kind={s} token={x} va={x} physical={x}/{x}/{x}",
+            .{channel, cid, @tagName(self.kind), token, self.address, self.backing.?.pages[0], self.backing.?.pages[1], self.backing.?.pages[2]});
+        log(ctx, "NVIDIA gsp-ring: channel={x} issued={d} completed={d} put={d} gp-get={d} gp-put={d} semaphore={d} pending={} published={}",
+            .{channel, self.issued, self.completed, self.put, self.word(wire.userd_offset + 0x88).*, self.word(wire.put_offset).*,
+                self.word(wire.completion_offset).*, self.pending != null, self.published});
+        log(ctx, "NVIDIA gsp-ring: channel={x} userd-get={x}:{x} userd-put={x}:{x} top-get={x}:{x} receipt=no",
+            .{channel, self.word(wire.userd_offset + 0x60).*, self.word(wire.userd_offset + 0x44).*,
+                self.word(wire.userd_offset + 0x4c).*, self.word(wire.userd_offset + 0x40).*,
+                self.word(wire.userd_offset + 0x5c).*, self.word(wire.userd_offset + 0x58).*});
+        if (self.issued == 0) return;
+        const index = (self.put + 511) % 512;
+        const push = wire.push_offset + ((self.issued - 1) % self.capacity()) * self.slotBytes();
+        const gp0 = self.word(index * 8).*;
+        const gp1 = self.word(index * 8 + 4).*;
+        const packet_bytes: usize = @as(usize, (gp1 >> 10) & 0x1fffff) * 4;
+        const captured: usize = @min(packet_bytes, self.slotBytes(), 256);
+        log(ctx, "NVIDIA gsp-ring: channel={x} gp-index={d} entry={x}/{x} push={x} bytes={d} captured={d}",
+            .{channel, index, gp0, gp1, self.address + push, packet_bytes, captured});
+        var offset: usize = 0;
+        while (offset < captured) : (offset += 32) {
+            const part: usize = @min(captured - offset, 32);
+            var block: [32]u8 = @splat(0);
+            for (0..part / 4) |i| std.mem.writeInt(u32, block[i * 4..][0..4], self.word(push + offset + i * 4).*, .little);
+            const hex = std.fmt.bytesToHex(block, .lower);
+            log(ctx, "NVIDIA gsp-ring-data: channel={x} offset={d} hex={s}", .{channel, offset, hex[0 .. part * 2]});
+        }
+    }
     pub fn close(self: *Ring) bool {
         if (self.self_address == 0) return true;
         if (!self.idle() or self.backing.?.memory.?.bufferUnmap(&self.cpu.lease) != a.gfx_buffer_result_ok) return false;

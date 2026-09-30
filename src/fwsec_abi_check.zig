@@ -10,6 +10,19 @@ const sequencer = @import("gsp_sequencer.zig");
 const core = @import("gsp_core.zig");
 const hs = @import("falcon_hs.zig");
 const firmware_run = @import("falcon_run.zig");
+const preboot = @import("gsp_preboot.zig");
+const static = @import("gsp_static.zig");
+const host_page = @import("gsp_host_page.zig");
+const host_vm = @import("gsp_host_vm_wire.zig");
+const host_tlb = @import("gsp_host_tlb.zig");
+const memory_clear = @import("gsp_memory_clear.zig");
+extern fn r4nv_gsp_copy_caps_abi_check([*]const u8, usize, c_uint, c_uint, [*]u8) c_int;
+extern fn r4nv_gsp_host_channel_abi_check(u32, u32, u32, u32, u32, u32) c_int;
+extern fn r4nv_gsp_memory_clear_abi_check([*]const u8, usize, u64, u64) c_int;
+extern fn r4nv_gsp_host_mmu_abi_check([*]const u32, usize, [*]const u8, usize, c_uint, u64) c_int;
+extern fn r4nv_gsp_host_page_word(u64, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint) u64;
+extern fn r4nv_gsp_host_vaspace_abi_check([*]const u8, usize) c_int;
+extern fn r4nv_gsp_preboot_abi_check([*]const u32, usize, [*]const u8, usize) c_int;
 extern fn r4nv_falcon_hs_abi_check([*]const u32, usize) c_int;
 extern fn r4nv_gsp_core_abi_check([*]const u32, usize) c_int;
 extern fn r4nv_fwsec_abi_check([*]const u8, usize, c_uint, [*]const u8, usize, c_uint, [*]const u8, usize) c_int;
@@ -19,7 +32,39 @@ extern fn r4nv_gsp_ring_abi_check([*]const u32, usize, c_uint) c_int;
 extern fn r4nv_gsp_event_abi_fixture(c_uint, [*]u8, usize) usize;
 extern fn r4nv_gsp_sequence_abi_fixture([*]u8, usize) usize;
 extern fn r4nv_gsp_unload_abi_check(c_uint, [*]const u8, usize, c_uint) c_int;
+extern fn r4nv_gsp_memory_owner_abi_check([*]const u8, usize) c_int;
 pub fn main() !void {
+    try checkHostChannel();
+    try checkCopyCaps();
+    try checkMemoryClear();
+    try checkHostMmu();
+    const preboot_layout = [_]u32{ preboot.registry_header_bytes, preboot.registry_entry_bytes, 0, 4, 8, 12, static.payload_bytes, static.split_vas_offset, 1 };
+    var boot_inputs: preboot.Payloads = .{};
+    var boot_identity: @import("identity.zig").Snapshot = .{ .pci = .{ .vendor_id = 0x10de, .device_id = 0x2504, .class_code = 3 } };
+    boot_identity.bars[0] = .{ .kind = .memory32, .base = 0xfc000000, .bytes = 0x1000000 };
+    boot_identity.bars[1] = .{ .kind = .memory64, .base = 0xd0000000, .bytes = 0x10000000 };
+    boot_identity.bars[2] = .{ .kind = .upper };
+    boot_identity.bars[3] = .{ .kind = .memory64, .base = 0xe0000000, .bytes = 0x2000000 };
+    boot_identity.bars[4] = .{ .kind = .upper };
+    try preboot.encode(&boot_identity, 8192, &boot_inputs);
+    if (r4nv_gsp_preboot_abi_check(&preboot_layout, preboot_layout.len, &boot_inputs.registry, boot_inputs.registry.len) != 0) return error.OriginalPrebootMismatch;
+    // A syntactically valid but wrong mode must fail the independent C check.
+    boot_inputs.registry[8 + 3 * 16 + 8] = 1;
+    if (r4nv_gsp_preboot_abi_check(&preboot_layout, preboot_layout.len, &boot_inputs.registry, boot_inputs.registry.len) == 0) return error.OriginalPrebootNegativeMismatch;
+    // Existing original-C packet fixtures must also satisfy RM's semantic
+    // memory-owner contract. Layout-only fixtures previously admitted zero.
+    const memory_packets = .{
+        .{ @embedFile("fixtures/control-buffer-570.144.bin"), [_]usize{ 160, 320 } },
+        .{ @embedFile("fixtures/buffer-part-570.144.bin"), [_]usize{ 160, 320 } },
+        .{ @embedFile("fixtures/virtual-range-570.144.bin"), [_]usize{ 0, 160 } },
+        .{ @embedFile("fixtures/vram-570.144.bin"), [_]usize{ 0, 160, 320, 480 } },
+        .{ @embedFile("fixtures/native-storage-570.144.bin"), [_]usize{ 0, 160, 320, 480 } },
+    };
+    inline for (memory_packets) |fixture| for (fixture[1]) |at| try checkMemoryOwner(fixture[0][at..][0..160]);
+    const images = @embedFile("fixtures/image-layout-570.144.bin");
+    for (0..12) |index| for ([_]usize{ 0, 160 }) |at| try checkMemoryOwner(images[index * 432 + at ..][0..160]);
+    const surfaces = @embedFile("fixtures/surface-rm-570.144.bin");
+    for (0..16) |index| try checkMemoryOwner(surfaces[index * 160 ..][0..160]);
     const unload = @import("gsp_unload.zig");
     const request: unload.Owner = .{};
     if (r4nv_gsp_unload_abi_check(unload.function, &request.request, request.request.len, core.reg.mailbox0) != 0) return error.OriginalUnloadMismatch;
@@ -175,4 +220,140 @@ pub fn main() !void {
         .crash_queue = .{ .address = 0x300007000, .bytes = 16384 },
     });
     if (r4nv_fwsec_abi_check(&sb.data, sb.length, sb.id, &frts.data, frts.length, frts.id, &metadata, metadata.len) != 0) return error.OriginalAbiMismatch;
+}
+fn checkHostChannel() !void {
+    const wire = @import("gsp_fifo_wire.zig");
+    const fixture = @embedFile("fixtures/fifo-570.144.bin");
+    const gr = @embedFile("fixtures/gr-context-570.144.bin");
+    const copy = @embedFile("fixtures/copy-570.144.bin");
+    // Independent original C fields also validate the changed binary vectors.
+    for (0..2) |queue| {
+        const request = fixture[queue * 800..][0..400];
+        const response = fixture[queue * 800 + 400..][0..400];
+        if (r4nv_gsp_host_channel_abi_check(8, 0, @intCast(queue), 0, std.mem.readInt(u32, request[52..56], .little), 8) != 0 or
+            r4nv_gsp_host_channel_abi_check(8, 0, @intCast(queue), 0, std.mem.readInt(u32, response[52..56], .little), 8) != 0 or
+            r4nv_gsp_host_channel_abi_check(8, 0, 0, @intCast(queue), std.mem.readInt(u32, gr[2784 + queue * 4..][0..4], .little), 8) != 0) return error.OriginalHostChannelFixture;
+    }
+    for ([_]usize{72, 472}) |at| if (r4nv_gsp_host_channel_abi_check(8, 0, 0, 0,
+        std.mem.readInt(u32, copy[at..][0..4], .little), 8) != 0) return error.OriginalHostCopyFixture;
+    for (0..wire.host_channel_slots) |slot| {
+        const chid = try wire.hardwareChannelForSlot(slot);
+        for ([_]u32{0, 1, 127}) |runlist| {
+            const token = try wire.hostWorkToken(chid, runlist);
+            for (0..2) |queue| for ([_]bool{false, true}) |golden| {
+                const flags = try wire.allocationFlags(chid, @intCast(queue), golden);
+                if (r4nv_gsp_host_channel_abi_check(chid, runlist, @intCast(queue), @intFromBool(golden), flags, token) != 0) return error.OriginalHostChannelMismatch;
+                for (0..32) |bit| {
+                    const mask = @as(u32, 1) << @intCast(bit);
+                    if (r4nv_gsp_host_channel_abi_check(chid, runlist, @intCast(queue), @intFromBool(golden), flags ^ mask, token) == 0 or
+                        r4nv_gsp_host_channel_abi_check(chid, runlist, @intCast(queue), @intFromBool(golden), flags, token ^ mask) == 0) return error.OriginalHostChannelMutationAccepted;
+                }
+            };
+        }
+    }
+}
+fn checkCopyCaps() !void {
+    const wire = @import("gsp_context_wire.zig");
+    const binding: wire.Binding = .{ .epoch = 7, .client = 0x1234, .device = 2, .subdevice = 0x5678,
+        .vaspace = 3, .group = 4, .share = 5, .internal_client = 0x2222, .internal_subdevice = 0x3333 };
+    var request: [wire.length(.copy_caps)]u8 = undefined;
+    var response: [wire.length(.copy_caps)]u8 = undefined;
+    for (0..20) |ce| for (0..4) |flags| {
+        const rm: u32 = @intCast(9 + ce);
+        const encoded = try wire.encode(binding, rm, 0, .copy_caps, &request);
+        if (r4nv_gsp_copy_caps_abi_check(encoded.ptr, encoded.len, @intCast(ce), @intCast(flags), &response) != 0)
+            return error.OriginalCopyCapsMismatch;
+        var record: message.Record = .{ .shape = .{ .message_bytes = 112, .checksum_bytes = 112, .storage_bytes = 4096, .elements = 1 },
+            .queue_sequence = 0, .rpc = .{ .function = 76, .result = 0 }, .payload = &response };
+        const reply = try wire.decode(binding, rm, 0, .copy_caps, encoded, record);
+        const caps: wire.CopyCaps = .{ .bytes = reply.ok[4..6].* };
+        if (caps.grce() != (flags & 1 != 0) or caps.sysmem() != (flags & 2 != 0) or caps.standalone() != (flags == 2))
+            return error.OriginalCopyCapsFlagsMismatch;
+        for (&request) |*byte| {
+            byte.* ^= 1;
+            if (r4nv_gsp_copy_caps_abi_check(&request, request.len, @intCast(ce), @intCast(flags), &response) == 0)
+                return error.OriginalCopyCapsMutationAccepted;
+            byte.* ^= 1;
+        }
+        response[24] ^= 1;
+        if (wire.decode(binding, rm, 0, .copy_caps, encoded, record)) |_| return error.CopyCapsWrongEngineAccepted else |_| {}
+        response[24] ^= 1;
+        record.payload = response[0..24];
+        if (wire.decode(binding, rm, 0, .copy_caps, encoded, record)) |_| return error.CopyCapsShortReplyAccepted else |_| {}
+        response[12] = 0x57;
+        if ((try wire.decode(binding, rm, 0, .copy_caps, encoded, record)).rejected != 0x57) return error.CopyCapsRejectionMismatch;
+    };
+}
+fn checkMemoryClear() !void {
+    const binding: memory_clear.Binding = .{ .epoch = 7, .client = 0x1234, .subdevice = 0x5678 };
+    var packet: [memory_clear.bytes]u8 = undefined;
+    var response: [memory_clear.bytes]u8 = undefined;
+    for ([_]u64{0x80000000, 0x123400000}) |base| for ([_]u64{4096, 65536, 64 * 1024 * 1024}) |size| {
+        const encoded = try memory_clear.encode(binding, base, size, &packet);
+        if (r4nv_gsp_memory_clear_abi_check(encoded.ptr, encoded.len, base, size) != 0) return error.OriginalMemoryClearMismatch;
+        response = packet;
+        var record: message.Record = .{ .shape = .{ .message_bytes = memory_clear.bytes + 80, .checksum_bytes = memory_clear.bytes + 80, .storage_bytes = 4096, .elements = 1 },
+            .queue_sequence = 0, .rpc = .{ .function = memory_clear.function, .result = 0 }, .payload = &response };
+        if ((try memory_clear.decode(binding, base, size, encoded, record)) != .ok) return error.MemoryClearReplyMismatch;
+        for (0..packet.len) |at| {
+            packet[at] ^= 1;
+            if (r4nv_gsp_memory_clear_abi_check(&packet, packet.len, base, size) == 0) return error.OriginalMemoryClearNegativeMismatch;
+            packet[at] ^= 1;
+        }
+        response[104] ^= 1;
+        if (memory_clear.decode(binding, base, size, encoded, record)) |_| return error.MemoryClearMutationAccepted else |_| {}
+        response = packet; response[12] = 0x56; record.payload = response[0..24];
+        if ((try memory_clear.decode(binding, base, size, encoded, record)).rejected != 0x56) return error.MemoryClearRejectionMismatch;
+        response[12] = 0;
+        if (memory_clear.decode(binding, base, size, encoded, record)) |_| return error.MemoryClearShortReplyAccepted else |_| {}
+        record.payload = &response; record.rpc.result = message.pending;
+        if (memory_clear.decode(binding, base, size, encoded, record)) |_| return error.MemoryClearOuterFailureAccepted else |_| {}
+    };
+}
+
+fn checkHostMmu() !void {
+    const objects = @import("gsp_objects.zig");
+    var plan = try objects.Plan.init(7, .{ .client = 0xc1d00000, .device = 0x10000000, .subdevice = 0x10000001,
+        .display = 0x10000002, .vaspace = 0x10000006 }, 0xffffffff, "");
+    plan.external_vaspace = true;
+    var request: [80]u8 = undefined;
+    const allocated = try objects.encode(&plan, .{ .allocate = .vaspace }, &request);
+    if (r4nv_gsp_host_vaspace_abi_check(allocated.bytes.ptr, allocated.bytes.len) != 0) return error.OriginalExternalVaspaceMismatch;
+    request[36] = 0;
+    if (r4nv_gsp_host_vaspace_abi_check(&request, request.len) == 0) return error.OriginalExternalVaspaceNegativeMismatch;
+    for ([_]u64{ 4096, 0x12345000, 0x12345678000, host_page.system_limit - 4096 }) |physical| {
+        const words = try host_tlb.words(physical);
+        const values = [_]u32{ host_vm.external_vaspace_flags, host_vm.header_bytes, 32, 8,
+            host_vm.command(.bind), host_vm.command(.unbind), host_page.stride(.root), host_page.stride(.dual), host_page.stride(.leaf),
+            host_tlb.pf_base, host_tlb.pdb_low, host_tlb.pdb_high, host_tlb.invalidate, host_tlb.trigger, host_tlb.command, words[0], words[1] };
+        var bytes: [host_vm.max_bytes]u8 = undefined;
+        const binding: host_vm.Binding = .{ .epoch = 7, .client = 0xc1d00000, .device = 0x10000000, .vaspace = 0x10000006, .root_dma = physical };
+        for ([_]host_vm.Operation{ .bind, .unbind }) |operation| {
+            const encoded = try host_vm.encode(binding, operation, &bytes);
+            if (r4nv_gsp_host_mmu_abi_check(&values, values.len, encoded.ptr, encoded.len, @intFromBool(operation == .bind), physical) != 0) return error.OriginalHostMmuMismatch;
+            bytes[24] ^= 1; // Address/handle mutation must be independently rejected.
+            if (r4nv_gsp_host_mmu_abi_check(&values, values.len, encoded.ptr, encoded.len, @intFromBool(operation == .bind), physical) == 0) return error.OriginalHostMmuNegativeMismatch;
+        }
+        for (1..3) |directory| if (try host_page.directory(physical) != r4nv_gsp_host_page_word(physical, @intCast(directory), 1, 0, 0, 0, 0, 0)) return error.OriginalDirectoryMismatch;
+    }
+    for ([_]host_page.Aperture{ .video, .system_coherent }) |aperture| {
+        const limit = if (aperture == .video) host_page.video_limit else host_page.system_limit;
+        for ([_]u64{ 4096, 0x12345000, limit - 4096 }) |physical| for (0..7) |kind| for (0..16) |flags| {
+            const policy: host_page.Policy = .{ .aperture = aperture, .kind = @intCast(kind), .cached = flags & 1 != 0, .read_only = flags & 2 != 0, .atomic = flags & 4 != 0, .privileged = flags & 8 != 0 };
+            const expected = r4nv_gsp_host_page_word(physical, 0, @intFromBool(aperture == .system_coherent), @intCast(kind), @intFromBool(policy.cached), @intFromBool(policy.read_only), @intFromBool(policy.atomic), @intFromBool(policy.privileged));
+            if (try host_page.page(physical, policy) != expected) return error.OriginalPageMismatch;
+        };
+    }
+}
+
+fn checkMemoryOwner(bytes: *const [160]u8) !void {
+    if (r4nv_gsp_memory_owner_abi_check(bytes, bytes.len) != 0) return error.OriginalMemoryOwnerMismatch;
+    var invalid = bytes.*;
+    for ([_]u32{ 0, 0xffffffff, 0xdeaf0000, 0xdeaf0009 }) |owner| {
+        std.mem.writeInt(u32, invalid[32..36], owner, .little);
+        if (r4nv_gsp_memory_owner_abi_check(&invalid, invalid.len) == 0) return error.InvalidMemoryOwnerAccepted;
+    }
+    invalid = bytes.*;
+    invalid[41] &= ~@as(u8, 0x80); // Missing MAP_NOT_REQUIRED in the allocation flags.
+    if (r4nv_gsp_memory_owner_abi_check(&invalid, invalid.len) == 0) return error.UnnormalizedMemoryFlagsAccepted;
 }

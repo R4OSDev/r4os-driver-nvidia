@@ -51,6 +51,7 @@ pub const Model = struct {
     var command_slot: usize = 0;
     pub var dma: [system_count]a.GfxDeviceLease = @splat(.{});
     pub var gpu: [system_count]a.GfxDeviceLease = @splat(.{});
+    var residency_rejected: [system_count]bool = @splat(false);
     pub var job: a.GfxDriverJob = .{};
     pub var queued = false;
     pub var active = false;
@@ -92,6 +93,7 @@ pub const Model = struct {
         std.debug.assert(table.gfx_memory_query.?(&original) == a.gfx_buffer_result_ok);
         table.gfx_memory_query = memory; table.gfx_queue_query = queue;
         references = @splat(.{}); dma = @splat(.{}); gpu = @splat(.{}); queued = false; active = false;
+        residency_rejected = @splat(false);
         completed = 0; result = 0; lost = false; unregisters = 0; reject_resource = false; native_index = index; fetched = false; executed = false; signaled = false;
         present_mode = false; product_mode = false; render_mode = false; render_operations = 13; shadow_cpu = false; shadow_creates = 0;
         direct_mode = false; scanouts = @splat(null); next_point = 0;
@@ -568,8 +570,17 @@ pub const Model = struct {
             initial_read = out.*; initial_index = i; gpu_data[i] = host[i]; fetched = false; executed = false; signaled = false;
             return a.gfx_buffer_result_ok;
         }
-        const mapped_bytes = if (present_mode)
-            (if (entry.mapping_only) (descriptor(i).byte_length + 4095) & ~@as(u64, 4095) else descriptor(i).byte_length) else length;
+        const logical_bytes = if (present_mode) descriptor(i).byte_length else length - 5;
+        // The kernel allows a mapping-only DMA alias to retain backing-page
+        // padding, but GPU residency is bounded by the logical BO descriptor.
+        // This reproduces the real 2048-byte upload rejected by Kernel232.
+        if (request.access == 3 and request.byte_length > logical_bytes) {
+            residency_rejected[i] = true;
+            std.debug.print("[nvidia-mapping] residency rejected bytes={d} logical={d}\n", .{request.byte_length, logical_bytes});
+            return a.gfx_buffer_error_invalid;
+        }
+        const mapped_bytes = if (request.access == 3 or !entry.mapping_only) logical_bytes
+            else (logical_bytes + 4095) & ~@as(u64, 4095);
         std.debug.assert(entry.active and request.byte_offset == 0 and request.byte_length == mapped_bytes);
         const virtual = request.access == 3;
         if (virtual) std.debug.assert(dma[i].lease.id != 0 and gpu[i].lease.id == 0 and request.gpu_virtual_address == address(i) and request.address_space == 1)
@@ -601,7 +612,8 @@ pub const Model = struct {
             if (reject_initial_release) return a.gfx_buffer_error_busy;
             initial_read = .{}; return a.gfx_buffer_result_ok;
         }
-        const i = (input.lease.id - 1701) / 2; std.debug.assert(quiesced == 1 and !active);
+        const i = (input.lease.id - 1701) / 2;
+        std.debug.assert(quiesced == 1 and (!active or (residency_rejected[i] and gpu[i].lease.id == 0 and !fetched)));
         if (input.access == 3) { std.debug.assert(std.meta.eql(input.*, gpu[i])); gpu[i] = .{}; }
         else { std.debug.assert(gpu[i].lease.id == 0 and std.meta.eql(input.*, dma[i])); dma[i] = .{}; }
         return a.gfx_buffer_result_ok;

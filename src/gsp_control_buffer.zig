@@ -5,9 +5,10 @@ const r4os = @import("r4os");
 const exchange = @import("gsp_exchange.zig");
 const boot = @import("gsp_boot_events.zig");
 const storage = @import("gsp_control_storage.zig");
+const host_vm = @import("gsp_host_vm.zig");
 pub const memory_caps = @import("gsp_memory_caps.zig");
 pub const wire = @import("gsp_buffer_wire.zig");
-pub const Error = wire.Error || storage.Error || error{Retained};
+pub const Error = wire.Error || storage.Error || host_vm.Error || error{Retained};
 pub const State = enum { creating, unwinding, ready, handed_off, destroying, closed, finished, failed };
 pub const Info = struct { epoch: u64, memory: u32, virtual: u32, address: u64, bytes: u64 };
 pub const Owner = struct {
@@ -34,6 +35,9 @@ pub const Owner = struct {
     caps_active: bool = false,
     request: [wire.max_request_bytes]u8 = undefined,
     deadline: u64,
+    host_range: host_vm.Range = .{},
+    host_binding: host_vm.Binding = .{},
+    host_active: bool = false,
 
     pub fn init(token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext, adapter: u32, binding: wire.Binding, deadline: u64) Error!Owner {
         return initSized(token, ctx, adapter, binding, deadline, storage.bytes);
@@ -134,6 +138,12 @@ pub const Owner = struct {
                 self.state = if (self.state == .unwinding) .ready else .closed;
                 return null;
             };
+            if (self.binding.space.host) |host| if (operation != .register and operation != .free_memory) {
+                if (try self.exchange.poll(self.deadline)) |dispatch| return dispatch;
+                if (self.exchange.in_lockdown) return null;
+                try self.advanceHost(host, operation);
+                return null;
+            };
             const encoded = try wire.encodePart(self.binding, self.part(), operation, self.backing.pages[0..self.byte_length / 4096], self.address, &self.request);
             try self.exchange.begin(encoded.function, encoded.bytes, self.deadline);
             // TX publication may be ambiguous even when send reports failure.
@@ -143,6 +153,7 @@ pub const Owner = struct {
         const dispatch = (try self.exchange.poll(self.deadline)) orelse return null;
         if (!dispatch.response) return dispatch;
         const operation = self.operation.?;
+        self.last_status = null; // A preceding caps/register success is not this reply's status.
         const reply = try wire.decodePart(self.binding, self.part(), operation, self.request[0..wire.partLength(operation, self.part())], dispatch.record, self.address);
         self.last_status = if (reply == .rejected) reply.rejected else 0;
         try self.exchange.complete(dispatch.ticket);
@@ -175,6 +186,50 @@ pub const Owner = struct {
         }
         self.operation = null;
         return null;
+    }
+    fn advanceHost(self: *Owner, host: *host_vm.Owner, operation: wire.Operation) Error!void {
+        // These are local VA/PTE operations. No RPC14 request or synthetic
+        // response is passed through the firmware exchange.
+        self.last_status = null;
+        switch (operation) {
+            .allocate => {
+                self.address = try host.reserve(&self.host_range, self.byte_length, 4096, 0);
+                self.allocated = true;
+            },
+            .map => {
+                if (!self.host_active) {
+                    try host.beginMap(&self.host_range, &self.host_binding, 0, self.backing.hostSource(), self.deadline);
+                    self.host_active = true;
+                    return;
+                }
+                if (!try host.poll(&self.host_binding)) return;
+                self.host_active = false;
+                self.mapped = true;
+                self.state = .ready;
+                self.backing.retainGpu(self.address) catch |err| {
+                    self.host_rejected = err;
+                    self.state = .unwinding;
+                };
+            },
+            .unmap => {
+                if (!self.host_active) {
+                    // Graph teardown starts only after every channel/user of
+                    // this private buffer has been drained and destroyed.
+                    try host.beginUnmap(&self.host_binding, self.deadline, true);
+                    self.host_active = true;
+                    return;
+                }
+                if (!try host.poll(&self.host_binding)) return;
+                self.host_active = false;
+                self.mapped = false;
+            },
+            .free_virtual => {
+                try host.releaseRange(&self.host_range);
+                self.allocated = false;
+                self.address = 0;
+            },
+            .register, .free_memory => return error.State,
+        }
     }
     pub fn handoff(self: *Owner, deadline: u64) Error!boot.Handoff {
         try self.stable();

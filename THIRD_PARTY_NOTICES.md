@@ -1,5 +1,37 @@
 ﻿# Third-Party Notices
 
+External GPU page tables (0.82.1, NVIDIA 0.1.159): MMU v2 geometry, entries,
+external FERMI_VASPACE_A flags, SET/UNSET_PAGE_DIRECTORY and the PF TLB
+invalidate sequence follow NVIDIA 570.144 (MIT), pinned at
+8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f. Sources are nvos.h,
+ctrl0080dma.h, gp100/dev_mmu.h, tu102/dev_mmu.h, tu102/dev_vm.h,
+kern_gmmu_fmt_gp10x.c and kern_gmmu_tu102.c. Complete original notices
+accompany gsp_host_page.zig, gsp_host_vm_wire.zig and gsp_host_tlb.zig,
+and are included in the module/image runtime license. The existing host
+ABI checker uses the complete original C headers; no additional upstream
+C implementation is linked into the driver. R4OS dynamic table storage,
+VA ownership, asynchronous lifetime and failure handling are Apache-2.0.
+Host comparisons and models do not establish physical GPU execution.
+
+Preboot VA-management mode (0.82.1, NVIDIA0.1.158): the explicit registry
+value and its GSP default follow pinned NVIDIA570.144 nvrm_registry.h and
+gpu_registry.c (MIT). Complete notices are retained beside the encoder and
+in the module/image runtime license. The static mode field follows the
+already attributed gsp_static_config.h. Original-C checks use the complete
+original types. This configuration does not establish firmware support for
+MAP_MEMORY_DMA; hardware qualification remains separate.
+
+Memory allocation replies (0.82.1, NVIDIA0.1.157): the bounded response
+validator follows the IN/OUT contracts in NVIDIA570.144 nvos.h, mem_utils.c,
+virtual_mem.c, vaspace.c, mem_mgr_gm107.c and mem_mgr_tu102.c (MIT), pinned
+at8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f. Complete original notices are
+retained beside the validator and in the module/image runtime license.
+No additional upstream implementation is linked. The320-byte GA106 fixture
+is an unmodified request/reply captured from OssiPC; its provenance and hash
+are recorded in src/fixtures/memory-reply-570.144-ga106.json. It proves no
+mapping, GPU execution or clean teardown. R4OS lifetime policy remains
+Apache-2.0.
+
 Native image page layouts (0.79.35, NVIDIA 0.1.139): uncompressed kind IDs and
 depth/stencil attribute selection follow NVIDIA570.144 nvos.h, TU102 dev_mmu.h
 and mem_mgr_tu102.c (MIT). Complete source notices accompany the encoder;
@@ -1010,3 +1042,25 @@ ExFiles/Reference/GFX/0.79.31/Sources.json. Complete original notices remain in
 Licenses/NVIDIA-GSP-RUNTIME-LICENSE.txt and its byte-identical distributed copy.
 The R4OS lifecycle, leases, common output metadata and Desktop policy are
 original Apache-2.0 code. No additional firmware is imported.
+
+# Explicit VRAM initialization
+
+`src/gsp_memory_clear.zig` derives the synchronous internal GSP MEMSET
+layout and operation from NVIDIA570.144 `ctrl2080internal.h`, `mem_utils.c`
+and `os/nv_memory_type.h`. Complete original MIT notices are included in
+the source and the bundled GSP runtime license. The existing host ABI oracle
+uses the original C types and the generated memory-descriptor address-space
+constant; no GPU execution is implied by that comparison.
+
+Host hardware-channel binding (0.1.168)
+------------------------------------
+The fixed USERD page/index allocation and CPU doorbell token follow the
+pinned NVIDIA 570.144 kernel_channel.c, kernel_fifo.c,
+arch/maxwell/kernel_channel_gm107.c and
+arch/{turing/kernel_fifo_tu102,ampere/kernel_fifo_ga100}.c implementations,
+alloc/alloc_channel.h and published/ampere/ga100/dev_ctrl.h (MIT).
+Their complete original notices are retained in
+Licenses/NVIDIA-GSP-RUNTIME-LICENSE.txt. The existing original-C ABI
+comparison covers fixed-channel flags and tokens independently for all
+64 private FIFO slots, with mutated-field rejection. R4OS slot ownership,
+ACK publication and conservative retirement remain original Apache-2.0 code.

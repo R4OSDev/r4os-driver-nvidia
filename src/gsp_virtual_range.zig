@@ -5,9 +5,10 @@ const std = @import("std");
 const boot = @import("gsp_boot_events.zig");
 const exchange = @import("gsp_exchange.zig");
 const names = @import("gsp_rm_names.zig");
+const host_vm = @import("gsp_host_vm.zig");
 pub const wire = @import("gsp_virtual_wire.zig");
 pub const alias = @import("gsp_memory_alias.zig");
-pub const Error = alias.Error || names.Error;
+pub const Error = alias.Error || names.Error || host_vm.Error;
 pub const State = enum { creating, ready, handed_off, mapping, unmapping, destroying, closed, finished, failed };
 pub const Config = struct {
     bytes: u64,
@@ -27,6 +28,7 @@ pub const Binding = struct {
     stamp: ?wire.Mapping = null,
     mapped: bool = false,
     rejected: ?u32 = null,
+    host: host_vm.Binding = .{},
 };
 pub const Info = struct { plan: wire.Allocation, address: u64 };
 pub const Owner = struct {
@@ -47,6 +49,8 @@ pub const Owner = struct {
     rejected: ?u32 = null,
     failure: ?Error = null,
     protocol_failure: ?exchange.Error = null,
+    host_range: host_vm.Range = .{},
+    host_active: bool = false,
 
     pub fn init(token: *boot.Handoff, space: @import("gsp_vaspace.zig").Info,
         parent: names.Lease, config: Config, deadline: u64) Error!Owner
@@ -195,6 +199,12 @@ pub const Owner = struct {
         try self.exchange.guard(self.deadline);
         if (self.exchange.pending != null) return error.Pending;
         if (self.active) |binding| try self.validateBinding(binding);
+        if (self.plan.space.host) |host| {
+            if (try self.exchange.poll(self.deadline)) |dispatch| return dispatch;
+            if (self.exchange.in_lockdown) return null;
+            try self.advanceHost(host);
+            return null;
+        }
         if (!self.submitted) {
             const encoded = switch (self.state) {
                 .creating => try wire.allocate(self.plan, &self.request),
@@ -249,6 +259,47 @@ pub const Owner = struct {
         }
         self.submitted = false;
         return null;
+    }
+    fn advanceHost(self: *Owner, host: *host_vm.Owner) Error!void {
+        switch (self.state) {
+            .creating => {
+                self.address = try host.reserve(&self.host_range, self.plan.bytes, self.plan.alignment, self.plan.fixed_address);
+                self.state = .ready;
+            },
+            .destroying => {
+                try host.releaseRange(&self.host_range);
+                try self.exchange.session.rm_names.retireChildren(self.reservation);
+                self.namespace_live = false;
+                self.address = 0;
+                self.state = .closed;
+            },
+            .mapping, .unmapping => {
+                const binding = self.active orelse return error.State;
+                if (!self.host_active) {
+                    if (self.state == .mapping) {
+                        var source = (try binding.source.info()).host orelse return error.Descriptor;
+                        const map = binding.mapping.?;
+                        if (source.bytes != map.bytes or source.policy.aperture !=
+                            @as(host_vm.page.Aperture, if (map.location == .system) .system_coherent else .video)) return error.Descriptor;
+                        if (map.virtual_kind) source.policy.kind = if (self.plan.pte_kind != 0) self.plan.pte_kind else if (self.plan.blocklinear) 6 else 0;
+                        source.policy.read_only = source.policy.read_only or map.readonly;
+                        source.policy.privileged = source.policy.privileged or self.plan.privileged;
+                        try host.beginMap(&self.host_range, &binding.host, map.virtual_offset, source, self.deadline);
+                    } else try host.beginUnmap(&binding.host, self.deadline, true);
+                    self.host_active = true;
+                    return;
+                }
+                if (!try host.poll(&binding.host)) return;
+                self.host_active = false;
+                if (self.state == .unmapping) {
+                    try binding.source.closeMapping(self, true);
+                    self.detach(binding);
+                } else binding.mapped = true;
+                self.active = null;
+                self.state = .ready;
+            },
+            else => return error.State,
+        }
     }
     pub fn handoff(self: *Owner, deadline: u64) Error!boot.Handoff {
         try self.stable();

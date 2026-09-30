@@ -303,12 +303,12 @@ pub const Owner = struct {
     unwind: bool = false,
 
     pub fn open(self: *Owner, token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext, adapter: u32, graph: names.Lease,
-        parent: *context.Owner, runqueue: u8, instance: *vram.Owner, userd: ?*vram.Owner, engine: wire.Engine, deadline: u64) Error!void
+        parent: *context.Owner, runqueue: u8, hardware_channel: u32, instance: *vram.Owner, userd: ?*vram.Owner, engine: wire.Engine, deadline: u64) Error!void
     {
-        return self.openEngines(token, ctx, adapter, graph, parent, runqueue, instance, userd, engine, wire.defaultEngineMask(engine), deadline);
+        return self.openEngines(token, ctx, adapter, graph, parent, runqueue, hardware_channel, instance, userd, engine, wire.defaultEngineMask(engine), deadline);
     }
     pub fn openEngines(self: *Owner, token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext, adapter: u32, graph: names.Lease,
-        parent: *context.Owner, runqueue: u8, instance: *vram.Owner, userd: ?*vram.Owner, engine: wire.Engine, engine_mask: u32, deadline: u64) Error!void
+        parent: *context.Owner, runqueue: u8, hardware_channel: u32, instance: *vram.Owner, userd: ?*vram.Owner, engine: wire.Engine, engine_mask: u32, deadline: u64) Error!void
     {
         const nv = @import("r4nv_binding");
         if (self.self_address != 0) return error.State;
@@ -317,6 +317,7 @@ pub const Owner = struct {
         const paired_copy = engine_mask & nv.native_engine_copy != 0;
         if ((userd != null) != (engine == .none)) return error.Unsupported;
         const parent_info = parent.info() orelse return error.State;
+        _ = try wire.hostWorkToken(hardware_channel, parent_info.engine.data[3]);
         const methods = parent.methodStorage(runqueue) orelse return error.State;
         const inst = instance.info() orelse return error.State;
         if (parent.exchange.session != token.session or graph.epoch != parent_info.binding.epoch or adapter != methods.adapter or instance.adapter != adapter or
@@ -345,6 +346,7 @@ pub const Owner = struct {
         const reservation = try token.session.rm_names.reserveChildren(graph, if (userd == null) 4 + @as(u8, @intFromBool(compute)) + @as(u8, @intFromBool(paired_copy)) else 3);
         self.* = .{ .self_address = @intFromPtr(self), .session = token.session, .parent = parent, .reservation = reservation, .namespace_live = true, .deadline = deadline,
             .config = .{ .chip_id = token.session.profile.chip_id, .context = parent_info.binding, .handle = try reservation.object(2), .rm_engine = parent_info.rm_engine, .runqueue = runqueue,
+                .hardware_channel = hardware_channel, .runlist = parent_info.engine.data[3],
                 .address = 4096, .instance = inst.physical.?.base, .userd = userd_address,
                 .system_userd = userd == null, .engine = engine, .graphics = graphics, .object_handle = if (userd == null) try reservation.object(3) else 0,
                 .engine_mask = engine_mask, .compute_handle = if (compute) try reservation.object(4) else 0,
@@ -435,7 +437,6 @@ pub const Owner = struct {
                 if (self.config.system_userd and self.config.object_class == 0) break :blk .classes;
                 if (!self.live) break :blk .allocate;
                 if (!self.bound) break :blk .bind;
-                if (self.work_submit_token == null) break :blk .token;
                 if (self.config.engine == .graphics and !self.graphics_promoted) break :blk .promote_graphics;
                 // RM's golden initializer needs a schedulable channel. It
                 // receives no host methods, and closes before normal work.
@@ -474,8 +475,10 @@ pub const Owner = struct {
                 }
             },
             .allocate => { self.live = true; self.cid = reply.ok; },
-            .bind => self.bound = true,
-            .token => self.work_submit_token = reply.ok,
+            .bind => {
+                self.bound = true;
+                self.work_submit_token = try wire.hostWorkToken(self.config.hardware_channel, self.config.runlist);
+            },
             .allocate_copy, .allocate_nvdec, .allocate_nvenc => self.engine_live = true,
             .promote_graphics => self.graphics_promoted = true,
             .allocate_graphics => { self.engine_live = true; self.engine_caps = reply.ok; self.graphics_initialized = true; },
@@ -576,6 +579,14 @@ pub const Owner = struct {
         }
         if (self.namespace_live) try self.session.?.rm_names.retireChildrenAfterReset(self.reservation.?, proof);
         self.namespace_live = false; self.state = .finished;
+    }
+    /// A global collector may still await a different native BO after this
+    /// channel's own leases have all been released. Retain the entire channel
+    /// and namespace while the runtime services those exact release tickets.
+    pub fn awaitingCollection(self: *const Owner) bool {
+        return self.self_address == @intFromPtr(self) and self.ring.self_address == 0 and
+            self.userd.self_address == 0 and self.instance.self_address == 0 and
+            (if (self.commands) |*command| command.backing.awaitingCollection() else false);
     }
     pub fn handoff(self: *Owner) Error!boot.Handoff {
         try self.stable();

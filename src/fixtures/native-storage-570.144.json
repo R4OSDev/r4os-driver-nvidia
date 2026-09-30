@@ -1,15 +1,22 @@
 {
   "source_pin": "NVIDIA570.144 / 8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f",
-  "generator": {
-    "path": "Temp/gfx-channel-backing-20260912/Storage-ABI.c",
-    "bytes": 10895,
-    "sha256": "5cbcd883334fb4399248833b52139adfd47b4640ab9931413dd3a904bbbd135f"
-  },
+  "generator": "Temp/Ossi08200/Memory155/native-storage.c",
   "vector": {
-    "path": "Temp/gfx-channel-backing-20260912/native-storage-570.144.bin",
+    "path": "Temp/Ossi08200/Memory155/native-storage-570.144.bin",
     "bytes": 896,
-    "sha256": "ee786a37c155464aae5f8675d8182052fdcc4de17fc9ff59df1f5411f55c0ff2"
+    "sha256": "c78f19d1974015f749ba60cd8f9f3236a0a27a5a5f138ca5f169a775e2909a8c"
   },
   "scope": "Six original-C request/reply pairs: contiguous IMAGE/NO_SCANOUT physical storage, GPU-VA allocation, map/unmap/free. No physical GPU execution.",
-  "archive": "ExFiles/Reference/GFX/Nvidia/0.79.11/channel-backing-20260912"
+  "archive": "ExFiles/Reference/GFX/Nvidia/0.79.11/channel-backing-20260912",
+  "sha256": "c78f19d1974015f749ba60cd8f9f3236a0a27a5a5f138ca5f169a775e2909a8c",
+  "owner_contract": {
+    "validation_sha256": "8e84b2a2641e580721ddccebc1c1a064e84b46614d7d65ae0022408224a995ee",
+    "header_sha256": "8d16bfd6f3a91f3e991f3c8458668bd21559cb59f9eb46a0921e8ec1271bae80",
+    "memory_owner": "HEAP_OWNER_RM_CLIENT_GENERIC (0xdeaf000c)",
+    "normalized_flags": "NVOS32_ALLOC_FLAGS_MAP_NOT_REQUIRED",
+    "original_generator": "Temp/gfx-channel-backing-20260912/Storage-ABI.c",
+    "regression": "GspMessageAbi.c reads complete original RPC/SDK/heap headers; old zero-owner fixtures rejected.",
+    "header": "src/nvidia/generated/g_heap_nvoc.h",
+    "validation_source": "src/nvidia/src/kernel/mem_mgr/standard_mem.c"
+  }
 }

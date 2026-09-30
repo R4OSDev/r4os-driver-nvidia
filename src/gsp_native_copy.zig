@@ -16,7 +16,9 @@ pub const Owner = struct {
     context: ?runtime.ContextHandle = null,
     storage: ?runtime.BufferHandle = null,
     channel: ?runtime.ChannelHandle = null,
-    rm_engine: u32 = 19,
+    // RM_ENGINE_TYPE_COPY0..COPY19 are 9..28 (gpu_engine_type.h).
+    // Starting at19 skipped COPY0..9; GA106 need not expose COPY10 at all.
+    rm_engine: u32 = 9,
     epoch: u64 = 0,
     last_clock: u64 = 0,
     deadline: u64 = 0,
@@ -82,7 +84,10 @@ pub const Owner = struct {
                 if (status.state != .handed_off) return false;
                 if (status.unavailable == .engine) self.next(.context_retire) else {
                     if (status.info == null or status.info.?.method_bytes == 0) return error.Descriptor;
-                    self.next(.methods_allocate);
+                    const caps = status.info.?.copy_caps orelse return error.Descriptor;
+                    // GRCE remains available to paired GR channels. This
+                    // separate upload/readback channel requires an async CE.
+                    self.next(if (caps.standalone()) .methods_allocate else .context_retire);
                 }
             },
             .context_retire => {

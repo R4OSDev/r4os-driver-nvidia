@@ -311,9 +311,23 @@ pub const State = enum { creating, unwinding, ready, handed_off, destroying, clo
 pub const Unavailable = enum { classes, engine, context_buffers };
 pub const Info = struct { binding: wire.Binding, rm_engine: u32, nv_engine: u32, engine: wire.Engine, method_bytes: u32, subcontext: u32,
     copy_rm_engine: ?u32 = null,
+    copy_caps: ?wire.CopyCaps = null,
     timeslice_requested_us: u64 = 0, timeslice_rejection: ?u32 = null };
 pub const Child = struct { epoch: u64, group: u32, serial: u64 };
 const ChildUse = struct { serial: u64 = 0, globals: bool = false };
+/// Validated discovery observations become public only after transport ACK.
+/// The bounded class buffer is resident in the heap-owned context, not on the
+/// shared worker stack. It does not replace any admission check.
+pub const Discovery = struct {
+    classes_acked: bool = false,
+    class_count: u32 = 0,
+    class_ids: [100]u32 = @splat(0),
+    required_classes: u8 = 0,
+    engine_pages: u32 = 0,
+    engine_rows: u32 = 0,
+    engine_mask: [4]u64 = @splat(0),
+    other_engines: u32 = 0,
+};
 pub const Owner = struct {
     self_address: usize = 0,
     exchange: exchange.Exchange,
@@ -327,6 +341,7 @@ pub const Owner = struct {
     base: u32 = 0,
     selected: ?wire.Engine = null,
     copies: wire.CopyTopology = .{},
+    copy_caps: ?wire.CopyCaps = null,
     method_bytes: u32 = 0,
     subcontext: u32 = 0,
     group_live: bool = false,
@@ -347,6 +362,7 @@ pub const Owner = struct {
     rejected: ?u32 = null,
     last_status: ?u32 = null,
     unavailable: ?Unavailable = null,
+    discovery: Discovery = .{},
     failure: ?Error = null,
     protocol_failure: ?exchange.Error = null,
     deadline: u64,
@@ -379,6 +395,7 @@ pub const Owner = struct {
         return .{ .binding = self.binding, .rm_engine = self.rm_engine, .nv_engine = wire.nvEngine(self.rm_engine) catch return null,
             .engine = self.selected orelse return null, .method_bytes = self.method_bytes, .subcontext = self.subcontext,
             .copy_rm_engine = self.copies.paired(self.selected orelse return null),
+            .copy_caps = self.copy_caps,
             .timeslice_requested_us = if (self.timeslice_attempted and self.timeslice_rejection == null) wire.timeslice.requested_us else 0,
             .timeslice_rejection = self.timeslice_rejection };
     }
@@ -509,6 +526,7 @@ pub const Owner = struct {
             const op: wire.Operation = if (self.state == .creating) blk: {
                 if (!self.classes) break :blk .classes;
                 if (!self.engines) break :blk .engines;
+                if (self.rm_engine >= 9 and self.rm_engine <= 28 and self.copy_caps == null) break :blk .copy_caps;
                 if (self.method_bytes == 0) break :blk .method_size;
                 if (self.rm_engine == 1 and self.graphics_plan == null) break :blk .graphics_info;
                 if (!self.group_live) break :blk .group;
@@ -550,10 +568,30 @@ pub const Owner = struct {
                 candidate = row;
             }
         };
-        const class_support = op == .classes and reply == .ok and wire.supports(reply.ok, 0xa06c) and wire.supports(reply.ok, 0x9067) and wire.supports(reply.ok, 0xc56f);
+        var required_classes: u8 = 0;
+        var class_count: u32 = 0;
+        var engine_mask = self.discovery.engine_mask;
+        var other_engines = self.discovery.other_engines;
+        var engine_rows: u32 = 0;
+        if (op == .classes and reply == .ok) {
+            class_count = wire.word(reply.ok, 0);
+            for (0..class_count) |i| self.discovery.class_ids[i] = wire.word(reply.ok, 4 + i * 4);
+            for ([_]u32{0xa06c, 0x9067, 0xc56f}, 0..) |class, bit|
+                if (wire.supports(reply.ok, class)) { required_classes |= @as(u8, 1) << @intCast(bit); };
+        }
+        if (op == .engines and reply == .ok) {
+            engine_rows = wire.word(reply.ok, 4);
+            for (0..engine_rows) |i| {
+                const rm = wire.engine(reply.ok, i).data[2];
+                if (rm < 256) engine_mask[rm / 64] |= @as(u64, 1) << @intCast(rm % 64)
+                else other_engines += 1;
+            }
+        }
+        const class_support = required_classes == 7;
         const more = op == .engines and reply == .ok and reply.ok[8] != 0;
         const value: u32 = if (reply == .ok and op == .method_size) wire.word(reply.ok, 0)
             else if (reply == .ok and op == .share) wire.word(reply.ok, 8) else 0;
+        const copy_caps: ?wire.CopyCaps = if (op == .copy_caps and reply == .ok) .{ .bytes = reply.ok[4..6].* } else null;
         self.last_status = if (reply == .rejected) reply.rejected else 0;
         try self.exchange.complete(dispatch.ticket);
         if (op == .timeslice) {
@@ -566,11 +604,18 @@ pub const Owner = struct {
             self.rejected = reply.rejected; self.state = .unwinding;
         } else switch (op) {
             .classes => {
+                self.discovery.classes_acked = true;
+                self.discovery.class_count = class_count;
+                self.discovery.required_classes = required_classes;
                 if (!class_support) {
                     self.unavailable = .classes; self.state = .unwinding;
                 } else self.classes = true;
             },
             .engines => {
+                self.discovery.engine_pages += 1;
+                self.discovery.engine_rows += engine_rows;
+                self.discovery.engine_mask = engine_mask;
+                self.discovery.other_engines = other_engines;
                 self.selected = candidate;
                 self.copies = copies;
                 if (more) self.base += 32 else {
@@ -579,6 +624,7 @@ pub const Owner = struct {
                 }
             },
             .method_size => self.method_bytes = value,
+            .copy_caps => self.copy_caps = copy_caps,
             .graphics_info => {
                 if (graphics_plan == null) { self.unavailable = .context_buffers; self.state = .unwinding; }
                 else self.graphics_plan = graphics_plan;

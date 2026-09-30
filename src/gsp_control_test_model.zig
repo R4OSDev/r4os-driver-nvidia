@@ -5,6 +5,7 @@ const r4os = @import("r4os");
 const a = r4os.abi;
 const storage = @import("gsp_control_storage.zig");
 const power = @import("gsp_power_memory_test.zig").Model;
+const host_pages = @import("gsp_host_vm_memory_test.zig").Model;
 pub const Model = struct {
     pub var original: a.DriverApi = undefined;
     pub var data: [storage.bytes]u8 align(4096) = undefined;
@@ -17,6 +18,7 @@ pub const Model = struct {
     pub var releases: usize = 0;
     pub var reset_losses: u32 = 0;
     pub var scenario: []const u8 = "";
+    pub var gpu_address: u64 = 0x600000;
     var sync_failed = false;
     var descriptor: a.GfxBufferDescriptor = .{};
     var dma: a.GfxDeviceLease = .{};
@@ -48,6 +50,8 @@ pub const Model = struct {
         releases = 0;
         reset_losses = 0;
         scenario = name;
+        gpu_address = if (std.mem.startsWith(u8, name, "host_mmu_")) 0x100000000 else 0x600000;
+        host_pages.reset(std.mem.startsWith(u8, name, "host_mmu_"));
         dma = .{};
         gpu = .{};
         read_lease = .{};
@@ -80,6 +84,7 @@ pub const Model = struct {
         return a.gfx_buffer_result_ok;
     }
     fn create(input: *const a.GfxBufferDescriptor, out: *a.GfxBufferReference) callconv(.c) i32 {
+        if (host_pages.enabled and input.byte_length == 4096) return host_pages.create(input, out);
         // The ordinary control fixture owns the renderer-sized allocation only.
         // The dedicated power fixture supplies an independent DMA page.
         if (input.byte_length == storage.shared_page_bytes) return power.create(input, out);
@@ -91,12 +96,14 @@ pub const Model = struct {
         return if (is("control_allocation")) -1 else a.gfx_buffer_result_ok;
     }
     fn describe(input: *const a.GfxBufferHandle, out: *a.GfxBufferDescriptor) callconv(.c) i32 {
+        if (host_pages.owns(input.*)) return host_pages.describe(input, out);
         if (power.owns(input.*)) return power.describe(input, out);
         std.debug.assert(active and std.meta.eql(input.*, reference));
         out.* = descriptor;
         return a.gfx_buffer_result_ok;
     }
     fn mapCpu(input: *const a.GfxBufferHandle, access: u32, offset: u64, bytes: u64, out: *a.GfxBufferMap) callconv(.c) i32 {
+        if (host_pages.owns(input.*)) return host_pages.mapCpu(input, access, offset, bytes, out);
         if (power.owns(input.*)) return power.mapCpu(input, access, offset, bytes, out);
         std.debug.assert(active and !cpu_mapped and !reading and std.meta.eql(input.*, reference) and access == 1 and offset == 0 and bytes == storage.bytes);
         cpu_mapped = true;
@@ -104,6 +111,7 @@ pub const Model = struct {
         return a.gfx_buffer_result_ok;
     }
     fn unmapCpu(input: *const a.GfxBufferHandle) callconv(.c) i32 {
+        if (host_pages.owns(input.*)) return host_pages.unmapCpu(input);
         if (power.owns(input.*)) return power.unmapCpu(input);
         std.debug.assert(active and cpu_mapped and std.meta.eql(input.*, cpu));
         if (is("control_sync") and !sync_failed) {
@@ -116,12 +124,13 @@ pub const Model = struct {
         return a.gfx_buffer_result_ok;
     }
     fn acquire(input: *const a.GfxBufferHandle, request: *const a.GfxDeviceRequest, out: *a.GfxDeviceLease) callconv(.c) i32 {
+        if (host_pages.owns(input.*)) return host_pages.acquire(input, request, out);
         if (power.owns(input.*)) return power.acquire(input, request, out);
         std.debug.assert(active and synced and !cpu_mapped and std.meta.eql(input.*, reference) and
             request.byte_offset == 0 and request.adapter_id == 0x01000000 and request.device_generation != 0);
         if (request.access == 0) {
             std.debug.assert(mapped and gpu_mapped and !reading and request.byte_length > 0 and request.byte_length <= storage.bytes and request.byte_length & 3 == 0 and
-                request.gpu_virtual_address == 0x600000 and request.address_space == 1 and request.dma_mask == std.math.maxInt(u64));
+                request.gpu_virtual_address == gpu_address and request.address_space == 1 and request.dma_mask == std.math.maxInt(u64));
             if (is("context_upload_acquire")) return -1;
             reading = true;
             out.* = .{ .lease = .{ .id = 76, .generation = 136 }, .byte_length = request.byte_length,
@@ -132,7 +141,7 @@ pub const Model = struct {
         std.debug.assert(request.byte_length == storage.bytes);
         const is_gpu = request.access == 3;
         if (is_gpu) {
-            std.debug.assert(mapped and !gpu_mapped and request.gpu_virtual_address == 0x600000 and request.address_space == 1);
+            std.debug.assert(mapped and !gpu_mapped and request.gpu_virtual_address == gpu_address and request.address_space == 1);
             if (is("control_gpu_acquire")) return -1;
             gpu_mapped = true;
         } else {
@@ -144,6 +153,7 @@ pub const Model = struct {
         return a.gfx_buffer_result_ok;
     }
     fn segment(input: *const a.GfxDeviceLease, offset: u64, out: *a.GfxDmaSegment) callconv(.c) i32 {
+        if (host_pages.owns(input.lease)) return host_pages.segment(input, offset, out);
         if (power.owns(input.lease)) return power.segment(input, offset, out);
         std.debug.assert(mapped and std.meta.eql(input.*, dma) and offset & 4095 == 0 and offset < storage.bytes);
         const i = offset / 4096;
@@ -151,6 +161,7 @@ pub const Model = struct {
         return a.gfx_buffer_result_ok;
     }
     fn releaseDevice(input: *const a.GfxDeviceLease, quiesced: u32) callconv(.c) i32 {
+        if (host_pages.owns(input.lease)) return host_pages.releaseDevice(input, quiesced);
         if (power.owns(input.lease)) return power.releaseDevice(input, quiesced);
         std.debug.assert(active and quiesced == 1);
         if (input.access == 0) {
@@ -171,6 +182,7 @@ pub const Model = struct {
         return a.gfx_buffer_result_ok;
     }
     fn release(input: *const a.GfxBufferHandle) callconv(.c) i32 {
+        if (host_pages.owns(input.*)) return host_pages.release(input);
         if (power.owns(input.*)) return power.release(input);
         std.debug.assert(active and !cpu_mapped and !mapped and !gpu_mapped and !reading and std.meta.eql(input.*, reference));
         if (is("control_release")) return -1;

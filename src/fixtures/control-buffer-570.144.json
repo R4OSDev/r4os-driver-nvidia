@@ -1,8 +1,8 @@
 {
   "source_commit": "8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f",
-  "generator": "Temp/gfx-buffer-map-20260912/Buffer-ABI.c",
+  "generator": "Temp/Ossi08200/Memory155/control-buffer.c",
   "bytes": 736,
-  "sha256": "276e2d532efcb31052b6efa327b3c0e1526efcf82fb5abf3d0a96b4c49402cf7",
+  "sha256": "f8111b67742ab3a00ded010addc623148cb442c0c8376066d7716cc4e9f605ae",
   "pairs": [
     {
       "operation": "register",
@@ -28,5 +28,15 @@
       "operation": "free_memory",
       "bytes": 16
     }
-  ]
+  ],
+  "owner_contract": {
+    "validation_sha256": "8e84b2a2641e580721ddccebc1c1a064e84b46614d7d65ae0022408224a995ee",
+    "header_sha256": "8d16bfd6f3a91f3e991f3c8458668bd21559cb59f9eb46a0921e8ec1271bae80",
+    "memory_owner": "HEAP_OWNER_RM_CLIENT_GENERIC (0xdeaf000c)",
+    "normalized_flags": "NVOS32_ALLOC_FLAGS_MAP_NOT_REQUIRED",
+    "original_generator": "Temp/gfx-buffer-map-20260912/Buffer-ABI.c",
+    "regression": "GspMessageAbi.c reads complete original RPC/SDK/heap headers; old zero-owner fixtures rejected.",
+    "header": "src/nvidia/generated/g_heap_nvoc.h",
+    "validation_source": "src/nvidia/src/kernel/mem_mgr/standard_mem.c"
+  }
 }

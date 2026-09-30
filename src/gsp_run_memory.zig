@@ -173,6 +173,11 @@ pub const Lease = struct {
     pub fn generation(self: *const Lease) u64 {
         return if (!self.failed and self.recovery_owner == 0 and self.matches()) self.queue.epoch else 0;
     }
+    /// Read-only diagnostic of the retained storage identities. Failure and
+    /// recovery admission remain separate; this grants no usable run epoch.
+    pub fn ownershipValid(self: *const Lease) bool {
+        return self.matches();
+    }
     pub fn inputs(self: *const Lease) !Inputs {
         if (self.generation() == 0) return error.Stale;
         return self.boundInputs();

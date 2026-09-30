@@ -2,10 +2,10 @@
   "source": "NVIDIA 570.144",
   "commit": "8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f",
   "bytes": 544,
-  "sha256": "b57348e66b9d67d87237cfdf3d004660ea5998a58e8c39b0c6c52f87bcbb5aa8",
+  "sha256": "f379251eaef9350259e48dc32eeb451ef6949d1300f98ef7381a637b84758d8f",
   "pairs": 4,
   "purpose": "Original C layouts: fixed 128KB virtual range aligned to 64KB, independent 8KB physical/32KB virtual offsets, exact v03_00 unmap and free.",
-  "generator": "ExFiles/Reference/GFX/0.79.35/Evidence/VirtualAddress/virtual_reference.c",
+  "generator": "Temp/Ossi08200/Memory155/virtual-range.c",
   "headers": [
     {
       "path": "src/common/sdk/nvidia/inc/nvos.h",
@@ -20,5 +20,15 @@
       "sha256": "d9a8432f764b3fef42e039d03b58e93eeb3b32915954b564039e3ee981cae2fd"
     }
   ],
-  "unmap_rpc": "v03_00 is 40 bytes with status at 32; public NVOS47 is 48 bytes and must not be sent as this RPC."
+  "unmap_rpc": "v03_00 is 40 bytes with status at 32; public NVOS47 is 48 bytes and must not be sent as this RPC.",
+  "owner_contract": {
+    "validation_sha256": "8e84b2a2641e580721ddccebc1c1a064e84b46614d7d65ae0022408224a995ee",
+    "header_sha256": "8d16bfd6f3a91f3e991f3c8458668bd21559cb59f9eb46a0921e8ec1271bae80",
+    "memory_owner": "HEAP_OWNER_RM_CLIENT_GENERIC (0xdeaf000c)",
+    "normalized_flags": "NVOS32_ALLOC_FLAGS_MAP_NOT_REQUIRED",
+    "original_generator": "ExFiles/Reference/GFX/0.79.35/Evidence/VirtualAddress/virtual_reference.c",
+    "regression": "GspMessageAbi.c reads complete original RPC/SDK/heap headers; old zero-owner fixtures rejected.",
+    "header": "src/nvidia/generated/g_heap_nvoc.h",
+    "validation_source": "src/nvidia/src/kernel/mem_mgr/standard_mem.c"
+  }
 }

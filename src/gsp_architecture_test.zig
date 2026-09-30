@@ -35,4 +35,20 @@ pub fn check() !void {
     try t.expectError(error.Binding, architecture.describe(&pci, 0x176, &topology, &memory, va, va.epoch, 0xc7b5));
     va.bytes = 0x800000000; memory.fb_bytes = 0;
     try t.expectError(error.Binding, architecture.describe(&pci, 0x176, &topology, &memory, va, va.epoch, 0xc7b5));
+    memory.fb_bytes = 12 << 30;
+    // OssiPC's external VAS begins at4K. Publish only its64K-aligned usable
+    // subset; excluding the small prefix does not change the real VAS.
+    va.base = 4096; va.bytes = (@as(u64, 1) << 49) - 4096;
+    const result = try architecture.describe(&pci, 0x176, &topology, &memory, va, va.epoch, 0xc7b5);
+    var info: nv.R4NvArchitecture = undefined;
+    @memcpy(std.mem.asBytes(&info), result.data[0..@sizeOf(nv.R4NvArchitecture)]);
+    try t.expect(info.va_start == 65536 and info.va_end == @as(u64, 1) << 49 and info.bind_alignment == 65536);
+    va.bytes = 3 * 65536;
+    const trimmed = try architecture.describe(&pci, 0x176, &topology, &memory, va, va.epoch, 0xc7b5);
+    @memcpy(std.mem.asBytes(&info), trimmed.data[0..@sizeOf(nv.R4NvArchitecture)]);
+    try t.expect(info.va_start == 65536 and info.va_end == 3 * 65536 and info.va_end <= va.base + va.bytes);
+    va.bytes = 65536;
+    try t.expectError(error.Binding, architecture.describe(&pci, 0x176, &topology, &memory, va, va.epoch, 0xc7b5));
+    va.bytes = 3 * 65536 + 1;
+    try t.expectError(error.Binding, architecture.describe(&pci, 0x176, &topology, &memory, va, va.epoch, 0xc7b5));
 }

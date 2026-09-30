@@ -36,6 +36,8 @@ pub const Storage = struct {
     pages: [page_count]u64 = @splat(0),
     retained: bool = false,
     prepared: bool = false,
+    close_step: enum { none, gpu, dma, cpu, reference, collect } = .none,
+    close_status: i32 = ok,
 
     pub fn prepare(self: *Storage, ctx: *const r4os.r4dev.DriverContext, adapter: u32, epoch: u64, byte_length: usize) Error!void {
         if (self.self_address != 0) return error.Busy;
@@ -110,31 +112,66 @@ pub const Storage = struct {
     pub fn gpuReady(self: *const Storage, address: u64) bool {
         return self.valid() and self.gpu.lease.id != 0 and self.gpu.gpu_virtual_address == address;
     }
+    pub fn hostSource(self: *const Storage) @import("gsp_host_vm.zig").Source {
+        return .{ .context = self, .valid = hostValid, .physical = hostPhysical, .bytes = self.byte_length,
+            .policy = .{ .aperture = .system_coherent, .atomic = true } };
+    }
+    fn hostValid(raw: *const anyopaque, epoch: u64) bool {
+        const self: *const Storage = @ptrCast(@alignCast(raw));
+        return self.valid() and self.retained and self.epoch == epoch;
+    }
+    fn hostPhysical(raw: *const anyopaque, offset: u64) @import("gsp_host_vm.zig").Error!u64 {
+        const self: *const Storage = @ptrCast(@alignCast(raw));
+        if (!hostValid(raw, self.epoch)) return error.Stale;
+        if (offset >= self.byte_length or offset & 4095 != 0) return error.Bounds;
+        return self.pages[@intCast(offset / 4096)];
+    }
     /// Private before RPC publication, or after every mapping/object free ACK.
     pub fn close(self: *Storage) bool {
         if (self.self_address == 0) return true;
         if (self.self_address != @intFromPtr(self) or self.retained) return false;
         self.prepared = false;
         const memory = self.memory orelse return false;
+        self.close_step = .none;
+        self.close_status = ok;
         if (self.gpu.lease.id != 0) {
-            if (memory.deviceRelease(&self.gpu, 1) != ok) return false;
+            self.close_step = .gpu;
+            self.close_status = memory.deviceRelease(&self.gpu, 1);
+            if (self.close_status != ok) return false;
             self.gpu = .{}; self.gpu_stamp = .{};
         }
         if (self.dma.lease.id != 0) {
-            if (memory.deviceRelease(&self.dma, 1) != ok) return false;
+            self.close_step = .dma;
+            self.close_status = memory.deviceRelease(&self.dma, 1);
+            if (self.close_status != ok) return false;
             self.dma = .{}; self.dma_stamp = .{};
         }
         if (self.cpu.lease.id != 0) {
-            if (memory.bufferUnmap(&self.cpu.lease) != ok) return false;
+            self.close_step = .cpu;
+            self.close_status = memory.bufferUnmap(&self.cpu.lease);
+            if (self.close_status != ok) return false;
             self.cpu = .{};
         }
         if (self.reference.reference.id != 0) {
-            if (memory.bufferRelease(&self.reference.reference) != ok) return false;
+            self.close_step = .reference;
+            self.close_status = memory.bufferRelease(&self.reference.reference);
+            if (self.close_status != ok) return false;
             self.reference = .{}; self.reference_stamp = .{};
         }
-        if (memory.collect() != ok) return false;
+        self.close_step = .collect;
+        self.close_status = memory.collect();
+        if (self.close_status != ok) return false;
         self.* = .{};
         return true;
+    }
+
+    /// All per-BO bindings were acknowledged, but the common collector also
+    /// covers other buffers owned by this driver. The caller must retain this
+    /// metadata and eventually finish close(); this is not a full close proof.
+    pub fn awaitingCollection(self: *const Storage) bool {
+        return self.self_address == @intFromPtr(self) and self.memory != null and !self.retained and !self.prepared and
+            self.close_step == .collect and self.close_status == a.gfx_buffer_error_busy and
+            self.gpu.lease.id == 0 and self.dma.lease.id == 0 and self.cpu.lease.id == 0 and self.reference.reference.id == 0;
     }
 
     pub fn closeAfterReset(self: *Storage, proof: @import("gsp_reset.zig").Quiescence) bool {

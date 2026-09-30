@@ -8,9 +8,10 @@ const boot = @import("gsp_boot_events.zig");
 const exchange = @import("gsp_exchange.zig");
 const names = @import("gsp_rm_names.zig");
 const vaspace = @import("gsp_vaspace.zig");
+const host_vm = @import("gsp_host_vm.zig");
 pub const wire = @import("gsp_buffer_wire.zig");
 pub const alias = @import("gsp_memory_alias.zig");
-pub const Error = wire.Error || names.Error || error{ Api, Descriptor, Memory, Map, Busy, Retained };
+pub const Error = wire.Error || names.Error || host_vm.Error || error{ Api, Descriptor, Memory, Map, Busy, Retained };
 pub const State = enum { creating, unwinding, ready, handed_off, destroying, closed, finished, failed };
 pub const Info = struct { epoch: u64, buffer: a.GfxBufferHandle, virtual: u32, address: u64, logical_bytes: u64, mapped_bytes: u64, parts: u16 };
 pub const chunk_bytes: u64 = wire.max_registration_pages * 4096;
@@ -56,6 +57,9 @@ pub const Owner = struct {
     host_rejected: ?Error = null,
     failure: ?Error = null,
     protocol_failure: ?exchange.Error = null,
+    host_range: host_vm.Range = .{},
+    host_binding: host_vm.Binding = .{},
+    host_active: bool = false,
 
     /// Adopt either a queue mapping alias or the driver's own normal import.
     /// A normal import leases only logical bytes; its last partial segment
@@ -132,8 +136,12 @@ pub const Owner = struct {
         const index: u16 = @intCast(offset / chunk_bytes);
         const extent = self.part(index);
         const local = offset - extent.offset;
+        var host_source = self.hostSource();
+        host_source.offset = offset;
+        host_source.bytes = @min(bytes, extent.byte_length - local);
         try self.aliases.acquire(use, .{ .space = self.space, .object = try self.reservation.object(index),
-            .allocation_bytes = extent.byte_length, .offset = local, .bytes = @min(bytes, extent.byte_length - local), .location = .system });
+            .allocation_bytes = extent.byte_length, .offset = local, .bytes = host_source.bytes, .location = .system,
+            .host = if (self.space.host != null) host_source else null });
     }
     fn part(self: *const Owner, index: u16) wire.Part {
         const offset = @as(u64, index) * chunk_bytes;
@@ -167,7 +175,7 @@ pub const Owner = struct {
     }
     fn deviceValid(self: *const Owner, value: a.GfxDeviceLease, access: u32, address: u64) bool {
         return value.version == 1 and value.size >= @sizeOf(a.GfxDeviceLease) and handleValid(value.lease) and
-            value.byte_offset == 0 and value.byte_length == self.leaseBytes() and value.gpu_virtual_address == address and
+            value.byte_offset == 0 and value.byte_length == (if (access == 3) self.logical_bytes else self.leaseBytes()) and value.gpu_virtual_address == address and
             value.device_generation == self.space.epoch and value.adapter_id == self.adapter and value.driver_owner != 0 and
             value.access == access and value.address_space == @as(u32, if (access == 3) 1 else 0);
     }
@@ -216,7 +224,7 @@ pub const Owner = struct {
             var index: u16 = 0;
             const operation: wire.Operation = if (self.state == .creating) blk: {
                 if (!self.allocated) break :blk .allocate;
-                if (self.registered == self.mapped) {
+                if (if (self.space.host != null) self.registered < self.parts else self.registered == self.mapped) {
                     index = self.registered;
                     const gathered = self.gather(index) catch |err| {
                         self.host_rejected = err; self.state = .unwinding;
@@ -236,6 +244,12 @@ pub const Owner = struct {
             } else {
                 try self.closeBacking();
                 self.state = if (self.state == .unwinding) .ready else .closed;
+                return null;
+            };
+            if (self.space.host) |host| if (operation != .register and operation != .free_memory) {
+                if (try self.exchange.poll(self.deadline)) |dispatch| return dispatch;
+                if (self.exchange.in_lockdown) return null;
+                try self.advanceHost(host, operation);
                 return null;
             };
             const extent = self.part(index);
@@ -279,16 +293,83 @@ pub const Owner = struct {
     }
     fn retainGpu(self: *Owner) Error!void {
         // A normal BO import does not grant page padding, and the common
-        // virtual-mapping descriptor requires whole pages. Its exact-length
+        // virtual-mapping descriptor covers the logical BO extent. Its exact-length
         // DMA backing lease already retains every mapped page until RM unmap.
         // Execution is separately leased by Initial or the common queue.
         if (self.source.flags == 0) return;
-        const acquired = self.memory.deviceAcquire(&self.source.reference, &.{ .byte_length = self.leaseBytes(), .gpu_virtual_address = self.address,
+        // DMA translation retains whole backing pages through its separate
+        // mapping-only lease. GPU residency must not extend the BO descriptor,
+        // even though the final PTE also covers that page's inaccessible tail.
+        const acquired = self.memory.deviceAcquire(&self.source.reference, &.{ .byte_length = self.logical_bytes, .gpu_virtual_address = self.address,
             .adapter_id = self.adapter, .device_generation = self.space.epoch, .access = 3, .address_space = 1 }, &self.gpu);
         self.gpu_stamp = self.gpu;
         if (acquired != a.gfx_buffer_result_ok and self.gpu.lease.id == 0) return error.Map;
         if (!self.deviceValid(self.gpu, 3, self.address) or self.gpu.driver_owner != self.dma.driver_owner) return error.Descriptor;
         if (acquired != a.gfx_buffer_result_ok) return error.Map;
+    }
+    fn hostSource(self: *const Owner) host_vm.Source {
+        return .{ .context = self, .valid = hostValid, .physical = hostPhysical, .bytes = self.mapped_bytes,
+            .policy = .{ .aperture = .system_coherent, .atomic = true } };
+    }
+    fn hostValid(raw: *const anyopaque, epoch: u64) bool {
+        const self: *const Owner = @ptrCast(@alignCast(raw));
+        self.stable() catch return false;
+        return self.self_address == @intFromPtr(self) and self.space.epoch == epoch and self.prepared and
+            self.dma.lease.id != 0 and self.registered == self.parts;
+    }
+    fn hostPhysical(raw: *const anyopaque, offset: u64) host_vm.Error!u64 {
+        const self: *const Owner = @ptrCast(@alignCast(raw));
+        if (!hostValid(raw, self.space.epoch)) return error.Stale;
+        if (offset >= self.leaseBytes() or offset & 4095 != 0) return error.Bounds;
+        var segment: a.GfxDmaSegment = .{};
+        if (self.memory.deviceSegment(&self.dma, offset, &segment) != a.gfx_buffer_result_ok) return error.Memory;
+        const bytes = @min(@as(u64, 4096), self.leaseBytes() - offset);
+        if (segment.version != 1 or segment.size < @sizeOf(a.GfxDmaSegment) or segment.dma_address == 0 or
+            segment.dma_address & 4095 != 0 or segment.dma_address > dma_mask - 4095 or
+            segment.byte_length != bytes or segment.next_offset != offset + bytes) return error.Descriptor;
+        return segment.dma_address;
+    }
+    fn advanceHost(self: *Owner, host: *host_vm.Owner, operation: wire.Operation) Error!void {
+        self.last_status = null;
+        switch (operation) {
+            .allocate => {
+                self.address = try host.reserve(&self.host_range, self.mapped_bytes, 4096, 0);
+                self.allocated = true;
+            },
+            .map => {
+                if (!self.host_active) {
+                    try host.beginMap(&self.host_range, &self.host_binding, 0, self.hostSource(), self.deadline);
+                    self.host_active = true;
+                    return;
+                }
+                if (!try host.poll(&self.host_binding)) return;
+                self.host_active = false;
+                self.mapped = self.parts;
+                self.state = .ready;
+                self.retainGpu() catch |err| {
+                    if (err == error.Descriptor) return err;
+                    self.host_rejected = err;
+                    self.state = .unwinding;
+                };
+            },
+            .unmap => {
+                if (!self.host_active) {
+                    if (!self.aliases.empty()) return error.Busy;
+                    try host.beginUnmap(&self.host_binding, self.deadline, true);
+                    self.host_active = true;
+                    return;
+                }
+                if (!try host.poll(&self.host_binding)) return;
+                self.host_active = false;
+                self.mapped = 0;
+            },
+            .free_virtual => {
+                try host.releaseRange(&self.host_range);
+                self.allocated = false;
+                self.address = 0;
+            },
+            .register, .free_memory => return error.State,
+        }
     }
     fn closeBacking(self: *Owner) Error!void {
         if (!self.aliases.empty() or self.allocated or self.registered != 0 or self.mapped != 0 or self.operation != null or self.exchange.pending != null) return error.Retained;

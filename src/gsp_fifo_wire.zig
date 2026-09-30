@@ -350,7 +350,7 @@ const context = @import("gsp_context_wire.zig");
 const exchange = @import("gsp_exchange.zig");
 const nv = @import("r4nv_binding");
 pub const Error = context.Error;
-pub const Operation = enum { classes, allocate, bind, token, promote_graphics, allocate_copy, allocate_graphics, allocate_compute, allocate_gr_copy, allocate_nvdec, allocate_nvenc, enable, disable, free_gr_copy, free_compute, free_copy, free };
+pub const Operation = enum { classes, allocate, bind, promote_graphics, allocate_copy, allocate_graphics, allocate_compute, allocate_gr_copy, allocate_nvdec, allocate_nvenc, enable, disable, free_gr_copy, free_compute, free_copy, free };
 pub const Engine = enum { none, copy, graphics, nvdec, nvenc };
 pub const max_bytes: usize = 584;
 pub const entries: u32 = 512;
@@ -360,6 +360,8 @@ pub const Config = struct {
     handle: u32,
     rm_engine: u32,
     runqueue: u8,
+    hardware_channel: u32,
+    runlist: u32,
     address: u64,
     instance: u64,
     userd: u64,
@@ -379,7 +381,26 @@ pub const Config = struct {
 };
 pub const Reply = union(enum) { rejected: u32, ok: u32 };
 pub fn function(op: Operation) u32 { return switch (op) { .allocate, .allocate_copy, .allocate_graphics, .allocate_compute, .allocate_gr_copy, .allocate_nvdec, .allocate_nvenc => 103, .free, .free_copy, .free_compute, .free_gr_copy => 10, else => 76 }; }
-pub fn command(op: Operation) u32 { return switch (op) { .bind => 0xa06f0104, .token => 0xc36f0108, .promote_graphics => 0x2080012b, .enable, .disable => 0xa06f0103, else => 0 }; }
+pub fn command(op: Operation) u32 { return switch (op) { .bind => 0xa06f0104, .promote_graphics => 0x2080012b, .enable, .disable => 0xa06f0103, else => 0 }; }
+// kchannelConstruct and kfifoGenerateWorkSubmitTokenHal_{TU102,GA100}:
+// the host reserves a hardware CHID, asks Physical RM to allocate exactly
+// that USERD page/index, then forms the host doorbell token after ACK.
+// Each resident FIFO slot owns one complete private USERD page. Skip page0
+// (GSP reserves CHID0); never reuse a slot while its RM/storage owner is held.
+pub const host_channel_slots: usize = 64;
+pub fn hardwareChannelForSlot(slot: usize) Error!u32 {
+    if (slot >= host_channel_slots) return error.Bounds;
+    return @intCast((slot + 1) * 8);
+}
+pub fn hostWorkToken(hardware_channel: u32, runlist: u32) Error!u32 {
+    if (hardware_channel == 0 or hardware_channel > host_channel_slots * 8 or hardware_channel % 8 != 0 or runlist > 0x7f) return error.Bounds;
+    return (runlist << 16) | hardware_channel;
+}
+pub fn allocationFlags(hardware_channel: u32, runqueue: u8, golden: bool) Error!u32 {
+    _ = try hostWorkToken(hardware_channel, 0);
+    if (runqueue >= 2) return error.Bounds;
+    return 0xc0 | ((hardware_channel / 8) << 12) | (1 << 21) | (@as(u32, runqueue) << 4) | (if (golden) @as(u32, 0x20) else 0);
+}
 pub fn length(op: Operation) usize { return switch (op) { .classes => 428, .allocate => 400, .allocate_copy, .allocate_gr_copy => 40, .allocate_graphics => 48, .allocate_compute => 32, .allocate_nvdec, .allocate_nvenc => 44, .promote_graphics => 584, .free, .free_copy, .free_compute, .free_gr_copy => 16, .enable, .disable => 26, else => 28 }; }
 pub fn validGraphicsEngines(mask: u32) bool {
     return mask & nv.native_engine_graphics != 0 and mask & ~(nv.native_engine_graphics | nv.native_engine_compute | nv.native_engine_copy) == 0;
@@ -441,6 +462,7 @@ pub fn validate(config: Config) Error!void {
     }
     for ([_]u32{0,config.context.client,config.context.device,config.context.subdevice,config.context.vaspace,config.context.group,config.context.share}) |handle|
         if (config.handle == handle) return error.Handle;
+    _ = try hostWorkToken(config.hardware_channel, config.runlist);
     if (config.runqueue >= 2 or config.address == 0 or config.address & 4095 != 0 or config.address > (@as(u64, 1) << 40) - 12288 or
         config.instance == 0 or config.instance & 4095 != 0 or config.userd == 0 or config.userd & 4095 != 0 or
         config.methods == 0 or config.methods & 4095 != 0 or config.method_bytes == 0) return error.Bounds;
@@ -484,10 +506,10 @@ pub fn encode(config: Config, op: Operation, output: []u8) Error![]const u8 {
         .allocate => {
             put(out, 4, config.context.group); put(out, 8, config.handle); put(out, 12, 0xc56f); put(out, 20, 368);
             wide(out, 40, config.address); put(out, 48, entries);
-            // New USERD page at index zero, chosen by RM. Delay scheduling;
-            // deny physical CE addressing. No caller-selected hardware CHID.
+            // Physical RM must bind the host-reserved CHID, with a private
+            // USERD page and index0. Delay scheduling; deny physical CE.
             const golden = if (config.graphics) |graphics| graphics.golden else false;
-            put(out, 52, 0x8c0 | (@as(u32, config.runqueue) << 4) | (if (golden) @as(u32, 0x20) else 0));
+            put(out, 52, try allocationFlags(config.hardware_channel, config.runqueue, golden));
             put(out, 56, config.context.share); put(out, 160, try context.nvEngine(config.rm_engine));
             descriptor(out, 176, config.instance, 4096, 1);
             descriptor(out, 200, config.userd, 512, 1);
@@ -575,10 +597,10 @@ pub fn decode(config: Config, op: Operation, request: []const u8, record: exchan
     if (status != 0) return .{ .rejected = status };
     if (data.len != request.len) return error.Payload;
     for (data[header..], header..) |value, i| {
-        if ((op == .allocate and i >= 164 and i < 168) or op == .token or (op == .allocate_graphics and i >= 44 and i < 48)) continue;
+        if ((op == .allocate and i >= 164 and i < 168) or (op == .allocate_graphics and i >= 44 and i < 48)) continue;
         if (value != request[i]) return error.Payload;
     }
-    const result = if (op == .allocate) word(data, 164) else if (op == .token) word(data, 24) else if (op == .allocate_graphics) word(data, 44) else 0;
+    const result = if (op == .allocate) word(data, 164) else if (op == .allocate_graphics) word(data, 44) else 0;
     // cid is the RM session identifier, NOT the hardware channel index.
     if (op == .allocate and result == 0) return error.Payload;
     return .{ .ok = result };

@@ -1,3 +1,26 @@
+// src/nvidia/src/kernel/gpu/mem_mgr/heap.c
+// /*
+//  * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//  * SPDX-License-Identifier: MIT
+//  *
+//  * Permission is hereby granted, free of charge, to any person obtaining a
+//  * copy of this software and associated documentation files (the "Software"),
+//  * to deal in the Software without restriction, including without limitation
+//  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//  * and/or sell copies of the Software, and to permit persons to whom the
+//  * Software is furnished to do so, subject to the following conditions:
+//  *
+//  * The above copyright notice and this permission notice shall be included in
+//  * all copies or substantial portions of the Software.
+//  *
+//  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+//  * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+//  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+//  * DEALINGS IN THE SOFTWARE.
+//  */
 // ExFiles/Reference/GFX/Nvidia/OpenKernelModules-570.144/src/common/sdk/nvidia/inc/nvos.h
 // /*
 //  * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
@@ -147,7 +170,7 @@ pub fn encodeLayout(binding: Binding, bytes: u64, layout: Layout, op: Operation,
             put(out, 8, binding.memory);
             put(out, 12, 0x40); // NV01_MEMORY_LOCAL_USER.
             put(p, 4, if (layout.scanout) 8 else 0); // PRIMARY or IMAGE.
-            put(p, 8, if (layout.scanout) 0x102 else 0x1102); // Scanout never sets NO_SCANOUT.
+            put(p, 8, if (layout.scanout) 0x8102 else 0x9102); // MAP_NOT_REQUIRED; scanout never sets NO_SCANOUT.
             put(p, 24, (if (layout.scanout or layout.contiguous) @as(u32, 0x10800000) else 0x08800000) | format);
             put(p, 108, 0);
         }
@@ -177,19 +200,39 @@ pub fn decode(binding: Binding, bytes: u64, op: Operation, request: []const u8, 
     if (status != 0) return .{ .rejected = status };
     if (data.len != 160) return error.Payload;
     const p = data[32..];
-    // Only physicality and the documented physical offset/limit may change
-    // for this exact uncompressed request. Any other successful outcome
-    // remains retained until the driver can describe it safely.
-    const attr = word(p, 24);
-    const physicality = (attr >> 27) & 3;
-    const requested_attr = word(request[32..], 24);
-    if ((attr & ~@as(u32, 3 << 27)) != (requested_attr & ~@as(u32, 3 << 27)) or
-        (physicality != 1 and physicality != 2) or (((requested_attr >> 27) & 3) == 2 and physicality != 2)) return error.Payload;
+    // RM may normalize contiguity, uncompressed kind and ZBC. Unlike a
+    // virtual reservation, physical memory must stay in the requested VRAM.
+    try @import("gsp_virtual_wire.zig").allocationAttributes(request[32..], p, false);
+    // Original heap.c adds IGNORE_BANK_PLACEMENT for forced grow direction
+    // or a constrained heap range. It also fills an unspecified range with
+    // the heap bounds. Neither result changes the allocated object's owner.
+    const before_flags = word(request, 40);
+    const after_flags = word(p, 8);
+    if (after_flags != before_flags and !(after_flags == before_flags | 1 and
+        (before_flags & 6 != 0 or long(p, 48) != 0 or long(p, 56) != 0))) return error.Payload;
     for (p, 0..) |v, i| {
-        if ((i >= 24 and i < 28) or (i >= 80 and i < 96)) continue;
+        if ((i >= 8 and i < 12) or (i >= 24 and i < 36) or
+            (i >= 48 and i < 64) or (i >= 80 and i < 96)) continue;
         if (v != request[32 + i]) return error.Payload;
     }
     const granule = long(request, 104);
-    if (granule < alignment or !std.math.isPowerOfTwo(granule) or long(p, 64) != bytes or long(p, 88) != bytes - 1 or long(p, 80) % granule != 0) return error.Bounds;
-    return .{ .ok = long(p, 80) }; // First physical page only, never CPU-accessible.
+    const physical_limit = @import("gsp_host_page.zig").video_limit;
+    const offset = long(p, 80);
+    if (granule < alignment or !std.math.isPowerOfTwo(granule) or long(p, 64) != bytes or
+        long(p, 88) != bytes - 1 or offset % granule != 0 or
+        offset >= physical_limit or bytes > physical_limit - offset) return error.Bounds;
+    const lo = long(p, 48);
+    const hi = long(p, 56);
+    if (lo != 0 or hi != 0) {
+        if (lo & 4095 != 0 or hi & 4095 != 4095 or lo > offset or
+            hi < offset or hi - offset < bytes - 1 or hi >= physical_limit) return error.Bounds;
+    }
+    const request_lo = long(request, 80);
+    const request_hi = long(request, 88);
+    if (request_lo != 0 or request_hi != 0) {
+        if (lo < request_lo or hi > request_hi or request_lo > offset or
+            request_hi < offset or request_hi - offset < bytes - 1) return error.Bounds;
+    }
+    if (before_flags & 0x10 != 0 and offset != long(request, 112)) return error.Bounds;
+    return .{ .ok = offset }; // First physical page only, never CPU-accessible.
 }

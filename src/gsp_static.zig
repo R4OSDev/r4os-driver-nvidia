@@ -228,6 +228,7 @@ const message = @import("gsp_message.zig");
 const firmware = @import("firmware.zig");
 pub const function: u32 = 65;
 pub const payload_bytes = 1656;
+pub const split_vas_offset = 1565;
 pub const max_regions = 16;
 pub const Error = error{ Unexpected, Guest, Rpc, Payload, Handle, Memory, Region };
 pub const Region = struct {
@@ -246,6 +247,7 @@ pub const Info = struct {
     fb_bytes: u64,
     bar1_pdb: u64,
     bar2_pdb: u64,
+    split_vas: bool = false,
     engine_caps: [3]u32,
     region_count: usize,
     regions: [max_regions]Region = @splat(.{}),
@@ -279,6 +281,7 @@ pub fn decode(record: message.Record, physical_bytes: u64) Error!Info {
         .client = get(u32, bytes, 1600), .device = get(u32, bytes, 1604),
         .subdevice = get(u32, bytes, 1608), .fb_bytes = get(u64, bytes, 1224),
         .bar1_pdb = get(u64, bytes, 1536), .bar2_pdb = get(u64, bytes, 1544),
+        .split_vas = try flag(bytes, split_vas_offset),
         .engine_caps = .{ get(u32, bytes, 1204), get(u32, bytes, 1208), get(u32, bytes, 1212) },
         .region_count = get(u32, bytes, 344),
         .non_wpr_heap = get(u64, bytes, 1640), .frts = get(u64, bytes, 1648),

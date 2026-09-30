@@ -147,8 +147,11 @@ pub const Model = struct {
             const call: *const fn (*const a.GfxBufferHandle, *const a.GfxDeviceRequest, *a.GfxDeviceLease) callconv(.c) i32 = @ptrFromInt(fallback().device_acquire);
             return call(input, request, out);
         };
-        std.debug.assert(refs[i] and request.byte_offset == 0 and request.byte_length == rounded[i] - @as(u64, if (full_refs[i]) 5 else 0) and request.adapter_id == 0x01000000);
         const virtual = request.access == 3;
+        const logical_bytes = rounded[i] - 5;
+        if (virtual and request.byte_length > logical_bytes) return a.gfx_buffer_error_invalid;
+        const lease_bytes = if (virtual or full_refs[i]) logical_bytes else rounded[i];
+        std.debug.assert(refs[i] and request.byte_offset == 0 and request.byte_length == lease_bytes and request.adapter_id == 0x01000000);
         if (virtual) {
             std.debug.assert(dma[i].lease.id != 0 and gpu[i].lease.id == 0 and request.gpu_virtual_address == address(i));
             if (is("mapping_gpu")) return -1;

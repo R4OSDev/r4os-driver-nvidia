@@ -4,7 +4,7 @@ const t = std.testing;
 const wire = @import("gsp_fifo_wire.zig");
 const message = @import("gsp_message.zig");
 pub const golden = @embedFile("fixtures/fifo-570.144.bin");
-pub const ops = [_]wire.Operation{.allocate,.allocate,.bind,.token,.enable,.disable,.free};
+pub const ops = [_]wire.Operation{.allocate,.allocate,.bind,.enable,.disable,.free};
 pub fn response(index: usize) []const u8 {
     var at: usize = 0;
     for (ops[0..index]) |op| at += wire.length(op) * 2;
@@ -17,7 +17,7 @@ pub fn check() !void {
     try checkGraphicsContexts();
     try checkNativeEngines();
     var config: wire.Config = .{ .context = .{ .epoch = 7, .client = 0xc1d00000, .device = 0x10000000, .subdevice = 0x10000001,
-        .vaspace = 0x10000006, .group = 0x10000009, .share = 0x1000000a }, .handle = 0x1000000d, .rm_engine = 19, .runqueue = 0,
+        .vaspace = 0x10000006, .group = 0x10000009, .share = 0x1000000a }, .handle = 0x1000000d, .rm_engine = 19, .runqueue = 0, .hardware_channel = 8, .runlist = 0,
         .address = 0x600000, .instance = 0x10000000, .userd = 0x20000000, .methods = 0x30000000, .method_bytes = 0x6000 };
     var request: [wire.max_bytes]u8 = undefined; var reply: [wire.max_bytes]u8 = undefined;
     var offset: usize = 0;
@@ -31,7 +31,6 @@ pub fn check() !void {
         const result = try wire.decode(config, op, data, record);
         try t.expect(result == .ok);
         if (op == .allocate) try t.expect(result.ok == 37);
-        if (op == .token) try t.expect(result.ok == 0x13572468);
         const header: usize = if (op == .allocate) 32 else if (op == .free) 16 else 24;
         const status_at: usize = if (op == .allocate) 16 else 12;
         std.mem.writeInt(u32, reply[status_at..][0..4], 0x57, .little); record.payload = reply[0..header];
@@ -44,11 +43,18 @@ pub fn check() !void {
             @memcpy(reply[0..data.len], response(index)); @memset(reply[164..168], 0);
             try t.expectError(error.Payload, wire.decode(config, op, data, record));
         }
-        if (op == .token) { @memset(reply[24..28], 0); try t.expect((try wire.decode(config, op, data, record)).ok == 0); }
         if (op == .enable) { reply[25] = 1; try t.expectError(error.Payload, wire.decode(config, op, data, record)); }
         offset += data.len * 2;
     }
-    try t.expect(offset == 1848 and offset == golden.len);
+    try t.expect(offset == 1792 and offset == golden.len);
+    for ([_]u32{0, 1, 7, 513, 4096}) |invalid| {
+        try t.expectError(error.Bounds, wire.hostWorkToken(invalid, 1));
+        var bad = config; bad.hardware_channel = invalid;
+        try t.expectError(error.Bounds, wire.encode(bad, .allocate, &request));
+    }
+    try t.expectError(error.Bounds, wire.hardwareChannelForSlot(wire.host_channel_slots));
+    try t.expectError(error.Bounds, wire.hostWorkToken(8, 128));
+    try t.expectError(error.Bounds, wire.allocationFlags(8, 2, false));
     config.userd = config.instance; try t.expectError(error.Bounds, wire.encode(config, .allocate, &request));
     config.userd = 0x20000000; config.runqueue = 2; try t.expectError(error.Bounds, wire.encode(config, .allocate, &request));
 }
@@ -61,7 +67,7 @@ fn checkGraphicsContexts() !void {
     try t.expect(plan.count == 9 and plan.buffers[0].bytes == 0x58000 and plan.buffers[4].alignment == 0x200000);
     var config: wire.Config = .{ .context = .{ .epoch = 7, .client = 1, .device = 2, .subdevice = 3,
         .vaspace = 4, .group = 5, .share = 6, .internal_client = 9, .internal_subdevice = 10 },
-        .handle = 7, .rm_engine = 1, .runqueue = 0, .address = 0x50000000, .instance = 0x10000000,
+        .handle = 7, .rm_engine = 1, .runqueue = 0, .hardware_channel = 8, .runlist = 0, .address = 0x50000000, .instance = 0x10000000,
         .userd = 0x8000004000, .methods = 0x30000000, .method_bytes = 0x6000, .system_userd = true,
         .engine = .graphics, .object_handle = 8, .object_class = 0xc797 };
     var request: [wire.max_bytes]u8 = undefined;
@@ -113,7 +119,7 @@ pub fn checkNativeEngines() !void {
         try t.expectEqual(expected, wire.validNativeEngines(@intCast(mask)));
     }
     var config: wire.Config = .{ .context = .{ .epoch = 7, .client = 1, .device = 2, .subdevice = 3,
-        .vaspace = 4, .group = 5, .share = 6 }, .handle = 7, .rm_engine = 1, .runqueue = 0,
+        .vaspace = 4, .group = 5, .share = 6 }, .handle = 7, .rm_engine = 1, .runqueue = 0, .hardware_channel = 8, .runlist = 0,
         .address = 0x50000000, .instance = 0x10000000, .userd = 0x8000004000, .methods = 0x30000000,
         .method_bytes = 0x6000, .system_userd = true, .engine = .graphics, .object_handle = 8, .object_class = 0xc797,
         .engine_mask = 7, .compute_handle = 9, .compute_class = 0xc7c0, .copy_handle = 10, .copy_class = 0xc7b5, .copy_rm_engine = 20 };
@@ -156,7 +162,7 @@ fn checkVideo(engine: wire.Engine) !void {
     const operation: wire.Operation = if (encode_video) .allocate_nvenc else .allocate_nvdec;
     const reference: []const u8 = if (encode_video) @embedFile("fixtures/nvenc-allocation-570.144.bin") else @embedFile("fixtures/nvdec-allocation-570.144.bin");
     var config: wire.Config = .{ .context = .{ .epoch = 7, .client = 1, .device = 2, .subdevice = 3,
-        .vaspace = 4, .group = 5, .share = 6 }, .handle = 7, .rm_engine = first, .runqueue = 0,
+        .vaspace = 4, .group = 5, .share = 6 }, .handle = 7, .rm_engine = first, .runqueue = 0, .hardware_channel = 8, .runlist = 0,
         .address = 0x50000000, .instance = 0x10000000, .userd = 0x8000004000, .methods = 0x30000000,
         .method_bytes = 0x6000, .system_userd = true, .engine = engine, .engine_mask = wire.defaultEngineMask(engine), .object_handle = 8 };
     var request: [wire.max_bytes]u8 = undefined;
@@ -230,7 +236,7 @@ fn checkGraphics() !void {
     const gr = @import("gsp_gr_wire.zig");
     const reference = @embedFile("fixtures/graphics-570.144.bin");
     var config: wire.Config = .{ .context = .{ .epoch = 7, .client = 1, .device = 2, .subdevice = 3,
-        .vaspace = 4, .group = 5, .share = 6 }, .handle = 7, .rm_engine = 1, .runqueue = 0,
+        .vaspace = 4, .group = 5, .share = 6 }, .handle = 7, .rm_engine = 1, .runqueue = 0, .hardware_channel = 8, .runlist = 0,
         .address = 0x50000000, .instance = 0x10000000, .userd = 0x8000004000, .methods = 0x30000000,
         .method_bytes = 0x6000, .system_userd = true, .engine = .graphics, .object_handle = 8, .object_class = 0xc797 };
     var request: [wire.max_bytes]u8 = undefined;

@@ -11,7 +11,7 @@ const names = @import("gsp_rm_names.zig");
 const i2c_object = @import("gsp_i2c_object.zig");
 const vaspace = @import("gsp_vaspace.zig");
 const control = @import("gsp_control_buffer.zig");
-pub const Error = exchange.Error || names.Error || control.Error;
+pub const Error = exchange.Error || names.Error || control.Error || vaspace.Error;
 pub const State = enum { base_creating, i2c_creating, vaspace_creating, control_creating, events_creating, ready, loaned, rejected, events_destroying, control_destroying, vaspace_destroying, i2c_destroying, base_destroying, closed, finished, failed };
 pub const Owner = struct {
     reservation: names.Lease,
@@ -21,6 +21,7 @@ pub const Owner = struct {
     address_space: ?vaspace.Owner = null,
     control_context: ?@import("r4os").r4dev.DriverContext = null,
     control_adapter: u32 = 0,
+    host_mmu_io: ?@import("gsp_host_tlb.zig").Io = null,
     control_buffer: ?control.Owner = null,
     state: State = .base_creating,
     self_address: usize = 0,
@@ -153,7 +154,13 @@ pub const Owner = struct {
             .i2c_creating => {
                 if (self.i2c.?.state == .ready) {
                     var token = self.i2c.?.handoff(self.deadline) catch |err| return self.fail(err);
-                    self.address_space = vaspace.Owner.init(&token, self.base.plan, self.deadline) catch |err| return self.fail(err);
+                    var plan = self.base.plan;
+                    plan.external_vaspace = self.host_mmu_io != null;
+                    self.address_space = vaspace.Owner.init(&token, plan, self.deadline) catch |err| return self.fail(err);
+                    if (self.host_mmu_io) |io| {
+                        const ctx = self.control_context orelse return self.fail(error.State);
+                        self.address_space.?.configureHost(&ctx, self.control_adapter, io) catch |err| return self.fail(err);
+                    }
                     self.state = .vaspace_creating;
                     return null;
                 }

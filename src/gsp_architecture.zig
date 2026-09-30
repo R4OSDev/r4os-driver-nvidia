@@ -20,7 +20,13 @@ pub fn describe(pci: *const identity.Snapshot, chip: u16, topology: *const posti
         (copy_class != profile.copy[0] and copy_class != profile.copy[1]) or copy_class == 0) return error.Binding;
     if (epoch == 0 or va.epoch != epoch or va.base == 0 or va.bytes == 0 or va.base >= (@as(u64, 1) << 49) or
         va.bytes > (@as(u64, 1) << 49) - va.base or va.big_page_bytes != 65536 or
-        va.base % va.big_page_bytes != 0 or va.bytes % va.big_page_bytes != 0 or memory.fb_bytes == 0) return error.Binding;
+        va.base & 4095 != 0 or va.bytes & 4095 != 0 or memory.fb_bytes == 0) return error.Binding;
+    // External page tables use4K granularity, while R4NV bindings retain
+    // their64K contract. Publish the aligned usable subset of the confirmed
+    // VAS, without extending it or changing the driver's actual owner.
+    const bind_start = std.mem.alignForward(u64, va.base, va.big_page_bytes);
+    const bind_end = std.mem.alignBackward(u64, va.base + va.bytes, va.big_page_bytes);
+    if (bind_start >= bind_end) return error.Binding;
     const gpc = @popCount(topology.gpc_mask);
     if (gpc == 0) return error.Geometry;
     var tpc: u32 = 0;
@@ -38,7 +44,7 @@ pub fn describe(pci: *const identity.Snapshot, chip: u16, topology: *const posti
         .device_id = pci.pci.device_id, .chipset = chip, .pci_revision = pci.revision, .pci_domain = 0,
         .pci_bus = pci.pci.bus, .pci_device = pci.pci.device, .pci_function = pci.pci.function,
         .gpc_count = gpc, .tpc_count = tpc, .shader_model = profile.sm, .mp_per_tpc = 2, .max_warps_per_mp = 48,
-        .rm_release = nv.rm_release, .vram_bytes = memory.fb_bytes, .va_start = va.base, .va_end = va.base + va.bytes,
+        .rm_release = nv.rm_release, .vram_bytes = memory.fb_bytes, .va_start = bind_start, .va_end = bind_end,
         .memory_generation = epoch, .bind_alignment = va.big_page_bytes,
         .flags = nv.architecture_image_layouts |
             @as(u32, if (@import("gsp_buffer_wire.zig").hostCoherentPolicy()) nv.architecture_host_coherent else 0),

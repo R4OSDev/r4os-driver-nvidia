@@ -203,6 +203,13 @@ int r4nv_fwsec_abi_check(const unsigned char *sb, size_t sb_len, unsigned sb_id,
     if (!r4nv_gsp_unload_abi_complete()) return 1;
     puts("{\"schema\":1,\"original_typedefs\":true,\"zig_c_byte_comparison\":true,"
          "\"gsp_unload_original_comparison\":true,\"gsp_unload_payload_bytes\":8,"
+         "\"gsp_memory_owner_original_comparison\":true,\"gsp_memory_owner_packets\":54,"
+         "\"gsp_host_mmu_original_comparison\":true,\"gsp_host_mmu_pte_cases\":672,"
+         "\"gsp_memory_clear_original_comparison\":true,\"gsp_memory_clear_cases\":6,"
+         "\"gsp_copy_caps_original_comparison\":true,\"gsp_copy_caps_cases\":80,"
+         "\"gsp_host_channel_original_comparison\":true,\"gsp_host_channel_cases\":768,"
+         "\"gsp_preboot_registry_original_comparison\":true,\"gsp_preboot_registry_entries\":4,"
+         "\"gsp_static_original_bytes\":1656,\"gsp_static_split_vas_offset\":1565,"
          "\"interface_header_bytes\":4,\"interface_entry_bytes\":8,\"mapper_bytes\":64,"
          "\"init_command_offset\":44,\"sb_bytes\":24,\"frts_region_bytes\":20,"
          "\"frts_region_offset\":24,\"frts_bytes\":48,\"frts_padding_zero\":true,"

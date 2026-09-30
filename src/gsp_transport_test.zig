@@ -3981,10 +3981,129 @@ test "GSP transport orders range publication, explicit acknowledgement and termi
     try t.expectError(error.Stale, transport.Session.init(model.port(), profile, 0, &model.tx, &model.rx));
 }
 
+fn checkPhysicalMemoryReceipt() !void {
+    const wire = @import("gsp_virtual_wire.zig");
+    const buffer = @import("gsp_buffer_wire.zig");
+    // Exact retained request/reply from OssiPC156, RPC103/sequence16. This
+    // fixture proves reply decoding only; the real driver stopped before map.
+    const golden = @embedFile("fixtures/memory-reply-570.144-ga106.bin");
+    const plan: wire.Allocation = .{ .space = .{ .epoch = 1, .client = 0xc1d00000,
+        .device = 0x10000000, .handle = 0x10000006, .base = 0x4000000,
+        .bytes = (@as(u64, 1) << 49) - 0x4000000, .big_page_bytes = 65536 },
+        .object = 0x10000008, .bytes = 32768 };
+    const binding: buffer.Binding = .{ .space = plan.space, .memory = 0x10000007, .virtual = plan.object };
+    const part: buffer.Part = .{ .total_bytes = plan.bytes, .byte_length = plan.bytes };
+    var request: [160]u8 = undefined;
+    try t.expectEqualSlices(u8, golden[0..160], (try wire.allocate(plan, &request)).bytes);
+    var reply: [160]u8 = golden[160..320].*;
+    const record: message.Record = .{ .shape = .{ .message_bytes = 240, .checksum_bytes = 240,
+        .storage_bytes = 4096, .elements = 1 }, .queue_sequence = 0,
+        .rpc = .{ .function = 103, .sequence = 16, .result = 0 }, .payload = &reply };
+    try t.expectEqual(@as(u64, 0x100000000), (try wire.allocated(plan, record)).ok);
+    try t.expectEqual(@as(u64, 0x100000000), (try buffer.decodePart(binding, part, .allocate, &request, record, 0)).ok);
+    // Unrelated parameter changes must not turn a successful but unusable
+    // receipt into ownership of a buffer with different cache/layout/size.
+    for ([_]usize{ 32, 36, 40, 44, 48, 52, 56, 58, 59, 60, 64, 68, 72, 96, 104, 128, 140, 144 }) |at| {
+        reply = golden[160..320].*;
+        reply[at] ^= if (at == 60) @as(u8, 4) else 1;
+        try t.expectError(error.Payload, wire.allocated(plan, record));
+        try t.expectError(error.Payload, buffer.decodePart(binding, part, .allocate, &request, record, 0));
+    }
+    for ([_]usize{ 80, 88, 112, 120 }) |at| {
+        reply = golden[160..320].*;
+        // Misaligned lower bound/address, invalid upper bound, wrong extent.
+        reply[at] ^= 1;
+        try t.expectError(error.Bounds, wire.allocated(plan, record));
+        try t.expectError(error.Bounds, buffer.decodePart(binding, part, .allocate, &request, record, 0));
+    }
+    reply = golden[160..320].*;
+    put(&reply, 56, 0x34800000); // Virtual location may become ANY, never another physical aperture.
+    try t.expectError(error.Payload, wire.allocated(plan, record));
+    reply = golden[160..320].*;
+    put(&reply, 60, 10); // Compression/ZBC was not requested.
+    try t.expectError(error.Payload, wire.allocated(plan, record));
+    // The same RM kind/ZBC normalization applies to physical VRAM, but ANY
+    // is legal only for virtual reservations. These are original-contract
+    // model cases, not additional physical captures.
+    const vram = @import("gsp_vram_wire.zig");
+    for ([_]vram.Layout{ .{}, .{ .contiguous = true }, .{ .scanout = true } }) |layout| {
+        const encoded = try vram.encodeLayout(binding, 65536, layout, .allocate_memory, 0, &request);
+        @memcpy(&reply, encoded.bytes);
+        put(&reply, 60, 5); // GPU cached YES plus PREFER_NO_ZBC.
+        put(&reply, 64, 6); // Generic uncompressed IMAGE/PRIMARY kind.
+        std.mem.writeInt(u64, reply[112..120], 0x200000, .little);
+        std.mem.writeInt(u64, reply[120..128], 65535, .little);
+        try t.expectEqual(@as(u64, 0x200000), (try vram.decode(binding, 65536, .allocate_memory, &request, record, 0)).ok);
+        const physical_attr = std.mem.readInt(u32, reply[56..60], .little);
+        put(&reply, 56, physical_attr | (3 << 25));
+        try t.expectError(error.Payload, vram.decode(binding, 65536, .allocate_memory, &request, record, 0));
+        put(&reply, 56, physical_attr);
+        if (layout.contiguous or layout.scanout) {
+            put(&reply, 56, (physical_attr & ~@as(u32, 3 << 27)) | (1 << 27));
+            try t.expectError(error.Payload, vram.decode(binding, 65536, .allocate_memory, &request, record, 0));
+        }
+    }
+}
+
+fn checkPhysicalVramReceipt() !void {
+    const wire = @import("gsp_vram_wire.zig");
+    // Exact RPC103/sequence27 on OssiPC161. RM allocated the methods buffer;
+    // the driver rejected its reply before clear, mapping or GPU execution.
+    const golden = @embedFile("fixtures/vram-reply-570.144-ga106.bin");
+    const binding: wire.Binding = .{ .space = .{ .epoch = 1, .client = 0xc1d00000,
+        .device = 0x10000000, .handle = 0x10000006, .base = 4096,
+        .bytes = (@as(u64, 1) << 49) - 4096, .big_page_bytes = 65536 },
+        .memory = 0x1000000b, .virtual = 0x1000000c };
+    var request: [160]u8 = undefined;
+    const encoded = try wire.encodeLayout(binding, 65536, .{ .contiguous = true }, .allocate_memory, 0, &request);
+    try t.expectEqualSlices(u8, golden[0..160], encoded.bytes);
+    var reply: [160]u8 = golden[160..320].*;
+    const record: message.Record = .{ .shape = .{ .message_bytes = 240, .checksum_bytes = 240,
+        .storage_bytes = 4096, .elements = 1 }, .queue_sequence = 0,
+        .rpc = .{ .function = 103, .sequence = 27, .result = 0 }, .payload = &reply };
+    try t.expectEqual(@as(u64, 0x2f0870000), (try wire.decode(binding, 65536, .allocate_memory, &request, record, 0)).ok);
+    // Only IGNORE_BANK_PLACEMENT may be added; no ownership/layout/cache/
+    // allocation-policy changes are accepted as incidental normalization.
+    for (1..32) |bit| {
+        reply = golden[160..320].*;
+        put(&reply, 40, std.mem.readInt(u32, reply[40..44], .little) ^ (@as(u32, 1) << @intCast(bit)));
+        try t.expectError(error.Payload, wire.decode(binding, 65536, .allocate_memory, &request, record, 0));
+    }
+    for ([_]usize{ 32, 36, 44, 48, 52, 56, 58, 59, 60, 64, 68, 72, 96, 104, 128, 140, 144 }) |at| {
+        reply = golden[160..320].*;
+        reply[at] ^= if (at == 60) @as(u8, 4) else 1;
+        try t.expectError(error.Payload, wire.decode(binding, 65536, .allocate_memory, &request, record, 0));
+    }
+    for ([_]struct { at: usize, value: u64 }{
+        .{ .at = 80, .value = 1 }, .{ .at = 80, .value = 0x2f0880000 },
+        .{ .at = 88, .value = 0x2f087ffff - 1 }, .{ .at = 88, .value = 0x2f086fff },
+        .{ .at = 88, .value = (@as(u64, 1) << 37) + 4095 },
+        .{ .at = 112, .value = 0x2f0870001 }, .{ .at = 112, .value = @as(u64, 1) << 37 },
+        .{ .at = 120, .value = 65536 },
+    }) |change| {
+        reply = golden[160..320].*;
+        std.mem.writeInt(u64, reply[change.at..][0..8], change.value, .little);
+        try t.expectError(error.Bounds, wire.decode(binding, 65536, .allocate_memory, &request, record, 0));
+    }
+    reply = golden[160..320].*;
+    @memset(reply[80..96], 0); // Unspecified range remains a valid reply.
+    try t.expectEqual(@as(u64, 0x2f0870000), (try wire.decode(binding, 65536, .allocate_memory, &request, record, 0)).ok);
+    // A caller-supplied range must not be widened by the reply.
+    std.mem.writeInt(u64, request[80..88], 0x2f0870000, .little);
+    std.mem.writeInt(u64, request[88..96], 0x2f087ffff, .little);
+    reply = golden[160..320].*;
+    try t.expectError(error.Bounds, wire.decode(binding, 65536, .allocate_memory, &request, record, 0));
+    @memcpy(reply[80..96], request[80..96]);
+    try t.expectEqual(@as(u64, 0x2f0870000), (try wire.decode(binding, 65536, .allocate_memory, &request, record, 0)).ok);
+}
+
 test "GPU virtual ranges keep independent addresses and exact memory ownership" {
+    try @import("gsp_host_vm_test.zig").check();
     const range = @import("gsp_virtual_range.zig");
     const wire = range.wire;
     try @import("gsp_architecture_test.zig").check();
+    try checkPhysicalMemoryReceipt();
+    try checkPhysicalVramReceipt();
     {
         // Original NVIDIA C types/macros generate all six uncompressed kinds
         // independently for both memory locations. A changed kind in an ACK
@@ -4015,6 +4134,17 @@ test "GPU virtual ranges keep independent addresses and exact memory ownership" 
                     const reply = if (index == 0) try wire.allocated(plan, record) else try wire.mapped(map, .map, record);
                     try t.expect(reply == .ok and reply.ok == (if (index == 0) @as(u64, 0x800000) else 0x808000));
                     if (index == 0) {
+                        // Normalize virtual metadata without changing any of
+                        // the six explicitly selected depth/color PTE kinds.
+                        const attr = std.mem.readInt(u32, ack[56..60], .little);
+                        put(&ack, 56, (attr & ~@as(u32, (3 << 25) | (3 << 27))) | (3 << 25) | (2 << 27));
+                        put(&ack, 60, std.mem.readInt(u32, ack[60..64], .little) | 1);
+                        std.mem.writeInt(u64, ack[80..88], plan.fixed_address, .little);
+                        std.mem.writeInt(u64, ack[88..96], plan.fixed_address + plan.bytes - 1, .little);
+                        try t.expectEqual(plan.fixed_address, (try wire.allocated(plan, record)).ok);
+                        std.mem.writeInt(u64, ack[88..96], plan.fixed_address + plan.bytes + 4095, .little);
+                        try t.expectError(error.Bounds, wire.allocated(plan, record));
+                        std.mem.writeInt(u64, ack[88..96], plan.fixed_address + plan.bytes - 1, .little);
                         ack[64] ^= 1; // format in the 32-byte-header allocation.
                         try t.expectError(error.Payload, wire.allocated(plan, record));
                     } else {
@@ -4041,7 +4171,8 @@ test "GPU virtual ranges keep independent addresses and exact memory ownership" 
     try checkResourceSlots();
     const model = try t.allocator.create(Model);
     defer t.allocator.destroy(model);
-    // Existing captured packets remain unchanged through the shared encoder.
+    // Original-C generated packets exercise the shared encoder. They are
+    // layout/owner fixtures, not successful captures from physical hardware.
     try checkVirtualRegistry(model);
     for ([_][]const u8{ "control", "part" }) |kind| {
         const legacy = @import("gsp_buffer_wire.zig");
