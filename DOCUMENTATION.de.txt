@@ -1,6 +1,30 @@
 ﻿NVIDIA: nativer Grafik- und Displaybesitzer
 =========================================
 
+0.82.4 / NVIDIA 187 / DISPLAYD 61 / 01.10.2026:
+HDMI-/EDID-Softwarevorbereitung technisch abgeschlossen. Letzte Antwort und
+letzte Ablehnung behalten Phase, Befehl, DDC-Block, RPC-/RM-Status,
+Receipt und tatsaechlichen ACK-Zustand.
+Erfolgreiche Wiederholung ueberschreibt den frueheren Fehler nicht. Bei
+unklarem Framing/ACK bleiben Graph/DMA und urspruengliche Fehlerphase erhalten.
+DISPLAYD /RECEIVERS /RAW liefert unveraenderte Bloecke mit Identitaeten,
+Katalogrevision und SHA256; ExportReceiverCapture.ps1 schreibt erst nach
+vollstaendiger Pruefung. Defekte EDID-Pruefsummen bleiben unveraendert,
+fehlende Erweiterungen bleiben fehlend; veraltete/abgebrochene Mitschnitte
+zaehlen nicht. Kein neuer DDC-/GSP-Abruf durch den Diagnosebefehl.
+Bestehende Port-/Transport-/Devicegruppen, Kernel-Empfaenger-/ELD-Faelle,
+Builds und SMP4/KVM in 60.71 s bestanden. Physisch mit NVIDIA 187:
+private Loeschprobe mit 5 CE-Auftraegen und 24576 exakten Bytes;
+kurzer Test mit 8 COPY- und 2 Render-Auftraegen, 2048 exakten Pixeln,
+ausgeglichener Ressourcenbilanz und ohne Reset. Das Update beendet den
+vorherigen Treiber 186 sauber ohne Wake. Sechs volle Artefakthashes,
+110 Katalogeintraege und Recovery stimmen. Der OssiPC-Rohdatenexport liest
+nur einen Firmware-Katalogeintrag ohne EDID: 0 Bloecke. Keine Aussage zum
+TV-Zustand. Frische TV-Erkennung und Transport bleiben in 0.82.37,
+manuelle Port-/Kabel-/Standbywechsel in 0.82.38 offen.
+Beleg: ExFiles/Reports/OssiGPU/20261001-receivers08204.
+Die datierten aelteren Abschnitte sind historische Zwischenstaende.
+
 Stand: 30.09.2026, technischer Grundbetrieb der Roadmap0.82.1 qualifiziert.
 OssiPC: NVIDIA178/R4NV15/DISPLAYD48/Kernel235, installiertes Release0.82.0.
 Zwei volle native CE/GR-Smokes liefern je8CE/2GR,2048exakte Pixel und ruhende

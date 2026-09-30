@@ -2892,7 +2892,11 @@ fn checkReceiver(model: *Model) !void {
                 if (case == .ack or case == .expired) {
                     try t.expectError(if (case == .ack) error.Io else error.Deadline, refresh.poll());
                     try t.expect(refresh.state == .failed and session.state == .failed and owner.state == .loaned);
-                    if (case == .ack) try t.expect(session.pending != null);
+                    if (case == .ack) {
+                        try t.expect(session.pending != null);
+                        try t.expect(capture.last_reply.?.phase == .edid and !capture.last_reply.?.acknowledged);
+                    }
+                    try t.expect(capture.failure_phase.? == .edid);
                     const calls = model.count;
                     try t.expectError(error.State, refresh.borrow(deadline + 100));
                     try t.expectError(error.State, refresh.poll());
@@ -3009,7 +3013,14 @@ fn checkReceiver(model: *Model) !void {
         if (case == .valid) try t.expect(result.report.hdmi and result.report.basic_audio and result.report.audio_count == 1 and result.report.mode_count == 1 and result.report.complete());
         if (case == .base_only or case == .missing or case == .checksum or case == .invalid_base or case == .verify_rejected) try t.expect(!result.report.hdmi and !result.report.basic_audio and result.report.audio_count == 0);
         if (case == .missing_extension or case == .truncated) try t.expect(result.report.warnings & receiver.edid.Warning.missing != 0);
-        if (case == .edid_rejected) try t.expectEqual(@as(u32, 0x55), result.control_status.?);
+        if (case == .edid_rejected) {
+            try t.expectEqual(@as(u32, 0x55), result.control_status.?);
+            const rejected = result.last_rejection.?;
+            try t.expect(rejected.phase == .edid and rejected.command == .edid and rejected.block == null and
+                rejected.control.? == 0x55 and rejected.rpc.? == 0 and rejected.acknowledged);
+            try t.expect(result.last_reply.?.phase == .verify and result.last_reply.?.acknowledged and
+                result.last_reply.?.receipt_serial > rejected.receipt_serial);
+        }
         if (case == .verify_rejected) try t.expect(result.connected == null and result.edid_bytes == 0 and result.report.mode_count == 0);
         if (case == .valid) {
             @memset(&model.rx, 0xcc);
@@ -3645,8 +3656,8 @@ fn checkDdcReceiver(model: *Model) !void {
     const capture = try t.allocator.create(receiver.Capture);
     defer t.allocator.destroy(capture);
     const end = 20 * std.time.ns_per_ms;
-    const Case = enum { full, bounded, dvi, bad_base, bad_extension, no_ddc_port, rejected_ports, prefix_error,
-        retry, exhausted, changed_base, changed_bus, hpd, ack, expired };
+    const Case = enum { full, bounded, dvi, bad_base, bad_extension, no_ddc_port, rejected_ports, prefix_error, prefix_rpc_error,
+        retry, exhausted, changed_base, changed_bus, hpd, ack, expired, short_reply };
     for (std.enums.values(Case)) |case| {
         var session: transport.Session = undefined;
         var boot = try startBoot(model, &session);
@@ -3718,11 +3729,18 @@ fn checkDdcReceiver(model: *Model) !void {
                 },
                 else => return error.UnexpectedDdc,
             }
-            try model.replyRpc(&session, .{ .function = 76, .result = 0 }, payload);
-            if (query == .ddc and (case == .ack or case == .expired)) {
-                if (case == .ack) { model.fault = model.count + 4; model.after = true; } else model.now = end;
-                try t.expectError(if (case == .ack) error.Io else error.Deadline, refresh.poll());
+            const rpc_error = case == .prefix_rpc_error and query == .ddc and query.ddc.block == 16;
+            const short_reply = case == .short_reply and query == .ddc;
+            try model.replyRpc(&session, .{ .function = 76, .result = if (rpc_error) 0x55 else 0 },
+                if (short_reply) payload[0 .. payload.len - 1] else payload);
+            if (query == .ddc and (case == .ack or case == .expired or case == .short_reply)) {
+                if (case == .ack) { model.fault = model.count + 4; model.after = true; } else if (case == .expired) model.now = end;
+                try t.expectError(if (case == .ack) error.Io else if (case == .short_reply) error.Payload else error.Deadline, refresh.poll());
                 try t.expect(session.state == .failed and refresh.state == .failed and parent.state == .loaned);
+                try t.expect(capture.failure_phase.? == .ddc);
+                if (case == .ack) try t.expect(capture.last_reply.?.phase == .ddc and
+                    capture.last_reply.?.block.? == 0 and !capture.last_reply.?.acknowledged);
+                if (case == .short_reply) try t.expect(capture.edid_bytes == 0 and capture.last_rejection == null);
                 try t.expectError(error.State, refresh.release(end + 1));
                 break;
             }
@@ -3731,14 +3749,14 @@ fn checkDdcReceiver(model: *Model) !void {
                 try t.expectError(error.Query, refresh.channel.begin(.{ .ddc = .{ .display_id = 1, .port = 2, .block = 0 } }, end));
         }
         try t.expect(steps < 90);
-        if (case == .ack or case == .expired) continue;
+        if (case == .ack or case == .expired or case == .short_reply) continue;
         if (case == .changed_base or case == .changed_bus or case == .hpd) {
             try t.expect(refresh.state == .obsolete);
             try t.expectError(error.State, refresh.borrow(end));
         } else {
             const result = try refresh.borrow(end);
             const expected: receiver.Status = switch (case) {
-                .bounded, .bad_extension, .prefix_error => .incomplete_edid,
+                .bounded, .bad_extension, .prefix_error, .prefix_rpc_error => .incomplete_edid,
                 .no_ddc_port, .rejected_ports => .edid_missing,
                 .bad_base => .invalid_edid,
                 .exhausted => .edid_rejected,
@@ -3751,6 +3769,16 @@ fn checkDdcReceiver(model: *Model) !void {
             if (case == .retry or case == .exhausted) try t.expect(result.ddc_retries == 2);
             if (case == .exhausted) try t.expect(reads == 3 and result.edid_bytes == 0);
             if (case == .prefix_error) try t.expect(result.edid_bytes == 2048 and result.ddc_control_status.? == 0x1f);
+            if (case == .prefix_rpc_error) try t.expect(result.edid_bytes == 2048 and result.ddc_rpc_status.? == 0x55);
+            if (case == .prefix_error or case == .prefix_rpc_error or case == .retry or case == .exhausted) {
+                const rejected = result.last_rejection.?;
+                try t.expect(rejected.phase == .ddc and rejected.command == .ddc and rejected.acknowledged);
+                try t.expect(rejected.block.? == (if (case == .prefix_error or case == .prefix_rpc_error) @as(u8, 16) else 0));
+                if (case == .prefix_rpc_error) try t.expect(rejected.rpc.? == 0x55 and rejected.control == null)
+                else try t.expect(rejected.rpc.? == 0 and rejected.control.? != 0);
+                try t.expect(result.last_reply.?.phase == .verify and result.last_reply.?.acknowledged and
+                    result.last_reply.?.receipt_serial > rejected.receipt_serial);
+            }
             if (case == .no_ddc_port or case == .rejected_ports) try t.expect(reads == 0);
         }
         try refresh.release(end);

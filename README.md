@@ -1,6 +1,23 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS. Module 0.1.186; original R4OS code is
+Roadmap0.82.4 / receiver capture preparation (0.1.187): receiver replies
+retain phase, command, DDC block, unique receipt, RPC/RM status and actual
+ACK. The last rejection survives successful retry/fallback. Read/ACK
+failure retains the original failed phase and existing graph/DMA owners.
+Existing topology/transport and Device cases pass; Kernel235 receiver
+invalidation checks and fresh SMP4/KVM60.71s pass. DISPLAYD61 exports
+unchanged shared-catalog blocks with identity/revision/SHA256; malformed
+or stale transcripts fail before export, while bad EDID checksums survive.
+Physical187 headless regression passes private clear5CE/24576bytes and
+short8CE/2GR/2048pixels with balanced resources and no reset. Update from186
+retires the previous driver cleanly without Wake; six artifact hashes,
+catalog110 and Recovery agree. OssiPC has one firmware catalog entry with
+no EDID bytes; no fresh bus data or receiver power state is inferred.
+Fresh TV/HDMI qualification remains0.82.37; manual changes0.82.38. Evidence:
+ExFiles/Reports/OssiGPU/20261001-receivers08204. Older dated entries below
+remain historical checkpoints, not the current list of unfinished work.
+
+NVIDIA display driver for R4OS. Module 0.1.187; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,

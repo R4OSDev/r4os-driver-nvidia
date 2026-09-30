@@ -108,6 +108,18 @@ pub const Error = graph.Error;
 pub const State = enum { supported, connected, edid, resource, aux_caps, aux_read, aux_verify_resource, buses, ports, ddc, ddc_verify, bus_verify, verify, drain, complete, obsolete, failed, released,
     dp_source, dp_caps, dp_extended, dp_mst, dp_dsc, dp_fec, dp_repeaters, dp_verify, frl_source, hdmi_dsc_source };
 pub const Status = enum { pending, not_supported, disconnected, edid_missing, edid_rejected, invalid_edid, unsupported_data, incomplete_edid, valid_edid, query_rejected };
+/// CPU-only diagnostic receipt. A reply is observed before consumption;
+/// acknowledgement becomes true only after the real channel completes it.
+/// Keep the last rejection separately when retries/fallback later succeed.
+pub const ReplyObservation = struct {
+    phase: State,
+    command: display.Command,
+    block: ?u8 = null,
+    receipt_serial: u64,
+    rpc: ?u32 = null,
+    control: ?u32 = null,
+    acknowledged: bool = false,
+};
 pub const Capture = struct {
     epoch: u64 = 0,
     client: u32 = 0,
@@ -120,6 +132,9 @@ pub const Capture = struct {
     rpc_status: ?u32 = null,
     control_status: ?u32 = null,
     rejected_command: ?display.Command = null,
+    last_reply: ?ReplyObservation = null,
+    last_rejection: ?ReplyObservation = null,
+    failure_phase: ?State = null,
     parse_error: ?edid.Error = null,
     edid_bytes: usize = 0,
     bytes: [edid.max_blocks * 128]u8 = @splat(0),
@@ -183,6 +198,8 @@ pub const Refresh = struct {
     fn fail(self: *Refresh, reason: Error) Error {
         if ((self.self_address != 0 and self.self_address != @intFromPtr(self)) or self.state == .released) return error.State;
         if (self.failure == null) self.failure = reason;
+        if (self.capture.failure_phase == null) self.capture.failure_phase =
+            if (self.capture.last_reply) |reply| (if (!reply.acknowledged) reply.phase else self.state) else self.state;
         self.channel.exchange.session.stop();
         self.state = .failed;
         return reason;
@@ -627,14 +644,30 @@ pub const Refresh = struct {
         self.guard() catch |err| return self.fail(err);
         if (pending) |dispatch| {
             if (dispatch.value == .notification) return dispatch;
+            const request = self.channel.request.?;
+            const reply = dispatch.value.reply;
+            self.capture.last_reply = .{ .phase = self.state, .command = std.meta.activeTag(request),
+                .block = if (request == .ddc) request.ddc.block else null,
+                .receipt_serial = dispatch.ticket.serial,
+                .rpc = if (reply == .obsolete) null else if (reply == .rpc_error) reply.rpc_error else 0,
+                .control = if (reply == .obsolete or reply == .rpc_error) null else if (reply == .control_error) reply.control_error
+                    else if (reply == .aux) reply.aux.status else 0 };
+            if (reply == .rpc_error or reply == .control_error or (reply == .aux and reply.aux.status != 0))
+                self.capture.last_rejection = self.capture.last_reply;
             const stopping = self.channel.request.? == .aux and self.channel.request.?.aux.operation == .stop;
             // AUX replies own their small value payload. Retire the receipt
             // first, so the block reader sees whether final-read/STOP closed
             // MOT. RAW EDID remains borrowed and is consumed before its ACK.
             const aux_value = dispatch.value.reply == .aux;
-            if (aux_value) self.channel.complete(dispatch.ticket) catch |err| return self.fail(err);
+            if (aux_value) {
+                self.channel.complete(dispatch.ticket) catch |err| return self.fail(err);
+                self.markAcknowledged(dispatch.ticket.serial);
+            }
             if (!self.invalidated or stopping) self.consume(dispatch.value.reply) catch |err| return self.fail(err);
-            if (!aux_value) self.channel.complete(dispatch.ticket) catch |err| return self.fail(err);
+            if (!aux_value) {
+                self.channel.complete(dispatch.ticket) catch |err| return self.fail(err);
+                self.markAcknowledged(dispatch.ticket.serial);
+            }
             self.capture.receipt_serial = dispatch.ticket.serial;
             if(self.capture.dp.source_state!=.unqueried or self.capture.dp.dpcd_state!=.unqueried)
                 self.capture.dp.receipt_serial=dispatch.ticket.serial;
@@ -647,6 +680,10 @@ pub const Refresh = struct {
             if (self.invalidated) self.state = .obsolete else self.state = .complete;
         }
         return null;
+    }
+    fn markAcknowledged(self: *Refresh, serial: u64) void {
+        if (self.capture.last_reply) |*reply| if (reply.receipt_serial == serial) { reply.acknowledged = true; };
+        if (self.capture.last_rejection) |*reply| if (reply.receipt_serial == serial) { reply.acknowledged = true; };
     }
     /// Complete means a coherent queried capture, including explicit no-data
     /// results. Check status/report warnings before using EDID capabilities.

@@ -806,6 +806,12 @@ pub const Owner = struct {
                 .{@errorName(err), self.cursor_upload != null, if (self.display_work) |work| work.cursor != null else false});
         if (self.display_resources_slot.owner) |owner| owner.quarantine();
         self.failure = err;
+        if (self.outputs.refresh) |*refresh| {
+            self.log("NVIDIA gsp-receiver-failed: generation={d} display={x} phase={s} bytes={d} failure={s} resources=retained",
+                .{self.outputs.data.generation, refresh.capture.display_id,
+                    @tagName(refresh.capture.failure_phase orelse refresh.state), refresh.capture.edid_bytes, @errorName(err)});
+            self.logReceiverReplies(self.outputs.data.generation, refresh.capture);
+        }
         // Retained CPU-side ownership only; no new query or cleanup action.
         // A graph deadline must identify the broker that still blocks FIFO
         // retirement even when the subsequent reset also fails.
@@ -5990,6 +5996,7 @@ pub const Owner = struct {
                     self.log("NVIDIA gsp-ddc: generation={d} display={x} port={?} flags={?} retries={d} rpc={?} rm={?}",
                         .{self.output_generation, capture.display_id, if (capture.buses) |buses| @as(?u32, buses.ddc) else null,
                             capture.port_info, capture.ddc_retries, capture.ddc_rpc_status, capture.ddc_control_status});
+                self.logReceiverReplies(self.output_generation, capture);
                 if (capture.source == .aux or capture.aux_rpc_status != null or capture.aux_control_status != null or capture.aux_reply != null)
                     self.log("NVIDIA gsp-aux: generation={d} display={x} dpcd={d} retries={d} rpc={?} rm={?} reply={?}",
                         .{self.output_generation, capture.display_id, capture.aux_caps_bytes, capture.aux_retries,
@@ -6000,6 +6007,13 @@ pub const Owner = struct {
             return if ((self.activeChannel() orelse return error.State).phase == .waiting) .idle else .progress;
         }
         return self.advanceStartup(current, channel);
+    }
+    fn logReceiverReplies(self: *Owner, catalog_generation: u64, capture: *const @import("gsp_receiver.zig").Capture) void {
+        for ([_]?@import("gsp_receiver.zig").ReplyObservation{capture.last_reply, capture.last_rejection}, 0..) |value, index|
+            if (value) |reply| self.log("NVIDIA gsp-receiver-reply: generation={d} display={x} kind={s} phase={s} command={x} block={?} receipt={d} ack={} rpc={?x} rm={?x}",
+                .{catalog_generation, capture.display_id, if (index == 0) @as([]const u8, "last") else "last-rejection",
+                    @tagName(reply.phase), @intFromEnum(reply.command), reply.block, reply.receipt_serial,
+                    reply.acknowledged, reply.rpc, reply.control});
     }
     noinline fn advancePowerOwner(self: *Owner, current: u64) !Progress {
         const owner = if (self.power_owner) |*value| value else return error.State;
