@@ -115,4 +115,26 @@ pub fn checkCopyTopology() !void {
     invalid = graphics;
     invalid.pbdma[0] += 1;
     try t.expect(topology.paired(invalid) == null);
+
+    // Original RM _kfifoIsValidCETag_GP102 accepts an intersection, not
+    // identical ordered PBDMA lists. A CE can share only GR's second PBDMA.
+    var shared_gr = graphics;
+    shared_gr.count = 2;
+    shared_gr.pbdma = .{ 17, 23 };
+    copy.count = 1;
+    copy.pbdma = .{ 23, 17 };
+    var shared: wire.CopyTopology = .{};
+    try shared.add(copy);
+    try t.expectEqual(@as(?u32, 9), shared.paired(shared_gr));
+    shared_gr.pbdma = .{ 17, 29 }; // Ignore the CE's inactive second slot.
+    try t.expect(shared.paired(shared_gr) == null);
+    shared_gr.pbdma = .{ 17, 23 };
+    copy.count = 2;
+    shared = .{};
+    try shared.add(copy);
+    try t.expectEqual(@as(?u32, 9), shared.paired(shared_gr));
+    copy.count = 0;
+    shared = .{};
+    try shared.add(copy);
+    try t.expect(shared.paired(shared_gr) == null);
 }

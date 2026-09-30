@@ -314,7 +314,7 @@ pub const Owner = struct {
         if (self.self_address != 0) return error.State;
         if (!wire.validChannelEngines(engine, engine_mask)) return error.Unsupported;
         const compute = engine_mask & nv.native_engine_compute != 0;
-        const paired_copy = engine_mask & nv.native_engine_copy != 0;
+        const paired_copy = engine == .graphics and engine_mask & nv.native_engine_copy != 0;
         if ((userd != null) != (engine == .none)) return error.Unsupported;
         const parent_info = parent.info() orelse return error.State;
         _ = try wire.hostWorkToken(hardware_channel, parent_info.engine.data[3]);

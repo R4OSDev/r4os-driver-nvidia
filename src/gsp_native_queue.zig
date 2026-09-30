@@ -8,6 +8,7 @@ const nv = @import("r4nv_binding");
 const runtime = @import("gsp_runtime.zig");
 const graphics = @import("gsp_native_graphics.zig");
 const video = @import("gsp_native_video.zig");
+const copy = @import("gsp_shared_copy.zig");
 const batch = @import("gsp_push_batch.zig");
 const Tree = std.Treap(u64, std.math.order);
 pub const operation_bit: u64 = @as(u64, 1) << a.gfx_queue_operation_native;
@@ -18,18 +19,18 @@ const Node = struct {
     allocation: a.DriverHeapAllocation,
     stamp: a.DriverHeapAllocation,
     producer: @import("gsp_work_scheduling.zig").Producer,
-    engine: union(enum) { graphics: graphics.Owner, video: video.Owner } = .{ .graphics = .{} },
+    engine: union(enum) { graphics: graphics.Owner, video: video.Owner, copy: copy.Owner } = .{ .graphics = .{} },
     jobs: usize = 0,
     closing: bool = false,
 
     fn mask(self: *const Node) u32 {
-        return switch (self.engine) { .graphics => |*owner| owner.engine_mask, .video => |*owner| owner.mask() };
+        return switch (self.engine) { .graphics => |*owner| owner.engine_mask, .video => |*owner| owner.mask(), .copy => nv.native_engine_copy };
     }
     fn requestClose(self: *Node) !void {
         switch (self.engine) { inline else => |*owner| try owner.requestClose() }
     }
     fn step(self: *Node, run: *runtime.Owner) !bool {
-        return switch (self.engine) { .graphics => |*owner| owner.step(run, true), .video => |*owner| owner.step(run) };
+        return switch (self.engine) { .graphics => |*owner| owner.step(run, true), inline else => |*owner| owner.step(run) };
     }
     fn done(self: *const Node) bool {
         return switch (self.engine) { inline else => |*owner| owner.phase == .closed or owner.phase == .unavailable };
@@ -173,7 +174,10 @@ pub const Owner = struct {
         }
         const node: *Node = @ptrFromInt(self.spare.cpu_address);
         node.* = .{ .allocation = self.spare, .stamp = self.spare, .producer = identity, .jobs = 1 };
-        const start = if (engine_mask == nv.native_engine_video or engine_mask == nv.native_engine_encode) blk: {
+        const start = if (engine_mask == nv.native_engine_copy) blk: {
+            node.engine = .{ .copy = .{} };
+            break :blk node.engine.copy.request(run);
+        } else if (engine_mask == nv.native_engine_video or engine_mask == nv.native_engine_encode) blk: {
             node.engine = .{ .video = .{} };
             break :blk node.engine.video.requestKind(if (engine_mask == nv.native_engine_encode) .encode else .decode);
         } else if (self.source) |template| node.engine.graphics.requestEngines(template, engine_mask) else error.Unsupported;

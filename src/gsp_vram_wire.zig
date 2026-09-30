@@ -1,3 +1,26 @@
+// src/nvidia/src/kernel/vgpu/rpc.c (570.144, allocation status semantics)
+// /*
+//  * SPDX-FileCopyrightText: Copyright (c) 2008-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//  * SPDX-License-Identifier: MIT
+//  *
+//  * Permission is hereby granted, free of charge, to any person obtaining a
+//  * copy of this software and associated documentation files (the "Software"),
+//  * to deal in the Software without restriction, including without limitation
+//  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//  * and/or sell copies of the Software, and to permit persons to whom the
+//  * Software is furnished to do so, subject to the following conditions:
+//  *
+//  * The above copyright notice and this permission notice shall be included in
+//  * all copies or substantial portions of the Software.
+//  *
+//  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+//  * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+//  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+//  * DEALINGS IN THE SOFTWARE.
+//  */
 // src/nvidia/src/kernel/gpu/mem_mgr/heap.c
 // /*
 //  * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
@@ -189,7 +212,6 @@ pub fn decode(binding: Binding, bytes: u64, op: Operation, request: []const u8, 
     }
     try base.validatePart(binding, part(bytes));
     if (bytes == 0 or bytes % alignment != 0 or request.len != 160 or record.rpc.function != 103 or record.rpc.cpu_rm_gfid != 0) return error.Payload;
-    if (record.rpc.result != 0) return error.FirmwareResult;
     const data = record.payload;
     if (data.len != 32 and data.len != 160) return error.Payload;
     for (data[0..32], 0..) |v, i| {
@@ -197,6 +219,13 @@ pub fn decode(binding: Binding, bytes: u64, op: Operation, request: []const u8, 
         if (v != request[i]) return error.Unexpected;
     }
     const status = word(data, 16);
+    // Original rpcRmApiAlloc_GSP returns the allocation payload's status
+    // after a failed RPC. Physical RM NO_MEMORY sets both status fields.
+    // Authenticate the complete object header first; a contradictory RPC
+    // result still leaves the effect unknown and cannot release ownership.
+    // RPC transport results start at NV_VGPU_MSG_RESULT__VMIOP (FF000000),
+    // outside the NV_STATUS domain returned by rpcRmApiAlloc_GSP.
+    if (record.rpc.result != 0 and (record.rpc.result >= 0xff000000 or record.rpc.result != status)) return error.FirmwareResult;
     if (status != 0) return .{ .rejected = status };
     if (data.len != 160) return error.Payload;
     const p = data[32..];

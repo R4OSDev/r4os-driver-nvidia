@@ -1064,3 +1064,16 @@ Licenses/NVIDIA-GSP-RUNTIME-LICENSE.txt. The existing original-C ABI
 comparison covers fixed-channel flags and tokens independently for all
 64 private FIFO slots, with mutated-field rejection. R4OS slot ownership,
 ACK publication and conservative retirement remain original Apache-2.0 code.
+
+NVIDIA0.1.179: allocation rejection semantics follow rpcRmApiAlloc_GSP in
+NVIDIA570.144 src/nvidia/src/kernel/vgpu/rpc.c (MIT, 2008-2025 NVIDIA).
+Its complete original notice is retained in src/gsp_vram_wire.zig. The
+320-byte OssiPC NO_MEMORY fixture captures this driver's own request/reply.
+
+GR/CE pairing (NVIDIA 0.1.183, 2026-09-30):
+The common-PBDMA predicate follows pinned570.144 MIT
+`src/nvidia/src/kernel/gpu/fifo/arch/pascal/kernel_fifo_gp102.c`,
+`_kfifoIsValidCETag_GP102`. Runlist/PRI identity remains required; matching
+uses active PBDMA intersections rather than equal ordered lists. Its full
+NVIDIA2021-2024 MIT notice is retained in gsp_context_wire.zig and the
+embedded/image NVIDIA-GSP-RUNTIME-LICENSE.txt. No upstream C code is linked.

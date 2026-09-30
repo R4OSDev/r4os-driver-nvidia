@@ -1128,7 +1128,18 @@ pub const Device = struct {
             self.running.fifo_active != null or self.running.context_active != null or self.running.virtuals.active_range != null or self.running.native_active != null or self.running.buffer_active != null or
             self.running.batch_work != null or self.running.outputs.active() or self.running.graph_closing or self.running.power_active or self.running.display_engine_active or self.running.display_channel_active != null or self.running.display_work != null or self.running.mode_control_active or self.running.graphics_work != null) return error.State;
         self.running.validateCopyOverlap() catch return error.Binding;
-        const channel_handle = if (self.running.graphics_upload) |*work| blk: {
+        const channel_handle = if (self.running.native_copy.probe.busy()) blk: {
+            const run = &self.running;
+            const work = &run.native_copy.probe;
+            const graph = if (run.graph) |*value| value else return error.Binding;
+            const staging = if (graph.control_buffer) |*value| value else return error.Binding;
+            if (run.native_copy.phase != .probe_wait or run.copy_backend != null or run.copy_job != null or
+                run.graphics_upload != null or run.display_upload_job != null or run.cursor_upload != null or run.initial_image != null or
+                work.source != staging or !std.meta.eql(work.channel, run.native_copy.channel.?) or
+                !work.matches(ticket, deadline) or fifo.config.context.vaspace != staging.binding.space.handle or
+                !fifo.ring.matchesTransfer(ticket, fifo.config.object_class, work.transfer() catch return error.Binding)) return error.Binding;
+            break :blk work.channel;
+        } else if (self.running.graphics_upload) |*work| blk: {
             const run = &self.running;
             const graph = if (run.graph) |*value| value else return error.Binding;
             const staging = if (graph.control_buffer) |*value| value else return error.Binding;

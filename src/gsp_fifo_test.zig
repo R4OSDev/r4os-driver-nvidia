@@ -115,7 +115,7 @@ pub fn checkNativeEngines() !void {
     try checkVideo(.nvdec);
     try checkVideo(.nvenc);
     for (0..64) |mask| {
-        const expected = mask == 1 or mask == 3 or mask == 5 or mask == 7 or mask == 8 or mask == 16;
+        const expected = mask == 1 or mask == 3 or mask == 4 or mask == 5 or mask == 7 or mask == 8 or mask == 16;
         try t.expectEqual(expected, wire.validNativeEngines(@intCast(mask)));
     }
     var config: wire.Config = .{ .context = .{ .epoch = 7, .client = 1, .device = 2, .subdevice = 3,

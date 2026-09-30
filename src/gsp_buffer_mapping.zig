@@ -42,6 +42,7 @@ pub const Owner = struct {
     gpu_stamp: a.GfxDeviceLease = .{},
     aliases: alias.Set = .{},
     prepared: bool = false,
+    collection_pending: bool = false,
     registered: u16 = 0,
     mapped: u16 = 0,
     allocated: bool = false,
@@ -242,7 +243,7 @@ pub const Owner = struct {
                 index = self.registered - 1;
                 break :blk .free_memory;
             } else {
-                try self.closeBacking();
+                _ = try self.closeBacking();
                 self.state = if (self.state == .unwinding) .ready else .closed;
                 return null;
             };
@@ -371,15 +372,17 @@ pub const Owner = struct {
             .register, .free_memory => return error.State,
         }
     }
-    fn closeBacking(self: *Owner) Error!void {
+    fn closeBacking(self: *Owner) Error!bool {
         if (!self.aliases.empty() or self.allocated or self.registered != 0 or self.mapped != 0 or self.operation != null or self.exchange.pending != null) return error.Retained;
-        try self.releaseBacking();
+        if (!try self.releaseBacking()) return false;
         if (self.namespace_live) {
             try self.exchange.session.rm_names.retireChildren(self.reservation);
             self.namespace_live = false;
         }
+        return true;
     }
-    fn releaseBacking(self: *Owner) Error!void {
+    fn releaseBacking(self: *Owner) Error!bool {
+        self.collection_pending = false;
         if (self.gpu.lease.id != 0) {
             if (self.memory.deviceRelease(&self.gpu, 1) != a.gfx_buffer_result_ok) return error.Retained;
             self.gpu = .{}; self.gpu_stamp = .{};
@@ -392,12 +395,32 @@ pub const Owner = struct {
             if (self.memory.bufferRelease(&self.source.reference) != a.gfx_buffer_result_ok) return error.Retained;
             self.source = .{}; self.source_stamp = .{};
         }
-        if (self.memory.collect() != a.gfx_buffer_result_ok) return error.Retained;
+        const collected = self.memory.collect();
+        if (collected == a.gfx_buffer_error_busy) {
+            // This is the whole driver epoch's barrier, not just this BO.
+            // All our physical mappings and individual loans are already
+            // acknowledged. Return the exchange so another native BO can
+            // finish RM destruction, retaining our metadata until collected.
+            self.collection_pending = true;
+            return false;
+        }
+        if (collected != a.gfx_buffer_result_ok) return error.Retained;
         if (self.allocation.handle != 0) {
             if (self.heap.release(self.allocation.handle) != a.driver_heap_ok) return error.Retained;
             self.allocation = .{}; self.allocation_stamp = .{};
         }
         self.prepared = false;
+        return true;
+    }
+    pub fn awaitingCollection(self: *const Owner) bool {
+        return self.collection_pending and self.source.reference.id == 0 and self.gpu.lease.id == 0 and self.dma.lease.id == 0;
+    }
+    /// Runs without borrowing the RM exchange. Rejection results remain
+    /// available to their caller; destroyed slots stay owned until true.
+    pub fn collectDeferred(self: *Owner) Error!bool {
+        try self.stable();
+        if (!self.awaitingCollection() or (self.state != .handed_off and self.state != .finished)) return error.State;
+        return self.closeBacking();
     }
     pub fn closeAfterReset(self: *Owner, proof: @import("gsp_reset.zig").Quiescence) Error!void {
         if (!self.aliases.empty()) return error.Retained;
@@ -407,7 +430,7 @@ pub const Owner = struct {
             !std.meta.eql(self.dma, self.dma_stamp) or !std.meta.eql(self.gpu, self.gpu_stamp) or
             (self.failure != null and self.failure.? == error.Descriptor)) return error.Retained;
         if (self.namespace_live) try self.exchange.session.rm_names.validateChildrenAfterReset(self.reservation, proof);
-        try self.releaseBacking();
+        if (!try self.releaseBacking()) return error.Retained;
         // No RM_FREE reply is invented. The entire old session namespace is
         // discarded only after every physical owner of that epoch has closed.
         if (self.namespace_live) try self.exchange.session.rm_names.retireChildrenAfterReset(self.reservation, proof);
@@ -420,7 +443,7 @@ pub const Owner = struct {
         // Only an active registration needs the large page-list scratch.
         // All later destroy requests fit in this resident owner's small
         // buffer; live BO count therefore does not multiply 128KB scratch.
-        if (self.allocation.handle != 0) {
+        if (!self.collection_pending and self.allocation.handle != 0) {
             if (self.heap.release(self.allocation.handle) != a.driver_heap_ok) return error.Retained;
             self.allocation = .{}; self.allocation_stamp = .{};
         }

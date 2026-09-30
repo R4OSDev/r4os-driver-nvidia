@@ -20,6 +20,153 @@ referenzierten Besitzer-/SMP4-/Hardwarearchive. TV/native Ausgabe erst0.82.37,
 manuelle Bild-/Ton-/Kabel-/Eingabe-/Recoverypruefungen0.82.38.
 Aeltere Laufnotizen darunter sind historische Zwischenstaende.
 
+Abschluss 01.10.2026 / Roadmap0.82.3 / NVIDIA186:
+Privater frischer4096-Byte-Steuer-BO physisch perCE ausgelesen: Nullinhalt,
+zwei verschiedene Muster und drei getrennte8192-Byte-SYS-Vergleiche mit
+Zieloffset7/A5-Vorbelegung. Fuenf echte CE-Abschluesse,24576exakteBytes
+einschliesslich12288Randbytes. Zweite Initialclear-Leihe abgewiesen; der
+Pruefpuffer ist vor COPY-Freigabe vollstaendig abgebaut und wird nie als
+Instanz-/Methodspeicher weitergegeben. Neue Gesamtmatrix265CE/27native/
+8Bilder/73138772exakteBytes/8705Seiten, volle500msBilanz und keinReset.
+Vorheriger185-Treiber nach GPU-Arbeit ebenfalls resources0/DMAgestoppt/
+terminaldisplayreleased/warm-reset-ready, ohneWake.186 beendet die volle
+Speicherarbeit mit demselben sauberen Abbau; normaler Neustart in
+69.937s ohneWake. Frischer Boot bestaetigt erneut privateLoeschung
+und8CE/2GR/2048exaktePixel samtBilanz. Alle sechs Artefakthashes,
+Katalog110, Kernel235-BOOT-Beleg und Recovery-Manifeste abgeglichen.
+Bestehende Devicegruppe5/5Schritte1/1 umfasst auch falschen Nullinhalt,
+fehlendeCompletion, konservativeStart-Shutdown-Sperre, ungueltigenReset
+und exaktesBesitzende; Build7/7, SMP4/KVM60.83s. Hostmodelle sind getrennt
+vom physischen Nachweis. Gesamtbelege:physical57/59/184/185/186 und die
+zugeordneten Kandidaten unter20260930-memory08203. HerkunftA1/A2/T5
+anzeigeunabhaengig erledigt; frischeTV-/Ausgabepruefung0.82.37 und manuelle
+Pruefungen0.82.38 bleiben offen. Kein erfundener Fault-CHID oder GPU-Reset-
+Neustart im laufenden HEADLESS-System; realeFaultquelle siehephysical184.
+
+NVIDIA186 /0.82.3: Direkte Kontrolle privater Initialloeschung
+Vor COPY-Freigabe liest der Treiber einen eigenen frischen4096-Byte-BO,
+prueft Nullinhalt, schreibt zwei unterschiedliche Muster und liest beide
+zurueck. Fuenf echte CE-Abschluesse,24576exakte SYS-Bytes einschliesslich
+12288Randbytes; Leseziel+7 und vorheriges A5 verhindern Scheinerfolg.
+Dieser Pruefpuffer wird nie als Instanz-/Methodspeicher benutzt. Zweite
+Initialclear-Leihe muss Busy liefern; vollstaendiger BO-Abbau vor Freigabe.
+Bestehende Devicegruppe5/5Schritte1/1 mit falschem Nullinhalt, fehlender
+Completion, konservativer Start-Shutdown-Sperre, ungueltigem Resetbeleg
+und exaktem Besitzende ohne RM-Nachrichten nach Reset bestanden.
+Normaler Terminalabbau greift bei bereits geschlossenen Pruefleihen
+nicht mehr auf freigegebene Stagingmetadaten zu. Build7/7 und frischer
+SMP4/KVM60.83s bestanden. Physisch186 bestaetigt privateLoeschung, die volle
+Speichermatrix und den regulaeren Neustart; Details inphysical186.
+Belege: candidate186 unter20260930-memory08203.
+
+NVIDIA185 /0.82.3: Zwei COPY-Kanaele mit gemeinsamem Kontext
+Native Maske4 leiht den bereiten Adapter-CE-Kontext samt Methodspeicher.
+Jeder Kanal besitzt eigene Instanz/FIFO/USERD/CHID; sein Ende gibt nur
+diesen Kindbesitz frei. Der Graph wartet vor dem Elternabbau auf alle
+nativen Queues. GR|COPY5 bleibt ein eigener gepaarter Pfad. Bestehende
+Devicegruppe5/5Schritte1/1 prueft zwei gleichzeitige Kanaele ohne GR-
+Template, GET ohne Completion, Ende des ersten und Folgearbeit des zweiten
+bei exakt gleicher Endbilanz. Original-Wiregruppe4/4Schritte1/1 und
+Modulbuild7/7 und frischer SMP4/KVM60.24s bestanden. Physisch185/60
+bestaetigen zwei Kanaele mit demselben Kontext0:3 und20KB-Methodspeicher,
+aber getrennten Instanzen/FIFO/USERD/CHID24/32. Nach Ende des ersten
+arbeitet der zweite mit neuem Muster weiter.265CE/27native/8Bilder/
+73138772exakteBytes, volleBilanz/keinReset; Archiv physical185. Private
+initiale Loeschung mit echten Bytevergleichen bleibt offen.
+
+NVIDIA184 /0.82.3: Nachgewiesenen Reset-/Aliaszyklus beseitigen
+Physisch183/R4NV16/DISPLAYD57 bestehen265CE/5nativeVA-Auftraege,8 logische
+Bilder,72241748 exakte Bytes und gleiche ruhende BO-/Runtimebilanz. Die
+neue R4NV-Kodierung nutzt CE4 statt des mitGR belegten Subchannel0.
+Der vorherige echte183/56-XID13 endet jedoch trotzFLR/DMA-Stopp in
+FIFO0/Collect-Timeout und Poweroff. Ein Wake stellt SSH wieder her.
+Das bestehende Device-Modell bildet jetzt Kernels tatsaechliche Regel ab:
+Nach bestaetigtem Device-Lost werden BOs ohne Leases auch mit ungueltigen
+Referenzen freigabebereit. Zuerst werden alle initialen Referenzen unter
+demselben Resetbeleg geschlossen; physische Freigabe und Namespace warten
+weiter auf ihre genauen Alias-/Ticketquittungen. Kind-VA-Aliase enden nach
+Ausfuehrungsleihen, aber vor der ersten FIFO-Collection. Der vorhandene
+Test reproduziert183/Descriptor und danach FIFO0/2000Slices/1930busy.
+Mit184 bestehen5/5 Schritte,1/1 bestehende Testgruppe; Collection6/busy2,
+keine RM-Nachrichten nach Reset. Ungueltiger Ruhenachweis behaelt Besitz.
+Modulbuild7/7 und SMP4/KVM59.83s bestanden. Physisch184 besteht die
+Speichermatrix und den echten XID13-Abbau beim regulaeren Neustart:
+FLR/DMAgestoppt/runtime-retired/resources0/terminaldisplayreleased,
+68.1223261s ohne Wake und danach8CE/2GR/2048exaktePixel/BilanzOK.
+Headless behaelt gestoppte Besitzer absichtlich bis zumShutdown; dieser
+Beleg behauptet keinen automatischen GPU-Neustart im laufenden System.
+
+0.82.3 / NVIDIA179: Die erste8197-Byte-Probe mit DISPLAYD49 besteht
+sechs reale CE-Auftraege und16456exakte Ruecklesebytes. Der danach
+angeforderte34MB+123Byte-VRAM-Block wird mit NV_ERR_NO_MEMORY abgelehnt.
+178 verwechselt den quittierten Fehler in RPC-Header und Payload mit
+unbekannten Firmwareeffekten und verliert die laufende GPU-Sitzung.
+179 prueft zuerst die Objektidentitaet und akzeptiert uebereinstimmende
+Ablehnungen fuer den regulaeren Reservierungsabbau. Widersprueche bleiben
+fatal. Wire-Regressionsfixture stammt aus dem echten178-Fehlerlauf;
+physisch179 bestaetigt OOM/-7 ohne Reset/Quarantaene, danach8CE/2GR/2048
+exakte Pixel und allocation/destruction/retained0. Auch8MB+5 werden sauber
+abgewiesen. Der vorangegangene178-Fehlerabbau bleibt gesondert offen:
+Reset-Retirement wartet im FIFO auf eine unpublizierte Reservierung;
+Poweroff statt Warmreset, ein Wake erforderlich. Belege im Workspace
+ExFiles/Reports/OssiGPU/20260930-memory08203/.
+GSPs eigener RM-Heap ist von den fuer
+CPU-Verwaltung vorgesehenen VRAM-Regionen getrennt. Gesamtgroesse und
+Admissionlimit sind keine Zusage eines grossen zusammenhaengenden RM-Blocks.
+Die vertiefte Speicherabnahme bleibt offen.
+
+NVIDIA180: Unpublizierte Reservierung vor der globalen Collection abbauen
+Nach bestaetigtem FLR und geschlossenem Allokationsprovider/Queue bricht
+der Runtime-Besitzer eine genau gebundene, noch nicht publizierte native
+Reservierung ab. Sie kann kein normales Verbraucher-Freigabeticket liefern
+und blockierte bisher die Kanal-Collection vor der spaeteren Native-Phase.
+Der bestehende Devicefall mit widerspruechlicher Allokationsquittung
+reproduziert2000Slices/FIFO0/1934busy. Mit Korrektur endet der Abbau nach
+398Slices, charged0 und ohne nachtraeglichen RM-Befehl. Ohne FLR-Proof
+bleibt dieselbe Reservierung gebunden. Publizierte BOs verlangen weiterhin
+vollstaendige Verbraucherfreigaben und genaue Release-Tickets.
+Bestehende Devicegruppe5/5,1/1Test und Modulbuild7/7 sowieSMP4/KVM60.03s
+bestanden. Hardware180 ist voll gehasht installiert und besteht8CE/2GR/
+2048exakte Pixel samt Bilanz. Der normale179-Abbau nach OOM/Grosspuffer
+endet ohne Wake mit warm-reset-ready. Der spezifische180-Fehlerabbau ist
+physisch weiterhin offen.
+
+NVIDIA181: Gleichzeitige native Freigabe waehrend Systemmapping-Eviction
+DISPLAYD52 liefert auf180 vor/nach Kind-Kill/Reap korrekte GPU-Daten,
+scheitert aber abschliessend am gemeinsamen Collector: host/mapping
+Retained, native64KB-Destruktion offen. Der bestehende Devicefall bildet
+nun genau diese Ueberlappung ab und reproduziert den Fehler mit180.
+181 gibt den RM-Austausch nach bestaetigtem Unmap und eigenen Leih-/
+Referenzfreigaben zurueck. Nur collect-busy wird spaeter wiederholt;
+Namespace und Mappingmetadaten bleiben bis erfolgreicher Collection
+gebunden. Andere Freigabefehler bleiben fatal. Device5/5,1/1Test mit9busy,
+Modulbuild7/7 und frischerSMP4/KVM60.43s bestehen. Physisch181/53 bestehen
+warm und nach frischem Boot jeweils228 CE-Auftraege,71377492 exakte Bytes,
+Kind-Kill/Reap und identische BO-/Runtimebilanz. Normaler Neustart nach
+GPU-Arbeit:70.864 Sekunden ohne Wake, alle RM-/Native-/Mapping-Ressourcen
+frei, DMA gestoppt und Terminaldisplay freigegeben. Der vorherige180-Fehler
+mit publiziertem BO/Mapping endet beim Update ebenfalls mit resources0 und
+warm-reset-ready. Der spezifische Fehlerpfad einer unpublizierten
+Reservierung und ein echter GSP-FAULT bleiben physisch offen.
+
+NVIDIA182: Bei regulaerer Setup-Ablehnung bleiben die genaue Phase und
+der Engine-Maskenwert bis zur Diagnose nach dem Abbau erhalten. Bereits
+quittierte Runlist-/PRI-/PBDMA-Daten des ausgewaehlten GR und aller CE-Zeilen
+machen die Paarungsentscheidung sichtbar. Anlass:181/DISPLAYD56 endet vor
+dem ersten expliziten VA-Push mit Unsupported, aber vollstaendigem Abbau.
+Die Aufnahmeregeln bleiben unveraendert. Physisch182 bestaetigt die Ursache:
+GR PBDMA[0,1], CE9[0] und CE10[1] auf Runlist0/PRIc00000, paired-copy=null.
+Alle Installationshashes stimmen; vorheriger181-Abbau ohne Wake vollstaendig.
+
+NVIDIA183: Die Paarungspruefung folgt nun dem urspruenglichen
+_kfifoIsValidCETag_GP102: gleiche Runlist/PRI und mindestens ein gemeinsamer
+aktiver PBDMA-Eintrag. Unterschiedliche Anzahl oder Reihenfolge duerfen
+eine gueltige Zuordnung nicht ablehnen. Der bestehende Transportfall
+reproduziert expected9/null mit182 und besteht korrigiert4/4,1/1Test.
+Inaktive Listeneintraege, leere Listen und fremde Runlists bleiben
+ausgeschlossen. Die physische182-Topologie bestaetigt diesen Fehler; der
+korrigierte183-Ausfuehrungspfad ist noch nicht physisch qualifiziert.
+
 NVIDIA 0.1.159 ersetzt im nativen Pfad die auf GA106 abgelehnten
 MAP_MEMORY_DMA-Aufrufe durch eigene GPU-Seitentabellen. FERMI_VASPACE_A
 wird extern angelegt, die Root ueber SET_PAGE_DIRECTORY angemeldet.

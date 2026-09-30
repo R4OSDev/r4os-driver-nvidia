@@ -429,8 +429,8 @@ pub const Owner = struct {
     memory_api: ?r4os.driver_memory.Context = null,
     close_deadline: u64 = 0,
     unload: @import("gsp_unload.zig").Owner = .{},
-    reset_stage: enum { loss, queue, transfers, work, presentations, fifos, display_channels, display_resources,
-        contexts, control, virtuals, mappings, virtual_provider, native, done } = .loss,
+    reset_stage: enum { loss, queue, transfers, work, presentations, virtuals, fifos, display_channels, display_resources,
+        contexts, control, mappings, virtual_provider, native, done } = .loss,
     reset_cursor: usize = 0,
     words: [logs.output_bytes]u8 = undefined,
 
@@ -553,6 +553,7 @@ pub const Owner = struct {
                 self.reset_stage = .transfers;
             },
             .transfers => {
+                if (!self.native_copy.probe.closeAfterReset(proof, self.epoch)) return error.Retained;
                 if (self.batch_work) |*work| { if (!work.resources.closeAfterReset(proof)) return error.Retained; self.batch_work = null; }
                 if (self.graphics_upload) |*work| { if (!work.operation.closeAfterReset(proof)) return error.Retained; self.graphics_upload = null; }
                 if (self.graphics_work) |*work| { if (!work.resources.closeAfterReset(proof)) return error.Retained; self.graphics_work = null; }
@@ -590,6 +591,16 @@ pub const Owner = struct {
                     slot.* = null; self.reset_cursor += 1; return false;
                 }
                 self.presentation = null; self.additional_presentations = @splat(null);
+                self.reset_stage = .virtuals;
+            },
+            .virtuals => {
+                // All execution loans above have consumed this same FLR
+                // proof. Remove child VA aliases before any channel waits
+                // on the whole-driver collector: deviceLost(quiesced) makes
+                // their reference-only native BOs pending even while the
+                // alias import survives. Parent backing and namespaces stay
+                // held until these exact children and receipts retire.
+                if (!try self.virtuals.closeAfterReset(proof)) return false;
                 self.reset_stage = .fifos; self.reset_cursor = 0;
             },
             .fifos => {
@@ -646,17 +657,16 @@ pub const Owner = struct {
                         return error.Retained;
                     }
                 };
-                self.reset_stage = .virtuals;
-            },
-            .virtuals => {
-                if (!try self.virtuals.closeAfterReset(proof)) return false;
                 self.reset_stage = .mappings; self.reset_cursor = 0;
             },
             .mappings => {
                 try self.public_import.closeAfterReset(proof);
                 if (self.reset_cursor < self.buffers.items().len) {
                     const slot = &self.buffers.items()[self.reset_cursor];
-                    if (slot.owner) |owner| try owner.closeAfterReset(proof);
+                    if (slot.owner) |owner| owner.closeAfterReset(proof) catch |err| {
+                        if (err == error.Retained and owner.awaitingCollection()) return false;
+                        return err;
+                    };
                     if (slot.pending_source.reference.id != 0) {
                         if (memory.bufferRelease(&slot.pending_source.reference) != r4os.abi.gfx_buffer_result_ok) return error.Retained;
                         slot.pending_source = .{};
@@ -703,12 +713,33 @@ pub const Owner = struct {
         }
         return false;
     }
-    /// Retire only an already issued, identity-matched common release. The
-    /// normal native stage still closes producer references and waits for any
-    /// remaining aliases/consumers; this helper does not bypass those owners.
+    /// An unpublished reservation cannot issue a consumer release ticket.
+    /// Abort it only after the allocation provider and queue are closed and
+    /// FLR proves DMA stopped. Published BOs still require their exact tickets;
+    /// the normal native stage closes remaining producer/consumer references.
     fn collectNativeAfterReset(self: *Owner, proof: @import("gsp_reset.zig").Quiescence) !bool {
         const memory = self.memory_api orelse return error.Api;
         var eligible = false;
+        for (self.native_buffers.items(), 0..) |*slot, index| if (slot.owner) |owner| {
+            if (!owner.committed) {
+                // Waiting until the final native stage deadlocks earlier
+                // channel collectors on this driver's allocating bytes.
+                // The owner authenticates the reservation, namespace and
+                // quiescence before aborting; no RM request is replayed.
+                if (!try owner.closeAfterReset(proof)) return error.Retained;
+                try self.freeNativeSlot(index);
+                return true;
+            }
+            // After deviceLost(quiesced), the common owner may issue a
+            // ticket even while an invalid producer/import reference exists.
+            // Prepare every published owner before taking any such ticket.
+            // Actual backing/namespace retirement still waits for all aliases
+            // and the exact release receipt; no GPU completion is inferred.
+            if (owner.common_live and (!owner.closing or owner.reference_live)) {
+                if (try owner.closeAfterReset(proof)) try self.freeNativeSlot(index);
+                return true;
+            }
+        };
         for (self.native_buffers.items(), 0..) |*slot, index| if (slot.owner) |owner| {
             if (!owner.closing or !owner.common_live) continue;
             eligible = true;
@@ -2802,7 +2833,7 @@ pub const Owner = struct {
         self.log("NVIDIA gsp-present-image: retired={d} shadow=unmapped,import-released scanout=retained", .{dma});
         return true;
     }
-    fn executionWorkBusy(self: *const Owner) bool { return self.batch_work != null or self.power_active or self.graphics_upload != null or self.graphics_work != null or self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.initial_image != null or self.mode_control_active or self.cursor_upload != null or self.audio_work != null or self.monitor_work != null or self.sor_work != null; }
+    fn executionWorkBusy(self: *const Owner) bool { return self.native_copy.probe.busy() or self.batch_work != null or self.power_active or self.graphics_upload != null or self.graphics_work != null or self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.initial_image != null or self.mode_control_active or self.cursor_upload != null or self.audio_work != null or self.monitor_work != null or self.sor_work != null; }
     fn engineWorkBusy(self: *const Owner) bool { return self.executionWorkBusy() or self.hasDisplayFlips(); }
     fn deviceWorkBusy(self: *const Owner) bool { return self.engineWorkBusy() or self.queued_render != null; }
     fn copyBusy(self: *const Owner) bool { return self.deviceWorkBusy() or self.frame_ready != null or (self.direct_work != null and !self.direct_step); }
@@ -2818,8 +2849,14 @@ pub const Owner = struct {
         return self.executionAdmissionBusy() or self.queued_render != null or self.queued_native != null;
     }
     fn executionAdmissionBusy(self: *const Owner) bool {
-        return self.batch_work != null or self.power_active or self.powerStopping() or self.direct_work != null or self.cursor_reserving or self.graphics_upload != null or self.graphics_work != null or self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.initial_image != null or self.cursor_upload != null or self.audio_work != null or self.monitor_work != null or self.sor_work != null or
+        return self.native_copy.probe.busy() or self.batch_work != null or self.power_active or self.powerStopping() or self.direct_work != null or self.cursor_reserving or self.graphics_upload != null or self.graphics_work != null or self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.initial_image != null or self.cursor_upload != null or self.audio_work != null or self.monitor_work != null or self.sor_work != null or
             self.mode_control_active or (self.hasDisplayFlips() and !self.overlapFlip());
+    }
+    pub fn privateClearAdmissionBusy(self: *const Owner) bool {
+        return self.executionAdmissionBusy() or self.hasDisplayFlips() or self.hasQueuedWork() or self.graph_closing or
+            self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or
+            self.virtuals.active_range != null or self.sequence.self_address != 0 or self.channel == null or self.channel.?.phase != .idle or
+            self.channel.?.pending != null or self.outputs.active();
     }
     pub fn cursorWorkAvailable(self: *Owner) bool {
         return !self.copyBusy() and self.cursor_point == null and self.nativeObject() != null and !self.graph_closing;
@@ -5719,6 +5756,10 @@ pub const Owner = struct {
     // reserves their combined high-water mark even during the first RM poll.
     noinline fn advance(self: *Owner) !Progress {
         const current = try self.now();
+        // A system mapping may have finished its own unmap while another
+        // native BO still needs this worker's RM channel. Retry only the
+        // common collection barrier, without keeping that channel borrowed.
+        if (try self.collectDeferredBuffer()) return .progress;
         if (self.unload.self_address == 0 and !self.shutdown_closing) {
             self.observePower(current);
             self.observeAdaptiveRefresh(current);
@@ -5779,6 +5820,7 @@ pub const Owner = struct {
                 try self.notification(channel, dispatch, current); return .progress;
             }
         }
+        if (try @call(.never_inline, @TypeOf(self.native_copy.probe).step, .{ &self.native_copy.probe, self, current })) return .progress;
         if (try @call(.never_inline, advanceCursorUpload, .{ self, current })) return .progress;
         if (try @call(.never_inline, advanceGraphicsUpload, .{ self, current })) return .progress;
         if (try @call(.never_inline, advanceDisplayUpload, .{ self, current })) return .progress;
@@ -5879,10 +5921,12 @@ pub const Owner = struct {
                 } else try self.retireVirtualRange(handle, self.close_deadline, true);
                 return .progress;
             }
-            for (self.buffers.items(), 0..) |*slot, index| if (slot.owner != null) {
+            for (self.buffers.items(), 0..) |*slot, index| if (slot.owner) |owner| {
+                if (owner.state == .finished) continue;
                 try self.retireBuffer(.{ .epoch = self.epoch, .serial = slot.serial, .slot = @intCast(index) }, self.close_deadline, true);
                 return .progress;
             };
+            for (self.buffers.items()) |*slot| if (slot.owner != null) break :graph_close;
             for (self.native_buffers.items()) |*slot| if (slot.owner != null) break :graph_close;
             try self.buffers.closeEmpty();
             try self.native_buffers.closeEmpty();
@@ -6097,12 +6141,7 @@ pub const Owner = struct {
             if (owner.state == .ready) try self.rejection(.mapping, owner.reservation.object(0) catch 0, owner.rejected, owner.host_rejected);
             var token = try owner.handoff(owner.deadline);
             self.channel = try exchange.Exchange.init(&token, owner.deadline);
-            if (owner.state == .finished) {
-                const heap = slot.heap orelse return error.Api;
-                if (heap.release(slot.allocation.handle) != r4os.abi.driver_heap_ok) return error.Retained;
-                if (slot.evicting) self.mapping_evictions +|= 1;
-                slot.* = .{};
-            }
+            if (owner.state == .finished and !owner.awaitingCollection()) try self.freeBufferSlot(index);
             self.buffer_active = null;
             return .progress;
         }
@@ -6111,6 +6150,26 @@ pub const Owner = struct {
             return .progress;
         }
         return if (owner.exchange.phase == .waiting) .idle else .progress;
+    }
+    fn freeBufferSlot(self: *Owner, index: usize) !void {
+        const slot = &self.buffers.items()[index];
+        const owner = slot.owner orelse return error.State;
+        if (owner.state != .finished or owner.namespace_live or owner.awaitingCollection()) return error.Retained;
+        const heap = slot.heap orelse return error.Api;
+        if (heap.release(slot.allocation.handle) != r4os.abi.driver_heap_ok) return error.Retained;
+        if (slot.evicting) self.mapping_evictions +|= 1;
+        slot.* = .{};
+    }
+    fn collectDeferredBuffer(self: *Owner) !bool {
+        for (self.buffers.items(), 0..) |*slot, index| if (slot.owner) |owner| {
+            if (!owner.awaitingCollection() or (owner.state != .finished and owner.state != .handed_off)) continue;
+            // One deferred owner per slice. A busy global barrier must still
+            // let the active RM owner and native release-ticket queue advance.
+            if (!try owner.collectDeferred()) return false;
+            if (owner.state == .finished) try self.freeBufferSlot(index);
+            return true;
+        };
+        return false;
     }
     noinline fn observePower(self: *Owner, current: u64) void {
         if (self.power_owner) |*owner| {
@@ -6510,6 +6569,16 @@ pub const Owner = struct {
         self.log("NVIDIA gsp-context-engines: acked-pages={d} rows={d} mask={x}/{x}/{x}/{x} other={d} selected={} method-bytes={d}",
             .{data.engine_pages, data.engine_rows, data.engine_mask[0], data.engine_mask[1], data.engine_mask[2], data.engine_mask[3],
                 data.other_engines, owner.selected != null, owner.method_bytes});
+        if (owner.selected) |selected| {
+            self.log("NVIDIA gsp-context-topology: rm-engine={d} runlist={d} pri={x} pbdmas={d} ids={x}/{x} paired-copy={?}",
+                .{owner.rm_engine, selected.data[3], selected.data[11], selected.count,
+                    selected.pbdma[0], selected.pbdma[1], owner.copies.paired(selected)});
+            if (owner.rm_engine == 1) for (&owner.copies.rows, 0..) |*row, index| {
+                if (!row.present) continue;
+                self.log("NVIDIA gsp-context-ce-row: rm-engine={d} runlist={d} pri={x} pbdmas={d} ids={x}/{x}",
+                    .{index + 9, row.runlist, row.base, row.count, row.pbdma[0], row.pbdma[1]});
+            };
+        }
         if (!data.classes_acked or owner.unavailable != .classes) return;
         var offset: usize = 0;
         while (offset < data.class_count) {

@@ -1,3 +1,26 @@
+// ExFiles/Reference/GFX/Nvidia/OpenKernelModules-570.144/src/nvidia/src/kernel/gpu/fifo/arch/pascal/kernel_fifo_gp102.c
+// /*
+//  * SPDX-FileCopyrightText: Copyright (c) 2021-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//  * SPDX-License-Identifier: MIT
+//  *
+//  * Permission is hereby granted, free of charge, to any person obtaining a
+//  * copy of this software and associated documentation files (the "Software"),
+//  * to deal in the Software without restriction, including without limitation
+//  * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+//  * and/or sell copies of the Software, and to permit persons to whom the
+//  * Software is furnished to do so, subject to the following conditions:
+//  *
+//  * The above copyright notice and this permission notice shall be included in
+//  * all copies or substantial portions of the Software.
+//  *
+//  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+//  * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+//  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+//  * DEALINGS IN THE SOFTWARE.
+//  */
 // ExFiles/Reference/GFX/Nvidia/OpenKernelModules-570.144/src/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080internal.h
 // /*
 //  * SPDX-FileCopyrightText: Copyright (c) 2020-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
@@ -359,9 +382,15 @@ pub const CopyTopology = struct {
             gr.data[3] == 0xffffffff or gr.data[11] == 0 or
             gr.data[11] == 0xffffffff or gr.data[11] & 3 != 0) return null;
         for (&self.rows, 0..) |*row, index| {
-            if (row.present and row.runlist == gr.data[3] and row.base == gr.data[11] and
-                row.count == gr.count and std.mem.eql(u32, row.pbdma[0..row.count], gr.pbdma[0..gr.count]))
-                return @intCast(9 + index);
+            if (!row.present or row.runlist != gr.data[3] or row.base != gr.data[11] or
+                row.count == 0 or row.count > row.pbdma.len) continue;
+            // RM _kfifoIsValidCETag_GP102 accepts any shared PBDMA. Counts
+            // and enumeration order are engine-local, not runlist identity.
+            for (row.pbdma[0..row.count]) |copy_dma| {
+                for (gr.pbdma[0..gr.count]) |graphics_dma| {
+                    if (copy_dma == graphics_dma) return @intCast(9 + index);
+                }
+            }
         }
         return null;
     }

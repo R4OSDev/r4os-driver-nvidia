@@ -317,7 +317,8 @@ const QueueNative = struct {
         // The real common collector cannot finish while a native BO still
         // needs the driver's RM destruction, even after its last ref closes.
         if (TerminalFixture.enforce_collection) TerminalFixture.collection_calls += 1;
-        if (TerminalFixture.enforce_collection and @import("gsp_vram_test_model.zig").Model.pendingReleases()) {
+        if (TerminalFixture.enforce_collection and (@import("gsp_vram_test_model.zig").Model.pendingReleases() or
+            @import("gsp_vram_test_model.zig").Model.pendingReservations())) {
             TerminalFixture.blocked_collections += 1;
             return a.gfx_buffer_error_busy;
         }
@@ -1666,7 +1667,8 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         context_display_present, context_display_present_timeout, context_display_present_fault,
         context_display_present_initial_timeout, context_display_present_initial_fault, context_display_present_initial_release,
         context_display_present_initial_acquire, context_display_present_initial_retry,
-        context_native_unknown, context_native_headless, context_native_terminal, context_native_reset, context_native_console, context_native_connected, context_native_connected_primary_timeout, context_native_dp, context_native_jobs, context_native_job_timeout, context_native_prepare_reject,
+        context_native_unknown, context_native_headless, context_native_allocation_fault, context_native_terminal, context_native_reset, context_native_console, context_native_connected, context_native_connected_primary_timeout, context_native_dp, context_native_jobs, context_native_job_timeout, context_native_prepare_reject,
+        context_native_private_corrupt, context_native_private_timeout, context_native_private_shutdown,
         context_native_flip_irq_timeout, context_native_flip_notifier_timeout, context_native_flip_release_timeout,
         context_native_frame_timeout,
         context_native_cursor_timeout, context_native_cursor_reject,
@@ -1719,7 +1721,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         IrqModel.reset();
         target.irq_wake = .{ .context = @intFromPtr(target), .signal = IrqModel.wake };
         const reset_case = case == .gpu_reset_success or case == .gpu_reset_gfw_timeout;
-        const reset_capable = reset_case or case == .context_native_reset or case == .context_native_console or case == .context_native_headless or case == .context_native_terminal or case == .mapping_provider_reset;
+        const reset_capable = reset_case or case == .context_native_reset or case == .context_native_console or case == .context_native_headless or case == .context_native_allocation_fault or case == .context_native_terminal or case == .mapping_provider_reset or std.mem.startsWith(u8, @tagName(case), "context_native_private_");
         capture.snapshot.?.caps.pcie = if (reset_capable) 0x78 else 0;
         capture.snapshot.?.caps.power_state = if (reset_capable) 0 else null;
         capture.snapshot.?.caps.msi = if (case == .irq_intx) 0 else 0x68;
@@ -2347,6 +2349,7 @@ fn checkDeviceReset(target: *@import("gsp_device.zig").Device, words: []u32, frt
     // The same logical stop used by failed submissions; Device must preserve
     // its first cause instead of replacing it with a subsequent State error.
     const reason = target.running.failure orelse error.Timeout;
+    const first_kind = if (target.running.faults.first_fatal) |record| record.kind else .timeout;
     target.running.stop(error.Timeout);
     _ = target.step();
     try t.expect(target.phase == .recovering and target.failure != null and
@@ -2366,7 +2369,7 @@ fn checkDeviceReset(target: *@import("gsp_device.zig").Device, words: []u32, frt
     const expected: @import("gsp_device.zig").Phase = if (target.recovery_hooks != null and !gfw_timeout) .retiring else .failed;
     try t.expect(count < 4000 and target.phase == expected and target.epoch == old_epoch and
         target.memory.?.retained and target.display.?.firmware_owner == @intFromPtr(target));
-    try t.expect(target.running.faults.first_fatal.?.kind == .timeout);
+    try t.expect(target.running.faults.first_fatal.?.kind == first_kind);
     try t.expect(ResetDeviceModel.triggers == 1 and !target.reader.?.enabled and target.interrupts.closed);
     if (gfw_timeout) {
         try t.expect(target.gpu_reset.quiescence() == null and target.gpu_reset.failure != null and target.gpu_reset.failure.? == error.Timeout);
@@ -4042,6 +4045,7 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
     const vectors = @import("gsp_display_commands_test.zig");
     const run = &target.running;
     const captured = target.display.?;
+    PrivateClearPeer.reset();
     const original_boot = captured.original_boot;
     const original_scanout = captured.scanout_original;
     const original_read = captured.boot.read;
@@ -4062,7 +4066,7 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
     const raw: [*]u32 = @ptrFromInt(target.port.window.cpu_address);
     display.install(table, scenario, raw[0..@intCast(target.port.window.byte_length / 4)]);
     target.running.memory_api = target.ctx.?.memory();
-    if (std.mem.eql(u8, scenario, "context_native_headless") or std.mem.eql(u8, scenario, "context_native_terminal"))
+    if (std.mem.eql(u8, scenario, "context_native_headless") or std.mem.eql(u8, scenario, "context_native_allocation_fault") or std.mem.eql(u8, scenario, "context_native_terminal") or std.mem.startsWith(u8, scenario, "context_native_private_"))
         copy.installHeadless(table, 3) else copy.installProduct(table, 3);
     target.running.memory_api = target.ctx.?.memory();
     @import("gsp_cursor_test_model.zig").Model.install(table);
@@ -4144,7 +4148,8 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
     if (NativeCommon.is("context_native_connected") or NativeCommon.is("context_native_dp") or NativeCommon.hasModes()) try @import("gsp_receiver_mode_test.zig").install(&run.outputs.data.receivers[0]);
     if (NativeCommon.is("context_native_dp")) @import("gsp_dp_link_test.zig").receiver(&run.outputs.data);
     if (NativeCommon.is("context_native_connected") or NativeCommon.hasModes()) installFrlReceiver(&run.outputs.data.receivers[0].report);
-    if (NativeCommon.is("context_native_headless") or NativeCommon.is("context_native_terminal")) return checkNativeHeadless(target,table);
+    if (std.mem.startsWith(u8, scenario, "context_native_private_")) return checkPrivateClearStop(target);
+    if (NativeCommon.is("context_native_headless") or NativeCommon.is("context_native_allocation_fault") or NativeCommon.is("context_native_terminal")) return checkNativeHeadless(target,table);
     try target.native_output.request(&target.ctx.?, run, captured);
     if (NativeCommon.is("context_native_connected") or NativeCommon.is("context_native_dp")) {
         @import("gsp_display_audio_test.zig").install(&run.outputs.data.receivers[0].report);
@@ -4166,6 +4171,7 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
         clock += if (NativeCommon.is("context_native_dp")) 100_000 else 1000;
         _ = target.step();
         if (target.phase != .ready) break;
+        try PrivateClearPeer.step(target);
         if (NativeCommon.is("context_native_mode_retire") and target.native_output.phase == .instance_allocate) {
             checkpoint = "mode control retirement";
             const handle = target.native_output.mode_control.?;
@@ -4242,6 +4248,7 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
         }
         if (NativeCommon.is("context_native_stale") and target.native_output.phase == .image_upload) run.outputs.data.generation += 1;
     }
+    const qualification_releases: u32 = @intFromBool(run.native_copy.probe.phase == .done and run.native_copy.storage == null and run.native_copy.retired_probe == null);
     const early_mode_failure = std.mem.startsWith(u8, scenario, "context_native_mode_");
     try t.expect(steps < 1200 and !copy.shadow_cpu and
         copy.shadow_creates == @as(usize, if (early_mode_failure) 0 else 1) and
@@ -4337,6 +4344,7 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
                 target.memory.?.retained and captured.boot.native_adopted and target.native_output.phase == .waiting and
                 run.faults.first_fatal.?.kind == .timeout and ResetDeviceModel.triggers == 1);
             checkpoint = "rebuild RM, channels and second native image";
+            PrivateClearPeer.reset();
             try checkDeviceStatic(target, ResetDeviceModel.words, target.vram.?.plan.?.frts.offset, .context_native_reset);
             try checkDevicePostInit(target, ResetDeviceModel.words, target.vram.?.plan.?.frts.offset, .context_native_reset);
             IrqModel.reset();
@@ -4386,7 +4394,7 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
         if (NativeCommon.flipFailure()) {
             checkpoint = "native flip deadline";
             try checkNativeFlip(target);
-            try t.expect(target.phase == .recovering and native.released == 0 and display.released == 0 and !NativeCommon.published);
+            try t.expect(target.phase == .recovering and native.released == qualification_releases and display.released == 0 and !NativeCommon.published);
             _ = target.stop(); return;
         }
         if (NativeCommon.is("context_native_connected")) {
@@ -4426,7 +4434,7 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
         checkpoint = "common Present framepool";
         if (NativeCommon.is("context_native_connected")) try checkNativeVrr(target) else try checkNativeFrames(target, false);
         if (NativeCommon.is("context_native_frame_timeout")) {
-            try t.expect(target.phase == .recovering and native.released == 0 and display.released == 0 and !NativeCommon.published);
+            try t.expect(target.phase == .recovering and native.released == qualification_releases and display.released == 0 and !NativeCommon.published);
             _ = target.stop(); return;
         }
         if (NativeCommon.is("context_native_unknown")) {
@@ -4440,7 +4448,7 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
             if (NativeCommon.is("context_native_cursor_common")) try checkCommonCursor(target) else try checkNativeCursor(target);
             if (NativeCommon.is("context_native_cursor_timeout") or NativeCommon.is("context_native_cursor_image_timeout") or
                 NativeCommon.is("context_native_cursor_upload_timeout")) {
-                try t.expect(target.phase == .recovering and native.released == 0 and display.released == 0 and !NativeCommon.published);
+                try t.expect(target.phase == .recovering and native.released == qualification_releases and display.released == 0 and !NativeCommon.published);
                 _ = target.stop(); return;
             }
         }
@@ -4448,7 +4456,7 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
             checkpoint = "common mode DMA timeout";
             try checkNativeModeTimeout(target);
             _ = target.stop();
-            try t.expect(native.released == 0 and display.released == 0 and !NativeCommon.published);
+            try t.expect(native.released == qualification_releases and display.released == 0 and !NativeCommon.published);
             return;
         }
         if (NativeCommon.is("context_native_jobs")) {
@@ -4506,7 +4514,7 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
     } else {
         try t.expect(target.phase != .ready and target.native_output.failure != null and !NativeCommon.published);
         try t.expect(NativeCommon.commits == @as(usize, if (NativeCommon.is("context_native_receipt")) 1 else 0));
-        try t.expect(target.memory.?.retained and native.released == 0);
+        try t.expect(target.memory.?.retained and native.released == qualification_releases);
         if (early_mode_failure) {
             try t.expect(copy.heldReferences() == 0 and run.display_resources_slot.owner == null and run.presentation == null);
             const owner = &run.mode_control_owner.?;
@@ -4527,7 +4535,10 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
     const released_before_stop = native.released;
     _ = target.stop();
     try t.expect(!NativeCommon.additional_published and !NativeCommon.additional_active);
-    try t.expect(native.released == @as(u32, if (NativeCommon.is("context_native_dp")) released_before_stop else if (NativeCommon.is("context_native_connected")) 5 + NativeCommon.additional_released + NativeCommon.hdmi_dsc_released else if (NativeCommon.is("context_native_jobs")) 7 else if (NativeCommon.is("context_native_unknown")) 4 else 0) and display.released == 0 and !NativeCommon.published);
+    const retired_display: u32 = if (NativeCommon.is("context_native_connected")) 5 + NativeCommon.additional_released + NativeCommon.hdmi_dsc_released
+        else if (NativeCommon.is("context_native_jobs")) 7 else if (NativeCommon.is("context_native_unknown")) 4 else 0;
+    const expected_released = if (NativeCommon.is("context_native_dp")) released_before_stop else qualification_releases + retired_display;
+    try t.expect(native.released == expected_released and display.released == 0 and !NativeCommon.published);
 }
 fn checkNativeDetach(target: *@import("gsp_device.zig").Device) !void {
     const run = &target.running; const product = &target.native_output;
@@ -5772,6 +5783,7 @@ fn checkNativeModeTimeout(target: *@import("gsp_device.zig").Device) !void {
     const run = &target.running; const product = &target.native_output;
     errdefer std.debug.print("native mode timeout diagnostic: {any}\n", .{product.modes.diagnostic});
     const native = @import("gsp_vram_test_model.zig").Model;
+    const released_before = native.released;
     const copy = @import("gsp_copy_test_model.zig").Model;
     for (0..100) |_| {
         clock += 1000; _ = target.step(); try t.expect(target.phase == .ready);
@@ -5805,7 +5817,7 @@ fn checkNativeModeTimeout(target: *@import("gsp_device.zig").Device) !void {
     try t.expect(timed_out and target.phase == .recovering and product.modes.phase == .failed and
         product.modes.failed_phase == .image_wait and run.initial_image != null and run.initial_image.?.operation.submitted and
         copy.initial_read.lease.id != 0 and copy.dma[1].lease.id != 0 and copy.borrowed_releases == 0 and copy.replacement_lent and
-        native.slots[index].live and native.slots[index].gpu.lease.id != 0 and native.released == 0 and run.presentation == old);
+        native.slots[index].live and native.slots[index].gpu.lease.id != 0 and native.released == released_before and run.presentation == old);
     const receipt = NativeCommon.mode_receipt.?;
     try t.expect(receipt.ticket == 1 and receipt.sequence == 1 and receipt.operation == a.gfx_mode_operation_apply and
         receipt.outcome == a.gfx_output_outcome_lost and receipt.quiesced == 0 and receipt.error_code == a.gfx_output_error_timeout);
@@ -5822,6 +5834,7 @@ fn checkNativeModeTimeout(target: *@import("gsp_device.zig").Device) !void {
 fn checkNativeModeJobs(target: *@import("gsp_device.zig").Device) !void {
     const run = &target.running; const product = &target.native_output;
     const native = @import("gsp_vram_test_model.zig").Model;
+    const released_before = native.released;
     const copy = @import("gsp_copy_test_model.zig").Model;
     const old = run.presentation.?;
     const pixels = copy.vram_data;
@@ -5893,7 +5906,7 @@ fn checkNativeModeJobs(target: *@import("gsp_device.zig").Device) !void {
         checkpoint = if (iteration == 0) "rollback" else "confirm";
         NativeCommon.mode_job = job; NativeCommon.mode_taken = false; NativeCommon.mode_receipt = null;
         try pumpNativeModeJob(target);
-        try t.expect(product.modes.phase == .idle and native.released == (iteration + 1) * run.presentation_buffers and copy.borrowed_releases == 0);
+        try t.expect(product.modes.phase == .idle and native.released == released_before + (iteration + 1) * run.presentation_buffers and copy.borrowed_releases == 0);
         const completed = NativeCommon.mode_receipt.?;
         if (iteration == 0) {
             try t.expect(completed.outcome == a.gfx_output_outcome_old_preserved and completed.quiesced == 2 and
@@ -5916,7 +5929,7 @@ fn checkNativeModeJobs(target: *@import("gsp_device.zig").Device) !void {
             try pumpNativeModeJob(target);
             try t.expect(NativeCommon.mode_receipt.?.outcome == a.gfx_output_outcome_old_preserved and
                 NativeCommon.mode_receipt.?.error_code == a.gfx_output_error_unsupported and target.session.?.tx_sequence == sequence and
-                run.presentation == old and native.released == run.presentation_buffers and copy.borrowed_releases == 0);
+                run.presentation == old and native.released == released_before + run.presentation_buffers and copy.borrowed_releases == 0);
             const rejected = product.modes.diagnostic;
             try t.expect(rejected.ticket == 2 and rejected.error_code == a.gfx_output_error_unsupported and rejected.quiesced == 2 and
                 rejected.requested.pixel_clock_hz == mode.pixel_clock_hz + 1 and std.meta.eql(rejected.before, rejected.after) and rejected.pending == 0 and
@@ -7013,6 +7026,7 @@ fn pumpResetNativeOutput(target: *@import("gsp_device.zig").Device) !void {
     for (0..2000) |_| {
         clock += 1000; _ = target.step();
         try t.expect(target.phase == .ready);
+        try PrivateClearPeer.step(target);
         if (product.phase == .active or product.phase == .console_active) return;
         if (run.fifo_active != null) { try replyDeviceFifo(target, &counts, "context_native_reset"); continue; }
         if (run.buffer_active != null) { try replyCopyMapping(target); continue; }
@@ -7269,6 +7283,51 @@ const TerminalFixture = struct {
     }
 };
 
+fn checkPrivateClearStop(target: *@import("gsp_device.zig").Device) !void {
+    const run = &target.running;
+    const work = &run.native_copy.probe;
+    const model = @import("gsp_vram_test_model.zig").Model;
+    run.discover_receivers = false;
+    try run.native_copy.request();
+    var counts: FifoCounts = .{};
+    var graphics_stage: u32 = 0;
+    for (0..1200) |_| {
+        _ = try stepNativeQueues(target, &counts, "context_native_headless", &graphics_stage);
+        if (work.phase == .submitted and PrivateClearPeer.stage == 1) break;
+    }
+    try t.expect(work.phase == .submitted and PrivateClearPeer.stage == 1 and run.copy_backend == null);
+    const gpu = work.gpu;
+    const held = work.target.info().?;
+    if (NativeCommon.is("context_native_private_timeout")) {
+        clock = work.deadline;
+        try t.expectError(error.Deadline, run.step());
+        try t.expect(std.meta.eql(work.gpu, gpu) and std.meta.eql(work.target.info().?, held));
+    } else if (NativeCommon.is("context_native_private_corrupt")) {
+        try PrivateClearPeer.step(target); // Actual modeled byte write.
+        ControlModel.data[7 + 197] ^= 1;
+        try PrivateClearPeer.step(target); // Separate GPU completion.
+        try t.expectError(error.PrivateClearBytes, run.step());
+        try t.expect(work.gpu.lease.id == 0 and !ControlModel.cpu_mapped and !ControlModel.reading and work.target.info() != null);
+    } else {
+        // Startup remains on the existing conservative shutdown policy:
+        // ordinary RM unload is unavailable until CE startup finishes.
+        // The Device uses its physical-reset retirement path instead.
+        try t.expectError(error.ShutdownStartup, run.beginShutdown());
+        try t.expect(!run.shutdown_closing and work.phase == .submitted and std.meta.eql(work.gpu, gpu) and
+            std.meta.eql(work.target.info().?, held) and ControlModel.reading and !ControlModel.cpu_mapped and run.failure == null);
+    }
+    try t.expect(work.exact_bytes == 0 and run.copy_backend == null);
+    try t.expect(!work.closeAfterReset(.{ .owner = &target.gpu_reset, .epoch = run.epoch }, run.epoch));
+    try checkDeviceReset(target, ResetDeviceModel.words, target.vram.?.plan.?.frts.offset, false);
+    const proof = target.gpu_reset.quiescence() orelse return error.NoResetProof;
+    const sent = target.session.?.tx_sequence;
+    var slices: usize = 0;
+    while (!try run.closeAfterReset(proof)) : (slices += 1) try t.expect(slices < 2000);
+    try t.expect(work.self_address == 0 and model.charged == 0 and !model.pendingReservations() and !model.pendingReleases() and
+        !ControlModel.active and !ControlModel.reading and target.session.?.tx_sequence == sent);
+    std.debug.print("[nvidia-private-clear] {s}: no backend publication; held until semaphore/reset; exact BO retirement; no post-reset RPC\n", .{NativeCommon.scenario});
+}
+
 fn checkNativeHeadless(target: *@import("gsp_device.zig").Device, table: *a.DriverApi) !void {
     const copy = @import("gsp_copy_test_model.zig").Model;
     const run = &target.running;
@@ -7371,12 +7430,39 @@ fn checkNativeHeadless(target: *@import("gsp_device.zig").Device, table: *a.Driv
         copy.heldReferences(), run.mapping_evictions,run.copy_backend.?.pending,clock});
     try t.expect(copy.heldReferences() == 2);
     try t.expect(!try run.prepareCopyMappings(2, 128 * 1024 * 1024, clock + std.time.ns_per_s));
+    const racing_buffer = try allocateContextBuffer(target, 65536, clock + std.time.ns_per_s, false);
+    const charge_before_retire = @import("gsp_vram_test_model.zig").Model.charged;
     clock += 180 * std.time.ns_per_s;
     try t.expect(!try target.native_output.step());
-    for (0..64) |_| {
+    // A process can close its last native reference after an idle system
+    // mapping already borrowed the exchange for eviction. Its global
+    // collection barrier must yield so that native RM retirement can run.
+    try t.expect(try run.prepareCopyMappings(0, std.math.maxInt(u64), clock + std.time.ns_per_s));
+    const evicting = run.buffer_active.?;
+    try run.releaseNativeBuffer(racing_buffer);
+    TerminalFixture.enforce_collection = true;
+    TerminalFixture.collection_calls = 0; TerminalFixture.blocked_collections = 0;
+    defer TerminalFixture.enforce_collection = false;
+    var retained_until_collection = false;
+    for (0..128) |_| {
         const progress = try stepNativeQueues(target,&counts,"context_native_headless",&graphics_stage);
+        try t.expect(target.phase == .ready and run.failure == null);
+        if (TerminalFixture.blocked_collections != 0) if (run.buffers.items()[evicting].owner) |owner| {
+            if (owner.source.reference.id == 0) {
+                try t.expect(owner.gpu.lease.id == 0 and owner.dma.lease.id == 0 and
+                    owner.registered == 0 and owner.mapped == 0 and !owner.allocated and owner.aliases.empty());
+                try t.expect(run.buffers.items()[evicting].allocation.handle != 0 and owner.namespace_live);
+                retained_until_collection = true;
+            }
+        };
         if (!progress and run.activeChannel().?.phase == .idle and run.buffer_active == null) break;
     }
+    try t.expect(retained_until_collection and TerminalFixture.blocked_collections != 0 and
+        @import("gsp_vram_test_model.zig").Model.charged == charge_before_retire - 65536);
+    try t.expectError(error.Stale, run.nativeBufferStatus(racing_buffer));
+    TerminalFixture.enforce_collection = false;
+    std.debug.print("[nvidia-mapping-collection] concurrent native retirement; busy={d}; metadata retained until collection; no reset\n", .{
+        TerminalFixture.blocked_collections });
     std.debug.print("[nvidia-idle-mappings] after refs={d} evictions={d} active={?} pending={} time={d}\n", .{
         copy.heldReferences(),run.mapping_evictions,run.buffer_active,run.copy_backend.?.pending,clock});
     try t.expect(run.buffer_active == null and copy.heldReferences() == 0 and
@@ -7389,6 +7475,7 @@ fn checkNativeHeadless(target: *@import("gsp_device.zig").Device, table: *a.Driv
         std.meta.eql(run.copy_backend.?.binding, binding) and std.meta.eql(run.native_copy.channel.?, handle) and
         std.meta.eql(target.native_graphics.channel.?,graphics_handle) and std.meta.eql(target.native_graphics.context.?,graphics_context));
     try t.expect(run.output_generation == output_generation and !run.outputs.active() and !run.receiver_events.capturing);
+    if (NativeCommon.is("context_native_allocation_fault")) return checkUnpublishedNativeReset(target);
     run.discover_receivers = true;
     run.receiver_events.not_before_ns = clock + 600 * std.time.ns_per_s;
     run.outputs.data = snapshot;
@@ -7407,6 +7494,17 @@ fn checkNativeHeadless(target: *@import("gsp_device.zig").Device, table: *a.Driv
     try t.expect(run.batch_work.?.submitted and (try run.virtuals.findBinding(batch_mapping)).executions == 1);
     const unproven: @import("gsp_reset.zig").Quiescence = .{ .owner = &target.gpu_reset, .epoch = run.epoch };
     try t.expect(!run.batch_work.?.resources.close(false) and !run.batch_work.?.resources.closeAfterReset(unproven));
+    // Match the public allocation lifetime: its producer is closed while
+    // this outstanding batch and RM alias still retain the backing.
+    const alias_set = (try run.virtuals.findBinding(batch_mapping)).value.source.set.?;
+    var producer_closed = false;
+    for (run.native_buffers.items()) |*slot| if (slot.owner) |owner| {
+        if (&owner.aliases != alias_set) continue;
+        try owner.closeReference();
+        producer_closed = true;
+    };
+    try t.expect(producer_closed);
+    try t.expectError(error.Retained, run.closeAfterReset(unproven));
     clock = batch_end + 1;
     try t.expectError(error.Deadline, run.step());
     stage = 7;
@@ -7437,6 +7535,49 @@ fn checkNativeHeadless(target: *@import("gsp_device.zig").Device, table: *a.Driv
     std.debug.print("[nvidia-fault-retirement] collections={d} busy={d}; native BOs retired; no post-reset RPC\n", .{
         TerminalFixture.collection_calls,TerminalFixture.blocked_collections});
     std.debug.print("[nvidia-headless-graphics] CE/GR/cache precede display; native queues without receiver; 180-second wait preserves contexts; late route reuses GPU; reset retires owners\n",.{});
+}
+
+fn checkUnpublishedNativeReset(target: *@import("gsp_device.zig").Device) !void {
+    const run = &target.running;
+    const model = @import("gsp_vram_test_model.zig").Model;
+    var checkpoint: []const u8 = "allocate";
+    errdefer std.debug.print("unpublished checkpoint={s}\n", .{checkpoint});
+    const buffer = try run.allocateNativeBuffer(34 * 1024 * 1024 + 123, clock + std.time.ns_per_s);
+    const owner = run.native_buffers.items()[buffer.slot].owner.?;
+    for (0..16) |_| {
+        _ = try run.step();
+        if (run.activeChannel().?.phase == .waiting) break;
+    }
+    try t.expect(owner.common_live and !owner.committed and !owner.reference_live and !owner.closing and
+        owner.operation.? == .allocate_memory and run.activeChannel().?.phase == .waiting);
+    var response: [160]u8 = undefined;
+    @memcpy(&response, owner.exchange.request);
+    outputWord(&response, 16, 0x51);
+    // A contradictory transport/allocation receipt must stay quarantined;
+    // the 179 OOM decoder fix deliberately does not accept this response.
+    try nativeReply(&target.session.?, 103, 0xff000001, &response);
+    checkpoint = "contradictory receipt";
+    try t.expectError(error.FirmwareResult, run.step());
+    try t.expect(model.pendingReservations() and owner.common_live and !owner.closing);
+    const unproven: @import("gsp_reset.zig").Quiescence = .{ .owner = &target.gpu_reset, .epoch = run.epoch };
+    try t.expectError(error.Retained, owner.closeAfterReset(unproven));
+    try t.expect(model.pendingReservations());
+    checkpoint = "physical reset";
+    try checkDeviceReset(target, ResetDeviceModel.words, target.vram.?.plan.?.frts.offset, false);
+    const proof = target.gpu_reset.quiescence() orelse return error.NoResetProof;
+    const sent = target.session.?.tx_sequence;
+    const aborted = model.aborted;
+    checkpoint = "retire reservation";
+    TerminalFixture.enforce_collection = true;
+    TerminalFixture.collection_calls = 0; TerminalFixture.blocked_collections = 0;
+    defer TerminalFixture.enforce_collection = false;
+    var slices: usize = 0;
+    errdefer std.debug.print("unpublished reset slices={d} phase={s} cursor={d} reservation={} blocked={d}\n", .{
+        slices, @tagName(run.reset_stage), run.reset_cursor, model.pendingReservations(), TerminalFixture.blocked_collections });
+    while (!try run.closeAfterReset(proof)) : (slices += 1) try t.expect(slices < 2000);
+    try t.expect(!model.pendingReservations() and !model.pendingReleases() and model.charged == 0 and
+        model.aborted == aborted + 1 and target.session.?.tx_sequence == sent);
+    std.debug.print("[nvidia-unpublished-retirement] exact reservation aborted after FLR; charged=0; no post-reset RPC; slices={d}\n", .{slices});
 }
 
 fn checkNativeBatchExecution(target: *@import("gsp_device.zig").Device,
@@ -8209,6 +8350,7 @@ fn checkGraphicsRendering(target: *@import("gsp_device.zig").Device, table: *@im
 fn stepNativeQueues(target: *@import("gsp_device.zig").Device, counts: *FifoCounts, scenario: []const u8, stage: *u32) !bool {
     const progress = target.step() == .progress;
     try t.expect(target.phase == .ready);
+    try PrivateClearPeer.step(target);
     const run = &target.running;
     if (run.fifo_active != null) try replyDeviceFifo(target,counts,scenario)
     else if (run.activeChannel().?.phase == .waiting) {
@@ -8219,6 +8361,75 @@ fn stepNativeQueues(target: *@import("gsp_device.zig").Device, counts: *FifoCoun
     } else stage.* = 0;
     return progress;
 }
+// Independent GPU byte store for the private allocation, separate from the
+// CPU staging array. Consume the actual CE wire packet; fetching, writing
+// bytes and signaling its semaphore are three separate peer steps.
+const PrivateClearPeer = struct {
+    var data: [4096]u8 = undefined;
+    var opened = false;
+    var stage: u8 = 0;
+    var transfers: u32 = 0;
+    fn reset() void { opened = false; stage = 0; transfers = 0; @memset(&data, 0xdd); }
+    fn step(target: *@import("gsp_device.zig").Device) !void {
+        const run = &target.running;
+        const work = &run.native_copy.probe;
+        if (work.self_address == 0) { reset(); return; }
+        if (!opened) {
+            const allocation = run.native_buffers.items()[work.buffer.slot].owner.?;
+            try t.expect(allocation.cleared and allocation.committed and allocation.storage_claimed and allocation.storage_policy != null);
+            try t.expect(work.target_stamp.?.bytes == data.len and work.target.info() != null);
+            // The fixture models the authenticated allocation-time clear. A
+            // real-board run must supply actual readback evidence instead.
+            @memset(&data, 0); opened = true;
+        }
+        if (work.phase != .submitted) {
+            stage = 0;
+            if (work.phase == .done) try t.expect(transfers == 5 and work.exact_bytes == 24576 and work.target.self_address == 0 and work.reuse.self_address == 0);
+            return;
+        }
+        if (stage == 3) return;
+        const fifo = @import("gsp_fifo_test_model.zig").Model;
+        const channel = run.fifos[work.channel.slot].owner.?;
+        const index = channel.commands.?.backing.reference.reference.id - 901;
+        const commands = &fifo.slots[index].data;
+        const ticket = work.ticket.?;
+        const load = @import("gsp_fifo_wire.zig").word;
+        const gp = @as(usize, (ticket.put + 511) % 512) * 8;
+        const command_address = @as(u64, load(commands, gp)) | (@as(u64, load(commands, gp + 4) & 255) << 32);
+        const offset: usize = @intCast(command_address - fifo.address(index));
+        try t.expect(load(commands, gp + 4) >> 10 == 17 and load(commands, offset) == 0x20010000 and load(commands, offset + 8) == 0x20040100);
+        const source = (@as(u64, load(commands, offset + 12)) << 32) | load(commands, offset + 16);
+        const destination = (@as(u64, load(commands, offset + 20)) << 32) | load(commands, offset + 24);
+        const readback = work.round & 1 == 0;
+        try t.expect(load(commands, offset + 32) == data.len and work.round == transfers);
+        try t.expect(source == (if (readback) work.target_stamp.?.address else work.source_stamp.?.address) and
+            destination == (if (readback) work.source_stamp.?.address + 7 else work.target_stamp.?.address));
+        try t.expect(ControlModel.reading and !ControlModel.cpu_mapped and work.gpu.access == @as(u32, if (readback) 1 else 0));
+        const semaphore = (@as(u64, load(commands, offset + 48)) << 32) | load(commands, offset + 52);
+        try t.expect(semaphore == fifo.address(index) + 0x2200 and load(commands, offset + 56) == ticket.point and load(commands, offset + 64) == 0x0400000c);
+        switch (stage) {
+            0 => {
+                var invalid: @import("gsp_reset.zig").Reset = .{};
+                try t.expect(!work.closeAfterReset(.{ .owner = &invalid, .epoch = run.epoch }, run.epoch));
+                try t.expect(work.target.info() != null and work.gpu.lease.id != 0);
+                std.mem.writeInt(u32, commands[0x2088..][0..4], ticket.put, .little);
+                stage = 1;
+            },
+            1 => {
+                try t.expect(channel.ring.completed < ticket.point and work.gpu.lease.id != 0);
+                if (readback) @memcpy(ControlModel.data[7..][0..data.len], &data)
+                else @memcpy(&data, ControlModel.data[0..data.len]);
+                stage = 2;
+            },
+            2 => {
+                try t.expect(channel.ring.completed < ticket.point and work.gpu.lease.id != 0);
+                std.mem.writeInt(u32, commands[0x2200..][0..4], ticket.point, .little);
+                transfers += 1; stage = 3;
+            },
+            else => {},
+        }
+    }
+};
 const VideoPeer = struct {
     const Mode = enum { success, absent, missing_class, rejected, close_context, close_storage, close_channel };
     var mode: Mode = .success;
@@ -8486,6 +8697,8 @@ fn checkNativeQueues(target: *@import("gsp_device.zig").Device, table: *a.Driver
         try t.expectEqualSlices(usize,&peer.engine_allocations,&peer.engine_frees);
     }
     peer.engine_fault = .none;
+    checkpoint = "shared CE context";
+    if (run.native_copy.phase == .ready) try checkSharedCopyQueues(target, counts, scenario, mapped);
     checkpoint = "public video queues";
     try checkPublicVideoQueues(target, counts, scenario, mapped, .decode);
     try checkPublicVideoQueues(target, counts, scenario, mapped, .encode);
@@ -8506,6 +8719,86 @@ fn checkNativeQueues(target: *@import("gsp_device.zig").Device, table: *a.Driver
     try t.expect(run.native_queues.source == null and !run.hasQueuedWork());
     std.debug.print("[nvidia-native-queue] two GR+compute+paired-CE contexts; subset reuse; canonical VA; GET retains; semaphore completes; invalid masks; active/idle close; missing topology/classes and partial RM unwind; no idle spin\n",.{});
     return fifo.released-released;
+}
+fn checkSharedCopyQueues(target: *@import("gsp_device.zig").Device, counts: *FifoCounts, scenario: []const u8,
+    mapped: @import("gsp_runtime.zig").VirtualBindingHandle) !void
+{
+    const peer = @import("gsp_native_queue_test_model.zig").Model;
+    const native = @import("gsp_vram_test_model.zig").Model;
+    const heap_peer = @import("gsp_buffer_test_model.zig").Model;
+    const layout = @import("gsp_copy_wire.zig");
+    const run = &target.running;
+    const parent_handle = run.native_copy.context.?;
+    const parent = run.contexts[parent_handle.slot].owner.?;
+    const adapter_channel = run.native_copy.channel.?;
+    const source = run.fifos[adapter_channel.slot].owner.?;
+    const methods = source.config.methods;
+    const before_heap = heap_peer.heapLive();
+    const before_bytes = native.charged;
+    const saved_source = run.native_queues.source;
+    const saved_phase = target.native_graphics.phase;
+    defer { run.native_queues.source = saved_source; target.native_graphics.phase = saved_phase; }
+    run.native_queues.source = null; target.native_graphics.phase = .unavailable;
+    var stage: u32 = 0;
+    var first: ?@import("gsp_runtime.zig").ChannelHandle = null;
+    var second: ?@import("gsp_runtime.zig").ChannelHandle = null;
+    var first_instance: u64 = 0;
+    var first_hw: u32 = 0;
+    var first_ring: u64 = 0;
+    for (0..3) |round| {
+        const completed = peer.completed;
+        peer.enqueue(if (round == 0) 20 else 21, false, 0);
+        std.mem.writeInt(u32, peer.command[8..12], 4, .little);
+        for (0..1100) |_| {
+            _ = try stepNativeQueues(target, counts, scenario, &stage);
+            if (run.batch_work != null and run.batch_work.?.submitted) break;
+            if (peer.completed != completed) return error.SharedCopyRejected;
+        }
+        try t.expect(run.batch_work != null and run.batch_work.?.submitted and run.native_queues.source == null);
+        const work = &run.batch_work.?;
+        const handle = work.channel_handle;
+        const owner = run.fifos[handle.slot].owner.?;
+        const node = run.queued_native.?.node.?;
+        try t.expect(node.engine == .copy and std.meta.eql(node.engine.copy.context.?, parent_handle) and
+            owner.parent == parent and owner.config.context.group == source.config.context.group and
+            owner.config.context.share == source.config.context.share and owner.config.methods == methods and
+            owner.config.engine == .copy and owner.config.engine_mask == 4 and !owner.copy_live and
+            owner.config.copy_handle == 0 and owner.ring.kind == .copy and owner.ring.cpu.cpu_address != source.ring.cpu.cpu_address);
+        if (round == 0) {
+            first = handle; first_instance = owner.config.instance; first_hw = owner.config.hardware_channel;
+            first_ring = owner.ring.cpu.cpu_address;
+        } else if (round == 1) {
+            second = handle;
+            try t.expect(!std.meta.eql(handle, first.?) and owner.config.instance != first_instance and
+                owner.config.hardware_channel != first_hw and owner.ring.cpu.cpu_address != first_ring and run.native_queues.count == 2);
+        } else {
+            try t.expect(std.meta.eql(handle, second.?) and run.fifos[first.?.slot].owner == null and run.native_queues.count == 1);
+        }
+        const ticket = work.ticket.?;
+        const bytes: [*]u8 = @ptrFromInt(owner.ring.cpu.cpu_address);
+        std.mem.writeInt(u32, bytes[layout.userd_offset + 0x88..][0..4], ticket.put, .little);
+        for (0..4) |_| _ = try stepNativeQueues(target, counts, scenario, &stage);
+        try t.expect(peer.completed == completed and work.receipt == null and (try run.virtuals.findBinding(mapped)).executions == 1);
+        peer.signaled = true;
+        std.mem.writeInt(u32, bytes[layout.completion_offset..][0..4], ticket.point, .little);
+        for (0..120) |_| { _ = try stepNativeQueues(target, counts, scenario, &stage); if (!run.hasQueuedWork()) break; }
+        try t.expect(peer.completed == completed + 1 and peer.result == a.gfx_queue_result_complete and !run.hasQueuedWork());
+        if (round == 1) {
+            peer.closed[20] = true; peer.notify();
+            for (0..600) |_| { _ = try stepNativeQueues(target, counts, scenario, &stage); if (run.native_queues.count == 1 and run.native_active == null and !native.pendingReleases()) break; }
+            try t.expect(run.native_queues.count == 1 and run.fifos[first.?.slot].owner == null and
+                (try run.executionContextStatus(parent_handle)).info.?.binding.group == source.config.context.group and
+                parent.methodStorage(0).?.physical.base == methods);
+        }
+    }
+    peer.closed[21] = true; peer.notify();
+    for (0..600) |_| { _ = try stepNativeQueues(target, counts, scenario, &stage); if (run.native_queues.count == 0 and run.native_active == null and !native.pendingReleases()) break; }
+    try t.expect(run.native_queues.count == 0 and run.native_queues.spare.handle == 0 and
+        std.meta.eql(run.native_copy.channel.?, adapter_channel) and parent.methodStorage(0).?.physical.base == methods and
+        source.ring.idle() and (try run.virtuals.findBinding(mapped)).executions == 0);
+    try t.expectEqual(before_heap, heap_peer.heapLive());
+    try t.expectEqual(before_bytes, native.charged);
+    std.debug.print("[nvidia-shared-copy] two distinct CE channels/instances/USERDs share exact group/context/method storage; GET does not complete; first retires, second runs again; no GR template; exact final balance\n", .{});
 }
 fn checkPublicVideoQueues(target: *@import("gsp_device.zig").Device, counts: *FifoCounts, scenario: []const u8,
     mapped: @import("gsp_runtime.zig").VirtualBindingHandle, kind: @import("gsp_native_video.zig").Kind) !void
@@ -10939,7 +11232,8 @@ fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverAp
                 try t.expect(std.mem.readInt(u64, response[96..104], .little) == owner.bytes);
                 std.mem.writeInt(u64, response[112..120], if (op == .allocate_memory) 0x80000000 else model.address(index), .little);
                 std.mem.writeInt(u64, response[120..128], owner.bytes - 1, .little);
-                if ((op == .allocate_memory and model.is("vram_physical_reject")) or (op == .allocate_virtual and model.is("vram_virtual_reject"))) outputWord(&response, 16, 0x57);
+                if (op == .allocate_memory and model.is("vram_physical_reject")) outputWord(&response, 16, 0x51);
+                if (op == .allocate_virtual and model.is("vram_virtual_reject")) outputWord(&response, 16, 0x57);
                 if (op == .allocate_memory and model.is("vram_size")) std.mem.writeInt(u64, response[96..104], owner.bytes + 65536, .little);
                 if (private_storage and op == .allocate_memory) {
                     const policy = owner.storage_policy.?;
@@ -10982,7 +11276,7 @@ fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverAp
                 }
             }
             if (op == .map and model.is("vram_timeout")) clock = deadline else {
-                try nativeReply(session, channel.function, 0, response[0..channel.request.len]);
+                try nativeReply(session, channel.function, if (op == .allocate_memory and model.is("vram_physical_reject")) @as(u32, 0x51) else 0, response[0..channel.request.len]);
                 if (op == .map and model.is("vram_ack")) range_failure_call = range_calls + 4;
             }
             _ = target.step(); range_failure_call = 0;

@@ -7,7 +7,7 @@ const runtime = @import("gsp_runtime.zig");
 pub const Phase = enum {
     detached, waiting, context_start, context_wait, context_retire, context_retiring,
     methods_allocate, methods_attach, instance_allocate, channel_create, channel_wait,
-    storage_wait, storage_release, register, ready,
+    storage_wait, storage_release, probe_allocate, probe_open, probe_wait, probe_release, probe_retiring, register, ready,
 };
 pub const Owner = struct {
     self_address: usize = 0,
@@ -26,6 +26,8 @@ pub const Owner = struct {
     // The explicit recovery-to-console path needs its private CE for table
     // uploads, but intentionally exposes no application execution backend.
     publish_backend: bool = true,
+    probe: @import("gsp_private_clear.zig").Owner = .{},
+    retired_probe: ?runtime.BufferHandle = null,
 
     pub fn request(self: *Owner) !void {
         if (self.self_address != 0) return error.State;
@@ -118,7 +120,7 @@ pub const Owner = struct {
                 const status = try run.executionChannelStatus(self.channel.?);
                 if (status.rejected != null or status.host_rejected != null) return error.Channel;
                 if (status.info == null) return false;
-                self.release(.register);
+                self.release(.probe_allocate);
             },
             .storage_wait => {
                 const status = try run.nativeBufferStatus(self.storage.?);
@@ -130,6 +132,32 @@ pub const Owner = struct {
                 try run.releaseNativeBuffer(self.storage.?);
                 self.storage = null;
                 self.next(self.after_storage);
+            },
+            .probe_allocate => try self.allocate(run, 4096, .probe_open),
+            .probe_open => {
+                if (run.privateClearAdmissionBusy()) return false;
+                try self.probe.open(run, self.channel.?, self.storage.?, self.phase_deadline);
+                self.next(.probe_wait);
+            },
+            .probe_wait => {
+                if (self.probe.phase != .done) return false;
+                if (self.probe.round != 5 or self.probe.exact_bytes != 24576) return error.PrivateClearBytes;
+                self.next(.probe_release);
+            },
+            .probe_release => {
+                try run.releaseNativeBuffer(self.storage.?);
+                self.retired_probe = self.storage; self.storage = null;
+                self.next(.probe_retiring);
+            },
+            .probe_retiring => {
+                _ = run.nativeBufferStatus(self.retired_probe.?) catch |err| {
+                    if (err != error.Stale) return err;
+                    self.retired_probe = null;
+                    @import("gsp_mode_diagnostics.zig").write(&run.ctx.?,
+                        "NVIDIA gsp-private-clear: OK fresh-zero=4096 pattern-A=4096 pattern-B=4096 guards=12288 exact-bytes=24576 CE=5 reused-fresh=false scratch-retired=yes", .{});
+                    self.next(.register); return true;
+                };
+                return false;
             },
             .register => {
                 if (self.publish_backend) _ = try run.registerCopyBackend(self.channel.?, self.phase_deadline);

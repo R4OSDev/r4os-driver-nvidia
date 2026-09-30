@@ -1,10 +1,16 @@
 ﻿# NVIDIA.R4D
 
-NVIDIA display driver for R4OS. Module 0.1.145; original R4OS code is
+NVIDIA display driver for R4OS. Module 0.1.186; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
-subsystem 1458:4074, VBIOS 94.06.2f.00.d6. Software integration through 0.79.42 is documented; physical native qualification remains separate.
+subsystem 1458:4074, VBIOS 94.06.2f.00.d6. Software integration through 0.79.45 is documented. Roadmap 0.82.1/2
+physically qualify the headless GA106 foundation on NVIDIA178/Kernel235:
+exact CE/GR output, balanced resources, two normal post-GPU restarts and
+missing/corrupt firmware recovery. TV output and manual acceptance remain
+separate (0.82.37/38). Roadmap0.82.3 now physically qualifies memory/layout/remap/OOM, shared COPY
+channels, private initial clear and exact fault/normal retirement on186/235.
+Active output and manual criteria remain separate.
 The automatic path inventories NVIDIA display functions once through
 the kernel PCI inventory. Explicit diagnostic/start modes are described below.
 Starting with R4OS 0.79.9, `IMAGE_SCOPE=slim` includes the current module in
@@ -14,9 +20,111 @@ the effective boot policy, measured boot adapter, chip/board and pinned local
 firmware checks succeed. Unknown/ambiguous hardware preserves the fallback.
 GRAPHICS=SOFTWARE and the one-shot software boot override every mode before
 resource, PCI or GPU access. Explicit mode=passive remains a diagnostic choice.
-Native graphics are experimental until the separate physical acceptance.
+Native display output remains experimental until its physical acceptance.
 Full includes DISPLAYD for subsequent hardware diagnostics. The manifest's
 firmware.version is checked against the pinned package during every build.
+
+Private control readback (0.1.186): before publishing the COPY backend,
+the driver allocates a separate private4096-byte BO and completes five CE
+transfers: initial zero readback, two changing uploads and their readbacks.
+Each read poisons8192 SYS bytes and targets offset7; all24576 bytes including
+12288 guard bytes must match after the actual semaphore and lease release.
+The scratch never becomes instance/method storage, cannot claim initial
+clear a second time, and must finish normal BO retirement before publication.
+The existing Device group passes5/5 steps and its grouped test, including
+corrupt readback, withheld completion, conservative startup shutdown, invalid
+reset proofs and exact post-reset ownership with no further RM calls. Normal
+terminal cleanup avoids dereferencing already retired staging metadata.
+Module build7/7 and a fresh SMP4 integration run pass. Hardware186
+passes the private clear/readback and full memory matrix:265CE/27native/
+8images/73138772 exact bytes, complete settled balance, no reset. Its normal
+post-GPU restart takes69.937s without Wake; all resources retire and
+fresh private-clear plus8CE/2GR/2048 exact pixels pass. Full installed hashes
+and catalog agree. Archive physical186; host models remain separate proof.
+
+Shared native COPY queues (0.1.185): native mask4 borrows the ready adapter
+CE context and method storage. Each queue retains its own instance, hardware
+CHID, FIFO and USERD; graph shutdown waits for these children before their
+shared parent. Standalone CE4 admission is distinct from paired GR|COPY5.
+Existing Device tests confirm two simultaneous children without a GR template,
+GET versus completion, first-child retirement and survivor work with exact
+resource balance. Original wire vectors and module build pass. DISPLAYD60
+adds six actual CE0 pushes with three changing patterns, full readback guards
+and a settled native-resource decrease before survivor work. Physical185/60
+qualification passed:265CE/27native/8images/73138772 exact bytes and full
+settled balance, no reset. Channels10000163/10000169 share context0:3 and
+20KB methods; CHID24/32 and instance/FIFO/USERD resources differ. The second
+channel completes a fresh pattern after first-child retirement. Archive
+physical185. The private initial-clear byte proof is completed by186 above.
+
+Unpublished reservation retirement (0.1.180): after confirmed FLR and
+allocation-provider/queue closure, the runtime aborts an authenticated
+unpublished reservation before waiting for per-channel collectors. Published
+BOs still require their exact release tickets. The existing device fixture
+reproduces the previous FIFO/collector deadlock and now retires all ownership
+without post-reset RPCs. Hardware180 is fully hash-verified and passes a
+short CE/GR probe; the specific unpublished-fault path remains unqualified.
+Its DISPLAYD52 producer-lifetime run subsequently exposed the separate
+mapping collection race below.
+
+GR/CE pairing (0.1.183): use the pinned RM common-PBDMA predicate for
+engines on the same confirmed runlist/PRI. A shared entry is sufficient;
+list length and order need not match. An existing transport case rejects
+the old implementation for that valid topology (RED182/GREEN1834/4); the
+existing Device group passes5/5 and the module builds7/7. Physical182 confirms
+GR has two PBDMAs[0,1], CE9/10 each one[0]/[1] on runlist0/PRIc00000. The
+old null selection explains the56 rejection. Physical183 confirms paired
+CE9 and the additional GR channel. R4NV16/DISPLAYD57 corrects the subsequent
+CE0/GR0 mismatch and passes five actual native VA copies/remapping,265
+canonical CE jobs and72241748 exact bytes with settled balance. The earlier
+XID13 fault separately exposed the reset-retirement defect addressed below.
+
+Reset alias retirement (0.1.184): after confirmed reset and execution-loan
+release, retire child VA aliases before FIFO-wide collection. A quiesced
+native BO may become reclaimable despite invalid references; prepare its
+producer close before accepting the exact release ticket, and retain its
+backing/namespace until aliases end. The existing device fixture now models
+the kernel's actual reference-versus-lease rule. It reproduces183's unprepared
+ticket rejection and, after that fix, the physical FIFO0 deadlock with1930
+busy collections. The corrected sequence passes5/5 steps and the existing
+grouped case, including unproven-reset retention and no post-reset RPCs.
+Physical184 passes the memory/remap matrix and the known real XID13 fault.
+Headless mode retains stopped ownership until terminal shutdown; all owners
+then retire with resources0, followed by a normal68.1223261s restart without
+Wake and fresh8CE/2GR/2048 exact pixels with balanced resources. The failed
+native job has GPGet3 but semaphore1 (two issued, one completed); no GPU
+completion is invented. This is not an automatic same-boot GPU restart.
+
+Native admission diagnostics (0.1.182): preserve the failing setup phase
+and requested engine mask through normal unwind. Context diagnostics expose
+only already acknowledged engine runlist/PRI/PBDMA rows and the resulting
+paired CE selection. This narrows the physical181/DISPLAYD56 Unsupported
+rejection before the first explicit-VA push; admission and execution are
+unchanged, and no new hardware qualification is claimed.
+
+Concurrent mapping collection (0.1.181): after confirmed GPU unmap and
+individual BO/lease releases, a busy whole-driver collector returns the RM
+exchange to the runtime. The mapping retains its metadata and RM namespace
+until collection succeeds. Native BO destruction can therefore progress
+while the system mapping waits. Other release errors remain fatal. The
+existing device test reproduces the physical180/DISPLAYD52 race and passes
+with retained metadata through nine busy collection calls. Build7/7 and
+fresh SMP4/KVM60.43s pass. Physical181/DISPLAYD53 now passes228 CE jobs,
+71377492 exact bytes, real producer kill/reap and full resource balance,
+both warm and after a fresh boot. The ordinary post-work restart takes
+70.864 seconds without Wake-on-LAN; RM/native/mapping resources retire,
+DMA stops and the terminal display is released. The previous180 published-
+BO/mapping fault also retires during the update restart. The separate
+unpublished-fault path and actual GSP fault remain unqualified.
+
+Allocation rejection correction (0.1.179): an authenticated RM allocation
+error present in both the RPC header and allocation payload ends that
+request with bounded unwind. It does not lose the working GPU epoch.
+Contradictory status fields, a different object or malformed receipts still
+retain ownership. The physical178 NO_MEMORY capture is a regression fixture;
+physical179 returns OOM, releases the reservation and executes exact CE/GR
+follow-up work in the same epoch. Total VRAM and the admission ceiling do
+not promise a contiguous allocation from GSP RM's internal heap.
 
 Boot owner correction (0.1.145, 2026-09-28): native startup requires the
 complete DriverApi36 owned-work entrypoint (Kernel 0.1.212 or newer). The

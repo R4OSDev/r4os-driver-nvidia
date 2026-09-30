@@ -1,0 +1,12 @@
+{
+  "source": "OssiPC NVIDIA0.1.178 Kernel0.1.235 DISPLAYD0.1.49 /NVIDIAMEM raw-create 2026-09-30",
+  "rpc_function": 103,
+  "rpc_sequence": 132,
+  "rpc_result": 81,
+  "payload_status": 81,
+  "logical_bytes": 35651707,
+  "allocation_bytes": 35717120,
+  "bytes": 320,
+  "sha256": "b80c084187b84efd7115973217e543daa4d7e82adf0865afa7a7012d2497f204",
+  "layout": "160-byte request then 160-byte response; failure capture, no GPU execution for this BO"
+}

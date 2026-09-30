@@ -4047,6 +4047,39 @@ fn checkPhysicalMemoryReceipt() !void {
 
 fn checkPhysicalVramReceipt() !void {
     const wire = @import("gsp_vram_wire.zig");
+    {
+        // Physical OssiPC178: RM explicitly rejects the large contiguous
+        // allocation with NO_MEMORY in both the RPC header and its payload.
+        // No object or page was allocated. It must unwind the reservation,
+        // without quarantining the whole already working GPU context.
+        const oom = @embedFile("fixtures/vram-oom-reply-570.144-ga106.bin");
+        const failed: wire.Binding = .{ .space = .{ .epoch = 1, .client = 0xc1d00000,
+            .device = 0x10000000, .handle = 0x10000006, .base = 4096,
+            .bytes = (@as(u64, 1) << 49) - 4096, .big_page_bytes = 65536 },
+            .memory = 0x1000004b, .virtual = 0x1000004c };
+        var request: [160]u8 = undefined;
+        try t.expectEqualSlices(u8, oom[0..160], (try wire.encodeLayout(failed, 35717120,
+            .{ .contiguous = true }, .allocate_memory, 0, &request)).bytes);
+        var reply: [160]u8 = oom[160..320].*;
+        var record: message.Record = .{ .shape = .{ .message_bytes = 240, .checksum_bytes = 240,
+            .storage_bytes = 4096, .elements = 1 }, .queue_sequence = 0,
+            .rpc = .{ .function = 103, .sequence = 132, .result = 0x51 }, .payload = &reply };
+        try t.expectEqual(@as(u32, 0x51), (try wire.decode(failed, 35717120, .allocate_memory, &request, record, 0)).rejected);
+        record.rpc.result = 0;
+        try t.expectEqual(@as(u32, 0x51), (try wire.decode(failed, 35717120, .allocate_memory, &request, record, 0)).rejected);
+        record.rpc.result = 0x51;
+        put(&reply, 16, 0); // A success payload does not explain a failed RPC.
+        try t.expectError(error.FirmwareResult, wire.decode(failed, 35717120, .allocate_memory, &request, record, 0));
+        put(&reply, 16, 0x57); // Contradictory failure stays uncertain too.
+        try t.expectError(error.FirmwareResult, wire.decode(failed, 35717120, .allocate_memory, &request, record, 0));
+        record.rpc.result = 0xff000001;
+        put(&reply, 16, record.rpc.result); // Transport failure is not NV_STATUS.
+        try t.expectError(error.FirmwareResult, wire.decode(failed, 35717120, .allocate_memory, &request, record, 0));
+        record.rpc.result = 0x51;
+        put(&reply, 16, 0x51);
+        reply[8] ^= 1; // A rejection for another handle cannot free ours.
+        try t.expectError(error.Unexpected, wire.decode(failed, 35717120, .allocate_memory, &request, record, 0));
+    }
     // Exact RPC103/sequence27 on OssiPC161. RM allocated the methods buffer;
     // the driver rejected its reply before clear, mapping or GPU execution.
     const golden = @embedFile("fixtures/vram-reply-570.144-ga106.bin");

@@ -114,6 +114,7 @@ pub const Owner = struct {
                 (self.phase == .context_start or self.phase == .methods_allocate or self.phase == .instance_allocate or
                 self.phase == .methods_attach or self.phase == .channel_start or self.phase == .buffers_allocate or
                 self.phase == .buffers_attach or self.phase == .globals_attach)) {
+                self.failed_phase = self.phase;
                 self.reason = err;
                 self.retireStorage(.context_close);
                 return true;
@@ -155,6 +156,7 @@ pub const Owner = struct {
                 if (status.state != .handed_off) return false;
                 if (self.closing) { self.next(.context_close); return true; }
                 const info = status.info orelse {
+                    self.failed_phase = self.phase;
                     self.reason = error.Unsupported; self.rm_status = status.rejected;
                     self.next(.context_close); return true;
                 };
@@ -187,6 +189,7 @@ pub const Owner = struct {
                 if (status.state != .handed_off) return false;
                 if (self.closing) { self.retireStorage(.context_close); return true; }
                 if (status.info == null) {
+                    self.failed_phase = self.phase;
                     self.reason = error.Memory; self.rm_status = status.rejected;
                     self.retireStorage(.context_close);
                 } else self.next(self.after_storage);
@@ -209,6 +212,7 @@ pub const Owner = struct {
                 if (status.state != .handed_off) return false;
                 if (self.closing) { self.next(.channel_close); return true; }
                 const info = status.info orelse {
+                    self.failed_phase = self.phase;
                     self.reason = error.Unsupported; self.rm_status = status.rejected;
                     self.next(.channel_close); return true;
                 };
@@ -272,8 +276,9 @@ pub const Owner = struct {
     fn unavailable(self: *Owner, ctx: *const r4os.r4dev.DriverContext) void {
         self.phase = .unavailable;
         var line: [200]u8 = undefined;
-        const message = std.fmt.bufPrintZ(&line, "NVIDIA graphics-engine: unavailable reason={s} rm-status={?} display=preserved",
-            .{if (self.reason) |err| @errorName(err) else "unknown", self.rm_status}) catch return;
+        const message = std.fmt.bufPrintZ(&line, "NVIDIA graphics-engine: unavailable reason={s} rm-status={?} phase={s} engines={x} display=preserved",
+            .{if (self.reason) |err| @errorName(err) else "unknown", self.rm_status,
+                if (self.failed_phase) |phase| @tagName(phase) else "none", self.engine_mask}) catch return;
         ctx.logInfo(message);
     }
     pub fn quarantine(self: *Owner, ctx: ?*const r4os.r4dev.DriverContext, err: anyerror) void {

@@ -4,7 +4,7 @@ const std = @import("std");
 const a = @import("r4os").abi;
 const heap_model = @import("gsp_buffer_test_model.zig").Model;
 pub const Model = struct {
-    const Slot = struct { reservation: a.GfxOwnedBufferReservation = .{}, descriptor: a.GfxBufferDescriptor = .{}, live: bool = false, published: bool = false, reference: bool = false, imported: bool = false, borrowed: bool = false, borrowed_flags: u32 = 0, claimed: bool = false, gpu: a.GfxDeviceLease = .{} };
+    const Slot = struct { reservation: a.GfxOwnedBufferReservation = .{}, descriptor: a.GfxBufferDescriptor = .{}, live: bool = false, published: bool = false, reference: bool = false, imported: bool = false, borrowed: bool = false, borrowed_flags: u32 = 0, claimed: bool = false, gpu: a.GfxDeviceLease = .{}, quiesced: bool = false };
     pub var slots: [32]Slot = @splat(.{});
     pub var charged: u64 = 0;
     pub var released: u32 = 0;
@@ -13,7 +13,18 @@ pub const Model = struct {
     pub var budget_configurations: u32 = 0;
     pub var import_failure: i32 = 0;
     pub fn pendingReleases() bool {
-        for (&slots) |*slot| if (slot.live and slot.published and !slot.reference and !slot.imported and !slot.borrowed and slot.gpu.lease.id == 0) return true;
+        for (&slots) |*slot| if (releasable(slot)) return true;
+        return false;
+    }
+    fn releasable(slot: *const Slot) bool {
+        // Kernel maybeRelease keeps real leases, but confirmed device loss
+        // makes reference-only native backing reclaimable. Those invalid
+        // references remain closeable after its exact release ticket ends.
+        return slot.live and slot.published and slot.gpu.lease.id == 0 and
+            (slot.quiesced or (!slot.reference and !slot.imported and !slot.borrowed));
+    }
+    pub fn pendingReservations() bool {
+        for (&slots) |*slot| if (slot.live and !slot.published) return true;
         return false;
     }
     var query: *const fn (*a.GfxDriverMemoryApi) callconv(.c) i32 = undefined;
@@ -22,6 +33,7 @@ pub const Model = struct {
     var fallback_import: u64 = 0;
     var fallback_acquire: u64 = 0;
     var fallback_device_release: u64 = 0;
+    var fallback_device_lost: u64 = 0;
     pub fn install(table: *a.DriverApi, scenario: []const u8) void {
         heap_model.install(table, scenario); query = table.gfx_memory_query.?;
         table.gfx_memory_query = memory; slots = @splat(.{}); charged = 0; released = 0; aborted = 0;
@@ -39,7 +51,7 @@ pub const Model = struct {
     pub fn address(index: usize) u64 {
         // Golden + regular GR, CE and render buffers coexist in the same
         // 4GB test VA space. Keep this larger scenario below the FIFO region.
-        const stride: u64 = if (std.mem.startsWith(u8, heap_model.scenario, "context_graphics") or is("context_native_headless") or
+        const stride: u64 = if (std.mem.startsWith(u8, heap_model.scenario, "context_graphics") or is("context_native_headless") or is("context_native_allocation_fault") or
             is("context_native_terminal")) 0x02000000 else 0x10000000;
         return 0x10000000 + index * stride;
     }
@@ -53,9 +65,20 @@ pub const Model = struct {
         out.buffer_take_release = @intFromPtr(&take); out.buffer_finish_release = @intFromPtr(&finish); out.buffer_release = @intFromPtr(&drop);
         out.buffer_import = @intFromPtr(&import); out.device_acquire = @intFromPtr(&acquire); out.device_release = @intFromPtr(&releaseDevice);
         out.buffer_describe = @intFromPtr(&describe);
+        fallback_device_lost = out.device_lost;
+        if (fallback_device_lost != 0) out.device_lost = @intFromPtr(&deviceLost);
         out.memory_budget = @intFromPtr(&memoryBudget);
         if (is("vram_surface_linear")) out.size = 184; // Existing native ABI, no optional budget service.
         return a.gfx_buffer_result_ok;
+    }
+    fn deviceLost(adapter: u32, epoch: u64, quiesced: u32) callconv(.c) i32 {
+        const call: *const fn (u32, u64, u32) callconv(.c) i32 = @ptrFromInt(fallback_device_lost);
+        const result = call(adapter, epoch, quiesced);
+        if (result == a.gfx_buffer_result_ok and quiesced == 1) for (&slots) |*slot| {
+            if (slot.live and slot.reservation.adapter_id == adapter and slot.reservation.device_generation == epoch)
+                slot.quiesced = true;
+        };
+        return result;
     }
     fn describe(input: *const a.GfxBufferHandle, out: *a.GfxBufferDescriptor) callconv(.c) i32 {
         for (&slots, 0..) |*slot, i| if (slot.live and slot.published) {
@@ -82,7 +105,7 @@ pub const Model = struct {
     fn reserve(d: *const a.GfxBufferDescriptor, cookie: u64, out: *a.GfxOwnedBufferReservation) callconv(.c) i32 {
         std.debug.assert(d.location == 1 and d.adapter_id == 0x01000000 and d.device_generation != 0 and d.driver_owner == 0 and d.usage & 3 == 0 and d.alignment >= 65536 and std.math.isPowerOfTwo(d.alignment));
         if (is("vram_budget")) return a.gfx_buffer_error_budget;
-        for (&slots, 0..) |*slot, i| if (!slot.live) {
+        for (&slots, 0..) |*slot, i| if (!slot.live and !slot.reference and !slot.imported and !slot.borrowed) {
             const bytes = std.mem.alignForward(u64, d.byte_length, d.alignment);
             if (budget_configurations != 0 and (charged > budget.limit_bytes or bytes > budget.limit_bytes - charged)) return a.gfx_buffer_error_budget;
             out.* = .{ .buffer = .{ .id = @intCast(801+i), .generation = 601 }, .reference = .{ .id = @intCast(811+i), .generation = 701 },
@@ -112,13 +135,13 @@ pub const Model = struct {
         return a.gfx_buffer_result_ok;
     }
     fn drop(reference: *const a.GfxBufferHandle) callconv(.c) i32 {
-        for (&slots, 0..) |*slot, i| if (slot.live and std.meta.eql(borrowedReference(i), reference.*)) {
+        for (&slots, 0..) |*slot, i| if ((slot.live or slot.quiesced) and std.meta.eql(borrowedReference(i), reference.*)) {
             std.debug.assert(slot.borrowed); slot.borrowed = false; return a.gfx_buffer_result_ok;
         };
-        for (&slots, 0..) |*slot, i| if (slot.live and std.meta.eql(importedReference(i), reference.*)) {
+        for (&slots, 0..) |*slot, i| if ((slot.live or slot.quiesced) and std.meta.eql(importedReference(i), reference.*)) {
             std.debug.assert(slot.imported and slot.gpu.lease.id == 0); slot.imported = false; return a.gfx_buffer_result_ok;
         };
-        for (&slots) |*slot| if (slot.live and std.meta.eql(slot.reservation.reference, reference.*)) {
+        for (&slots) |*slot| if ((slot.live or slot.quiesced) and std.meta.eql(slot.reservation.reference, reference.*)) {
             std.debug.assert(slot.reference and slot.published); slot.reference = false; return a.gfx_buffer_result_ok;
         };
         const call: *const fn (*const a.GfxBufferHandle) callconv(.c) i32 = @ptrFromInt(fallback_release); return call(reference);
@@ -177,7 +200,7 @@ pub const Model = struct {
             .device_generation = r.device_generation, .driver_generation = r.driver_generation, .adapter_id = r.adapter_id, .driver_owner = r.driver_owner };
     }
     fn take(adapter: u32, epoch: u64, out: *a.GfxOwnedBufferRelease) callconv(.c) i32 {
-        for (&slots) |*slot| if (slot.live and slot.published and !slot.reference and !slot.imported and !slot.borrowed and slot.gpu.lease.id == 0 and !slot.claimed) {
+        for (&slots) |*slot| if (releasable(slot) and !slot.claimed) {
             std.debug.assert(slot.reservation.adapter_id == adapter and slot.reservation.device_generation == epoch);
             slot.claimed = true; out.* = ticket(slot.*); return a.gfx_buffer_result_ok;
         };
@@ -185,7 +208,7 @@ pub const Model = struct {
     }
     fn finish(r: *const a.GfxOwnedBufferRelease, quiesced: u32) callconv(.c) i32 {
         for (&slots) |*slot| if (slot.live and std.meta.eql(ticket(slot.*), r.*)) {
-            std.debug.assert(slot.claimed and !slot.reference and !slot.imported and !slot.borrowed and slot.gpu.lease.id == 0 and quiesced == 1);
+            std.debug.assert(slot.claimed and releasable(slot) and quiesced == 1);
             if (is("vram_finish")) return a.gfx_buffer_error_busy;
             slot.live = false; charged -= r.byte_length; released += 1; return a.gfx_buffer_result_ok;
         };

@@ -72,7 +72,7 @@ pub const Model = struct {
         out.device_segment = @intFromPtr(&segment);
         out.device_release = @intFromPtr(&releaseDevice);
         if (power.is("power_success")) out.telemetry_exchange = @intFromPtr(&power.exchange);
-        if (std.mem.startsWith(u8, scenario, "gpu_reset_") or is("context_native_reset") or is("context_native_console") or is("context_native_headless") or is("context_native_terminal") or is("mapping_provider_reset")) {
+        if (std.mem.startsWith(u8, scenario, "gpu_reset_") or std.mem.startsWith(u8, scenario, "context_native_private_") or is("context_native_reset") or is("context_native_console") or is("context_native_headless") or is("context_native_allocation_fault") or is("context_native_terminal") or is("mapping_provider_reset")) {
             out.size = @sizeOf(a.GfxDriverMemoryApi);
             out.device_lost = @intFromPtr(&deviceLost);
         }
@@ -105,7 +105,7 @@ pub const Model = struct {
     fn mapCpu(input: *const a.GfxBufferHandle, access: u32, offset: u64, bytes: u64, out: *a.GfxBufferMap) callconv(.c) i32 {
         if (host_pages.owns(input.*)) return host_pages.mapCpu(input, access, offset, bytes, out);
         if (power.owns(input.*)) return power.mapCpu(input, access, offset, bytes, out);
-        std.debug.assert(active and !cpu_mapped and !reading and std.meta.eql(input.*, reference) and access == 1 and offset == 0 and bytes == storage.bytes);
+        std.debug.assert(active and !cpu_mapped and !reading and std.meta.eql(input.*, reference) and access <= 1 and offset == 0 and bytes == storage.bytes);
         cpu_mapped = true;
         out.* = .{ .lease = cpu, .cpu_address = @intFromPtr(&data), .byte_length = bytes, .cache_policy = if (is("control_cache")) a.gfx_buffer_cache_write_combining else a.gfx_buffer_cache_write_back };
         return a.gfx_buffer_result_ok;
@@ -128,7 +128,7 @@ pub const Model = struct {
         if (power.owns(input.*)) return power.acquire(input, request, out);
         std.debug.assert(active and synced and !cpu_mapped and std.meta.eql(input.*, reference) and
             request.byte_offset == 0 and request.adapter_id == 0x01000000 and request.device_generation != 0);
-        if (request.access == 0) {
+        if (request.access <= 1) {
             std.debug.assert(mapped and gpu_mapped and !reading and request.byte_length > 0 and request.byte_length <= storage.bytes and request.byte_length & 3 == 0 and
                 request.gpu_virtual_address == gpu_address and request.address_space == 1 and request.dma_mask == std.math.maxInt(u64));
             if (is("context_upload_acquire")) return -1;
@@ -164,7 +164,7 @@ pub const Model = struct {
         if (host_pages.owns(input.lease)) return host_pages.releaseDevice(input, quiesced);
         if (power.owns(input.lease)) return power.releaseDevice(input, quiesced);
         std.debug.assert(active and quiesced == 1);
-        if (input.access == 0) {
+        if (input.access <= 1) {
             std.debug.assert(reading and gpu_mapped and mapped and std.meta.eql(input.*, read_lease));
             if (is("context_upload_release")) return -1;
             reading = false; read_lease = .{}; return a.gfx_buffer_result_ok;

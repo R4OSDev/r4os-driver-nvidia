@@ -406,7 +406,6 @@ pub const Owner = struct {
     /// requires an exact release ticket, and its outstanding leases still veto
     /// issuance. False means a ticket or one of those consumers remains held.
     pub fn closeAfterReset(self: *Owner, proof: @import("gsp_reset.zig").Quiescence) Error!bool {
-        if (!self.aliases.empty()) return false;
         if ((self.self_address != 0 and self.self_address != @intFromPtr(self)) or
             !proof.valid(self.binding.space.epoch) or self.exchange.session.epoch != self.binding.space.epoch or
             !std.meta.eql(self.reservation, self.reservation_stamp) or
@@ -418,6 +417,11 @@ pub const Owner = struct {
                 self.memory.bufferRelease(&self.reference.reference) != a.gfx_buffer_result_ok) return error.Retained;
             self.reference_live = false;
         }
+        // Confirmed loss may make reference-only BOs reclaimable before
+        // their RM aliases are removed. Close the initial logical reference
+        // now, but retain this owner and any exact ticket until those aliases
+        // have independently consumed the same quiescence proof.
+        if (!self.aliases.empty()) return false;
         if (self.common_live) {
             if (self.committed) {
                 if (self.release.attempt == 0) return false;

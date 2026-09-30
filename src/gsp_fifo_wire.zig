@@ -406,10 +406,10 @@ pub fn validGraphicsEngines(mask: u32) bool {
     return mask & nv.native_engine_graphics != 0 and mask & ~(nv.native_engine_graphics | nv.native_engine_compute | nv.native_engine_copy) == 0;
 }
 pub fn validNativeEngines(mask: u32) bool {
-    return mask == nv.native_engine_video or mask == nv.native_engine_encode or validGraphicsEngines(mask);
+    return mask == nv.native_engine_copy or mask == nv.native_engine_video or mask == nv.native_engine_encode or validGraphicsEngines(mask);
 }
 pub fn defaultEngineMask(engine: Engine) u32 {
-    return switch (engine) { .nvdec => nv.native_engine_video, .nvenc => nv.native_engine_encode, else => nv.native_engine_graphics };
+    return switch (engine) { .copy => nv.native_engine_copy, .nvdec => nv.native_engine_video, .nvenc => nv.native_engine_encode, else => nv.native_engine_graphics };
 }
 pub fn validChannelEngines(engine: Engine, mask: u32) bool {
     return if (engine == .graphics) validGraphicsEngines(mask) else mask == defaultEngineMask(engine);
