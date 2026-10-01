@@ -174,6 +174,7 @@ pub const GraphicsWork = struct {
     receipt: ?GraphicsReceipt = null,
     resources: render_job.Owner = .{},
     queued: bool = false,
+    diagnostic_timeout: bool = false,
 };
 pub const batch_job = @import("gsp_batch_job.zig");
 pub const BatchWork = struct {
@@ -395,6 +396,9 @@ pub const Owner = struct {
     // Explicit headless diagnostic only. Consumed by one public CE submit;
     // rebuilding Owner does not rearm it. Hardware completion is not forged.
     diagnostic_copy_timeout: bool = false,
+    // Same bounded observation probe for one public draw. Startup barriers,
+    // shader uploads and all submitted command/shader bytes remain unchanged.
+    diagnostic_render_timeout: bool = false,
     // Native diagnostic only: withhold the first submitted flip's use of
     // head observations. IRQ dispatch, Window execution and DMA stay real.
     // The ordinary deadline/retention path and one-shot reset remain owners.
@@ -3594,6 +3598,10 @@ pub const Owner = struct {
         try self.validateGraphicsWork();
         const fifo = try self.findChannel(work.channel_handle);
         if (work.submitted) {
+            if (work.diagnostic_timeout) {
+                if (current >= work.deadline) return error.Deadline;
+                return false;
+            }
             if (try fifo.ring.poll() >= work.ticket.?.point) {
                 if (!work.resources.close(true)) return error.Retained;
                 work.receipt = .{ .channel = work.channel_handle, .point = work.ticket.?.point, .completed_ns = current };
@@ -3609,6 +3617,13 @@ pub const Owner = struct {
         work.ticket = try fifo.prepareGraphics(work.command);
         try self.device.?.submitGraphics(fifo, work.ticket.?, work.deadline);
         work.submitted = true;
+        if (self.diagnostic_render_timeout and work.queued) {
+            const queued = self.queued_render orelse return error.State;
+            self.diagnostic_render_timeout = false;
+            work.diagnostic_timeout = true;
+            self.log("NVIDIA reset-probe: render-submitted epoch={d} timeline={d} point={d} GR-point={d} deadline={d} DMA=held completion-observation=withheld hardware-fault=no",
+                .{self.epoch,queued.job.fence.timeline,queued.job.fence.point,work.ticket.?.point,work.deadline});
+        }
         return true;
     }
     /// Private producers and authenticated common-queue jobs share the same
@@ -3733,6 +3748,8 @@ pub const Owner = struct {
     }
     fn freeChannelSlot(self: *Owner, index: usize) !void {
         const slot = &self.fifos[index]; const heap = slot.heap orelse return error.Api;
+        const owner = slot.owner orelse return error.State;
+        if (owner.state != .finished or owner.namespace_live or owner.awaitingCollection()) return error.Retained;
         if (heap.release(slot.allocation.handle) != r4os.abi.driver_heap_ok) return error.Retained;
         slot.* = .{};
     }
@@ -5797,6 +5814,7 @@ pub const Owner = struct {
         // native BO still needs this worker's RM channel. Retry only the
         // common collection barrier, without keeping that channel borrowed.
         if (try self.collectDeferredBuffer()) return .progress;
+        if (try self.collectDeferredChannel()) return .progress;
         if (self.unload.self_address == 0 and !self.shutdown_closing) {
             self.observePower(current);
             self.observeAdaptiveRefresh(current);
@@ -6134,7 +6152,9 @@ pub const Owner = struct {
                     fifo_info.work_submit_token,fifo_info.config.rm_engine,fifo_info.config.object_class});
             const deadline = owner.deadline; var token = try owner.handoff();
             self.channel = try exchange.Exchange.init(&token, deadline);
-            if (owner.state == .finished) try self.freeChannelSlot(index);
+            if (owner.awaitingCollection()) self.log("NVIDIA channel-retire: channel={x} epoch={d} RM=returned collection=pending namespace=held",
+                .{owner.config.handle, self.epoch});
+            if (owner.state == .finished and !owner.awaitingCollection()) try self.freeChannelSlot(index);
             self.fifo_active = null; return .progress;
         }
         if (@call(.never_inline, @TypeOf(owner.*).poll, .{owner}) catch |err| { self.rmFailure(.channel, owner.config.handle, owner.last_status); return err; }) |dispatch| {
@@ -6204,6 +6224,19 @@ pub const Owner = struct {
         if (heap.release(slot.allocation.handle) != r4os.abi.driver_heap_ok) return error.Retained;
         if (slot.evicting) self.mapping_evictions +|= 1;
         slot.* = .{};
+    }
+    fn collectDeferredChannel(self: *Owner) !bool {
+        for (&self.fifos, 0..) |*slot, index| if (slot.owner) |owner| {
+            if (!owner.awaitingCollection() or (owner.state != .finished and owner.state != .handed_off)) continue;
+            // No RM exchange is borrowed while the epoch-wide barrier waits
+            // for other native BOs. Keep the namespace until its exact ack.
+            if (!try owner.collectDeferred()) return false;
+            self.log("NVIDIA channel-retire: channel={x} epoch={d} collection=complete namespace=released",
+                .{owner.config.handle, self.epoch});
+            if (owner.state == .finished) try self.freeChannelSlot(index);
+            return true;
+        };
+        return false;
     }
     fn collectDeferredBuffer(self: *Owner) !bool {
         for (self.buffers.items(), 0..) |*slot, index| if (slot.owner) |owner| {

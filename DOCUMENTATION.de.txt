@@ -1,6 +1,39 @@
 ﻿NVIDIA: nativer Grafik- und Displaybesitzer
 =========================================
 
+0.82.10 / NVIDIA190-191 / 01.10.2026:
+190 korrigiert den reproduzierten Vulkan-Abbaufehler bei gleichzeitigem
+Kanal-/BO-Ende. Nur einzeln quittiert freigegebene FIFO-Commandpuffer duerfen
+collector-busy zurueckstellen; RM geht an andere Besitzer zurueck, die
+Namespace-Identitaet bleibt bis zur Collection erhalten. Vorher Retained,
+danach bestehende Devicegruppe5/5Schritte1/1 bestanden. Physisch190 bestehen
+14x2Referenzen/28GR/82CE/87808Bytes, dieselbe CPU/GPU-Szene/6272Bytes und
+der unveraenderte dynamische Vulkan-Verbraucher/192Pixel/2304Randbytes samt
+kaltem/warmem Cache und geaendertem Shader. Die urspruengliche gesamte
+BO-Bilanz ist in Epoche1 wiederhergestellt, kein GPUreset. Beide echten
+Collectionmarker erfasst. Archiv20261001-render08210/Correction190.
+Der vorausgehende Update-Neustart beendete den noch quarantinierten189 mit
+poweroff-device-handoff; einmalWake war noetig. Das ist kein sauberer189-
+Neustartnachweis. Installation190/Journal92/Batch73 und volle Hashes stimmen.
+
+191 ergaenzt den ausdruecklichen HEADLESS-Modus reset-probe=render-timeout.
+Genau ein oeffentlicher gueltiger Draw behaelt bis zu seiner regulaeren
+Frist die Completion-Auswertung zurueck. Startupbarrieren, CE-Uploads,
+Shader-/Kommandobytes und echte GPU-Semaphore bleiben unveraendert. Danach
+gelten gewoehnliche Fehler-, DMA-Halte- und Resetvertraege. Der erneuerte
+Runtime-Owner bleibt unbewaffnet; bei einem neuen OS-Boot wird dagegen die
+Konfiguration erneut gelesen. Option nach der Diagnose wieder entfernen.
+Bestehende Device-/Lifecyclegruppen pruefen Zulassung, unveraenderte Frist,
+Fence/Klasse/Cache, fehlenden Erfolg trotz gleichzeitig/spaeter Semaphore
+und erhaltene DMA. Ein solcher Diagnose-Timeout ist kein echter GPU-Hang
+und kein von der Firmware gemeldeter Xid. Physische191-Abnahme bestanden:
+Fence2:4 terminal fehlgeschlagen, DMA bisFn0FLR gehalten, nach21.976s neue
+Epoche2 mit allen Referenzen und demselben Runtime-SPIRV-/Cacheverbraucher,
+vollstaendige BO-Bilanz. Diagnoseoption danach entfernt. Zwei normale
+Post-GPU-Neustarts190/191 mit terminalem FLR, DMAstillstand, Ressourcen0 und
+warm-reset-ready ohne Wake. Separates SSH-Endausgaberennen inSSHD10 behoben.
+Belege im gleichen .10-Archiv unterFinal08210; fruehere Fehlversuche erhalten.
+
 0.82.4 / NVIDIA 187 / DISPLAYD 61 / 01.10.2026:
 HDMI-/EDID-Softwarevorbereitung technisch abgeschlossen. Letzte Antwort und
 letzte Ablehnung behalten Phase, Befehl, DDC-Block, RPC-/RM-Status,

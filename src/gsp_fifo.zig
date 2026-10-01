@@ -410,7 +410,7 @@ pub const Owner = struct {
     fn advance(self: *Owner) Error!?exchange.Dispatch {
         if (self.state == .command_creating or self.state == .command_destroying) {
             const owner = &self.commands.?;
-            if (owner.state != .ready and owner.state != .closed) return owner.poll();
+            if (owner.state != .ready and owner.state != .closed) return owner.pollDeferredCollection();
             const creating = self.state == .command_creating;
             const command_info = owner.info();
             var token = try owner.handoff(self.deadline);
@@ -543,7 +543,12 @@ pub const Owner = struct {
         const parent = self.parent;
         if (self.live or self.enabled or self.engine_live or self.compute_live or self.copy_live or self.ring.self_address != 0 or !self.releasePrivate()) return error.Retained;
         if (self.golden() and self.graphics_initialized and !self.unwind) (parent orelse return error.State).golden_complete = true;
-        if (self.namespace_live) { try self.session.?.rm_names.retireChildren(self.reservation.?); self.namespace_live = false; }
+        // A consumer may close native BOs while this channel owns RM. Its
+        // acknowledged command-buffer frees may then await the common
+        // collector. Return RM, retaining this owner and its namespace.
+        if (!self.awaitingCollection() and self.namespace_live) {
+            try self.session.?.rm_names.retireChildren(self.reservation.?); self.namespace_live = false;
+        }
         self.state = if (self.unwind) .ready else .closed;
     }
     pub fn beginDestroy(self: *Owner, token: *boot.Handoff, deadline: u64, quiesced: bool) Error!void {
@@ -587,6 +592,22 @@ pub const Owner = struct {
         return self.self_address == @intFromPtr(self) and self.ring.self_address == 0 and
             self.userd.self_address == 0 and self.instance.self_address == 0 and
             (if (self.commands) |*command| command.backing.awaitingCollection() else false);
+    }
+    pub fn collectDeferred(self: *Owner) Error!bool {
+        try self.stable();
+        if (!self.awaitingCollection() or self.failure != null or
+            (self.state != .finished and self.state != .handed_off) or
+            self.live or self.enabled or self.engine_live or self.compute_live or self.copy_live or
+            self.child != null or self.parent != null) return error.State;
+        if (!self.commands.?.backing.close()) {
+            if (self.awaitingCollection()) return false;
+            return error.Retained;
+        }
+        if (self.namespace_live) {
+            try self.session.?.rm_names.retireChildren(self.reservation.?);
+            self.namespace_live = false;
+        }
+        return true;
     }
     pub fn handoff(self: *Owner) Error!boot.Handoff {
         try self.stable();

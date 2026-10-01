@@ -107,15 +107,23 @@ pub const Owner = struct {
         return null;
     }
     pub fn poll(self: *Owner) Error!?exchange.Dispatch {
+        return self.pollMode(false);
+    }
+    /// Only a caller retaining this owner after handoff may defer the final
+    /// whole-epoch collection. All individual frees must still succeed.
+    pub fn pollDeferredCollection(self: *Owner) Error!?exchange.Dispatch {
+        return self.pollMode(true);
+    }
+    fn pollMode(self: *Owner, defer_collection: bool) Error!?exchange.Dispatch {
         try self.stable();
         if (self.state != .creating and self.state != .unwinding and self.state != .destroying) return error.State;
         self.self_address = @intFromPtr(self);
-        return self.advance() catch |err| {
+        return self.advance(defer_collection) catch |err| {
             if (err == error.Pending) return err;
             return self.fail(err);
         };
     }
-    fn advance(self: *Owner) Error!?exchange.Dispatch {
+    fn advance(self: *Owner, defer_collection: bool) Error!?exchange.Dispatch {
         try self.exchange.guard(self.deadline);
         if (self.backing.prepared and !self.backing.valid()) return error.Stale;
         if (self.exchange.pending != null) return error.Pending;
@@ -134,7 +142,7 @@ pub const Owner = struct {
                 if (!self.registered) .register else if (!self.allocated) .allocate else .map
             else if (self.mapped) .unmap else if (self.allocated) .free_virtual else if (self.registered) .free_memory else {
                 self.backing.retained = false;
-                if (!self.backing.close()) return error.Retained;
+                if (!self.backing.close() and !(defer_collection and self.backing.awaitingCollection())) return error.Retained;
                 self.state = if (self.state == .unwinding) .ready else .closed;
                 return null;
             };

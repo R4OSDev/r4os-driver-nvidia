@@ -506,7 +506,7 @@ test "NVIDIA actual driver lifecycle verifies loaded lock before PCI and binds f
     // Both persistent and one-shot software override even an explicit native
     // mode and a corrupt firmware package before PCI/MMIO/resource admission.
     for ([_]u32{ 1, 2 }) |software| for ([_][*:0]const u8{ "auto", "native", "headless", "gsp-start", "boot-check", "passive" }) |mode|
-        for ([_][*:0]const u8{ "", "copy-timeout", "flip-irq-timeout", "invalid" }) |probe| {
+        for ([_][*:0]const u8{ "", "copy-timeout", "render-timeout", "flip-irq-timeout", "invalid" }) |probe| {
         state = .{ .boot_policy = software, .selected_mode = mode, .selected_reset_probe = probe, .resource_fault = .wrong };
         try t.expectEqual(@as(i32, 0), driver.nvidia_init(&api));
         try t.expectEqual(@as(usize, 0), state.enumerate_count);
@@ -516,11 +516,12 @@ test "NVIDIA actual driver lifecycle verifies loaded lock before PCI and binds f
     // Reject a mismatched probe before native work, firmware or PCI. Valid
     // pairings still have to pass the normal owned-work admission next.
     for ([_][*:0]const u8{ "auto", "native", "headless", "passive" }) |mode|
-        for ([_][*:0]const u8{ "copy-timeout", "flip-irq-timeout", "invalid" }) |probe| {
+        for ([_][*:0]const u8{ "copy-timeout", "render-timeout", "flip-irq-timeout", "invalid" }) |probe| {
         state = .{ .selected_mode = mode, .selected_reset_probe = probe };
         const headless = std.mem.eql(u8, std.mem.span(mode), "headless");
         const native = std.mem.eql(u8, std.mem.span(mode), "auto") or std.mem.eql(u8, std.mem.span(mode), "native");
-        const valid = (headless and std.mem.eql(u8, std.mem.span(probe), "copy-timeout")) or
+        const valid = (headless and (std.mem.eql(u8, std.mem.span(probe), "copy-timeout") or
+            std.mem.eql(u8, std.mem.span(probe), "render-timeout"))) or
             (native and std.mem.eql(u8, std.mem.span(probe), "flip-irq-timeout"));
         try t.expectEqual(@as(i32, if (valid) -12 else -2), driver.nvidia_init(&api));
         try t.expect(state.enumerate_count == 0 and !state.mapping and !state.lock_verified);

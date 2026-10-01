@@ -1651,7 +1651,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         context_fifo_success, context_fifo_allocate, context_fifo_bind, context_fifo_hardware_changed, context_fifo_enable,
         context_fifo_changed, context_fifo_ack, context_fifo_timeout, context_fifo_disable, context_fifo_free, context_fifo_dma,
         context_graphics, context_graphics_missing, context_graphics_reject, context_graphics_timeout,
-        context_graphics_command_fault, context_graphics_shader_fault,
+        context_graphics_command_fault, context_graphics_shader_fault, context_graphics_observation_timeout,
         context_graphics_promote_reject, context_graphics_promote_changed,
         context_copy_success, context_copy_class, context_copy_allocate, context_copy_changed, context_copy_timeout, context_copy_completion,
         context_copy_rc, context_copy_rc_unmatched, context_copy_mmu, context_copy_xid, context_copy_fault_ack, context_copy_irq,
@@ -7176,6 +7176,8 @@ const HeadlessResetFixture = struct {
         }
         const job = run.copy_job.?;
         try t.expect(job.diagnostic_timeout and !run.diagnostic_copy_timeout);
+        // Even an unconsumed diagnostic option cannot cross a reset epoch.
+        run.diagnostic_render_timeout = true;
         const raw: [*]const u8 = @ptrFromInt(target.port.window.cpu_address);
         try copy.fetch(run.fifos[job.channel_handle.slot].owner.?, raw[0..@intCast(target.port.window.byte_length)]);
         try copy.execute();
@@ -7208,7 +7210,7 @@ const HeadlessResetFixture = struct {
         }
         try t.expect(target.phase == .frts and calls == 2 and restaging.calls == 1 and target.epoch > old_epoch and
             !proof.valid(old_epoch) and !target.memory.?.releaseAfterReset(proof) and !run.discover_receivers and
-            !run.diagnostic_copy_timeout and target.native_output.self_address == 0 and target.fault_reset_attempted);
+            !run.diagnostic_copy_timeout and !run.diagnostic_render_timeout and target.native_output.self_address == 0 and target.fault_reset_attempted);
         var notified = false;
         while (target.phase != .ready) : (slices += 1) {
             try t.expect(slices < 16000 and target.phase != .failed);
@@ -8859,8 +8861,50 @@ fn checkNativeQueues(target: *@import("gsp_device.zig").Device, table: *a.Driver
     for (0..100) |_| { _ = try stepNativeQueues(target,counts,scenario,&stage); if (peer.job == null and !run.hasQueuedWork()) break; }
     try t.expect(peer.job == null and peer.result == a.gfx_queue_result_cancelled);
     checkpoint = "idle queue retirement";
+    // A Vulkan device can close application BOs while its last channel is
+    // already borrowing RM for destruction. The common collector covers
+    // both owners; channel storage must return RM before that BO can retire.
+    const racing_buffer = allocation: {
+        for (0..200) |_| {
+            const candidate = run.allocateNativeBuffer(65536, deadline) catch |err| {
+                if (err != error.Busy) return @as(anyerror!usize, err);
+                _ = try stepNativeQueues(target, counts, scenario, &stage);
+                continue;
+            };
+            break :allocation try finishContextBuffer(target, candidate, deadline);
+        }
+        return error.SetupTimeout;
+    };
+    const charge_before_retire = native.charged;
+    TerminalFixture.enforce_collection = true;
+    TerminalFixture.collection_calls = 0;
+    TerminalFixture.blocked_collections = 0;
+    defer TerminalFixture.enforce_collection = false;
+    var concurrent_release = false;
+    var deferred_channel = false;
     peer.closed[0] = true; peer.notify();
-    for (0..600) |_| { _ = try stepNativeQueues(target,counts,scenario,&stage); if (run.native_queues.count == 0 and run.native_active == null and !native.pendingReleases()) break; }
+    for (0..600) |_| {
+        _ = try stepNativeQueues(target,counts,scenario,&stage);
+        if (!concurrent_release and run.fifo_active == first_channel.?.slot) {
+            try run.releaseNativeBuffer(racing_buffer);
+            concurrent_release = true;
+            try t.expect(native.pendingReleases());
+        }
+        if (run.fifos[first_channel.?.slot].owner) |owner| if (owner.awaitingCollection()) {
+            try t.expect(owner.namespace_live and (owner.state == .closed or owner.state == .finished));
+            if (owner.state == .finished) {
+                try t.expect(run.fifo_active != first_channel.?.slot);
+                deferred_channel = true;
+            }
+        };
+        if (run.native_queues.count == 0 and run.native_active == null and !native.pendingReleases()) break;
+    }
+    try t.expect(concurrent_release and deferred_channel and TerminalFixture.blocked_collections != 0 and
+        native.charged < charge_before_retire and target.phase == .ready and run.failure == null);
+    try t.expectError(error.Stale, run.nativeBufferStatus(racing_buffer));
+    TerminalFixture.enforce_collection = false;
+    std.debug.print("[nvidia-channel-collection] concurrent native retirement; busy={d}; namespace retained; RM returned; no reset\n", .{
+        TerminalFixture.blocked_collections });
     try t.expect(run.native_queues.count == 0 and run.native_queues.spare.handle == 0 and fifo.released == released+video_releases+2 and
         run.fifos[target.native_graphics.channel.?.slot].owner.?.ring.idle());
     try t.expectEqualSlices(usize,&.{2,2},&peer.engine_allocations);
@@ -9179,7 +9223,8 @@ fn checkQueuedRendering(target: *@import("gsp_device.zig").Device, table: *@impo
     for ([_]usize{11,3,9}) |scene_index| try checkQueuedScene(target,table,counts,scenario,ce,scene_index);
 }
 fn graphicsFaultScenario(scenario: []const u8) bool {
-    return std.mem.eql(u8,scenario,"context_graphics_command_fault") or std.mem.eql(u8,scenario,"context_graphics_shader_fault");
+    return std.mem.eql(u8,scenario,"context_graphics_command_fault") or std.mem.eql(u8,scenario,"context_graphics_shader_fault") or
+        std.mem.eql(u8,scenario,"context_graphics_observation_timeout");
 }
 fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("r4os").abi.DriverApi, counts: *FifoCounts,
     scenario: []const u8, ce: @import("gsp_runtime.zig").ChannelHandle, scene_index: usize) !void {
@@ -9331,6 +9376,7 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
                 else model.enqueueRenderGridList(native_index, source_index, &commands, &grids, deadline);
             } else model.enqueueRenderList(native_index, source_index, &commands, deadline);
         } else model.enqueueRender(native_index, source_index, command, deadline);
+        if (std.mem.eql(u8,scenario,"context_graphics_observation_timeout")) run.diagnostic_render_timeout = true;
         try t.expect(try run.beginCopyWork(ce,model.binding,deadline));
         try t.expect(model.active and run.copy_job == null and run.queued_render != null);
         if (batched) model.render_list.commands[15].opacity ^= 1; // Driver owns its copied list.
@@ -9570,6 +9616,7 @@ fn checkGraphicsFault(target: *@import("gsp_device.zig").Device, ce: @import("gs
     const tx = session.tx_sequence;
     const binding = try run.graphics_cache.binding();
     const shader = std.mem.eql(u8,scenario,"context_graphics_shader_fault");
+    const timeout = std.mem.eql(u8,scenario,"context_graphics_observation_timeout");
     const message = if (shader) "Graphics Exception: Shader Program Header 11 Error" else "Class Error";
     var payload: [272]u8 = @splat(0);
     outputWord(&payload,0,if (shader) 13 else 69);
@@ -9580,18 +9627,29 @@ fn checkGraphicsFault(target: *@import("gsp_device.zig").Device, ce: @import("gs
     // A simultaneously visible semaphore cannot erase the earlier fatal
     // event. No shader pixels or successful queue receipt are fabricated.
     std.mem.writeInt(u32,fifo.slots[0].data[0x2200..][0..4],ticket.point,.little);
-    try nativeEvent(session,0x1006,&payload); _ = target.step();
+    if (timeout) {
+        try t.expect(run.graphics_work.?.diagnostic_timeout and !run.diagnostic_render_timeout);
+        _ = target.step();
+        try t.expect(target.phase == .ready and run.graphics_work.?.receipt == null and model.completed == 0 and
+            model.heldReferences() == held and owner.ring.completed == point);
+        clock = run.graphics_work.?.deadline;
+        _ = target.step();
+        if (target.phase == .ready) _ = target.step();
+    } else {
+        try nativeEvent(session,0x1006,&payload); _ = target.step();
+    }
     try t.expect(target.phase == .recovering and run.queued_render != null and run.graphics_work != null and
         model.active and model.lost and model.completed == 0 and model.heldReferences() == held and
         model.result == a.gfx_queue_result_device_lost and model.unregisters == 1 and run.quarantine_result.? == a.gfx_queue_error_busy and
         run.graphics_completed == completed and owner.ring.completed == point and run.graphics_cache.borrowed and
         fifo.slots[0].active and fifo.slots[0].cpu and native.slots[image_index].live and native.slots[image_index].imported);
     const record = run.faults.first_fatal.?;
-    try t.expect(record.source == .xid and record.fatal and record.acknowledged and record.render_phase == .execution and
+    try t.expect(record.source == (if (timeout) @import("gsp_faults.zig").Source.host else .xid) and record.fatal and
+        record.acknowledged == !timeout and record.render_phase == .execution and
         record.graphics_point == ticket.point and record.graphics_class == (try run.graphicsClass()) and record.epoch == run.epoch and
         std.meta.eql(record.active_fence,model.job.fence) and record.programs_address == binding.programs.address and
         record.packet_address == binding.packet.address and session.tx_sequence == tx);
-    const expected_kind: @import("gsp_faults.zig").Kind = if (shader) .shader else .graphics_command;
+    const expected_kind: @import("gsp_faults.zig").Kind = if (timeout) .timeout else if (shader) .shader else .graphics_command;
     const expected_shader: @import("gsp_faults.zig").Shader = if (shader) .header else .none;
     try t.expect(record.kind == expected_kind and record.shader == expected_shader);
     std.mem.writeInt(u32,fifo.slots[0].data[0x2200..][0..4],ticket.point,.little);
@@ -9602,6 +9660,7 @@ fn checkGraphicsFault(target: *@import("gsp_device.zig").Device, ce: @import("gs
     try t.expectError(error.State,run.step()); run.stop(error.Stopped);
     try t.expect(model.unregisters == 1 and model.heldReferences() == held and model.active and owner.ring.completed == point and
         run.graphics_cache.borrowed and run.graphics_completed == completed);
+    if (timeout) std.debug.print("[nvidia-render-probe] one public draw; completion observation withheld; original deadline; exact fence/class/cache; late semaphore cannot revive generation; DMA retained\n", .{});
 }
 fn stepQueuedRendering(target: *@import("gsp_device.zig").Device) !void {
     _ = target.step();

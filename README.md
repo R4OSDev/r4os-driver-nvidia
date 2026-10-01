@@ -1,5 +1,34 @@
 ﻿# NVIDIA.R4D
 
+Roadmap0.82.10 / channel retirement (0.1.190): concurrent Vulkan channel
+and native BO destruction exposed a driver-wide collector dependency. A
+FIFO command buffer now defers only confirmed collector-busy after its
+individual releases, returns RM to other owners, and retains its namespace
+until final collection. The existing Device regression reproduces the old
+failure and passes after the fix. Physical GA106 checks pass all 14 reference
+scenes in both layouts, the shared CPU/GPU scene, and the unchanged runtime
+SPIR-V Vulkan consumer with cold/restored/changed-source pipelines. All
+resources return to the original same-epoch baseline without a GPU reset.
+Evidence: ExFiles/Reports/OssiGPU/20261001-render08210/Correction190.
+
+Version0.1.191 adds explicit `mode=headless` plus
+`reset-probe=render-timeout`. With supported reset prerequisites, it withholds
+completion observation for exactly one submitted public draw until that
+draw's original deadline. Command and shader bytes, startup barriers, CE
+uploads and hardware completion remain unchanged. The normal failure path
+retains DMA and invalidates the generation; late semaphore visibility cannot
+complete it. A rebuilt runtime does not rearm the probe. Remove the option
+after diagnosis: another OS boot reads configuration again. This probe is
+an observation timeout, not a claimed GPU hang or firmware-generated Xid.
+
+Physical191 qualification passes: the original draw fence fails at its
+deadline, DMA stays held until confirmed Fn0 FLR, and rebuilt epoch2 passes
+all reference scenes and the unchanged runtime SPIR-V/cache consumer with
+complete resource retirement. The probe option was then removed. Two normal
+post-GPU OS restarts (190 and191) confirm terminal FLR, stopped DMA, zero
+resources and warm-reset readiness without Wake-on-LAN. Full evidence and
+the separately fixed SSH final-output race are in the archive's `Final08210`.
+
 Roadmap0.82.4 / receiver capture preparation (0.1.187): receiver replies
 retain phase, command, DDC block, unique receipt, RPC/RM status and actual
 ACK. The last rejection survives successful retry/fallback. Read/ACK
@@ -17,7 +46,7 @@ Fresh TV/HDMI qualification remains0.82.37; manual changes0.82.38. Evidence:
 ExFiles/Reports/OssiGPU/20261001-receivers08204. Older dated entries below
 remain historical checkpoints, not the current list of unfinished work.
 
-NVIDIA display driver for R4OS. Module 0.1.187; original R4OS code is
+NVIDIA display driver for R4OS. Module 0.1.191; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,
