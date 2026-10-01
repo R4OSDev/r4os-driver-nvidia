@@ -147,6 +147,7 @@ pub const DisplayFlip = struct {
     receipt: flip.Receipt,
     ordinary: bool = false,
     retiring_activation: bool = false,
+    diagnostic_irq_timeout: bool = false,
 };
 const subscriptions = @import("gsp_event_objects.zig");
 const outputs = @import("gsp_outputs.zig");
@@ -394,6 +395,10 @@ pub const Owner = struct {
     // Explicit headless diagnostic only. Consumed by one public CE submit;
     // rebuilding Owner does not rearm it. Hardware completion is not forged.
     diagnostic_copy_timeout: bool = false,
+    // Native diagnostic only: withhold the first submitted flip's use of
+    // head observations. IRQ dispatch, Window execution and DMA stay real.
+    // The ordinary deadline/retention path and one-shot reset remain owners.
+    diagnostic_flip_irq_timeout: bool = false,
     graphics_work: ?GraphicsWork = null,
     batch_work: ?BatchWork = null,
     graphics_cache: render_cache.Owner = .{},
@@ -5027,6 +5032,12 @@ pub const Owner = struct {
                 work.receipt.submitted_ns = current;
             }
             const changed = try self.advanceDisplaySubmission(window, work.deadline, current);
+            if (self.diagnostic_flip_irq_timeout and window.phase == .submitted) {
+                self.diagnostic_flip_irq_timeout = false;
+                work.diagnostic_irq_timeout = true;
+                self.log("NVIDIA reset-probe: flip-submitted epoch={d} head={d} sequence={d} Window-point={d} deadline={d} DMA=held IRQ-observation=withheld IRQ-handler=unchanged hardware-fault=no",
+                    .{self.epoch, work.receipt.head, work.receipt.sequence, window.ticket.?.point, work.deadline});
+            }
             if (window.phase != .complete) return changed;
         }
         if (self.outputPaused(index) and work.receipt.begun_observed_ns == 0) {
@@ -5055,6 +5066,10 @@ pub const Owner = struct {
             return true;
         }
         if (work.receipt.begun_observed_ns == 0) {
+            // The actual IRQ owner continues recording/acknowledging events.
+            // Only this exact submitted flip ignores them until its existing
+            // deadline; no visible receipt, FINISHED or quiescence is forged.
+            if (work.diagnostic_irq_timeout) return false;
             const observed = self.headObservation(work.receipt.head) catch |err| {
                 if (err == error.Busy) return false; return err;
             };

@@ -367,6 +367,7 @@ test "NVIDIA actual driver lifecycle bridges resident CPU memory and retains fai
 
 const State = struct {
     selected_mode: [*:0]const u8 = "passive",
+    selected_reset_probe: [*:0]const u8 = "",
     boot_policy: u32 = 0,
     present: bool = true,
     clock_fixture: bool = false,
@@ -504,11 +505,25 @@ test "NVIDIA actual driver lifecycle verifies loaded lock before PCI and binds f
     api.gfx_display_query = policyDisplay;
     // Both persistent and one-shot software override even an explicit native
     // mode and a corrupt firmware package before PCI/MMIO/resource admission.
-    for ([_]u32{ 1, 2 }) |software| for ([_][*:0]const u8{ "auto", "native", "headless", "gsp-start", "boot-check", "passive" }) |mode| {
-        state = .{ .boot_policy = software, .selected_mode = mode, .resource_fault = .wrong };
+    for ([_]u32{ 1, 2 }) |software| for ([_][*:0]const u8{ "auto", "native", "headless", "gsp-start", "boot-check", "passive" }) |mode|
+        for ([_][*:0]const u8{ "", "copy-timeout", "flip-irq-timeout", "invalid" }) |probe| {
+        state = .{ .boot_policy = software, .selected_mode = mode, .selected_reset_probe = probe, .resource_fault = .wrong };
         try t.expectEqual(@as(i32, 0), driver.nvidia_init(&api));
         try t.expectEqual(@as(usize, 0), state.enumerate_count);
         try t.expect(!state.lock_verified and !state.mapping);
+        try t.expectEqual(@as(i32, 0), driver.nvidia_shutdown());
+    };
+    // Reject a mismatched probe before native work, firmware or PCI. Valid
+    // pairings still have to pass the normal owned-work admission next.
+    for ([_][*:0]const u8{ "auto", "native", "headless", "passive" }) |mode|
+        for ([_][*:0]const u8{ "copy-timeout", "flip-irq-timeout", "invalid" }) |probe| {
+        state = .{ .selected_mode = mode, .selected_reset_probe = probe };
+        const headless = std.mem.eql(u8, std.mem.span(mode), "headless");
+        const native = std.mem.eql(u8, std.mem.span(mode), "auto") or std.mem.eql(u8, std.mem.span(mode), "native");
+        const valid = (headless and std.mem.eql(u8, std.mem.span(probe), "copy-timeout")) or
+            (native and std.mem.eql(u8, std.mem.span(probe), "flip-irq-timeout"));
+        try t.expectEqual(@as(i32, if (valid) -12 else -2), driver.nvidia_init(&api));
+        try t.expect(state.enumerate_count == 0 and !state.mapping and !state.lock_verified);
         try t.expectEqual(@as(i32, 0), driver.nvidia_shutdown());
     };
     api.gfx_display_query = null;
@@ -565,7 +580,9 @@ test "NVIDIA actual driver lifecycle verifies loaded lock before PCI and binds f
     try t.expectEqual(@as(i32, 0), driver.nvidia_shutdown());
 }
 fn option(_: [*:0]const u8, key: [*:0]const u8) callconv(.c) [*:0]const u8 {
-    return if (std.mem.eql(u8, std.mem.span(key), "mode")) state.selected_mode else "";
+    if (std.mem.eql(u8, std.mem.span(key), "mode")) return state.selected_mode;
+    if (std.mem.eql(u8, std.mem.span(key), "reset-probe")) return state.selected_reset_probe;
+    return "";
 }
 fn policyDisplay(out: *a.GfxDriverDisplayApi) callconv(.c) i32 {
     out.* = .{ .boot_info = @intFromPtr(&policyBootInfo) }; return a.gfx_output_ok;

@@ -1669,7 +1669,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         context_display_present_initial_acquire, context_display_present_initial_retry,
         context_native_unknown, context_native_headless, context_native_allocation_fault, context_native_terminal, context_native_headless_reset, context_native_reset, context_native_console, context_native_connected, context_native_connected_primary_timeout, context_native_dp, context_native_jobs, context_native_job_timeout, context_native_prepare_reject,
         context_native_private_corrupt, context_native_private_timeout, context_native_private_shutdown,
-        context_native_flip_irq_timeout, context_native_flip_notifier_timeout, context_native_flip_release_timeout,
+        context_native_flip_irq_timeout, context_native_flip_probe_timeout, context_native_flip_notifier_timeout, context_native_flip_release_timeout,
         context_native_frame_timeout,
         context_native_cursor_timeout, context_native_cursor_reject,
         context_native_cursor_image_timeout, context_native_cursor_upload_timeout, context_native_cursor_imp_fallback, context_native_cursor_common,
@@ -6129,8 +6129,11 @@ fn checkNativeFlip(target: *@import("gsp_device.zig").Device) !void {
         const prior_offset = note.offset;
         checkpoint = "prepare flip";
         try t.expectError(error.Unsupported, run.flipDisplayPresentationImage(prior.image.dma, deadline));
+        const injected_irq = NativeCommon.is("context_native_flip_probe_timeout");
+        if (injected_irq) run.diagnostic_flip_irq_timeout = true;
         try run.flipDisplayPresentationImage(selected_dma, deadline);
         const work = run.primaryFlip().?;
+        if (injected_irq) try t.expect(run.diagnostic_flip_irq_timeout and !work.diagnostic_irq_timeout);
         const io = target.port.owner.?;
         try io.admit_display_push.?(io.context, &target.port, window, deadline, .read);
         work.window.config.with_core = true;
@@ -6169,6 +6172,7 @@ fn checkNativeFlip(target: *@import("gsp_device.zig").Device) !void {
         display.words[(user + 4) / 4] = display.words[user / 4];
         clock += 1000; _ = target.step();
         try t.expect(work.window.phase == .submitted and run.flip_visible == iteration and std.meta.eql(run.display_images[prior.image.channel - 1].?, prior));
+        if (injected_irq) try t.expect(!run.diagnostic_flip_irq_timeout and work.diagnostic_irq_timeout);
         checkpoint = "independent hardware receipts";
         try deliverNativeHead(target, false); _ = target.step();
         try t.expect(run.flip_visible == iteration and work.window.phase == .submitted);
@@ -6192,13 +6196,19 @@ fn checkNativeFlip(target: *@import("gsp_device.zig").Device) !void {
             try deliverNativeHead(target, true); _ = target.step();
         }
         if (NativeCommon.flipFailure()) {
-            const visible: u64 = if (missing_irq or missing_notifier) 0 else 1;
+            const visible: u64 = if (missing_irq or missing_notifier or injected_irq) 0 else 1;
+            if (injected_irq) {
+                const observed = target.interrupts.display.heads[work.receipt.head].snapshot().?;
+                try t.expect(observed.sequence > work.baseline.sequence and work.window.phase == .complete and
+                    work.receipt.begun_observed_ns == 0 and !run.diagnostic_flip_irq_timeout and work.diagnostic_irq_timeout);
+            }
             try t.expect(run.flip_visible == visible and run.flip_released == 0 and run.primaryFlip() != null);
             clock = deadline; _ = target.step();
             try t.expect(target.phase == .recovering and target.failure.? == error.Timeout and run.primaryFlip() != null and
                 run.flip_visible == visible and run.flip_released == 0 and native.released == before_released and
                 old.surface.target.?.gpu.lease.id != 0 and candidate.surface.target.?.gpu.lease.id != 0 and
                 copy.borrowed_releases == 0 and run.copy_completed == before_copies and copy.completed == before_queue);
+            if (injected_irq) std.debug.print("[nvidia-flip-probe] one actual Window submission; real modeled IRQ and BEGUN preserved; no visible receipt; original deadline; images/DMA retained\n", .{});
             return;
         }
         checkpoint = "visible before release";
