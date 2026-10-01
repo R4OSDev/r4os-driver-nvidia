@@ -59,6 +59,10 @@ pub fn check() !void {
     const object: @import("gsp_display_rpc.zig").Object = .{ .epoch = 11, .client = 12, .display = 13 };
     const link: runtime.DisplayLink = .{ .plan = try runtime.display_link.derive(bound, object, snapshot), .acknowledged = 7, .receipt = 11 };
     const plan = try vrr.derive(bound, object, snapshot, link, 0xc67d);
+    try t.expectEqualDeep(plan, try vrr.derive(bound, object, snapshot, link, 0xc77d));
+    var unconfirmed = link;
+    unconfirmed.receipt = 0;
+    try t.expectError(error.Unsupported, vrr.derive(bound, object, snapshot, unconfirmed, 0xc67d));
     try pacingCheck(plan.refresh);
     try t.expect(plan.refresh.timeout_us == 20000 and plan.refresh.max_vtotal == 1350 and !plan.refresh.lfc);
     try t.expectError(error.Unsupported, vrr.derive(bound, object, snapshot, link, 0xc37d));

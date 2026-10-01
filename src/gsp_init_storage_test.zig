@@ -3738,6 +3738,7 @@ const NativeCommon = struct {
     var refresh_intent: a.GfxRefreshRequest = .{};
     var refresh_reject: ?@import("gsp_vrr_control.zig").Phase = null;
     var refresh_stale = false;
+    var refresh_downspread: u8 = 0x10;
     fn publishRefresh(input: *const a.GfxOutputRefresh) callconv(.c) i32 {
         std.debug.assert(input.version == 1 and input.size == 272 and input.target.display_generation != 0);
         if (input.status.phase == a.gfx_refresh_phase_active)
@@ -5616,6 +5617,73 @@ fn checkNativeVrrBridge(target: *@import("gsp_device.zig").Device) !void {
     }
     try t.expect(!run.refresh_quiescing and !run.anyAdaptiveRefresh());
 }
+// Exercise VRR on links that the existing full mode transaction actually
+// trained/configured. The tiny high-clock rasters are software owner fixtures,
+// not claims about receiver rates or physical FRL/DSC/Adaptive-Sync output.
+fn checkQualifiedLinkVrr(target: *@import("gsp_device.zig").Device, label: []const u8) !void {
+    try pumpNativeAudio(target);
+    const run = &target.running;
+    const product = &target.native_output;
+    const control = @import("gsp_vrr_control.zig");
+    const display = @import("gsp_display_test_model.zig").Model;
+    const window = product.mode.?.window;
+    const image = &run.display_images[window].?;
+    const mode = image.boot_mode.?;
+    const receiver = &run.outputs.data.receivers[0];
+    const old_refresh = receiver.report.refresh;
+    const old_link = image.link.?;
+    defer { receiver.report.refresh = old_refresh; image.link = old_link; }
+    const timing = try control.timing(mode);
+    const range: control.edid.refresh.Range = .{ .min_millihz = timing.millihz() / 2, .max_millihz = timing.millihz() + 1000 };
+    if (mode.displayPort()) {
+        receiver.report.refresh = .{ .dynamic = .{ .refresh = range, .seamless = true,
+            .min_pixel_clock_hz = timing.clock_hz, .max_pixel_clock_hz = timing.clock_hz } };
+        // The existing DP/DSC fixture has no Ignore-MSA capability. It must
+        // remain fixed until that separate source/sink fact is present.
+        try t.expectError(error.Unsupported, run.adaptiveRefreshPlan(window));
+        image.link.?.dp.?.dpcd[7] |= 64;
+    } else receiver.report.refresh.hdmi = .{ .refresh = range };
+    const plan = try run.adaptiveRefreshPlan(window);
+    try t.expect(!plan.refresh.lfc and plan.refresh.max_vtotal > timing.v_total);
+    const retained = image.*;
+    const audio = CatalogModel.audio;
+    const user = try @import("gsp_display_push.zig").userBase(.core, 0);
+    NativeCommon.refresh_downspread = 0x10;
+    errdefer |err| std.debug.print("qualified VRR {s}: {s}, device={s}, runtime={?}\n",
+        .{ label, @errorName(err), @tagName(target.phase), run.failure });
+    for ([_]bool{ true, false }) |enabled| {
+        const sequence = try run.beginAdaptiveRefresh(product.core.?, window, enabled, clock + std.time.ns_per_s);
+        var acknowledged = false;
+        var replies: usize = 0;
+        for (0..120) |_| {
+            clock += 1000; _ = target.step();
+            try t.expect(target.phase == .ready);
+            if (run.display_work == null) break;
+            try t.expect(run.anyAdaptiveRefresh() != enabled);
+            if (run.activeChannel().?.phase == .waiting) { try replyNativeProduct(target); replies += 1; continue; }
+            const work = &run.display_work.?;
+            if (work.core.phase == .rewind or work.core.phase == .submitted) {
+                display.words[(user + 4) / 4] = display.words[user / 4];
+                if (work.core.phase == .submitted) {
+                    clock += 1000; _ = target.step();
+                    try t.expect(run.display_work != null and run.anyAdaptiveRefresh() != enabled);
+                    const note: *u32 = @ptrFromInt(work.core.notifier.cpu.cpu_address);
+                    note.* = 2 << 30;
+                    acknowledged = true;
+                }
+            }
+        }
+        try t.expect(run.display_work == null and acknowledged);
+        try t.expectEqual(@as(usize, if (enabled) 6 else 7) + @as(usize, if (mode.displayPort()) 2 else 0), replies);
+        const result = run.refresh_results[window].?;
+        try t.expect(result.sequence == sequence and result.enabled == enabled and result.failure == null and
+            result.core_point != 0 and result.receipt != 0 and run.anyAdaptiveRefresh() == enabled);
+        try t.expectEqualDeep(retained, image.*);
+        try t.expectEqualDeep(audio, CatalogModel.audio);
+    }
+    try t.expect(NativeCommon.refresh_downspread == 0x10 and !run.anyAdaptiveRefresh());
+    std.debug.print("[nvidia-vrr-link] {s}: enable/disable RM+Core receipts, GET alone pending, image/link/PPS/audio retained, no LFC\n", .{label});
+}
 fn checkNativeFrames(target: *@import("gsp_device.zig").Device, extra: bool) !void {
     const run = &target.running; const product = &target.native_output;
     _ = product.color.step(product);
@@ -6784,6 +6852,7 @@ fn checkNativeDsc(target: *@import("gsp_device.zig").Device) !void {
             try t.expectEqual(@as(u64, 5_184_000_000), facts.dp_payload_bits_per_second);
             try t.expect(facts.h_active == 256 and facts.v_active == 60 and facts.pixel_clock_numerator == 240_000_000);
             try run.selectDisplayPresentationImage(dma);
+            try checkQualifiedLinkVrr(target, "DP-SST DSC");
         } else {
             const failed = (try run.takeDisplayLinkFailure(product.engine.?, plan.window, dma, plan)).?;
             try t.expect(NativeCommon.dsc_failed and failed.receipt != 0 and image.link.?.complete() and
@@ -6909,6 +6978,7 @@ fn checkNativeHdmiDsc(target: *@import("gsp_device.zig").Device) !void {
             try run.selectDisplayPresentationImage(dma);
             const facts = NativeCommon.color_state;
             try t.expect(facts.link_kind == 2 and facts.link_flags == 3 and facts.compressed_bpp_x16 == 192 and facts.dsc_depths == 1);
+            try checkQualifiedLinkVrr(target, "HDMI FRL DSC");
         } else {
             const failure = (try run.takeDisplayLinkFailure(product.engine.?, plan.window, dma, plan)).?;
             try t.expect(NativeCommon.frl_failed and failure.reason == error.Stale and failure.restored_receipt != 0 and
@@ -6984,6 +7054,7 @@ fn checkFrlRecovery(target: *@import("gsp_device.zig").Device) !void {
             const image = run.display_images[fast.window].?;
             try t.expect(image.link.?.complete() and image.link.?.frl.?.training_receipt != 0 and image.boot_mode.?.signal.hdmi_frl and
                 image.core_point > previous.core_point and image.window_point > previous.window_point and run.display_link_failures[fast.window] == null);
+            try checkQualifiedLinkVrr(target, "HDMI FRL");
         } else {
             try t.expect(NativeCommon.frl_failed);
             const failed = (try run.takeDisplayLinkFailure(product.engine.?, fast.window, product.dma, fast)).?;
@@ -8279,7 +8350,19 @@ fn replyNativeProduct(target: *@import("gsp_device.zig").Device) !void {
         if (work.refresh) |*refresh| {
             try t.expect(refresh.control.pending and rpc.deadline == work.deadline and
                 std.mem.eql(u8, refresh.control.request[0..refresh.control.length], rpc.request));
-            try t.expect(refresh.control.plan.mode.transport_hdmi and rpc.function == 76);
+            try t.expect(rpc.function == 76);
+            if (refresh.control.phase == .link_read or refresh.control.phase == .link_write or refresh.control.phase == .link_verify) {
+                try t.expect(refresh.control.plan.mode.displayPort());
+                try t.expect(std.mem.readInt(u32, rpc.request[8..12], .little) == 0x731341 and
+                    std.mem.readInt(u32, rpc.request[40..44], .little) == 0x107);
+                if (refresh.control.phase == .link_write) {
+                    const expected: u8 = if (refresh.control.enabled) 0x90 else 0x10;
+                    try t.expect(rpc.request[44] == expected);
+                    NativeCommon.refresh_downspread = rpc.request[44];
+                }
+                outputWord(&response, 60, 1); outputWord(&response, 64, 0);
+                response[44] = NativeCommon.refresh_downspread;
+            }
             if (refresh.control.enabled and NativeCommon.refresh_reject != null and refresh.control.phase == NativeCommon.refresh_reject.?) {
                 outputWord(&response, 12, 0x56);
                 NativeCommon.refresh_reject = null;
@@ -13448,6 +13531,8 @@ fn checkMstRejectedMode(target: *@import("gsp_device.zig").Device) !void {
     const vm = @import("gsp_vram_test_model.zig").Model;
     const old = run.currentPresentation(extra.mode.?.window).?;
     const before = run.display_images[extra.mode.?.window].?;
+    try t.expect(before.link.?.complete() and before.boot_mode.?.signal.mst != null);
+    try t.expectError(error.Unsupported, run.adaptiveRefreshPlan(extra.mode.?.window));
     const peer = run.display_images[primary.mode.?.window].?;
     const root = try run.outputs.mst_store.root(8);
     const digest = try root.live.table.digest();
