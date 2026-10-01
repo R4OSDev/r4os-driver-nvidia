@@ -368,6 +368,7 @@ test "NVIDIA actual driver lifecycle bridges resident CPU memory and retains fai
 const State = struct {
     selected_mode: [*:0]const u8 = "passive",
     selected_reset_probe: [*:0]const u8 = "",
+    selected_vram_limit: [*:0]const u8 = "",
     boot_policy: u32 = 0,
     present: bool = true,
     clock_fixture: bool = false,
@@ -507,10 +508,25 @@ test "NVIDIA actual driver lifecycle verifies loaded lock before PCI and binds f
     // mode and a corrupt firmware package before PCI/MMIO/resource admission.
     for ([_]u32{ 1, 2 }) |software| for ([_][*:0]const u8{ "auto", "native", "headless", "gsp-start", "boot-check", "passive" }) |mode|
         for ([_][*:0]const u8{ "", "copy-timeout", "render-timeout", "flip-irq-timeout", "invalid" }) |probe| {
-        state = .{ .boot_policy = software, .selected_mode = mode, .selected_reset_probe = probe, .resource_fault = .wrong };
+        state = .{ .boot_policy = software, .selected_mode = mode, .selected_reset_probe = probe, .selected_vram_limit = "invalid", .resource_fault = .wrong };
         try t.expectEqual(@as(i32, 0), driver.nvidia_init(&api));
         try t.expectEqual(@as(usize, 0), state.enumerate_count);
         try t.expect(!state.lock_verified and !state.mapping);
+        try t.expectEqual(@as(i32, 0), driver.nvidia_shutdown());
+    };
+    const residency = @import("gsp_residency.zig");
+    try t.expectEqual(@as(u64, 0), try residency.configuredLimit(""));
+    try t.expectEqual(@as(u64, 64 * 1024 * 1024), try residency.configuredLimit("64"));
+    try t.expectEqual(@as(u64, 65536) * 1024 * 1024, try residency.configuredLimit("65536"));
+    for ([_][]const u8{ "0", "63", "65537", "-64", "+64", "64x", "64.0", "1_024", " 64", "18446744073709551616" }) |invalid|
+        try t.expectError(error.Invalid, residency.configuredLimit(invalid));
+    for ([_][*:0]const u8{ "auto", "native", "headless", "passive" }) |mode|
+        for ([_][*:0]const u8{ "64", "128", "0", "bad" }) |limit| {
+        state = .{ .selected_mode = mode, .selected_vram_limit = limit };
+        const valid = std.mem.eql(u8, std.mem.span(mode), "headless") and
+            (std.mem.eql(u8, std.mem.span(limit), "64") or std.mem.eql(u8, std.mem.span(limit), "128"));
+        try t.expectEqual(@as(i32, if (valid) -12 else -2), driver.nvidia_init(&api));
+        try t.expect(state.enumerate_count == 0 and !state.mapping and !state.lock_verified);
         try t.expectEqual(@as(i32, 0), driver.nvidia_shutdown());
     };
     // Reject a mismatched probe before native work, firmware or PCI. Valid
@@ -583,6 +599,7 @@ test "NVIDIA actual driver lifecycle verifies loaded lock before PCI and binds f
 fn option(_: [*:0]const u8, key: [*:0]const u8) callconv(.c) [*:0]const u8 {
     if (std.mem.eql(u8, std.mem.span(key), "mode")) return state.selected_mode;
     if (std.mem.eql(u8, std.mem.span(key), "reset-probe")) return state.selected_reset_probe;
+    if (std.mem.eql(u8, std.mem.span(key), "vram-limit-mb")) return state.selected_vram_limit;
     return "";
 }
 fn policyDisplay(out: *a.GfxDriverDisplayApi) callconv(.c) i32 {

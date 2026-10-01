@@ -8,12 +8,13 @@ const exchange = @import("gsp_exchange.zig");
 const names = @import("gsp_rm_names.zig");
 const vaspace = @import("gsp_vaspace.zig");
 const host_vm = @import("gsp_host_vm.zig");
+const user_vram = @import("gsp_user_vram.zig");
 const clear = @import("gsp_memory_clear.zig");
 pub const wire = @import("gsp_vram_wire.zig");
 pub const surface = @import("gsp_surface_layout.zig");
 pub const storage = @import("gsp_native_backing.zig");
 pub const alias = @import("gsp_memory_alias.zig");
-pub const Error = wire.Error || names.Error || surface.Error || storage.Error || host_vm.Error || error{ Api, Descriptor, Memory, Busy, Retained };
+pub const Error = wire.Error || names.Error || surface.Error || storage.Error || host_vm.Error || user_vram.Error || error{ Api, Descriptor, Memory, Busy, Retained };
 pub const State = enum { creating, unwinding, ready, handed_off, destroying, closed, finished, failed };
 pub const Info = struct { reference: a.GfxBufferReference, address: u64, logical_bytes: u64, allocation_bytes: u64, epoch: u64, surface: surface.Plan, physical: ?storage.Physical = null };
 pub const Owner = struct {
@@ -60,6 +61,8 @@ pub const Owner = struct {
     host_binding: host_vm.Binding = .{},
     host_active: bool = false,
     host_physical: ?u64 = null,
+    user_memory: ?struct { heap: *user_vram.Owner, view: *const @import("gsp_memory_inventory.zig").Owner } = null,
+    user_range: user_vram.Range = .{},
 
     pub fn init(token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext, adapter: u32, space: vaspace.Info,
         parent: names.Lease, logical_bytes: u64, deadline: u64) Error!Owner
@@ -256,6 +259,12 @@ pub const Owner = struct {
                 self.state = if (self.state == .unwinding) .ready else .closed;
                 return null;
             };
+            if (self.user_memory != null and (op == .allocate_memory or op == .free_memory)) {
+                if (try self.exchange.poll(self.deadline)) |dispatch| return dispatch;
+                if (self.exchange.in_lockdown) return null;
+                try self.advanceUserPhysical(op);
+                return null;
+            }
             if (self.binding.space.host) |host| if (op != .allocate_memory and op != .free_memory) {
                 if (try self.exchange.poll(self.deadline)) |dispatch| return dispatch;
                 if (self.exchange.in_lockdown) return null;
@@ -316,6 +325,30 @@ pub const Owner = struct {
         self.cleared = true; self.clear_active = false;
         return null;
     }
+    fn advanceUserPhysical(self: *Owner, op: wire.Operation) Error!void {
+        const user = self.user_memory orelse return error.State;
+        if (self.binding.space.host == null or self.storage_policy != null or self.mapped or self.virtual or self.host_active or
+            !self.aliases.empty()) return error.State;
+        switch (op) {
+            .allocate_memory => {
+                const base = user.heap.reserve(user.view, self.binding.space.epoch, &self.user_range, self.bytes, self.layout.descriptor.alignment) catch |err| {
+                    if (err != error.Memory) return err;
+                    self.host_rejected = a.gfx_buffer_error_oom;
+                    self.state = .unwinding;
+                    return;
+                };
+                self.host_physical = base; self.physical = true; self.cleared = true;
+            },
+            .free_memory => {
+                // The exact common release ticket excludes users; host VA
+                // teardown above already acknowledged every PTE/TLB removal.
+                try user.heap.release(&self.user_range, true);
+                self.host_physical = null; self.physical = false; self.cleared = false;
+            },
+            else => return error.State,
+        }
+        self.last_status = 0;
+    }
     fn hostSource(self: *const Owner) host_vm.Source {
         return .{ .context = self, .valid = hostValid, .physical = hostPhysical, .bytes = self.bytes,
             .policy = .{ .aperture = .video, .kind = if (self.layout.blocklinear()) 6 else 0, .cached = true,
@@ -324,6 +357,8 @@ pub const Owner = struct {
     fn hostValid(raw: *const anyopaque, epoch: u64) bool {
         const self: *const Owner = @ptrCast(@alignCast(raw));
         self.stable() catch return false;
+        if (self.user_memory) |user| if (!user.heap.owns(&self.user_range) or
+            self.host_physical != self.user_range.span.base or self.bytes != self.user_range.span.bytes) return false;
         return self.self_address == @intFromPtr(self) and self.binding.space.epoch == epoch and self.physical and self.host_physical != null;
     }
     fn hostPhysical(raw: *const anyopaque, offset: u64) host_vm.Error!u64 {
@@ -430,10 +465,11 @@ pub const Owner = struct {
             } else if (self.memory.bufferAbort(&self.reservation, 1) != a.gfx_buffer_result_ok) return error.Retained;
             self.common_live = false;
         }
+        if (self.user_range.owner) |heap| try heap.release(&self.user_range, true);
         if (self.namespace_live) try self.exchange.session.rm_names.retireChildrenAfterReset(self.names, proof);
         self.namespace_live = false;
         self.physical = false; self.virtual = false; self.mapped = false;
-        self.physical_extent = null; self.state = .finished;
+        self.physical_extent = null; self.host_physical = null; self.state = .finished;
         return true;
     }
     pub fn handoff(self: *Owner) Error!boot.Handoff {

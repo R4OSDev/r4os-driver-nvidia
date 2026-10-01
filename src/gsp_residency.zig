@@ -3,7 +3,17 @@
 //! subsets are distinct. This snapshot grants no eviction or quiescence.
 const std = @import("std");
 const a = @import("r4os").abi;
+/// Optional bounded headless budget. MB follows the R4OS 1024*1024 convention.
+/// This only lowers admission; it neither allocates nor invents free VRAM.
+pub fn configuredLimit(value: []const u8) !u64 {
+    if (value.len == 0) return 0;
+    for (value) |digit| if (digit < '0' or digit > '9') return error.Invalid;
+    const megabytes = std.fmt.parseInt(u64, value, 10) catch return error.Invalid;
+    if (megabytes < 64 or megabytes > 65536) return error.Invalid;
+    return megabytes * 1024 * 1024;
+}
 pub const Admission = struct {
+    requested_limit_bytes: u64 = 0,
     epoch: u64 = 0,
     configured: bool = false,
     limit_bytes: u64 = 0,
@@ -19,6 +29,10 @@ pub const Admission = struct {
         const region_capacity = @min(memory.region_bytes, @min(memory.physical_bytes, memory.reported_bytes));
         return (region_capacity -| memory.retained_bytes -| memory.speculative_reserved) & ~@as(u64, 65535);
     }
+    pub fn effectiveCeiling(self: *const Admission, memory: anytype) u64 {
+        const detected = ceiling(memory);
+        return if (self.requested_limit_bytes == 0) detected else @min(detected, self.requested_limit_bytes);
+    }
     fn accept(self: *Admission, state: a.GfxDeviceBudgetState, adapter: u32, epoch: u64) !void {
         if (state.version != 1 or state.size < @sizeOf(a.GfxDeviceBudgetState) or state.adapter_id != adapter or
             state.memory_generation != epoch or state.flags & ~a.gfx_memory_budget_closing != 0 or state.limit_bytes % 4096 != 0) return error.Descriptor;
@@ -32,7 +46,7 @@ pub const Admission = struct {
         const memory = run.ctx.?.memory() orelse return error.Api;
         var state: a.GfxDeviceBudgetState = .{};
         if (self.epoch == 0) {
-            const limit = ceiling(observed);
+            const limit = self.effectiveCeiling(observed);
             const result = memory.memoryBudget(&.{ .adapter_id = run.adapter_id, .memory_generation = run.epoch,
                 .operation = a.gfx_memory_budget_configure, .limit_bytes = limit }, &state);
             if (result != a.gfx_buffer_result_ok and result != a.err_no_fn) return error.Api;

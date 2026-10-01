@@ -85,6 +85,8 @@ pub const Summary = struct {
     instance_active: bool = false,
     rebar_present: bool = false,
     firmware_layout_matches: bool = false,
+    firmware_layout_reported: bool = false,
+    firmware_layout_usable: bool = false,
     non_wpr_heap: u64 = 0,
     frts: u64 = 0,
     bar1_pdb: u64 = 0,
@@ -98,9 +100,9 @@ pub const Placement = enum {
     rm_reserved,
     boot_retained,
     firmware_layout_changed,
-    // Necessary interval screening only. A future RM allocation and mapping
-    // owner must establish actual ownership and device visibility separately.
-    requires_rm_allocation,
+    // Necessary screening only; the driver's application heap must reserve
+    // this extent before the host MMU can establish device visibility.
+    requires_host_allocation,
 };
 pub const Owner = struct {
     self_address: usize = 0,
@@ -131,6 +133,14 @@ pub const Owner = struct {
         self.binding = binding;
         errdefer self.state = .invalidated;
         self.data = .{ .epoch = epoch, .boot_epoch = binding.epoch, .physical_bytes = plan.fb_bytes, .reported_bytes = info.fb_bytes, .region_count = info.region_count, .surface_extents = map.range_count, .table_pages = map.page_count, .payload_extents = context.payload_plan.count, .instance_active = context.instance_active, .rebar_present = pci.caps.rebar != 0, .firmware_layout_matches = info.non_wpr_heap == plan.non_wpr_heap.offset and info.frts == plan.frts.offset, .non_wpr_heap = info.non_wpr_heap, .frts = info.frts, .bar1_pdb = info.bar1_pdb, .bar2_pdb = info.bar2_pdb };
+        self.data.firmware_layout_reported = info.non_wpr_heap != 0 or info.frts != 0;
+        // 570.144 kernel_gsp.c:_kgspSetFwWprLayoutOffset only consumes these
+        // fields on ACR-owned WPR layouts. g_gpu_nvoc.c leaves that property
+        // false on GA102/AD102 HALs. Their absent pair does not supersede the
+        // already authenticated boot plan; a nonzero mismatch still fails
+        // closed. Do not infer this policy for later architectures.
+        self.data.firmware_layout_usable = self.data.firmware_layout_matches or
+            (!self.data.firmware_layout_reported and @import("generation.zig").ga102Hal(display.chip.?.id));
         if (info.fb_bytes == 0 or info.fb_bytes > plan.fb_bytes) return error.MemoryBounds;
         for ([_]u8{ 0, 1, 3 }, 0..) |index, slot|
             self.data.windows[slot] = try window(pci, index);
@@ -164,7 +174,7 @@ pub const Owner = struct {
         // Firmware regions may have gaps or appear out of address order.
         // Fully protect every speculative/protected region: never invent a
         // reserved tail from an amount. Unknown layout changes screen no bytes.
-        if (self.data.firmware_layout_matches) for (self.regions[0..self.data.region_count]) |*region| {
+        if (self.data.firmware_layout_usable) for (self.regions[0..self.data.region_count]) |*region| {
             if (region.protected or region.reserved != 0) continue;
             var bytes = region.bytes;
             for (self.retained[0..self.data.retained_count]) |span|
@@ -191,14 +201,14 @@ pub const Owner = struct {
     pub fn placement(self: *const Owner, span: Span) !Placement {
         if (self.snapshot() == null) return error.MemoryStale;
         self.bounds(span) catch return .invalid;
-        if (!self.data.firmware_layout_matches) return .firmware_layout_changed;
+        if (!self.data.firmware_layout_usable) return .firmware_layout_changed;
         for (self.retained[0..self.data.retained_count]) |retained|
             if (overlap(span, retained) != 0) return .boot_retained;
         for (self.regions[0..self.data.region_count]) |*region| {
             if (span.base < region.base or span.base + span.bytes > region.base + region.bytes) continue;
             if (region.protected) return .protected;
             if (region.reserved != 0) return .rm_reserved;
-            return .requires_rm_allocation;
+            return .requires_host_allocation;
         }
         return .region_gap;
     }

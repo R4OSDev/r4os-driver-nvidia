@@ -693,9 +693,11 @@ pub const Device = struct {
                 const journal = self.running.faults;
                 const adapter = self.running.adapter_id;
                 const discover_receivers = self.running.discover_receivers;
+                const requested_limit = self.running.memory_admission.requested_limit_bytes;
                 self.running = .{};
                 self.running.adapter_id = adapter;
                 self.running.discover_receivers = discover_receivers;
+                self.running.memory_admission.requested_limit_bytes = requested_limit;
                 self.running.faults = journal;
                 // Keep the first failure and every diagnostic record, but
                 // the retired generation's fatal delivery is now consumed.

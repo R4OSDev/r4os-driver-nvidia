@@ -2063,7 +2063,7 @@ fn checkDeviceStatic(target: *@import("gsp_device.zig").Device, words: []u32, fr
         try t.expect(memory.screened_bytes == physical / 2 - retained);
         try t.expect(memory.windows[1].base == 0xd0000000 and memory.windows[1].bytes == 0x10000000 and memory.windows[1].status == .measured);
         try t.expect(memory.windows[2].pci_index == 3 and memory.windows[2].bytes == 0x2000000);
-        try t.expect(DeviceModel.memory_logs == memory_logs + 2 and DeviceModel.region_logs == region_logs + 2 and DeviceModel.aperture_logs == aperture_logs + 3);
+        try t.expect(DeviceModel.memory_logs == memory_logs + 3 and DeviceModel.region_logs == region_logs + 2 and DeviceModel.aperture_logs == aperture_logs + 3);
         if (scenario == .success) try checkMemoryInventory(target, &info);
         // Snapshot survives reuse of the borrowed DMA receive buffer.
         @memset(&target.rx, 0xa5);
@@ -2093,7 +2093,7 @@ fn checkMemoryInventory(target: *@import("gsp_device.zig").Device, info: *const 
     const live = &target.running.memory_inventory;
     const lease = target.vram.?;
     const physical = info.fb_bytes;
-    try t.expectEqual(inventory.Placement.requires_rm_allocation, try live.placement(.{ .base = 0x20000, .bytes = 4096 }));
+    try t.expectEqual(inventory.Placement.requires_host_allocation, try live.placement(.{ .base = 0x20000, .bytes = 4096 }));
     try t.expectEqual(inventory.Placement.boot_retained, try live.placement(.{ .base = 0x10000, .bytes = 4096 }));
     try t.expectEqual(inventory.Placement.boot_retained, try live.placement(.{ .base = lease.plan.?.reserved.offset, .bytes = 1 }));
     try t.expectEqual(inventory.Placement.protected, try live.placement(.{ .base = physical / 2, .bytes = 4096 }));
@@ -2105,6 +2105,7 @@ fn checkMemoryInventory(target: *@import("gsp_device.zig").Device, info: *const 
     try t.expectError(error.MemoryStale, live.placement(.{ .base = 0x20000, .bytes = 4096 }));
     lease.serial -= 1;
     try t.expect(target.running.nativeMemory() != null);
+    try checkUserVram(live, target.epoch);
 
     // Same real retained lease, varied firmware metadata. These observations
     // never allocate memory or extend the device port's allowed operations.
@@ -2131,6 +2132,25 @@ fn checkMemoryInventory(target: *@import("gsp_device.zig").Device, info: *const 
     try t.expect(!model.snapshot().?.firmware_layout_matches and model.snapshot().?.screened_bytes == 0);
     try t.expectEqual(inventory.Placement.firmware_layout_changed, try model.placement(.{ .base = 0x20000, .bytes = 4096 }));
 
+    // GA102/AD102 do not use ACR-supplied WPR offsets (original 570.144
+    // generated property). An absent pair keeps the authenticated boot plan.
+    sample = info.*; sample.non_wpr_heap = 0; sample.frts = 0;
+    model.* = .{};
+    try model.prepare(lease, &sample, target.epoch);
+    try model.publish();
+    try t.expect(!model.data.firmware_layout_reported and !model.data.firmware_layout_matches and model.data.firmware_layout_usable);
+    try t.expectEqual(live.data.screened_bytes, model.data.screened_bytes);
+    try checkUserVram(model, target.epoch);
+    sample.frts = info.frts;
+    model.* = .{};
+    try model.prepare(lease, &sample, target.epoch);
+    try model.publish();
+    try t.expect(model.data.firmware_layout_reported and !model.data.firmware_layout_usable and model.data.screened_bytes == 0);
+    var denied: @import("gsp_user_vram.zig").Owner = .{};
+    var range: @import("gsp_user_vram.zig").Range = .{};
+    try t.expectError(error.Memory, denied.reserve(model, target.epoch, &range, 65536, 65536));
+    try t.expect(denied.empty() and range.owner == null);
+
     // Holes are not free, region order does not imply address order, aliases
     // are counted once, and partial batch failure never publishes a catalog.
     sample = info.*;
@@ -2147,11 +2167,48 @@ fn checkMemoryInventory(target: *@import("gsp_device.zig").Device, info: *const 
     try t.expect(model.snapshot().?.region_holes == 0x40000 and model.snapshot().?.retained_count == 3);
     try t.expect(model.snapshot().?.retained_bytes == live.data.retained_bytes - 4096);
     try t.expectEqual(inventory.Placement.region_gap, try model.placement(.{ .base = 0x20000, .bytes = 4096 }));
-    try t.expectEqual(inventory.Placement.requires_rm_allocation, try model.placement(.{ .base = 0x40000, .bytes = 4096 }));
+    try t.expectEqual(inventory.Placement.requires_host_allocation, try model.placement(.{ .base = 0x40000, .bytes = 4096 }));
     sample.regions[1].base = physical - 1;
     model.* = .{};
     try t.expectError(error.MemoryBounds, model.prepare(lease, &sample, target.epoch));
     try t.expect(model.snapshot() == null);
+}
+
+fn checkUserVram(view: *@import("gsp_memory_inventory.zig").Owner, epoch: u64) !void {
+    const user = @import("gsp_user_vram.zig");
+    var arena: user.Owner = .{};
+    var ranges: [3]user.Range = @splat(.{});
+    const first = try arena.reserve(view, epoch, &ranges[0], 8 * 1024 * 1024, 65536);
+    const second = try arena.reserve(view, epoch, &ranges[1], 16 * 1024 * 1024, 65536);
+    try t.expect(second >= first + ranges[0].span.bytes and arena.count == 2 and arena.bytes == 24 * 1024 * 1024);
+    for (&ranges) |*range| if (range.owner != null) {
+        try t.expectEqual(@import("gsp_memory_inventory.zig").Placement.requires_host_allocation, try view.placement(range.span));
+        for (view.retained[0..view.data.retained_count]) |held|
+            try t.expect(range.span.base >= held.base + held.bytes or range.span.base + range.span.bytes <= held.base);
+    };
+    try t.expectError(error.Retained, arena.release(&ranges[0], false));
+    var copy = ranges[0];
+    try t.expectError(error.Stale, arena.release(&copy, true));
+    try t.expectError(error.Stale, arena.reserve(view, epoch + 1, &ranges[2], 65536, 65536));
+    try t.expectError(error.Bounds, arena.reserve(view, epoch, &ranges[2], 65536, 0));
+    try t.expectError(error.Bounds, arena.reserve(view, epoch, &ranges[2], 1, 65536));
+    try t.expectError(error.Memory, arena.reserve(view, epoch, &ranges[2], view.data.physical_bytes, 65536));
+    try arena.release(&ranges[0], true);
+    try t.expectEqual(first, try arena.reserve(view, epoch, &ranges[2], 8 * 1024 * 1024, 65536));
+    try arena.release(&ranges[1], true);
+    try arena.release(&ranges[2], true);
+    try t.expect(arena.empty());
+    // A larger request may cross a boot exclusion that the smaller one did
+    // not. Empty application ownership never makes those boot holes free.
+    try t.expect(try arena.reserve(view, epoch, &ranges[0], 24 * 1024 * 1024, 65536) >= first);
+    try t.expectEqual(@import("gsp_memory_inventory.zig").Placement.requires_host_allocation, try view.placement(ranges[0].span));
+    const state = view.state;
+    view.invalidate();
+    try t.expectError(error.Stale, arena.reserve(view, epoch, &ranges[1], 65536, 65536));
+    try t.expectError(error.Retained, arena.release(&ranges[0], false));
+    try arena.release(&ranges[0], true);
+    try t.expect(arena.empty());
+    view.state = state;
 }
 
 fn checkDevicePostInit(target: *@import("gsp_device.zig").Device, words: []u32, frts: u64, scenario: anytype) !void {
@@ -2650,8 +2707,9 @@ fn checkDeviceHostMmu(target: *@import("gsp_device.zig").Device, words: []u32, t
     const vm_wire = @import("gsp_host_vm_wire.zig");
     const caps = @import("gsp_memory_caps.zig");
     const heap_model = @import("gsp_buffer_test_model.zig").Model;
-    heap_model.install(table, "host_mmu_native");
-    defer heap_model.dispose(table);
+    const native_model = @import("gsp_vram_test_model.zig").Model;
+    native_model.install(table, "host_mmu_native");
+    defer native_model.dispose(table);
     const running = &target.running;
     const session = &target.session.?;
     const command = init.queues_offset + init.command_offset;
@@ -2662,6 +2720,7 @@ fn checkDeviceHostMmu(target: *@import("gsp_device.zig").Device, words: []u32, t
     var invalidates: usize = 0;
     var checked = false;
     var deferred_checked = false;
+    var prior_page_releases: usize = 0;
     var steps: usize = 0;
     errdefer |err| std.debug.print("external PDB actual Device error={s} phase={s} failure={?}/{?} graph={s} steps={d} binds={d} unbinds={d} invalidates={d} pages={d}\n",
         .{@errorName(err), @tagName(target.phase), target.failure, running.failure,
@@ -2681,7 +2740,7 @@ fn checkDeviceHostMmu(target: *@import("gsp_device.zig").Device, words: []u32, t
         try t.expect(target.phase == .ready and running.failure == null);
         if (pages.deferred_collects != 0 and ControlModel.active) {
             const storage = &running.graph.?.address_space.?.host_storage;
-            try t.expect(storage.deferred_pages != 0 and pages.count == 5 and pages.released == 0);
+            try t.expect(storage.deferred_pages != 0 and pages.count == 5 and pages.released == prior_page_releases);
             try t.expect(heap_model.heapLive() >= pages.count);
             try t.expectError(error.Retained, storage.closeEmpty());
             deferred_checked = true;
@@ -2699,6 +2758,9 @@ fn checkDeviceHostMmu(target: *@import("gsp_device.zig").Device, words: []u32, t
             var copy = space.host.?.*;
             const port_owner = target.port.owner.?;
             try t.expectError(error.Binding, port_owner.admit_host_mmu.?(port_owner.context, &target.port, &copy, clock + 1000000000));
+            try checkHostNativeVram(target, words, bound, &invalidates);
+            try t.expect(pages.count == 5 and running.user_vram.empty() and native_model.charged == 0);
+            prior_page_releases = pages.released;
             checked = true;
             // The common collector covers the entire driver epoch. A native
             // backing being destroyed can keep it busy until this VM unmap
@@ -2738,7 +2800,7 @@ fn checkDeviceHostMmu(target: *@import("gsp_device.zig").Device, words: []u32, t
                 try t.expect(std.mem.readInt(u32, response[32..36], .little) == 4 and std.mem.readInt(u32, response[36..40], .little) == 9);
                 binds += 1;
             } else if (cmd == vm_wire.command(.unbind)) {
-                try t.expect(checked and bound != 0 and length == 32 and pages.count == 1 and invalidates == 2);
+                try t.expect(checked and bound != 0 and length == 32 and pages.count == 1 and invalidates == 6);
                 try t.expect(try pages.walk(bound, ControlModel.gpu_address) == 0 and !ControlModel.active);
                 unbinds += 1;
                 bound = 0;
@@ -2755,12 +2817,64 @@ fn checkDeviceHostMmu(target: *@import("gsp_device.zig").Device, words: []u32, t
         else try t.expect(function == 4);
         try nativeEvent(session, function, response[0..length]);
     }
-    try t.expect(steps < 2000 and checked and binds == 1 and unbinds == 1 and invalidates == 2 and bound == 0);
+    try t.expect(steps < 2000 and checked and binds == 1 and unbinds == 1 and invalidates == 6 and bound == 0);
     try t.expect(pages.count == 0 and pages.allocated == pages.released and !ControlModel.active and ControlModel.releases == 1);
     try t.expect(deferred_checked and pages.deferred_collects >= 4);
     try t.expect(running.graph.?.address_space.?.host_storage.self_address == 0 and running.graph.?.address_space.?.host_vm.self_address == 0);
     try t.expect(heap_model.heapLive() == 0);
     try t.expect(target.catalog.close());
+}
+
+fn checkHostNativeVram(target: *@import("gsp_device.zig").Device, words: []u32, root: u64, invalidates: *usize) !void {
+    const pages = @import("gsp_host_vm_memory_test.zig").Model;
+    const tlb = @import("gsp_host_tlb.zig");
+    const runtime = @import("gsp_runtime.zig");
+    const running = &target.running;
+    var handles: [2]runtime.BufferHandle = undefined;
+    const before_sequence = target.session.?.tx_sequence;
+    const before_pages = pages.count;
+    for (&handles, 0..) |*handle, index| {
+        handle.* = try running.allocateNativeBuffer(if (index == 0) 8 * 1024 * 1024 else 4 * 1024 * 1024, clock + 1000000000);
+        var steps: usize = 0;
+        while (steps < 4096) : (steps += 1) {
+            if (words[tlb.invalidate / 4] & tlb.trigger != 0) {
+                try t.expect(words[tlb.invalidate / 4] == tlb.command);
+                words[tlb.invalidate / 4] = 0; invalidates.* += 1;
+            }
+            clock += 1000; _ = target.step();
+            try t.expect(target.phase == .ready and running.failure == null and target.session.?.tx_sequence == before_sequence);
+            const state = try running.nativeBufferStatus(handle.*);
+            if (state.state == .handed_off) break;
+        }
+        try t.expect(steps < 4096);
+        const state = try running.nativeBufferStatus(handle.*);
+        const info = state.info orelse return error.MissingNativeBuffer;
+        const owner = running.native_buffers.items()[handle.slot].owner.?;
+        try t.expect(owner.user_range.owner == &running.user_vram and owner.physical and owner.mapped and state.rejected == null);
+        const physical = owner.user_range.span.base;
+        var offset: u64 = 0;
+        while (offset < info.allocation_bytes) : (offset += 4096) {
+            const pte = try pages.walk(root, info.address + offset);
+            try t.expectEqual((physical + offset) >> 4, pte & @as(u64, 0x000fffffffffff00));
+            try t.expect(pte & 1 != 0);
+        }
+    }
+    try t.expect(running.user_vram.count == 2 and running.user_vram.bytes == 12 * 1024 * 1024 and pages.count > before_pages);
+    for (handles) |handle| try running.releaseNativeBuffer(handle);
+    var steps: usize = 0;
+    while (steps < 4096) : (steps += 1) {
+        if (words[tlb.invalidate / 4] & tlb.trigger != 0) {
+            try t.expect(words[tlb.invalidate / 4] == tlb.command);
+            words[tlb.invalidate / 4] = 0; invalidates.* += 1;
+        }
+        clock += 1000; _ = target.step();
+        try t.expect(target.phase == .ready and running.failure == null and target.session.?.tx_sequence == before_sequence);
+        var live = false;
+        for (running.native_buffers.view()) |slot| if (slot.owner != null) { live = true; };
+        if (!live) break;
+    }
+    try t.expect(steps < 4096 and running.user_vram.empty() and pages.count == before_pages);
+    std.debug.print("[nvidia-host-vram] application 8MB+4MB; every host PTE checked; no allocation/map/free RPC; exact last-use and TLB retirement\n", .{});
 }
 
 fn checkDeviceRm(target: *@import("gsp_device.zig").Device, words: []u32, frts: u64, scenario: anytype) !void {
@@ -7178,6 +7292,9 @@ const HeadlessResetFixture = struct {
         try t.expect(job.diagnostic_timeout and !run.diagnostic_copy_timeout);
         // Even an unconsumed diagnostic option cannot cross a reset epoch.
         run.diagnostic_render_timeout = true;
+        // A configured admission ceiling is policy, not a one-shot fault.
+        // It must survive and configure the fresh memory generation again.
+        run.memory_admission.requested_limit_bytes = 128 * 1024 * 1024;
         const raw: [*]const u8 = @ptrFromInt(target.port.window.cpu_address);
         try copy.fetch(run.fifos[job.channel_handle.slot].owner.?, raw[0..@intCast(target.port.window.byte_length)]);
         try copy.execute();
@@ -7211,6 +7328,7 @@ const HeadlessResetFixture = struct {
         try t.expect(target.phase == .frts and calls == 2 and restaging.calls == 1 and target.epoch > old_epoch and
             !proof.valid(old_epoch) and !target.memory.?.releaseAfterReset(proof) and !run.discover_receivers and
             !run.diagnostic_copy_timeout and !run.diagnostic_render_timeout and target.native_output.self_address == 0 and target.fault_reset_attempted);
+        try t.expect(run.memory_admission.epoch == 0 and run.memory_admission.requested_limit_bytes == 128 * 1024 * 1024);
         var notified = false;
         while (target.phase != .ready) : (slices += 1) {
             try t.expect(slices < 16000 and target.phase != .failed);
@@ -11386,6 +11504,10 @@ fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverAp
     model.install(table, scenario);
     target.running.memory_api = target.ctx.?.memory();
     defer model.dispose(table);
+    if (model.is("vram_success")) {
+        try t.expect(running.memory_admission.epoch == 0);
+        running.memory_admission.requested_limit_bytes = 128 * 1024 * 1024;
+    }
     var handles: [2]runtime.BufferHandle = undefined;
     var messages: usize = 0;
     var interleaved = false;
@@ -11429,7 +11551,8 @@ fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverAp
         for (reserved_names[0..reserved_count]) |lease| try session.rm_names.retireChildren(lease);
         try t.expect(running.memory_admission.epoch == running.epoch);
         if (model.is("vram_surface_linear")) try t.expect(!running.memory_admission.configured and model.budget_configurations == 0)
-        else try t.expect(running.memory_admission.configured and model.budget_configurations == 1 and model.budget.limit_bytes == @import("gsp_residency.zig").Admission.ceiling(running.nativeMemory().?));
+        else try t.expect(running.memory_admission.configured and model.budget_configurations == 1 and model.budget.limit_bytes == running.memory_admission.effectiveCeiling(running.nativeMemory().?));
+        if (model.is("vram_success")) try t.expect(model.budget.limit_bytes == 128 * 1024 * 1024 and running.memory_admission.progress_bytes == 16 * 1024 * 1024);
         var forged = handles[index]; forged.serial += 1;
         try t.expectError(error.Stale, running.nativeBufferStatus(forged));
         var steps: usize = 0;

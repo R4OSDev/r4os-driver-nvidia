@@ -46,7 +46,38 @@ Fresh TV/HDMI qualification remains0.82.37; manual changes0.82.38. Evidence:
 ExFiles/Reports/OssiGPU/20261001-receivers08204. Older dated entries below
 remain historical checkpoints, not the current list of unfinished work.
 
-NVIDIA display driver for R4OS. Module 0.1.191; original R4OS code is
+Version0.1.192 adds optional `OPTION NVIDIA vram-limit-mb=64` for
+`mode=headless`. Decimal values64..65536 limit driver admission to the
+smaller of this MB budget and detected capacity; one MB is1024*1024bytes.
+The existing progress reserve and physical allocation/retirement accounting
+remain in force. No option keeps the detected budget. Invalid values or use
+outside headless mode fail before PCI/firmware access; effective software
+graphics still bypasses native initialization. A GPU reset preserves this
+policy for the fresh memory generation. This is a budget, not a placement
+or fragmentation guarantee. Physical pressure qualification is recorded below.
+
+Version0.1.193 moves ordinary application backing in the host-owned GPU
+address space to the firmware-declared, nonreserved VRAM regions. The old
+direct NV01_MEMORY_LOCAL_USER path consumed GSP's small private heap and
+rejected even8MB on GA106. Resident extent ownership excludes every retained
+boot range and whole reserved/protected regions. It survives producer close
+until the exact last-use release and host PTE/TLB retirement; confirmed reset
+has its separate cleanup path. Private control and scanout backing retain
+their RM allocation/clear contracts. Application aliases use the existing
+host MMU and do not fabricate firmware memory-object acknowledgements.
+Absent WPR-offset fields on GA102/AD102 retain the authenticated boot layout;
+a reported nonzero mismatch still blocks placement. Physical193 passes both8MB
+allocations and two concurrent30-second producers (375 rounds each, exact
+pixels), actual64MB budget pressure, prioritized managed-image reconstruction
+and exact warm resource retirement. Raw/imported/pinned images are preserved.
+The original configuration is restored; normal shutdown confirms zero resources
+and stopped DMA without Wake-on-LAN. Fresh native work passes at the original
+budget. Existing owner groups and fresh SMP4 pass. See GrafikResidenz07928.json
+pressure_qualification_08215 and ExFiles/Reports/OssiGPU/20261001-pressure08215.
+The original failed192 attempt and8MB rejection remain evidence; active output
+and manual observations remain0.82.37/38.
+
+NVIDIA display driver for R4OS. Module 0.1.193; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,

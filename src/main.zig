@@ -102,6 +102,17 @@ pub export fn nvidia_init(api: *const a.DriverApi) callconv(.c) i32 {
     }
     starting_native = automatic or std.ascii.eqlIgnoreCase(mode, "native");
     starting_headless = std.ascii.eqlIgnoreCase(mode, "headless");
+    const vram_limit = std.mem.span(ctx.getOption("NVIDIA", "vram-limit-mb"));
+    if (vram_limit.len != 0 and !starting_headless) {
+        ctx.logError("NVIDIA budget: rejected; vram-limit-mb requires headless mode");
+        return -2;
+    }
+    native_device.running.memory_admission.requested_limit_bytes = @import("gsp_residency.zig").configuredLimit(vram_limit) catch {
+        ctx.logError("NVIDIA budget: rejected; vram-limit-mb must be decimal 64..65536");
+        return -2;
+    };
+    if (vram_limit.len != 0) log("NVIDIA budget: requested-limit={d} effective-limit=min(detected,requested) progress-reserve=preserved", .{
+        native_device.running.memory_admission.requested_limit_bytes });
     const reset_probe = std.mem.span(ctx.getOption("NVIDIA", "reset-probe"));
     const copy_probe = starting_headless and std.ascii.eqlIgnoreCase(reset_probe, "copy-timeout");
     const render_probe = starting_headless and std.ascii.eqlIgnoreCase(reset_probe, "render-timeout");

@@ -294,6 +294,7 @@ pub const Owner = struct {
     static_info: ?static.Info = null,
     reservation: ?*const @import("boot_vram_lease.zig").Lease = null,
     memory_inventory: inventory.Owner = .{},
+    user_vram: @import("gsp_user_vram.zig").Owner = .{},
     memory_admission: @import("gsp_residency.zig").Admission = .{},
     physical_bytes: u64 = 0,
     startup_deadline: u64 = 0,
@@ -715,6 +716,7 @@ pub const Owner = struct {
                     return error.Descriptor;
                 };
                 try self.native_buffers.closeEmpty();
+                if (!self.user_vram.empty()) return error.Retained;
                 if (self.graph) |*graph| if (graph.address_space) |*space| {
                     if (!try space.host_storage.closeAfterReset(proof)) return false;
                     space.host_vm = .{};
@@ -1125,7 +1127,10 @@ pub const Owner = struct {
             .{data.control_reserved_bytes,data.scanout_reserved_bytes,data.render_cache_bytes,data.mapping_reserved_bytes,data.mapping_cache_bytes,data.mapping_evicting_bytes,data.mapping_evictions});
         self.log("NVIDIA residency: budget-configured={} limit={d} progress-margin={d} last-admission-charge={d} denials={d}",
             .{self.memory_admission.configured,self.memory_admission.limit_bytes,self.memory_admission.progress_bytes,self.memory_admission.charged_bytes,self.memory_admission.denials});
-        self.log("NVIDIA residency: placement=RM largest-free-extent=unknown fragmentation=unmeasured retained-is-not-leak=yes", .{});
+        if (self.memory_admission.requested_limit_bytes != 0) self.log("NVIDIA residency: configured-headless-limit={d} placement-guarantee=no", .{
+            self.memory_admission.requested_limit_bytes });
+        self.log("NVIDIA residency: placement=host-application,RM-private host-extents={d} host-bytes={d} largest-free-extent=unknown fragmentation=unmeasured retained-is-not-leak=yes",
+            .{self.user_vram.count, self.user_vram.bytes});
         self.log("NVIDIA scheduling: held={d}/{d} high-water={d} slices={d} copy-limit={d} render-pixels={d} cursor=between-physical-slices",
             .{self.work_schedule.count(),scheduling.capacity,self.work_schedule.high_water,self.work_schedule.slices,
                 self.work_schedule.copy_limit,self.work_schedule.render_limit});
@@ -5615,6 +5620,8 @@ pub const Owner = struct {
         };
         const owner = &storage.owner;
         owner.* = value; slot.owner = owner; slot.serial = serial;
+        if (space.host != null and policy == null)
+            owner.user_memory = .{ .heap = &self.user_vram, .view = &self.memory_inventory };
         self.buffer_serial = serial; self.native_active = index;
         return .{ .epoch = self.epoch, .serial = serial, .slot = index };
     }
@@ -5985,6 +5992,7 @@ pub const Owner = struct {
             for (self.native_buffers.items()) |*slot| if (slot.owner != null) break :graph_close;
             try self.buffers.closeEmpty();
             try self.native_buffers.closeEmpty();
+            if (!self.user_vram.empty()) return error.Retained;
             var token = try channel.handoff(self.close_deadline);
             try self.graph.?.reclaim(&token, self.close_deadline);
             try self.graph.?.beginDestroy(self.close_deadline);
@@ -6513,6 +6521,8 @@ pub const Owner = struct {
                 data.speculative_reserved, data.retained_bytes, data.screened_bytes});
         self.log("NVIDIA gsp-memory: union={d} surface-extents={d} table-pages={d} instance={any} payload-extents={d} firmware-layout-matches={any}",
             .{data.retained_count, data.surface_extents, data.table_pages, data.instance_active, data.payload_extents, data.firmware_layout_matches});
+        self.log("NVIDIA gsp-memory: layout-reported={any} layout-usable={any} non-wpr={x} frts={x} application-placement=host-regions",
+            .{data.firmware_layout_reported, data.firmware_layout_usable, data.non_wpr_heap, data.frts});
         for (data.windows) |bar|
             self.log("NVIDIA gsp-aperture: pci-bar={d} base={x} bytes={d} status={s} prefetch={any} rebar-present={any} resize=no",
                 .{bar.pci_index, bar.base, bar.bytes, @tagName(bar.status), bar.prefetchable, data.rebar_present});
