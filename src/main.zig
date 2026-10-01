@@ -102,6 +102,12 @@ pub export fn nvidia_init(api: *const a.DriverApi) callconv(.c) i32 {
     }
     starting_native = automatic or std.ascii.eqlIgnoreCase(mode, "native");
     starting_headless = std.ascii.eqlIgnoreCase(mode, "headless");
+    const reset_probe = std.mem.span(ctx.getOption("NVIDIA", "reset-probe"));
+    if (reset_probe.len != 0 and (!starting_headless or !std.ascii.eqlIgnoreCase(reset_probe, "copy-timeout"))) {
+        ctx.logError("NVIDIA reset-probe: rejected; requires mode=headless reset-probe=copy-timeout");
+        return -2;
+    }
+    native_device.running.diagnostic_copy_timeout = reset_probe.len != 0;
     if (boot_policy == null and (starting_native or starting_headless or std.ascii.eqlIgnoreCase(mode, "gsp-start") or std.ascii.eqlIgnoreCase(mode, "boot-check"))) {
         ctx.logError("NVIDIA bind: boot-policy-unavailable native-writes=disabled fallback=preserved");
         return -11;
@@ -793,10 +799,14 @@ fn checkBoot(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Sna
     log("NVIDIA booters: resources=14 license=matched generation={d} reads={d} source=loaded-r4d gpu-authentication=unverified", .{ booters.generation, booters.reads });
     if (!stageBootInit(ctx, chip.id)) return false;
     if (starting_gsp) {
-        if (starting_native) {
+        if (starting_native or starting_headless) {
             const display = ctx.graphicsDisplay() orelse return false;
             if (!display.supportsReset()) {
                 ctx.logError("NVIDIA native-output: common reset/rebuild API unavailable; firmware-execution=disabled");
+                return false;
+            }
+            if (starting_headless and !display.supportsHeadlessResume()) {
+                ctx.logError("NVIDIA headless: common reset/resume API unavailable; firmware-execution=disabled");
                 return false;
             }
             native_device.recovery_hooks = .{ .restage = restageBootAfterReset };
@@ -805,6 +815,13 @@ fn checkBoot(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Sna
             log("NVIDIA gsp-start: rejected phase=owner reason={s} firmware-execution=disabled", .{@errorName(err)});
             return false;
         };
+        if (native_device.running.diagnostic_copy_timeout) {
+            if (!native_device.reset_config.valid() or native_device.reset_config_failure != null) {
+                ctx.logError("NVIDIA reset-probe: unsupported reset identity; firmware-execution=disabled");
+                return false;
+            }
+            ctx.logInfo("NVIDIA reset-probe: armed=one-public-copy completion-observation=withheld-until-deadline hardware-fault=no");
+        }
         native_device.running.discover_receivers = !starting_headless;
         if (starting_native) native_device.native_output.request(ctx, &native_device.running, &boot_vram) catch |err| {
             log("NVIDIA native-output: rejected phase=owner reason={s} firmware-execution=disabled", .{@errorName(err)});

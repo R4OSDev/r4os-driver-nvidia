@@ -217,6 +217,7 @@ pub const CopyJob = struct {
     ticket: ?execution_fifo.copy.Ticket = null,
     submitted: bool = false,
     presentation: bool = false,
+    diagnostic_timeout: bool = false,
     output_window: ?u3 = null,
     transfer: ?execution_fifo.copy.wire.Transfer = null,
     copied: u64 = 0,
@@ -390,6 +391,9 @@ pub const Owner = struct {
     work_schedule: scheduling.Owner = .{},
     active_work: ?usize = null,
     copy_job: ?*CopyJob = null,
+    // Explicit headless diagnostic only. Consumed by one public CE submit;
+    // rebuilding Owner does not rearm it. Hardware completion is not forged.
+    diagnostic_copy_timeout: bool = false,
     graphics_work: ?GraphicsWork = null,
     batch_work: ?BatchWork = null,
     graphics_cache: render_cache.Owner = .{},
@@ -3986,6 +3990,10 @@ pub const Owner = struct {
         if (!std.meta.eql(work.job, work.job_stamp)) return error.Stale;
         const fifo = try self.findChannel(work.channel_handle);
         if (work.submitted) {
+            if (work.diagnostic_timeout) {
+                if (current >= work.deadline) return error.Timeout;
+                return false;
+            }
             if (try fifo.ring.poll() >= work.ticket.?.point) {
                 work.copied = work.slice_end;
                 if (work.copied < try execution_fifo.copy.wire.logicalBytes(work.transfer orelse return error.State)) {
@@ -4088,7 +4096,15 @@ pub const Owner = struct {
         if (work.render_read.self_address != 0) work.render_read.ticket = work.ticket;
         try self.device.?.submitCopy(fifo, work.ticket.?, work.deadline);
         if (work.render_read.self_address != 0) work.render_read.submitted = true;
-        work.submitted = true; return true;
+        work.submitted = true;
+        if (self.diagnostic_copy_timeout and !work.presentation) {
+            self.diagnostic_copy_timeout = false;
+            work.diagnostic_timeout = true;
+            @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,
+                "NVIDIA reset-probe: submitted epoch={d} timeline={d} point={d} CE-point={d} deadline={d} DMA=held completion-observation=withheld hardware-fault=no",
+                .{self.epoch,work.job.fence.timeline,work.job.fence.point,work.ticket.?.point,work.deadline});
+        }
+        return true;
     }
     pub fn copyTransfer(self: *Owner) !execution_fifo.copy.wire.Transfer {
         try self.validateCopyOverlap();

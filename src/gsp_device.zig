@@ -95,6 +95,8 @@ pub const Device = struct {
     reset_config: reset.Config = .{},
     reset_config_failure: ?anyerror = null,
     gpu_reset: reset.Reset = .{},
+    fault_reset_attempted: bool = false,
+    terminal_reset_attempted: bool = false,
     recovery_hooks: ?RecoveryHooks = null,
     reset_binding: a.GfxBackendBinding = .{},
     reset_original_display: u64 = 0,
@@ -105,6 +107,8 @@ pub const Device = struct {
     reset_retire_deadline: u64 = 0,
     reset_frame_count: u8 = 2,
     reset_graphics_requested: bool = false,
+    reset_output_requested: bool = false,
+    headless_resumed: bool = false,
     reset_audio_location: u32 = 0,
     reset_audio_device: u32 = 0,
     reset_audio_attached: bool = false,
@@ -312,6 +316,22 @@ pub const Device = struct {
         if (self.phase == .ready) {
             if (self.interrupts.failed()) return error.Interrupt;
             if (self.running.failure) |err| return err;
+            if (self.gpu_reset.resumed and !self.reset_output_requested and !self.headless_resumed) {
+                if (self.running.copy_backend) |backend| {
+                    if (try self.now() >= self.deadline) return error.Deadline;
+                    const display = self.display.?.boot.display orelse return error.Api;
+                    var state: a.GfxNativeState = .{};
+                    const result = display.resumeHeadless(&backend.binding, self.reset_display.generation, &state);
+                    if (result == a.gfx_output_error_busy) return false;
+                    if (result != a.gfx_output_ok or !validResetState(state) or state.generation != self.reset_display.generation)
+                        return error.Handoff;
+                    self.headless_resumed = true;
+                    @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,
+                        "NVIDIA gpu-reset: headless-resumed epoch={d} device-generation={d} display-generation={d} output=held old-quiescence=revoked",
+                        .{self.epoch,backend.binding.device_generation,state.generation});
+                    return true;
+                }
+            }
             if (self.running.post.snapshot()) |inventory| {
                 if (self.interrupts.self_address == 0) {
                     if (try self.now() >= self.deadline) return error.Deadline;
@@ -534,7 +554,7 @@ pub const Device = struct {
             if (self.reset_display.generation == 0) self.resetBinding();
             self.phase = .resetting;
             self.reset_retire_deadline = try std.math.add(u64, try self.now(), 5 * std.time.ns_per_s);
-        } else if (self.phase == .ready and self.failure == null and
+        } else if (self.phase == .ready and self.running.failure == null and
             (self.native_output.self_address == 0 or self.native_output.phase == .waiting or self.native_output.phase == .receiver_wait) and
             (self.native_graphics.phase == .ready or self.native_graphics.phase == .unavailable or self.native_graphics.phase == .detached) and
             (self.native_graphics.phase != .ready or self.render_startup.phase == .ready or self.render_startup.phase == .unavailable)) {
@@ -566,10 +586,23 @@ pub const Device = struct {
         if (!self.interrupts.close()) return error.IrqRetirement;
         try self.reader.?.setPolling(false);
         if (self.reset_config_failure) |err| return err;
-        if (self.gpu_reset.self_address != 0) return error.ResetLimit;
+        // One automatic fault recovery per Device. A later explicit system
+        // shutdown independently needs physical stop of the rebuilt epoch.
+        // Never reuse the old epoch's proof or retry a failed terminal FLR.
+        const attempted = if (self.terminal_requested) &self.terminal_reset_attempted else &self.fault_reset_attempted;
+        if (attempted.*) return error.ResetLimit;
+        if (self.gpu_reset.self_address != 0) {
+            if (!self.terminal_requested or !self.gpu_reset.resumed or self.epoch <= self.gpu_reset.epoch)
+                return error.ResetLimit;
+            self.gpu_reset = .{};
+        }
+        attempted.* = true;
         self.phase = .resetting;
+        self.reset_display = .{};
+        self.reset_retire_stage = .runtime;
         self.reset_retire_deadline = try std.math.add(u64, self.clock_api.?.nowNs(), 5 * std.time.ns_per_s);
         self.reset_graphics_requested = self.native_graphics.self_address != 0 and !self.reset_to_console;
+        self.reset_output_requested = self.native_output.self_address != 0 or self.reset_to_console;
         if (self.recovery_hooks == null and !self.terminal_requested) {
             try self.gpu_reset.open(&self.reset_config, self.epoch, self.resetIo());
         } else {
@@ -580,8 +613,8 @@ pub const Device = struct {
             self.reset_audio_attached = self.native_output.audio.catalog != null;
         }
         @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,
-            "NVIDIA gpu-reset: attempt=1 scope=selected-NVIDIA-Fn0 epoch={d} original-phase={s} driver={s} firmware={s} resources=held display=held",
-            .{self.epoch,@tagName(self.failed_phase orelse .detached),@import("nvidia_identity").version,@import("firmware.zig").lock.rm_version});
+            "NVIDIA gpu-reset: attempt=1 purpose={s} scope=selected-NVIDIA-Fn0 epoch={d} original-phase={s} driver={s} firmware={s} resources=held display=held",
+            .{if (self.terminal_requested) "terminal" else "fault",self.epoch,@tagName(self.failed_phase orelse .detached),@import("nvidia_identity").version,@import("firmware.zig").lock.rm_version});
     }
     fn resetBinding(self: *Device) void {
         self.reset_original_display = if (self.reset_to_console) self.display.?.firmware_restore_generation
@@ -679,7 +712,9 @@ pub const Device = struct {
                     .{ .epoch = self.epoch, .deadline_ns = self.deadline, .resume_args = inputs.resume_args }, self.owner(), &self.display.?.registers);
                 self.catalog = .{};
                 try self.catalog.open(&self.ctx.?, adapter);
-                try self.native_output.requestAfterReset(&self.ctx.?, &self.running, self.display.?, self.reset_display.generation);
+                if (self.reset_output_requested)
+                    try self.native_output.requestAfterReset(&self.ctx.?, &self.running, self.display.?, self.reset_display.generation)
+                else try self.running.native_copy.request();
                 if (self.reset_graphics_requested) try self.native_graphics.request();
                 if (self.reset_to_console) {
                     self.running.native_copy.publish_backend = false;

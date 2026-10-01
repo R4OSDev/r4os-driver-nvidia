@@ -58,6 +58,7 @@ pub const Model = struct {
     pub var completed: usize = 0;
     pub var result: u32 = 0;
     pub var lost = false;
+    pub var stop_proof: ?@import("gsp_reset.zig").Quiescence = null;
     pub var unregisters: usize = 0;
     pub var presentation_wakes: usize = 0;
     pub var initial_read: a.GfxDeviceLease = .{};
@@ -94,7 +95,7 @@ pub const Model = struct {
         table.gfx_memory_query = memory; table.gfx_queue_query = queue;
         references = @splat(.{}); dma = @splat(.{}); gpu = @splat(.{}); queued = false; active = false;
         residency_rejected = @splat(false);
-        completed = 0; result = 0; lost = false; unregisters = 0; reject_resource = false; native_index = index; fetched = false; executed = false; signaled = false;
+        completed = 0; result = 0; lost = false; stop_proof = null; unregisters = 0; reject_resource = false; native_index = index; fetched = false; executed = false; signaled = false;
         present_mode = false; product_mode = false; render_mode = false; render_operations = 13; shadow_cpu = false; shadow_creates = 0;
         direct_mode = false; scanouts = @splat(null); next_point = 0;
         shadow_live = false; registration = null; decoded_count = 0; presentation_wakes = 0;
@@ -367,6 +368,12 @@ pub const Model = struct {
         registration = input.*; out.* = binding; return a.gfx_queue_ok;
     }
     fn unregister(input: *const a.GfxBackendBinding, quiesced: u32) callconv(.c) i32 {
+        if (quiesced == 1) {
+            const proof = stop_proof orelse unreachable;
+            std.debug.assert(proof.valid(proof.epoch) and lost and std.meta.eql(input.*, binding));
+            active = false;
+            return a.gfx_queue_ok;
+        }
         std.debug.assert(std.meta.eql(input.*, binding) and quiesced == 0 and !lost);
         lost = true; unregisters += 1; queued = false;
         if (active) result = a.gfx_queue_result_device_lost;
