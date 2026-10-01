@@ -77,7 +77,22 @@ pressure_qualification_08215 and ExFiles/Reports/OssiGPU/20261001-pressure08215.
 The original failed192 attempt and8MB rejection remain evidence; active output
 and manual observations remain0.82.37/38.
 
-NVIDIA display driver for R4OS. Module 0.1.193; original R4OS code is
+Version0.1.194 permits the separate terminal reset when a second GPU fault
+has exhausted automatic recovery in an already rebuilt epoch. The old
+resumed reset receipt cannot release current DMA. An explicit shutdown
+admits one new terminal FLR through the existing retirement owner; failed
+or incomplete resets remain retained and are never retried. The original
+first fault survives, and terminal cleanup does not start another GPU epoch.
+The existing Device group includes both healthy rebuilt shutdown and this
+second-MMU/reset-limit sequence. Physical194 qualification passes two actual MMU faults with terminal public
+waits, first FLR/rebuilt CE/GR pixels, then ResetLimit followed by its own
+terminal FLR, stopped DMA/zero resources and a normal software follow-boot
+without Wake. Three remote cursor movements and exact HEADLESS restoration
+with fresh GPU content pass. The original193 poweroff remains in Failure193.
+Evidence: GrafikReset07930.json fault_qualification_08217; actual output
+and manual recovery remain0.82.37/38.
+
+NVIDIA display driver for R4OS. Module 0.1.194; original R4OS code is
 Apache-2.0, with attributed MIT layout/metadata code, selected original MIT
 headers and separately licensed firmware.
 Passive hardware acceptance for roadmap 0.79.9 is complete on GA106/A1,

@@ -76,7 +76,7 @@ pub const Model = struct {
         out.device_segment = @intFromPtr(&segment);
         out.device_release = @intFromPtr(&releaseDevice);
         if (power.is("power_success")) out.telemetry_exchange = @intFromPtr(&power.exchange);
-        if (std.mem.startsWith(u8, scenario, "gpu_reset_") or std.mem.startsWith(u8, scenario, "context_native_private_") or is("context_native_reset") or is("context_native_console") or is("context_native_headless") or is("context_native_allocation_fault") or is("context_native_terminal") or is("context_native_headless_reset") or is("mapping_provider_reset")) {
+        if (std.mem.startsWith(u8, scenario, "gpu_reset_") or std.mem.startsWith(u8, scenario, "context_native_private_") or is("context_native_reset") or is("context_native_console") or is("context_native_headless") or is("context_native_allocation_fault") or is("context_native_terminal") or std.mem.startsWith(u8, scenario, "context_native_headless_reset") or is("mapping_provider_reset")) {
             out.size = @sizeOf(a.GfxDriverMemoryApi);
             out.device_lost = @intFromPtr(&deviceLost);
         }

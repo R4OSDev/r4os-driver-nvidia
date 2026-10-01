@@ -550,10 +550,19 @@ pub const Device = struct {
         self.terminal_requested = true;
         if (!self.catalog.close()) return error.Retained;
         if (self.phase == .failed) {
-            if (self.gpu_reset.quiescence() == null) return error.Retained;
-            if (self.reset_display.generation == 0) self.resetBinding();
-            self.phase = .resetting;
-            self.reset_retire_deadline = try std.math.add(u64, try self.now(), 5 * std.time.ns_per_s);
+            if (self.gpu_reset.quiescence() == null) {
+                // Exhausted automatic recovery does not quiesce the rebuilt
+                // epoch. Explicit shutdown still owns its separate one-shot
+                // physical stop. Never retry an incomplete/failed old FLR or
+                // mistake the resumed epoch's old receipt for current DMA rest.
+                if (self.recovery_failure == null or self.recovery_failure.? != error.ResetLimit or !self.fault_reset_attempted or
+                    !self.gpu_reset.resumed or self.epoch <= self.gpu_reset.epoch) return error.Retained;
+                try self.beginReset();
+            } else {
+                if (self.reset_display.generation == 0) self.resetBinding();
+                self.phase = .resetting;
+                self.reset_retire_deadline = try std.math.add(u64, try self.now(), 5 * std.time.ns_per_s);
+            }
         } else if (self.phase == .ready and self.running.failure == null and
             (self.native_output.self_address == 0 or self.native_output.phase == .waiting or self.native_output.phase == .receiver_wait) and
             (self.native_graphics.phase == .ready or self.native_graphics.phase == .unavailable or self.native_graphics.phase == .detached) and

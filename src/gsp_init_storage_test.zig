@@ -1428,7 +1428,7 @@ const DeviceModel = struct {
     var nocat_tail_logs: usize = 0;
     fn log(text: [*:0]const u8) callconv(.c) void {
         const line = std.mem.span(text);
-        if ((ControlModel.is("context_native_reset") or ControlModel.is("context_native_console") or ControlModel.is("context_native_headless_reset")) and
+        if ((ControlModel.is("context_native_reset") or ControlModel.is("context_native_console") or std.mem.startsWith(u8, ControlModel.scenario, "context_native_headless_reset")) and
             (std.mem.startsWith(u8, line, "NVIDIA gsp-start: failed=") or std.mem.startsWith(u8, line, "NVIDIA gpu-reset:")))
             std.debug.print("{s}\n", .{line});
         if (std.mem.startsWith(u8, line, "NVIDIA gsp-receiver:")) receiver_logs += 1;
@@ -1667,7 +1667,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         context_display_present, context_display_present_timeout, context_display_present_fault,
         context_display_present_initial_timeout, context_display_present_initial_fault, context_display_present_initial_release,
         context_display_present_initial_acquire, context_display_present_initial_retry,
-        context_native_unknown, context_native_headless, context_native_allocation_fault, context_native_terminal, context_native_headless_reset, context_native_reset, context_native_console, context_native_connected, context_native_connected_primary_timeout, context_native_dp, context_native_jobs, context_native_job_timeout, context_native_prepare_reject,
+        context_native_unknown, context_native_headless, context_native_allocation_fault, context_native_terminal, context_native_headless_reset, context_native_headless_reset_limit, context_native_reset, context_native_console, context_native_connected, context_native_connected_primary_timeout, context_native_dp, context_native_jobs, context_native_job_timeout, context_native_prepare_reject,
         context_native_private_corrupt, context_native_private_timeout, context_native_private_shutdown,
         context_native_flip_irq_timeout, context_native_flip_probe_timeout, context_native_flip_notifier_timeout, context_native_flip_release_timeout,
         context_native_frame_timeout,
@@ -1721,7 +1721,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         IrqModel.reset();
         target.irq_wake = .{ .context = @intFromPtr(target), .signal = IrqModel.wake };
         const reset_case = case == .gpu_reset_success or case == .gpu_reset_gfw_timeout;
-        const reset_capable = reset_case or case == .context_native_reset or case == .context_native_console or case == .context_native_headless or case == .context_native_allocation_fault or case == .context_native_terminal or case == .context_native_headless_reset or case == .mapping_provider_reset or std.mem.startsWith(u8, @tagName(case), "context_native_private_");
+        const reset_capable = reset_case or case == .context_native_reset or case == .context_native_console or case == .context_native_headless or case == .context_native_allocation_fault or case == .context_native_terminal or case == .context_native_headless_reset or case == .context_native_headless_reset_limit or case == .mapping_provider_reset or std.mem.startsWith(u8, @tagName(case), "context_native_private_");
         capture.snapshot.?.caps.pcie = if (reset_capable) 0x78 else 0;
         capture.snapshot.?.caps.power_state = if (reset_capable) 0 else null;
         capture.snapshot.?.caps.msi = if (case == .irq_intx) 0 else 0x68;
@@ -1896,7 +1896,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
             CatalogModel.active = false; CatalogModel.count = 0;
             try t.expect(target.catalog.close() and target.catalog.last_status == a.gfx_output_error_stale and lease.retained);
         }
-        if (case == .context_native_terminal or case == .context_native_headless_reset) {
+        if (case == .context_native_terminal or case == .context_native_headless_reset or case == .context_native_headless_reset_limit) {
             try t.expect(target.terminal_retired and !target.closeBeforeSubmission() and !capture.close() and lease.self_address == 0);
             // Reacquire fixture backing for the following independent case;
             // the production terminal path never resumes DMA or restarts.
@@ -2431,6 +2431,13 @@ fn checkDeviceReset(target: *@import("gsp_device.zig").Device, words: []u32, frt
     if (gfw_timeout) {
         try t.expect(target.gpu_reset.quiescence() == null and target.gpu_reset.failure != null and target.gpu_reset.failure.? == error.Timeout);
         try t.expect(!target.port.close() and !target.memory.?.releaseBeforeSubmission());
+        // A failed physical FLR is not the exhausted-automatic-recovery
+        // case. Explicit shutdown must not retry it or release DMA.
+        try t.expectError(error.Retained, target.requestShutdown());
+        const terminal_deadline = target.terminal_deadline;
+        try target.requestShutdown();
+        try t.expect(target.terminal_requested and !target.terminal_reset_attempted and target.phase == .failed and
+            target.terminal_deadline == terminal_deadline and ResetDeviceModel.triggers == 1 and target.memory.?.retained);
     } else {
         const proof = target.gpu_reset.quiescence() orelse return error.NoResetProof;
         try t.expect(proof.valid(old_epoch) and !proof.valid(old_epoch + 1));
@@ -3753,6 +3760,7 @@ const NativeCommon = struct {
     fn is(name: []const u8) bool {
         return std.mem.eql(u8, scenario, name) or (std.mem.eql(u8, name, "context_native_connected") and
             std.mem.eql(u8, scenario, "context_native_connected_primary_timeout")) or
+            (std.mem.eql(u8, name, "context_native_headless_reset") and std.mem.eql(u8, scenario, "context_native_headless_reset_limit")) or
             ((std.mem.eql(u8, name, "context_native_unknown") or std.mem.eql(u8, name, "context_native_reset")) and
                 std.mem.eql(u8, scenario, "context_native_console")) or
             (std.mem.eql(u8, name, "context_native_unknown") and std.mem.eql(u8, scenario, "context_native_reset"));
@@ -4181,7 +4189,7 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
     const raw: [*]u32 = @ptrFromInt(target.port.window.cpu_address);
     display.install(table, scenario, raw[0..@intCast(target.port.window.byte_length / 4)]);
     target.running.memory_api = target.ctx.?.memory();
-    if (std.mem.eql(u8, scenario, "context_native_headless") or std.mem.eql(u8, scenario, "context_native_allocation_fault") or std.mem.eql(u8, scenario, "context_native_terminal") or std.mem.eql(u8, scenario, "context_native_headless_reset") or std.mem.startsWith(u8, scenario, "context_native_private_"))
+    if (std.mem.eql(u8, scenario, "context_native_headless") or std.mem.eql(u8, scenario, "context_native_allocation_fault") or std.mem.eql(u8, scenario, "context_native_terminal") or std.mem.startsWith(u8, scenario, "context_native_headless_reset") or std.mem.startsWith(u8, scenario, "context_native_private_"))
         copy.installHeadless(table, 3) else copy.installProduct(table, 3);
     target.running.memory_api = target.ctx.?.memory();
     @import("gsp_cursor_test_model.zig").Model.install(table);
@@ -7387,10 +7395,85 @@ const HeadlessResetFixture = struct {
         for (0..3) |row| try t.expectEqualSlices(u8, copy.host[0][17 + row * 80 ..][0..64], copy.host[1][31 + row * 96 ..][0..64]);
         try t.expect(target.failure.? == error.Timeout and run.failure == null and !run.diagnostic_copy_timeout and
             NativeCommon.prepares == 0 and NativeCommon.commits == 0 and NativeCommon.restores == 0);
-        try TerminalFixture.check(target, table);
+        if (NativeCommon.is("context_native_headless_reset_limit"))
+            try checkResetLimitShutdown(target, table, &counts, &graphics_stage)
+        else try TerminalFixture.check(target, table);
         try t.expect(target.terminal_reset_attempted and target.fault_reset_attempted and ResetDeviceModel.triggers == 2 and
             !proof.valid(old_epoch) and target.gpu_reset.quiescence().?.valid(target.epoch));
         std.debug.print("[nvidia-headless-reset] injected CE observation timeout; old wait lost/DMA retained; FLR; fresh RM/CE/GR; no output; later terminal FLR; original fault retained\n", .{});
+    }
+    fn checkResetLimitShutdown(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, counts: *FifoCounts, graphics_stage: *u32) !void {
+        const copy = @import("gsp_copy_test_model.zig").Model;
+        const run = &target.running;
+        const first = run.faults.first_fatal.?;
+        const epoch = target.epoch;
+        const lease = target.memory.?;
+        copy.enqueueRows(null, null, 17, 31, 64, 3, 80, 96);
+        try copy.notifyQueue();
+        for (0..400) |_| {
+            _ = try stepNativeQueues(target, counts, "context_native_headless", graphics_stage);
+            if (run.copy_job != null and run.copy_job.?.submitted) break;
+        }
+        try t.expect(run.copy_job != null and run.copy_job.?.submitted);
+        const held = copy.heldReferences();
+        // A second original-format MMU notification reaches the same live
+        // worker as hardware. It is not a second automatic FLR permit.
+        try nativeEvent(&target.session.?, 0x1005, &.{});
+        _ = target.step();
+        try t.expect(target.phase == .recovering and run.failure.? == error.DeviceLost and copy.lost and held != 0);
+        for (0..12000) |_| {
+            clock += std.time.ns_per_ms;
+            if (target.phase == .recovering) DeviceModel.tick(ResetDeviceModel.words, target.vram.?.plan.?.frts.offset, false);
+            _ = target.step();
+            if (target.phase == .failed) break;
+        }
+        try t.expect(target.phase == .failed and target.recovery_failure.? == error.ResetLimit and
+            target.fault_reset_attempted and !target.terminal_reset_attempted and ResetDeviceModel.triggers == 1 and
+            target.epoch == epoch and target.gpu_reset.resumed and target.gpu_reset.quiescence() == null and
+            copy.heldReferences() == held and run.copy_job != null and std.meta.eql(first, run.faults.first_fatal.?));
+        for (0..10) |_| try t.expect(target.step() == .stopped);
+        try t.expect(ResetDeviceModel.triggers == 1 and !target.terminal_requested);
+
+        TerminalFixture.boot = lease.boot_storage; TerminalFixture.init_storage = lease.init_storage;
+        TerminalFixture.frts = lease.fwsec_storage; TerminalFixture.sb = lease.fwsec_sb_storage; TerminalFixture.booters = lease.booter_storage;
+        TerminalFixture.query_attempts = 0; TerminalFixture.reset_calls = 0; TerminalFixture.reset_busy = .{ false, false };
+        TerminalFixture.terminal_calls = 0; TerminalFixture.release_case = .complete;
+        const saved = table.*; defer table.* = saved;
+        table.resource_query = TerminalFixture.denyResources; table.gfx_memory_query = TerminalFixture.denyMemory;
+        table.gfx_display_query = TerminalFixture.denyDisplay; table.gfx_queue_query = TerminalFixture.denyQueue;
+        try target.requestShutdown();
+        try t.expect(target.terminal_requested and target.terminal_reset_attempted and target.phase == .resetting and
+            target.gpu_reset.quiescence() == null and copy.heldReferences() == held and target.epoch == epoch);
+        const deadline = target.terminal_deadline;
+        try target.requestShutdown();
+        try t.expect(target.terminal_deadline == deadline and ResetDeviceModel.triggers == 1);
+        for (0..8000) |_| {
+            clock += std.time.ns_per_ms;
+            // The independent queue peer accepts physical retirement only
+            // after the current reset owner actually produces its new proof.
+            if (target.gpu_reset.quiescence()) |current_proof| copy.stop_proof = current_proof;
+            if (target.phase == .resetting) {
+                ResetDeviceModel.words[@import("gsp_core.zig").reg.cpuctl / 4] = @import("gsp_core.zig").bits.halted;
+                ResetDeviceModel.words[0x118128 / 4] = 1; ResetDeviceModel.words[0x118234 / 4] = 0xff;
+            }
+            _ = target.step();
+            try t.expect(target.phase != .failed);
+            if (target.terminal_retired) break;
+        }
+        const proof = target.gpu_reset.quiescence() orelse return error.NoResetProof;
+        try t.expect(target.terminal_retired and proof.valid(epoch) and target.epoch == epoch and ResetDeviceModel.triggers == 2 and
+            !target.gpu_reset.resumed and copy.heldReferences() == 0 and run.copy_job == null and run.copy_backend == null and
+            run.native_queues.count == 0 and run.reset_stage == .done and run.virtuals.ranges.root == null and
+            lease.self_address == 0 and target.port.self_address == 0 and target.reader.?.self_address == 0 and
+            target.interrupts.closed and TerminalFixture.query_attempts == 0 and std.meta.eql(first, run.faults.first_fatal.?));
+        const capture = target.display.?;
+        const boot_snapshot = capture.boot; defer capture.boot = boot_snapshot;
+        try t.expect(!capture.closeAfterReset(proof, target.self_address, &target.reset_binding, target.reset_display.generation));
+        try capture.boot.releaseTerminal(&target.reset_binding, target.reset_display.generation);
+        try t.expect(TerminalFixture.terminal_calls == 1 and capture.boot.held_generation == 0 and target.step() == .stopped);
+        try target.requestShutdown();
+        try t.expect(target.terminal_deadline == deadline and ResetDeviceModel.triggers == 2 and target.epoch == epoch);
+        std.debug.print("[nvidia-reset-limit-terminal] second MMU lost/retained; no automatic FLR; explicit shutdown FLR for current epoch; no restart/query; first fault preserved\n", .{});
     }
 };
 
@@ -7426,7 +7509,8 @@ const TerminalFixture = struct {
         }
         if (quiesced == 0) {
             std.debug.assert(reset_calls == 0 and target.gpu_reset.self_address == 0 and
-                generation == (if (target.display.?.boot.native_adopted) target.display.?.boot.native_generation else target.display_epoch) and target.running.failure.? == error.RmClosed);
+                generation == (if (target.display.?.boot.native_adopted) target.display.?.boot.native_generation else target.display_epoch) and
+                target.running.failure.? == (if (NativeCommon.is("context_native_headless_reset_limit")) error.DeviceLost else error.RmClosed));
             DeviceModel.boot_info.generation = generation + 1;
             DeviceModel.boot_info.state = a.display_state_recovering;
         } else {
