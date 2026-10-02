@@ -1,5 +1,41 @@
 ﻿# NVIDIA.R4D
 
+Roadmap0.82.26 / command RM admission (0.1.197): shader-cache uploads,
+GR barriers and native push batches wait for the actual main RM exchange
+when a context, FIFO or buffer owner temporarily holds it. No command work
+or address-space lookup starts during that loan. The existing Device case
+reproduces State on the handed-off parent and checks Busy without changing
+work or the context loan, followed by exact context retirement and the
+normal shader upload. The existing Device case and all ten actual driver
+lifecycle cases pass. PhysicalReset26F on197 uses the identical frozen public
+caller: old cache/binary invalidation, actual MMU/FLR, fresh imported GPU
+work and exact resource retirement pass, followed by seven raster paths,
+a normal post-GPU reboot without Wake and fresh CE/GR work. Failed195/196
+results remain archived.
+
+Roadmap0.82.26 / golden bootstrap retirement (0.1.196): pending public GR
+jobs no longer block retirement of the private golden initialization channel
+whose completion they need. Copy-busy, RM handoff, physical ring-idle and
+resource/namespace collection rules remain in force; regular/application
+channels retain their queued-work barrier. The existing Device fixture runs
+the actual golden bootstrap with a waiting scheduler job and verifies that
+the regular channel remains protected before cancelling that unsent job.
+The Device regression and all ten actual driver lifecycle cases pass.
+PhysicalReset26D on195 remains a failed hardware result. PhysicalReset26E
+on196 completes the golden and regular template bootstrap, then exposes
+the separate RM admission error addressed by197. Its failed result and
+retained resources remain recorded.
+
+Roadmap0.82.26 / native graphics admission (0.1.195): a rebuilt execution
+binding can become public while its GR golden context is still starting.
+Graphics jobs now retain their existing scheduler slot and wait before
+allocating a new context, rather than reporting Unsupported and losing a
+fresh Vulkan device. The worker passes the actual golden-owner state;
+permanent unavailability still rejects, while copy and video admission
+remain independent. The existing Device regression reproduces the old
+rejection and resumes the same job after readiness without a spare/context
+allocation during the wait. Its copy/video and shutdown cases still pass.
+
 Roadmap0.82.10 / channel retirement (0.1.190): concurrent Vulkan channel
 and native BO destruction exposed a driver-wide collector dependency. A
 FIFO command buffer now defers only confirmed collector-busy after its

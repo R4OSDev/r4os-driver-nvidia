@@ -8527,14 +8527,54 @@ fn checkDeviceGraphics(target: *@import("gsp_device.zig").Device, table: *a.Driv
     run.output_generation = run.outputs.data.generation; run.outputs.invalidated = false;
     run.receiver_events = .{ .epoch = run.epoch, .not_before_ns = clock + 60 * std.time.ns_per_s };
     try target.native_graphics.request();
+    // A claimed public job can already wait for this very bootstrap. Exercise
+    // the actual golden-channel retirement, not merely a ready template whose
+    // readiness flag is temporarily hidden. Queue metadata alone is modeled;
+    // the device, RM, FIFO and scheduler owners below are production code.
+    const early_native = native.is("context_graphics");
+    const native_peer = @import("gsp_native_queue_test_model.zig").Model;
+    const saved_backend = run.copy_backend;
+    var early_peer_active = false;
+    if (early_native) {
+        try t.expect(saved_backend == null and !run.hasQueuedWork());
+        native_peer.install(table);
+        early_peer_active = true;
+        const queue = target.ctx.?.graphicsQueue().?;
+        const binding = native_peer.binding;
+        run.copy_backend = .{ .queue = queue, .binding = binding };
+        // Publication has already advertised the pending GR bootstrap when
+        // the real public job is claimed. Preserve that exact precondition.
+        run.native_queues = .{ .queue = queue, .binding = binding, .epoch = run.epoch,
+            .heap = target.ctx.?.heap().?, .graphics_waiting = true };
+        const job: a.GfxDriverJob = .{ .size = @sizeOf(a.GfxDriverJob), .operation = a.gfx_queue_operation_native,
+            .producer_kind = 1, .producer_id = 200, .producer_generation = 31, .deadline_ns = clock + 60 * std.time.ns_per_s,
+            .fence = .{ .adapter_id = binding.adapter_id, .timeline = 100, .point = 1,
+                .device_generation = binding.device_generation, .reset_generation = binding.reset_generation } };
+        native_peer.job = job; native_peer.claimed = true;
+        try run.work_schedule.admit(0, job);
+        run.work_slots[0] = .{ .native = .{} };
+        const waiting = &run.work_slots[0].native;
+        try waiting.open(run, queue, binding, job);
+        waiting.header = .{ .version = @import("r4nv_binding").native_submit_version,
+            .size = @sizeOf(@import("r4nv_binding").R4NvNativeSubmitHeader),
+            .engine_mask = @import("r4nv_binding").native_engine_graphics, .push_count = 0, .reserved0 = 0, .reserved1 = 0 };
+        waiting.phase = .context;
+        run.active_work = 0; run.queued_native = waiting;
+    }
+    defer if (early_peer_active) {
+        native_peer.dispose(table);
+        run.copy_backend = saved_backend;
+        run.native_queues = .{};
+    };
     var counts: FifoCounts = .{};
     var extra_releases: usize = 0;
     var stages: u32 = 0;
     var steps: usize = 0;
-    errdefer |err| std.debug.print("graphics {s}: {s} phase={s} owner={s}/{?} failure={?} context={?} fifo={?} native={?} stage={d} context-op={?}\n",
+    errdefer |err| std.debug.print("graphics {s}: {s} phase={s} owner={s}/{?} failure={?} context={?} fifo={?} native={?} stage={d} context-op={?} queued={} peer={d}/{d} waiting={} clock={d}\n",
         .{scenario,@errorName(err),@tagName(target.phase),@tagName(target.native_graphics.phase),target.native_graphics.failed_phase,target.failure,
         run.context_active,run.fifo_active,run.native_active,stages,
-        if (run.context_active) |index| if (run.contexts[index].owner) |owner| owner.operation else null else null});
+        if (run.context_active) |index| if (run.contexts[index].owner) |owner| owner.operation else null else null,
+        run.hasQueuedWork(),native_peer.completed,native_peer.result,run.native_queues.graphics_waiting,clock});
     while (target.phase == .ready and target.native_graphics.phase != .ready and target.native_graphics.phase != .unavailable and steps < 900) : (steps += 1) {
         _ = target.step();
         if (target.phase != .ready) break;
@@ -8547,6 +8587,24 @@ fn checkDeviceGraphics(target: *@import("gsp_device.zig").Device, table: *a.Driv
         };
     }
     try t.expect(steps < 900);
+    if (early_native) {
+        try t.expect(target.native_graphics.phase == .ready and native_peer.completed == 0 and
+            run.hasQueuedWork() and run.native_queues.count == 0 and run.native_queues.spare.handle == 0);
+        // The non-golden template/application channel is still protected by
+        // the same waiting public job, even after bootstrap retirement.
+        try t.expectError(error.Busy, run.retireExecutionChannel(target.native_graphics.channel.?, clock + std.time.ns_per_s, true));
+        // Model only this unsent job's deadline, without advancing the clock
+        // for unrelated RM leases or receiver work in the same fixture.
+        _ = try run.work_slots[0].native.step(run, run.work_slots[0].native.job.deadline_ns);
+        for (0..12) |_| { _ = try run.step(); if (!run.hasQueuedWork()) break; }
+        try t.expect(!run.hasQueuedWork() and native_peer.completed == 1 and native_peer.result == a.gfx_queue_result_cancelled and
+            run.native_queues.count == 0 and run.native_queues.spare.handle == 0 and run.failure == null);
+        std.debug.print("[nvidia-bootstrap-queue] actual golden startup/retirement completes with a waiting public job; deadline cancels before any application context/submission\n", .{});
+        native_peer.dispose(table);
+        early_peer_active = false;
+        run.copy_backend = saved_backend;
+        run.native_queues = .{};
+    }
     if (native.is("context_graphics_promote_changed")) {
         const owner = run.fifos[run.fifo_active.?].owner.?;
         try t.expect(target.phase == .recovering and owner.namespace_live and owner.live and !owner.engine_live and
@@ -8829,6 +8887,10 @@ fn checkGraphicsRendering(target: *@import("gsp_device.zig").Device, table: *@im
 fn stepNativeQueues(target: *@import("gsp_device.zig").Device, counts: *FifoCounts, scenario: []const u8, stage: *u32) !bool {
     const progress = target.step() == .progress;
     try t.expect(target.phase == .ready);
+    try replyNativeQueueStep(target, counts, scenario, stage);
+    return progress;
+}
+fn replyNativeQueueStep(target: *@import("gsp_device.zig").Device, counts: *FifoCounts, scenario: []const u8, stage: *u32) !void {
     try PrivateClearPeer.step(target);
     const run = &target.running;
     if (run.fifo_active != null) try replyDeviceFifo(target,counts,scenario)
@@ -8838,7 +8900,6 @@ fn stepNativeQueues(target: *@import("gsp_device.zig").Device, counts: *FifoCoun
     if (run.graphics_work) |*work| {
         if (work.submitted and work.receipt == null) try modelGraphicsStep(target,stage);
     } else stage.* = 0;
-    return progress;
 }
 // Independent GPU byte store for the private allocation, separate from the
 // CPU staging array. Consume the actual CE wire packet; fetching, writing
@@ -9075,6 +9136,32 @@ fn checkNativeQueues(target: *@import("gsp_device.zig").Device, table: *a.Driver
         checkpoint = "submit";
         peer.enqueue(if (round == 2) 1 else 0,false,0);
         if (round != 1) std.mem.writeInt(u32,peer.command[8..12],7,.little);
+        if (round == 0) {
+            // A new execution binding is public before the GR golden owner
+            // finishes rebuilding. Keep that bootstrap pending while the
+            // actual native job reaches context admission in the scheduler.
+            var pending_graphics: @import("gsp_native_graphics.zig").Owner = .{ .phase = .waiting };
+            run.native_queues.source = null;
+            _ = try run.native_queues.step(run, &pending_graphics);
+            try t.expect(try run.beginCopyWork(ce, run.copy_backend.?.binding, deadline));
+            for (0..700) |_| {
+                if (run.queued_native) |job| if (job.phase == .context) break;
+                _ = try run.step();
+                try replyNativeQueueStep(target, counts, scenario, &stage);
+                try t.expect(run.failure == null and peer.completed == 0);
+            }
+            try t.expect(run.queued_native != null and run.queued_native.?.phase == .context);
+            const waiting_heap = @import("gsp_buffer_test_model.zig").Model.heapLive();
+            for (0..12) |_| {
+                _ = try run.step();
+                try replyNativeQueueStep(target, counts, scenario, &stage);
+                try t.expect(run.failure == null and peer.completed == 0 and peer.claimed and
+                    run.native_queues.count == 0 and run.native_queues.spare.handle == 0 and run.batch_work == null);
+                try t.expectEqual(waiting_heap, @import("gsp_buffer_test_model.zig").Model.heapLive());
+            }
+            _ = try run.native_queues.step(run, &target.native_graphics);
+            std.debug.print("[nvidia-native-startup] pending GR retains the same job; no context/spare allocation; ready template resumes admission\n", .{});
+        }
         var steps: usize = 0;
         while (steps < 700) : (steps += 1) {
             _ = try stepNativeQueues(target,counts,scenario,&stage);
@@ -9449,6 +9536,33 @@ fn checkRenderWarmup(target: *@import("gsp_device.zig").Device, table: *a.Driver
     // owns both allocations and waits for the actual CE upload receipt.
     try t.expect(run.presentation == null and target.render_startup.phase == .waiting);
     try t.expect(try target.render_startup.step(run,target.native_graphics.channel,ce));
+    // A public native context can own RM while the common shader cache
+    // reaches its first upload. Admission must wait for the exact exchange;
+    // guarding the loaned main exchange reports State and loses the device.
+    try run.graphics_cache.initializeFor(run.epoch, try run.graphicsClass());
+    const concurrent_context = try run.createExecutionContext(1, clock + 5 * std.time.ns_per_s);
+    try t.expect(run.context_active != null and run.activeChannel() != &run.channel.?);
+    const held_context = run.context_active;
+    try t.expectError(error.State, run.channel.?.guard(clock + std.time.ns_per_s));
+    try t.expectError(error.Busy, run.beginGraphicsUpload(ce, .programs, null, clock + std.time.ns_per_s));
+    try t.expectError(error.Busy, run.beginGraphicsBarrier(target.native_graphics.channel.?, clock + std.time.ns_per_s));
+    try t.expectError(error.Busy, run.beginPushBatch(target.native_graphics.channel.?, &.{}, &.{}, clock + std.time.ns_per_s));
+    try t.expect(run.context_active == held_context and run.graphics_upload == null and run.graphics_work == null and run.batch_work == null and run.failure == null);
+    for (0..200) |_| {
+        if (run.context_active == null) break;
+        _ = try run.step();
+        if (run.activeChannel().?.phase == .waiting) try replyNativeProduct(target);
+    }
+    try t.expect(run.context_active == null);
+    try run.retireExecutionContext(concurrent_context, clock + std.time.ns_per_s);
+    for (0..200) |_| {
+        if (run.context_active == null) break;
+        _ = try run.step();
+        if (run.activeChannel().?.phase == .waiting) try replyNativeProduct(target);
+    }
+    try t.expect(run.context_active == null);
+    try t.expectError(error.Stale, run.executionContextStatus(concurrent_context));
+    std.debug.print("[nvidia-rm-admission] actual context loan retains RM; shader upload/GR barrier/native batch wait Busy without mutating work; exact context close returns exchange\n", .{});
     checkpoint = 2;
     for (0..160) |_| {
         try stepQueuedRendering(target);

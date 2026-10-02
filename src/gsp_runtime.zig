@@ -2876,6 +2876,14 @@ pub const Owner = struct {
         return self.native_copy.probe.busy() or self.batch_work != null or self.power_active or self.powerStopping() or self.direct_work != null or self.cursor_reserving or self.graphics_upload != null or self.graphics_work != null or self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.initial_image != null or self.cursor_upload != null or self.audio_work != null or self.monitor_work != null or self.sor_work != null or
             self.mode_control_active or (self.hasDisplayFlips() and !self.overlapFlip());
     }
+    // Context/FIFO/buffer owners may temporarily hold RM without submitting
+    // GPU work. Command admission must wait for their exact handback before
+    // looking up the hidden address space or guarding the main exchange.
+    fn commandExchangeBusy(self: *Owner) bool {
+        const channel = if (self.channel) |*value| value else return true;
+        return self.sequence.self_address != 0 or self.activeChannel() != channel or
+            channel.phase != .idle or channel.pending != null or channel.in_lockdown;
+    }
     pub fn privateClearAdmissionBusy(self: *const Owner) bool {
         return self.executionAdmissionBusy() or self.hasDisplayFlips() or self.hasQueuedWork() or self.graph_closing or
             self.fifo_active != null or self.context_active != null or self.native_active != null or self.buffer_active != null or
@@ -3408,7 +3416,7 @@ pub const Owner = struct {
     fn startGraphicsUpload(self: *Owner, handle: ChannelHandle, kind: render_cache.Kind, draws: []const render.Draw, deadline: u64, queued: bool) !void {
         const current = try self.now();
         if (deadline <= current or deadline == std.math.maxInt(u64)) return error.Deadline;
-        if (self.executionWorkBusy() or (self.hasDisplayFlips() and !self.overlapFlip()) or
+        if (self.commandExchangeBusy() or self.executionWorkBusy() or (self.hasDisplayFlips() and !self.overlapFlip()) or
             (!queued and self.queued_render != null) or self.cursor_reserving or self.graph_closing) return error.Busy;
         const fifo = try self.findChannel(handle);
         const info = fifo.info() orelse return error.State;
@@ -3582,7 +3590,7 @@ pub const Owner = struct {
     fn startGraphicsBarrier(self: *Owner, handle: ChannelHandle, deadline: u64, queued: bool) !void {
         const current = try self.now();
         if (deadline <= current or deadline == std.math.maxInt(u64)) return error.Deadline;
-        if (self.executionAdmissionBusy() or (!queued and self.queued_render != null) or self.graph_closing) return error.Busy;
+        if (self.commandExchangeBusy() or self.executionAdmissionBusy() or (!queued and self.queued_render != null) or self.graph_closing) return error.Busy;
         const fifo = try self.findChannel(handle);
         const info = fifo.info() orelse return error.State;
         if (info.config.engine != .graphics or info.config.object_class != try self.graphicsClass() or info.config.graphics == null or info.config.graphics.?.golden or fifo.state != .handed_off or !fifo.ring.idle()) return error.Unsupported;
@@ -3653,7 +3661,7 @@ pub const Owner = struct {
     {
         const current = try self.now();
         if (deadline <= current or deadline == std.math.maxInt(u64)) return error.Deadline;
-        if (self.executionAdmissionBusy() or self.queued_render != null or self.graph_closing) return error.Busy;
+        if (self.commandExchangeBusy() or self.executionAdmissionBusy() or self.queued_render != null or self.graph_closing) return error.Busy;
         const fifo = try self.findChannel(handle);
         const info = fifo.info() orelse return error.State;
         if (info.config.engine == .none or fifo.state != .handed_off or !fifo.ring.idle() or
@@ -3742,7 +3750,14 @@ pub const Owner = struct {
         if (self.copy_backend) |backend| if (backend.channel) |channel| if (std.meta.eql(channel, handle)) return error.Busy;
         if (self.presentation) |entry| if (std.meta.eql(entry.channel_handle, handle)) return error.Busy;
         const owner = try self.findChannel(handle);
-        if (self.copyBusy() or (self.hasQueuedWork() and !owner.allocationReleased() and !self.native_queues.retiring(handle))) return error.Busy;
+        // Public GR jobs wait for the golden bootstrap to finish; none can
+        // execute on its private initialization channel. Let that idle channel
+        // retire without waiting on the jobs that depend on its retirement.
+        // Application/regular channels retain the existing queue barrier.
+        const golden_bootstrap = self.native_queues.graphics_waiting and owner.config.engine == .graphics and
+            owner.config.graphics != null and owner.config.graphics.?.golden;
+        if (self.copyBusy() or (self.hasQueuedWork() and !owner.allocationReleased() and
+            !self.native_queues.retiring(handle) and !golden_bootstrap)) return error.Busy;
         if (self.fifo_active != null or self.context_active != null or self.virtuals.active_range != null or self.native_active != null or self.buffer_active != null or self.outputs.active() or self.sequence.self_address != 0 or
             self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         var token = try self.channel.?.handoff(deadline);

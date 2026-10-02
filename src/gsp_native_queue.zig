@@ -61,6 +61,7 @@ fn matches(info: a.GfxQueueOwnerInfo, timeline: u64, owner: @import("gsp_work_sc
 }
 pub const Owner = struct {
     source: ?*const graphics.Owner = null,
+    graphics_waiting: bool = false,
     heap: ?r4os.r4dev.DriverHeapContext = null,
     queue: r4os.driver_queue.Context = undefined,
     binding: a.GfxBackendBinding = .{},
@@ -83,6 +84,11 @@ pub const Owner = struct {
 
     pub fn step(self: *Owner, run: *runtime.Owner, source: ?*const graphics.Owner) !bool {
         if (run.failure != null) return false;
+        const available = if (source) |template| if (template.phase == .ready and !template.closing) template else null else null;
+        const waiting = if (source) |template| !template.closing and switch (template.phase) {
+            .detached, .ready, .closed, .unavailable, .failed => false,
+            else => true,
+        } else false;
         if (!self.ready()) {
             const backend = if (run.copy_backend) |*value| value else return false;
             const table = backend.queue.table;
@@ -93,7 +99,8 @@ pub const Owner = struct {
             if (rc == a.gfx_queue_error_busy) return false;
             if (rc != 1) return error.Queue;
             backend.operations |= operation_bit;
-            self.source = if (source) |template| if (template.phase == .ready and !template.closing) template else null else null;
+            self.source = available;
+            self.graphics_waiting = waiting;
             self.epoch = run.epoch;
             self.binding = backend.binding;
             self.queue = backend.queue;
@@ -105,14 +112,13 @@ pub const Owner = struct {
             return false;
         }
         if (run.epoch != self.epoch or run.copy_backend == null or !std.meta.eql(run.copy_backend.?.binding, self.binding)) return error.Stale;
-        // NVDEC/NVENC can start without a GR golden context. A later ready renderer
-        // supplies the template only for subsequent graphics queue creation.
-        if (self.source == null) if (source) |template| {
-            if (template.phase == .ready and !template.closing) {
-                self.source = template;
-                return true;
-            }
-        };
+        // Copy/video admission is independent of GR. Graphics jobs retain their
+        // scheduler slot while the golden owner is still rebuilding, instead
+        // of confusing its temporary absence with unsupported hardware.
+        const changed = self.source != available or self.graphics_waiting != waiting;
+        self.source = available;
+        self.graphics_waiting = waiting;
+        if (changed) return true;
         if (self.dirty) {
             self.scan_remaining = self.count;
             self.dirty = false;
@@ -163,6 +169,10 @@ pub const Owner = struct {
             if (node.closing or node.done()) return error.Cancelled;
             node.jobs = try std.math.add(usize, node.jobs, 1);
             return node;
+        }
+        if (engine_mask & nv.native_engine_graphics != 0 and self.source == null) {
+            if (self.graphics_waiting) return error.Busy;
+            return error.Unsupported;
         }
         const result = self.heap.?.allocate(@sizeOf(Node), @alignOf(Node), &self.spare);
         if (result != a.driver_heap_ok and self.spare.handle == 0 and self.spare.cpu_address == 0) return error.Memory;

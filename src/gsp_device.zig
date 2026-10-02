@@ -366,8 +366,7 @@ pub const Device = struct {
             const graphics_progress = try self.native_graphics.step(&self.running,
                 self.running.native_copy.phase == .ready or self.running.native_copy.phase == .detached);
             if (progress) self.running.native_queues.wake();
-            const native_progress = try self.running.native_queues.step(&self.running,
-                if (self.native_graphics.phase == .ready) &self.native_graphics else null);
+            const native_progress = try self.running.native_queues.step(&self.running, &self.native_graphics);
             const render_progress = try self.render_startup.step(&self.running,
                 if (self.native_graphics.phase == .ready) self.native_graphics.channel else null,
                 if (self.running.native_copy.phase == .ready) self.running.native_copy.channel else null);
@@ -1490,6 +1489,14 @@ pub const Device = struct {
         const text = std.fmt.bufPrintZ(&buffer, "NVIDIA gsp-start: failed={s} phase={s} reason={s} effects={} memory-retained={}",
             .{ phase, @tagName(self.failed_phase orelse self.phase), @errorName(err), self.port.effects_possible, self.memory.?.retained }) catch return;
         self.ctx.?.logError(text);
+        if (self.running.epoch != 0) {
+            @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,
+                "NVIDIA runtime-failure: epoch={d} render={s} native-job={s} main-RM={s} context={?d} fifo={?d} native={?d} buffer={?d}",
+                .{ self.running.epoch, @tagName(self.render_startup.phase),
+                    if (self.running.queued_native) |job| @tagName(job.phase) else "none",
+                    if (self.running.channel) |channel| @tagName(channel.phase) else "none",
+                    self.running.context_active, self.running.fifo_active, self.running.native_active, self.running.buffer_active });
+        }
         @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,
             "NVIDIA admission-failure: live={s} epoch={d} port={s} boot-status={d} boot-state={d} boot-generation={d}",
             .{ if (self.first_live_failure) |reason| @errorName(reason) else "none", self.live_failure_epoch,
