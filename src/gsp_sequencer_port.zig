@@ -133,6 +133,14 @@ pub const command_queue_head: u32 = 0x110c00;
 pub const Access = enum { read, write };
 pub const Phase = enum { boot, runtime, recovery };
 pub const GenerationFailure = enum { state, mapping, runtime, memory, owner };
+pub const RecoveryStage = enum { between_steps, step, generation, checked, policy, owner_access, owner_done, raw_read, read_done, raw_write, write_done };
+pub const RecoveryLatency = struct {
+    stage: RecoveryStage = .between_steps,
+    address: ?u32 = null,
+    started_ns: u64 = 0,
+    finished_ns: u64 = 0,
+    elapsed_ns: u64 = 0,
+};
 const Scope = union(enum) { boot: void, request: u64 };
 pub const RecoveryOwner = struct {
     // Independent of the failed queue epoch: the actual attached device and
@@ -227,6 +235,10 @@ pub const Port = struct {
     recovery_deadline: u64 = 0,
     recovery_last_clock: u64 = 0,
     recovery_failure: ?anyerror = null,
+    recovery_trace_stage: RecoveryStage = .between_steps,
+    recovery_trace_address: ?u32 = null,
+    recovery_trace_clock: u64 = 0,
+    recovery_latency: RecoveryLatency = .{},
 
     /// Stable address, serialized init/Driver Work owner; not an IRQ callback
     /// or a dedicated task. Failure retains any partially returned mapping.
@@ -974,6 +986,25 @@ pub const Port = struct {
         self.recovery_deadline = deadline;
         self.recovery_last_clock = after;
         self.phase = .recovery;
+        self.recovery_trace_clock = after;
+    }
+    /// Resident elapsed-time diagnostic, including time scheduled away. It
+    /// grants no admission, changes no deadline and never reads the device.
+    /// Keep the longest interval until the retained recovery is diagnosed.
+    pub fn traceRecovery(self: *Port, stage: RecoveryStage, address: ?u32) void {
+        if (self.recovery_owner == 0 or self.clock == null) return;
+        const moment = self.clock.?.nowNs();
+        if (moment == 0 or moment == std.math.maxInt(u64) or moment < self.recovery_trace_clock) return;
+        if (self.recovery_trace_clock != 0) {
+            const elapsed = moment - self.recovery_trace_clock;
+            if (elapsed > self.recovery_latency.elapsed_ns) self.recovery_latency = .{
+                .stage = self.recovery_trace_stage, .address = self.recovery_trace_address,
+                .started_ns = self.recovery_trace_clock, .finished_ns = moment, .elapsed_ns = elapsed,
+            };
+        }
+        self.recovery_trace_stage = stage;
+        self.recovery_trace_address = address;
+        self.recovery_trace_clock = moment;
     }
     pub fn recoveryEpoch(self: *const Port, borrower: usize) u64 {
         if (borrower == 0 or self.recovery_owner != borrower or self.phase != .recovery or
@@ -985,7 +1016,10 @@ pub const Port = struct {
         return self.run.epoch;
     }
     pub fn checkRecovery(self: *Port, borrower: usize) !void {
-        if (self.recoveryEpoch(borrower) == 0) return error.Stale;
+        self.traceRecovery(.generation, null);
+        const epoch = self.recoveryEpoch(borrower);
+        self.traceRecovery(.checked, null);
+        if (epoch == 0) return error.Stale;
         const now = self.clock.?.nowNs();
         if (now == std.math.maxInt(u64) or now < self.recovery_last_clock) return error.Clock;
         self.recovery_last_clock = now;
@@ -993,17 +1027,22 @@ pub const Port = struct {
     }
     fn recoveryAccess(self: *Port, borrower: usize, kind: Access, address: u32) !void {
         try self.checkRecovery(borrower);
+        self.traceRecovery(.policy, address);
         if (!self.supports(kind, address)) return error.Register;
         const owner = self.owner.?;
+        self.traceRecovery(.owner_access, address);
         try owner.recovery.?.access(owner.context, kind, address);
+        self.traceRecovery(.owner_done, address);
         try self.checkRecovery(borrower);
     }
     pub fn recoveryRead(self: *Port, borrower: usize, address: u32) !u32 {
         errdefer |err| { if (self.recovery_failure == null) self.recovery_failure = err; }
         try self.recoveryAccess(borrower, .read, address);
+        self.traceRecovery(.raw_read, address);
         fence();
         const value = self.pointer(address).*;
         fence();
+        self.traceRecovery(.read_done, address);
         try self.checkRecovery(borrower);
         return value;
     }
@@ -1012,9 +1051,11 @@ pub const Port = struct {
         try self.recoveryAccess(borrower, .write, address);
         try self.recoveryAccess(borrower, .read, 0);
         try self.recoveryAccess(borrower, .write, address);
+        self.traceRecovery(.raw_write, address);
         fence();
         self.pointer(address).* = value;
         fence();
+        self.traceRecovery(.write_done, address);
         if (try self.recoveryRead(borrower, 0) != self.boot0) return error.IdentityChanged;
     }
     /// Retryable mapping cleanup. Ambiguous device effects keep this port and

@@ -298,6 +298,8 @@ pub const Device = struct {
                 self.recovery_started = true;
                 return true;
             }
+            self.port.traceRecovery(.step, null);
+            defer self.port.traceRecovery(.between_steps, null);
             const before = self.recovery.phase;
             const complete = try self.recovery.step();
             if (before == .sb and self.recovery.phase == .unload) if (self.recovery.sb_result.? == .rejected) {
@@ -1520,6 +1522,15 @@ pub const Device = struct {
                     operation.last_address, operation.last_value, if (operation.hs_operation) |*hs_operation| @tagName(hs_operation.phase) else "none" });
         }
         if (self.recovery.operation) |*operation| {
+            const latency = self.port.recovery_latency;
+            @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,
+                "NVIDIA teardown-latency: stage={s} address={?x} elapsed-ns={d} start={d} end={d} includes-descheduled=yes",
+                .{ @tagName(latency.stage), latency.address, latency.elapsed_ns, latency.started_ns, latency.finished_ns });
+            if (operation.hs_operation) |*nested| {
+                @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,
+                    "NVIDIA teardown-nested: phase={s} last-address={?x} last-value={?x} transferred={d} blocks={d}",
+                    .{ @tagName(nested.phase), nested.last_address, nested.last_value, nested.transferred, nested.result.blocks });
+            }
             @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,
                 "NVIDIA teardown-operation: phase={s} engine={s} operation={s} nested={s} last-address={?x} last-value={?x}",
                 .{ @tagName(self.recovery.phase), @tagName(operation.options.engine), @tagName(operation.phase),
