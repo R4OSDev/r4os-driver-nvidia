@@ -112,6 +112,7 @@ fn checkGraphicsContexts() !void {
 }
 
 pub fn checkNativeEngines() !void {
+    try checkFalconPromotion();
     try checkVideo(.nvdec);
     try checkVideo(.nvenc);
     for (0..64) |mask| {
@@ -153,6 +154,50 @@ pub fn checkNativeEngines() !void {
     config.engine_mask = 7;
     config.compute_class = 0xc9c0;
     try t.expectError(error.Unsupported,wire.encode(config,.allocate_compute,&request));
+}
+
+fn checkFalconPromotion() !void {
+    const context = @import("gsp_context_wire.zig");
+    const c = @embedFile("fixtures/video-context-570.144.bin");
+    var config: wire.Config = .{ .context = .{ .epoch = 7, .client = 1, .device = 2, .subdevice = 3,
+        .vaspace = 4, .group = 5, .share = 6 }, .handle = 7, .rm_engine = 29, .runqueue = 0,
+        .hardware_channel = 8, .runlist = 0, .address = 0x50000000, .instance = 0x10000000,
+        .userd = 0x8000004000, .methods = 0x30000000, .method_bytes = 0x6000, .system_userd = true,
+        .engine = .nvdec, .engine_mask = wire.defaultEngineMask(.nvdec), .object_handle = 8,
+        .falcon = .{ .address = 0x14000000, .bytes = 0x13000 } };
+    var request: [wire.max_bytes]u8 = undefined;
+    var reply: [wire.max_bytes]u8 = undefined;
+    for (0..12) |i| {
+        config.rm_engine = @intCast(29 + i);
+        config.engine = if (i < 8) .nvdec else .nvenc;
+        config.engine_mask = wire.defaultEngineMask(config.engine);
+        config.object_class = if (i < 8) 0xc7b0 else 0xc7b7;
+        const data = try wire.encode(config, .promote_falcon, &request);
+        try t.expect(data.len == 24 + wire.word(c, 24) and wire.word(data, 8) == wire.word(c, 20));
+        try t.expectEqualSlices(u8, c[60 + context.falcon_info_bytes + i * 560..][0..560], data[24..]);
+        @memcpy(&reply, data);
+        var record: message.Record = .{ .shape = .{ .message_bytes = 664, .checksum_bytes = 664, .storage_bytes = 4096, .elements = 1 },
+            .queue_sequence = 0, .rpc = .{ .function = 76, .result = 0 }, .payload = &reply };
+        try t.expect((try wire.decode(config, .promote_falcon, data, record)) == .ok);
+        reply[48] ^= 1;
+        try t.expectError(error.Payload, wire.decode(config, .promote_falcon, data, record));
+        reply[48] ^= 1;
+        record.payload = reply[0..24];
+        try t.expectError(error.Payload, wire.decode(config, .promote_falcon, data, record));
+        std.mem.writeInt(u32, reply[12..16], 0x57, .little);
+        try t.expect((try wire.decode(config, .promote_falcon, data, record)).rejected == 0x57);
+    }
+    config.falcon = null;
+    try t.expectError(error.Unsupported, wire.encode(config, .promote_falcon, &request));
+    config.falcon = .{ .address = 1, .bytes = 0x13000 };
+    try t.expectError(error.Bounds, wire.encode(config, .promote_falcon, &request));
+    config.falcon = .{ .address = 0x14000000, .bytes = 0 };
+    try t.expectError(error.Bounds, wire.encode(config, .promote_falcon, &request));
+    config.falcon = .{ .address = 0x14000000, .bytes = context.max_falcon_bytes + 1 };
+    try t.expectError(error.Bounds, wire.encode(config, .promote_falcon, &request));
+    config.falcon = .{ .address = 0x14000000, .bytes = 0x13000 };
+    config.engine = .graphics; config.engine_mask = 1; config.rm_engine = 1; config.object_class = 0xc797;
+    try t.expectError(error.Unsupported, wire.encode(config, .promote_falcon, &request));
 }
 
 fn checkVideo(engine: wire.Engine) !void {

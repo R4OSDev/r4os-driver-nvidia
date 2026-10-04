@@ -310,6 +310,7 @@ pub const Error = wire.Error || names.Error || vram.Error || error{Retained, Bus
 pub const State = enum { creating, unwinding, ready, handed_off, destroying, closed, finished, failed };
 pub const Unavailable = enum { classes, engine, context_buffers };
 pub const Info = struct { binding: wire.Binding, rm_engine: u32, nv_engine: u32, engine: wire.Engine, method_bytes: u32, subcontext: u32,
+    falcon_bytes: u32 = 0,
     copy_rm_engine: ?u32 = null,
     copy_caps: ?wire.CopyCaps = null,
     timeslice_requested_us: u64 = 0, timeslice_rejection: ?u32 = null };
@@ -343,6 +344,8 @@ pub const Owner = struct {
     copies: wire.CopyTopology = .{},
     copy_caps: ?wire.CopyCaps = null,
     method_bytes: u32 = 0,
+    falcon_bytes: u32 = 0,
+    falcon_buffer: vram.storage.Use = .{},
     subcontext: u32 = 0,
     group_live: bool = false,
     timeslice_attempted: bool = false,
@@ -393,7 +396,7 @@ pub const Owner = struct {
         if (self.self_address != @intFromPtr(self) or !self.share_live or self.exchange.session.state != .active or
             (self.state != .ready and self.state != .handed_off)) return null;
         return .{ .binding = self.binding, .rm_engine = self.rm_engine, .nv_engine = wire.nvEngine(self.rm_engine) catch return null,
-            .engine = self.selected orelse return null, .method_bytes = self.method_bytes, .subcontext = self.subcontext,
+            .engine = self.selected orelse return null, .method_bytes = self.method_bytes, .subcontext = self.subcontext, .falcon_bytes = self.falcon_bytes,
             .copy_rm_engine = self.copies.paired(self.selected orelse return null),
             .copy_caps = self.copy_caps,
             .timeslice_requested_us = if (self.timeslice_attempted and self.timeslice_rejection == null) wire.timeslice.requested_us else 0,
@@ -433,6 +436,27 @@ pub const Owner = struct {
     pub fn methodStorage(self: *const Owner, runqueue: u8) ?vram.storage.Source {
         if (self.info() == null or runqueue >= self.methods.len) return null;
         return self.methods[runqueue].info();
+    }
+    pub fn attachFalcon(self: *Owner, source: *vram.Owner) Error!void {
+        if (self.info() == null or !wire.videoEngine(self.rm_engine) or self.falcon_bytes == 0) return error.State;
+        if (self.state != .handed_off or self.held() or self.falcon_buffer.self_address != 0) return error.Busy;
+        const source_info = source.info() orelse return error.State;
+        const space = source.binding.space;
+        if (space.epoch != self.binding.epoch or space.client != self.binding.client or space.device != self.binding.device or
+            space.handle != self.binding.vaspace) return error.Stale;
+        if (source_info.logical_bytes != self.falcon_bytes or source_info.physical == null or source_info.address & 4095 != 0 or
+            source_info.surface.readonly) return error.Descriptor;
+        source.retainStorage(&self.falcon_buffer) catch |err| {
+            if (err == error.Descriptor or err == error.Retained) return self.fail(err);
+            return err;
+        };
+    }
+    pub fn falconPromotion(self: *const Owner) Error!wire.FalconPromotion {
+        if (self.info() == null or !wire.videoEngine(self.rm_engine) or self.falcon_bytes == 0) return error.State;
+        const source = self.falcon_buffer.info() orelse return error.State;
+        const result: wire.FalconPromotion = .{ .address = source.address, .bytes = self.falcon_bytes };
+        try result.validate();
+        return result;
     }
     pub fn graphicsRequirement(self: *const Owner, index: usize) Error!?wire.graphics.Requirement {
         if (self.info() == null or self.rm_engine != 1) return error.State;
@@ -504,6 +528,7 @@ pub const Owner = struct {
         if (self.namespace_live) try self.exchange.session.rm_names.validateChildrenAfterReset(self.reservation, proof);
         for (&self.children) |*child| if (child.serial != 0) return false;
         for (&self.methods) |*storage| if (!storage.closeAfterReset(proof)) return error.Retained;
+        if (!self.falcon_buffer.closeAfterReset(proof)) return error.Retained;
         for (&self.graphics_buffers) |*storage| if (!storage.closeAfterReset(proof)) return error.Retained;
         if (self.graphics_shared) |owner| {
             try owner.releaseChildAfterReset(self.graphics_shared_child orelse return error.State, proof);
@@ -529,6 +554,7 @@ pub const Owner = struct {
                 if (self.rm_engine >= 9 and self.rm_engine <= 28 and self.copy_caps == null) break :blk .copy_caps;
                 if (self.method_bytes == 0) break :blk .method_size;
                 if (self.rm_engine == 1 and self.graphics_plan == null) break :blk .graphics_info;
+                if (wire.videoEngine(self.rm_engine) and self.falcon_bytes == 0) break :blk .falcon_info;
                 if (!self.group_live) break :blk .group;
                 if (!self.timeslice_attempted) break :blk .timeslice;
                 if (!self.share_live) break :blk .share;
@@ -537,6 +563,7 @@ pub const Owner = struct {
                 // GSP installs the fault-method descriptor in the group.
                 // It outlives individual channel objects and context shares.
                 for (&self.methods) |*storage| if (!storage.close(true)) return error.Retained;
+                if (!self.falcon_buffer.close(true)) return error.Retained;
                 for (&self.graphics_buffers) |*storage| if (!storage.close(true)) return error.Retained;
                 if (self.graphics_shared) |owner| {
                     try owner.releaseChild(self.graphics_shared_child orelse return error.State, true);
@@ -556,6 +583,11 @@ pub const Owner = struct {
             if (err != error.Unsupported) return err;
             break :blk null;
         } else null;
+        const falcon_bytes = if (op == .falcon_info and reply == .ok)
+            wire.falconBytes(reply.ok, (self.selected orelse return error.State).data[0]) catch |err| blk: {
+                if (err != error.Unsupported) return err;
+                break :blk null;
+            } else null;
         // Validate the selected engine before ACK, publish its copy after ACK.
         var candidate = self.selected;
         var copies = self.copies;
@@ -628,6 +660,10 @@ pub const Owner = struct {
             .graphics_info => {
                 if (graphics_plan == null) { self.unavailable = .context_buffers; self.state = .unwinding; }
                 else self.graphics_plan = graphics_plan;
+            },
+            .falcon_info => {
+                if (falcon_bytes) |bytes| self.falcon_bytes = bytes
+                else { self.unavailable = .context_buffers; self.state = .unwinding; }
             },
             .group => self.group_live = true,
             .timeslice => unreachable,

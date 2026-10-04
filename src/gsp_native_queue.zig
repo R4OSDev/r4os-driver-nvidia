@@ -249,6 +249,15 @@ pub const Owner = struct {
 };
 
 pub const Phase = enum { inspect, count_bindings, allocate, pushes, bindings, context, submit, wait, done };
+pub fn activityForEngines(mask: u32) runtime.power.policy.Activity {
+    if (!@import("gsp_fifo_wire.zig").validNativeEngines(mask)) return .{};
+    return .{
+        .copy = mask & nv.native_engine_copy != 0,
+        .render = mask & nv.native_engine_graphics != 0,
+        .compute = mask & nv.native_engine_compute != 0,
+        .video = mask & (nv.native_engine_video | nv.native_engine_encode) != 0,
+    };
+}
 pub const Job = struct {
     self_address: usize = 0,
     queue: r4os.driver_queue.Context = undefined,
@@ -269,6 +278,13 @@ pub const Job = struct {
     node: ?*Node = null,
     phase: Phase = .inspect,
     waited: bool = false,
+
+    pub fn powerActivity(self: *const Job) runtime.power.policy.Activity {
+        // Only inspect publishes a validated header. A failed inspection can
+        // finish without one; neither boundary may read the undefined header.
+        if (self.phase == .inspect or self.phase == .done) return .{};
+        return activityForEngines(self.header.engine_mask);
+    }
 
     pub fn open(self: *Job, run: *runtime.Owner, queue: r4os.driver_queue.Context, binding: a.GfxBackendBinding, job: a.GfxDriverJob) !void {
         if (self.self_address != 0) return error.State;

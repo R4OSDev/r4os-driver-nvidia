@@ -7,7 +7,7 @@ const context_wire = @import("gsp_context_wire.zig");
 const nv = @import("r4nv_binding");
 pub const Kind = enum { decode, encode };
 pub const Phase = enum {
-    detached, waiting, context_start, context_wait, methods_allocate, methods_attach,
+    detached, waiting, context_start, context_wait, methods_allocate, methods_attach, falcon_allocate, falcon_attach,
     instance_allocate, storage_wait, storage_release, channel_start, channel_wait,
     ready, channel_close, channel_closing, context_close, context_closing, closed, unavailable,
 };
@@ -21,6 +21,7 @@ pub const Owner = struct {
     kind: Kind = .decode,
     rm_engine: u32 = 29,
     method_bytes: u32 = 0,
+    falcon_bytes: u32 = 0,
     epoch: u64 = 0,
     last_clock: u64 = 0,
     deadline: u64 = 0,
@@ -72,7 +73,7 @@ pub const Owner = struct {
             // Unknown/device outcomes propagate to the runtime reset owner.
             if ((err == error.Memory or err == error.Exhausted or err == error.Unsupported) and
                 (self.phase == .context_start or self.phase == .methods_allocate or self.phase == .methods_attach or
-                self.phase == .instance_allocate or self.phase == .channel_start)) {
+                self.phase == .falcon_allocate or self.phase == .falcon_attach or self.phase == .instance_allocate or self.phase == .channel_start)) {
                 self.reason = err; self.retireStorage(.context_close); return true;
             }
             return err;
@@ -93,7 +94,7 @@ pub const Owner = struct {
     }
     fn advance(self: *Owner, run: *runtime.Owner) !bool {
         if (self.closing) switch (self.phase) {
-            .context_start, .methods_allocate, .methods_attach, .instance_allocate, .channel_start => {
+            .context_start, .methods_allocate, .methods_attach, .falcon_allocate, .falcon_attach, .instance_allocate, .channel_start => {
                 self.retireStorage(.context_close); return true;
             },
             else => {},
@@ -116,13 +117,19 @@ pub const Owner = struct {
                     self.next(.context_close); return true;
                 };
                 if (info.rm_engine != self.rm_engine or info.nv_engine != try context_wire.nvEngine(self.rm_engine) or
-                    info.engine.data[2] != self.rm_engine or info.engine.count == 0 or info.method_bytes == 0) return error.Descriptor;
+                    info.engine.data[2] != self.rm_engine or info.engine.count == 0 or info.method_bytes == 0 or info.falcon_bytes == 0) return error.Descriptor;
                 self.method_bytes = info.method_bytes;
+                self.falcon_bytes = info.falcon_bytes;
                 self.next(.methods_allocate);
             },
             .methods_allocate => try self.allocate(run, self.method_bytes, .methods_attach),
             .methods_attach => {
                 try run.attachContextMethods(self.context.?, 0, self.storage.?);
+                self.retireStorage(.falcon_allocate);
+            },
+            .falcon_allocate => try self.allocate(run, self.falcon_bytes, .falcon_attach),
+            .falcon_attach => {
+                try run.attachFalconContextBuffer(self.context.?, self.storage.?);
                 self.retireStorage(.instance_allocate);
             },
             .instance_allocate => try self.allocate(run, 4096, .channel_start),

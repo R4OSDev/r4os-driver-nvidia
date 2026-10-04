@@ -5,6 +5,7 @@ const policy = @import("gsp_power_policy.zig");
 const message = @import("gsp_exchange.zig").message;
 pub fn check() !void {
     try @import("gsp_power_clock.zig").check();
+    try checkRuntimeActivity();
     const binding: wire.Binding = .{ .epoch = 1, .client = 0xc1, .subdevice = 0xd2 };
     var bytes: [wire.max_bytes + 8]u8 = @splat(0xa5);
     var value = try wire.encode(binding, .{ .attach = 0x12345000 }, &bytes);
@@ -70,4 +71,50 @@ pub fn check() !void {
     const saved = owner;
     try t.expectError(error.Clock, owner.next(1, .{}, .{}));
     try t.expect(std.meta.eql(saved, owner));
+}
+
+fn checkRuntimeActivity() !void {
+    const runtime = @import("gsp_runtime.zig");
+    const nv = @import("r4nv_binding");
+    const run = try t.allocator.create(runtime.Owner);
+    defer t.allocator.destroy(run);
+    run.* = .{};
+    const cases = [_]struct { mask: u32, activity: policy.Activity }{
+        .{ .mask = nv.native_engine_video, .activity = .{ .video = true } },
+        .{ .mask = nv.native_engine_encode, .activity = .{ .video = true } },
+        .{ .mask = nv.native_engine_copy, .activity = .{ .copy = true } },
+        .{ .mask = nv.native_engine_graphics, .activity = .{ .render = true } },
+        .{ .mask = nv.native_engine_graphics | nv.native_engine_compute, .activity = .{ .render = true, .compute = true } },
+        .{ .mask = nv.native_engine_graphics | nv.native_engine_copy, .activity = .{ .render = true, .copy = true } },
+        .{ .mask = nv.native_engine_graphics | nv.native_engine_compute | nv.native_engine_copy, .activity = .{ .render = true, .compute = true, .copy = true } },
+    };
+    for (cases) |case| {
+        run.work_slots[0] = .{ .native = .{ .phase = .count_bindings, .header = .{
+            .version = nv.native_submit_version, .size = @sizeOf(nv.R4NvNativeSubmitHeader),
+            .engine_mask = case.mask, .push_count = 1, .reserved0 = 0, .reserved1 = 0,
+        } } };
+        try t.expectEqualDeep(case.activity, run.powerActivity());
+        run.work_slots[0].native.phase = .wait;
+        run.batch_work = .{ .channel_handle = .{ .epoch = 1, .serial = 1, .slot = 0 },
+            .deadline = 10, .native_fence = .{} };
+        try t.expectEqualDeep(case.activity, run.powerActivity());
+        run.batch_work = null;
+    }
+    for ([_]@import("gsp_native_queue.zig").Phase{ .inspect, .done }) |phase| {
+        run.work_slots[0] = .{ .native = .{ .phase = phase } };
+        try t.expectEqualDeep(policy.Activity{}, run.powerActivity());
+    }
+    run.work_slots[0] = .free;
+    const fifo = try t.allocator.create(runtime.execution_fifo.Owner);
+    defer t.allocator.destroy(fifo);
+    fifo.* = .{};
+    fifo.config = std.mem.zeroes(runtime.execution_fifo.wire.Config);
+    fifo.config.engine = .nvdec;
+    fifo.config.engine_mask = nv.native_engine_video;
+    run.epoch = 1;
+    run.fifos[0] = .{ .owner = fifo, .serial = 1 };
+    run.batch_work = .{ .channel_handle = .{ .epoch = 1, .serial = 1, .slot = 0 }, .deadline = 10 };
+    try t.expectEqualDeep(policy.Activity{ .video = true }, run.powerActivity());
+    run.batch_work.?.channel_handle.serial = 2;
+    try t.expectEqualDeep(policy.Activity{}, run.powerActivity());
 }

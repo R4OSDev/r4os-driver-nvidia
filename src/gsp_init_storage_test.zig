@@ -8229,13 +8229,22 @@ fn replyNativeProduct(target: *@import("gsp_device.zig").Device) !void {
         if (op == .graphics_info) {
             try t.expect(owner.rm_engine == 1 and @import("gsp_context_wire.zig").word(rpc.request, 0) == run.static_info.?.client and @import("gsp_context_wire.zig").word(rpc.request, 4) == run.static_info.?.subdevice);
             @memcpy(response[24..1688], @embedFile("fixtures/gr-context-570.144.bin")[0..1664]);
+        } else if (op == .falcon_info) {
+            const wire = @import("gsp_context_wire.zig");
+            try t.expect(owner.selected != null and wire.videoEngine(owner.rm_engine) and owner.falcon_bytes == 0 and
+                wire.word(rpc.request, 0) == run.static_info.?.client and wire.word(rpc.request, 4) == run.static_info.?.subdevice and
+                wire.word(rpc.request, 8) == 0x208001b0);
+            outputWord(&response, 24, 1);
+            outputWord(&response, 28, owner.selected.?.data[0]);
+            outputWord(&response, 36, if (VideoPeer.mode == .context_zero) 0 else 0x13000);
+            if (VideoPeer.mode == .context_rejected) outputWord(&response, 12, 0x57);
         } else if (op == .copy_caps) {
             const wire = @import("gsp_context_wire.zig");
             try t.expect(wire.word(rpc.request, 0) == run.static_info.?.client and
                 wire.word(rpc.request, 4) == run.static_info.?.subdevice and wire.word(rpc.request, 8) == 0x20802a07);
             response[28] = if (owner.rm_engine == 9) 0x21 else if (owner.rm_engine == 10) 0 else 0x20;
         } else if (op != .timeslice) {
-        const vector: usize = switch (op) { .classes => 0, .engines => if (owner.base == 0) 1 else 2, .method_size => 3, .group => 4, .share => 5, .free_share => 6, .free_group => 7, .graphics_info, .copy_caps, .timeslice => unreachable };
+        const vector: usize = switch (op) { .classes => 0, .engines => if (owner.base == 0) 1 else 2, .method_size => 3, .group => 4, .share => 5, .free_share => 6, .free_group => 7, .graphics_info, .falcon_info, .copy_caps, .timeslice => unreachable };
         const bytes = @import("gsp_context_test.zig").response(vector);
         const header: usize = if (rpc.function == 76) 24 else if (rpc.function == 103) 32 else 16;
         @memcpy(response[header..rpc.request.len], bytes[header..]);
@@ -8971,7 +8980,8 @@ const PrivateClearPeer = struct {
     }
 };
 const VideoPeer = struct {
-    const Mode = enum { success, absent, missing_class, rejected, close_context, close_storage, close_channel };
+    const Mode = enum { success, absent, missing_class, rejected, context_rejected, context_zero, promotion_rejected,
+        close_context, close_storage, close_falcon_storage, close_falcon_attach, close_channel };
     var mode: Mode = .success;
     var allocations: usize = 0;
     var frees: usize = 0;
@@ -9003,13 +9013,14 @@ fn checkVideoChannels(target: *@import("gsp_device.zig").Device, counts: *FifoCo
         const before_bytes = native.charged;
         try owner.requestKind(kind);
         const stop: video.Phase = switch (mode) {
-            .success => .ready, .absent, .missing_class, .rejected => .unavailable,
+            .success => .ready, .absent, .missing_class, .rejected, .context_rejected, .context_zero, .promotion_rejected => .unavailable,
             .close_context => .context_wait, .close_storage => .storage_wait, .close_channel => .channel_wait,
+            .close_falcon_storage => .storage_wait, .close_falcon_attach => .falcon_attach,
         };
         var steps: usize = 0;
         errdefer |err| std.debug.print("VIDEO mode={s} phase={s} engine={d} error={s} runtime={?}\n",
             .{@tagName(mode),@tagName(owner.phase),owner.rm_engine,@errorName(err),run.failure});
-        while (owner.phase != stop and steps < 1100) : (steps += 1) {
+        while ((owner.phase != stop or (mode == .close_falcon_storage and owner.after_storage != .falcon_attach)) and steps < 1100) : (steps += 1) {
             _ = target.step(); try t.expect(target.phase == .ready);
             _ = try owner.step(run);
             if (run.fifo_active != null) try replyDeviceFifo(target, counts, scenario)
@@ -9023,8 +9034,10 @@ fn checkVideoChannels(target: *@import("gsp_device.zig").Device, counts: *FifoCo
             const info = (try run.executionChannelStatus(owner.channel.?)).info.?;
             const context = run.contexts[owner.context.?.slot].owner.?;
             try t.expect(owner.rm_engine == selected and info.config.engine == expected_engine and info.config.object_class == (if (encode_video) try run.nvencClass() else try run.nvdecClass()) and
-                channel.engine_live and channel.enabled and !channel.graphics_promoted and !channel.compute_live and !channel.copy_live and
+                channel.engine_live and channel.enabled and channel.falcon_promoted and !channel.graphics_promoted and !channel.compute_live and !channel.copy_live and
                 channel.ring.kind == expected_ring and channel.ring.idle() and context.graphics_plan == null and context.graphics_shared == null);
+            try t.expect(context.falcon_bytes == 0x13000 and context.falcon_buffer.info() != null and
+                info.config.falcon.?.bytes == 0x13000 and info.config.falcon.?.address == context.falcon_buffer.info().?.address);
             try t.expectError(error.Retained, run.retireExecutionContext(owner.context.?, clock + std.time.ns_per_s));
             try t.expectError(error.State, channel.prepareGraphics(.barrier));
             try t.expect(!try owner.step(run));
@@ -9032,6 +9045,7 @@ fn checkVideoChannels(target: *@import("gsp_device.zig").Device, counts: *FifoCo
             try t.expect(owner.context == null and owner.channel == null and owner.storage == null);
             try t.expect(owner.rm_engine == (if (mode == .absent) @as(u32, if (encode_video) 40 else 36) else selected));
             try t.expect((owner.rm_status == 0x51) == (mode == .rejected));
+            try t.expect((owner.rm_status == 0x57) == (mode == .context_rejected or mode == .promotion_rejected));
         }
         const old_context = owner.context;
         const old_channel = owner.channel;
@@ -9054,7 +9068,7 @@ fn checkVideoChannels(target: *@import("gsp_device.zig").Device, counts: *FifoCo
     }
     }
     VideoPeer.mode = .success;
-    std.debug.print("[nvidia-video-channel] NVDEC/NVENC; sparse engine discovery; class/instance allocation; rejected/missing engines; close during context/storage/channel; exact RM/BO retirement\n", .{});
+    std.debug.print("[nvidia-video-channel] NVDEC/NVENC; sparse engine discovery; internal Falcon size/VA promotion; exact unrounded context bytes; rejected/zero context and rejected promotion; close during context/method/Falcon storage/attach/channel; exact RM/BO retirement\n", .{});
     return fifo.released - released;
 }
 fn checkNativeQueues(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, counts: *FifoCounts, scenario: []const u8) anyerror!usize {
@@ -10234,7 +10248,7 @@ fn checkDeviceContexts(target: *@import("gsp_device.zig").Device, table: *a.Driv
             const channel = running.activeChannel().?;
             if (channel.phase != .waiting) continue;
             const op = owner.operation.?;
-            const vector_index: usize = switch (op) { .classes => 0, .engines => if (owner.base == 0) 1 else 2, .method_size => 3, .group => 4, .share => 5, .free_share => 6, .free_group => 7, .timeslice, .copy_caps => 0, .graphics_info => unreachable };
+            const vector_index: usize = switch (op) { .classes => 0, .engines => if (owner.base == 0) 1 else 2, .method_size => 3, .group => 4, .share => 5, .free_share => 6, .free_group => 7, .timeslice, .copy_caps => 0, .graphics_info, .falcon_info => unreachable };
             const cursor = (session.tx_write + 62) % 63;
             const record = try transport.message.decode(session.profile, backing.?[command + 4096 + cursor * 4096..][0..4096], session.tx_sequence - 1);
             try t.expectEqualSlices(u8, channel.request, record.payload);
@@ -11593,10 +11607,25 @@ fn replyDeviceFifo(target: *@import("gsp_device.zig").Device, counts: *FifoCount
             .bind => try t.expect(owner.live and !owner.bound and !owner.enabled and owner.work_submit_token == null),
             .allocate_copy => try t.expect(owner.bound and !owner.engine_live and !owner.enabled),
             .allocate_nvdec, .allocate_nvenc => {
-                try t.expect(owner.config.engine == (if (op == .allocate_nvenc) @import("gsp_fifo_wire.zig").Engine.nvenc else .nvdec) and owner.bound and !owner.engine_live and !owner.enabled and !owner.graphics_promoted);
+                try t.expect(owner.config.engine == (if (op == .allocate_nvenc) @import("gsp_fifo_wire.zig").Engine.nvenc else .nvdec) and owner.bound and owner.falcon_promoted and !owner.engine_live and !owner.enabled and !owner.graphics_promoted);
                 const reference: []const u8 = if (op == .allocate_nvenc) @embedFile("fixtures/nvenc-allocation-570.144.bin") else @embedFile("fixtures/nvdec-allocation-570.144.bin");
                 try t.expectEqualSlices(u8, reference[2 * 16 + 4..][0..12], channel.request[32..44]);
                 if (VideoPeer.mode == .rejected) outputWord(&response, 16, 0x51) else VideoPeer.allocations += 1;
+            },
+            .promote_falcon => {
+                const context = owner.parent.?;
+                const source = context.falcon_buffer.info().?;
+                const promotion = owner.config.falcon.?;
+                try t.expect(owner.bound and !owner.falcon_promoted and !owner.engine_live and !owner.enabled and
+                    context.held() and source.bytes == 0x13000 and promotion.address == source.address and promotion.bytes == context.falcon_bytes);
+                const wire = @import("gsp_fifo_wire.zig");
+                try t.expect(wire.word(channel.request, 24) == try @import("gsp_context_wire.zig").nvEngine(context.rm_engine) and
+                    wire.word(channel.request, 28) == context.binding.client and wire.word(channel.request, 32) == owner.config.hardware_channel and
+                    wire.word(channel.request, 36) == context.binding.client and wire.word(channel.request, 40) == owner.config.handle and
+                    wire.word(channel.request, 64) == 0);
+                try t.expect(std.mem.readInt(u64, channel.request[48..56], .little) == source.address and
+                    std.mem.readInt(u64, channel.request[56..64], .little) == 0x13000);
+                if (VideoPeer.mode == .promotion_rejected) outputWord(&response, 12, 0x57);
             },
             .promote_graphics => {
                 const promotion = owner.config.graphics.?;

@@ -13,6 +13,7 @@ pub fn response(index: usize) []const u8 {
 }
 pub fn check() !void {
     try checkCopyTopology();
+    try checkFalcon();
     const binding: wire.Binding = .{ .epoch = 7, .client = 0xc1d00000, .device = 0x10000000,
         .subdevice = 0x10000001, .vaspace = 0x10000006, .group = 0x10000009, .share = 0x1000000a };
     const types = @embedFile("fixtures/context-engines-570.144.bin");
@@ -87,6 +88,53 @@ pub fn check() !void {
         offset += data.len * 2;
     }
     try t.expect(offset == 14112 and offset == golden.len);
+}
+
+fn checkFalcon() !void {
+    const c = @embedFile("fixtures/video-context-570.144.bin");
+    const layout = [_]u32{0x208001b0, 1284, 4, 20, 8, 0x2080012b, 560, 4, 8, 12, 16, 24, 32, 40, 48};
+    for (layout, 0..) |value, i| try t.expectEqual(value, wire.word(c, i * 4));
+    const payload = c[60..][0..wire.falcon_info_bytes];
+    try t.expectEqual(@as(u32, 0x13000), try wire.falconBytes(payload, 0x02000000));
+    try t.expectEqual(@as(u32, 0x8000), try wire.falconBytes(payload, 0x103000));
+    try t.expectError(error.Unsupported, wire.falconBytes(payload, 29));
+    try t.expectError(error.Payload, wire.falconBytes(payload[0 .. payload.len - 1], 0x02000000));
+    var malformed = payload[0..wire.falcon_info_bytes].*;
+    std.mem.writeInt(u32, malformed[0..4], 65, .little);
+    try t.expectError(error.Bounds, wire.falconBytes(&malformed, 0x02000000));
+    malformed = payload[0..wire.falcon_info_bytes].*;
+    std.mem.writeInt(u32, malformed[44..48], 0x02000000, .little);
+    try t.expectError(error.Payload, wire.falconBytes(&malformed, 0x02000000));
+    malformed = payload[0..wire.falcon_info_bytes].*;
+    std.mem.writeInt(u32, malformed[32..36], 0, .little);
+    try t.expectError(error.Unsupported, wire.falconBytes(&malformed, 0x02000000));
+    std.mem.writeInt(u32, malformed[32..36], wire.max_falcon_bytes + 1, .little);
+    try t.expectError(error.Bounds, wire.falconBytes(&malformed, 0x02000000));
+    const binding: wire.Binding = .{ .epoch = 7, .client = 1, .device = 2, .subdevice = 3, .vaspace = 4,
+        .group = 5, .share = 6, .internal_client = 9, .internal_subdevice = 10 };
+    var request: [wire.max_bytes]u8 = undefined;
+    var response_bytes: [wire.max_bytes]u8 = undefined;
+    for (29..41) |rm| {
+        const query = try wire.encode(binding, @intCast(rm), 0, .falcon_info, &request);
+        try t.expect(query.len == 24 + wire.word(c, 4) and wire.word(query, 0) == 9 and wire.word(query, 4) == 10 and
+            wire.word(query, 8) == wire.word(c, 0) and wire.word(query, 16) == wire.word(c, 4));
+        @memcpy(response_bytes[0..query.len], query);
+        @memcpy(response_bytes[24..query.len], payload);
+        var record: message.Record = .{ .shape = .{ .message_bytes = query.len + 80, .checksum_bytes = query.len + 80, .storage_bytes = 4096, .elements = 1 },
+            .queue_sequence = 0, .rpc = .{ .function = 76, .result = 0 }, .payload = response_bytes[0..query.len] };
+        try t.expect((try wire.decode(binding, @intCast(rm), 0, .falcon_info, query, record)) == .ok);
+        response_bytes[0] ^= 1;
+        try t.expectError(error.Unexpected, wire.decode(binding, @intCast(rm), 0, .falcon_info, query, record));
+        response_bytes[0] ^= 1;
+        record.payload = response_bytes[0..24];
+        try t.expectError(error.Payload, wire.decode(binding, @intCast(rm), 0, .falcon_info, query, record));
+        std.mem.writeInt(u32, response_bytes[12..16], 0x57, .little);
+        try t.expect((try wire.decode(binding, @intCast(rm), 0, .falcon_info, query, record)).rejected == 0x57);
+    }
+    var wrong = binding;
+    wrong.internal_client = 0;
+    try t.expectError(error.Handle, wire.encode(wrong, 29, 0, .falcon_info, &request));
+    try t.expectError(error.Unsupported, wire.encode(binding, 1, 0, .falcon_info, &request));
 }
 
 pub fn checkCopyTopology() !void {

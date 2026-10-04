@@ -1,0 +1,63 @@
+{
+  "schema": 1,
+  "purpose": "Original C sizes/offsets and exact NVDEC0-7/NVENC0-3 Falcon VA promotion payloads; internal constructed-table match uses ENGINE_INFO_TYPE_ENG_DESC, not RM engine or FIFO tag.",
+  "pin": "NVIDIA 570.144",
+  "generator": "Tests/VideoContextReference.c",
+  "generator_sha256": "6789bbcbf883335a1b908b59954212bbcaf7f459983b23482cbe4104ff95b0e0",
+  "fixture_sha256": "7bbc6faf69cc72bab0c6482e921fec59461bd9d3bea699cc9702345e9843cdc9",
+  "fixture_bytes": 8064,
+  "layout_words": [
+    545259952,
+    1284,
+    4,
+    20,
+    8,
+    545259819,
+    560,
+    4,
+    8,
+    12,
+    16,
+    24,
+    32,
+    40,
+    48
+  ],
+  "sources": [
+    {
+      "path": "src/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080gpu.h",
+      "sha256": "5e7b247d68713323f1110c61691d11bfe8bd1f31bbf67302fb7f98b3ef47fca1"
+    },
+    {
+      "path": "src/common/sdk/nvidia/inc/class/cl2080_notification.h",
+      "sha256": "d8ca340a170461423cf8f969dd8c3ee5cb2c599d311b78bab3ce5c0abe96c3cf"
+    },
+    {
+      "path": "src/common/sdk/nvidia/inc/nvtypes.h",
+      "sha256": "3fd5e2c20b1432421a214b12e52778f48f7914b87645d4736cf55324d25c9d3c"
+    }
+  ],
+  "lifecycle_sources": [
+    {
+      "path": "ExFiles/Reference/GFX/Nvidia/Nouveau/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r570/fifo.c",
+      "sha256": "78f774431d1d9436fab61ae37ebd407baedd5a90eb790577b87108a498691dfe"
+    },
+    {
+      "path": "ExFiles/Reference/GFX/Nvidia/Nouveau/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/fifo.c",
+      "sha256": "b0aff0841b4268a974ab92ae6749bb0f405746f334e168339d7ba465f4fcc55f"
+    },
+    {
+      "path": "ExFiles/Reference/GFX/Nvidia/Nouveau/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/vmm.c",
+      "sha256": "2ef7ee1959140a04194793547c9bc2456833c0f047d2ad5c16350f3734ff2ceb"
+    },
+    {
+      "path": "ExFiles/Reference/GFX/Nvidia/OpenKernelModules-570.144/src/nvidia/src/kernel/gpu/gpu.c",
+      "sha256": "cf2738adc37a76638eef4f5d83d09eb55d432bd8c2f77850b25c35ad56162953"
+    },
+    {
+      "path": "ExFiles/Reference/GFX/Nvidia/OpenKernelModules-570.144/src/nvidia/src/kernel/gpu/falcon/kernel_falcon.c",
+      "sha256": "729d73ebd2fd2a468765e336122359c3af461bd4d9152f6245f8e85bb64c72ce"
+    }
+  ],
+  "scope": "Host C oracle; no physical decode or completion claim. VA-only promotion matches Nouveau r535_flcn_bind with its externally owned host VMM. Clear/mapping/contiguity are separately held by native storage."
+}

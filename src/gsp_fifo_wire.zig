@@ -350,7 +350,7 @@ const context = @import("gsp_context_wire.zig");
 const exchange = @import("gsp_exchange.zig");
 const nv = @import("r4nv_binding");
 pub const Error = context.Error;
-pub const Operation = enum { classes, allocate, bind, promote_graphics, allocate_copy, allocate_graphics, allocate_compute, allocate_gr_copy, allocate_nvdec, allocate_nvenc, enable, disable, free_gr_copy, free_compute, free_copy, free };
+pub const Operation = enum { classes, allocate, bind, promote_graphics, promote_falcon, allocate_copy, allocate_graphics, allocate_compute, allocate_gr_copy, allocate_nvdec, allocate_nvenc, enable, disable, free_gr_copy, free_compute, free_copy, free };
 pub const Engine = enum { none, copy, graphics, nvdec, nvenc };
 pub const max_bytes: usize = 584;
 pub const entries: u32 = 512;
@@ -376,12 +376,13 @@ pub const Config = struct {
     copy_class: u32 = 0,
     copy_rm_engine: u32 = 0,
     graphics: ?context.graphics.Promotion = null,
+    falcon: ?context.FalconPromotion = null,
     methods: u64,
     method_bytes: u32,
 };
 pub const Reply = union(enum) { rejected: u32, ok: u32 };
 pub fn function(op: Operation) u32 { return switch (op) { .allocate, .allocate_copy, .allocate_graphics, .allocate_compute, .allocate_gr_copy, .allocate_nvdec, .allocate_nvenc => 103, .free, .free_copy, .free_compute, .free_gr_copy => 10, else => 76 }; }
-pub fn command(op: Operation) u32 { return switch (op) { .bind => 0xa06f0104, .promote_graphics => 0x2080012b, .enable, .disable => 0xa06f0103, else => 0 }; }
+pub fn command(op: Operation) u32 { return switch (op) { .bind => 0xa06f0104, .promote_graphics, .promote_falcon => 0x2080012b, .enable, .disable => 0xa06f0103, else => 0 }; }
 // kchannelConstruct and kfifoGenerateWorkSubmitTokenHal_{TU102,GA100}:
 // the host reserves a hardware CHID, asks Physical RM to allocate exactly
 // that USERD page/index, then forms the host doorbell token after ACK.
@@ -401,7 +402,7 @@ pub fn allocationFlags(hardware_channel: u32, runqueue: u8, golden: bool) Error!
     if (runqueue >= 2) return error.Bounds;
     return 0xc0 | ((hardware_channel / 8) << 12) | (1 << 21) | (@as(u32, runqueue) << 4) | (if (golden) @as(u32, 0x20) else 0);
 }
-pub fn length(op: Operation) usize { return switch (op) { .classes => 428, .allocate => 400, .allocate_copy, .allocate_gr_copy => 40, .allocate_graphics => 48, .allocate_compute => 32, .allocate_nvdec, .allocate_nvenc => 44, .promote_graphics => 584, .free, .free_copy, .free_compute, .free_gr_copy => 16, .enable, .disable => 26, else => 28 }; }
+pub fn length(op: Operation) usize { return switch (op) { .classes => 428, .allocate => 400, .allocate_copy, .allocate_gr_copy => 40, .allocate_graphics => 48, .allocate_compute => 32, .allocate_nvdec, .allocate_nvenc => 44, .promote_graphics, .promote_falcon => 584, .free, .free_copy, .free_compute, .free_gr_copy => 16, .enable, .disable => 26, else => 28 }; }
 pub fn validGraphicsEngines(mask: u32) bool {
     return mask & nv.native_engine_graphics != 0 and mask & ~(nv.native_engine_graphics | nv.native_engine_compute | nv.native_engine_copy) == 0;
 }
@@ -441,6 +442,10 @@ pub fn validate(config: Config) Error!void {
         if (config.engine != .graphics) return error.Unsupported;
         if (graphics.golden and config.engine_mask != nv.native_engine_graphics) return error.Unsupported;
         graphics.validate() catch return error.Bounds;
+    }
+    if (config.falcon) |falcon| {
+        if ((config.engine != .nvdec and config.engine != .nvenc) or !context.videoEngine(config.rm_engine)) return error.Unsupported;
+        try falcon.validate();
     }
     if (config.engine == .graphics) {
         if (!validGraphicsEngines(config.engine_mask) or
@@ -529,6 +534,18 @@ pub fn encode(config: Config, op: Operation, output: []u8) Error![]const u8 {
                 std.mem.writeInt(u16, out[at + 28..][0..2], entry.id, .little);
                 out[at + 30] = @intFromBool(entry.initialize); out[at + 31] = @intFromBool(entry.nonmapped);
             }
+        },
+        .promote_falcon => {
+            const falcon = config.falcon orelse return error.Unsupported;
+            // Nouveau r535_flcn_bind: one initialized/mapped context VA, on
+            // the exact channel's external client/subdevice. This is also
+            // used by Nouveau's externally owned host VMM; no invented
+            // Physical RM-only buffer entry or second initialization.
+            put(out, 4, config.context.subdevice); put(out, 8, command(op)); put(out, 16, 560);
+            put(out, 24, try context.nvEngine(config.rm_engine));
+            put(out, 28, config.context.client); put(out, 32, config.hardware_channel);
+            put(out, 36, config.context.client); put(out, 40, config.handle);
+            wide(out, 48, falcon.address); wide(out, 56, falcon.bytes);
         },
         .allocate_copy, .allocate_gr_copy => {
             const auxiliary = op == .allocate_gr_copy;

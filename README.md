@@ -1,5 +1,34 @@
 ﻿# NVIDIA.R4D
 
+Roadmap0.82.30 / native workload power classification (0.1.200): the
+runtime classifies authenticated native jobs by their validated engine mask.
+NVDEC/NVENC report video demand, GR reports render, and combined GR/compute/CE
+requests preserve their respective activity. Uninspected and completed jobs
+do not read an undefined header. Public batches retain the exact job mask;
+a broader channel capability does not turn video/render into copy demand.
+Private batches use their still-bound channel with the exact epoch/serial.
+The existing GSP transport check reproduces the prior wrong Copy activity
+and covers all accepted masks and inspection/completion boundaries. Firmware
+still owns clocks, board limits and finite performance requests; no forced
+P-state, extra polling demand or display discovery is introduced. Physical
+video/idle qualification is recorded separately from CPU owner checks.
+
+Roadmap0.82.30 / Falcon video context preparation (0.1.199): native video
+contexts query the internal physical RM subdevice with570.144
+GPU_GET_CONSTRUCTED_FALCON_INFO, match the selected engine's ENG_DESC,
+and retain an initially cleared, mapped private BO with its exact reported
+logical length. FIFO creation promotes that VA on the same external
+client/subdevice and channel before allocating/enabling the codec object.
+The group retains the context through channel retirement; normal close and
+confirmed-reset close both release the exact storage loan. The original
+Nouveau r570 sizing and r535 Falcon bind with its externally owned VMM are
+the protocol reference. Tests/VideoContextReference.c independently evaluates
+the unmodified NVIDIA C layouts and all12 video-engine promotion payloads.
+Existing Device cases cover zero/rejected sizing, rejected promotion and
+close during method/context storage or attachment, with exact RM/BO retirement.
+Physical decode qualification remains open; earlier198/VIDEO7-10 failures
+are retained and this required preparation alone is no completion claim.
+
 Roadmap0.82.26 / command RM admission (0.1.197): shader-cache uploads,
 GR barriers and native push batches wait for the actual main RM exchange
 when a context, FIFO or buffer owner temporarily holds it. No command work

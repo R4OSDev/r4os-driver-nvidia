@@ -286,6 +286,7 @@ pub const Owner = struct {
     copy_live: bool = false,
     engine_caps: u32 = 0,
     graphics_promoted: bool = false,
+    falcon_promoted: bool = false,
     graphics_initialized: bool = false,
     live: bool = false,
     bound: bool = false,
@@ -340,6 +341,7 @@ pub const Owner = struct {
             .nvenc => { _ = try context.wire.nvencInstance(parent_info.rm_engine); },
         }
         const graphics = if (engine == .graphics) try parent.graphicsPromotion() else null;
+        const falcon = if (engine == .nvdec or engine == .nvenc) try parent.falconPromotion() else null;
         if (graphics != null and graphics.?.golden and engine_mask != nv.native_engine_graphics) return error.Unsupported;
         const copy_rm_engine = if (paired_copy) parent_info.copy_rm_engine orelse return error.Unsupported else 0;
         try token.session.guard(deadline);
@@ -348,7 +350,7 @@ pub const Owner = struct {
             .config = .{ .chip_id = token.session.profile.chip_id, .context = parent_info.binding, .handle = try reservation.object(2), .rm_engine = parent_info.rm_engine, .runqueue = runqueue,
                 .hardware_channel = hardware_channel, .runlist = parent_info.engine.data[3],
                 .address = 4096, .instance = inst.physical.?.base, .userd = userd_address,
-                .system_userd = userd == null, .engine = engine, .graphics = graphics, .object_handle = if (userd == null) try reservation.object(3) else 0,
+                .system_userd = userd == null, .engine = engine, .graphics = graphics, .falcon = falcon, .object_handle = if (userd == null) try reservation.object(3) else 0,
                 .engine_mask = engine_mask, .compute_handle = if (compute) try reservation.object(4) else 0,
                 .copy_handle = if (paired_copy) try reservation.object(4 + @as(u8, @intFromBool(compute))) else 0, .copy_rm_engine = copy_rm_engine,
                 .methods = methods.physical.base, .method_bytes = parent_info.method_bytes } };
@@ -396,6 +398,10 @@ pub const Owner = struct {
                 (self.compute_live and self.config.compute_class == 0) or (self.copy_live and self.config.copy_class == 0)) return null;
             if (self.copy_live and (self.parent.?.info() orelse return null).copy_rm_engine != self.config.copy_rm_engine) return null;
             if (self.config.engine == .graphics and !self.graphics_promoted) return null;
+            if (self.config.engine == .nvdec or self.config.engine == .nvenc) {
+                if (!self.falcon_promoted or self.config.falcon == null or
+                    !std.meta.eql(self.config.falcon.?, self.parent.?.falconPromotion() catch return null)) return null;
+            }
             if (self.config.graphics) |graphics| {
                 if (!std.meta.eql(graphics, self.parent.?.graphicsPromotion() catch return null)) return null;
             }
@@ -438,6 +444,7 @@ pub const Owner = struct {
                 if (!self.live) break :blk .allocate;
                 if (!self.bound) break :blk .bind;
                 if (self.config.engine == .graphics and !self.graphics_promoted) break :blk .promote_graphics;
+                if ((self.config.engine == .nvdec or self.config.engine == .nvenc) and !self.falcon_promoted) break :blk .promote_falcon;
                 // RM's golden initializer needs a schedulable channel. It
                 // receives no host methods, and closes before normal work.
                 if (self.golden() and !self.enabled) break :blk .enable;
@@ -481,6 +488,7 @@ pub const Owner = struct {
             },
             .allocate_copy, .allocate_nvdec, .allocate_nvenc => self.engine_live = true,
             .promote_graphics => self.graphics_promoted = true,
+            .promote_falcon => self.falcon_promoted = true,
             .allocate_graphics => { self.engine_live = true; self.engine_caps = reply.ok; self.graphics_initialized = true; },
             .allocate_compute => self.compute_live = true,
             .allocate_gr_copy => self.copy_live = true,

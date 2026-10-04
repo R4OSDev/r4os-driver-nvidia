@@ -350,7 +350,7 @@ const std = @import("std");
 const exchange = @import("gsp_exchange.zig");
 pub const Error = exchange.Error || error{Unsupported};
 pub const graphics = @import("gsp_gr_context.zig");
-pub const Operation = enum { classes, engines, copy_caps, method_size, graphics_info, group, timeslice, share, free_share, free_group };
+pub const Operation = enum { classes, engines, copy_caps, method_size, graphics_info, falcon_info, group, timeslice, share, free_share, free_group };
 pub const timeslice = @import("gsp_timeslice.zig");
 pub const max_bytes: usize = 3236;
 pub const Binding = struct { epoch: u64, client: u32, device: u32, subdevice: u32, vaspace: u32, group: u32, share: u32, internal_client: u32 = 0, internal_subdevice: u32 = 0 };
@@ -408,9 +408,39 @@ pub fn nvdecInstance(rm: u32) Error!u32 {
 pub fn nvencInstance(rm: u32) Error!u32 {
     return if (rm >= 37 and rm <= 40) rm - 37 else error.Unsupported;
 }
-pub fn function(op: Operation) u32 { return switch (op) { .classes, .engines, .copy_caps, .method_size, .graphics_info, .timeslice => 76, .group, .share => 103, .free_share, .free_group => 10 }; }
-pub fn command(op: Operation) u32 { return switch (op) { .classes => 0x800292, .engines => 0x20801112, .copy_caps => 0x20802a07, .method_size => 0x20802a08, .graphics_info => 0x20800a32, .timeslice => timeslice.command, else => 0 }; }
-pub fn length(op: Operation) usize { return switch (op) { .classes => 428, .engines => max_bytes, .copy_caps => 32, .method_size => 28, .graphics_info => 24 + graphics.info_bytes, .timeslice => 32, .group => 52, .share => 44, .free_share, .free_group => 16 }; }
+// ctrl2080gpu.h 570.144, independently evaluated by the original-header C
+// fixture. r570_fifo_ectx_size queries the internal physical RM subdevice,
+// matches ENGINE_INFO_TYPE_ENG_DESC (engine.data[0]), and uses the exact size.
+pub const falcon_info_bytes: usize = 1284;
+pub const max_falcon_bytes: u32 = 64 * 1024 * 1024; // Bounded private-context admission, not a hardware size.
+pub fn videoEngine(rm: u32) bool { return rm >= 29 and rm <= 40; }
+pub const FalconPromotion = struct {
+    address: u64,
+    bytes: u64,
+    pub fn validate(self: FalconPromotion) Error!void {
+        if (self.address == 0 or self.address & 4095 != 0 or self.bytes == 0 or self.bytes > max_falcon_bytes or
+            self.address >= (@as(u64, 1) << 40) or self.bytes > (@as(u64, 1) << 40) - self.address) return error.Bounds;
+    }
+};
+pub fn falconBytes(payload: []const u8, engine_desc: u32) Error!u32 {
+    if (payload.len != falcon_info_bytes) return error.Payload;
+    const count = word(payload, 0);
+    if (count > 64) return error.Bounds;
+    var found: ?u32 = null;
+    for (0..count) |i| {
+        const at = 4 + i * 20;
+        if (word(payload, at) != engine_desc) continue;
+        if (found != null) return error.Payload;
+        found = word(payload, at + 8);
+    }
+    const bytes = found orelse return error.Unsupported;
+    if (bytes == 0) return error.Unsupported;
+    if (bytes > max_falcon_bytes) return error.Bounds;
+    return bytes;
+}
+pub fn function(op: Operation) u32 { return switch (op) { .classes, .engines, .copy_caps, .method_size, .graphics_info, .falcon_info, .timeslice => 76, .group, .share => 103, .free_share, .free_group => 10 }; }
+pub fn command(op: Operation) u32 { return switch (op) { .classes => 0x800292, .engines => 0x20801112, .copy_caps => 0x20802a07, .method_size => 0x20802a08, .graphics_info => 0x20800a32, .falcon_info => 0x208001b0, .timeslice => timeslice.command, else => 0 }; }
+pub fn length(op: Operation) usize { return switch (op) { .classes => 428, .engines => max_bytes, .copy_caps => 32, .method_size => 28, .graphics_info => 24 + graphics.info_bytes, .falcon_info => 24 + falcon_info_bytes, .timeslice => 32, .group => 52, .share => 44, .free_share, .free_group => 16 }; }
 pub fn word(data: []const u8, at: usize) u32 { return std.mem.readInt(u32, data[at..][0..4], .little); }
 fn put(out: []u8, at: usize, value: u32) void { std.mem.writeInt(u32, out[at..][0..4], value, .little); }
 pub fn validate(binding: Binding) Error!void {
@@ -443,6 +473,12 @@ pub fn encode(binding: Binding, rm_engine: u32, base: u32, op: Operation, output
             if (rm_engine != 1 or binding.internal_client == 0 or binding.internal_subdevice == 0 or binding.internal_client == binding.client) return error.Handle;
             put(out, 0, binding.internal_client); put(out, 4, binding.internal_subdevice);
             put(out, 8, command(op)); put(out, 16, graphics.info_bytes);
+        },
+        .falcon_info => {
+            if (!videoEngine(rm_engine)) return error.Unsupported;
+            if (binding.internal_client == 0 or binding.internal_subdevice == 0 or binding.internal_client == binding.client) return error.Handle;
+            put(out, 0, binding.internal_client); put(out, 4, binding.internal_subdevice);
+            put(out, 8, command(op)); put(out, 16, falcon_info_bytes);
         },
         .timeslice => {
             put(out, 4, binding.group); put(out, 8, command(op)); put(out, 16, 8);
@@ -486,6 +522,7 @@ pub fn decode(binding: Binding, rm_engine: u32, base: u32, op: Operation, reques
         .method_size => if (word(payload, 0) == 0) return error.Bounds,
         .copy_caps => if (rm_engine < 9 or rm_engine > 28 or word(payload, 0) != try nvEngine(rm_engine)) return error.Payload,
         .graphics_info => {}, // The context owner validates the bounded GR0 plan before ACK.
+        .falcon_info => if (!videoEngine(rm_engine) or word(payload, 0) > 64) return error.Bounds,
         .group, .timeslice => if (!std.mem.eql(u8, payload, request[header..])) return error.Payload,
         .share => {
             if (!std.mem.eql(u8, payload[0..8], request[header..][0..8]) or word(payload, 8) & 0x80000000 != 0) return error.Payload;

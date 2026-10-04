@@ -3202,7 +3202,7 @@ pub const Owner = struct {
     }
     fn createContext(self: *Owner, rm_engine: u32, deadline: u64) !ContextHandle {
         _ = try self.now();
-        const internal_query = rm_engine == 1 or (rm_engine >= 9 and rm_engine <= 28);
+        const internal_query = rm_engine == 1 or (rm_engine >= 9 and rm_engine <= 28) or execution_context.wire.videoEngine(rm_engine);
         if (internal_query and self.static_info == null) return error.State;
         if (self.graph_closing or self.fifo_active != null or self.context_active != null or self.virtuals.active_range != null or self.native_active != null or self.buffer_active != null or self.sequence.self_address != 0 or self.outputs.active()) return error.Busy;
         const space = (self.nativeAddressSpace() orelse return error.State).*;
@@ -3260,6 +3260,11 @@ pub const Owner = struct {
         if (self.copyBusy() or self.graph_closing or self.fifo_active != null or self.context_active != null or self.virtuals.active_range != null or self.native_active != null or self.display_engine_active or self.display_channel_active != null) return error.Busy;
         const owner = try self.findContext(context);
         try owner.attachMethods(runqueue, try self.findNativeBuffer(buffer));
+    }
+    pub fn attachFalconContextBuffer(self: *Owner, context: ContextHandle, buffer: BufferHandle) !void {
+        if (self.copyBusy() or self.graph_closing or self.fifo_active != null or self.context_active != null or self.virtuals.active_range != null or
+            self.native_active != null or self.display_engine_active or self.display_channel_active != null) return error.Busy;
+        try (try self.findContext(context)).attachFalcon(try self.findNativeBuffer(buffer));
     }
     pub fn createRegularGraphicsContext(self: *Owner, golden: ContextHandle, deadline: u64) !ContextHandle {
         const source = try self.findContext(golden);
@@ -6474,13 +6479,13 @@ pub const Owner = struct {
     fn powerStopping(self: *const Owner) bool {
         return if (self.power_owner) |*owner| owner.stopping else false;
     }
-    fn powerActivity(self: *const Owner) power.policy.Activity {
+    pub fn powerActivity(self: *const Owner) power.policy.Activity {
         // Bootstrap/context construction stays under firmware defaults.
         // Host policy follows accepted application jobs and published outputs.
         var published = false;
         for (&self.presentation_slots) |*slot| if (slot.*) |*image| if (image.registered) { published = true; };
         var result: power.policy.Activity = .{
-            .copy = self.copy_job != null or self.batch_work != null,
+            .copy = self.copy_job != null,
             .render = self.queued_render != null or (if (self.graphics_work) |*work| work.queued else false),
             .display_commit = published and (self.display_work != null or self.hasDisplayFlips()),
             .cursor = published and (self.cursor_upload != null or self.cursor_point != null),
@@ -6488,11 +6493,31 @@ pub const Owner = struct {
             .stopping = self.graph_closing or self.shutdown_closing,
         };
         for (&self.work_slots) |*slot| {
-            if (slot.* == .copy or slot.* == .native) result.copy = true;
-            if (slot.* == .render) result.render = true;
+            switch (slot.*) {
+                .copy => result.copy = true,
+                .render => result.render = true,
+                .native => |*work| mergeEngineActivity(&result, work.powerActivity()),
+                .free => {},
+            }
         }
+        // A public batch already has the exact admitted job above. Its
+        // channel can support a broader mask and must not reclassify it.
+        // Private batches use their still-bound, generation-matched owner.
+        if (self.batch_work) |*work| if (work.native_fence == null and work.receipt == null) {
+            const handle = work.channel_handle;
+            if (handle.epoch == self.epoch and handle.serial != 0 and handle.slot < self.fifos.len and
+                self.fifos[handle.slot].serial == handle.serial)
+            {
+                if (self.fifos[handle.slot].owner) |fifo| if (fifo.config.engine != .none)
+                    mergeEngineActivity(&result, native_queue.activityForEngines(fifo.config.engine_mask));
+            }
+        };
         for (&self.display_images) |*image| if (image.* != null) { result.outputs += 1; };
         return result;
+    }
+    fn mergeEngineActivity(result: *power.policy.Activity, activity: power.policy.Activity) void {
+        inline for (.{ "copy", "render", "video", "compute" }) |field|
+            @field(result, field) = @field(result, field) or @field(activity, field);
     }
     fn beginPower(self: *Owner, current: u64) !bool {
         if (!self.power_enabled or !self.rm_enabled or self.power_active or self.copyBusy() or self.cursor_point != null or
@@ -6673,6 +6698,8 @@ pub const Owner = struct {
             .{data.engine_pages, data.engine_rows, data.engine_mask[0], data.engine_mask[1], data.engine_mask[2], data.engine_mask[3],
                 data.other_engines, owner.selected != null, owner.method_bytes});
         if (owner.selected) |selected| {
+            if (execution_context.wire.videoEngine(owner.rm_engine)) self.log("NVIDIA gsp-context-falcon: rm-engine={d} eng-desc={x} bytes={d} held={}",
+                .{owner.rm_engine, selected.data[0], owner.falcon_bytes, owner.falcon_buffer.info() != null});
             self.log("NVIDIA gsp-context-topology: rm-engine={d} runlist={d} pri={x} pbdmas={d} ids={x}/{x} paired-copy={?}",
                 .{owner.rm_engine, selected.data[3], selected.data[11], selected.count,
                     selected.pbdma[0], selected.pbdma[1], owner.copies.paired(selected)});
