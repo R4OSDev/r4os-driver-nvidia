@@ -71,6 +71,20 @@ pub fn check() !void {
     const saved = owner;
     try t.expectError(error.Clock, owner.next(1, .{}, .{}));
     try t.expect(std.meta.eql(saved, owner));
+    // A GR-prepared video job must not replace its accepted finite MAX
+    // request with BOOST_1LEVEL after the producer's short hold expires.
+    // Renew during continuing work; settle and clear when that work ends.
+    var video_owner: policy.Owner = .{};
+    const producer = (try video_owner.next(start, .{ .render = true }, .{})).?;
+    try video_owner.complete(producer, 0, start + 1);
+    try t.expect(try video_owner.next(start + policy.hold_ns + 10, .{ .video = true }, .{}) == null);
+    const video = (try video_owner.next(start + policy.renew_ns + 10, .{ .video = true }, .{})).?;
+    try t.expect(video.level == producer.level and video.level == 2 and video.seconds == 2 and video.reason == .video);
+    try video_owner.complete(video, 0, start + policy.renew_ns + 11);
+    try t.expect(try video_owner.next(start + policy.renew_ns + 12, .{}, .{}) == null);
+    const video_clear = (try video_owner.next(start + policy.renew_ns + policy.hold_ns + 20, .{}, .{})).?;
+    try t.expect(video_clear.level == 0 and video_clear.seconds == 0 and video_clear.reason == .idle);
+    try video_owner.complete(video_clear, 0, start + policy.renew_ns + policy.hold_ns + 21);
 }
 
 fn checkRuntimeActivity() !void {

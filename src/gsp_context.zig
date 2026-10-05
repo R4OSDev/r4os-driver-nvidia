@@ -371,6 +371,13 @@ pub const Owner = struct {
     deadline: u64,
 
     pub fn init(token: *boot.Handoff, parent: names.Lease, space: @import("gsp_vaspace.zig").Info, subdevice: u32, rm_engine: u32, deadline: u64) Error!Owner {
+        var result: Owner = undefined;
+        try result.initInto(token, parent, space, subdevice, rm_engine, deadline);
+        return result;
+    }
+    /// Initialize the stable heap owner in place, without copying its
+    /// complete state through the shared 64-KB driver Work stack.
+    pub fn initInto(self: *Owner, token: *boot.Handoff, parent: names.Lease, space: @import("gsp_vaspace.zig").Info, subdevice: u32, rm_engine: u32, deadline: u64) Error!void {
         _ = try wire.nvEngine(rm_engine);
         if (token.claimed or token.session.state != .active or token.session.pending != null or
             space.epoch != token.session.epoch or parent.epoch != space.epoch or parent.client != space.client) return error.Stale;
@@ -380,7 +387,7 @@ pub const Owner = struct {
         const binding: wire.Binding = .{ .epoch = space.epoch, .client = space.client, .device = space.device, .subdevice = subdevice,
             .vaspace = space.handle, .group = try children.object(0), .share = try children.object(1) };
         try wire.validate(binding);
-        return .{ .exchange = try exchange.Exchange.init(token, deadline), .binding = binding, .reservation = children, .rm_engine = rm_engine, .deadline = deadline };
+        self.* = .{ .exchange = try exchange.Exchange.init(token, deadline), .binding = binding, .reservation = children, .rm_engine = rm_engine, .deadline = deadline };
     }
     fn stable(self: *const Owner) Error!void {
         if ((self.self_address != 0 and self.self_address != @intFromPtr(self)) or self.binding.epoch != self.exchange.session.epoch) return error.Stale;

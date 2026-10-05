@@ -12915,6 +12915,19 @@ fn stepDevicePower(target: *@import("gsp_device.zig").Device) !void {
     if (rpc.phase != .waiting) return;
     const operation = owner.operation.?;
     const deadline = rpc.deadline.?;
+    // A real pending power RPC owns the one RM exchange. Codec context and
+    // channel admission must retry before inspecting its temporarily hidden
+    // VA space, without writing, consuming a receipt or poisoning the device.
+    const calls_before = range_calls;
+    const sequence_before = target.session.?.tx_sequence;
+    const serial_before = run.buffer_serial;
+    try t.expect(run.channel.?.phase == .handed_off and run.nativeAddressSpace() == null);
+    try t.expectError(error.Busy, run.createNvencChannel(.{ .epoch = run.epoch, .serial = 1, .slot = 0 },
+        0, .{ .epoch = run.epoch, .serial = 1, .slot = 0 }, deadline));
+    try t.expectError(error.Busy, run.createExecutionContext(37, deadline));
+    try t.expect(range_calls == calls_before and target.session.?.tx_sequence == sequence_before and
+        run.buffer_serial == serial_before and target.phase == .ready and run.failure == null and
+        run.activeChannel() == rpc and rpc.phase == .waiting);
     rpc.phase = .prepared;
     try target.port.owner.?.admit_command.?(target.port.owner.?.context, &target.port, deadline);
     owner.shared_binding.client ^= 1;

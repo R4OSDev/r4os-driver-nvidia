@@ -94,7 +94,10 @@ pub const Owner = struct {
         } else if (activity.render) {
             self.reason = .render; level = 2;
         } else if (activity.video) {
-            self.reason = .video; level = 1;
+            // Keep video work at the same finite demand as its GR producer.
+            // Physical570.144 accepts MAX but rejects a subsequent one-level
+            // request on OssiPC. Firmware still owns clocks and board limits.
+            self.reason = .video; level = 2;
         } else if (activity.copy or activity.display_commit or activity.cursor) {
             self.reason = if (activity.outputs > 1) .multi_output else .desktop; level = 1;
         } else if (self.last_activity) |last| {

@@ -3020,3 +3020,35 @@ fixed/VRR heads need additional RM flip traps and currently stay fixed.
 No LFC or physical panel behavior is inferred from the software model.
 Details and evidence: workspace Docs/Desktop/GrafikVRR07926.txt/.json;
 physical follow-up: ExFiles/Reports/OssiGPU.txt / 0.79.26.
+
+
+0.82.31: NVENC ownership and finite video demand
+------------------------------------------------
+Native BO, context and channel creation share the same RM admission check.
+While power or display work owns the exchange, creation returns Busy before
+reading the temporarily hidden VA space or allocating handles. The existing
+power-owner test exercises a real pending RPC and checks that its receipt,
+sequence, native serial and failure state remain unchanged.
+
+Video work retains the same finite MAX demand as its GR producer; physical
+570.144 accepted this request while rejecting the later one-level request.
+Demand still expires, renews only during work and clears after the idle hold.
+Power logs distinguish requested level/duration from the accepted level.
+Execution contexts initialize their stable heap owner in place to avoid a
+complete owner copy through the shared 64-KB driver worker stack.
+
+Temporary NVENC PRI snapshots, device-table probes and raw RC dumps have
+been removed. The cleaned0.1.222 driver passes the existing complete owner
+tests, module build and fresh SMP4 startup. With installed R4ENC0.1.6/R4NV0.1.17,
+GA106 public ENCODE_V1 reproduces all eight changing IDR/P packets from the
+diagnostic predecessor byte-for-byte. Independent pixel/timestamp/color
+checks, bounded output backpressure, Abort/Close, full resource retirement
+and a normal post-GPU reboot pass. Desktop0.1.102 also produces four independently
+decoded native recording parts with source/size changes, repeated recording,
+static tail, delayed/failed file writes and full resource/worker retirement.
+Its finite5s worker budget includes the2.02–2.07s cold start under live capture.
+A controlled public GR completion-observation timeout also drives an actual
+FLR/headless rebuild while the recording encoder and final packet remain held.
+The native part survives; the recorder closes the old encoder before opening
+software. Both files decode correctly and all resource/worker owners retire.
+Shared evidence and limits: workspace Docs/Drivers/Videoencoding07941.txt.

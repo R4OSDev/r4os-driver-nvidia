@@ -3201,13 +3201,11 @@ pub const Owner = struct {
         return self.createContext(rm_engine, deadline) catch |err| { self.hostRejection(.context, err); return err; };
     }
     fn createContext(self: *Owner, rm_engine: u32, deadline: u64) !ContextHandle {
-        _ = try self.now();
+        try self.admitNativeRmCreation();
         const internal_query = rm_engine == 1 or (rm_engine >= 9 and rm_engine <= 28) or execution_context.wire.videoEngine(rm_engine);
         if (internal_query and self.static_info == null) return error.State;
-        if (self.graph_closing or self.fifo_active != null or self.context_active != null or self.virtuals.active_range != null or self.native_active != null or self.buffer_active != null or self.sequence.self_address != 0 or self.outputs.active()) return error.Busy;
         const space = (self.nativeAddressSpace() orelse return error.State).*;
         const subdevice = self.graph.?.base.plan.handles.subdevice;
-        if (self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         _ = try execution_context.wire.nvEngine(rm_engine);
         try self.channel.?.guard(deadline);
         const serial = try std.math.add(u64, self.buffer_serial, 1);
@@ -3229,15 +3227,15 @@ pub const Owner = struct {
         errdefer if (heap.release(allocation.handle) == r4os.abi.driver_heap_ok) { slot.* = .{}; } else self.stop(error.Retained);
         if (result != r4os.abi.driver_heap_ok) return error.Memory;
         var token = try self.channel.?.handoff(deadline);
-        var value = execution_context.Owner.init(&token, self.graph.?.reservation, space, subdevice, rm_engine, deadline) catch |err| {
+        const owner: *execution_context.Owner = @ptrFromInt(allocation.cpu_address);
+        owner.initInto(&token, self.graph.?.reservation, space, subdevice, rm_engine, deadline) catch |err| {
             self.channel = exchange.Exchange.init(&token, deadline) catch |restore| { self.stop(restore); return restore; }; return err;
         };
         if (internal_query) {
-            value.binding.internal_client = self.static_info.?.client;
-            value.binding.internal_subdevice = self.static_info.?.subdevice;
+            owner.binding.internal_client = self.static_info.?.client;
+            owner.binding.internal_subdevice = self.static_info.?.subdevice;
         }
-        const owner: *execution_context.Owner = @ptrFromInt(allocation.cpu_address);
-        owner.* = value; slot.owner = owner; slot.serial = serial; self.buffer_serial = serial; self.context_active = index;
+        slot.owner = owner; slot.serial = serial; self.buffer_serial = serial; self.context_active = index;
         return .{ .epoch = self.epoch, .serial = serial, .slot = index };
     }
     fn findContext(self: *Owner, handle: ContextHandle) !*execution_context.Owner {
@@ -3334,10 +3332,8 @@ pub const Owner = struct {
         return self.openChannel(context_handle, runqueue, instance, null, .graphics, engine_mask, deadline) catch |err| { self.hostRejection(.channel, err); return err; };
     }
     fn openChannel(self: *Owner, context_handle: ContextHandle, runqueue: u8, instance: BufferHandle, userd: ?BufferHandle, engine: execution_fifo.wire.Engine, engine_mask: u32, deadline: u64) !ChannelHandle {
-        _ = try self.now();
-        if (self.graph_closing or self.fifo_active != null or self.context_active != null or self.virtuals.active_range != null or self.native_active != null or self.buffer_active != null or self.sequence.self_address != 0 or self.outputs.active()) return error.Busy;
+        try self.admitNativeRmCreation();
         _ = self.nativeAddressSpace() orelse return error.State;
-        if (self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         const parent = try self.findContext(context_handle);
         const inst = try self.findNativeBuffer(instance); const usr = if (userd) |handle| try self.findNativeBuffer(handle) else null;
         try self.channel.?.guard(deadline);
@@ -5559,12 +5555,12 @@ pub const Owner = struct {
     /// borrowed driver reference only after RM allocation/map ACKs and common
     /// commit. Consumers import that reference through the common API.
     pub fn allocateNativeBuffer(self: *Owner, bytes: u64, deadline: u64) !BufferHandle {
-        try self.admitNativeAllocation();
+        try self.admitNativeRmCreation();
         const space = (self.nativeAddressSpace() orelse return error.State).*;
         return self.allocateNativePlan(try vram.surface.raw(self.adapter_id, space, bytes), deadline);
     }
     pub fn allocateNativeSurface(self: *Owner, request: vram.surface.Request, deadline: u64) !BufferHandle {
-        try self.admitNativeAllocation();
+        try self.admitNativeRmCreation();
         const space = (self.nativeAddressSpace() orelse return error.State).*;
         const caps = self.nativeMemoryCapabilities() orelse return error.State;
         return self.allocateNativePlan(try vram.surface.create(self.adapter_id, space, caps, request), deadline);
@@ -5572,7 +5568,7 @@ pub const Owner = struct {
     /// Own scanout requires a verified contiguous physical extent in the
     /// display DMA context, while retaining the common native BO descriptor.
     pub fn allocateDisplaySurface(self: *Owner, request: vram.surface.Request, deadline: u64) !BufferHandle {
-        try self.admitNativeAllocation();
+        try self.admitNativeRmCreation();
         const space = (self.nativeAddressSpace() orelse return error.State).*;
         const caps = self.nativeMemoryCapabilities() orelse return error.State;
         const summary = self.nativeMemory() orelse return error.State;
@@ -5595,7 +5591,7 @@ pub const Owner = struct {
         return self.allocatePrivateStorage(requirement.bytes, requirement.alignment, true, requirement.readonly, deadline);
     }
     fn allocatePrivateStorage(self: *Owner, bytes: u64, alignment: u64, privileged: bool, readonly: bool, deadline: u64) !BufferHandle {
-        try self.admitNativeAllocation();
+        try self.admitNativeRmCreation();
         const space = (self.nativeAddressSpace() orelse return error.State).*;
         const caps = self.nativeMemoryCapabilities() orelse return error.State;
         const memory_summary = self.nativeMemory() orelse return error.State;
@@ -5611,7 +5607,7 @@ pub const Owner = struct {
         return self.openNativeBuffer(plan, policy, deadline) catch |err| { self.hostRejection(.native_buffer, err); return err; };
     }
     fn openNativeBuffer(self: *Owner, plan: vram.surface.Plan, policy: ?vram.storage.Policy, deadline: u64) !BufferHandle {
-        try self.admitNativeAllocation();
+        try self.admitNativeRmCreation();
         const space = (self.nativeAddressSpace() orelse return error.State).*;
         try self.channel.?.guard(deadline);
         try self.memory_admission.admit(self, plan.allocation_bytes, policy != null);
@@ -5646,9 +5642,9 @@ pub const Owner = struct {
         return .{ .epoch = self.epoch, .serial = serial, .slot = index };
     }
     // Address-space lookup intentionally hides a currently loaned RM channel.
-    // Check transient ownership first, so a concurrent allocation retries
-    // instead of treating ordinary buffer reclamation as device corruption.
-    fn admitNativeAllocation(self: *Owner) !void {
+    // Check transient ownership first for memory, contexts and channels, so
+    // ordinary reclamation or power RPCs retry without poisoning the device.
+    fn admitNativeRmCreation(self: *Owner) !void {
         _ = try self.now();
         if (self.power_active or self.powerStopping()) return error.Busy;
         if (self.graph_closing or self.fifo_active != null or self.context_active != null or self.virtuals.active_range != null or self.native_active != null or self.buffer_active != null or self.sequence.self_address != 0 or self.outputs.active()) return error.Busy;
@@ -6097,9 +6093,11 @@ pub const Owner = struct {
         if (owner.completed) {
             const deadline = owner.deadline;
             const operation = owner.operation orelse return error.State;
-            self.log("NVIDIA power: control={x} status={?x} telemetry={s} poll-mask={x} policy={s} requested-level={d}",
+            const boost = switch (operation) { .boost => |value| value, else => null };
+            self.log("NVIDIA power: control={x} status={?x} telemetry={s} poll-mask={x} policy={s} requested-level={?d} seconds={?d} accepted-level={d}",
                 .{power.wire.command(operation),owner.last_status,@tagName(owner.status),owner.active_mask,
-                @tagName(owner.performance.reason),owner.performance.accepted_level});
+                @tagName(owner.performance.reason),if (boost) |value| @as(?u2, value.level) else null,
+                if (boost) |value| @as(?u16, value.seconds) else null,owner.performance.accepted_level});
             var token = try owner.handoff(deadline);
             self.channel = try exchange.Exchange.init(&token, deadline);
             self.power_active = false;
