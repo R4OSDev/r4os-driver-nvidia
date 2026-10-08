@@ -156,8 +156,10 @@ pub const Work = struct {
         self.pending = false;
         switch (self.operation) {
             .caps => self.operation = .enable,
-            .enable => if (self.plan.mode.transport_hdmi) { self.operation = .audio_mute; } else { self.phase = .scanout; },
-            .audio_mute => self.phase = .scanout,
+            // HDMI audio controls address an active RM head. SET_HDMI_ENABLE
+            // does not establish it after FLR; wait for actual Core/Window.
+            .enable => self.phase = .scanout,
+            .audio_mute => self.operation = .avi,
             .avi => self.operation = .vsi,
             .vsi => self.operation = .hdr_disable,
             .hdr_disable => self.operation = .gcp,
@@ -165,16 +167,16 @@ pub const Work = struct {
         }
     }
     pub fn scanoutComplete(self: *Work) !void {
-        if (self.phase != .scanout or self.pending or self.acknowledged != @as(u8, if (self.plan.mode.transport_hdmi) 3 else 2)) return error.State;
+        if (self.phase != .scanout or self.pending or self.acknowledged != 2) return error.State;
         self.phase = if (self.plan.mode.transport_hdmi) .after_scanout else .complete;
-        self.operation = .avi;
+        self.operation = .audio_mute;
     }
     pub fn matches(self: *const Work, channel: *const exchange.Exchange, deadline: u64) bool {
         if (!self.pending or (self.phase != .before_scanout and self.phase != .after_scanout) or
             channel.phase != .prepared or channel.deadline != deadline or channel.function != function or
             channel.request.ptr != self.request[0..].ptr or channel.request.len != self.length) return false;
         const expected_index: u8 = switch (self.operation) { .caps => 0, .enable => 1, .audio_mute => 2, .avi => 3, .vsi => 4, .hdr_disable => 5, .gcp => 6 };
-        if (self.acknowledged != expected_index or (self.phase == .before_scanout) != (expected_index < 3) or
+        if (self.acknowledged != expected_index or (self.phase == .before_scanout) != (expected_index < 2) or
             (!self.plan.mode.transport_hdmi and expected_index > 1)) return false;
         var expected: [max_bytes]u8 = undefined;
         const length = encode(self.plan, self.operation, &expected) catch return false;

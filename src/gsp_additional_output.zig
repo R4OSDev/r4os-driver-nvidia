@@ -8,6 +8,7 @@ const catalog = @import("gsp_catalog.zig");
 // Additional heads use desktop software cursors and have no app-audio
 // publisher yet. Physical HDMI/DP mute/disable still runs in Hotplug/Runtime.
 const SoftwareCursor = struct {
+    pub fn beforePause(_: *SoftwareCursor, _: anytype) !bool { return true; }
     pub fn busy(_: *const SoftwareCursor) bool { return false; }
     pub fn pause(_: *SoftwareCursor, _: anytype) !bool { return false; }
     pub fn stopped(_: *SoftwareCursor, _: anytype) !bool { return true; }

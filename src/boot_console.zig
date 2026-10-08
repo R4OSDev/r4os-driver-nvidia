@@ -215,6 +215,23 @@ pub const Owner = struct {
         return self.phase == .ready;
     }
     pub fn invalidate(self: *Owner) void { self.phase = .failed; self.confirmed = false; }
+    pub fn closeAfterReset(self: *Owner, proof: reset.Quiescence) bool {
+        if (self.self_address == 0) return true;
+        if (self.self_address != @intFromPtr(self) or !proof.valid(self.epoch) or proof.epoch <= self.stopped_epoch) return false;
+        const lease = self.lease orelse return false;
+        const device: *const @import("gsp_device.zig").Device = @ptrCast(@alignCast(proof.owner.io.?.context));
+        if (device.self_address != @intFromPtr(device) or &device.gpu_reset != proof.owner or
+            &device.boot_console != self or !device.terminal_requested or !device.terminal_console_requested or
+            device.phase != .retiring or device.running.reset_stage != .done or device.native_output.self_address != 0 or
+            lease.console_owner != self.self_address or !lease.validates(self.reservation orelse return false)) return false;
+        // Every physical/runtime display consumer has retired under this
+        // fresh epoch's stop. Release only our original reservation metadata;
+        // the parent retains RAM, BAR1 and firmware leases until terminal ACK.
+        lease.console_owner = 0;
+        lease.display.?.firmware_recovery = null;
+        self.* = .{};
+        return true;
+    }
     pub fn authorize(self: *Owner, generation: u64, boot: *const a.GfxNativeBootInfo) bool {
         if (self.phase != .ready or !self.confirmed or self.consumer == 0 or !self.valid(self.epoch) or
             generation != self.callback_generation or boot.generation != generation or

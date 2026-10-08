@@ -1,16 +1,39 @@
 {
   "vectors": {
-    "sha256": "4ecaf8e780948276c6fe50def8ba33647cef1dc4f629b098f716f258c984c880",
-    "bytes": 484,
-    "path": "Repositories/Drivers/NVIDIA/src/fixtures/display-commands.bin"
+    "path": "Repositories/Drivers/NVIDIA/src/fixtures/display-commands.bin",
+    "bytes": 524,
+    "sha256": "872450f827e84d7e86a37e07acdf756ed5e930ab7dcf75e5be336427bca61e82"
   },
   "nvidia": "570.144",
   "archive": "ExFiles/Reference/GFX/Nvidia/0.79.13/display-submit-20260912",
   "linux": "7.2.4",
-  "scope": "Original C67D/C37B/507C definitions and Nouveau DRF macros; four complete packets plus cursor/notifier fields. No physical GPU proof.",
+  "scope": "Original class/header vectors retain all non-notifier bytes. Core notifier binding/control pairs now come from executing unchanged NVIDIA570.144 functions, including NULL DMA for hardware bug1945716; no physical GPU proof.",
   "generator": {
     "sha256": "99d8178e73bbe01b5f63cecd7bcb910775e0a7eca3c1735148ee23fbd5fd95f8",
     "bytes": 3494,
     "path": "Temp/gfx-display-submit-20260912/Original-Commands.c"
+  },
+  "core_notifier_update": {
+    "source": "NVIDIA570.144 unchanged nvEvoSetNotifierC3 and EvoSetCoreNotifierSurfaceAddressAndControlC3",
+    "hardware_bug": 1945716,
+    "archive": "ExFiles/Reports/OssiGPU/20261005-tv08237/N264NotifierReferences",
+    "before_vectors_sha256": "4ecaf8e780948276c6fe50def8ba33647cef1dc4f629b098f716f258c984c880",
+    "vectors_sha256": "872450f827e84d7e86a37e07acdf756ed5e930ab7dcf75e5be336427bca61e82"
+  },
+  "base_reference": {
+    "vectors": {
+      "sha256": "4ecaf8e780948276c6fe50def8ba33647cef1dc4f629b098f716f258c984c880",
+      "bytes": 484,
+      "path": "Repositories/Drivers/NVIDIA/src/fixtures/display-commands.bin"
+    },
+    "nvidia": "570.144",
+    "archive": "ExFiles/Reference/GFX/Nvidia/0.79.13/display-submit-20260912",
+    "linux": "7.2.4",
+    "scope": "Original C67D/C37B/507C definitions and Nouveau DRF macros; four complete packets plus cursor/notifier fields. No physical GPU proof.",
+    "generator": {
+      "sha256": "99d8178e73bbe01b5f63cecd7bcb910775e0a7eca3c1735148ee23fbd5fd95f8",
+      "bytes": 3494,
+      "path": "Temp/gfx-display-submit-20260912/Original-Commands.c"
+    }
   }
 }

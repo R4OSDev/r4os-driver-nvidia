@@ -111,7 +111,12 @@ pub const Model = struct {
             out.* = .{ .buffer = .{ .id = @intCast(801+i), .generation = 601 }, .reference = .{ .id = @intCast(811+i), .generation = 701 },
                 .allocation_bytes = bytes, .cookie = cookie, .device_generation = d.device_generation, .driver_generation = 0x200000003,
                 .adapter_id = d.adapter_id, .driver_owner = 7 };
-            slot.* = .{ .reservation = out.*, .descriptor = d.*, .live = true }; charged += bytes;
+            // The kernel binds the driver owner during bufferReserve. A
+            // later bufferDescribe returns that bound descriptor, even
+            // though the driver's original geometry plan has owner zero.
+            slot.* = .{ .reservation = out.*, .descriptor = d.*, .live = true };
+            slot.descriptor.driver_owner = out.driver_owner;
+            charged += bytes;
             return a.gfx_buffer_result_ok;
         };
         return a.gfx_buffer_error_capacity;

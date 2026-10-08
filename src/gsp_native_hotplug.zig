@@ -7,7 +7,8 @@ const receiver = @import("gsp_hotplug.zig");
 pub const Phase = enum { online, pause, drain, mute, mute_wait, disable, disable_wait, clear, clear_wait, detach, detach_wait,
     settle, receiver_wait, query, query_wait, refresh, refresh_wait, commit, commit_wait, publish, unpause,
     resize, resize_publish, resize_catalog, source_create, source_map, source_clear, source_unmap, resize_submit, resize_wait, restore_unavailable,
-    power_quiesce, power_off, power_off_wait, power_asleep, power_on, power_on_wait, power_refresh, power_failed };
+    power_quiesce, power_bound_off, power_bound_off_wait, power_bound_on, power_bound_on_wait,
+    power_off, power_off_wait, power_asleep, power_on, power_on_wait, power_refresh, power_failed };
 pub const Owner = struct {
     phase: Phase = .online,
     initialized: bool = false,
@@ -37,6 +38,8 @@ pub const Owner = struct {
     power_attempted: u64 = 0,
     power_generation: u64 = 0,
     power_failure: ?anyerror = null,
+    power_bound_done: bool = false,
+    power_resume: Phase = .publish,
 
     pub fn step(self: *Owner, product: anytype) !bool {
         const run = product.running.?;
@@ -63,7 +66,7 @@ pub const Owner = struct {
             (product.modes.phase == .idle or product.modes.phase == .unavailable or product.modes.phase == .detached);
         if (self.phase == .online and self.power_intent.off != 0 and self.power_intent.sequence != self.power_attempted and
             !affected and !run.outputs.invalidated and idle_modes) {
-            self.power_cycle = true; self.power_waking = false; self.power_failure = null;
+            self.power_cycle = true; self.power_waking = false; self.power_failure = null; self.power_bound_done = false;
             self.power_attempted = self.power_intent.sequence;
             self.deadline = product.last_clock +| 30 * std.time.ns_per_s;
             self.phase = .power_quiesce;
@@ -146,6 +149,7 @@ pub const Owner = struct {
             .online => return false,
             .power_quiesce => {
                 if (run.anyAdaptiveRefresh() or run.refresh_quiescing) return false;
+                if (!try product.cursor.beforePause(product)) return false;
                 if (!try product.audio.suspendRoute()) return false;
                 try run.pauseOutput(window, true);
                 try run.restoreOutput(window, false);
@@ -168,7 +172,7 @@ pub const Owner = struct {
                 if (product.primaryOutput()) run.cursor_reserving = false;
                 if (run.display_images[window]) |*image| {
                     self.previous = image.boot_mode orelse return error.State;
-                    self.phase = if (self.previous.?.hasAudio()) .mute else .detach;
+                    self.phase = if (self.previous.?.hasAudio()) .mute else if (self.boundDigitalOff()) .power_bound_off else .detach;
                 } else if (run.display_retired[window] != null) self.phase = .settle else return error.State;
             },
             .mute, .disable, .clear => {
@@ -181,7 +185,7 @@ pub const Owner = struct {
                 if (receipt.sequence != self.audio_sequence or receipt.receipt == 0 or receipt.status != 0 or
                     receipt.operation != @as(runtime.display_audio.Operation, if (self.phase == .mute_wait) .mute else if (self.phase == .disable_wait) .disable else .clear)) return error.Completion;
                 self.phase = if (self.phase == .mute_wait and self.previous.?.displayPort()) .disable else
-                    if (self.phase != .clear_wait) .clear else .detach;
+                    if (self.phase != .clear_wait) .clear else if (self.boundDigitalOff()) .power_bound_off else .detach;
             },
             .detach => { try run.detachDisplayImage(product.core.?, product.window.?, self.deadline); self.phase = .detach_wait; },
             .detach_wait => {
@@ -202,7 +206,16 @@ pub const Owner = struct {
                     // Keep the paused common output, CPU image, geometry and
                     // connector identity, including its MST RM-ID hold.
                     // Sleep is not a cable withdrawal.
-                    self.phase = .power_off;
+                    if (self.power_bound_done) {
+                        if (self.power_failure != null) {
+                            self.power_waking = true;
+                            self.deadline = product.last_clock +| 30 * std.time.ns_per_s;
+                            self.phase = .power_on;
+                        } else {
+                            self.phase = .power_asleep;
+                            product.ctx.?.logInfo("NVIDIA screen: off scanout=retired audio=muted images=retained system=running");
+                        }
+                    } else self.phase = .power_off;
                     return true;
                 }
                 // Withdrawal requests common rollback while its old identity
@@ -291,7 +304,15 @@ pub const Owner = struct {
                 self.phase = .commit_wait;
             },
             .commit_wait => {
-                if (run.display_work != null) return false;
+                if (run.display_work) |*work| {
+                    if (work.wake_before_link and work.boot_mode.?.window == window) if (work.wake_failure) |err| {
+                        const result = run.monitor_result orelse return error.Completion;
+                        if (result.sequence != work.wake_sequence or result.failure == null) return error.Completion;
+                        self.power_sequence = result.sequence; self.power_receipt = result.receipt;
+                        return self.failPower(product, err);
+                    };
+                    return false;
+                }
                 const dma = run.currentPresentation(window).?.surface.scanout.?.dma;
                 if (try run.takeDisplayLinkFailure(product.engine.?, window, dma, self.plan.?)) |failed| {
                     if (failed.previous != null or run.display_images[window] != null) return error.Stale;
@@ -304,8 +325,9 @@ pub const Owner = struct {
                 if (image.boot_mode == null or !std.meta.eql(image.boot_mode.?, self.plan.?) or image.mode_receipt == 0 or
                     image.link == null or !image.link.?.complete()) return error.Completion;
                 product.mode = self.plan; product.link = image.link.?.plan; product.confirmed_image = image;
-                try product.buildPublication();
-                self.phase = .publish;
+                try self.buildPublication(product);
+                self.power_resume = .publish;
+                self.phase = if (self.boundDigitalOff() and !try self.consumeDigitalWake(image)) .power_bound_on else .publish;
             },
             .publish => {
                 const result = product.outputs.?.publish(&product.publication, &product.output);
@@ -332,7 +354,7 @@ pub const Owner = struct {
             .resize => {
                 product.mode = self.plan;
                 product.link = try runtime.display_link.derive(self.plan.?, run.nativeObject() orelse return error.Busy, run.nativeOutputs() orelse return error.Busy);
-                try product.buildPublication();
+                try self.buildPublication(product);
                 self.phase = .resize_publish;
             },
             .resize_publish => {
@@ -412,6 +434,14 @@ pub const Owner = struct {
             },
             .resize_wait => {
                 if (try self.releaseSource(product)) return true;
+                if (run.display_work) |*work| {
+                    if (work.wake_before_link and work.boot_mode.?.window == window) if (work.wake_failure) |err| {
+                        const result = run.monitor_result orelse return error.Completion;
+                        if (result.sequence != work.wake_sequence or result.failure == null) return error.Completion;
+                        self.power_sequence = result.sequence; self.power_receipt = result.receipt;
+                        return self.failPower(product, err);
+                    };
+                }
                 if (try product.modes.step(product)) return true;
                 var status: a.GfxModeStatus = .{};
                 const result = product.outputs.?.modeStatus(self.restore_ticket, &status);
@@ -428,13 +458,61 @@ pub const Owner = struct {
                     !std.meta.eql(run.currentPresentation(window).?.surface.scanout.?, image.image)) return error.Completion;
                 product.confirmed_image = image;
                 self.restore_ticket = 0;
-                self.phase = .unpause;
+                self.power_resume = .unpause;
+                self.phase = if (self.boundDigitalOff() and !try self.consumeDigitalWake(image)) .power_bound_on else .unpause;
             },
             .restore_unavailable => {
                 if (try self.releaseSource(product)) return true;
                 return self.keepHeadless(product);
             },
+            .power_bound_off => {
+                self.power_sequence = try run.beginBoundMonitorPower(window, false, self.deadline);
+                self.phase = .power_bound_off_wait;
+            },
+            .power_bound_off_wait => {
+                if (run.monitor_work != null) return false;
+                const result = run.monitor_result orelse return error.Completion;
+                if (result.sequence != self.power_sequence or result.on or result.receipt == 0) return error.Completion;
+                self.power_receipt = result.receipt; self.power_failure = result.failure;
+                self.power_bound_done = true;
+                self.phase = .detach;
+            },
+            .power_bound_on => {
+                self.power_sequence = try run.beginBoundMonitorPower(window, true, self.deadline);
+                self.phase = .power_bound_on_wait;
+            },
+            .power_bound_on_wait => {
+                if (run.monitor_work != null) return false;
+                const result = run.monitor_result orelse return error.Completion;
+                if (result.sequence != self.power_sequence or !result.on or result.receipt == 0) return error.Completion;
+                self.power_receipt = result.receipt;
+                if (result.failure) |err| return self.failPower(product, err);
+                if (self.power_resume != .publish and self.power_resume != .unpause) return error.State;
+                self.power_failure = null;
+                self.phase = self.power_resume;
+            },
             .power_off, .power_on => {
+                if (self.phase == .power_on and self.boundDigitalOff()) {
+                    // Digital RM power resolves the currently bound head.
+                    // The paused Core ownership binds it before link and ISO
+                    // programming. Its On receipt alone never publishes an
+                    // image or unpauses the common output.
+                    if (run.display_work) |*work| {
+                        if (!work.wake_before_link or work.boot_mode.?.window != window) return error.Busy;
+                        self.plan = try run.retryPendingMonitorWake(window, self.deadline);
+                        self.phase = if (self.restore_ticket != 0) .resize_wait else .commit_wait;
+                    } else if (run.display_images[window] != null) {
+                        // Only a new explicit request can retry a rejected
+                        // bound On. Preserve that exact committed image.
+                        self.plan = product.mode;
+                        self.phase = .power_bound_on;
+                    } else {
+                        self.power_generation = run.output_generation;
+                        try run.receiver_events.refreshOutput(run.epoch, product.last_clock, product.mode.?.signal.display_id);
+                        self.phase = .power_refresh;
+                    }
+                    return true;
+                }
                 self.power_sequence = try run.beginMonitorPower(window, self.phase == .power_on, self.deadline);
                 self.phase = if (self.phase == .power_off) .power_off_wait else .power_on_wait;
             },
@@ -490,6 +568,31 @@ pub const Owner = struct {
         }
         return false;
     }
+    fn boundDigitalOff(self: *const Owner) bool {
+        const mode = self.previous orelse return false;
+        return self.power_cycle and !mode.displayPort() and mode.signal.mst == null;
+    }
+    noinline fn buildPublication(self: *const Owner, product: anytype) !void {
+        const limits = product.publication.info.limits;
+        try product.buildPublication();
+        if (!self.power_cycle) return;
+        // Pause retains the common source contract, even when a resized
+        // secondary has retired its separate framebuffer consumer. Fresh
+        // EDID and IMP evidence selects the timing; it cannot renegotiate
+        // a live adapter's source limits or restore boot-only admission.
+        if (!@import("gsp_native_modes.zig").withinSourceLimits(product.publication.modes[0], limits))
+            return error.Unsupported;
+        product.publication.info.limits = limits;
+    }
+    fn consumeDigitalWake(self: *Owner, image: runtime.ActiveDisplayImage) !bool {
+        if (image.wake_receipt == 0) return false;
+        if (!self.power_waking or image.wake_sequence <= self.power_sequence or
+            image.wake_receipt <= self.power_receipt or image.boot_mode == null or
+            !std.meta.eql(image.boot_mode.?, self.plan.?)) return error.Completion;
+        self.power_sequence = image.wake_sequence; self.power_receipt = image.wake_receipt;
+        self.power_failure = null;
+        return true;
+    }
     pub fn closeAfterReset(self: *Owner, product: anytype, proof: @import("gsp_reset.zig").Quiescence) !bool {
         if (!proof.valid(product.running.?.epoch) or product.running.?.reset_stage != .done) return error.Retained;
         if (try self.releaseSource(product)) return false;
@@ -506,7 +609,9 @@ pub const Owner = struct {
     }
     fn failPower(self: *Owner, product: anytype, err: anyerror) bool {
         self.power_failure = err; self.power_attempted = self.power_intent.sequence;
-        self.plan = null; self.restore_ticket = 0; self.phase = .power_failed;
+        self.plan = null; self.phase = .power_failed;
+        const retained_wake = if (product.running.?.display_work) |*work| work.wake_before_link and work.wake_failure != null else false;
+        if (!retained_wake) self.restore_ticket = 0;
         product.running.?.restoreOutput(product.mode.?.window, false) catch {};
         if (!product.primaryOutput()) product.running.?.preparing_outputs &= ~product.mode.?.signal.display_id;
         product.ctx.?.logInfo("NVIDIA screen: wake=unavailable image=retained system=running retry=new-request");

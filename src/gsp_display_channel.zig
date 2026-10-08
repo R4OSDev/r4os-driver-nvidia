@@ -249,7 +249,11 @@ pub const Owner = struct {
             try self.exchange.session.rm_names.validateChildrenAfterReset(self.reservation, proof);
             if (self.parent.children[self.parent_slot] != self.config.handle) return error.Stale;
         }
-        if (!self.ring.close(true) or !self.backing.closeAfterReset(proof)) return error.Retained;
+        if (!self.ring.close(true)) return error.Retained;
+        if (!self.backing.closeAfterReset(proof)) {
+            if (self.backing.awaitingCollection()) return error.Busy;
+            return error.Retained;
+        }
         if (self.namespace_live) {
             try self.exchange.session.rm_names.retireChildrenAfterReset(self.reservation, proof);
             self.namespace_live = false; self.parent.children[self.parent_slot] = 0;

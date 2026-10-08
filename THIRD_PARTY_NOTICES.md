@@ -1,5 +1,15 @@
 ﻿# Third-Party Notices
 
+Private identity display conversion (0.82.37, NVIDIA0.1.275): C5 ILUT/OLUT
+layout, direct10 controls, OCSC0 S5.14 coefficients and IMP usage follow
+pinned NVIDIA570.144 nvkms-evo3.c, nvkms-types.h, nvkms-lut.c,
+clc67d.h/clc67e.h and ctrlc372chnc.h (MIT). Full original notices accompany
+the table generator and existing encoders. Complete host fixtures retain
+original C/SoftFloat output and C layouts; no additional upstream C or
+SoftFloat implementation is linked into the driver. R4OS integer generation,
+serialized CE/readback, coupled DMA lifetime and admission remain original
+Apache-2.0 code. A host fixture is not a hardware cursor or scanout receipt.
+
 External GPU page tables (0.82.1, NVIDIA 0.1.159): MMU v2 geometry, entries,
 external FERMI_VASPACE_A flags, SET/UNSET_PAGE_DIRECTORY and the PF TLB
 invalidate sequence follow NVIDIA 570.144 (MIT), pinned at
@@ -187,6 +197,22 @@ full applicable MIT notices. Original ownership/Device integration is
 Apache-2.0. Prior runtime-license bytes are unchanged; full added notices
 are embedded and distributed identically. No reference C implementation
 is linked into the module.
+
+Display DMA correction (NVIDIA 0.1.233, 2026-10-06):
+Coherent SYS contexts use NVIDIA 570.144's PHYSICAL_PCI_COHERENT target3.
+RAMHT publication reuses the existing MIT-attributed display_context client
+hash. The existing transport case compares64 unchanged inputs evaluated by
+verbatim original NVIDIA hash/context and Nouveau descriptor binder C
+functions; their host harness selects the correct coherent target. The old
+Nouveau-only fixture is retained. Complete originals, licenses and hashes
+accompany 0.82.37/20261005-tv08237/DmaReference4; no C harness is linked.
+
+Direct primary correction (NVIDIA 0.1.234, 2026-10-06):
+The mono unscaled integer primary uses the composition bypass from NVIDIA
+570.144 EvoBypassCompositionC5; ordinary FP16 composition requires actual
+ILUT/OLUT storage. An unchanged original C function evaluates the existing
+image fixture's corrected field in CompositionReference1. Its full source,
+MIT notice and hashes are retained; the host harness is not linked.
 
 Display RAMHT and physical DMA contexts (NVIDIA 0.1.80, 2026-09-12):
 The GA106 table layout, hash and GV100 descriptors follow the pinned
@@ -469,6 +495,24 @@ NVIDIA DCB speed/function-mask facts and GSP/RM EDID ownership are documented
 there. Firmware/RM display controls and register I2C remain reference-only;
 no imported C implementation, native DDC transaction or live HPD is linked.
 
+
+Native C67A cursor PIO sequencing (NVIDIA 0.1.247):
+The C67A position method sequence in NVIDIA 0.1.247 follows the pinned
+570.144 `nvkms-cursor3.c` MoveCursorC3: a separate free-space admission
+before position and UPDATE=0; RELEASE_ELV is a different operation.
+Its original 2016 NVIDIA MIT copyright and complete notice are retained
+alongside the original class/register notices in `gsp_cursor_pio.zig`.
+The C-evaluated fixture keeps the allocation/register vectors unchanged.
+R4OS bounded worker steps, exact partial-prefix ownership and IRQ receipts
+remain Apache-2.0; the original C implementation is reference-only.
+
+Native cursor image bindings (NVIDIA 0.1.248):
+Both context-DMA and offset slots follow SetCursorSurfaceAddress in the
+pinned 570.144 `nvkms-evo3.c`, including mono mode. They share only the
+current owned image; hiding clears both. The original 2010-2023 NVIDIA
+MIT copyright and complete notice remain in `gsp_display_commands.zig`.
+Original C header vectors qualify all five existing size/hide cases.
+R4OS ownership and double ARM validation remain Apache-2.0.
 
 GA106 cursor and memory-LUT payloads (NVIDIA 0.1.39):
 display_assets uses the original MIT C67D/C67E fields, NVKMS LUT layout

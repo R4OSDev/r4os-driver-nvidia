@@ -199,6 +199,11 @@ pub const Owner = struct {
             self.cpu.lease.id != 0 and std.meta.eql(self.cpu, self.cpu_stamp);
     }
     fn word(self: *const Owner, index: usize) *volatile u32 { return @ptrFromInt(self.cpu.cpu_address + index * 4); }
+    /// Retained CPU mapping only; this observation is not a completion receipt.
+    pub fn observedWord(self: *const Owner) Error!u32 {
+        if (!self.valid() or self.offset > 16 or self.offset & 15 != 0) return error.Stale;
+        fence(); const value = self.word(self.offset / 4).*; fence(); return value;
+    }
     pub fn arm(self: *Owner, point: u64, deadline: u64) Error!void {
         if (!self.valid()) return error.Stale;
         if (self.channel != 0 or (self.phase != .ready and self.phase != .complete)) return error.State;
@@ -281,6 +286,18 @@ pub const Owner = struct {
         self.result = .{ .word = first, .timestamp = (@as(u64, hi) << 32) | lo };
         self.phase = if (status == 2) .complete else .begun; return self.result;
     }
+    /// Runtime calls this only after the exact NULL command's Core, GET,
+    /// previous FINISHED and physical ARM stop. NULL has no image lifetime;
+    /// its unused record must not demand an imaginary future FINISHED.
+    /// Preserve point history and actual bytes/result; never synthesize DMA.
+    pub fn retireWindowNoImage(self: *Owner, point: u64, deadline: u64) Error!void {
+        if (!self.valid() or self.channel == 0 or (self.offset != 0 and self.offset != 16) or
+            self.point != point or self.deadline != deadline or self.window_points[self.offset / 16] != point) return error.Stale;
+        if (self.phase != .submitted and self.phase != .begun and self.phase != .complete) return error.State;
+        if ((try self.observedWord()) >> 30 == 3) return error.Completion;
+        self.window_used &= ~(@as(u2, 1) << @intCast(self.offset / 16));
+        self.phase = .complete;
+    }
     pub fn quarantine(self: *Owner) void { self.failed = true; self.phase = .failed; self.backing.retained = true; }
     pub fn closeAfterReset(self: *Owner, proof: @import("gsp_reset.zig").Quiescence) bool {
         if (self.self_address == 0) return true;
@@ -292,6 +309,10 @@ pub const Owner = struct {
         }
         if (!self.backing.closeAfterReset(proof)) return false;
         self.* = .{}; return true;
+    }
+    pub fn awaitingCollection(self: *const Owner) bool {
+        return self.self_address == @intFromPtr(self) and self.cpu.lease.id == 0 and
+            std.meta.eql(self.cpu, self.cpu_stamp) and self.backing.awaitingCollection();
     }
     /// Only an unpublished table may abandon this allocation. There is no
     /// equivalent release from channel Free or CPU-only shutdown.

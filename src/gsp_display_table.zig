@@ -150,7 +150,8 @@ pub const ramht_bytes: usize = 8192;
 pub const descriptor_bytes: usize = 32; // 24-byte descriptor, aligned to32.
 pub const image_bytes: usize = ramht_bytes + capacity * descriptor_bytes;
 pub const Target = enum { vram, coherent_system };
-pub const Descriptor = struct { channel: u32, handle: u32, target: Target, physical: u64, bytes: u64, reserved_console: bool = false };
+pub const PageSize = enum { small, big };
+pub const Descriptor = struct { channel: u32, handle: u32, target: Target, physical: u64, bytes: u64, reserved_console: bool = false, page_size: PageSize = .small };
 pub const Change = struct { index: u8, bucket: u16, remove: bool };
 pub const Range = struct { offset: u32, bytes: u32 };
 pub const Table = struct {
@@ -187,7 +188,7 @@ pub const Table = struct {
         if (self.count >= capacity or self.revision == std.math.maxInt(u64)) return error.Exhausted;
         for (&self.entries) |item| if (item) |entry| if (entry.handle == input.handle) return error.Handle;
         const index = self.freeIndex() orelse return error.Exhausted;
-        var bucket = hash(input.channel, input.handle);
+        var bucket = hash(self.client, input.channel, input.handle);
         var probed: usize = 0;
         while (self.buckets[bucket] != null and probed < self.buckets.len) : (probed += 1) bucket = (bucket + 1) % self.buckets.len;
         if (probed == self.buckets.len) return error.Exhausted;
@@ -287,13 +288,20 @@ pub fn validate(input: Descriptor) Error!void {
     if ((input.physical == 0 and !input.reserved_console) or input.physical & 255 != 0 or input.bytes == 0 or input.bytes & 255 != 0 or
         input.physical >= @as(u64, 1) << 40 or input.bytes > (@as(u64, 1) << 40) - input.physical) return error.Bounds;
 }
-pub fn hash(channel: u32, handle: u32) usize {
-    var value = handle; var result: u32 = 0;
-    while (value != 0) : (value >>= 10) result ^= value & 1023;
-    return result ^ (channel << 6);
+pub fn hash(client: u32, channel: u32, handle: u32) usize {
+    // NVIDIA instmemHashFunc_v03_00 includes the exact low14 client bits.
+    // The existing retained-instance decoder already owns that wire rule.
+    // Nouveau's client-independent helper only agrees for client ID zero.
+    return @import("display_context.zig").hash(@truncate(client), handle, @intCast(channel));
 }
 pub fn descriptor(input: Descriptor) [6]u32 {
     const start = input.physical >> 8; const limit = (input.physical + input.bytes - 1) >> 8;
-    return .{if (input.target == .vram) 0x45 else 0x46, @truncate(start), @truncate(start >> 32), @truncate(limit), @truncate(limit >> 32), 0};
+    // NVIDIA570.144 instmemCommitContextDma_v03_00 / GA102 NV_DMA:
+    // CacheSnoop selects PHYSICAL_PCI_COHERENT=3, not PHYSICAL_PCI=2.
+    // CPU write-back notifiers require the former. Ordinary images and
+    // notifiers retain small pages; the cursor selects its original profile.
+    const flags: u32 = (if (input.target == .vram) @as(u32, 5) else 7) |
+        (if (input.page_size == .small) @as(u32, 0x40) else 0);
+    return .{flags, @truncate(start), @truncate(start >> 32), @truncate(limit), @truncate(limit >> 32), 0};
 }
 fn put(bytes: []u8, offset: usize, word: u32) void { std.mem.writeInt(u32, bytes[offset..][0..4], word, .little); }

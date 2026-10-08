@@ -28,6 +28,12 @@ pub const Owner = struct {
     dynamic_names: [layout.capacity]?names.Children = @splat(null),
     last_window_use: [layout.capacity]?struct { point: u64, offset: u16 } = @splat(null),
     notifiers: [9]notifier.Owner = @splat(.{}),
+    // Two channel-local DMA aliases share one private BO use. They retire
+    // together with the exact enclosing display epoch, never individually.
+    identity_lut: ?struct {
+        control: @import("gsp_display_identity_lut.zig").Controls,
+        core_index: u8, window_index: u8, ready: bool = false,
+    } = null,
     failed: bool = false,
 
     pub fn open(self: *Owner, session: *transport.Session, binding: wire.Binding, parent: names.Lease, instance: *vram.storage.Use) Error!void {
@@ -48,6 +54,8 @@ pub const Owner = struct {
             !std.meta.eql(self.instance.?.info(), self.instance_stamp) or !self.table.valid() or
             self.table.epoch != self.binding.?.epoch or self.table.client != self.binding.?.client or self.table.root != self.binding.?.root) return false;
         self.session.?.rm_names.validateChildren(self.reservation orelse return false) catch return false;
+        if (self.identity_lut) |lut| if (lut.core_index >= layout.capacity or lut.window_index >= layout.capacity or
+            lut.core_index == lut.window_index) return false;
         for (&self.storage, &self.table.entries, 0..) |*use, *entry, i| {
             if (entry.*) |descriptor| {
                 if (self.dynamic_names[i]) |lease| {
@@ -62,6 +70,16 @@ pub const Owner = struct {
                             use.self_address != 0 or self.surfaces[i] != null or self.surface_stamps[i] != 0) return false;
                         continue;
                     }
+                    if (self.identity_lut) |lut| if (i == lut.window_index) {
+                        const core = self.table.entries[lut.core_index] orelse return false;
+                        const value = self.storage[lut.core_index].info() orelse return false;
+                        if (use.self_address != 0 or self.surfaces[i] != null or self.surface_stamps[i] != 0 or
+                            descriptor.reserved_console or descriptor.channel != 1 + lut.control.window or descriptor.handle != lut.control.input or
+                            core.channel != 0 or core.handle != lut.control.output or descriptor.physical != core.physical or
+                            descriptor.bytes != core.bytes or descriptor.page_size != core.page_size or
+                            value.bytes != @import("gsp_display_identity_lut.zig").allocation_bytes or value.epoch != self.table.epoch) return false;
+                        continue;
+                    };
                     const value = use.info() orelse return false;
                     if (descriptor.reserved_console) return false;
                     if (value.epoch != self.table.epoch or descriptor.physical != value.physical.base or descriptor.bytes != value.bytes) return false;
@@ -78,10 +96,55 @@ pub const Owner = struct {
                 }
             } else if (use.self_address != 0 or self.consoles[i] != null or self.surfaces[i] != null or self.surface_stamps[i] != 0 or self.dynamic_names[i] != null or self.last_window_use[i] != null) return false;
         }
+        if (self.identity_lut) |lut| {
+            lut.control.validate() catch return false;
+            if (lut.core_index == lut.window_index or lut.core_index >= layout.capacity or lut.window_index >= layout.capacity) return false;
+            const core = self.table.entries[lut.core_index] orelse return false;
+            const window = self.table.entries[lut.window_index] orelse return false;
+            if (core.channel != 0 or core.handle != lut.control.output or window.channel != 1 + lut.control.window or window.handle != lut.control.input or
+                core.target != .vram or window.target != .vram or self.surfaces[lut.core_index] != null or self.consoles[lut.core_index] != null) return false;
+        }
         return true;
     }
+    pub fn bindIdentityLut(self: *Owner, source: *vram.Owner, head: u32, window: u32) Error!void {
+        const policy = source.storage_policy orelse return error.Unsupported;
+        const src = source.info() orelse return error.Stale;
+        if (policy.role != .lut or src.logical_bytes != @import("gsp_display_identity_lut.zig").allocation_bytes or head >= 8 or window >= 8) return error.Descriptor;
+        if (!self.valid() or self.identity_lut != null) return error.State;
+        if (self.table.uploading or self.table.uploaded_revision != 0 or self.table.change != null) return error.Busy;
+        if (self.table.count > layout.capacity - 2) return error.Exhausted;
+        const output = try self.bindSource(0, source, src, false, .small);
+        errdefer self.quarantine(); // Partial aliases remain owned for reset.
+        const core_index = self.table.indexOf(0, output) orelse return error.State;
+        const index = self.table.freeIndex() orelse return error.Exhausted;
+        const input = try self.reservation.?.object(@intCast(index));
+        var descriptor = self.table.entries[core_index].?;
+        descriptor.channel = 1 + window; descriptor.handle = input;
+        try self.table.add(descriptor);
+        self.identity_lut = .{ .control = .{ .head = head, .window = window, .input = input, .output = output },
+            .core_index = @intCast(core_index), .window_index = @intCast(index) };
+    }
+    pub fn identityLutTarget(self: *Owner) ?*vram.storage.Use {
+        if (!self.valid()) return null;
+        const lut = self.identity_lut orelse return null;
+        return &self.storage[lut.core_index];
+    }
+    pub fn identityLutControls(self: *Owner, head: u32, window: u32) ?@import("gsp_display_identity_lut.zig").Controls {
+        if (!self.valid()) return null;
+        const lut = self.identity_lut orelse return null;
+        if (!lut.ready or lut.control.head != head or lut.control.window != window or
+            !self.table.published(0, lut.control.output) or !self.table.published(1 + window, lut.control.input)) return null;
+        return lut.control;
+    }
     pub fn bindNative(self: *Owner, channel: u32, source: *vram.Owner) Error!u32 {
-        return self.bindSource(channel, source, source.info() orelse return error.Stale, false);
+        return self.bindSource(channel, source, source.info() orelse return error.Stale, false, .small);
+    }
+    pub fn bindCursor(self: *Owner, source: *vram.Owner) Error!u32 {
+        // Original NVIDIA570.144 physical pitch cursor context uses
+        // PAGE_SIZE_BIG=0. Other image/notifier profiles keep small pages.
+        const policy = source.storage_policy orelse return error.Unsupported;
+        if (policy.role != .cursor) return error.Unsupported;
+        return self.bindSource(0, source, source.info() orelse return error.Stale, false, .big);
     }
     /// Original reserved console memory is not a native allocation alias.
     /// Install only into a fresh table; the enclosing Device keeps its owner
@@ -98,9 +161,9 @@ pub const Owner = struct {
         return handle;
     }
     pub fn bindScanout(self: *Owner, channel: u32, source: *vram.Owner, reference: a.GfxBufferReference) Error!u32 {
-        return self.bindSource(channel, source, source.scanoutInfo(reference) orelse return error.Stale, true);
+        return self.bindSource(channel, source, source.scanoutInfo(reference) orelse return error.Stale, true, .small);
     }
-    fn bindSource(self: *Owner, channel: u32, source: *vram.Owner, src: vram.Info, scanout: bool) Error!u32 {
+    fn bindSource(self: *Owner, channel: u32, source: *vram.Owner, src: vram.Info, scanout: bool, page_size: layout.PageSize) Error!u32 {
         if (!self.valid()) return error.Stale;
         if (self.table.uploading or self.table.change != null) return error.Busy;
         if (self.table.count >= layout.capacity or self.table.revision == std.math.maxInt(u64)) return error.Exhausted;
@@ -116,7 +179,7 @@ pub const Owner = struct {
             try self.session.?.rm_names.reserveChildren(self.reservation.?.parent, 1) else null;
         errdefer if (dynamic) |lease| self.session.?.rm_names.retireChildren(lease) catch {};
         const handle = if (dynamic) |lease| try lease.object(0) else try self.reservation.?.object(@intCast(index));
-        const entry: layout.Descriptor = .{ .channel = channel, .handle = handle, .target = .vram, .physical = physical.base, .bytes = src.logical_bytes };
+        const entry: layout.Descriptor = .{ .channel = channel, .handle = handle, .target = .vram, .physical = physical.base, .bytes = src.logical_bytes, .page_size = page_size };
         try layout.validate(entry);
         if (scanout) try self.storage[index].acquireScanout(source.memory, .{ .reference = src.reference,
             .physical = physical, .address = src.address, .bytes = src.logical_bytes, .epoch = src.epoch,
@@ -188,6 +251,7 @@ pub const Owner = struct {
     pub fn publishedCursorStorage(self: *Owner, handle: u32) ?*vram.storage.Use {
         if (!self.valid() or !self.table.published(0, handle)) return null;
         const index = self.table.indexOf(0, handle) orelse return null;
+        if (self.identity_lut) |lut| if (index == lut.core_index) return null;
         if (self.table.entries[index].?.target != .vram or self.consoles[index] != null or self.surfaces[index] != null) return null;
         return &self.storage[index];
     }
@@ -233,7 +297,13 @@ pub const Owner = struct {
             if (held.consumer != @intFromPtr(self) or held.epoch != self.binding.?.epoch) return error.Stale;
             held.invalidate(); held.consumer = 0; slot.* = null;
         };
-        for (&self.notifiers) |*note| if (!note.closeAfterReset(proof)) return error.Retained;
+        for (&self.notifiers) |*note| if (!note.closeAfterReset(proof)) {
+            // Releasing the final scanout use can make a native BO release
+            // ticket ready in this same slice. Keep the owner and RM names
+            // while Runtime drains that exact ticket before our next retry.
+            if (note.awaitingCollection()) return error.Busy;
+            return error.Retained;
+        };
         for (&self.dynamic_names) |*lease| if (lease.*) |held| {
             try self.session.?.rm_names.retireChildrenAfterReset(held, proof); lease.* = null;
         };

@@ -306,6 +306,16 @@ pub const Ring = struct {
         if (self.pending_batch) self.batch_point = ticket.point;
         self.word(wire.put_offset).* = ticket.put; fence();
     }
+    /// Only CPU-prepared words beyond the unchanged USERD PUT are revoked.
+    /// Require the exact ticket and the preceding real semaphore completion;
+    /// no GET inference, point increment, DMA write or completion fabrication.
+    pub fn abortUnpublished(self: *Ring, ticket: Ticket) Error!void {
+        if (!self.matches(ticket) or self.pending_batch or self.batch_point != 0) return error.Stale;
+        fence();
+        if (self.issued != self.completed or self.word(wire.put_offset).* != self.put or
+            self.word(wire.completion_offset).* != self.completed) return error.Retained;
+        self.pending = null;
+    }
     pub fn notified(self: *Ring, ticket: Ticket) Error!void {
         if (!self.valid() or !self.published or self.pending == null or !std.meta.eql(self.pending.?, ticket)) return error.Stale;
         self.pending = null; self.published = false; self.pending_batch = false;

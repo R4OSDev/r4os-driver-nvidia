@@ -14,6 +14,8 @@ pub const Node = struct {
     allocation_stamp: a.DriverHeapAllocation,
     previous: ?*Node = null,
     next: ?*Node = null,
+    deferred_previous: ?*Node = null,
+    deferred_next: ?*Node = null,
     backing: storage.Storage = .{},
     cpu: a.GfxBufferMap = .{},
     cpu_stamp: a.GfxBufferMap = .{},
@@ -31,6 +33,7 @@ pub const Owner = struct {
     pending_stamp: a.DriverHeapAllocation = .{},
     failure: ?vm.Error = null,
     deferred_pages: usize = 0,
+    deferred_first: ?*Node = null,
     last_operation: enum { none, cpu_unmap, backing, heap_release } = .none,
     last_status: i32 = ok,
     last_backing_step: []const u8 = "none",
@@ -66,6 +69,12 @@ pub const Owner = struct {
             if (prev.next != node) return error.Descriptor;
         } else if (self.first != node) return error.Descriptor;
         if (node.next) |next| if (next.previous != node) return error.Descriptor;
+        if (node.awaiting_collection) {
+            if (node.deferred_previous) |prev| {
+                if (prev.deferred_next != node) return error.Descriptor;
+            } else if (self.deferred_first != node) return error.Descriptor;
+            if (node.deferred_next) |next| if (next.deferred_previous != node) return error.Descriptor;
+        } else if (node.deferred_previous != null or node.deferred_next != null) return error.Descriptor;
     }
     fn cast(raw: *anyopaque) *Owner { return @ptrCast(@alignCast(raw)); }
     pub fn backend(self: *Owner) vm.Error!vm.Backend {
@@ -128,7 +137,8 @@ pub const Owner = struct {
         // The VM removed this table only after confirmed invalidation/root
         // detach. Finish that logical removal even if the common collector
         // awaits the surrounding native BO's RM destruction. Keep the node
-        // resident until closeEmpty/closeAfterReset proves collection later.
+        // resident until the worker's bounded retry (or final teardown)
+        // proves collection later. Live page tables never enter that list.
         _ = self.dispose(node, null, true) catch |err| return self.fail(err);
     }
     fn releasePending(self: *Owner) vm.Error!void {
@@ -163,8 +173,13 @@ pub const Owner = struct {
             self.last_status = node.backing.close_status;
             self.last_backing_step = @tagName(node.backing.close_step);
             if (allow_deferred and node.backing.awaitingCollection()) {
-                if (!node.awaiting_collection) self.deferred_pages += 1;
-                node.awaiting_collection = true;
+                if (!node.awaiting_collection) {
+                    node.deferred_next = self.deferred_first;
+                    if (self.deferred_first) |first| first.deferred_previous = node;
+                    self.deferred_first = node;
+                    self.deferred_pages += 1;
+                    node.awaiting_collection = true;
+                }
                 node.prepared = false;
                 return false;
             }
@@ -175,9 +190,29 @@ pub const Owner = struct {
         self.pending_stamp = node.allocation_stamp;
         if (node.previous) |prev| prev.next = node.next else self.first = node.next;
         if (node.next) |next| next.previous = node.previous;
-        if (node.awaiting_collection) self.deferred_pages -= 1;
+        if (node.awaiting_collection) {
+            if (node.deferred_previous) |prev| prev.deferred_next = node.deferred_next else self.deferred_first = node.deferred_next;
+            if (node.deferred_next) |next| next.deferred_previous = node.deferred_previous;
+            self.deferred_pages -= 1;
+        }
         try self.releasePending();
         return true;
+    }
+    /// Retry one detached table's common collection in constant owner work.
+    /// Its exact TLB/root detach and every CPU/DMA/reference release already
+    /// succeeded. Busy leaves it resident and lets other RM destruction run;
+    /// this neither examines nor releases a live prepared table.
+    pub fn collectDeferred(self: *Owner) vm.Error!bool {
+        if (self.self_address == 0) return false;
+        try self.stable();
+        if (self.failure != null or self.pending.handle != 0 or self.pending.cpu_address != 0) return error.Retained;
+        if (self.deferred_first) |node| {
+            if (self.deferred_pages == 0 or !node.awaiting_collection or node.prepared or !node.backing.awaitingCollection())
+                return self.fail(error.Descriptor);
+            return self.dispose(node, null, true) catch |err| return self.fail(err);
+        }
+        if (self.deferred_pages != 0) return self.fail(error.Descriptor);
+        return false;
     }
     /// One common BO/metadata allocation per reset cleanup step. The proof
     /// is checked again for each step while PCI bus mastering remains off.
@@ -198,7 +233,7 @@ pub const Owner = struct {
             if (!node.awaiting_collection or node.prepared) return error.Retained;
             _ = try self.dispose(node, null, false);
         }
-        if (self.deferred_pages != 0 or self.pending.handle != 0 or self.pending.cpu_address != 0) return error.Retained;
+        if (self.deferred_pages != 0 or self.deferred_first != null or self.pending.handle != 0 or self.pending.cpu_address != 0) return error.Retained;
         self.* = .{};
     }
 };

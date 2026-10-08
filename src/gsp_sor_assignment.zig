@@ -36,14 +36,18 @@ pub const Request = struct {
     // Display IDs already owned by an active head or a pending route, indexed
     // by the actual SOR. Excluding these also protects not-yet-lit outputs.
     protected: [4]u32 = @splat(0),
+    // NVIDIA 570.144 RestoreSorAssignList excludes every other SOR when
+    // restoring a cached connector. This is not a request for a new route.
+    fixed_sor: ?u2 = null,
     pub fn excluded(self: Request) u8 {
-        var bits: u8 = 0;
+        var bits: u8 = if (self.fixed_sor) |index| ~(@as(u8, 1) << index) else 0;
         for (self.protected, 0..) |id, index| if (id != 0) { bits |= @as(u8, 1) << @intCast(index); };
         return bits;
     }
     fn validate(self: Request) !void {
         if (self.object.epoch == 0 or self.object.client == 0 or self.object.display == 0) return error.Handle;
         if (!oneBit(self.display_id)) return error.Descriptor;
+        if (self.fixed_sor) |index| if (self.protected[index] != 0) return error.Binding;
         var seen = self.display_id;
         for (self.protected) |id| if (id != 0) {
             if (!oneBit(id) or id & seen != 0) return error.Descriptor;

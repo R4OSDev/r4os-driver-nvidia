@@ -60,6 +60,16 @@ pub const Owner = struct {
         if (status == a.gfx_output_ok) self.last = value else if (status != a.gfx_output_error_busy) {
             self.disabled = true;
             @import("gsp_mode_diagnostics.zig").write(&product.ctx.?, "NVIDIA present-statistics: unavailable status={d} video=preserved", .{status});
+            @import("gsp_mode_diagnostics.zig").write(&product.ctx.?,
+                "NVIDIA present-rejected: head={d} sequence={d} flags={x} pending={x} acquired={d} rendered={d} submitted={d} visible={d} released={d} visible-sequence={d}",
+                .{value.head_id, value.sequence, value.flags, value.pending, value.acquired_count, value.rendered_count,
+                    value.submitted_count, value.visible_count, value.released_count, value.visible_sequence});
+            @import("gsp_mode_diagnostics.zig").write(&product.ctx.?,
+                "NVIDIA present-rejected-points: source={d}:{d} render={d} window={d} IRQ={d} buffers={d}",
+                .{value.source_timeline, value.source_point, value.render_point, value.window_point, value.irq_sequence, value.buffer_count});
+            @import("gsp_mode_diagnostics.zig").write(&product.ctx.?,
+                "NVIDIA present-rejected-times: submitted={d} IRQ={d} visible={d} released={d}",
+                .{value.submitted_ns, value.irq_observed_ns, value.visible_ns, value.released_ns});
         }
     }
     fn publishInfo(self: *Owner, product: anytype, base: Plan, generation: u64, failed: bool, additional: bool) void {
@@ -69,6 +79,11 @@ pub const Owner = struct {
         if (run.presentation_buffers < 2 or run.presentation_buffers > 3 or mode.head >= 8) return;
         const current = run.currentPresentation(mode.window);
         const direct = current != null and current.?.direct != null;
+        // Queued present already accepts exact linear SYSTEM RGBX sources
+        // through its retained mapping and CE copy. Publish that admission
+        // only after the common backend really registered the operation.
+        const system_sources = if (run.copy_backend) |backend|
+            backend.operations & (@as(u64, 1) << a.gfx_queue_operation_present) != 0 else false;
         var value: a.DisplayPresentationInfo = .{ .head_id = mode.head, .backend = product.backend,
             // Additional registration seeds the common metadata at sequence1.
             .display_generation = generation, .sequence = if (self.last_info) |last| last.sequence else @intFromBool(additional),
@@ -79,6 +94,7 @@ pub const Owner = struct {
             // Window SET_PRESENT_CONTROL uses non-tearing interval1. Latest
             // ready changes only the unsubmitted userland queue, not that mode.
             .flags = a.display_presentation_info_native | a.display_presentation_info_synchronized | a.display_presentation_info_visibility |
+                @as(u32, if (system_sources) a.display_presentation_info_system_source else 0) |
                 @as(u32, if (!additional and run.directOutputAvailable(mode.window)) a.display_presentation_info_direct else 0) |
                 @as(u32, if (run.outputPaused(mode.window)) a.display_presentation_info_occluded else a.display_presentation_info_active) |
                 @as(u32, if (failed or run.failure != null) a.display_presentation_info_lost else 0),

@@ -620,6 +620,7 @@ const WorkFixture = struct {
     var submits: u32 = 0;
     var releases: u32 = 0;
     var callbacks: u32 = 0;
+    var callback_failures: u32 = 0;
     var active: u32 = 0;
     var result: i32 = 0;
     var cancelled = false;
@@ -628,11 +629,29 @@ const WorkFixture = struct {
     var semaphore_destroy_result: i32 = 0;
     var semaphore_destroys: u32 = 0;
     var task_releases: u32 = 0;
+    var frequency_hz: u32 = 10;
+    var completion_script: []const i32 = &.{};
+    var script_index: usize = 0;
+    var semaphore_waits: u32 = 0;
+    var wait_timeouts: [8]u64 = @splat(0);
+    var defer_callback = false;
+    var pending_handler: ?a.DriverWorkHandler = null;
+    var pending_raw: usize = 0;
+    var pending_running = false;
+    var completion_waits: u32 = 0;
+    var completion_wait_error: i32 = 0;
+    var stop_during_wait = false;
+    var complete_before_timeout = false;
     fn reset() void {
         task = .{}; ticks = 0; owner = false; busy = 0; release_busy = 0;
         submits = 0; releases = 0; callbacks = 0; active = 0; result = 0; cancelled = false;
+        callback_failures = 0;
         join_result = 0; task_release_busy = 0; semaphore_destroy_result = 0;
         semaphore_destroys = 0; task_releases = 0;
+        frequency_hz = 10; completion_script = &.{}; script_index = 0;
+        semaphore_waits = 0; wait_timeouts = @splat(0);
+        defer_callback = false; pending_handler = null; pending_raw = 0; pending_running = false;
+        completion_waits = 0; completion_wait_error = 0; stop_during_wait = false; complete_before_timeout = false;
     }
     fn threads(out: *a.DriverThreadApi) callconv(.c) i32 {
         out.* = .{ .start = @intFromPtr(&start), .stop = @intFromPtr(&stopTask),
@@ -665,6 +684,8 @@ const WorkFixture = struct {
     }
     fn acquire(handle: u64, timeout: u64) callconv(.c) i32 {
         std.debug.assert(handle == 9 and active == 0 and !owner);
+        if (semaphore_waits < wait_timeouts.len) wait_timeouts[semaphore_waits] = timeout;
+        semaphore_waits += 1;
         wait(timeout); return a.driver_semaphore_error_timeout;
     }
     fn submit(handler: a.DriverWorkHandler, raw: usize, out: *u32) callconv(.c) i32 {
@@ -672,17 +693,64 @@ const WorkFixture = struct {
         submits += 1; active = submits; out.* = active;
         if (cancelled) result = -7 else if (busy != 0) {
             busy -= 1; result = a.driver_work_owner_busy;
+        } else if (script_index < completion_script.len) {
+            // Model completed owned turns; the actual final stopped slice
+            // still runs below. Pacing publication is separate from generic
+            // Work success. No ticket may survive a requeue or sleep.
+            const disposition = completion_script[script_index]; script_index += 1;
+            if (disposition >= 0) {
+                const work: *@import("gsp_start_work.zig").Work = @ptrFromInt(raw);
+                if (disposition != 99) @atomicStore(u32, &work.completion_disposition, @intCast(disposition), .release);
+                result = 0;
+            } else result = disposition;
+        } else if (defer_callback) {
+            pending_handler = handler; pending_raw = raw;
         } else {
             owner = true; callbacks += 1;
             result = handler(raw);
+            if (result != 0) callback_failures += 1;
             owner = false;
         }
         return 0;
     }
     fn status(handle: u32, out: *a.DriverCompletionStatus) callconv(.c) i32 {
         std.debug.assert(handle == active and !owner);
-        out.* = .{ .state = if (cancelled) a.driver_work_state_cancelled else a.driver_work_state_completed, .result = result };
+        out.* = .{ .state = if (cancelled) a.driver_work_state_cancelled else if (pending_handler != null)
+            (if (pending_running) a.driver_work_state_running else a.driver_work_state_queued)
+            else a.driver_work_state_completed, .result = result };
         return 0;
+    }
+    fn completionWait(handle: u32, timeout: u64, out: *i32) callconv(.c) i32 {
+        std.debug.assert(handle == active and timeout != 0 and !owner and pending_handler != null);
+        completion_waits += 1;
+        if (completion_wait_error != 0) {
+            const error_code = completion_wait_error; completion_wait_error = 0;
+            if (stop_during_wait) {
+                const work: *@import("gsp_start_work.zig").Work = @ptrFromInt(pending_raw);
+                @atomicStore(u32, &work.stopping, 1, .release);
+                pending_running = true;
+            }
+            if (error_code == a.driver_work_result_cancelled) {
+                pending_handler = null; cancelled = true; result = error_code; out.* = result;
+            }
+            if (error_code == 1 and complete_before_timeout) {
+                // The real kernel's timeout result can race the completed
+                // book state/publication before the waiter returns. Execute
+                // the same owned callback and retain its exact result.
+                const handler = pending_handler.?; pending_handler = null;
+                owner = true; callbacks += 1; result = handler(pending_raw); owner = false;
+                if (result != 0) callback_failures += 1;
+                ticks += frequency_hz;
+                out.* = result;
+            }
+            return error_code;
+        }
+        // The queued callback executes with its exact lifecycle owner while
+        // the pacing task is asleep on the completion, never that owner.
+        const handler = pending_handler.?; pending_handler = null;
+        owner = true; callbacks += 1; result = handler(pending_raw); owner = false;
+        if (result != 0) callback_failures += 1;
+        out.* = result; return 0;
     }
     fn release(handle: u32) callconv(.c) i32 {
         std.debug.assert(handle == active and !owner);
@@ -690,7 +758,7 @@ const WorkFixture = struct {
         active = 0; releases += 1; return 0;
     }
     fn tick() callconv(.c) u64 { return ticks; }
-    fn frequency() callconv(.c) u32 { return 10; }
+    fn frequency() callconv(.c) u32 { return frequency_hz; }
     fn wait(count_ticks: u64) callconv(.c) void {
         std.debug.assert(!owner); ticks += count_ticks;
     }
@@ -707,6 +775,7 @@ const WorkFixture = struct {
         api.thread_query = threads; api.semaphore_query = semaphores;
         api.driver_work_submit_owned = submit;
         api.driver_completion_status = status; api.driver_completion_release = release;
+        api.driver_completion_wait = completionWait;
         api.tick_count = tick; api.timer_frequency = frequency; api.wait_ticks = wait;
         api.resource_query = WorkFixture.resources;
         return api;
@@ -723,7 +792,7 @@ test "NVIDIA actual driver lifecycle paces hardware under owned work and retains
     target.* = .{ .self_address = @intFromPtr(target), .stopped = true };
     var api = WorkFixture.table();
     const ctx = r4os.r4dev.DriverContext.init(&api);
-    for (0..4) |scenario| {
+    for (0..16) |scenario| {
         WorkFixture.reset();
         var work: worker.Work = .{};
         try work.start(&ctx, target);
@@ -732,6 +801,27 @@ test "NVIDIA actual driver lifecycle paces hardware under owned work and retains
             1 => WorkFixture.busy = 100,
             2 => WorkFixture.release_busy = 100,
             3 => WorkFixture.cancelled = true,
+            4, 5 => {
+                WorkFixture.frequency_hz = 1000;
+                WorkFixture.completion_script = &.{ 3, 3, 0, 2, a.driver_work_owner_busy, 3 };
+                if (scenario == 5) WorkFixture.release_busy = 2;
+            },
+            6...11 => {
+                WorkFixture.defer_callback = true;
+                if (scenario == 7) WorkFixture.release_busy = 2;
+                if (scenario == 8) WorkFixture.completion_wait_error = 1;
+                if (scenario == 9 or scenario == 10) WorkFixture.completion_wait_error = -5;
+                if (scenario == 10) WorkFixture.stop_during_wait = true;
+                if (scenario == 11) WorkFixture.completion_wait_error = a.driver_work_result_cancelled;
+            },
+            12 => WorkFixture.completion_script = &.{99}, // Successful ticket without publication.
+            13 => WorkFixture.completion_script = &.{-3}, // Genuine callback failure.
+            14 => WorkFixture.completion_script = &.{4}, // Invalid pacing publication.
+            15 => {
+                WorkFixture.defer_callback = true;
+                WorkFixture.completion_wait_error = 1;
+                WorkFixture.complete_before_timeout = true;
+            },
             else => unreachable,
         }
         const result = WorkFixture.run();
@@ -761,8 +851,66 @@ test "NVIDIA actual driver lifecycle paces hardware under owned work and retains
                 try t.expectEqual(@as(u32, 1), WorkFixture.releases);
                 try t.expectEqual(@as(u32, 0), work.completion);
             },
+            4, 5 => {
+                try t.expectEqual(@as(i32, 0), result);
+                try t.expectEqual(@as(u32, 7), WorkFixture.submits);
+                try t.expectEqual(@as(u32, 7), WorkFixture.releases);
+                try t.expectEqual(@as(u32, 1), WorkFixture.callbacks);
+                try t.expectEqual(@as(u32, 0), work.completion);
+                try t.expectEqual(@as(u32, 3), WorkFixture.semaphore_waits);
+                try t.expectEqualSlices(u64, &.{ 1, 10, 1 }, WorkFixture.wait_timeouts[0..3]);
+                try t.expectEqual(@as(u64, if (scenario == 5) 14 else 12), WorkFixture.ticks);
+            },
+            6, 7, 10 => {
+                try t.expectEqual(@as(i32, 0), result);
+                try t.expectEqual(@as(u32, 1), WorkFixture.submits);
+                try t.expectEqual(@as(u32, 1), WorkFixture.callbacks);
+                try t.expectEqual(@as(u32, 1), WorkFixture.releases);
+                try t.expectEqual(@as(u32, 0), work.completion);
+                try t.expectEqual(@as(u32, if (scenario == 10) 2 else 1), WorkFixture.completion_waits);
+                try t.expectEqual(@as(u64, if (scenario == 7) 2 else if (scenario == 10) 1 else 0), WorkFixture.ticks);
+            },
+            8, 9 => {
+                try t.expectEqual(@as(i32, -1), result);
+                try t.expectEqual(@as(u32, 1), WorkFixture.submits);
+                try t.expectEqual(@as(u32, 0), WorkFixture.callbacks);
+                try t.expectEqual(@as(u32, 0), WorkFixture.releases);
+                try t.expectEqual(@as(u32, 1), work.completion);
+                try t.expectEqual(@as(u32, 1), WorkFixture.completion_waits);
+            },
+            11 => {
+                try t.expectEqual(a.driver_work_result_cancelled, result);
+                try t.expectEqual(@as(u32, 1), WorkFixture.releases);
+                try t.expectEqual(@as(u32, 0), work.completion);
+                try t.expectEqual(@as(u32, 0), WorkFixture.callbacks);
+                try t.expectEqual(@as(u32, 1), WorkFixture.completion_waits);
+            },
+            12, 14 => {
+                try t.expectEqual(@as(i32, -1), result);
+                try t.expectEqual(@as(u32, 1), WorkFixture.submits);
+                try t.expectEqual(@as(u32, 0), WorkFixture.releases);
+                try t.expectEqual(@as(u32, 1), work.completion);
+            },
+            13 => {
+                try t.expectEqual(@as(i32, -3), result);
+                try t.expectEqual(@as(u32, 1), WorkFixture.submits);
+                try t.expectEqual(@as(u32, 1), WorkFixture.releases);
+                try t.expectEqual(@as(u32, 0), work.completion);
+            },
+            15 => {
+                try t.expectEqual(@as(i32, 0), result);
+                try t.expectEqual(@as(u32, 1), WorkFixture.submits);
+                try t.expectEqual(@as(u32, 1), WorkFixture.callbacks);
+                try t.expectEqual(@as(u32, 1), WorkFixture.completion_waits);
+                try t.expectEqual(@as(u32, 1), WorkFixture.releases);
+                try t.expectEqual(@as(u32, 0), work.completion);
+                try t.expectEqual(@as(u64, WorkFixture.frequency_hz), WorkFixture.ticks);
+            },
             else => unreachable,
         }
+        try t.expectEqual(@as(u32, 0), WorkFixture.callback_failures);
+        if (work.completion == 0) try t.expectEqual(std.math.maxInt(u32),
+            @atomicLoad(u32, &work.completion_disposition, .acquire));
     }
     target.irq_wake = null;
     // Pacing joins while the live device and IRQ wake callback retain their

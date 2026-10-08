@@ -371,6 +371,7 @@ pub fn encodeTopology(binding: Binding, op: Operation, mode: modes.Plan, topolog
                 put(head, 44, 16); put(head, 52, 16); // NO_LOCK, PIN_UNSPECIFIED.
                 put(head, 56, 1024); put(head, 60, 1024); head[64] = 1;
                 put(head, 68, selected.signal.min_frame_idle);
+                head[72] = if (selected.native_lut) 2 else 0; // Original IMP_LUT_USAGE_1025.
                 head[73] = @intCast(selected.cursor_size / 32);
                 const compression = if (selected.signal.dp_dsc) |compressed| compressed.params else
                     if (selected.signal.hdmi_dsc) |compressed| compressed.params else null;
@@ -380,10 +381,11 @@ pub fn encodeTopology(binding: Binding, op: Operation, mode: modes.Plan, topolog
                     put(head, 80, @as(u32, 1) << @intCast(params.slices - 1));
                     put(head, 84, params.slice_width);
                 }
-                // LUTs, rotation, scaling, overfetch and YUV stay off.
+                // Only the actual private identity ILUT/OLUT are admitted; no TMO.
                 const window = data[744 + index * 36..][0..36];
                 put(window, 0, selected.window); put(window, 4, selected.head); put(window, 8, 4);
                 put(window, 16, selected.width); put(window, 20, 1024); put(window, 24, 1024);
+                window[31] = if (selected.native_lut) 2 else 0;
                 window[28] = 1; window[33] = 1; // One tap, PITCH layout.
                 }
                 put(data, 1896, 3); // Fresh min-vpstate and margin query; no cached perf.

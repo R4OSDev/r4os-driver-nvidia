@@ -1,11 +1,22 @@
 //! Existing transport-group probe: complete output from pinned original
-//! Nouveau RAMHT and GV100 binder C functions, not a duplicate Zig codec.
+//! NVIDIA client hash/context and Nouveau GV100 binder C functions. Coherent
+//! SYS records use the original NVIDIA PHYSICAL_PCI_COHERENT target, while
+//! the historical Nouveau-only binary remains a separate source artifact.
 const std = @import("std");
 const t = std.testing;
 const layout = @import("gsp_display_table.zig");
-const fixture = @embedFile("fixtures/display-table-nouveau.bin");
+const fixture = @embedFile("fixtures/display-table-nvidia.bin");
+const cursor_fixture = @embedFile("fixtures/display-cursor-dma570.144.bin");
 pub fn check() !void {
     try t.expect(fixture.len == 12296 and word(0) == layout.capacity);
+    // Unchanged original NVIDIA physical-pitch commit, evaluated by C.
+    // This does not modify the existing 64-entry Nouveau-profile oracle.
+    try t.expect(cursor_fixture.len == 20);
+    const cursor_start = @as(u64, std.mem.readInt(u32, cursor_fixture[4..8], .little)) << 8;
+    const cursor_limit = (@as(u64, std.mem.readInt(u32, cursor_fixture[12..16], .little)) + 1) << 8;
+    const cursor_words = layout.descriptor(.{ .channel = 0, .handle = 0x100000ea,
+        .target = .vram, .physical = cursor_start, .bytes = cursor_limit - cursor_start, .page_size = .big });
+    for (0..5) |i| try t.expectEqual(std.mem.readInt(u32, cursor_fixture[i * 4..][0..4], .little), cursor_words[i]);
     const table = try t.allocator.create(layout.Table); defer t.allocator.destroy(table);
     table.* = .{}; try table.init(word(4), 0xc123ffff, 7);
     try t.expectError(error.Busy, table.beginUpload());

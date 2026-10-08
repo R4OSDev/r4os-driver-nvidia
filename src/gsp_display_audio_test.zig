@@ -83,8 +83,55 @@ fn checkMonitorPower(mode: @import("gsp_boot_mode.zig").Plan, object: @import("g
         try work.consume(reply, 1, 8);
         try t.expect(work.stage == .complete and work.receipt == 8);
     }
+    const forced_vectors = @embedFile("fixtures/monitor-forced-570.144.bin");
+    for ([_]bool{false, true}) |on| {
+        var work = try power.Work.init(.{ .object = object, .mode = mode,
+            .kind = .digital, .sink_control = true, .bound_paused = true }, on, 7, deadline);
+        const length = try work.encode(&bytes);
+        try t.expect(length == 44 and word(&bytes, 36) == 0 and word(&bytes, 40) == 0);
+        work.pending = true;
+        try work.consume(powerReply(bytes[0..length]), 1, 8);
+        try t.expect(work.stage == .complete and work.receipt == 8);
+    }
+    var pending = try power.Work.init(.{ .object = object, .mode = mode,
+        .kind = .digital, .sink_control = true, .bound_paused = true, .pending_head = true }, true, 7, deadline);
+    const pending_length = try pending.encode(&bytes);
+    try t.expect(pending_length == 44 and word(&bytes, 32) == 1 and word(&bytes, 36) == 0 and word(&bytes, 40) == 0);
+    pending.pending = true;
+    try pending.consume(powerReply(bytes[0..pending_length]), 1, 8);
+    try t.expect(pending.stage == .complete and pending.receipt == 8);
+    try t.expectError(error.Descriptor, power.Work.init(.{ .object = object, .mode = mode,
+        .kind = .digital, .sink_control = true, .bound_paused = true, .pending_head = true }, false, 7, deadline));
+    try t.expectError(error.Descriptor, power.Work.init(.{ .object = object, .mode = mode,
+        .kind = .digital, .sink_control = true, .pending_head = true }, true, 7, deadline));
+    for ([_]bool{false, true}, 0..) |on, index| {
+        var work = try power.Work.init(.{ .object = object, .mode = mode, .kind = .digital,
+            .sink_control = true, .force_monitor_state = true }, on, 7, deadline);
+        const length = try work.encode(&bytes);
+        try t.expectEqualSlices(u8, forced_vectors[index * 44 ..][0..44], bytes[0..length]);
+        work.pending = true;
+        const reply = powerReply(bytes[0..length]);
+        bytes[36] ^= 1;
+        try t.expectError(error.Unexpected, work.consume(reply, 1, 8));
+        bytes[36] ^= 1;
+        bytes[40] ^= 1;
+        try t.expectError(error.Unexpected, work.consume(reply, 1, 8));
+        bytes[40] ^= 1;
+        put(&bytes, 12, 0x1f);
+        try t.expectError(error.RmRejected, work.consume(reply, 1, 8));
+        try t.expect(work.stage == .digital and work.receipt == 0);
+        put(&bytes, 12, 0);
+        try work.consume(reply, 1, 8);
+        try t.expect(work.stage == .complete and work.receipt == 8);
+    }
     var dp = mode;
     dp.transport_hdmi = false; dp.signal.sor_control = 0x802;
+    try t.expectError(error.Descriptor, power.Work.init(.{ .object = object, .mode = dp,
+        .kind = .dp_sst, .sink_control = true, .bound_paused = true }, true, 9, deadline));
+    try t.expectError(error.Descriptor, power.Work.init(.{ .object = object, .mode = dp,
+        .kind = .dp_sst, .sink_control = true, .bound_paused = true, .pending_head = true }, true, 9, deadline));
+    try t.expectError(error.Descriptor, power.Work.init(.{ .object = object, .mode = dp,
+        .kind = .dp_sst, .sink_control = true, .force_monitor_state = true }, false, 9, deadline));
     var off = try power.Work.init(.{ .object = object, .mode = dp, .kind = .dp_sst, .sink_control = true }, false, 9, deadline);
     try t.expect(try off.encode(&bytes) == 72 and word(&bytes, 8) == 0x731341 and word(&bytes, 40) == 0x600 and bytes[44] == 2);
     off.pending = true;

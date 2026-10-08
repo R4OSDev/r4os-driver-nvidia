@@ -52,6 +52,7 @@ pub const Device = struct {
     last_clock: u64 = 0,
     stopped: bool = false,
     terminal_requested: bool = false,
+    terminal_console_requested: bool = false,
     terminal_retired: bool = false,
     terminal_deadline: u64 = 0,
     failure: ?anyerror = null,
@@ -100,6 +101,7 @@ pub const Device = struct {
     recovery_hooks: ?RecoveryHooks = null,
     reset_binding: a.GfxBackendBinding = .{},
     reset_original_display: u64 = 0,
+    reset_display_status: i32 = 0,
     reset_display: a.GfxNativeState = .{},
     reset_retire_stage: enum { runtime, common, output, console_memory, port, reader, memory, terminal, restage, restart } = .runtime,
     reset_to_console: bool = false,
@@ -108,11 +110,18 @@ pub const Device = struct {
     reset_frame_count: u8 = 2,
     reset_graphics_requested: bool = false,
     reset_output_requested: bool = false,
+    reset_output_route: ?@import("gsp_output_route.zig").RestoreIdentity = null,
     headless_resumed: bool = false,
     reset_audio_location: u32 = 0,
     reset_audio_device: u32 = 0,
     reset_audio_attached: bool = false,
     heads_reported: u32 = 0,
+    flip_watch: [8]struct {
+        epoch: u64 = 0,
+        sequence: u64 = 0,
+        first_seen_ns: u64 = 0,
+        reported: bool = false,
+    } = @splat(.{}),
     tx: [transport.message.max_bytes]u8 = undefined,
     rx: [transport.message.max_bytes]u8 = undefined,
 
@@ -243,8 +252,36 @@ pub const Device = struct {
             } else self.fail(err);
             break :blk true;
         };
+        self.observeFlipStall(progress);
         self.native_output.statistics.publish(&self.native_output);
         return if (self.phase == .failed) .stopped else if (progress) .progress else .idle;
+    }
+    /// One retained-metadata report per unusually long Window use. This does
+    /// not touch PCI/MMIO, change a deadline or manufacture a flip receipt.
+    noinline fn observeFlipStall(self: *Device, progress: bool) void {
+        if (self.phase != .ready or self.running.failure != null or self.native_output.phase != .active) return;
+        const run = &self.running;
+        const current = run.last_clock;
+        for (&run.display_flips, &self.flip_watch, 0..) |*slot, *watch, index| {
+            const work = if (slot.*) |*value| value else { watch.* = .{}; continue; };
+            if (watch.epoch != run.epoch or watch.sequence != work.receipt.sequence)
+                watch.* = .{ .epoch = run.epoch, .sequence = work.receipt.sequence, .first_seen_ns = current };
+            if (watch.reported or current < watch.first_seen_ns) continue;
+            const age = current - watch.first_seen_ns;
+            if (age < std.time.ns_per_s and current < work.deadline) continue;
+            watch.reported = true;
+            const word: ?u32 = work.window.notifier.observedWord() catch null;
+            @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,
+                "NVIDIA flip-stall: epoch={d} head={d} window={d} sequence={d} age-ns={d} now={d} deadline={d} phase={s} point={d} notifier={?x} visible={} old-released={}",
+                .{run.epoch,work.receipt.head,index,work.receipt.sequence,age,current,work.deadline,@tagName(work.window.phase),
+                    if (work.window.ticket) |ticket| ticket.point else 0,word,work.receipt.begun_observed_ns != 0,work.receipt.previous_released_ns != 0});
+            @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,
+                "NVIDIA flip-stall-owner: progress={} polls={d} events={d} RM={s} sequence={} power={} display-channel={?} mode={} engine={} FIFO={?} context={?} VA={} native={?} buffer={?} output={} copy={} GR={} upload={} display={}",
+                .{progress,run.snapshot.polls,run.snapshot.events,if (run.activeChannel()) |channel| @tagName(channel.phase) else "none",
+                    run.sequence.self_address != 0,run.power_active,run.display_channel_active,run.mode_control_active,run.display_engine_active,
+                    run.fifo_active,run.context_active,run.virtuals.active_range != null,run.native_active,run.buffer_active,run.outputs.active(),
+                    run.copy_job != null,run.graphics_work != null,run.display_upload_job != null,run.display_work != null});
+        }
     }
     fn advance(self: *Device) !bool {
         if (self.terminal_requested and self.phase == .ready) {
@@ -268,12 +305,39 @@ pub const Device = struct {
                 self.last_clock = current;
                 const display = self.display.?.boot.display orelse return error.Api;
                 if (!display.supportsReset()) return error.Api;
+                if (self.terminal_console_requested or (!self.reset_to_console and self.display.?.boot.native_adopted)) {
+                    // A failed common queue can already invalidate the active
+                    // scanout before q0. Its lost generation is distinct from
+                    // both our committed native image and the immutable hold.
+                    var current_boot: a.GfxNativeBootInfo = .{};
+                    self.reset_display_status = display.bootInfo(&current_boot);
+                    if (self.reset_display_status == a.gfx_output_error_busy) return false;
+                    const original = self.display.?.original_boot orelse return error.Binding;
+                    if (self.reset_display_status != a.gfx_output_ok or current_boot.version != 1 or
+                        current_boot.size < @sizeOf(a.GfxNativeBootInfo) or
+                        current_boot.physical_address != original.physical_address or current_boot.byte_length != original.byte_length or
+                        current_boot.width != original.width or current_boot.height != original.height or
+                        current_boot.pitch != original.pitch or current_boot.format != original.format or current_boot.policy != original.policy)
+                        return error.Handoff;
+                    if (self.terminal_console_requested) {
+                        if (current_boot.state != a.display_state_bootfb or current_boot.generation < self.reset_original_display or
+                            current_boot.generation <= self.boot_console.callback_generation)
+                            return error.Handoff;
+                        self.reset_original_display = current_boot.generation;
+                    } else if (current_boot.state == a.display_state_unavailable and current_boot.generation > self.reset_original_display)
+                        self.reset_original_display = current_boot.generation;
+                    // deviceReset still authenticates the exact R4D/backend
+                    // owner. This observation neither adopts an image nor
+                    // authorizes release or asserts physical quiescence.
+                }
                 var state: a.GfxNativeState = .{};
                 const result = display.deviceReset(&self.reset_binding, self.reset_original_display, false, &state);
+                self.reset_display_status = result;
                 if (result == a.gfx_output_error_busy) return false;
                 if (result != a.gfx_output_ok or !validResetState(state) or state.generation <= self.reset_original_display)
                     return error.Handoff;
                 try self.display.?.boot.adoptReset(state);
+                if (self.terminal_console_requested) self.display.?.boot.console_active = false;
                 self.reset_display = state;
                 return true;
             }
@@ -318,7 +382,11 @@ pub const Device = struct {
         if (self.phase == .ready) {
             if (self.interrupts.failed()) return error.Interrupt;
             if (self.running.failure) |err| return err;
-            if (self.gpu_reset.resumed and !self.reset_output_requested and !self.headless_resumed) {
+            // Record the rebuilt execution binding while it is live, even
+            // when a native output is still waiting for its receiver. The
+            // previous display receipt proves only the old stopped epoch.
+            // A later prepare_reset consumes this same new binding.
+            if (self.gpu_reset.resumed and !self.headless_resumed) {
                 if (self.running.copy_backend) |backend| {
                     if (try self.now() >= self.deadline) return error.Deadline;
                     const display = self.display.?.boot.display orelse return error.Api;
@@ -535,8 +603,7 @@ pub const Device = struct {
     /// Startup/fault paths retain their existing conservative teardown; an
     /// idle headless runtime drains its actual RM graph and unloading RPC.
     pub fn requestShutdown(self: *Device) !void {
-        if (self.self_address != @intFromPtr(self) or self.stopped or
-            (!self.port.effects_possible and self.gpu_reset.quiescence() == null)) return error.State;
+        if (self.self_address != @intFromPtr(self) or self.stopped) return error.State;
         if (self.terminal_requested) {
             // Retry only acknowledged physical-stop cleanup. Never renew a
             // failed firmware/reset attempt or enable DMA during shutdown.
@@ -546,8 +613,14 @@ pub const Device = struct {
             }
             return;
         }
+        if (!self.port.effects_possible and self.gpu_reset.quiescence() == null and !self.hasResumedResetEpoch()) return error.State;
         if (!(self.display.?.boot.display orelse return error.Api).supportsTerminalRelease()) return error.Api;
         self.terminal_deadline = try std.math.add(u64, try self.now(), 60 * std.time.ns_per_s);
+        self.terminal_console_requested = self.phase == .ready and self.reset_to_console and
+            self.native_output.phase == .console_active and self.native_output.console == &self.boot_console and
+            self.display.?.boot.console_active and self.boot_console.phase == .ready and self.boot_console.confirmed and
+            self.boot_console.valid(self.epoch) and self.hasResumedResetEpoch() and
+            self.running.copy_backend == null and self.running.presentation == null;
         self.terminal_requested = true;
         if (!self.catalog.close()) return error.Retained;
         if (self.phase == .failed) {
@@ -556,8 +629,7 @@ pub const Device = struct {
                 // epoch. Explicit shutdown still owns its separate one-shot
                 // physical stop. Never retry an incomplete/failed old FLR or
                 // mistake the resumed epoch's old receipt for current DMA rest.
-                if (self.recovery_failure == null or self.recovery_failure.? != error.ResetLimit or !self.fault_reset_attempted or
-                    !self.gpu_reset.resumed or self.epoch <= self.gpu_reset.epoch) return error.Retained;
+                if (!self.hasResumedResetEpoch()) return error.Retained;
                 try self.beginReset();
             } else {
                 if (self.reset_display.generation == 0) self.resetBinding();
@@ -592,6 +664,24 @@ pub const Device = struct {
     }
 
     fn from(raw: *anyopaque) *Device { return @ptrCast(@alignCast(raw)); }
+    fn hasResumedResetEpoch(self: *const Device) bool {
+        return self.fault_reset_attempted and self.gpu_reset.self_address == @intFromPtr(&self.gpu_reset) and
+            self.gpu_reset.phase == .complete and self.gpu_reset.failure == null and self.gpu_reset.triggered and
+            self.gpu_reset.resumed and self.epoch > self.gpu_reset.epoch;
+    }
+    fn hasUnstartedRestartHandoff(self: *const Device) bool {
+        // The old shared display/queue already retired. A new memory epoch
+        // and DMA enable do not create a new shared queue or display binding.
+        // Keep that exact logical handoff only if restart failed before any
+        // firmware submission/runtime/output owner; it never proves DMA rest.
+        const lease = self.memory orelse return false;
+        return self.hasResumedResetEpoch() and self.phase == .failed and self.reset_retire_stage == .restart and
+            !self.reset_to_console and !self.port.effects_possible and self.running.self_address == 0 and
+            self.running.copy_backend == null and self.native_output.self_address == 0 and self.native_graphics.self_address == 0 and
+            self.session == null and self.handoff == null and self.boot == null and self.sequence == null and
+            lease.self_address == @intFromPtr(lease) and !lease.retained and lease.generation() == self.epoch and
+            validResetState(self.reset_display);
+    }
     fn beginReset(self: *Device) !void {
         if (!self.interrupts.close()) return error.IrqRetirement;
         try self.reader.?.setPolling(false);
@@ -601,14 +691,15 @@ pub const Device = struct {
         // Never reuse the old epoch's proof or retry a failed terminal FLR.
         const attempted = if (self.terminal_requested) &self.terminal_reset_attempted else &self.fault_reset_attempted;
         if (attempted.*) return error.ResetLimit;
+        const retired_handoff = self.terminal_requested and self.hasUnstartedRestartHandoff();
         if (self.gpu_reset.self_address != 0) {
-            if (!self.terminal_requested or !self.gpu_reset.resumed or self.epoch <= self.gpu_reset.epoch)
+            if (!self.terminal_requested or !self.hasResumedResetEpoch())
                 return error.ResetLimit;
             self.gpu_reset = .{};
         }
         attempted.* = true;
         self.phase = .resetting;
-        self.reset_display = .{};
+        if (!retired_handoff) self.reset_display = .{};
         self.reset_retire_stage = .runtime;
         self.reset_retire_deadline = try std.math.add(u64, self.clock_api.?.nowNs(), 5 * std.time.ns_per_s);
         self.reset_graphics_requested = self.native_graphics.self_address != 0 and !self.reset_to_console;
@@ -616,12 +707,14 @@ pub const Device = struct {
         if (self.recovery_hooks == null and !self.terminal_requested) {
             try self.gpu_reset.open(&self.reset_config, self.epoch, self.resetIo());
         } else {
-            self.resetBinding();
+            if (!retired_handoff) self.resetBinding();
             self.reset_frame_count = self.native_output.frame_count;
+            self.reset_output_route = self.native_output.recoveryRoute();
             self.reset_audio_location = self.native_output.audio.location;
             self.reset_audio_device = self.native_output.audio.device;
             self.reset_audio_attached = self.native_output.audio.catalog != null;
         }
+        if (retired_handoff) self.ctx.?.logInfo("NVIDIA shutdown: restart=unsubmitted shared-handoff=already-retired current-epoch-FLR=required old-DMA-proof=revoked");
         @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,
             "NVIDIA gpu-reset: attempt=1 purpose={s} scope=selected-NVIDIA-Fn0 epoch={d} original-phase={s} driver={s} firmware={s} resources=held display=held",
             .{if (self.terminal_requested) "terminal" else "fault",self.epoch,@tagName(self.failed_phase orelse .detached),@import("nvidia_identity").version,@import("firmware.zig").lock.rm_version});
@@ -650,12 +743,14 @@ pub const Device = struct {
                 const display = self.display.?.boot.display orelse return error.Api;
                 var result: a.GfxNativeState = .{};
                 const status = display.deviceReset(&self.reset_binding, self.reset_display.generation, true, &result);
+                self.reset_display_status = status;
                 if (status == a.gfx_output_error_busy) return false;
                 if (status != a.gfx_output_ok or !validResetState(result) or result.generation != self.reset_display.generation) return error.Handoff;
                 self.reset_retire_stage = .output;
             },
             .output => {
                 if (!try self.native_output.closeAfterReset(proof)) return false;
+                if (self.terminal_console_requested and !self.boot_console.closeAfterReset(proof)) return error.Retained;
                 self.native_graphics = .{};
                 self.render_startup = .{};
                 self.reset_retire_stage = if (self.reset_to_console and !self.terminal_requested) .console_memory else .port;
@@ -663,6 +758,9 @@ pub const Device = struct {
             .console_memory => {
                 if (self.boot_console.self_address == 0) try self.boot_console.open(self.vram.?, proof, self.consoleIo());
                 if (!try self.boot_console.stage(proof)) return false;
+                @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,
+                    "NVIDIA console-memory: stopped-epoch={d} original-pages={d} original-pixel-bytes={d} source=held-CPU-image readback=all-bytes mapping=held",
+                    .{proof.epoch,self.vram.?.boot_mapping.?.page_count,self.boot_console.bytes});
                 self.reset_retire_stage = .port;
             },
             .port => {
@@ -695,6 +793,9 @@ pub const Device = struct {
             },
             .restart => {
                 if (self.terminal_requested) return error.Retained;
+                // Never overwrite a failed metadata-source close. An exact
+                // generic queue retirement may already have revoked it.
+                if (!self.catalog.close()) return error.Retained;
                 // Every old GPU/DMA borrower has consumed its proof. Revoke
                 // that proof before the first potentially posted DMA enable.
                 try self.gpu_reset.resumeDma();
@@ -725,11 +826,12 @@ pub const Device = struct {
                 self.catalog = .{};
                 try self.catalog.open(&self.ctx.?, adapter);
                 if (self.reset_output_requested)
-                    try self.native_output.requestAfterReset(&self.ctx.?, &self.running, self.display.?, self.reset_display.generation)
+                    try self.native_output.requestAfterReset(&self.ctx.?, &self.running, self.display.?, self.reset_display.generation, self.reset_output_route)
                 else try self.running.native_copy.request();
                 if (self.reset_graphics_requested) try self.native_graphics.request();
                 if (self.reset_to_console) {
                     self.running.native_copy.publish_backend = false;
+                    self.running.boot_console_restore = &self.boot_console;
                     self.native_output.console = &self.boot_console;
                     self.display.?.firmware_recovery = .{ .context = self.self_address, .callback = consoleRestored };
                 }
@@ -753,10 +855,10 @@ pub const Device = struct {
         // Retained owner metadata only. No fresh GPU or API query after a
         // failed reset; identify the exact bounded retirement stage.
         @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,
-            "NVIDIA reset-retirement: phase={s} stage={s} runtime={s} cursor={d} backend={} allocation={} provider={} result={s}",
+            "NVIDIA reset-retirement: phase={s} stage={s} runtime={s} cursor={d} backend={} allocation={} provider={} display-status={d} catalog-status={d} result={s}",
             .{ @tagName(self.phase), @tagName(self.reset_retire_stage), @tagName(self.running.reset_stage),
                 self.running.reset_cursor, self.running.copy_backend != null, self.running.allocations.pending != null,
-                self.running.virtual_provider.handle.id, @errorName(err) });
+                self.running.virtual_provider.handle.id, self.reset_display_status, self.catalog.last_status, @errorName(err) });
         if (self.boot_console.self_address != 0) self.boot_console.invalidate();
         self.recovery_failure = err;
         self.phase = .failed;
@@ -1063,7 +1165,8 @@ pub const Device = struct {
         } else if (self.running.sor_work) |*work| {
             if (channel != &self.running.channel.? or !work.matches(channel, deadline)) return error.Binding;
             self.running.validateSorAssignment() catch return error.Binding;
-        } else if (self.running.display_work) |*work| {
+        } else if (self.running.display_work != null and self.running.monitor_work == null) {
+            const work = &self.running.display_work.?;
             if (work.refresh) |*refresh| {
                 if (channel != &self.running.channel.? or work.deadline != deadline or !refresh.control.matches(channel, deadline)) return error.Binding;
                 self.running.validateAdaptiveRefresh() catch return error.Binding;
@@ -1142,7 +1245,7 @@ pub const Device = struct {
         const rpc = run.activeChannel() orelse return error.State;
         if (rpc.session != &self.session.? or port.runtime_session != rpc.session or rpc.session.pending != null or
             rpc.phase != .idle or rpc.pending != null or rpc.in_lockdown) return error.Binding;
-        try rpc.guard(deadline);
+        if (work.queued) try rpc.guardUnsubmitted(deadline) else try rpc.guard(deadline);
     }
     fn admitBatch(raw: *anyopaque, port: *const native.Port, fifo: *@import("gsp_fifo.zig").Owner, ticket: @import("gsp_push_ring.zig").Ticket, deadline: u64) !void {
         const self = from(raw);
@@ -1210,10 +1313,19 @@ pub const Device = struct {
             const staging = if (graph.control_buffer) |*value| value else return error.Binding;
             if (self.running.copy_job != null or self.running.initial_image != null or root.info() == null or !root.instance_bound or
                 !resources.valid() or !std.meta.eql(resources.binding.?, root.binding) or resources.instance != &root.instance_storage or
-                work.operation.table != &resources.table or work.operation.source != staging or work.operation.target != &root.instance_storage or
-                !work.operation.matches(ticket, deadline) or fifo.config.context.vaspace != staging.binding.space.handle) return error.Binding;
+                work.operation.source != staging or !work.operation.matches(ticket, deadline) or fifo.config.context.vaspace != staging.binding.space.handle) return error.Binding;
             if (!fifo.ring.matchesTransfer(ticket, fifo.config.object_class, work.operation.transfer() catch return error.Binding)) return error.Binding;
-            try self.running.validateDisplayTableUpdate();
+            if (work.operation.purpose == .identity_lut) {
+                try self.running.validateIdentityLutUpload();
+                if (self.native_output.phase != .identity_wait or self.native_output.running != &self.running or
+                    self.native_output.mode == null or !self.native_output.mode.?.native_lut or
+                    self.native_output.engine == null or self.native_output.engine.?.root != root.binding.root or
+                    resources.identity_lut.?.control.head != self.native_output.mode.?.head or
+                    resources.identity_lut.?.control.window != self.native_output.mode.?.window) return error.Binding;
+            } else {
+                if (work.operation.table != &resources.table or work.operation.target != &root.instance_storage) return error.Binding;
+                try self.running.validateDisplayTableUpdate();
+            }
             break :blk work.channel_handle;
         } else if (self.running.direct_work != null and self.running.direct_work.?.phase == .restore) blk: {
             const work = &self.running.direct_work.?;
@@ -1250,7 +1362,8 @@ pub const Device = struct {
         const rpc = self.running.activeChannel() orelse return error.State;
         if (rpc.session != &self.session.? or port.runtime_session != rpc.session or rpc.session.pending != null or
             rpc.phase != .idle or rpc.pending != null or rpc.in_lockdown or ticket.epoch != self.epoch) return error.Binding;
-        try rpc.guard(deadline);
+        const public_upload = if (self.running.graphics_upload) |work| work.queued else false;
+        if (public_upload) try rpc.guardUnsubmitted(deadline) else try rpc.guard(deadline);
     }
     fn admitCursorPoint(self: *Device, port: *const native.Port, channel: *@import("gsp_display_channel.zig").Owner, deadline: u64, access_kind: native.DisplayAccess) !void {
         if (self.phase != .ready or port != &self.port or port.phase != .runtime or self.session == null or self.inLockdown() or
@@ -1298,8 +1411,11 @@ pub const Device = struct {
         } else if (work.core.config.cursor_image != null) return error.Binding;
         const position_part: ?*runtime.PositionSubmission = if (channel.config.kind == .immediate)
             if (work.position) |*value| value else return error.Binding else null;
+        const ownership_pending = if (work.ownership) |*value| value.phase != .complete else false;
+        if (ownership_pending and channel.config.kind != .core) return error.Binding;
         const part: ?*runtime.DisplaySubmission = if (position_part != null) null else
-            if (channel.config.kind == .core) &work.core else if (work.window) |*value| value else return error.Binding;
+            if (channel.config.kind == .core) (if (ownership_pending) &work.ownership.? else &work.core)
+            else if (work.window) |*value| value else return error.Binding;
         const handle = if (position_part) |value| value.handle else part.?.handle;
         const config = if (position_part) |value| &value.config else &part.?.config;
         const phase = if (position_part) |value| value.phase else part.?.phase;
@@ -1311,8 +1427,58 @@ pub const Device = struct {
             !std.meta.eql(resources.binding.?, root.binding) or config.windows != root_info.hardware.windows or
             config.initialize == channel.ring.initialized) return error.Binding;
         if (part) |value| if (resources.publishedNotifier(slot) != value.notifier or config.notifier != value.notifier.handle) return error.Binding;
+        if (work.boot_mode) |plan| {
+            const lut = if (plan.native_lut) resources.identityLutControls(plan.head, plan.window) orelse return error.Binding else null;
+            if (!std.meta.eql(work.core.config.identity_lut, lut) or
+                (if (work.window) |value| !std.meta.eql(value.config.identity_lut, lut) else lut != null) or
+                (if (work.ownership) |value| !std.meta.eql(value.config.identity_lut, lut) else false)) return error.Binding;
+        } else {
+            if (work.core.config.identity_lut != null) return error.Binding;
+            if (work.window) |value| if (value.config.identity_lut) |lut| {
+                const route = value.config.route orelse return error.Binding;
+                if (!std.meta.eql(resources.identityLutControls(route.head, route.window), @as(?@import("gsp_display_identity_lut.zig").Controls, lut))) return error.Binding;
+            };
+        }
         const mst_repair = if (work.link_restore) |*restore| restore.control.mst_rebuild != null else false;
-        if (mst_repair) {
+        var null_detach_read = false;
+        if (ownership_pending) {
+            const ownership = &work.ownership.?;
+            const window_part = if (work.window) |*value| value else return error.Binding;
+            const route = work.core.config.route orelse return error.Binding;
+            const expected: runtime.display_channel.push.commands.Config = .{ .notifier = work.core.notifier.handle,
+                .windows = root_info.hardware.windows, .initialize = !channel.ring.initialized, .route = route,
+                .ownership_only = true, .preserve_windows = self.running.displayPeerWindows(route.window) catch return error.Binding,
+                .signal = work.core.config.signal, .cursor_usage = work.core.config.cursor_usage,
+                .identity_lut = work.core.config.identity_lut,
+                .mst_sor_control = work.core.config.mst_sor_control, .clear_dsc = work.core.config.clear_dsc };
+            if (work.detach != null or work.refresh != null or work.cursor != null or work.link_restore != null or work.link_stop != null or
+                work.core.phase != .prepare or work.core.ticket != null or window_part.phase != .prepare or window_part.ticket != null or
+                (if (work.position) |value| value.phase != .prepare or value.ticket != null else false) or
+                route.window >= 8 or route.head >= root_info.hardware.heads or window_part.handle.slot != 1 + route.window or
+                ownership.handle.epoch != work.core.handle.epoch or ownership.handle.handle != work.core.handle.handle or
+                ownership.notifier != work.core.notifier or !std.meta.eql(config.*, expected) or
+                !std.meta.eql(window_part.config.route, work.core.config.route) or self.running.display_images[route.window] != null)
+                return error.Binding;
+            if (work.boot_mode) |plan| {
+                const link = if (work.link) |*value| value else return error.Binding;
+                if (work.wake_before_link and work.wake_receipt == 0) {
+                    self.running.validateDigitalWakeBinding(route.window) catch return error.Binding;
+                } else if (!link.readyScanout()) return error.Binding;
+                self.running.validateDisplayLink() catch return error.Binding;
+                const planned = self.running.displayWorkPlan(.{ .epoch = self.epoch, .root = root.binding.root }, route.window) catch return error.Binding;
+                if (!std.meta.eql(plan, planned) or plan.head != route.head or
+                    !std.meta.eql(work.core.config.signal, @as(?runtime.boot_mode.Signal, planned.signal)) or
+                    work.core.config.cursor_usage != planned.cursor_size) return error.Binding;
+            } else if (work.core.config.signal != null or work.link != null or work.core.config.cursor_usage != 0 or
+                work.core.config.mst_sor_control != null or work.core.config.clear_dsc) return error.Binding;
+            if (phase == .submitted) {
+                if (access_kind != .read or ticket == null or ticket.?.kind != .frame or
+                    channel.ring.pending == null or channel.ring.program == null or !channel.ring.published or
+                    !std.meta.eql(ticket.?, channel.ring.pending.?) or !channel.ring.matchesPublished(ticket.?, config.*) or
+                    ownership.notifier.phase != .submitted or ownership.notifier.point != ticket.?.point or
+                    ownership.notifier.deadline != deadline or ownership.notifier.offset != 0) return error.Binding;
+            }
+        } else if (config.ownership_only) return error.Binding else if (mst_repair) {
             self.running.validateMstLinkRecovery() catch return error.Binding;
             const restore = &work.link_restore.?;
             if (!restore.scanout_replaced or restore.control.phase != .scanout or restore.control.pending) return error.Binding;
@@ -1350,7 +1516,21 @@ pub const Device = struct {
                 !std.meta.eql(resources.publishedImage(window_part.handle.slot, work.detach.?.image.dma).?, work.detach.?.image)) return error.Binding;
             if (config.kind == .core) {
                 if (window_part.phase != .submitted and window_part.phase != .complete) return error.Binding;
-            } else if (work.core.phase != .prepare) return error.Binding;
+            } else if (work.core.phase != .prepare) {
+                // Only the exact still-published NULL Window may observe GET
+                // after its own interlocked Core completed. No publication,
+                // other output or ordinary image gains this read admission.
+                const core_owner = if (self.running.display_channels[work.core.handle.slot]) |*value| value else return error.Binding;
+                if (access_kind != .read or config.kind != .window or work.core.phase != .complete or
+                    window_part.phase != .submitted or window_part.ticket == null or
+                    channel.ring.pending == null or !std.meta.eql(window_part.ticket.?, channel.ring.pending.?) or
+                    !channel.ring.matchesPublished(window_part.ticket.?, window_part.config) or
+                    window_part.notifier.phase != .submitted or window_part.notifier.point != window_part.ticket.?.point or
+                    window_part.notifier.deadline != deadline or work.core.ticket == null or
+                    core_owner.ring.pending != null or core_owner.ring.completed != work.core.ticket.?.point or
+                    work.core.notifier.phase != .complete or work.core.notifier.point != work.core.ticket.?.point) return error.Binding;
+                null_detach_read = true;
+            }
         } else if (work.window) |*window_part| {
             if (work.core.config.detach_sor != null or window_part.config.detach_sor != null) return error.Binding;
             const route = work.core.config.route orelse return error.Binding;
@@ -1410,7 +1590,9 @@ pub const Device = struct {
             if (phase != .prepare or ticket == null or !channel.ring.matches(ticket.?, config.*)) return error.Binding;
             if (part) |value| if (ticket.?.kind == .frame and (value.notifier.phase != .armed or value.notifier.point != ticket.?.point or
                 value.notifier.deadline != deadline or value.notifier.offset != config.notifier_offset)) return error.Binding;
-        } else if (phase != .prepare and phase != .rewind and !(position_part != null and phase == .submitted) and
+        } else if (phase != .prepare and phase != .rewind and !null_detach_read and
+            !(position_part != null and phase == .submitted) and
+            !(ownership_pending and access_kind == .read and phase == .submitted) and
             !((work.cursor != null or work.detach != null or work.core.config.mst_sor_control != null) and config.kind == .core and phase == .complete)) return error.Binding;
         const rpc = self.running.activeChannel() orelse return error.State;
         const canonical = if (self.running.channel) |*value| value else return error.State;
@@ -1487,6 +1669,7 @@ pub const Device = struct {
         self.ctx.?.logInfo(text);
     }
     fn logFailure(self: *Device, phase: []const u8, err: anyerror) void {
+
         var buffer: [220]u8 = undefined;
         const text = std.fmt.bufPrintZ(&buffer, "NVIDIA gsp-start: failed={s} phase={s} reason={s} effects={} memory-retained={}",
             .{ phase, @tagName(self.failed_phase orelse self.phase), @errorName(err), self.port.effects_possible, self.memory.?.retained }) catch return;

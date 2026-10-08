@@ -31,6 +31,30 @@ pub fn check() !void {
             .h_start = word(at + 16), .h_end = word(at + 20), .v_start = word(at + 24), .v_end = word(at + 28),
             .clock_hz = word(at + 32), .flags = word(at + 36), .vic = @intCast(word(at + 40)) };
     }
+    var dvi_raw = raw;
+    dvi_raw.heads[1].hdmi = 0;
+    const dvi = try boot.bind(try boot.capture(&dvi_raw, &info, 3), snapshot, 11, 4);
+    try t.expect(!dvi.hasAudio());
+    const admitted = try modes.admitBootHdmi(dvi, snapshot);
+    try t.expect(admitted.hasAudio());
+    var exact = admitted;
+    exact.transport_hdmi = false;
+    try t.expect(std.meta.eql(dvi, exact)); // Every raster/clock/owner byte retained.
+    capture.connected = null;
+    try t.expect(std.meta.eql(dvi, try modes.admitBootHdmi(dvi, snapshot)));
+    capture.connected = true;
+    capture.report.hdmi = false;
+    try t.expect(std.meta.eql(dvi, try modes.admitBootHdmi(dvi, snapshot)));
+    capture.report.hdmi = true;
+    capture.report.warnings = receiver.edid.Warning.missing;
+    try t.expect(std.meta.eql(dvi, try modes.admitBootHdmi(dvi, snapshot)));
+    capture.report.warnings = 0;
+    snapshot.topology.routes[0].connectors.?.data[0].kind = 0x30;
+    try t.expect(std.meta.eql(dvi, try modes.admitBootHdmi(dvi, snapshot)));
+    snapshot.topology.routes[0].connectors.?.data[0].kind = 0x61;
+    snapshot.generation += 1;
+    try t.expectError(error.Stale, modes.admitBootHdmi(dvi, snapshot));
+    snapshot.generation -= 1;
     var published: a.GfxReceiverInfo = .{};
     try @import("gsp_catalog.zig").encode(&published, &snapshot.topology.routes[0], capture);
     try t.expect(published.mode_count == 4 and published.flags & a.gfx_output_flag_receiver_incomplete != 0);

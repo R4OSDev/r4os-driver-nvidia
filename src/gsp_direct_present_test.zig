@@ -27,6 +27,37 @@ pub fn check(target: *Device, clock: *u64, reply: anytype, head: anytype, table:
         .{ @errorName(err), checkpoint, @tagName(target.phase), target.failure,
             if (run.direct_work) |value| value.phase else null, run.primaryFlip() != null, copy.heldScanouts() });
     try t.expect(run.direct_enabled and copy.heldScanouts() == 0);
+    {
+        checkpoint = "graphics-before-output catalog";
+        // OssiPC's GR queue is ready before the native private framepool.
+        // Recreate that catalog order at this already-qualified pool, using
+        // the existing queue callback. No GR work or buffer is fabricated.
+        const was_graphics = run.graphics_enabled;
+        const was_direct = run.direct_enabled;
+        const was_render_model = copy.render_mode;
+        const original_operations = run.copy_backend.?.operations;
+        defer {
+            run.graphics_enabled = was_graphics;
+            run.direct_enabled = was_direct;
+            run.copy_backend.?.operations = original_operations;
+            std.debug.assert(run.copy_backend.?.queue.updateOperations(&run.copy_backend.?.binding, original_operations) == a.gfx_queue_ok);
+            copy.render_mode = was_render_model;
+        }
+        run.graphics_enabled = true;
+        run.direct_enabled = false;
+        copy.render_mode = true;
+        const graphics_operations: u64 = 2941; // Existing render/color/grid/native/display catalog.
+        run.copy_backend.?.operations = graphics_operations;
+        try t.expect(run.copy_backend.?.queue.updateOperations(&run.copy_backend.?.binding, graphics_operations) == a.gfx_queue_ok);
+        const pool_count = run.presentationGroupCount(run.presentation.?);
+        const retired = native.released;
+        try t.expect(try run.prepareConfirmedModeFrames(product.mode.?.window, clock.* + std.time.ns_per_s));
+        try t.expect(run.direct_enabled and run.directOutputAvailable(product.mode.?.window));
+        try t.expectEqual(graphics_operations | 128, run.copy_backend.?.operations);
+        try t.expectEqual(graphics_operations | 128, copy.render_operations);
+        try t.expect(run.presentationGroupCount(run.presentation.?) == pool_count and native.released == retired and
+            copy.completed == before_completed and run.copy_bytes == before_bytes and copy.heldScanouts() == 0);
+    }
     for (0..2) |pass| {
         checkpoint = "allocation";
         const deadline = clock.* + 5 * std.time.ns_per_s;

@@ -304,7 +304,7 @@
 const std = @import("std");
 const exchange = @import("gsp_exchange.zig");
 pub const Error = exchange.Error || error{Unsupported};
-pub const Operation = enum { classes, static_info, allocate, preserve, free, instance };
+pub const Operation = enum { classes, static_info, allocate, preserve, free, instance, system_caps };
 pub const max_bytes = 428;
 pub const root_class: u32 = 0xc670;
 pub const Binding = struct { chip_id: u16 = 0x176, epoch: u64, client: u32, device: u32, root: u32, internal_client: u32, internal_subdevice: u32 };
@@ -317,8 +317,8 @@ pub const StaticInfo = struct {
 };
 pub const Reply = union(enum) { rejected: u32, ok: []const u8 };
 pub fn function(op: Operation) u32 { return switch (op) { .allocate => 103, .free => 10, else => 76 }; }
-pub fn length(op: Operation) usize { return switch (op) { .classes => 428, .static_info => 60, .allocate, .preserve => 32, .free => 16, .instance => 48 }; }
-pub fn command(op: Operation) u32 { return switch (op) { .classes => 0x800292, .static_info => 0x20800a01, .preserve => 0x50700117, .instance => 0x20800a49, else => 0 }; }
+pub fn length(op: Operation) usize { return switch (op) { .classes => 428, .static_info => 60, .allocate, .preserve, .system_caps => 32, .free => 16, .instance => 48 }; }
+pub fn command(op: Operation) u32 { return switch (op) { .classes => 0x800292, .static_info => 0x20800a01, .preserve => 0x50700117, .instance => 0x20800a49, .system_caps => 0x50700709, else => 0 }; }
 pub fn word(data: []const u8, at: usize) u32 { return std.mem.readInt(u32, data[at..][0..4], .little); }
 fn put(out: []u8, at: usize, value: u32) void { std.mem.writeInt(u32, out[at..][0..4], value, .little); }
 pub fn validate(binding: Binding) Error!void {
@@ -333,7 +333,7 @@ pub fn encode(binding: Binding, op: Operation, output: []u8) Error![]const u8 {
     const out = output[0..length(op)]; @memset(out, 0);
     put(out, 0, if (op == .static_info) binding.internal_client else binding.client);
     switch (op) {
-        .classes, .static_info, .preserve => {
+        .classes, .static_info, .preserve, .system_caps => {
             put(out, 4, switch (op) { .classes => binding.device, .static_info => binding.internal_subdevice, else => binding.root });
             put(out, 8, command(op)); put(out, 16, @intCast(out.len - 24));
             // subdeviceIndex=0; the one-shot flag applies to the NEXT RmFree.
@@ -373,6 +373,13 @@ pub fn decode(binding: Binding, op: Operation, request: []const u8, record: exch
     switch (op) {
         .classes => if (word(payload, 0) > 100) return error.Bounds,
         .static_info => { _ = try staticInfo(payload); },
+        .system_caps => {
+            // Original base.subdeviceIndex remains0 and padding is opaque
+            // wire storage, not another capability field. Keep every bit of
+            // the sole caps byte; never assume an absent query means no WAR.
+            if (payload.len != 8 or !std.mem.eql(u8, payload[0..4], request[24..28]) or
+                !std.mem.eql(u8, payload[5..8], request[29..32])) return error.Payload;
+        },
         .preserve, .instance => if (!std.mem.eql(u8, payload, request[header..])) return error.Payload,
         .allocate, .free => {},
     }

@@ -77,7 +77,11 @@ pub const Entry = struct {
     // Both states must describe input direction and opposite physical
     // levels. A GPIO definition that drives the wire is not HPD sensing.
     pub fn inputPolarity(self: Entry) ?bool {
-        if (self.dedicated_lock or self.reserved_bits != 0 or
+        // Nouveau gpio_get uses the parsed line and log[1] polarity.
+        // Unknown GPIO4.1 metadata bits do not invalidate input sensing:
+        // GA106 HPD entries set bit30. Preserve it verbatim; this grants
+        // no authority to drive or reconfigure the pin.
+        if (self.dedicated_lock or
             self.off & 2 == 0 or self.on & 2 == 0 or self.off == self.on)
             return null;
         if (self.lock_pin) |pin| if (pin != 15) return null;

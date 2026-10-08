@@ -22,6 +22,9 @@ pub const Model = struct {
     pub var command: [48]u8 = undefined;
     pub var info: a.GfxNativeJobInfo = .{};
     pub var resource: a.GfxNativeBinding = .{};
+    pub var resource_reads: [64]u32 = @splat(0);
+    pub var reject_resource: ?u32 = null;
+    pub var reject_read: u32 = 1;
     var next_point: u64 = 0;
     pub fn install(table: *a.DriverApi) void {
         original = table.gfx_queue_query;
@@ -39,6 +42,9 @@ pub const Model = struct {
         next_point = 0;
         signaled = false;
         wakes = 0;
+        resource_reads = @splat(0);
+        reject_resource = null;
+        reject_read = 1;
     }
     pub fn dispose(table: *a.DriverApi) void {
         table.gfx_queue_query = original;
@@ -86,6 +92,9 @@ pub const Model = struct {
         @memcpy(command[32..48], std.mem.asBytes(&push));
         info = .{ .interface_id_lo = nv.backend_v1_header.interface_id_lo, .interface_id_hi = nv.backend_v1_header.interface_id_hi, .revision = 1, .command_bytes = if (empty) 32 else 48, .resource_count = if (empty) 0 else 1 };
         signaled = false;
+        resource_reads = @splat(0);
+        reject_resource = null;
+        reject_read = 1;
         notify();
     }
     fn take(value: *const a.GfxBackendBinding, out: *a.GfxDriverJob) callconv(.c) i32 {
@@ -110,6 +119,8 @@ pub const Model = struct {
     }
     fn readBinding(fence: *const a.GfxFence, index: u32, out: *a.GfxNativeBinding) callconv(.c) i32 {
         if (!valid(fence) or index >= info.resource_count) return -1;
+        if (index < resource_reads.len) resource_reads[index] += 1;
+        if (reject_resource == index and index < resource_reads.len and resource_reads[index] >= reject_read) return -1;
         out.* = resource;
         return 1;
     }

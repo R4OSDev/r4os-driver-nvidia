@@ -130,7 +130,7 @@ pub fn read(run: anytype) !Snapshot {
             try add(&result.native_uncertain_bytes, owner.bytes);
         if (owner.storage_policy) |policy| switch (policy.role) {
             .control => try add(&result.control_reserved_bytes, owner.bytes),
-            .scanout => try add(&result.scanout_reserved_bytes, owner.bytes),
+            .scanout, .cursor, .lut => try add(&result.scanout_reserved_bytes, owner.bytes),
         };
     };
     for (run.buffers.view()) |slot| if (slot.owner) |owner| {

@@ -23,6 +23,8 @@ pub const Storage = struct {
     retained: bool = false,
     role: Role = .pushbuffer,
     role_stamp: Role = .pushbuffer,
+    close_step: enum { none, dma, cpu, reference, collect } = .none,
+    close_status: i32 = a.gfx_buffer_result_ok,
 
     pub fn prepare(self: *Storage, ctx: *const r4os.r4dev.DriverContext, adapter: u32, epoch: u64) Error!void {
         return self.prepareRole(ctx, adapter, epoch, .pushbuffer);
@@ -91,20 +93,39 @@ pub const Storage = struct {
         if (self.self_address != @intFromPtr(self) or self.retained) return false;
         const memory = self.memory orelse return false;
         self.ready = false;
+        self.close_step = .none;
+        self.close_status = a.gfx_buffer_result_ok;
         if (self.dma.lease.id != 0) {
-            if (memory.deviceRelease(&self.dma, 1) != a.gfx_buffer_result_ok) return false;
+            self.close_step = .dma;
+            self.close_status = memory.deviceRelease(&self.dma, 1);
+            if (self.close_status != a.gfx_buffer_result_ok) return false;
             self.dma = .{}; self.dma_stamp = .{};
         }
         if (self.cpu.lease.id != 0) {
-            if (memory.bufferUnmap(&self.cpu.lease) != a.gfx_buffer_result_ok) return false;
+            self.close_step = .cpu;
+            self.close_status = memory.bufferUnmap(&self.cpu.lease);
+            if (self.close_status != a.gfx_buffer_result_ok) return false;
             self.cpu = .{};
         }
         if (self.reference.reference.id != 0) {
-            if (memory.bufferRelease(&self.reference.reference) != a.gfx_buffer_result_ok) return false;
+            self.close_step = .reference;
+            self.close_status = memory.bufferRelease(&self.reference.reference);
+            if (self.close_status != a.gfx_buffer_result_ok) return false;
             self.reference = .{}; self.reference_stamp = .{};
         }
-        if (memory.collect() != a.gfx_buffer_result_ok) return false;
+        self.close_step = .collect;
+        self.close_status = memory.collect();
+        if (self.close_status != a.gfx_buffer_result_ok) return false;
         self.* = .{}; return true;
+    }
+
+    /// The common collector covers other BOs in this driver epoch. Only
+    /// this acknowledged per-buffer close may wait for that shared barrier;
+    /// failed lease/reference operations are still retained failures.
+    pub fn awaitingCollection(self: *const Storage) bool {
+        return self.self_address == @intFromPtr(self) and self.memory != null and !self.retained and !self.ready and
+            self.close_step == .collect and self.close_status == a.gfx_buffer_error_busy and
+            self.dma.lease.id == 0 and self.cpu.lease.id == 0 and self.reference.reference.id == 0;
     }
 
     pub fn closeAfterReset(self: *Storage, proof: @import("gsp_reset.zig").Quiescence) bool {

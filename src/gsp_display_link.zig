@@ -320,7 +320,7 @@ pub const Work = struct {
             !std.meta.eql(native.result.?.compressed, self.plan.mode.signal.hdmi_dsc) or
             (native.result.?.compressed != null and native.result.?.capacity_receipt <= native.result.?.training_receipt)) return false;
         if (self.dp) |*value| return value.stage == .complete and value.result != null and value.result.?.complete(self.plan.mode);
-        return self.acknowledged == @as(u8, if (self.plan.mode.transport_hdmi) 3 else 2);
+        return self.acknowledged == 2;
     }
     pub fn scanoutComplete(self: *Work) !void {
         if (!self.readyScanout()) return error.State;

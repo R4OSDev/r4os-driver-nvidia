@@ -8,14 +8,26 @@ const vram = @import("gsp_vram.zig");
 const cache = @import("gsp_render_cache.zig");
 pub const Resource = struct { info: vram.Info, driver_owner: u32 };
 pub fn image(resource: Resource, target: bool) !render.image.Image {
+    return imageImpl(resource, target, false);
+}
+/// The exact canonical queue execution lease owns this image; its retained
+/// driver reference maps addresses only. The runtime must separately reject
+/// its private/active presentation images before preparing any target work.
+/// The queue's read-only scanout reference excludes a new writer until final
+/// DMA-table retirement. No standalone/private render call gets this path.
+pub fn queuedImage(resource: Resource, target: bool) !render.image.Image {
+    if (resource.info.reference.flags != a.gfx_buffer_reference_mapping_only) return error.Descriptor;
+    return imageImpl(resource, target, true);
+}
+fn imageImpl(resource: Resource, target: bool, queued: bool) !render.image.Image {
     const info = resource.info;
     const descriptor = info.surface.descriptor;
     const request = info.surface.request orelse return error.Unsupported;
     try info.surface.validateView(descriptor.adapter_id, info.epoch);
     if (info.allocation_bytes != info.surface.allocation_bytes) return error.Descriptor;
-    // Direct rendering into a displayed image needs the presentation owner's
-    // inactive-image lease. This initial job path accepts offscreen images.
-    if (target and descriptor.usage & a.gfx_buffer_usage_scanout != 0) return error.Unsupported;
+    // A capability bit alone grants no inactive-image write permission.
+    // Only the admitted canonical queue use may target an inactive scanout BO.
+    if (target and !queued and descriptor.usage & a.gfx_buffer_usage_scanout != 0) return error.Unsupported;
     if (resource.driver_owner == 0 or info.epoch == 0 or info.epoch != descriptor.device_generation or descriptor.location != a.gfx_buffer_location_device_local or
         descriptor.plane_count != 1 or descriptor.plane_offsets[0] != 0 or descriptor.plane_pitches[0] > std.math.maxInt(u32) or descriptor.byte_length != info.logical_bytes or
         descriptor.usage & (if (target) a.gfx_buffer_usage_render else (a.gfx_buffer_usage_transfer_source | a.gfx_buffer_usage_render)) == 0) return error.Unsupported;
@@ -103,9 +115,14 @@ pub const Owner = struct {
     fn openResources(self: *Owner, memory: r4os.driver_memory.Context, programs: *cache.Owner, target: Resource, source: ?Resource, queued: bool) !void {
         if (self.self_address != 0) return error.Busy;
         const binding = try programs.binding();
-        if (!std.meta.eql(binding.draw.target, try image(target,true)) or (binding.draw.source != null) != (source != null) or
+        const target_image = if (queued) try queuedImage(target, true) else try image(target, true);
+        if (!std.meta.eql(binding.draw.target, target_image) or (binding.draw.source != null) != (source != null) or
             target.info.epoch != programs.epoch or target.driver_owner != programs.programs.info().?.driver_owner) return error.Descriptor;
-        if (source) |value| if (!std.meta.eql(binding.draw.source.?,try image(value,false)) or value.info.epoch != programs.epoch or value.driver_owner != target.driver_owner) return error.Descriptor;
+        if (source) |value| {
+            const source_image = if (queued) try queuedImage(value, false) else try image(value, false);
+            if (!std.meta.eql(binding.draw.source.?, source_image) or value.info.epoch != programs.epoch or
+                value.driver_owner != target.driver_owner) return error.Descriptor;
+        }
         self.* = .{ .self_address = @intFromPtr(self), .memory = memory };
         self.acquire(programs,target,source,queued) catch |err| {
             self.failure = err;

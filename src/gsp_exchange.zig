@@ -138,6 +138,14 @@ pub const Exchange = struct {
         if (self.phase == .failed or self.phase == .handed_off) return error.State;
         self.session.guard(end) catch |err| return self.fail(err);
     }
+    pub fn guardUnsubmitted(self: *Exchange, end: u64) Error!void {
+        if (self.phase != .idle or self.pending != null or self.request.len != 0 or
+            self.deadline != null or self.in_lockdown or self.session.pending != null) return error.State;
+        self.session.guardUnsubmitted(end) catch |err| {
+            if (err == error.AdmissionExpired) return err;
+            return self.fail(err);
+        };
+    }
     pub fn invalidate(self: *Exchange) Error!void {
         if (self.phase == .failed or self.phase == .handed_off) return error.State;
         if (self.revision == std.math.maxInt(u64)) return self.fail(error.Exhausted);

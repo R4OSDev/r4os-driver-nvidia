@@ -177,6 +177,7 @@ pub const Owner = struct {
             },
             .prepare => {
                 run.prepareQueuedGraphics(self) catch |err| {
+                    if (err == error.Busy) return false;
                     if (err == error.Empty or err == error.Unsupported or err == error.Bounds or err == error.Overflow) {
                         if (err != error.Empty) try run.renderRejection(err);
                         try self.finish(if (err == error.Empty) a.gfx_queue_result_complete else a.gfx_queue_result_failed); return true;
@@ -187,7 +188,14 @@ pub const Owner = struct {
                 self.phase = .upload;
             },
             .upload => {
-                run.beginQueuedGraphicsUpload(self) catch |err| { if (err == error.Busy) return false; return err; };
+                run.beginQueuedGraphicsUpload(self) catch |err| {
+                    if (err == error.Busy) return false;
+                    if (err == error.AdmissionExpired) {
+                        try run.cancelQueuedGraphicsAdmission(self);
+                        try self.finish(a.gfx_queue_result_failed); return true;
+                    }
+                    return err;
+                };
                 self.phase = .upload_wait;
             },
             .upload_wait => {
@@ -196,7 +204,14 @@ pub const Owner = struct {
                 self.phase = .draw;
             },
             .draw => {
-                run.beginQueuedGraphicsDraw(self) catch |err| { if (err == error.Busy) return false; return err; };
+                run.beginQueuedGraphicsDraw(self) catch |err| {
+                    if (err == error.Busy) return false;
+                    if (err == error.AdmissionExpired) {
+                        try run.cancelQueuedGraphicsAdmission(self);
+                        try self.finish(a.gfx_queue_result_failed); return true;
+                    }
+                    return err;
+                };
                 self.phase = .draw_wait;
             },
             .draw_wait => {

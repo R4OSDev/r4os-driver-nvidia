@@ -51,7 +51,7 @@
 const std = @import("std");
 pub const message = @import("gsp_message.zig");
 pub const ring = @import("gsp_ring.zig");
-pub const Error = ring.Error || error{ State, Stale, Deadline, Clock, Io, PeerProgress, Pending, Exhausted, Notification };
+pub const Error = ring.Error || error{ State, Stale, Deadline, AdmissionExpired, Clock, Io, PeerProgress, Pending, Exhausted, Notification };
 pub const State = enum { linking, active, failed };
 pub const Ticket = struct { epoch: u64, serial: u64, sequence: u32, cursor: u32, next: u32 };
 pub const Received = struct { ticket: Ticket, record: message.Record };
@@ -131,7 +131,15 @@ pub const Session = struct {
     pub fn guard(self: *Session, deadline: u64) Error!void {
         try self.check(deadline);
     }
-    fn check(self: *Session, deadline: u64) Error!void {
+    /// The exact idle Exchange uses this only before publishing a private
+    /// GPU command. Expiry cancels that command, not an outstanding RPC.
+    pub fn guardUnsubmitted(self: *Session, deadline: u64) Error!void {
+        if (self.state != .active or self.pending != null) return error.State;
+        try self.checkLifetimeClock();
+        if (deadline == std.math.maxInt(u64)) return self.fail(error.Deadline);
+        if (self.last_clock >= deadline) return error.AdmissionExpired;
+    }
+    fn checkLifetimeClock(self: *Session) Error!void {
         if (self.state == .failed) return error.State;
         if (self.port.generation(self.port.context) != self.epoch) return self.fail(error.Stale);
         if (self.port.notification) |notification| {
@@ -140,7 +148,10 @@ pub const Session = struct {
         const now = self.port.now_ns(self.port.context);
         if (now == std.math.maxInt(u64) or now < self.last_clock) return self.fail(error.Clock);
         self.last_clock = now;
-        if (deadline == std.math.maxInt(u64) or now >= deadline) return self.fail(error.Deadline);
+    }
+    fn check(self: *Session, deadline: u64) Error!void {
+        try self.checkLifetimeClock();
+        if (deadline == std.math.maxInt(u64) or self.last_clock >= deadline) return self.fail(error.Deadline);
     }
     fn read(self: *Session, deadline: u64, queue: ring.Queue, offset: usize, output: []u8) Error!void {
         try self.check(deadline);

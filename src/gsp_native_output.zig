@@ -16,8 +16,8 @@ pub fn frameCount(option: []const u8) !u8 {
 }
 
 pub const Phase = enum {
-    detached, waiting, engine_create, engine_wait, receiver_wait, mode_create, mode_wait, instance_allocate, instance_attach, instance_wait,
-    core_notifier, window_notifier, surface_allocate, surface_bind,
+    detached, waiting, engine_create, engine_wait, receiver_wait, sor_wait, sor_refresh, mode_create, mode_wait, instance_allocate, instance_attach, instance_wait,
+    core_notifier, window_notifier, identity_allocate, identity_bind, identity_upload, identity_wait, surface_allocate, surface_bind,
     storage_wait, storage_release, table_upload, table_wait,
     core_create, core_wait, window_create, window_wait, immediate_create, immediate_wait,
     shadow_create, shadow_map, shadow_copy, shadow_unmap, register, publish, prepare,
@@ -78,6 +78,10 @@ pub const Owner = struct {
     reset_generation: u64 = 0,
     console: ?*@import("boot_console.zig").Owner = null,
     waiting_generation: u64 = 0,
+    restore_route: ?runtime.output_route.RestoreIdentity = null,
+    sor_saved: ?runtime.boot_mode.Plan = null,
+    sor_sequence: u64 = 0,
+    sor_attempted: bool = false,
 
     /// Explicit mode=native only. Check the common handoff API before the
     /// device worker can execute the already prepared firmware operations.
@@ -121,13 +125,25 @@ pub const Owner = struct {
     /// Reuse the original captured CPU image and discovered device policy,
     /// while the common bridge retains the independently identified hold.
     pub fn requestAfterReset(self: *Owner, ctx: *const r4os.r4dev.DriverContext, running: *runtime.Owner,
-        captured: *capture.Capture, generation: u64) !void
+        captured: *capture.Capture, generation: u64, route: ?runtime.output_route.RestoreIdentity) !void
     {
         if (generation == 0 or !captured.boot.native_adopted or captured.boot.native_generation != generation) return error.Stale;
         const display = ctx.graphicsDisplay() orelse return error.Api;
         if (!display.supportsReset()) return error.Api;
         try self.request(ctx, running, captured);
         self.reset_generation = generation;
+        self.restore_route = route;
+    }
+
+    pub fn recoveryRoute(self: *const Owner) ?runtime.output_route.RestoreIdentity {
+        if (self.self_address != @intFromPtr(self)) return null;
+        const mode = self.mode orelse return null;
+        const claim = self.hotplug.route orelse return null;
+        const seen = self.hotplug.observation orelse return null;
+        if (claim.mst != null or seen.state != .connected or seen.fingerprint == null or
+            claim.display_id != mode.signal.display_id or claim.head != mode.head or claim.window != mode.window or
+            claim.sor != mode.signal.sor or claim.protocol != (mode.signal.sor_control >> 8) & 15) return null;
+        return .{ .claim = claim, .fingerprint = seen.fingerprint.? };
     }
 
     // Runtime graph and common display consumers must retire first. A mode
@@ -196,10 +212,67 @@ pub const Owner = struct {
                 const info = (try run.displayEngineStatus(self.engine.?)).info orelse return error.State;
                 const mask = info.hardware.windows & held.scanout_original.?.window_mask & 255;
                 if (mask == 0) return error.Unsupported;
-                const saved = try runtime.boot_mode.capture(&held.scanout_original.?, &boot, @ctz(mask));
+                const saved = runtime.boot_mode.capture(&held.scanout_original.?, &boot, @ctz(mask)) catch |err| {
+                    @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,
+                        "NVIDIA native-output: preflight=boot-capture reason={s} format={d} window-mask={x}",
+                        .{@errorName(err), boot.format, mask});
+                    const raw = &held.scanout_original.?;
+                    const heads = @import("boot_scanout.zig").routedHeads(raw);
+                    if (@popCount(heads) == 1) {
+                        const head = &raw.heads[@ctz(heads)];
+                        @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,
+                            "NVIDIA native-output: retained-signal output={x} control={x} clock-config={x} point-in={x} point-out-adjust={x} hdmi={x} dsc={x}/{x}",
+                            .{head.get(.output), head.get(.control), head.get(.clock_config), head.color.get(.point_in),
+                                head.color.get(.point_out_adjust), head.color.get(.hdmi), head.dsc_control, head.dsc_pps_control});
+                        // Repeat only immutable retained fields at the actual
+                        // rejection; startup records may already have rolled
+                        // out of the bounded public boot log. No new MMIO.
+                        const decoder = @import("boot_scanout.zig");
+                        if (decoder.timing(head)) |timing| {
+                            @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,
+                                "NVIDIA native-output: rejected-geometry boot={d}x{d} active={d}x{d} input={d}x{d} output={d}x{d} total={d}x{d} depth={d} hdmi={} clock={x}",
+                                .{boot.width, boot.height, timing.active.x, timing.active.y, timing.viewport_in.x,
+                                    timing.viewport_in.y, timing.viewport_out.x, timing.viewport_out.y,
+                                    timing.total.x, timing.total.y, timing.depth_code, timing.hdmi_enabled, head.get(.clock)});
+                        } else |decode_error| {
+                            @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,
+                                "NVIDIA native-output: rejected-timing boot={d}x{d} reason={s} total={x} sync={x} blank-end={x} blank-start={x} input={x} output={x} clock={x}",
+                                .{boot.width, boot.height, @errorName(decode_error), head.get(.total), head.get(.sync_end),
+                                    head.get(.blank_end), head.get(.blank_start), head.get(.viewport_in), head.get(.viewport_out), head.get(.clock)});
+                        }
+                        const retained_window = &raw.windows[@ctz(mask)];
+                        const retained_sors = decoder.headSors(raw, @ctz(heads));
+                        @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,
+                            "NVIDIA native-output: rejected-route head={d} sor-mask={x} sor-control={x} window={d} size={x} input={x} output={x}",
+                            .{@ctz(heads), retained_sors, if (retained_sors != 0) raw.sors[@ctz(retained_sors)] else @as(u32, 0),
+                                @ctz(mask), retained_window.get(.size), retained_window.get(.input), retained_window.get(.output)});
+                    }
+                    return err;
+                };
                 const snapshot = run.nativeOutputs() orelse return error.Busy;
                 self.mode = runtime.boot_mode.bind(saved, snapshot, run.epoch, held.boot.held_generation) catch |err| {
                     if (err != error.Routing and err != error.Stale and err != error.Unsupported) return err;
+                    if (err == error.Routing and self.restore_route != null and !self.sor_attempted) {
+                        const end = try std.math.add(u64, self.last_clock, 5 * std.time.ns_per_s);
+                        const sequence = run.beginBootSorAssignment(self.engine.?, saved, self.restore_route.?, end) catch |assignment_error| {
+                            if (assignment_error == error.Busy or assignment_error == error.Stale or
+                                assignment_error == error.Routing or assignment_error == error.Unsupported) {
+                                if (snapshot.generation != self.waiting_generation) {
+                                    self.waiting_generation = snapshot.generation;
+                                    @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,
+                                        "NVIDIA native-output: SOR-admission-wait generation={d} reason={s} cursor-admission={} work={} channel={?} sequence={d}",
+                                        .{snapshot.generation, @errorName(assignment_error), run.cursorWorkAvailable(), run.hasQueuedWork(),
+                                            if (run.channel) |channel| channel.phase else null, run.sequence.self_address});
+                                }
+                                return false;
+                            }
+                            return assignment_error;
+                        };
+                        self.sor_saved = saved; self.sor_sequence = sequence; self.sor_attempted = true;
+                        self.deadline = try std.math.add(u64, self.last_clock, 120 * std.time.ns_per_s);
+                        self.next(.sor_wait);
+                        return true;
+                    }
                     // A missing/currently unusable receiver cannot invalidate
                     // an otherwise running GPU. No display PUT has occurred.
                     if (snapshot.generation != self.waiting_generation) {
@@ -210,14 +283,56 @@ pub const Owner = struct {
                     }
                     return false;
                 };
+                if (self.console == null) {
+                    const previous = self.mode.?;
+                    self.mode = try @import("gsp_receiver_mode.zig").admitBootHdmi(previous, snapshot);
+                    if (previous.transport_hdmi != self.mode.?.transport_hdmi)
+                        @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,
+                            "NVIDIA native-output: boot-transport=HDMI admission=fresh-physical-receiver raster=retained clock={x} source/IMP/link=pending",
+                            .{self.mode.?.signal.clock});
+                    try run.configureIdentityLutUsage(self.engine.?, self.mode.?.window);
+                    self.mode.?.native_lut = true;
+                }
                 if (info.cursor) {
                     try run.configureCursorUsage(self.engine.?, @import("gsp_cursor_image.zig").max_size);
                     self.mode.?.cursor_size = @import("gsp_cursor_image.zig").max_size;
                 }
-                self.link = try runtime.display_link.derive(self.mode.?, run.nativeObject() orelse return error.Busy, snapshot);
+                self.link = runtime.display_link.derive(self.mode.?, run.nativeObject() orelse return error.Busy, snapshot) catch |err| {
+                    @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,
+                        "NVIDIA native-output: preflight=display-link reason={s} display={x} transport-hdmi={} clock={x} hdmi={x}",
+                        .{@errorName(err), self.mode.?.signal.display_id, saved.transport_hdmi, saved.signal.clock, saved.signal.hdmi});
+                    return err;
+                };
                 // Time without a receiver consumes no active modeset budget.
                 self.deadline = try std.math.add(u64, self.last_clock, 120 * std.time.ns_per_s);
                 self.next(.mode_create);
+            },
+            .sor_wait => {
+                _ = (try run.sorAssignmentStatus(self.sor_sequence)) orelse return false;
+                const result = try run.finishSorAssignment(self.sor_sequence);
+                if (result.rejected != null or result.obsolete or !result.crossbar or result.assignment == null) {
+                    if (run.sor_result != null) try run.abandonSorAssignment(self.sor_sequence);
+                    self.sor_saved = null; self.sor_sequence = 0;
+                    self.next(.receiver_wait);
+                    return true;
+                }
+                self.next(.sor_refresh);
+            },
+            .sor_refresh => {
+                if (run.nativeOutputs() == null) return false;
+                self.mode = run.finishBootSorAssignment(self.engine.?, self.sor_sequence, self.sor_saved.?) catch |err| {
+                    if (err == error.Busy) return false;
+                    if (err != error.Stale and err != error.Routing and err != error.Unsupported) return err;
+                    try run.abandonSorAssignment(self.sor_sequence);
+                    self.sor_saved = null; self.sor_sequence = 0;
+                    self.next(.receiver_wait);
+                    return true;
+                };
+                @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,
+                    "NVIDIA native-output: SOR-restored epoch={d} display={x} sor={d} generation={d} receiver=same route=same topology=fresh",
+                    .{run.epoch, self.mode.?.signal.display_id, self.mode.?.signal.sor, self.mode.?.output_generation});
+                self.sor_saved = null; self.sor_sequence = 0;
+                self.next(.receiver_wait);
             },
             .mode_create => {
                 self.mode_control = try run.createModeControl(self.engine.?, self.mode.?, self.phase_deadline);
@@ -258,6 +373,24 @@ pub const Owner = struct {
             },
             .window_notifier => {
                 _ = try run.createDisplayNotifier(self.engine.?, .window, self.mode.?.window);
+                self.next(if (self.console == null) .identity_allocate else .surface_allocate);
+            },
+            .identity_allocate => {
+                if (self.storage != null or !self.mode.?.native_lut) return error.State;
+                self.storage = try run.allocateIdentityLutStorage(self.phase_deadline);
+                self.next_phase = .identity_bind;
+                self.next(.storage_wait);
+            },
+            .identity_bind => {
+                try run.bindIdentityLut(self.engine.?, self.storage.?, self.mode.?.head, self.mode.?.window);
+                self.release(.identity_upload);
+            },
+            .identity_upload => {
+                try run.uploadIdentityLut(self.engine.?, self.copy.?, self.phase_deadline);
+                self.next(.identity_wait);
+            },
+            .identity_wait => {
+                if (!try run.identityLutReady(self.engine.?)) return false;
                 self.next(.surface_allocate);
             },
             .surface_allocate => {
@@ -273,7 +406,12 @@ pub const Owner = struct {
             },
             .storage_wait => {
                 const status = try run.nativeBufferStatus(self.storage.?);
-                if (status.rejected != null or status.host_rejected != null) return error.Buffer;
+                if (status.rejected != null or status.host_rejected != null) {
+                    @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,
+                        "NVIDIA native-output: buffer-rejected state={s} rm=0x{?x} host={?d} next={s}",
+                        .{@tagName(status.state), status.rejected, status.host_rejected, @tagName(self.next_phase)});
+                    return error.Buffer;
+                }
                 if (status.info == null) return false;
                 self.next(self.next_phase);
             },

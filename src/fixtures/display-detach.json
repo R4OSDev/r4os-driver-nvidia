@@ -1,24 +1,57 @@
 {
-  "source": "NVIDIA Open GPU Kernel Modules 570.144",
+  "utc": "2026-10-07T20:22:16.341055+00:00",
   "inputs": [
     {
-      "path": "src/common/sdk/nvidia/inc/class/clc67d.h",
+      "file": "Original/NVIDIA570.144/src/common/sdk/nvidia/inc/class/clc67d.h",
+      "bytes": 120297,
       "sha256": "adccb6c2442b4b8d01717b72efca0dee8f183e1a07204968e840d54e559c564c"
     },
     {
-      "path": "src/common/sdk/nvidia/inc/class/clc67e.h",
+      "file": "Original/NVIDIA570.144/src/common/sdk/nvidia/inc/class/clc67e.h",
+      "bytes": 60972,
       "sha256": "2925642cbfef82ddea42a3c6be1551ae6e0e04e50a0533666042a4e72a1725b9"
     },
     {
-      "path": "src/nvidia-modeset/src/nvkms-evo.c",
-      "sha256": "cab100c1c75141693aa9ed5777ca0f53f335e7b7dc1b7492ba23f51fc8d1a25e"
+      "file": "Original/NVIDIA570.144/src/common/sdk/nvidia/inc/class/clc57d.h",
+      "bytes": 114704,
+      "sha256": "d963431a61daa6b0a1034b56d256aa555fe1679cbf17c10e1b450789ff3f3dce"
     },
     {
-      "path": "src/nvidia-modeset/src/nvkms-evo3.c",
+      "file": "Original/NVIDIA570.144/src/common/sdk/nvidia/inc/class/clc37d.h",
+      "bytes": 84836,
+      "sha256": "162875e0f0ec078504b54acb45a985d81192c0cf0052985e8ee52995c2361b0d"
+    },
+    {
+      "file": "Original/NVIDIA570.144/src/nvidia-modeset/src/nvkms-evo3.c",
+      "bytes": 347587,
       "sha256": "8d9feac7175aa6ad7f2dc1d4021cf9a6babe9c290d93bb023d484383858b58b2"
+    },
+    {
+      "file": "Original/Nouveau/drivers/gpu/drm/nouveau/dispnv50/disp.c",
+      "bytes": 88283,
+      "sha256": "6145162d40567f867998e6000aeb7a354fb58de7effbebfa4e3a876109e5d96a"
+    },
+    {
+      "file": "Original/Nouveau/drivers/gpu/drm/nouveau/dispnv50/corec37d.c",
+      "bytes": 5447,
+      "sha256": "e447a0582ef4a1fee45fc788cfb582ef3b541f4efe228af60f543ab86eb6f66d"
+    },
+    {
+      "file": "Original/Nouveau/drivers/gpu/drm/nouveau/dispnv50/headc57d.c",
+      "bytes": 8603,
+      "sha256": "f076a3b8405a57b4f584c797ee7f5146a16074ee3ed2fc5bb6ccbc53ca22415b"
     }
   ],
-  "fixture_sha256": "6204bc1d4a2c372d7d4cc4848e4e2d40c87d4b3aa0aa59cb7949629289041387",
-  "bytes": 440,
-  "scope": "two NULL-ISO/Core detach command vectors; no physical hardware proof"
+  "source": "NVIDIA Open GPU Kernel Modules570.144 class definitions and modeset source; Nouveau display owner sequencing",
+  "scope": "Parameterized original C class/header packet evaluation, not execution of a complete original modeset function and not a physical receipt. Retain acknowledged Window->head during interlocked NULL ISO; NVIDIA EvoInitWindowMapping3 forbids Window interlock when owner changes. NVIDIA nvSetupOutputLUT5/EvoSetOutputLutC5 disables OCSC0 before NULL OLUT. Core notifier binding/disable keeps N264 original bug1945716 qualification.",
+  "references": [
+    "nvkms-evo3.c:EvoInitWindowMapping3/nvEvoUpdateC3",
+    "disp.c:nv50_disp_atomic_commit_tail window assignment comment",
+    "nvkms-evo3.c:nvSetupOutputLUT5/EvoSetOutputLutC5"
+  ],
+  "vectors": {
+    "bytes": 488,
+    "sha256": "688fc941c26bff9ae23e583409ebddab896a36136632faac752c7da42e9e17f6"
+  },
+  "prior_vectors_sha256": "6940e2c02b355233945e23a197f122cb3cb5f57e6ada994f3466215ddcd44aea"
 }

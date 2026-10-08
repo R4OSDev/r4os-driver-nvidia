@@ -18,6 +18,7 @@ pub const Work = struct {
     device: ?*device.Device = null,
     task: u64 = 0,
     completion: u32 = 0,
+    completion_disposition: u32 = std.math.maxInt(u32),
     stopping: u32 = 0,
 
     pub fn start(self: *Work, ctx: *const r4os.r4dev.DriverContext, target: *device.Device) !void {
@@ -102,6 +103,7 @@ pub const Work = struct {
         while (@atomicLoad(u32, &self.stopping, .acquire) == 0) {
             // Ordinary Work carries a driver identity but no lifecycle guard;
             // it cannot query the boot hold or perform display/MMIO operations.
+            if (self.completion == 0) @atomicStore(u32, &self.completion_disposition, std.math.maxInt(u32), .release);
             if (self.completion != 0 or ctx.workSubmitOwned(slice, raw, &self.completion) != 0 or self.completion == 0) {
                 ctx.logError("NVIDIA gsp-start: pacing=failed reason=work-admission device=retained");
                 return -1;
@@ -125,11 +127,16 @@ pub const Work = struct {
                 owner_wait_started = ctx.tickCount();
                 owner_retries = 0;
             }
+            // A slice which used its bounded progress budget has not reached
+            // an idle hardware wait. Requeue behind other owners immediately,
+            // after releasing this exact completion and lifecycle guard.
+            // Idle polling and owner contention retain their finite waits.
+            if (result == 3) continue;
             // Sleeping here releases the dedicated task's owner context.
             // No shared worker, MMIO callback or device lock spans this wait.
             // A GSP IRQ supplies a permit immediately; the finite timeout
             // preserves startup, deadlines and log polling if no IRQ arrives.
-            const ticks = if (result == 2 and self.device.?.phase == .ready) @max(ctx.timerFrequency() / 100, 1) else 1;
+            const ticks = if (result == 2) @max(ctx.timerFrequency() / 100, 1) else 1;
             const waited = self.semaphores.?.acquire(self.wake_semaphore, ticks);
             if (waited != 0 and waited != a.driver_semaphore_error_timeout) {
                 if (@atomicLoad(u32, &self.stopping, .acquire) != 0 or waited == a.driver_semaphore_error_cancelled) return 0;
@@ -145,27 +152,80 @@ pub const Work = struct {
         const bound = @max(ctx.timerFrequency(), 1);
         while (true) {
             var status: a.DriverCompletionStatus = .{};
-            if (ctx.completionStatus(self.completion, &status) != 0) return false;
+            const queried = ctx.completionStatus(self.completion, &status);
+            if (queried != 0) return self.failedCompletion("status", queried, status, started_at);
             if (status.state == a.driver_work_state_completed or status.state == a.driver_work_state_cancelled) {
+                var disposition = status.result;
+                if (status.state == a.driver_work_state_completed and status.result == 0) {
+                    const published = @atomicLoad(u32, &self.completion_disposition, .acquire);
+                    // Kernel Work success is zero. Our pacing state belongs
+                    // to this exact callback, not its generic result code.
+                    // Missing publication cannot release the retained ticket.
+                    if (published > 3) return self.failedCompletion("disposition", 0, status, started_at);
+                    disposition = @intCast(published);
+                }
                 const released = ctx.completionRelease(self.completion);
                 if (released == 0) {
-                    result.* = status.result;
+                    result.* = disposition;
                     self.completion = 0;
+                    @atomicStore(u32, &self.completion_disposition, std.math.maxInt(u32), .release);
                     return true;
                 }
                 // Final status can precede wake publication. Keep the exact
                 // ticket until release succeeds or this bounded wait expires.
-                if (released != -2) return false;
-            } else if (status.state != a.driver_work_state_queued and status.state != a.driver_work_state_running) return false;
-            if (@atomicLoad(u32, &self.stopping, .acquire) != 0 and status.state == a.driver_work_state_queued) _ = ctx.workCancel(self.completion);
-            if (ctx.tickCount() -% started_at >= bound) return false;
+                if (released != -2) return self.failedCompletion("release", released, status, started_at);
+            } else if (status.state == a.driver_work_state_queued or status.state == a.driver_work_state_running) {
+                if (@atomicLoad(u32, &self.stopping, .acquire) != 0 and status.state == a.driver_work_state_queued) _ = ctx.workCancel(self.completion);
+                const elapsed = ctx.tickCount() -% started_at;
+                if (elapsed >= bound) return self.failedCompletion("deadline", 1, status, started_at);
+                // The dedicated task sleeps on this exact completion. Its
+                // physical callback and publication wake it immediately;
+                // periodic status polling would add a tick to every turn.
+                var waited_result: i32 = 0;
+                const waited = ctx.completionWait(self.completion, bound - elapsed, &waited_result);
+                if (waited == 0 or waited == a.driver_work_result_cancelled) continue;
+                if (waited == 1) {
+                    // A timeout wake can race the real callback's final
+                    // publication. Recheck only this exact ticket; a final
+                    // state still needs its actual disposition and release.
+                    // Running/queued work keeps the original expired bound.
+                    var raced: a.DriverCompletionStatus = .{};
+                    const checked = ctx.completionStatus(self.completion, &raced);
+                    if (checked == 0 and (raced.state == a.driver_work_state_completed or
+                        raced.state == a.driver_work_state_cancelled)) continue;
+                    return self.failedCompletion("wait-timeout", if (checked == 0) waited else checked, raced, started_at);
+                }
+                // A stopped task can have its wait cancelled while the
+                // callback still owns its ticket. Drain with the original
+                // bounded status/release path, never free that live ticket.
+                if (waited != -5 or @atomicLoad(u32, &self.stopping, .acquire) == 0)
+                    return self.failedCompletion("wait", waited, status, started_at);
+            } else return self.failedCompletion("state", 0, status, started_at);
+            if (ctx.tickCount() -% started_at >= bound) return self.failedCompletion("release-deadline", 1, status, started_at);
             ctx.waitTicks(1);
         }
+    }
+    fn failedCompletion(self: *const Work, phase: []const u8, result: i32, previous: a.DriverCompletionStatus, started_at: u64) bool {
+        const ctx = self.ctx.?;
+        var live: a.DriverCompletionStatus = .{};
+        const queried = ctx.completionStatus(self.completion, &live);
+        var bytes: [340]u8 = undefined;
+        const message = std.fmt.bufPrintZ(&bytes,
+            "NVIDIA work-completion: phase={s} code={d} ticket={d} prior-state={d} live-status={d} live-state={d} live-result={d} disposition={d} elapsed-ticks={d} stopping={d}",
+            .{ phase, result, self.completion, previous.state, queried, live.state, live.result,
+                @atomicLoad(u32, &self.completion_disposition, .acquire), ctx.tickCount() -% started_at,
+                @atomicLoad(u32, &self.stopping, .acquire) }) catch return false;
+        ctx.logError(message.ptr);
+        return false;
+    }
+    fn completeSlice(self: *Work, disposition: u32) i32 {
+        @atomicStore(u32, &self.completion_disposition, disposition, .release);
+        return 0;
     }
     fn slice(raw: usize) callconv(.c) i32 {
         const self = from(raw);
         if (self.self_address != raw or self.ctx == null or self.device == null) return -1;
-        if (@atomicLoad(u32, &self.stopping, .acquire) != 0) return 1;
+        if (@atomicLoad(u32, &self.stopping, .acquire) != 0) return self.completeSlice(1);
         // Reset temporarily retires the firmware port. Pacing belongs to
         // the resident driver, and must survive that port's replacement.
         const clock = self.ctx.?.resources() orelse return -1;
@@ -174,16 +234,22 @@ pub const Work = struct {
         // Both a step count and a monotonic time bound apply. A single step
         // already has its native phase's finite deadline and register limit.
         for (0..64) |_| {
-            if (@atomicLoad(u32, &self.stopping, .acquire) != 0) return 1;
+            if (@atomicLoad(u32, &self.stopping, .acquire) != 0) return self.completeSlice(1);
             switch (self.device.?.step()) {
-                .stopped => return 1,
-                .idle => return 2,
+                .stopped => return self.completeSlice(1),
+                // An unchanged snapshot can retain a queue job between CE/GR
+                // sub-operations. Poll that owner's full lifetime at one tick;
+                // the 10-ms delay belongs to a ready device without queued
+                // work. Classify under the serialized lifecycle owner.
+                .idle => return self.completeSlice(if (self.device.?.phase == .ready and !self.device.?.running.workPolling()) 2 else 0),
                 .progress => {},
             }
             const current = clock.nowNs();
             if (current == std.math.maxInt(u64) or current < started_at) return -1;
             if (current - started_at >= 2 * std.time.ns_per_ms) break;
         }
-        return 0;
+        // The last step made progress; only the shared callback's step/time
+        // budget ended this turn. Its next turn must not wait for an IRQ.
+        return self.completeSlice(3);
     }
 };

@@ -456,6 +456,12 @@ fn readVbios(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Sna
                 if (hpd.line) |value| @as(u16, value) else @as(u16, 256),
                 if (hpd.active_high) |value| @as(u8, @intFromBool(value)) else @as(u8, 2),
             });
+            if (hpd.entry_index) |index| if (index < gpio.count) {
+                const entry = gpio.entry(index) catch continue;
+                log("NVIDIA HPD-entry: index={d} raw={x} extra={?x} extension={?x} line={d} off={d} on={d} lock-pin={?} dedicated={} reserved={x} source=retained-VBIOS", .{
+                    index,entry.raw,entry.extra,entry.extension_byte,entry.line,entry.off,entry.on,entry.lock_pin,entry.dedicated_lock,entry.reserved_bits,
+                });
+            };
         }
     } else ctx.logInfo("NVIDIA gpio-table: absent live-HPD=unknown");
     if (result.external_gpio) |*external| {
@@ -648,6 +654,13 @@ fn logBootScanout(raw: *const @import("boot_scanout.zig").Raw) void {
         log("NVIDIA boot-sor: id={d} heads={x:0>2} protocol={s} control={x:0>8}", .{ sor, raw.sors[sor] & 0xff, @tagName(scanout.protocol(raw.sors[sor])), raw.sors[sor] });
     };
     for (0..scanout.max_heads) |head| if (routed & (@as(u8, 1) << @intCast(head)) != 0) {
+        const source = &raw.heads[head];
+        log("NVIDIA boot-signal: head={d} output={x:0>8} control={x:0>8} clock-config={x:0>8}", .{
+            head, source.get(.output), source.get(.control), source.get(.clock_config),
+        });
+        log("NVIDIA boot-signal-color: head={d} point-in={x:0>8} point-out-adjust={x:0>8} hdmi={x:0>8} dsc={x:0>8}/{x:0>8}", .{
+            head, source.color.get(.point_in), source.color.get(.point_out_adjust), source.color.get(.hdmi), source.dsc_control, source.dsc_pps_control,
+        });
         const timing = scanout.timing(&raw.heads[head]) catch |err| {
             log("NVIDIA boot-head: id={d} timing=unknown reason={s} raw-state=retained", .{ head, @errorName(err) });
             continue;
@@ -831,6 +844,7 @@ fn checkBoot(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Sna
             log("NVIDIA gsp-start: rejected phase=owner reason={s} firmware-execution=disabled", .{@errorName(err)});
             return false;
         };
+
         if (native_device.running.diagnostic_copy_timeout or native_device.running.diagnostic_render_timeout or native_device.running.diagnostic_flip_irq_timeout) {
             if (!native_device.reset_config.valid() or native_device.reset_config_failure != null) {
                 ctx.logError("NVIDIA reset-probe: unsupported reset identity; firmware-execution=disabled");

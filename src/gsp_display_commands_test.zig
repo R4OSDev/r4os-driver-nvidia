@@ -7,7 +7,7 @@ const push = @import("gsp_display_push.zig");
 const fixture = @embedFile("fixtures/display-commands.bin");
 fn word(at: usize) u32 { return std.mem.readInt(u32, fixture[at..][0..4], .little); }
 pub fn check() !void {
-    try t.expect(fixture.len == 484 and word(0) == 4);
+    try t.expect(fixture.len == 524 and word(0) == 4);
     var at: usize = 4;
     for (0..word(0)) |_| {
         const result = try commands.core(.{ .windows = word(at), .notifier = word(at + 4), .initialize = word(at + 8) == 1 });
@@ -23,6 +23,7 @@ pub fn check() !void {
     try t.expectError(error.Bounds, commands.core(.{ .notifier = 1, .windows = 256, .initialize = true }));
     try t.expectError(error.Handle, commands.core(.{ .notifier = 0, .windows = 1, .initialize = true }));
     try t.expectError(error.Completion, push.cursor(0xffffffff));
+    try checkIdentityLut();
     try checkImages();
     try checkDetach();
     try checkBootMode();
@@ -150,26 +151,82 @@ fn checkBootMode() !void {
     // Replay the actual emitted route methods against two active peers.
     // A candidate modeset may clear unused firmware routes, never a peer.
     var peers = config; peers.initialize = false; peers.preserve_windows = 0x11;
-    const changing = try commands.encode(peers);
-    var routes: [8]u32 = @splat(7); routes[0] = 2; routes[4] = 0;
-    var offset: usize = 0;
-    while (offset < changing.count) {
-        const header = changing.words[offset]; offset += 1;
+    var ownership = peers; ownership.signal = null; ownership.ownership_only = true;
+    var signaled_ownership = ownership; signaled_ownership.signal = config.signal;
+    const ownership_packet = try commands.encode(signaled_ownership);
+    // The independent original C packet remains the timing/output oracle.
+    // Cursor/OLUT methods are deliberately absent before owner assignment.
+    var checked: usize = 0;
+    var before_owner = true;
+    var at: usize = 0;
+    while (at < ownership_packet.count) {
+        const header = ownership_packet.words[at]; at += 1;
         const count = (header >> 18) & 0x7ff;
         const method = header & 0x3fff;
         for (0..count) |i| {
             const address = method + @as(u32, @intCast(i)) * 4;
-            if (address >= 0x1000 and address <= 0x1380 and (address - 0x1000) % 0x80 == 0)
-                routes[(address - 0x1000) / 0x80] = changing.words[offset + i];
+            if (address == 0x1000 + bound.window * 0x80) before_owner = false;
+            if (address >= 0x2000) {
+                try t.expect(before_owner);
+                for ([_]u32{0x2088,0x208c,0x2090,0x2094,0x2098,0x209c,0x20a0,0x2288}) |deferred|
+                    try t.expect(address != deferred + bound.head * 0x400);
+                var found = false; var pos: usize = 0;
+                while (pos < reference.len) {
+                    const original_header = std.mem.readInt(u32, reference[pos..][0..4], .little); pos += 4;
+                    const original_count = (original_header >> 18) & 0x7ff;
+                    const original_method = original_header & 0x3fff;
+                    for (0..original_count) |j| if (original_method + @as(u32,@intCast(j))*4 == address) {
+                        try t.expectEqual(std.mem.readInt(u32,reference[pos+j*4..][0..4],.little),ownership_packet.words[at+i]);
+                        found = true;
+                    };
+                    pos += original_count * 4;
+                }
+                try t.expect(found); checked += 1;
+            }
+            if (address == 0x218 or address == 0x21c) try t.expectEqual(@as(u32,0),ownership_packet.words[at+i]);
         }
-        offset += count;
+        at += count;
     }
-    try t.expectEqualSlices(u32, &.{ 2, 15, 15, bound.head, 0, 15, 15, 15 }, &routes);
+    try t.expect(checked >= 30 and !before_owner);
+    for ([_]commands.Program{ try commands.encode(peers), try commands.encode(ownership), ownership_packet }) |changing| {
+        var routes: [8]u32 = @splat(7); routes[0] = 2; routes[4] = 0;
+        var offset: usize = 0;
+        while (offset < changing.count) {
+            const header = changing.words[offset]; offset += 1;
+            const count = (header >> 18) & 0x7ff;
+            const method = header & 0x3fff;
+            for (0..count) |i| {
+                const address = method + @as(u32, @intCast(i)) * 4;
+                if (address >= 0x1000 and address <= 0x1380 and (address - 0x1000) % 0x80 == 0)
+                    routes[(address - 0x1000) / 0x80] = changing.words[offset + i];
+            }
+            offset += count;
+        }
+        try t.expectEqualSlices(u32, &.{ 2, 15, 15, bound.head, 0, 15, 15, 15 }, &routes);
+    }
+    ownership.signal = config.signal; ownership.cursor_image = .{ .head = bound.head };
+    try t.expectError(error.Descriptor, commands.encode(ownership)); ownership.cursor_image = null;
+    ownership.signal.?.display_id = 0; try t.expectError(error.Descriptor, commands.encode(ownership));
+    ownership.signal = null; ownership.preserve_windows = 8; try t.expectError(error.Descriptor, commands.encode(ownership));
     peers.initialize = true; try t.expectError(error.Descriptor, commands.encode(peers));
     peers.initialize = false; peers.preserve_windows = 8; try t.expectError(error.Descriptor, commands.encode(peers));
     raw.heads[1].words[2] ^= 1;
     try t.expect(!std.meta.eql(saved, try mode.capture(&raw, &boot, 3)));
-    raw.heads[1].words[1] = 8; try t.expectError(error.Unsupported, mode.capture(&raw, &boot, 3));
+    // Real OssiPC/Hisense boot: HEAD_SET_CONTROL=0x180, progressive RGB8,
+    // slave/master NO_LOCK and inactive INTERNAL_SCAN_LOCK_0 selector.
+    // It must derive the same signal and original reference packet as zero.
+    for ([_]u32{ 0x10, 0x100, 0x180, 0x1f0, 0x180000, 0x180180 }) |control| {
+        raw = bootFixture(1920, 1080);
+        raw.heads[1].words[1] = control;
+        try t.expect(std.meta.eql(saved, try mode.capture(&raw, &boot, 3)));
+    }
+    // Active locks, interlace/stereo/YUV and bits outside the two inactive
+    // pin selectors retain the original strict admission boundary.
+    for ([_]u32{ 1, 2, 4, 8, 0x200, 0x580, 0xd80, 0x1180, 0x200000, 0x580180, 0xd80180, 0x1000000 }) |control| {
+        raw = bootFixture(1920, 1080);
+        raw.heads[1].words[1] = control;
+        try t.expectError(error.Unsupported, mode.capture(&raw, &boot, 3));
+    }
     raw = bootFixture(1920, 1080); raw.sors[3] |= 1; try t.expectError(error.Routing, mode.capture(&raw, &boot, 3));
     raw = bootFixture(1920, 1080); raw.sors[3] = 0xc02; try t.expectError(error.Unsupported, mode.capture(&raw, &boot, 3));
     raw = bootFixture(1920, 1080); raw.heads[1].words[4] -= 1; try t.expectError(error.Unsupported, mode.capture(&raw, &boot, 3));
@@ -186,7 +243,7 @@ fn checkBootMode() !void {
 }
 fn checkImages() !void {
     const vectors = @embedFile("fixtures/display-image.bin");
-    try t.expect(vectors.len == 984 and std.mem.readInt(u32, vectors[0..4], .little) == 4);
+    try t.expect(vectors.len == 1008 and std.mem.readInt(u32, vectors[0..4], .little) == 4);
     var at: usize = 4;
     for (0..4) |_| {
         var fields: [15]u32 = undefined;
@@ -209,4 +266,83 @@ fn checkImages() !void {
         }
     }
     try t.expect(at == vectors.len);
+}
+
+fn methodValue(program: commands.Program, method: u32) !u32 {
+    var at: usize = 0; var found: ?u32 = null;
+    while (at < program.count) {
+        const header = program.words[at]; at += 1;
+        const count = (header >> 18) & 0x7ff;
+        const base = header & 0x3fff;
+        for (0..count) |i| if (base + @as(u32, @intCast(i)) * 4 == method) {
+            try t.expect(found == null);
+            found = program.words[at + i];
+        };
+        at += count;
+    }
+    return found orelse error.MissingMethod;
+}
+fn checkIdentityLut() !void {
+    errdefer |err| std.debug.print("identity original C: {s}\n", .{@errorName(err)});
+    const lut = @import("gsp_display_identity_lut.zig");
+    const original = @embedFile("fixtures/display-identity-lut570.144.bin");
+    var data: [lut.bytes]u8 = undefined;
+    try lut.fill(&data);
+    try t.expectEqualSlices(u8, original, &data);
+    try t.expect((try lut.firstDifference(&data)) == null);
+    data[32] ^= 1;
+    try t.expectEqual(@as(?u32, 32), try lut.firstDifference(&data));
+    try t.expectError(error.Bounds, lut.fill(data[0 .. data.len - 1]));
+    const a = @import("r4os").abi;
+    var raw = bootFixture(1920, 1080);
+    const boot: a.GfxNativeBootInfo = .{ .generation = 3, .physical_address = 0xd0000000,
+        .byte_length = 8192 * 1080, .pitch = 8192, .width = 1920, .height = 1080, .format = a.gfx_buffer_format_xrgb8888 };
+    const saved = try commands.boot_mode.capture(&raw, &boot, 3);
+    const snapshot = try t.allocator.create(@import("gsp_outputs.zig").Snapshot); defer t.allocator.destroy(snapshot);
+    outputFixture(snapshot, 11, 12);
+    const bound = try commands.boot_mode.bind(saved, snapshot, 11, 4);
+    var signal = bound.signal;
+    signal.sor_control = (signal.sor_control & ~@as(u32, 255)) | 1;
+    const control: lut.Controls = .{ .head = 0, .window = 3, .input = 0x100000ee, .output = 0x100000ef };
+    const core: commands.Config = .{ .notifier = 0x1234, .windows = 255, .initialize = false,
+        .route = .{ .head = 0, .window = 3 }, .signal = signal, .identity_lut = control };
+    const window: commands.Config = .{ .kind = .window, .notifier = 0x1235, .windows = 255, .initialize = true,
+        .route = core.route, .identity_lut = control,
+        .scanout = .{ .dma = 0x5678, .channel = 4, .format = a.gfx_buffer_format_xrgb8888,
+            .width = 1920, .height = 1080, .pitch = 7680, .bytes = 7680 * 1080, .offset = 0 } };
+    const cpacket = try commands.encode(core);
+    const wpacket = try commands.encode(window);
+    const values = @embedFile("fixtures/display-identity-controls570.144.bin");
+    try t.expectEqual(@as(usize, 176), values.len);
+    for (0 .. values.len / 8) |i| {
+        const address = std.mem.readInt(u32, values[i * 8 ..][0..4], .little);
+        const expected = std.mem.readInt(u32, values[i * 8 + 4 ..][0..4], .little);
+        try t.expectEqual(expected, try methodValue(if (address >= 0x2000) cpacket else wpacket, address));
+    }
+    var ownership = core; ownership.ownership_only = true;
+    const before_image = try commands.encode(ownership);
+    try t.expectError(error.MissingMethod, methodValue(before_image, 0x2288));
+    try t.expectError(error.MissingMethod, methodValue(before_image, 0x2240));
+    var bad = window; bad.identity_lut.?.head = 1;
+    try t.expectError(error.Descriptor, commands.encode(bad));
+    bad = window; bad.identity_lut.?.output = control.input;
+    try t.expectError(error.Descriptor, commands.encode(bad));
+    const imp = @import("gsp_mode_control.zig");
+    const offsets = @embedFile("fixtures/display-identity-imp570.144.bin");
+    try t.expect(offsets.len == 28);
+    try t.expectEqual(@as(u32, 92), std.mem.readInt(u32, offsets[0..4], .little));
+    try t.expectEqual(@as(u32, 36), std.mem.readInt(u32, offsets[4..8], .little));
+    var request: [imp.length(.possible)]u8 = undefined;
+    var plain: [imp.length(.possible)]u8 = undefined;
+    var mode = bound; mode.native_lut = true;
+    const binding: imp.Binding = .{ .epoch = 11, .client = 12, .device = 0x10000000, .display = 0x10000001, .control = 0x10000002 };
+    _ = try imp.encode(binding, .possible, mode, &request);
+    _ = try imp.encode(binding, .possible, bound, &plain);
+    const h = 24 + 8 + std.mem.readInt(u32, offsets[8..12], .little);
+    const w = 24 + 744 + std.mem.readInt(u32, offsets[12..16], .little);
+    const usage = std.mem.readInt(u32, offsets[24..28], .little);
+    try t.expectEqual(usage, request[h]); try t.expectEqual(usage, request[w]);
+    for (request, plain, 0..) |actual, previous, index| try t.expectEqual(if (index == h or index == w) @as(u8, @intCast(usage)) else previous, actual);
+    try t.expect(request[24 + 744 + std.mem.readInt(u32, offsets[16..20], .little)] == 0); // No TMO requested.
+    std.debug.print("[nvidia-identity-lut] original full C/SoftFloat tables, C67D/C67E controls and original IMP layout; old no-LUT packets unchanged\n", .{});
 }

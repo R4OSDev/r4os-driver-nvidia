@@ -1,5 +1,20 @@
 ﻿# NVIDIA.R4D
 
+Roadmap0.82.37 / restored original-console terminal lifetime: reconstruction
+keeps a new private firmware/C67D graph resident after the common owner has
+returned to bootfb. It publishes no new public GPU queue. System shutdown
+must authenticate that exact restored identity, revoke CPU framebuffer
+writers, and obtain a fresh physical stop for this new epoch. The old
+resumed reset receipt is invalid. Common restoration consumes the public
+reset record; its separate pointer-free receipt retains the exact R4D
+identity, including driver generation, adapter and restored generation.
+It authorizes only that owner's later terminal handoff, never DMA release.
+Runtime/common retirement precedes the
+exact console-reservation close; RAM/BAR1/firmware stay held until terminal
+release. The existing full Device and Kernel display-owner tests cover this
+path, stale identities, Busy retries and release receipts. Actual scoped
+hardware qualification is recorded under the common OssiGPU checkpoint.
+
 Roadmap0.82.30 / native workload power classification (0.1.200): the
 runtime classifies authenticated native jobs by their validated engine mask.
 NVDEC/NVENC report video demand, GR reports render, and combined GR/compute/CE
@@ -594,6 +609,16 @@ The shadow and common commit use the same immutable pre-firmware RAM image.
 The callback validates prior CE/notifier/HDMI completion without waiting
 for its own worker. A matching software-native receipt enables the existing
 common Present queue: CPU rendering in RAM and native VRAM scanout.
+
+The unscaled opaque integer primary uses C67E composition bypass when its
+ILUT/OLUT contexts are disabled. Normal FP16 composition requires real colour
+conversion tables; a NULL LUT context does not implement an identity table.
+
+After common queue loss, reset admission observes the newer unavailable
+display generation and validates the unchanged boot descriptor before q0.
+The common bridge still authenticates the exact driver/backend; the original
+boot hold and physical DMA-stop proof remain separate. Failed submissions
+retain their producer phase and original deadline for fault attribution.
 
 Before display DMA setup, a real NVC372 control object under the RM device
 queries the output's source pixel-clock limit and fresh IMP head/window

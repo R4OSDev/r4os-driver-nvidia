@@ -30,6 +30,28 @@ const catalog = @import("gsp_catalog.zig");
 const receiver = @import("gsp_receiver.zig");
 const timing = receiver.edid.timing;
 
+/// Native takeover reuses the exact captured raster, but a firmware DVI
+/// enable bit must not suppress HDMI audio at a freshly proven HDMI socket.
+/// This only admits transport intent. The ordinary source-clock/IMP/link
+/// transaction still has to acknowledge the full mode before audio can run.
+/// Original boot-console restoration must keep its captured transport.
+pub noinline fn admitBootHdmi(saved: boot.Plan, snapshot: *const outputs.Snapshot) !boot.Plan {
+    if (!std.meta.eql(saved, try boot.bind(saved, snapshot, saved.epoch, saved.held_generation))) return error.Stale;
+    if (saved.displayPort() or saved.hasAudio()) return saved;
+    for (snapshot.topology.routes[0..snapshot.count], snapshot.receivers[0..snapshot.count]) |route, *capture| {
+        if (route.id != saved.signal.display_id) continue;
+        if (capture.connected != true or capture.status != .valid_edid or !capture.report.complete() or
+            !capture.report.digital or !capture.report.hdmi) return saved;
+        const connectors = route.connectors orelse return saved;
+        if (!connectors.present() or connectors.count != 1 or
+            (connectors.data[0].kind != 0x61 and connectors.data[0].kind != 0x63)) return saved;
+        var result = saved;
+        result.transport_hdmi = true;
+        return result;
+    }
+    return saved;
+}
+
 /// The caller supplies a freshly bound retained or claimed route. A mode
 /// ID is local to this exact output generation and final RM receipt.
 pub fn select(saved: boot.Plan, snapshot: *const outputs.Snapshot, id: u32) !boot.Plan {

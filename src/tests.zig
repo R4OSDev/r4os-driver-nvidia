@@ -592,7 +592,6 @@ fn checkGpioTopology(rom: *const [1024]u8) !void {
     try t.expectEqual(@as(?u8, 63), high_pin.hpd[0].line); // Metadata, not GA106 admission (32 lines).
     for ([_]struct { word: u32, extra: u8 }{
         .{ .word = 0x00000740, .extra = 0xef }, // Dedicated lock, no GPIO.
-        .{ .word = 0x40000701, .extra = 0xef }, // Reserved bit.
         .{ .word = 0x00000701, .extra = 0xe0 }, // HPD cannot be a lock pin.
         .{ .word = 0x00000701, .extra = 0xcf }, // OFF drives output.
         .{ .word = 0x00000701, .extra = 0xff }, // Input levels indistinguishable.
@@ -601,6 +600,21 @@ fn checkGpioTopology(rom: *const [1024]u8) !void {
         const bad = try gpio.parse(&one, 0);
         try t.expectEqual(gpio.Status.invalid_input, bad.hpd[0].status);
         try t.expect(bad.hpd[0].line == null and bad.hpd[0].active_high == null);
+    }
+    // Exact retained GA106 records. Pinned Nouveau bios/gpio.c parses the
+    // same five-byte prefix of this six-byte stride and gpio_get compares
+    // the sensed line with log[1]&1, ignoring bit30. No GPIO I/O occurs here.
+    for ([_]u32{0x4300511b,0x44005211,0x45005e12,0x46005f18}) |raw_hpd| {
+        var measured: [12]u8 = .{0x41,6,1,6,0,0,0,0,0,0,0xbf,1};
+        put32(&measured,6,raw_hpd);
+        const observed = try gpio.parse(&measured,0);
+        const item = try observed.entry(0);
+        const signal = try observed.input(@truncate(raw_hpd >> 8));
+        try t.expectEqual(gpio.Status.mapped,signal.status);
+        try t.expectEqual(@as(?u8,@intCast(raw_hpd&63)),signal.line);
+        try t.expectEqual(@as(?bool,false),signal.active_high);
+        try t.expect(item.off == 3 and item.on == 2 and item.lock_pin.? == 15 and
+            item.reserved_bits == 0x40000000 and item.extension_byte.? == 1 and item.raw == raw_hpd);
     }
     put32(&one, 6, 0x0000ff01);one[10] = 0xef;
     try t.expectEqual(gpio.Status.missing, (try gpio.parse(&one, 0)).hpd[0].status);

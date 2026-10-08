@@ -45,6 +45,7 @@ pub const Model = struct {
     var mode_descriptor: ?a.GfxBufferDescriptor = null;
     pub var mode_lent = false;
     pub var replacement_lent = false;
+    pub var replacement_producer_closed = false;
     pub var borrowed_releases: usize = 0;
     var initial_index: usize = 0;
     var command_view: [length]u8 = undefined;
@@ -73,7 +74,7 @@ pub const Model = struct {
     var decoded_count: u32 = 0;
     var present_mode = false;
     var product_mode = false;
-    var render_mode = false;
+    pub var render_mode = false;
     pub var render_operations: u64 = 13;
     pub var render_list: a.GfxRenderList = .{};
     pub var render_grids: [a.gfx_render_list_capacity]a.GfxSampleGrid = @splat(.{});
@@ -102,7 +103,7 @@ pub const Model = struct {
         additional_shadow = false; additional_shadow_live = false; additional_shadow_cpu = false; additional_descriptor = null;
         mode_descriptor = null; mode_lent = false;
         initial_read = .{}; reject_initial_read = false; reject_initial_release = false;
-        replacement_native = null; replacement_descriptor = null; replacement_lent = false; borrowed_releases = 0; initial_index = 0;
+        replacement_native = null; replacement_descriptor = null; replacement_lent = false; replacement_producer_closed = false; borrowed_releases = 0; initial_index = 0;
         app_reference = true; native.slots[index].imported = true; // Separate app alias, independent of the allocator's producer reference.
         for (0..system_count) |i| { @memset(&host[i], 0xa5); @memset(&gpu_data[i], 0x5a); }
         @memset(&vram_data, 0xcc);
@@ -334,7 +335,8 @@ pub const Model = struct {
         .scanout_retire_requested = if (direct_mode) @intFromPtr(&retireRequested) else 0,
         .unregister_backend = @intFromPtr(&unregister), .take = @intFromPtr(&take), .retain_resource = @intFromPtr(&retain), .complete = @intFromPtr(&complete) }; return a.gfx_queue_ok; }
     fn updateOperations(input: *const a.GfxBackendBinding, operations: u64) callconv(.c) i32 {
-        const with_display = operations | 36;
+        const render_base = if (direct_mode) operations & ~@as(u64, 128) else operations;
+        const with_display = render_base | 36;
         std.debug.assert(std.meta.eql(input.*, binding) and ((present_mode and operations == 13) or (direct_mode and operations == 173) or
             (render_mode and (with_display == 29 or with_display == 61 or with_display == 125 or with_display == 381 or with_display == 893 or with_display == 2941))));
         render_operations = operations; return a.gfx_queue_ok;
@@ -527,6 +529,9 @@ pub const Model = struct {
         }
         std.debug.assert(shadow_live or own or replacement or additional or mode);
         const buffer = if (own) references[select(input.*).?].buffer else sys(if (mode) @as(usize, 3) else if (additional) @as(usize, 2) else @intFromBool(replacement));
+        // Kernel stoppedOwner leaves retained consumers usable, but closes
+        // every new import, including a clone of an existing consumer alias.
+        if (replacement_producer_closed and std.meta.eql(buffer, sys(1))) return a.gfx_buffer_error_closed;
         const readonly = own and references[select(input.*).?].readonly;
         for (&references, 0..) |*entry, i| if (!entry.active) {
             entry.* = .{ .active = true, .buffer = buffer, .mapping_only = false, .readonly = readonly };

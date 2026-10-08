@@ -1,0 +1,17 @@
+{
+  "utc": "2026-10-07T00:13:50.359228+00:00",
+  "original_function": "instmemCommitContextDma_v03_00",
+  "unchanged_function_sha256": "ad4ecf11022e8358914d0bb5d0b654a1a8d3ca5153117c431a29f2b900a30a78",
+  "inputs": {
+    "disp_inst_mem_0300.c": "src/nvidia/src/kernel/gpu/disp/inst_mem/arch/v03/disp_inst_mem_0300.c",
+    "dev_disp.h": "src/common/inc/swref/published/disp/v03_00/dev_disp.h",
+    "nvmisc.h": "src/common/sdk/nvidia/inc/nvmisc.h",
+    "nvtypes.h": "src/common/sdk/nvidia/inc/nvtypes.h",
+    "cpuopsys.h": "src/common/sdk/nvidia/inc/cpuopsys.h",
+    "nvos.h": "src/common/sdk/nvidia/inc/nvos.h"
+  },
+  "output": "00000005 02f0b200 00000000 02f0b9ff 00000000",
+  "scope": "Original pitch, physical VRAM, read/write commit for the actual cursor address and length. Host stubs supply memory ownership/transfer only. Compared with existing descriptor45: original flags05 differ only by page-size bit6. No hardware pass.",
+  "archive": "ExFiles/Reports/OssiGPU/20261005-tv08237/N266CursorDmaOriginal",
+  "qualification": "Original function evaluated on host; hardware pending."
+}

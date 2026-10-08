@@ -494,7 +494,7 @@ pub fn allocationAttributes(request: []const u8, response: []const u8, is_virtua
     const kind_after = word(response, 32);
     const memory_type = word(request, 4);
     if (kind_after != kind_before and !(kind_before == 0 and kind_after == 6 and
-        before & (3 << 12) == 0 and (memory_type == 0 or memory_type == 6 or memory_type == 8))) return error.Payload;
+        before & (3 << 12) == 0 and (memory_type == 0 or memory_type == 5 or memory_type == 6 or memory_type == 8))) return error.Payload;
 }
 
 /// Validate one successful virtual-allocation parameter block. The returned

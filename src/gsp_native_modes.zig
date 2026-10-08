@@ -23,6 +23,7 @@ pub const Owner = struct {
     deadline: u64 = 0,
     cursor: u32 = 0,
     publication: a.GfxOutputPublication = .{},
+    retained_source_limits: bool = false,
     plan: ?runtime.boot_mode.Plan = null,
     job: ?a.GfxDriverModeJob = null,
     applied: ?a.GfxDriverModeJob = null,
@@ -127,23 +128,30 @@ pub const Owner = struct {
         switch (phase) {
             .detached => {
                 if (!product.outputs.?.supportsModes() or product.receiver.flags & a.gfx_output_flag_connected == 0 or
-                    product.receiver.flags & (a.gfx_output_flag_receiver_incomplete | a.gfx_output_flag_edid_invalid | a.gfx_output_flag_edid_missing) != 0) {
+                    product.receiver.flags & (a.gfx_output_flag_edid_invalid | a.gfx_output_flag_edid_missing) != 0 or
+                    !try self.completeReceiver(product)) {
                     self.phase = .unavailable; return false;
                 }
                 self.publication = product.publication;
+                self.retained_source_limits = self.publication.info.limits.flags & a.gfx_output_limit_modeset != 0;
                 self.publication.modes = @splat(.{});
                 self.publication.info.mode_count = 0; self.publication.info.preferred_mode_id = 0;
-                self.publication.info.limits.max_width = 0; self.publication.info.limits.max_height = 0;
+                if (!self.retained_source_limits) {
+                    self.publication.info.limits.max_width = 0; self.publication.info.limits.max_height = 0;
+                }
                 self.deadline = now +| (5 * std.time.ns_per_s);
                 self.phase = .catalog_next;
             },
             .catalog_next => {
                 if (self.cursor == product.receiver.mode_count) {
                     if (self.publication.info.mode_count == 0) { self.phase = .unavailable; return true; }
-                    self.publication.info.limits.flags = a.gfx_output_limit_modeset;
+                    self.publication.info.limits.flags |= a.gfx_output_limit_modeset;
                     self.phase = .enable; return true;
                 }
                 const mode = product.receiver.modes[self.cursor];
+                if (self.retained_source_limits and !withinSourceLimits(mode, self.publication.info.limits)) {
+                    self.cursor += 1; return true;
+                }
                 self.plan = run.displayModePlan(product.engine.?, product.mode.?.window, mode.mode_id) catch |err| {
                     if (err == error.Unsupported) { self.cursor += 1; return true; }
                     return err;
@@ -173,15 +181,17 @@ pub const Owner = struct {
                     const info = &self.publication.info;
                     self.publication.modes[info.mode_count] = mode; info.mode_count += 1;
                     if (info.preferred_mode_id == 0 or mode.flags & a.gfx_output_mode_preferred != 0) info.preferred_mode_id = mode.mode_id;
-                    info.limits.max_width = @max(info.limits.max_width, mode.width);
-                    info.limits.max_height = @max(info.limits.max_height, mode.height);
-                    // This is an admission envelope for individually IMP-
-                    // checked modes on one head, not measured GPU throughput.
-                    info.limits.max_pixel_clock_hz = @max(info.limits.max_pixel_clock_hz, mode.pixel_clock_hz);
-                    info.limits.total_pixel_clock_hz = info.limits.max_pixel_clock_hz;
-                    const bytes = @as(u64, mode.width) * 4 * mode.height;
-                    const rate = try std.math.add(u64, try std.math.mul(u64, bytes, mode.refresh_millihz), 999);
-                    info.limits.bandwidth_bytes_per_second = @max(info.limits.bandwidth_bytes_per_second, rate / 1000);
+                    if (!self.retained_source_limits) {
+                        info.limits.max_width = @max(info.limits.max_width, mode.width);
+                        info.limits.max_height = @max(info.limits.max_height, mode.height);
+                        // Admission for individually IMP-checked modes on
+                        // one head, not measured GPU throughput.
+                        info.limits.max_pixel_clock_hz = @max(info.limits.max_pixel_clock_hz, mode.pixel_clock_hz);
+                        info.limits.total_pixel_clock_hz = info.limits.max_pixel_clock_hz;
+                        const bytes = @as(u64, mode.width) * 4 * mode.height;
+                        const rate = try std.math.add(u64, try std.math.mul(u64, bytes, mode.refresh_millihz), 999);
+                        info.limits.bandwidth_bytes_per_second = @max(info.limits.bandwidth_bytes_per_second, rate / 1000);
+                    }
                 }
                 self.cursor += 1; self.phase = .catalog_next;
             },
@@ -359,6 +369,21 @@ pub const Owner = struct {
             },
             .reply => {
                 const job = self.job.?;
+                // APPLY starts a live confirmation interval: its ordinary
+                // composed frames already need the entire private pool.
+                // KEEP also releases the caller to exit, after which new
+                // SYSTEM imports are forbidden. Finish the exact pool before
+                // either receipt; stopped heads keep their no-submission path.
+                const window = product.mode.?.window;
+                if ((job.operation == a.gfx_mode_operation_apply or job.operation == a.gfx_mode_operation_confirm) and
+                    self.outcome == a.gfx_output_outcome_applied and
+                    !self.stopping_cleanup and !run.outputPaused(window)) {
+                    const selected = run.currentPresentation(window) orelse return error.State;
+                    if (run.frame_setup != null or run.presentationGroupCount(selected) < run.presentation_buffers) {
+                        if (now >= self.deadline) return error.Deadline;
+                        return run.prepareConfirmedModeFrames(window, self.deadline);
+                    }
+                }
                 const receipt: a.GfxDriverModeCompletion = .{ .ticket = job.ticket, .sequence = job.sequence, .operation = job.operation,
                     .outcome = self.outcome, .quiesced = if (self.outcome == a.gfx_output_outcome_applied) 1 else 2, .error_code = self.error_code };
                 self.last_status = product.outputs.?.completeMode(&receipt);
@@ -482,14 +507,27 @@ pub const Owner = struct {
                 image.usage & (a.gfx_buffer_usage_cpu_write | a.gfx_buffer_usage_transfer_source) != a.gfx_buffer_usage_cpu_write | a.gfx_buffer_usage_transfer_source) return error.Descriptor;
         }
     }
+    fn completeReceiver(_: *Owner, product: anytype) !bool {
+        const run = product.running.?;
+        // receiver_incomplete also describes omitted unsupported timings.
+        // Keep that diagnostic flag; admit only the exact complete capture
+        // behind this publication, then query each surviving mode normally.
+        const snapshot = run.outputs.snapshot() orelse return error.Busy;
+        const mode = product.mode orelse return error.State;
+        if (snapshot.generation != mode.output_generation or snapshot.final_receipt_serial != mode.receipt_serial or
+            snapshot.topology.epoch != run.epoch or product.receiver.connector_id != mode.signal.display_id) return false;
+        for (snapshot.receivers[0..snapshot.count]) |*capture| if (capture.display_id == mode.signal.display_id) {
+            const bytes = capture.edid_bytes;
+            return capture.epoch == run.epoch and capture.client == snapshot.topology.client and
+                capture.connected == true and capture.status == .valid_edid and capture.report.complete() and
+                bytes != 0 and bytes % 128 == 0 and bytes <= capture.bytes.len and bytes <= product.receiver.edid.len and
+                bytes == product.receiver.edid_bytes and
+                std.mem.eql(u8, capture.bytes[0..bytes], product.receiver.edid[0..bytes]);
+        };
+        return false;
+    }
     fn checkSurface(_: *Owner, run: *runtime.Owner, width: u32, height: u32) !void {
-        const space = (run.nativeAddressSpace() orelse return error.Busy).*;
-        const caps = run.nativeMemoryCapabilities() orelse return error.Busy;
-        const memory = run.nativeMemory() orelse return error.Busy;
-        const plan = try runtime.vram.surface.create(run.adapter_id, space, caps, .{ .width = width, .height = height, .usage = 40 });
-        _ = try runtime.display_resources.image.create(plan, 1, 1);
-        const policy: runtime.vram.storage.Policy = .{ .capabilities = caps, .physical_bytes = @min(memory.physical_bytes, memory.reported_bytes), .role = .scanout };
-        try policy.validate(space, plan.allocation_bytes);
+        try run.validateDisplaySurface(.{ .width = width, .height = height, .usage = 40 });
     }
     fn imageStorage(run: *runtime.Owner, dma: u32) !runtime.BufferHandle {
         const resources = run.display_resources_slot.owner orelse return error.State;
@@ -551,3 +589,10 @@ pub const Owner = struct {
         product.ctx.?.logInfo(text);
     }
 };
+pub fn withinSourceLimits(mode: a.GfxOutputMode, limits: a.GfxDisplayLimits) bool {
+    if (mode.width == 0 or mode.height == 0 or mode.width > limits.max_width or mode.height > limits.max_height) return false;
+    if (limits.flags & a.gfx_output_limit_modeset == 0) return true;
+    const rate = (@as(u128, mode.width) * mode.height * 4 * mode.refresh_millihz + 999) / 1000;
+    return mode.pixel_clock_hz <= limits.max_pixel_clock_hz and mode.pixel_clock_hz <= limits.total_pixel_clock_hz and
+        rate <= limits.bandwidth_bytes_per_second;
+}

@@ -169,7 +169,7 @@ pub const Error = base.Error;
 pub const Binding = base.Binding;
 pub const Operation = enum { allocate_memory, allocate_virtual, map, unmap, free_virtual, free_memory };
 pub const alignment: u64 = 65536;
-pub const Layout = struct { blocklinear: bool = false, scanout: bool = false, contiguous: bool = false, granule: u64 = alignment, privileged: bool = false, readonly: bool = false };
+pub const Layout = struct { blocklinear: bool = false, scanout: bool = false, cursor: bool = false, lut: bool = false, contiguous: bool = false, granule: u64 = alignment, privileged: bool = false, readonly: bool = false };
 pub fn function(op: Operation) u32 { return switch (op) { .allocate_memory, .allocate_virtual => 103, .map => 14, .unmap => 15, .free_virtual, .free_memory => 10 }; }
 fn translated(op: Operation) base.Operation { return switch (op) { .allocate_memory, .allocate_virtual => .allocate, .map => .map, .unmap => .unmap, .free_virtual => .free_virtual, .free_memory => .free_memory }; }
 fn part(bytes: u64) base.Part { return .{ .total_bytes = bytes, .byte_length = bytes }; }
@@ -182,6 +182,8 @@ pub fn encode(binding: Binding, bytes: u64, op: Operation, address: u64, out: []
 }
 pub fn encodeLayout(binding: Binding, bytes: u64, layout: Layout, op: Operation, address: u64, out: []u8) Error!base.Encoded {
     if (bytes == 0 or bytes % alignment != 0 or layout.granule < alignment or layout.granule > (@as(u64, 1) << 30) or !std.math.isPowerOfTwo(layout.granule) or (layout.readonly and !layout.privileged)) return error.Bounds;
+    if (layout.cursor and (layout.scanout or layout.lut or layout.blocklinear or layout.privileged or layout.readonly)) return error.Bounds;
+    if (layout.lut and (layout.scanout or layout.blocklinear or layout.privileged or layout.readonly)) return error.Bounds;
     const result = try base.encodePart(binding, part(bytes), translated(op), &.{}, address, out);
     if (op == .allocate_memory or op == .allocate_virtual) {
         const p = out[32..160];
@@ -192,9 +194,12 @@ pub fn encodeLayout(binding: Binding, bytes: u64, layout: Layout, op: Operation,
         if (op == .allocate_memory) {
             put(out, 8, binding.memory);
             put(out, 12, 0x40); // NV01_MEMORY_LOCAL_USER.
-            put(p, 4, if (layout.scanout) 8 else 0); // PRIMARY or IMAGE.
-            put(p, 8, if (layout.scanout) 0x8102 else 0x9102); // MAP_NOT_REQUIRED; scanout never sets NO_SCANOUT.
-            put(p, 24, (if (layout.scanout or layout.contiguous) @as(u32, 0x10800000) else 0x08800000) | format);
+            put(p, 4, if (layout.cursor) 5 else if (layout.scanout) 8 else 0); // CURSOR, PRIMARY or IMAGE.
+            put(p, 8, if (layout.scanout or layout.cursor or layout.lut) 0x8102 else 0x9102); // Display storage never sets NO_SCANOUT.
+            put(p, 24, (if (layout.scanout or layout.cursor or layout.lut or layout.contiguous) @as(u32, 0x10800000) else 0x08800000) | format);
+            // standard_mem.c requires and retains ISO for CURSOR. Specify
+            // it before the RPC; no unrelated returned attribute is relaxed.
+            if (layout.cursor or layout.lut) put(p, 28, word(p, 28) | (1 << 18));
             put(p, 108, 0);
         }
         if (layout.privileged) put(p, 8, word(p, 8) | 0x08000000); // NVOS32_ALLOC_FLAGS_ALLOCATE_KERNEL_PRIVILEGED.

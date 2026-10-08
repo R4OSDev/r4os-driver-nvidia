@@ -16,6 +16,26 @@ pub const Claim = struct {
 };
 pub const Selection = struct { claim: Claim, plan: boot.Plan };
 pub const Assignment = struct { request: @import("gsp_sor_assignment.zig").Request, connector: display.Connector, fingerprint: [32]u8 };
+pub const RestoreIdentity = struct { claim: Claim, fingerprint: [32]u8 };
+
+/// Reuse an identified physical SST receiver after FLR. A fresh coherent
+/// capture must still name the same socket, protocol and complete EDID.
+/// The original boot signal supplies the only permitted SOR/head/window.
+pub fn restoreAssignment(object: display.Object, snapshot: *const outputs.Snapshot, occupied: []const ?Claim,
+    saved: boot.Plan, identity: RestoreIdentity) !Assignment
+{
+    const claim = identity.claim;
+    if (claim.mst != null or saved.signal.mst != null or claim.sor >= 4 or claim.sor != saved.signal.sor or
+        claim.head != saved.head or claim.window != saved.window or claim.protocol != (saved.signal.sor_control >> 8) & 15 or
+        saved.signal.display_id != 0) return error.Unsupported;
+    var source = try assignment(object, snapshot, occupied, claim.display_id);
+    const current = try route(snapshot, claim.display_id);
+    const resource = current.resource.?;
+    if ((resource.index != 0xffffffff and resource.index != claim.sor) or resource.protocol != claim.protocol or
+        !std.meta.eql(source.connector, claim.connector) or !std.meta.eql(source.fingerprint, identity.fingerprint)) return error.Stale;
+    source.request.fixed_sor = @intCast(claim.sor);
+    return source;
+}
 
 /// A physical hub may have no EDID and no SOR yet. This fingerprint binds
 /// assignment to its freshly captured DPCD; it grants no encoder or mode.

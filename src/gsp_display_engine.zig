@@ -307,7 +307,7 @@ const vram = @import("gsp_vram.zig");
 pub const wire = @import("gsp_display_engine_wire.zig");
 pub const Error = wire.Error || names.Error || vram.Error;
 pub const State = enum { creating, binding_instance, unwinding, ready, handed_off, destroying, closed, finished, failed };
-pub const Info = struct { binding: wire.Binding, hardware: wire.StaticInfo, core: bool, window: bool, immediate: bool, cursor: bool = false, cursor_size: u16 = 0, instance_bound: bool };
+pub const Info = struct { binding: wire.Binding, hardware: wire.StaticInfo, core: bool, window: bool, immediate: bool, cursor: bool = false, cursor_size: u16 = 0, instance_bound: bool, system_caps: u8 };
 pub const Owner = struct {
     self_address: usize = 0,
     exchange: exchange.Exchange,
@@ -317,11 +317,13 @@ pub const Owner = struct {
     state: State = .creating,
     classes: bool = false,
     hardware: ?wire.StaticInfo = null,
+    system_caps: ?u8 = null,
     core_supported: bool = false,
     window_supported: bool = false,
     immediate_supported: bool = false,
     cursor_supported: bool = false,
     cursor_size: u16 = 0,
+    identity_windows: u8 = 0,
     instance_storage: vram.storage.Use = .{},
     instance_bound: bool = false,
     instance_possible: bool = false,
@@ -364,7 +366,7 @@ pub const Owner = struct {
             (self.state != .ready and self.state != .handed_off)) return null;
         if (self.instance_bound and self.instance_storage.info() == null) return null;
         return .{ .binding = self.binding, .hardware = self.hardware orelse return null, .core = self.core_supported,
-            .window = self.window_supported, .immediate = self.immediate_supported, .cursor = self.cursor_supported, .cursor_size = self.cursor_size, .instance_bound = self.instance_bound };
+            .window = self.window_supported, .immediate = self.immediate_supported, .cursor = self.cursor_supported, .cursor_size = self.cursor_size, .instance_bound = self.instance_bound, .system_caps = self.system_caps orelse return null };
     }
     pub fn attachInstance(self: *Owner, source: *vram.Owner, token: *boot.Handoff, deadline: u64) Error!void {
         const root = self.info() orelse return error.State;
@@ -398,6 +400,10 @@ pub const Owner = struct {
                 if (!self.classes) break :blk .classes;
                 if (self.hardware == null) break :blk .static_info;
                 if (!self.live) break :blk .allocate;
+                // Original nvkms-evo.c queries display caps on the allocated
+                // root before Core setup. Exact transport ACK precedes any
+                // publication; a failed query is never a zero-caps receipt.
+                if (self.system_caps == null) break :blk .system_caps;
                 self.state = .ready; return null;
             } else if (self.live) (if (!self.preserve) .preserve else .free) else {
                 if (self.namespace_live) { try self.exchange.session.rm_names.retireChildren(self.reservation); self.namespace_live = false; }
@@ -436,6 +442,7 @@ pub const Owner = struct {
                 else { self.unavailable = true; self.state = .unwinding; },
             .static_info => if (hardware.?.windows != 0) { self.hardware = hardware; } else { self.unavailable = true; self.state = .unwinding; },
             .allocate => self.live = true,
+            .system_caps => self.system_caps = reply.ok[4],
             .preserve => self.preserve = true,
             .free => { self.live = false; self.preserve = false; self.allocation_possible = false; },
             .instance => { self.instance_bound = true; self.state = .ready; },

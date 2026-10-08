@@ -141,7 +141,7 @@ pub const RecoveryLatency = struct {
     finished_ns: u64 = 0,
     elapsed_ns: u64 = 0,
 };
-const Scope = union(enum) { boot: void, request: u64 };
+const Scope = union(enum) { boot: void, request: u64, unsubmitted: u64 };
 pub const RecoveryOwner = struct {
     // Independent of the failed queue epoch: the actual attached device and
     // its unchanged reset/display owner must still match this retained run.
@@ -215,6 +215,15 @@ pub const Port = struct {
     boot1: u32 = 0,
     self_address: usize = 0,
     last_clock: u64 = 0,
+    submission: struct {
+        producer: Producer = .copy,
+        stage: enum { none, guard, admit, identity, recheck, publish, doorbell, flush, receipt, complete } = .none,
+        epoch: u64 = 0,
+        point: u32 = 0,
+        deadline: u64 = 0,
+        observed_ns: u64 = 0,
+        failure: ?anyerror = null,
+    } = .{},
     cleanup_needed: bool = false,
     ready: bool = false,
     effects_possible: bool = false,
@@ -543,8 +552,13 @@ pub const Port = struct {
                 if (self.phase == .boot and limit > self.run.deadline_ns) return error.Deadline;
                 break :blk limit;
             },
+            .unsubmitted => |limit| blk: {
+                if (self.phase != .runtime) return error.Phase;
+                break :blk limit;
+            },
         };
-        if (deadline == std.math.maxInt(u64) or now >= deadline) return error.Deadline;
+        if (deadline == std.math.maxInt(u64)) return error.Deadline;
+        if (now >= deadline) return if (scope == .unsubmitted) error.AdmissionExpired else error.Deadline;
     }
     fn mappingValid(self: *const Port) bool {
         if (self.ready and !std.meta.eql(self.window, self.window_stamp)) return false;
@@ -554,6 +568,7 @@ pub const Port = struct {
         if (self.failure == null and self.phase != .recovery) self.failure = err;
     }
     fn accessFor(self: *Port, scope: Scope, kind: Access, offset: u32) !void {
+        if (scope == .unsubmitted and kind == .write) return error.Phase;
         try self.guardFor(scope);
         if (!self.supports(kind, offset)) return error.Register;
         const owner = self.owner.?;
@@ -604,7 +619,7 @@ pub const Port = struct {
     }
     fn readFor(self: *Port, scope: Scope, offset: u32) !u32 {
         if (scope == .boot and self.phase != .boot) return error.Phase;
-        errdefer |err| self.recordFailure(err);
+        errdefer |err| if (scope != .unsubmitted or err != error.AdmissionExpired) { self.recordFailure(err); };
         try self.accessFor(scope, .read, offset);
         fence();
         const value = self.pointer(offset).*;
@@ -696,34 +711,86 @@ pub const Port = struct {
     /// Separate engine producer gates. Sequencers retain their existing register
     /// policy and cannot write this doorbell, USERD or a caller-selected token.
     pub fn submitCopy(self: *Port, fifo: *@import("gsp_fifo.zig").Owner, ticket: @import("gsp_push_ring.zig").Ticket, deadline: u64) !void {
-        return self.submitEngine(fifo, ticket, deadline, .copy);
+        return self.submitEngine(fifo, ticket, deadline, .copy, false);
+    }
+    pub fn submitQueuedUpload(self: *Port, fifo: *@import("gsp_fifo.zig").Owner, ticket: @import("gsp_push_ring.zig").Ticket, deadline: u64) !void {
+        return self.submitEngine(fifo, ticket, deadline, .copy, true);
     }
     pub fn submitGraphics(self: *Port, fifo: *@import("gsp_fifo.zig").Owner, ticket: @import("gsp_push_ring.zig").Ticket, deadline: u64) !void {
-        return self.submitEngine(fifo, ticket, deadline, .graphics);
+        return self.submitEngine(fifo, ticket, deadline, .graphics, false);
+    }
+    pub fn submitQueuedGraphics(self: *Port, fifo: *@import("gsp_fifo.zig").Owner, ticket: @import("gsp_push_ring.zig").Ticket, deadline: u64) !void {
+        return self.submitEngine(fifo, ticket, deadline, .graphics, true);
     }
     pub fn submitBatch(self: *Port, fifo: *@import("gsp_fifo.zig").Owner, ticket: @import("gsp_push_ring.zig").Ticket, deadline: u64) !void {
-        return self.submitEngine(fifo, ticket, deadline, .batch);
+        return self.submitEngine(fifo, ticket, deadline, .batch, false);
     }
     const Producer = enum { copy, graphics, batch };
-    fn submitEngine(self: *Port, fifo: *@import("gsp_fifo.zig").Owner, ticket: @import("gsp_push_ring.zig").Ticket, deadline: u64, producer: Producer) !void {
+    fn submitEngine(self: *Port, fifo: *@import("gsp_fifo.zig").Owner, ticket: @import("gsp_push_ring.zig").Ticket, deadline: u64, producer: Producer, unsubmitted: bool) !void {
         const offset = @import("gsp_copy_wire.zig").notify;
-        const scope: Scope = .{ .request = deadline };
-        errdefer |err| self.recordFailure(err);
+        const scope: Scope = if (unsubmitted) .{ .unsubmitted = deadline } else .{ .request = deadline };
+        if (self.failure == null) self.submission = .{ .producer = producer, .stage = .guard,
+            .epoch = ticket.epoch, .point = ticket.point, .deadline = deadline };
+        errdefer |err| {
+            if (self.submission.failure == null) {
+                self.submission.failure = err;
+                self.submission.observed_ns = self.last_clock;
+            }
+            if (err != error.AdmissionExpired or !unsubmitted or !fifo.ring.matches(ticket)) self.recordFailure(err);
+        }
         try self.guardFor(scope);
         if (self.phase != .runtime or !self.retained or !self.supports(.write, offset)) return error.Phase;
         const owner = self.owner.?;
         const admit_engine = (switch (producer) { .copy => owner.admit_copy, .graphics => owner.admit_graphics, .batch => owner.admit_batch }) orelse return error.Unsupported;
         if (switch (producer) { .copy => fifo.config.engine != .copy, .graphics => fifo.config.engine != .graphics,
             .batch => fifo.config.engine == .none }) return error.Binding;
+        self.submission.stage = .admit;
         try admit_engine(owner.context, self, fifo, ticket, deadline);
+        self.submission.stage = .identity;
         if (try self.readFor(scope, 0) != self.boot0) return error.IdentityChanged;
+        self.submission.stage = .recheck;
         try admit_engine(owner.context, self, fifo, ticket, deadline);
+        self.submission.stage = .publish;
         try fifo.ring.publish(ticket);
         // USERD is now reachable even if the subsequent MMIO/identity check
         // fails. The pending ticket and all job resources stay retained.
+        self.submission.stage = .doorbell;
         self.pointer(offset).* = ticket.token; fence();
-        if (try self.readFor(scope, 0) != self.boot0) return error.IdentityChanged;
+        self.submission.stage = .flush;
+        if (try self.readFor(.{ .request = deadline }, 0) != self.boot0) return error.IdentityChanged;
+        self.submission.stage = .receipt;
         try fifo.ring.notified(ticket);
+        self.submission.stage = .complete;
+        self.submission.observed_ns = self.last_clock;
+    }
+    /// First cursor activation: bounded read-only state under the same exact
+    /// Core admission as its command. No arbitrary register access is exposed.
+    pub fn readCursorHeadState(self: *Port, channel: *@import("gsp_display_channel.zig").Owner,
+        wanted: @import("gsp_cursor_image.zig").Control, deadline: u64) !?[8]u32
+    {
+        const scope: Scope = .{ .request = deadline };
+        errdefer |err| self.recordFailure(err);
+        try wanted.validate();
+        if (self.phase != .runtime or !self.retained or channel.config.kind != .core) return error.State;
+        const binding = self.owner orelse return error.State;
+        const admit_image = binding.admit_display_push orelse return error.State;
+        const base = @import("boot_scanout.zig").armed_base + wanted.head * 0x400;
+        const methods = [_]u32{ 0x2030, 0x2088, 0x208c, 0x2090, 0x2094, 0x2098, 0x209c, 0x20a0 };
+        for (methods) |method| if (!self.supports(.read, base + method)) return error.Register;
+        try self.guardFor(scope); try admit_image(binding.context, self, channel, deadline, .read);
+        if (try self.readFor(scope, 0) != self.boot0) return error.IdentityChanged;
+        var first: [methods.len]u32 = undefined;
+        for (0..2) |pass| for (methods, 0..) |method, i| {
+            try self.guardFor(scope); try admit_image(binding.context, self, channel, deadline, .read);
+            fence(); const observed = self.pointer(base + method).*; fence();
+            // Before activation these are opaque retained fields, including
+            // unbound cursor descriptors. Their full-width value is not a
+            // completion receipt. BOOT0 and exact admission bracket the read.
+            if (pass == 0) first[i] = observed else if (observed != first[i]) return null;
+        };
+        try self.guardFor(scope); try admit_image(binding.context, self, channel, deadline, .read);
+        if (try self.readFor(scope, 0) != self.boot0) return error.IdentityChanged;
+        return first;
     }
     pub fn readCursorImageArmed(self: *Port, channel: *@import("gsp_display_channel.zig").Owner,
         wanted: @import("gsp_cursor_image.zig").Control, deadline: u64) !bool
@@ -736,7 +803,7 @@ pub const Port = struct {
         const admit_image = binding.admit_display_push orelse return error.State;
         const base = @import("boot_scanout.zig").armed_base + wanted.head * 0x400;
         const methods = [_]u32{ 0x2088, 0x208c, 0x2090, 0x2094, 0x2098, 0x209c, 0x20a0 };
-        const expected = [_]u32{ wanted.dma, 0, @intCast(wanted.offset >> 8), 0, 0, try wanted.word(), 0x75ff };
+        const expected = [_]u32{ wanted.dma, wanted.dma, @intCast(wanted.offset >> 8), @intCast(wanted.offset >> 8), 0, try wanted.word(), 0x75ff };
         const count: usize = if (wanted.visible) methods.len else methods.len - 1;
         for (methods[0..count]) |method| if (!self.supports(.read, base + method)) return error.Register;
         try self.guardFor(scope); try admit_image(binding.context, self, channel, deadline, .read);
@@ -790,10 +857,13 @@ pub const Port = struct {
         const base = scan.window_armed_base + previous.window * 0x1000;
         const addresses = [_]u32{ scan.armed_base + 0x300 + previous.signal.sor * 0x20,
             scan.armed_base + 0x1000 + previous.window * 0x80,
+            scan.armed_base + 0x2240 + previous.head * 0x400,
             scan.armed_base + 0x2288 + previous.head * 0x400,
             base + 0x240, base + 0x244, base + 0x248, base + 0x24c, base + 0x250, base + 0x254,
             scan.armed_base + 0x22d4 + previous.head * 0x400, scan.armed_base + 0x22d8 + previous.head * 0x400 };
-        const expected = [_]u32{ shared_sor orelse 0, 15, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+        // The stopped Window remains assigned to its exact acknowledged
+        // head. OCSC0 and all image DMA still need independent NULL proof.
+        const expected = [_]u32{ shared_sor orelse 0, previous.head, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
         const count: usize = if (previous.signal.dp_dsc != null or previous.signal.hdmi_dsc != null) addresses.len else addresses.len - 2;
         const scope: Scope = .{ .request = deadline };
         errdefer |err| self.recordFailure(err);
@@ -836,20 +906,19 @@ pub const Port = struct {
         const scope: Scope = .{ .request = deadline };
         errdefer |err| if (err != error.Busy) self.recordFailure(err);
         try self.guardFor(scope);
-        if (self.phase != .runtime or !self.retained or channel.config.kind != .cursor or channel.point.pending == null or channel.point.pending.?.published) return error.Phase;
+        if (self.phase != .runtime or !self.retained or channel.config.kind != .cursor or channel.point.pending == null or
+            channel.point.pending.?.next_method >= pio.methods.len) return error.Phase;
         const endpoint = self.owner.?; const admit_push = endpoint.admit_display_push orelse return error.Unsupported;
         try admit_push(endpoint.context, self, channel, deadline, .publish);
         const base = try pio.base(channel.config.index);
         for (pio.methods) |method| if (!self.supports(.write, base + method)) return error.Register;
         const available = (try self.readCursorPoint(channel, deadline)) orelse return error.Busy;
-        if (!try pio.idle(available)) return error.Busy;
+        if (!try pio.writable(available)) return error.Busy;
         try admit_push(endpoint.context, self, channel, deadline, .publish);
-        try channel.point.publish(deadline);
+        const index = try channel.point.issueMethod(deadline);
         const point = channel.point.pending.?.point;
-        for (pio.methods, 0..) |method, i| {
-            try self.guardFor(scope); try admit_push(endpoint.context, self, channel, deadline, .publish);
-            self.pointer(base + method).* = pio.value(point, i); fence();
-        }
+        try self.guardFor(scope); try admit_push(endpoint.context, self, channel, deadline, .publish);
+        self.pointer(base + pio.methods[index]).* = pio.value(point, index); fence();
         if (try self.readFor(scope, 0) != self.boot0) return error.IdentityChanged;
     }
     pub fn readDisplayCursor(self: *Port, channel: *@import("gsp_display_channel.zig").Owner, deadline: u64) !?struct { put: u16, get: u16 } {
@@ -893,6 +962,38 @@ pub const Port = struct {
         try channel.ring.publish(ticket, config);
         self.pointer(base).* = @as(u32, ticket.put) << 2; fence();
         if (try self.readFor(scope, 0) != self.boot0) return error.IdentityChanged;
+    }
+    /// Bounded read-only GA106 Core status. Only the exact live published
+    /// ownership frame can pass Device's admission on every observation.
+    /// These documented registers have no read-to-clear side effects.
+    pub fn readPendingDisplayOwner(self: *Port, channel: *@import("gsp_display_channel.zig").Owner,
+        deadline: u64) !?[4]u32
+    {
+        const wire = @import("gsp_display_channel_wire.zig");
+        const scope: Scope = .{ .request = deadline };
+        errdefer |err| self.recordFailure(err);
+        try self.guardFor(scope);
+        if (self.phase != .runtime or !self.retained or channel.config.kind != .core or channel.config.index != 0 or
+            !channel.ring.published or channel.ring.pending == null or channel.ring.pending.?.kind != .frame)
+            return error.Phase;
+        const endpoint = self.owner.?;
+        const admit_push = endpoint.admit_display_push orelse return error.Unsupported;
+        try admit_push(endpoint.context,self,channel,deadline,.read);
+        // OpenGpuDoc GA102 dev_display_withoffset: FE_CHNCTL_CORE,
+        // FE_CHNSTATUS_CORE, FE_SUPERVISOR_MAIN and FE_RM_INTR_DISPATCH.
+        const offsets = [_]u32{try wire.controlRegister(.core,0),try wire.statusRegister(.core,0),
+            0x6107a8,0x611ec0};
+        for (offsets) |offset| if (!self.supports(.read,offset)) return error.Register;
+        if (try self.readFor(scope,0) != self.boot0) return error.IdentityChanged;
+        var samples: [2][4]u32 = undefined;
+        for (&samples) |*sample| for (offsets,0..) |offset,i| {
+            try self.guardFor(scope); try admit_push(endpoint.context,self,channel,deadline,.read);
+            fence(); sample[i] = self.pointer(offset).*; fence();
+        };
+        if (try self.readFor(scope,0) != self.boot0) return error.IdentityChanged;
+        try admit_push(endpoint.context,self,channel,deadline,.read);
+        if (!std.meta.eql(samples[0],samples[1])) return null;
+        return samples[1];
     }
     /// Exact display-channel owner, read-only GA106 retirement registers.
     /// No generic sequencer permission or caller-selected MMIO is introduced.

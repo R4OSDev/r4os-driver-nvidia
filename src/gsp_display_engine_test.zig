@@ -5,7 +5,9 @@ const wire = @import("gsp_display_engine_wire.zig");
 const message = @import("gsp_message.zig");
 pub const golden = @embedFile("fixtures/display-engine-570.144.bin");
 pub const ops = [_]wire.Operation{ .classes, .static_info, .allocate, .preserve, .free };
+const system_caps_golden = @embedFile("fixtures/display-system-caps-570.144.bin");
 pub fn response(op: wire.Operation) []const u8 {
+    if (op == .system_caps) return system_caps_golden[32..64];
     var offset: usize = 0;
     for (ops) |item| { const bytes = wire.length(item); if (op == item) return golden[offset + bytes..][0..bytes]; offset += bytes * 2; }
     unreachable;
@@ -44,6 +46,23 @@ pub fn check() !void {
         offset += data.len * 2;
     }
     try t.expectEqual(@as(usize, 1136), offset);
+    // All five original root vectors above remain exact. The additional
+    // read-only caps exchange has its own independently evaluated C layout.
+    const caps_request = try wire.encode(binding, .system_caps, &request);
+    try t.expectEqualSlices(u8, system_caps_golden[0..32], caps_request);
+    @memcpy(bytes[0..32], response(.system_caps));
+    var caps_record: message.Record = .{ .shape = .{ .message_bytes = 112, .checksum_bytes = 112, .storage_bytes = 4096, .elements = 1 },
+        .queue_sequence = 0, .rpc = .{ .function = wire.function(.system_caps), .result = 0 }, .payload = bytes[0..32] };
+    const caps_reply = try wire.decode(binding, .system_caps, caps_request, caps_record);
+    try t.expect(caps_reply == .ok and caps_reply.ok[4] == 0x30);
+    bytes[24] = 1; try t.expectError(error.Payload, wire.decode(binding, .system_caps, caps_request, caps_record));
+    @memcpy(bytes[0..32], response(.system_caps)); bytes[29] = 1;
+    try t.expectError(error.Payload, wire.decode(binding, .system_caps, caps_request, caps_record));
+    @memcpy(bytes[0..32], response(.system_caps)); caps_record.payload = bytes[0..31];
+    try t.expectError(error.Payload, wire.decode(binding, .system_caps, caps_request, caps_record));
+    std.mem.writeInt(u32, bytes[12..16], 0x57, .little); caps_record.payload = bytes[0..24];
+    const caps_rejected = try wire.decode(binding, .system_caps, caps_request, caps_record);
+    try t.expect(caps_rejected == .rejected and caps_rejected.rejected == 0x57);
     var forged = binding; forged.internal_client = binding.client;
     try t.expectError(error.Handle, wire.encode(forged, .static_info, &request));
     try checkModeControl();

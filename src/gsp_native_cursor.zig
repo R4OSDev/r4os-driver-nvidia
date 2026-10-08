@@ -25,6 +25,25 @@ pub const Owner = struct {
     failure: ?anyerror = null,
 
     pub fn busy(self: *const Owner) bool { return self.job != null; }
+    pub fn beforePause(self: *Owner, product: anytype) !bool {
+        if (!self.configured) return true;
+        const run = product.running.?;
+        if (run.display_paused) return error.State;
+        self.disabled = true;
+        const info = self.capabilities(product);
+        const result = product.display.?.cursorConfigure(&info);
+        if (result == a.gfx_output_ok) {
+            if (self.job != null or run.cursor_upload != null or run.cursor_point != null or
+                (run.cursor_storage != null and run.cursor_storage.?.active != null)) return error.Completion;
+            self.phase = .unavailable; self.configured = false;
+            return true;
+        }
+        if (result != a.gfx_output_error_busy) return error.CursorApi;
+        // Keep the head and IRQ active until the ordinary RELEASE path
+        // completes Core/ARM and returns its exact common job/source alias.
+        _ = try self.step(product);
+        return false;
+    }
     pub fn pause(self: *Owner, product: anytype) !bool {
         if (!product.running.?.display_paused) return error.State;
         product.running.?.cursor_reserving = false;
@@ -54,7 +73,14 @@ pub const Owner = struct {
                 job.request.display_generation != product.receipt.generation or job.request.head_id != product.mode.?.head) return error.CursorApi;
             self.job = job;
         }
-        self.reply(product, false, a.gfx_output_error_unavailable);
+        const retired = run.display_retired[product.mode.?.window];
+        const operation = self.job.?.request.operation;
+        const hidden = retired != null and retired.?.epoch == run.epoch and retired.?.image.head == product.mode.?.head and
+            retired.?.core_point != 0 and retired.?.window_point != 0 and
+            (operation == a.display_cursor_operation_hide or operation == a.display_cursor_operation_release);
+        // Receiver loss can close this actor only after its exact physical
+        // NULL/Core/old-FINISHED/ARM retirement, never from paused metadata.
+        self.reply(product, hidden, if (hidden) 0 else a.gfx_output_error_unavailable);
         _ = try self.advance(product);
         return false;
     }
@@ -65,8 +91,18 @@ pub const Owner = struct {
     fn exclusive(self: *const Owner) bool {
         const job = self.job orelse return false;
         if (self.phase == .reply or self.phase == .failed) return false;
-        return job.request.operation == a.display_cursor_operation_prepare or job.request.operation == a.display_cursor_operation_hide or
-            job.request.operation == a.display_cursor_operation_release or self.phase == .commit or self.phase == .commit_wait;
+        // A SHOW, HIDE or RELEASE can reach commit while canonical GR work
+        // is already retained. Core admission waits for that work; reserving
+        // its GPU admission would prevent the completion we are waiting on.
+        // Once Core is submitted, retain exclusivity through its real receipt.
+        // Channel creation, allocation and image upload also wait for an
+        // already retained GR job before their first physical operation.
+        // Reserve admission only after starting that exact sub-operation.
+        const preparing = job.request.operation == a.display_cursor_operation_prepare and
+            self.phase != .channel and self.phase != .allocate and self.phase != .upload;
+        return preparing or self.phase == .commit_wait or
+            ((job.request.operation == a.display_cursor_operation_hide or job.request.operation == a.display_cursor_operation_release) and
+                self.phase != .commit);
     }
     pub fn step(self: *Owner, product: anytype) !bool {
         if (self.phase == .unavailable or self.phase == .failed) return false;
@@ -76,6 +112,7 @@ pub const Owner = struct {
         defer run.cursor_reserving = self.exclusive();
         return self.advance(product) catch |err| {
             if (err == error.Busy) return false;
+            self.logFailure(product, err);
             // Before publication, optional cursor failures preserve the
             // display. Never release or relabel any unconfirmed GPU use.
             if (self.job != null and self.phase != .reply and run.failure == null and run.cursor_upload == null and
@@ -87,6 +124,30 @@ pub const Owner = struct {
                 return true;
             }
             self.quarantine(product, err); return err;
+        };
+    }
+    noinline fn logFailure(self: *const Owner, product: anytype, err: anyerror) void {
+        const job = self.job orelse return;
+        const run = product.running.?;
+        var bytes: [320]u8 = undefined;
+        const failure = std.fmt.bufPrintZ(&bytes,
+            "NVIDIA cursor-failure: phase={s} error={s} job={d} op={d} now={d} deadline={d} barrier={d}/{d}",
+            .{ @tagName(self.phase), @errorName(err), job.sequence, job.request.operation, product.last_clock,
+                job.deadline_ns, job.barrier_timeline, job.barrier_point }) catch return;
+        product.ctx.?.logInfo(failure.ptr);
+        const blockers = std.fmt.bufPrintZ(&bytes,
+            "NVIDIA cursor-blockers: render={s} frame={} GR={} upload={} copy={} mode={} display={} flips={} RM={s} sequencer={}",
+            .{ if (run.queued_render) |queued| @tagName(queued.phase) else "none", run.frame_ready != null,
+                run.graphics_work != null, run.graphics_upload != null, run.copy_job != null, run.mode_control_active,
+                run.display_work != null, run.hasDisplayFlips(), if (run.channel) |channel| @tagName(channel.phase) else "none",
+                run.sequence.self_address != 0 }) catch return;
+        product.ctx.?.logInfo(blockers.ptr);
+        if (job.request.head_id < run.flip_receipts.len) if (run.flip_receipts[job.request.head_id]) |seen| {
+            const fence = std.fmt.bufPrintZ(&bytes,
+                "NVIDIA cursor-fence: epoch={d} head={d} receipt-epoch={d} source={d}/{d} begun-ns={d}",
+                .{ run.epoch, job.request.head_id, seen.epoch, seen.source_timeline, seen.source_point,
+                    seen.begun_observed_ns }) catch return;
+            product.ctx.?.logInfo(fence.ptr);
         };
     }
     fn capabilities(self: *const Owner, product: anytype) a.DisplayCursorInfo {
@@ -135,7 +196,9 @@ pub const Owner = struct {
                     if (self.disabled) { self.reply(product, false, a.gfx_output_error_unsupported); return true; }
                     if (run.cursor_storage != null and run.cursor_storage.?.active != null) return error.State;
                     self.plan = try image.make(request.width, request.height, request.hotspot_x, request.hotspot_y, request.pitch, request.byte_length);
-                    self.phase = if (run.cursor_storage == null) .allocate else if (self.channel == null) .channel else .upload;
+                    // RM establishes the PIO channel before publishing the
+                    // private cursor DMA in the shared display instance.
+                    self.phase = if (self.channel == null) .channel else if (run.cursor_storage == null) .allocate else .upload;
                 } else if (request.operation == a.display_cursor_operation_show or request.operation == a.display_cursor_operation_move) {
                     if (self.image_slot == null or self.channel == null or request.image_sequence != self.image_sequence or self.image_sequence == 0) return error.Stale;
                     self.phase = if (request.operation == a.display_cursor_operation_show) .barrier else .point;
@@ -144,7 +207,7 @@ pub const Owner = struct {
             },
             .allocate => {
                 if (!run.cursorWorkAvailable()) return false;
-                self.allocation = try run.allocateNativeStorage(2 * image.max_bytes, self.job.?.deadline_ns);
+                self.allocation = try run.allocateCursorStorage(self.job.?.deadline_ns);
                 self.phase = .allocation_wait;
             },
             .allocation_wait => {
@@ -169,7 +232,8 @@ pub const Owner = struct {
                 const table = try run.displayTableStatus(product.engine.?);
                 if (table.uploading) return false;
                 if (table.revision != table.published_revision) return error.Completion;
-                self.phase = if (self.channel == null) .channel else .upload;
+                if (self.channel == null) return error.State;
+                self.phase = .upload;
             },
             .channel => {
                 self.channel = try run.createDisplayChannel(product.engine.?, .cursor, product.mode.?.head, self.job.?.deadline_ns);
@@ -179,7 +243,7 @@ pub const Owner = struct {
                 const result = try run.displayChannelStatus(self.channel.?);
                 if (run.display_channel_active != null) return false;
                 if (result.info == null) { self.disabled = true; return error.Unsupported; }
-                self.phase = .upload;
+                self.phase = if (run.cursor_storage == null) .allocate else .upload;
             },
             .upload => {
                 try run.uploadCursorImage(product.copy.?, self.job.?.request.reference, self.plan.?, self.next_slot, self.job.?.deadline_ns);

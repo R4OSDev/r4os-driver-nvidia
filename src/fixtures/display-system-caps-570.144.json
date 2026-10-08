@@ -1,0 +1,72 @@
+{
+  "utc": "2026-10-07T05:07:25.677311+00:00",
+  "source": "NVIDIA570.144",
+  "command": "NV5070_CTRL_CMD_SYSTEM_GET_CAPS_V2",
+  "source_owner": "display root",
+  "wire_size": 8,
+  "caps_offset": 4,
+  "physical_forwarding": "Generated method flags0x48; ROUTE_TO_PHYSICAL0x40; rmresControl_Prologue NV_RM_RPC_CONTROL preserves hClient/hObject.",
+  "scope": "Complete independently C-evaluated32B request and32B reply. Modeled caps30 are not OssiPC data. No cursor/physical pass.",
+  "files": [
+    {
+      "file": "Compile.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "file": "DisplayCaps",
+      "bytes": 16216,
+      "sha256": "7e657d03c6114f224ba6ec6f6f827be1ed4968b09758ef7355a2675d1f39da9c"
+    },
+    {
+      "file": "DisplayCaps.c",
+      "bytes": 1616,
+      "sha256": "d0a3303fa3f0384ac216603967b34ad0f2f6caaaa973860269aa1818ecd1d4c4"
+    },
+    {
+      "file": "Original/src/common/sdk/nvidia/inc/ctrl/ctrl5070/ctrl5070base.h",
+      "bytes": 2364,
+      "sha256": "6121030e75e63e1ceff1ff33bf318444008722fd50c3ffa0cbc762528ae7b94e"
+    },
+    {
+      "file": "Original/src/common/sdk/nvidia/inc/ctrl/ctrl5070/ctrl5070system.h",
+      "bytes": 3686,
+      "sha256": "63270dbc293f31c0aa53845b8aa1fec9ba00fde6a54f631c76b2453de43f4c7d"
+    },
+    {
+      "file": "Original/src/nvidia/generated/g_disp_objs_nvoc.c",
+      "bytes": 380996,
+      "sha256": "412596538ef236e456cc0eb12ac2bbf53cdc442d6949f371143be4eafdbd0f8c"
+    },
+    {
+      "file": "Original/src/nvidia/inc/kernel/rmapi/control.h",
+      "bytes": 16037,
+      "sha256": "270a59d28493e98bcbb45ee3a7d850d140da19c0928f63cc2bfa317bea746998"
+    },
+    {
+      "file": "Original/src/nvidia/src/kernel/rmapi/control.c",
+      "bytes": 38765,
+      "sha256": "095c7db63152094ce103e1a31351490e87e7c84d6ed1f83142542dbcd1f3e59f"
+    },
+    {
+      "file": "Original/src/nvidia/src/kernel/rmapi/resource.c",
+      "bytes": 9934,
+      "sha256": "3064cbe774d932433cc22ec34a193344375df7a2661315ae3b96ac32e0ec078b"
+    },
+    {
+      "file": "Original/src/nvidia-modeset/src/nvkms-cursor.c",
+      "bytes": 15280,
+      "sha256": "88c8b40fb540be07f7a06ec4763029ef4d8b36c590c4854ffd7bc8529ca581ea"
+    },
+    {
+      "file": "Original/src/nvidia-modeset/src/nvkms-evo.c",
+      "bytes": 350346,
+      "sha256": "cab100c1c75141693aa9ed5777ca0f53f335e7b7dc1b7492ba23f51fc8d1a25e"
+    },
+    {
+      "file": "display-system-caps-570.144.bin",
+      "bytes": 64,
+      "sha256": "51e993e2e977fbeca81422378b70ef0ee5b6b7a214b3c670aa67e783596d7285"
+    }
+  ]
+}

@@ -71,6 +71,8 @@ pub const Plan = struct {
     hdmi_dsc_sink: @import("gsp_dsc.zig").links.HdmiDsc = .{},
     hdmi_dsc_only: bool = false,
     cursor_size: u16 = 0,
+    // Private identity format conversion needs real IMP fetch bandwidth.
+    native_lut: bool = false,
     color: ?@import("gsp_color_signal.zig").color.Signal = null,
     color_pipeline: @import("gsp_color_signal.zig").color.Pipeline = .{
         .linear_composition = false, .output_transform = false, .opaque_output = false },
@@ -122,7 +124,13 @@ pub fn capture(raw: *const scanout.Raw, boot: *const a.GfxNativeBootInfo, window
     const protocol = scanout.protocol(raw.sors[sor]);
     if (protocol != .tmds_a and protocol != .tmds_b and protocol != .dp_a and protocol != .dp_b) return error.Unsupported;
     if ((protocol == .dp_a or protocol == .dp_b) and timing.hdmi_enabled) return error.Unsupported;
-    if (source.get(.control) != 0 or source.get(.clock_config) & ~@as(u32, 1) != 0 or
+    // C67D enables slave/master synchronization through LOCK_MODE, not
+    // LOCK_PIN. OssiPC's firmware leaves INTERNAL_SCAN_LOCK_0 in the slave
+    // selector (0x180) with both modes NO_LOCK. The driver-owned progressive
+    // signal clears those unused selectors; all active/unknown control bits
+    // still reject adoption, including frame/raster locks and YUV packing.
+    const inactive_lock_pins: u32 = 0x001f01f0;
+    if (source.get(.control) & ~inactive_lock_pins != 0 or source.get(.clock_config) & ~@as(u32, 1) != 0 or
         timing.depth_code != 4 or source.get(.output) & 0x01000000 != 0 or
         raw.sors[sor] & ~@as(u32, 0x10fff) != 0 or
         source.color.get(.point_in) != 0 or source.color.get(.point_out_adjust) != 0 or

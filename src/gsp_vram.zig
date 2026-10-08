@@ -91,13 +91,26 @@ pub const Owner = struct {
         try plan.validate(adapter, space);
         if (policy) |value| {
             switch (value.role) {
-                .control => if (plan.request != null) return error.Descriptor,
+                .control, .cursor, .lut => {
+                    if (plan.request != null) return error.Descriptor;
+                    if (value.role == .cursor and (plan.descriptor.byte_length != 2 * @import("gsp_cursor_image.zig").max_bytes or
+                        plan.privileged or plan.readonly)) return error.Descriptor;
+                    if (value.role == .lut and (plan.descriptor.byte_length != @import("gsp_display_identity_lut.zig").allocation_bytes or
+                        plan.privileged or plan.readonly)) return error.Descriptor;
+                },
                 .scanout => {
                     _ = try @import("gsp_display_image.zig").create(plan, 1, 1);
                     if (plan.descriptor.usage & a.gfx_buffer_usage_transfer_target == 0) return error.Descriptor;
                 },
             }
             try value.validate(space, plan.allocation_bytes);
+            if (value.needsIso() and space.host != null) {
+                // RM's cleared-allocation guarantee covers its own heap,
+                // not a freshly reserved span in the host framebuffer heap.
+                const target = value.clear orelse return error.Unsupported;
+                if (target.epoch != space.epoch) return error.Stale;
+                try clear.validate(target);
+            }
         }
         const children = if (resident) |node| try token.session.rm_names.reserveResidentChildren(parent, 2, node)
             else try token.session.rm_names.reserveChildren(parent, 2);
@@ -272,7 +285,9 @@ pub const Owner = struct {
                 return null;
             };
             const encoded = try wire.encodeLayout(self.binding, self.bytes, .{ .blocklinear = self.layout.blocklinear(), .scanout = self.layout.scanout(),
-                .contiguous = self.storage_policy != null or self.binding.space.host != null, .granule = self.layout.descriptor.alignment,
+                .contiguous = self.storage_policy != null or self.binding.space.host != null,
+                .cursor = if (self.storage_policy) |policy| policy.role == .cursor else false,
+                .lut = if (self.storage_policy) |policy| policy.role == .lut else false, .granule = self.layout.descriptor.alignment,
                 .privileged = self.layout.privileged, .readonly = self.layout.readonly }, op, self.address, &self.request);
             try self.exchange.begin(encoded.function, encoded.bytes, self.deadline);
             self.operation = op; self.request_bytes = encoded.bytes.len;
@@ -313,6 +328,9 @@ pub const Owner = struct {
         return null;
     }
     fn advanceClear(self: *Owner) Error!?exchange.Dispatch {
+        if (self.user_memory != null and (!hostValid(self, self.binding.space.epoch) or
+            !std.meta.eql(self.physical_extent, @as(?storage.Physical, .{ .base = self.user_range.span.base,
+                .bytes = self.user_range.span.bytes })))) return error.Stale;
         const dispatch = (try self.exchange.poll(self.deadline)) orelse return null;
         if (!dispatch.response) return dispatch;
         const target = self.storage_policy.?.clear.?;
@@ -327,23 +345,29 @@ pub const Owner = struct {
     }
     fn advanceUserPhysical(self: *Owner, op: wire.Operation) Error!void {
         const user = self.user_memory orelse return error.State;
-        if (self.binding.space.host == null or self.storage_policy != null or self.mapped or self.virtual or self.host_active or
+        if (self.binding.space.host == null or (if (self.storage_policy) |policy| !policy.needsIso() else false) or
+            self.mapped or self.virtual or self.host_active or
             !self.aliases.empty()) return error.State;
         switch (op) {
             .allocate_memory => {
-                const base = user.heap.reserve(user.view, self.binding.space.epoch, &self.user_range, self.bytes, self.layout.descriptor.alignment) catch |err| {
+                const allocation = if (self.storage_policy != null)
+                    user.heap.reserveNonzero(user.view, self.binding.space.epoch, &self.user_range, self.bytes, self.layout.descriptor.alignment)
+                else user.heap.reserve(user.view, self.binding.space.epoch, &self.user_range, self.bytes, self.layout.descriptor.alignment);
+                const base = allocation catch |err| {
                     if (err != error.Memory) return err;
                     self.host_rejected = a.gfx_buffer_error_oom;
                     self.state = .unwinding;
                     return;
                 };
-                self.host_physical = base; self.physical = true; self.cleared = true;
+                self.host_physical = base; self.physical = true;
+                self.cleared = self.storage_policy == null;
+                if (self.storage_policy != null) self.physical_extent = .{ .base = base, .bytes = self.bytes };
             },
             .free_memory => {
                 // The exact common release ticket excludes users; host VA
                 // teardown above already acknowledged every PTE/TLB removal.
                 try user.heap.release(&self.user_range, true);
-                self.host_physical = null; self.physical = false; self.cleared = false;
+                self.host_physical = null; self.physical_extent = null; self.physical = false; self.cleared = false;
             },
             else => return error.State,
         }

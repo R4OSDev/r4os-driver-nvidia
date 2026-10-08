@@ -47,6 +47,10 @@ pub const Owner = struct {
     }
     pub fn beforeInitial(self: *Owner, product: anytype) !bool {
         if (self.catalog == null or !product.mode.?.hasAudio() or self.settled or self.phase == .failed) return true;
+        // A fresh epoch has no active RM head yet. Its route remains absent
+        // until the video transaction completes; step() then configures the
+        // exact current ELD and PCM route. Do not mute an unattached displayId.
+        if (try product.running.?.displayImageStatus(product.engine.?, product.mode.?.window) == null) return true;
         _ = try self.drive(product, product.mode.?, false);
         return !self.busy();
     }

@@ -121,11 +121,15 @@ const a = r4os.abi;
 const caps = @import("gsp_memory_caps.zig");
 const vaspace = @import("gsp_vaspace.zig");
 pub const Error = error{ Stale, Bounds, Unsupported, Descriptor, Memory, Busy, Retained };
+pub const Role = enum { control, scanout, cursor, lut };
 pub const Policy = struct {
     capabilities: caps.Info,
     physical_bytes: u64,
-    role: enum { control, scanout } = .control,
+    role: Role = .control,
     clear: ?@import("gsp_memory_clear.zig").Binding = null,
+    // Cursor pixels are consumed by the ISO display engine just like
+    // head images. Private ownership does not make them RM control storage.
+    pub fn needsIso(self: Policy) bool { return self.role != .control; }
     pub fn validate(self: Policy, space: vaspace.Info, bytes: u64) Error!void {
         const binding = self.capabilities.binding;
         if (binding.epoch != space.epoch or binding.client != space.client or binding.device != space.device) return error.Stale;

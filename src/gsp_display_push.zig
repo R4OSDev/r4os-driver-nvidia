@@ -176,6 +176,19 @@ pub const Ring = struct {
         for (expected.words[0..expected.count], 0..) |value, i| if (self.word(ticket.start + i).* != value) return false;
         return true;
     }
+    /// Exact submitted frame proof for observation only. Unlike matches(),
+    /// this grants no further publication or completion.
+    pub fn matchesPublished(self: *const Ring, ticket: Ticket, config: commands.Config) bool {
+        if (!self.valid() or !self.published or self.pending == null or ticket.kind != .frame or
+            !std.meta.eql(self.pending.?, ticket) or self.issued != ticket.point or self.put != ticket.put or
+            config.initialize == self.initialized or config.kind != self.binding.?.kind) return false;
+        const expected = commands.encode(config) catch return false;
+        if (self.program == null or !commands.same(self.program.?, expected) or
+            ticket.start >= 1023 or @as(usize,ticket.start) + expected.count != ticket.put or ticket.put >= 1023) return false;
+        notifier.fence();
+        for (expected.words[0..expected.count], 0..) |value, i| if (self.word(ticket.start + i).* != value) return false;
+        return true;
+    }
     pub fn publish(self: *Ring, ticket: Ticket, config: commands.Config) Error!void {
         if (!self.matches(ticket, config)) return error.Stale;
         // Publish ownership before a possibly partial MMIO callback.

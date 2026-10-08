@@ -47,7 +47,12 @@ pub const Owner = struct {
         const context = ctx.graphicsOutputs() orelse return error.Api;
         if (!context.supportsReceivers()) return error.Api;
         self.last_status = context.registerSource(adapter, &self.binding);
-        if (self.last_status != a.gfx_output_ok) return error.Catalog;
+        if (self.last_status != a.gfx_output_ok) {
+            @import("gsp_mode_diagnostics.zig").write(ctx,
+                "NVIDIA gsp-catalog: register rejected adapter={d} status={d} generation={d}",
+                .{adapter,self.last_status,self.binding.generation});
+            return error.Catalog;
+        }
         self.context = context;
     }
     fn replace(self: *Owner, count: u32) !void {

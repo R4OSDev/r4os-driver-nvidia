@@ -1,6 +1,8 @@
 // NVIDIA570.144/src/nvidia-modeset/src/nvkms-evo.c
+// NVIDIA570.144/src/nvidia-modeset/src/nvkms-evo3.c (SetCursorSurfaceAddress)
 // /*
 //  * SPDX-FileCopyrightText: Copyright (c) 2014 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//  * SPDX-FileCopyrightText: Copyright (c) 2010-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //  * SPDX-License-Identifier: MIT
 //  *
 //  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -280,8 +282,13 @@ pub const Config = struct {
     position: ?Point = null,
     with_position: bool = false,
     with_core: bool = true,
+    // Nouveau disp.c commits WINDOW_SET_CONTROL without Window interlocks
+    // before the first image transaction. Changing the owner in the latter
+    // transaction trips the hardware UPDATE state checks.
+    ownership_only: bool = false,
     cursor_usage: u16 = 0,
     cursor_image: ?cursor_image.Control = null,
+    identity_lut: ?@import("gsp_display_identity_lut.zig").Controls = null,
     // Explicit retirement of this route. No image/timing/cursor activation
     // may be mixed with the NULL ISO and SOR owner-mask transaction.
     detach_sor: ?u32 = null,
@@ -292,9 +299,19 @@ pub const Config = struct {
     refresh_control: ?RefreshControl = null,
     clear_dsc: bool = false,
 };
-pub const max_words: usize = 192;
+pub const max_words: usize = 256;
 pub fn validateSharedSor(config: Config) Error!void {
-    if (config.preserve_windows != 0 and (config.kind != .core or config.initialize or config.signal == null or config.route == null or
+    if (config.identity_lut) |lut| {
+        try lut.validate();
+        const route = config.route orelse return error.Descriptor;
+        if (route.head != lut.head or route.window != lut.window or config.detach_sor != null or
+            config.refresh_control != null or config.cursor_image != null or
+            (config.kind == .core and config.signal == null) or
+            (config.kind == .window and config.scanout == null) or
+            (config.kind != .core and config.kind != .window)) return error.Descriptor;
+    }
+    if (config.preserve_windows != 0 and (config.kind != .core or config.initialize or
+        (config.signal == null and !config.ownership_only) or config.route == null or
         config.route.?.window >= 8 or config.preserve_windows & ~config.windows != 0 or
         config.preserve_windows & (@as(u8, 1) << @intCast(config.route.?.window)) != 0)) return error.Descriptor;
     const value = config.mst_sor_control orelse return;
@@ -321,6 +338,13 @@ pub const Program = struct {
         @memcpy(self.words[self.count..][0..values.len], values); self.count += @intCast(values.len);
     }
 };
+// Original nvEvoSetNotifierC3/EvoSetCoreNotifierSurfaceAddressAndControlC3:
+// hardware bug1945716 requires NULL DMA when notification is disabled.
+// Every later enabled update rebinds this exact private notifier first.
+fn coreNotifier(out: *Program, handle: u32, enabled: bool) Error!void {
+    try out.method(0x208, &.{if (enabled) handle else 0});
+    try out.method(0x20c, &.{if (enabled) @as(u32, 0x1000) else 0});
+}
 fn refresh(config: Config, control: RefreshControl) Error!Program {
     // C67D lightweight update; its caller must arm RM's lightweight
     // supervisor and serialize this with all other Core/Window mutations.
@@ -333,18 +357,101 @@ fn refresh(config: Config, control: RefreshControl) Error!Program {
     const base = control.head * 0x400;
     try out.method(base + 0x2034, &.{if (control.enabled) @as(u32, 0x1005) else 0x1000}); // LINE_LOCK, no external pin.
     try out.method(base + 0x21a8, &.{if (control.enabled) (control.timeout_us << 4) | 5 else 0});
-    try out.method(0x20c, &.{0x1000});
+    try coreNotifier(&out, config.notifier, true);
     try out.method(0x218, &.{ 0, 0 });
     try out.method(0x200, &.{1}); // RELEASE_ELV, then the existing Core notifier.
-    try out.method(0x20c, &.{0});
+    try coreNotifier(&out, config.notifier, false);
     return out;
+}
+// Nouveau disp.c calls head_flush_set before the standalone assignment.
+// Only cursor/OLUT state (head_flush_set_wndw) waits for the image update.
+// Both phases use the same admitted timing and output state; the ordinary
+// image packet retains its original byte-for-byte method ordering.
+fn headSignal(out: *Program, config: Config, signal: boot_mode.Signal) Error!void {
+    const route = config.route orelse return error.Descriptor;
+    boot_mode.validate(signal, route.head) catch return error.Descriptor;
+    const cursor_usage = try cursor_image.usageCode(config.cursor_usage);
+    const base = route.head * 0x400;
+    if (signal.dp_dsc) |compressed| {
+        // C67D single-encoder RGB DSC. PPS is the admitted original
+        // generator output; the link owner proves FEC and decompression
+        // before this Core update can be submitted.
+        try out.method(base + 0x22d4, &.{1 | 0x30 | (@as(u32, compressed.params.flatnessThreshold()) << 6)});
+        try out.method(base + 0x22d8, &.{1 | (31 << 2)});
+        try out.method(base + 0x22dc, &.{0x007f1000});
+        try out.method(base + 0x22e0, &compressed.params.pps);
+    } else if (signal.hdmi_dsc) |compressed| {
+        // C67D HDMI CVTEM carries128 PPS bytes in a136-byte VBLANK
+        // packet every frame. The RM query supplies the HC raster.
+        try out.method(base + 0x22d4, &.{1 | 0x30 | (@as(u32, compressed.params.flatnessThreshold()) << 6)});
+        try out.method(base + 0x22d8, &.{1 | 2 | (0x21 << 2)});
+        try out.method(base + 0x22dc, &.{0x7f});
+        try out.method(base + 0x22e0, &compressed.params.pps);
+        try out.method(base + 0x2368, &.{@as(u32, compressed.hc_active_bytes) | (@as(u32, compressed.hc_active_tri_bytes) << 16)});
+        try out.method(base + 0x236c, &.{compressed.hc_blank_tri_bytes});
+    } else if (config.clear_dsc) try out.method(base + 0x22d4, &.{ 0, 0 });
+    // Preserve the exact Hz + 1000/1001 encoding and raster coordinates.
+    // Clock configuration transfers programming to RM, without hopping.
+    try out.method(base + 0x2008, &.{0});
+    try out.method(base + 0x200c, &.{signal.clock});
+    try out.method(base + 0x201c, &.{0});
+    try out.method(base + 0x2020, &.{ signal.display_id, 0 });
+    try out.method(base + 0x2028, &.{signal.clock});
+    try out.method(base + 0x2030, &.{0x1000 | cursor_usage | @as(u32, if (config.identity_lut != null) 0x10 else 0)}); // Exact IMP-admitted fetches.
+    // Use individual raster writes, matching NVIDIA's EvoSetRasterParams3.
+    try out.method(base + 0x2064, &.{signal.total});
+    try out.method(base + 0x2068, &.{signal.sync_end});
+    try out.method(base + 0x206c, &.{signal.blank_end});
+    try out.method(base + 0x2070, &.{signal.blank_start});
+    // Nouveau head.c disables the second interval with start1/end0.
+    // Zero encodes start0/end0 instead; real C67D reports Xid56 CMDre.
+    try out.method(base + 0x2074, &.{1});
+    try out.method(base + 0x2218, &.{signal.min_frame_idle});
+    try out.method(base + 0x2048, &.{ 0, signal.viewport });
+    try out.method(base + 0x2058, &.{ signal.viewport, 0 });
+    try out.method(base + 0x2014, &.{0x11});
+    try out.method(base + 0x2078, &.{ 0, 0, signal.hdmi });
+    // Establish the admitted RGB depth and identity colour state. Never replay captured
+    // cursor or OLUT DMA handles into the new instance's namespace.
+    if (!config.ownership_only) {
+        try out.method(base + 0x209c, &.{0xcf});
+        try out.method(base + 0x2088, &.{ 0, 0 });
+        if (config.identity_lut == null) try out.method(base + 0x2288, &.{0});
+    }
+    if (config.identity_lut) |lut| {
+        if (!config.ownership_only) {
+            const identity = @import("gsp_display_identity_lut.zig");
+            // Original EvoSetOutputLutC5: S5.14 OCSC0 coefficients, actual
+            // direct10 OLUT, U32 unity norm, then enable OCSC0 last.
+            try out.method(base + 0x2244, &.{ 0x4000, 0, 0, 0, 0, 0x4000, 0, 0, 0, 0, 0x4000, 0 });
+            try out.method(base + 0x2280, &.{identity.olut_control});
+            try out.method(base + 0x2288, &.{lut.output});
+            try out.method(base + 0x228c, &.{identity.output_offset >> 8});
+            try out.method(base + 0x2284, &.{0xffffffff});
+            try out.method(base + 0x2240, &.{1});
+        }
+    } else try out.method(base + 0x2240, &.{0});
+    try out.method(base + 0x229c, &.{0});
+    try out.method(base + 0x2238, &.{ 0x0fff0000, 0x0fff0000 });
+    try out.method(base + 0x2220, &.{ 0xff, 0 });
+    try out.method(base + 0x2018, &.{0});
+    // DP MISC1[6] selects VSC colorimetry via the C67D color override.
+    // The link transaction must acknowledge that packet before activation.
+    const depth: u32 = if (signal.bpc == 10) 0x50 else 0x40;
+    try out.method(base + 0x2000, &.{ 0, 0xfc000000 | depth | signal.polarity |
+        @as(u32, if (signal.dp_vsc) 0x01800000 else 0) });
+    const sor_control = if (signal.hdmi_frl) (signal.sor_control & ~@as(u32, 0xf00)) | 0xc00 else signal.sor_control;
+    try out.method(0x300 + signal.sor * 0x20, &.{config.mst_sor_control orelse sor_control});
 }
 pub fn core(config: Config) Error!Program {
     try validateSharedSor(config);
-    if (config.refresh_control) |control| return refresh(config, control);
+    if (config.refresh_control) |control| {
+        if (config.ownership_only) return error.Descriptor;
+        return refresh(config, control);
+    }
     if (config.kind != .core or config.scanout != null or config.notifier_offset != 0 or config.position != null or config.with_position or !config.with_core) return error.Descriptor;
     if (config.notifier == 0) return error.Handle;
-    const cursor_usage = try cursor_image.usageCode(config.cursor_usage);
+    _ = try cursor_image.usageCode(config.cursor_usage);
     if (config.signal == null and config.cursor_usage != 0) return error.Descriptor;
     if (config.windows == 0 or config.windows & ~@as(u32, 0xff) != 0) return error.Bounds;
     if (config.clear_dsc and (config.route == null or (config.signal == null and config.detach_sor == null))) return error.Descriptor;
@@ -354,7 +461,6 @@ pub fn core(config: Config) Error!Program {
     }
     var out: Program = .{};
     if (config.initialize) {
-        try out.method(0x208, &.{config.notifier});
         for (0..8) |i| if (config.windows & (@as(u32, 1) << @intCast(i)) != 0) {
             const base: u32 = 0x1000 + @as(u32, @intCast(i)) * 0x80;
             // C67D inherits the C57D RGB/ILUT/scaler bounds. Actual image,
@@ -363,10 +469,28 @@ pub fn core(config: Config) Error!Program {
             try out.method(base + 0x10, &.{0x00117fff});
         };
     }
+    if (config.ownership_only) {
+        const route = config.route orelse return error.Descriptor;
+        if (config.cursor_image != null or config.detach_sor != null or route.window >= 8 or route.head >= 8 or
+            config.windows & (@as(u32, 1) << @intCast(route.window)) == 0) return error.Descriptor;
+        if (config.signal) |signal| try headSignal(&out, config, signal);
+        try out.method(0x1000 + route.window * 0x80, &.{route.head});
+        for (0..8) |i| if (i != route.window and config.windows & (@as(u32, 1) << @intCast(i)) != 0 and
+            config.preserve_windows & (@as(u8, 1) << @intCast(i)) == 0)
+            try out.method(0x1000 + @as(u32, @intCast(i)) * 0x80, &.{15});
+        try coreNotifier(&out, config.notifier, true);
+        try out.method(0x218, &.{ 0, 0 }); // No Window/Cursor interlock for ownership.
+        try out.method(0x200, &.{1});
+        try coreNotifier(&out, config.notifier, false);
+        return out;
+    }
     var interlocks: u32 = 0;
     if (config.route) |route| {
         if (route.window >= 8 or route.head >= 8 or config.windows & (@as(u32, 1) << @intCast(route.window)) == 0) return error.Bounds;
-        try out.method(0x1000 + route.window * 0x80, &.{if (config.detach_sor != null) @as(u32, 15) else route.head});
+        // Original EvoInitWindowMapping3/Nouveau disp.c forbid changing
+        // Window ownership in an update interlocked with that Window.
+        // NULL ISO disables its fetches while its acknowledged route stays.
+        try out.method(0x1000 + route.window * 0x80, &.{route.head});
         interlocks = @as(u32, 1) << @intCast(route.window);
     }
     if (config.detach_sor) |sor| {
@@ -378,6 +502,9 @@ pub fn core(config: Config) Error!Program {
         try out.method(base + 0x209c, &.{0xcf});
         try out.method(base + 0x2088, &.{ 0, 0 });
         try out.method(base + 0x2090, &.{ 0, 0, 0 });
+        // Original nvSetupOutputLUT5/EvoSetOutputLutC5 requires OCSC0
+        // disabled before removing its OLUT DMA, even for identity colour.
+        try out.method(base + 0x2240, &.{0});
         try out.method(base + 0x2288, &.{0});
         try out.method(0x300 + sor * 0x20, &.{config.mst_sor_control orelse 0});
         try out.method(base + 0x2020, &.{ 0, 0 });
@@ -390,81 +517,30 @@ pub fn core(config: Config) Error!Program {
         for (0..8) |i| if (i != route.window and config.windows & (@as(u32, 1) << @intCast(i)) != 0 and
             config.preserve_windows & (@as(u8, 1) << @intCast(i)) == 0)
             try out.method(0x1000 + @as(u32, @intCast(i)) * 0x80, &.{15});
-        const base = route.head * 0x400;
-        if (signal.dp_dsc) |compressed| {
-            // C67D single-encoder RGB DSC. PPS is the admitted original
-            // generator output; the link owner proves FEC and decompression
-            // before this Core update can be submitted.
-            try out.method(base + 0x22d4, &.{1 | 0x30 | (@as(u32, compressed.params.flatnessThreshold()) << 6)});
-            try out.method(base + 0x22d8, &.{1 | (31 << 2)});
-            try out.method(base + 0x22dc, &.{0x007f1000});
-            try out.method(base + 0x22e0, &compressed.params.pps);
-        } else if (signal.hdmi_dsc) |compressed| {
-            // C67D HDMI CVTEM carries128 PPS bytes in a136-byte VBLANK
-            // packet every frame. The RM query supplies the HC raster.
-            try out.method(base + 0x22d4, &.{1 | 0x30 | (@as(u32, compressed.params.flatnessThreshold()) << 6)});
-            try out.method(base + 0x22d8, &.{1 | 2 | (0x21 << 2)});
-            try out.method(base + 0x22dc, &.{0x7f});
-            try out.method(base + 0x22e0, &compressed.params.pps);
-            try out.method(base + 0x2368, &.{@as(u32, compressed.hc_active_bytes) | (@as(u32, compressed.hc_active_tri_bytes) << 16)});
-            try out.method(base + 0x236c, &.{compressed.hc_blank_tri_bytes});
-        } else if (config.clear_dsc) try out.method(base + 0x22d4, &.{ 0, 0 });
-        // Preserve the exact Hz + 1000/1001 encoding and raster coordinates.
-        // Clock configuration transfers programming to RM, without hopping.
-        try out.method(base + 0x2008, &.{0});
-        try out.method(base + 0x200c, &.{signal.clock});
-        try out.method(base + 0x201c, &.{0});
-        try out.method(base + 0x2020, &.{ signal.display_id, 0 });
-        try out.method(base + 0x2028, &.{signal.clock});
-        try out.method(base + 0x2030, &.{0x1000 | cursor_usage}); // IMP-admitted cursor, no LUT/upscale.
-        // Use individual raster writes, matching NVIDIA's EvoSetRasterParams3.
-        try out.method(base + 0x2064, &.{signal.total});
-        try out.method(base + 0x2068, &.{signal.sync_end});
-        try out.method(base + 0x206c, &.{signal.blank_end});
-        try out.method(base + 0x2070, &.{signal.blank_start});
-        try out.method(base + 0x2074, &.{0}); // No second interlaced blanking interval.
-        try out.method(base + 0x2218, &.{signal.min_frame_idle});
-        try out.method(base + 0x2048, &.{ 0, signal.viewport });
-        try out.method(base + 0x2058, &.{ signal.viewport, 0 });
-        try out.method(base + 0x2014, &.{0x11});
-        try out.method(base + 0x2078, &.{ 0, 0, signal.hdmi });
-        // Establish the admitted RGB depth and identity colour state. Never replay captured
-        // cursor or OLUT DMA handles into the new instance's namespace.
-        try out.method(base + 0x209c, &.{0xcf});
-        try out.method(base + 0x2088, &.{ 0, 0 });
-        try out.method(base + 0x2288, &.{0});
-        try out.method(base + 0x2240, &.{0});
-        try out.method(base + 0x229c, &.{0});
-        try out.method(base + 0x2238, &.{ 0x0fff0000, 0x0fff0000 });
-        try out.method(base + 0x2220, &.{ 0xff, 0 });
-        try out.method(base + 0x2018, &.{0});
-        // DP MISC1[6] selects VSC colorimetry via the C67D color override.
-        // The link transaction must acknowledge that packet before activation.
-        const depth: u32 = if (signal.bpc == 10) 0x50 else 0x40;
-        try out.method(base + 0x2000, &.{ 0, 0xfc000000 | depth | signal.polarity |
-            @as(u32, if (signal.dp_vsc) 0x01800000 else 0) });
-        const sor_control = if (signal.hdmi_frl) (signal.sor_control & ~@as(u32, 0xf00)) | 0xc00 else signal.sor_control;
-        try out.method(0x300 + signal.sor * 0x20, &.{config.mst_sor_control orelse sor_control});
+        try headSignal(&out, config, signal);
     }
     if (config.cursor_image) |cursor| {
         if (config.initialize or config.route != null or config.signal != null) return error.Descriptor;
         try cursor.validate();
         const base = cursor.head * 0x400;
-        try out.method(base + 0x2098, &.{0}); // Mono; never borrow an old right-eye image.
-        try out.method(base + 0x2088, &.{ cursor.dma, 0 });
-        try out.method(base + 0x2090, &.{ @intCast(cursor.offset >> 8), 0 });
+        try out.method(base + 0x2098, &.{0}); // Mono; both slots bind only this owned image.
+        // Original SetCursorSurfaceAddress writes both contexts and offsets
+        // even in mono mode. Never retain a previous right-eye descriptor.
+        try out.method(base + 0x2088, &.{ cursor.dma, cursor.dma });
+        try out.method(base + 0x2090, &.{ @intCast(cursor.offset >> 8), @intCast(cursor.offset >> 8) });
         try out.method(base + 0x209c, &.{try cursor.word()});
         if (cursor.visible) try out.method(base + 0x20a0, &.{0x75ff}); // Straight ARGB: src*alpha + dst*(1-alpha).
     }
     // A private16-byte notifier at offset0; no interrupt callback is needed.
     // Its completion establishes method execution, not visible scanout.
-    try out.method(0x20c, &.{0x1000});
+    try coreNotifier(&out, config.notifier, true);
     try out.method(0x218, &.{ 0, interlocks });
     try out.method(0x200, &.{1});
-    try out.method(0x20c, &.{0});
+    try coreNotifier(&out, config.notifier, false);
     return out;
 }
 pub fn window(config: Config) Error!Program {
+    if (config.ownership_only) return error.Descriptor;
     if (config.clear_dsc) return error.Descriptor;
     if (config.refresh_control != null) return error.Descriptor;
     if (config.cursor_image != null or config.cursor_usage != 0) return error.Descriptor;
@@ -505,18 +581,25 @@ pub fn window(config: Config) Error!Program {
     try out.method(0x2a4, &.{ size, 0x11 }); // Output size, horizontal/vertical two-tap scaler.
     try out.method(0x338, &.{ 0, 0 }); // Disable acquire-only semaphore; scan top-to-bottom, left-to-right.
     if (config.initialize) {
-        try out.method(0x444, &.{0}); // Identity ILUT when no input LUT is bound.
+        if (config.identity_lut) |lut| {
+            try out.method(0x440, &.{@import("gsp_display_identity_lut.zig").ilut_control});
+            try out.method(0x444, &.{lut.input});
+            try out.method(0x448, &.{0});
+        } else try out.method(0x444, &.{0}); // Reserved console stays bypassed.
         for ([_]u32{ 0x45c, 0x4bc, 0x53c, 0x59c, 0x4a0, 0x580 }) |control| try out.method(control, &.{0});
         try out.method(0x400, &.{ 0x10000, 0, 0, 0, 0, 0x10000, 0, 0, 0, 0, 0x10000, 0 });
-        // Opaque primary layer: full constant alpha, source K1, destination
-        // 1-K1, color keys disabled; other composition inputs are explicit.
-        try out.method(0x2ec, &.{ 0, 255, 0x4422, 0xffff0000, 0xffff0000, 0xffff0000, 0xffff0000 });
+        // NVIDIA EvoFlipC5Common/EvoBypassCompositionC5: an unscaled opaque
+        // integer primary with no ILUT/OLUT must bypass FP16 composition.
+        // Ordinary composition needs actual conversion LUTs, even for an
+        // identity colour transform. Keep the other state explicit.
+        try out.method(0x2ec, &.{ @as(u32, if (config.identity_lut != null) 0 else 0x10000), 255, 0x4422, 0xffff0000, 0xffff0000, 0xffff0000, 0xffff0000 });
     }
     try out.method(0x370, &.{ @intFromBool(config.with_core), 0 });
     try out.method(0x200, &.{if (config.with_position) @as(u32, 0x1001) else 1});
     return out;
 }
 pub fn immediate(config: Config) Error!Program {
+    if (config.ownership_only) return error.Descriptor;
     if (config.clear_dsc) return error.Descriptor;
     if (config.refresh_control != null) return error.Descriptor;
     if (config.cursor_image != null or config.cursor_usage != 0 or config.detach_sor != null) return error.Descriptor;

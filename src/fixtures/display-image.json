@@ -3,14 +3,37 @@
   "archive": "ExFiles/Reference/GFX/Nvidia/0.79.13/display-image-20260912",
   "linux": "7.2.4",
   "vectors": {
-    "sha256": "7303b911a8b6ecedcfbf5827c81c6bc80354935654b295760d5b1c7fbd82e818",
     "path": "Repositories/Drivers/NVIDIA/src/fixtures/display-image.bin",
-    "bytes": 984
+    "bytes": 1008,
+    "sha256": "9c42071706b9914a95c442d7db11f01a6f81f3359245e62a81248326bf06b958"
   },
-  "scope": "Original C67D/C67E/C37B definitions and Nouveau DRF macros: routed core init/repeat and RGB/ARGB window init/repeat, notifier16 and nonzero image origin. No physical GPU proof.",
+  "scope": "Original class/header vectors retain all non-notifier bytes. Core notifier binding/control pairs now come from executing unchanged NVIDIA570.144 functions, including NULL DMA for hardware bug1945716; no physical GPU proof.",
   "generator": {
     "sha256": "acdd521211d74a2a6482cb909e295848e172804857c0146c16fd6c1c5dc0bcb7",
     "path": "Temp/gfx-display-image-20260912/Original-Image.c",
     "bytes": 7399
+  },
+  "core_notifier_update": {
+    "source": "NVIDIA570.144 unchanged nvEvoSetNotifierC3 and EvoSetCoreNotifierSurfaceAddressAndControlC3",
+    "hardware_bug": 1945716,
+    "archive": "ExFiles/Reports/OssiGPU/20261005-tv08237/N264NotifierReferences",
+    "before_vectors_sha256": "82dccb445c5e7aa9c34c8dbc86f02ee54b48febd010f156adebbd47a10493ed8",
+    "vectors_sha256": "9c42071706b9914a95c442d7db11f01a6f81f3359245e62a81248326bf06b958"
+  },
+  "base_reference": {
+    "nvidia": "570.144",
+    "archive": "ExFiles/Reference/GFX/Nvidia/0.79.13/display-image-20260912",
+    "linux": "7.2.4",
+    "vectors": {
+      "sha256": "7303b911a8b6ecedcfbf5827c81c6bc80354935654b295760d5b1c7fbd82e818",
+      "path": "Repositories/Drivers/NVIDIA/src/fixtures/display-image.bin",
+      "bytes": 984
+    },
+    "scope": "Original C67D/C67E/C37B definitions and Nouveau DRF macros: routed core init/repeat and RGB/ARGB window init/repeat, notifier16 and nonzero image origin. No physical GPU proof.",
+    "generator": {
+      "sha256": "acdd521211d74a2a6482cb909e295848e172804857c0146c16fd6c1c5dc0bcb7",
+      "path": "Temp/gfx-display-image-20260912/Original-Image.c",
+      "bytes": 7399
+    }
   }
 }

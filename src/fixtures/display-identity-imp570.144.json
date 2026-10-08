@@ -1,0 +1,9 @@
+{
+  "source": "NVIDIA570.144",
+  "scope": "Both unchanged original C5 identity functions and original NVIDIA SoftFloat. Copied exact original entry/data/enum declarations. Complete padded tables, zero VSS headers and alignment. Direct10 controls are parameterized host reference, no hardware/scanout/cursor pass.",
+  "expanded_scope": "Original class OCSC0 S5.14 identity matrix and enable-after-OLUT, OLUT usage bound, and original C IMP head/window sizeof/offsetof. No hardware pass.",
+  "bytes": 28,
+  "sha256": "4bef68273073777e6ca84fec2dc41334c7ef0442bf699cb60b1393f842a0d9ed",
+  "reference_archive": "ExFiles/Reports/OssiGPU/20261005-tv08237/IdentityLut275Verified/IdentityLut275Reference",
+  "hardware_passed": false
+}

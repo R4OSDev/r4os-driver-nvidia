@@ -23,13 +23,21 @@ pub const Owner = struct {
     count: usize = 0,
 
     pub fn reserve(self: *Owner, view: *const inventory.Owner, epoch: u64, range: *Range, bytes: u64, alignment: u64) Error!u64 {
+        return self.reserveInner(view, epoch, range, bytes, alignment, 0);
+    }
+    // Display storage and the existing physical-clear contract use zero as
+    // an absent backing. Ordinary application mappings may still use page0.
+    pub fn reserveNonzero(self: *Owner, view: *const inventory.Owner, epoch: u64, range: *Range, bytes: u64, alignment: u64) Error!u64 {
+        return self.reserveInner(view, epoch, range, bytes, alignment, 65536);
+    }
+    fn reserveInner(self: *Owner, view: *const inventory.Owner, epoch: u64, range: *Range, bytes: u64, alignment: u64, minimum: u64) Error!u64 {
         if (self.self_address != 0 and (self.self_address != @intFromPtr(self) or self.view != view or self.epoch != epoch)) return error.Stale;
         if (!std.meta.eql(range.*, Range{})) return error.Stale;
         const data = view.snapshot() orelse return error.Stale;
         if (epoch == 0 or data.epoch != epoch) return error.Stale;
         if (bytes == 0 or bytes & 65535 != 0 or alignment < 65536 or !std.math.isPowerOfTwo(alignment)) return error.Bounds;
         if (!data.firmware_layout_usable) return error.Memory;
-        const base = try self.choose(view, bytes, alignment);
+        const base = try self.choose(view, bytes, alignment, minimum);
         const address_limit = @import("gsp_host_page.zig").video_limit;
         if (base >= address_limit or bytes > address_limit - base) return error.Bounds;
         const total = std.math.add(u64, self.bytes, bytes) catch return error.Exhausted;
@@ -50,13 +58,13 @@ pub const Owner = struct {
         self.bytes = total; self.count = count;
         return base;
     }
-    fn choose(self: *const Owner, view: *const inventory.Owner, bytes: u64, alignment: u64) Error!u64 {
+    fn choose(self: *const Owner, view: *const inventory.Owner, bytes: u64, alignment: u64, minimum: u64) Error!u64 {
         for (view.regions[0..view.data.region_count]) |region| {
             // Conservatively exclude the WHOLE partially reserved region.
             // ISO/compression support is also required for reusable images.
             if (region.reserved != 0 or region.protected or !region.iso or !region.compressed) continue;
             const limit = region.base + region.bytes;
-            var base = alignUp(region.base, alignment) catch continue;
+            var base = alignUp(@max(region.base, minimum), alignment) catch continue;
             var retained: usize = 0;
             var allocated = self.first;
             // Merge both sorted exclusion lists in one bounded traversal.

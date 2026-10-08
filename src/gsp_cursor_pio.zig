@@ -1,7 +1,9 @@
 // C67A cursor methods and GA102 PIO registers (MIT). R4OS owner policy: Apache-2.0.
 // ExFiles/Reference/GFX/Nvidia/OpenKernelModules-570.144/src/common/sdk/nvidia/inc/class/clc67a.h
+// ExFiles/Reference/GFX/Nvidia/OpenKernelModules-570.144/src/nvidia-modeset/src/nvkms-cursor3.c
 // /*
 //  * SPDX-FileCopyrightText: Copyright (c) 2020 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//  * SPDX-FileCopyrightText: Copyright (c) 2016 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //  * SPDX-License-Identifier: MIT
 //  *
 //  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -79,7 +81,8 @@ pub const Sample = struct { free: u32, control: u32, state: u32 };
 pub const Receipt = struct { sequence: u64, point: Point, submitted_ns: u64, drained_ns: u64, head: head.Sample };
 pub const Job = struct {
     sequence: u64, point: Point, point_stamp: Point, deadline: u64,
-    submitted_ns: u64 = 0, baseline: head.Sample = .{}, published: bool = false,
+    submitted_ns: u64 = 0, update_submitted_ns: u64 = 0, baseline: head.Sample = .{}, published: bool = false,
+    next_method: u8 = 0,
 };
 pub const Owner = struct {
     issued: u64 = 0,
@@ -96,7 +99,8 @@ pub const Owner = struct {
     }
     pub fn valid(self: *const Owner, deadline: u64) bool {
         const job = self.pending orelse return false;
-        return job.deadline == deadline and job.sequence != 0 and std.meta.eql(job.point, job.point_stamp) and
+        return job.deadline == deadline and job.sequence != 0 and job.next_method <= methods.len and
+            (job.published or job.next_method == 0) and std.meta.eql(job.point, job.point_stamp) and
             (if (job.published) job.sequence == self.issued and job.submitted_ns != 0 else job.sequence == self.issued +| 1);
     }
     pub fn prepare(self: *Owner, now: u64, observed: head.Sample) Error!void {
@@ -105,29 +109,56 @@ pub const Owner = struct {
         if (now == 0 or now >= job.deadline or observed.observed_ns > now) return error.Timeout;
         job.submitted_ns = now; job.baseline = observed;
     }
-    pub fn publish(self: *Owner, deadline: u64) Error!void {
+    fn publish(self: *Owner, deadline: u64) Error!void {
         if (!self.valid(deadline)) return error.Stale;
         const job = &self.pending.?;
         if (job.published or job.submitted_ns == 0) return error.State;
         // Before the first possibly partial MMIO write. Never replay UPDATE.
         job.published = true; self.issued = job.sequence;
     }
+    pub fn prepareUpdate(self: *Owner, now: u64, observed: head.Sample) Error!void {
+        const job = if (self.pending) |*pending| pending else return error.State;
+        if (!self.valid(job.deadline) or !job.published or job.next_method != methods.len-1) return error.Stale;
+        if (now == 0 or now >= job.deadline or now < job.submitted_ns or observed.observed_ns > now) return error.Timeout;
+        job.update_submitted_ns = now; job.baseline = observed;
+    }
+    /// Called immediately before one possibly partial MMIO write. Each
+    /// method owns its own FREE credit; its prefix must never be replayed.
+    pub fn issueMethod(self: *Owner, deadline: u64) Error!usize {
+        if (!self.valid(deadline)) return error.Stale;
+        if (self.pending.?.next_method >= methods.len) return error.State;
+        if (self.pending.?.next_method == methods.len-1 and self.pending.?.update_submitted_ns == 0) return error.State;
+        if (!self.pending.?.published) try self.publish(deadline);
+        const index = self.pending.?.next_method;
+        self.pending.?.next_method += 1;
+        return index;
+    }
     pub fn observe(self: *Owner, sample: Sample, observed: head.Sample, now: u64) Error!bool {
         const job = self.pending orelse return error.State;
         if (!self.valid(job.deadline) or !job.published) return error.Stale;
         if (now >= job.deadline) return error.Timeout;
-        if (!try idle(sample) or observed.sequence <= job.baseline.sequence or observed.observed_ns < job.submitted_ns) return false;
-        if (observed.observed_ns > now) return error.Completion;
+        if (job.next_method != methods.len or job.update_submitted_ns == 0 or !try idle(sample) or
+            observed.sequence <= job.baseline.sequence or observed.observed_ns < job.update_submitted_ns) return false;
+        if (observed.observed_ns > now) return false;
         self.completed = .{ .sequence = job.sequence, .point = job.point, .submitted_ns = job.submitted_ns, .drained_ns = now, .head = observed };
         self.pending = null; return true;
     }
 };
 pub fn base(index: u32) Error!u32 { if (index >= 8) return error.Bounds; return 0x6d8000 + index * 4096; }
-pub const methods = [_]u32{ 0x204, 0x210, 0x208, 0x200 };
-pub fn value(point: Point, index: usize) u32 { return switch (index) { 0, 1 => 0, 2 => point.encode(), 3 => 1, else => unreachable }; }
-pub fn idle(sample: Sample) Error!bool {
+// Exact MoveCursorC3 from NVIDIA570.144 nvkms-cursor3.c: position then
+// UPDATE with no flip lock. RELEASE_ELV is a distinct owner operation.
+pub const methods = [_]u32{ 0x208, 0x200 };
+pub fn value(point: Point, index: usize) u32 { return switch (index) { 0 => point.encode(), 1 => 0, else => unreachable }; }
+pub fn writable(sample: Sample) Error!bool {
     if (sample.free == 0xffffffff or sample.control == 0xffffffff or sample.state == 0xffffffff) return error.Completion;
+    if (sample.state & 0xf == 1) return error.Completion; // MP_STATE_PBERR.
+    // NVIDIA's WaitForFreeSpace applies before each method, including the
+    // UPDATE which drains its prepared position. Processing state is not
+    // a completion receipt and must not block that final method.
+    return sample.free & 0x3f != 0 and sample.control & 0x11 == 1;
+}
+pub fn idle(sample: Sample) Error!bool {
     // Allocated and unlocked, empty PIO method processor and no method
     // execution. FREE alone is never evidence of position visibility.
-    return sample.free & 0x3f >= 4 and sample.control & 0x11 == 1 and sample.state & 0x8007000f == 0x40000;
+    return try writable(sample) and sample.state & 0x8007000f == 0x40000;
 }

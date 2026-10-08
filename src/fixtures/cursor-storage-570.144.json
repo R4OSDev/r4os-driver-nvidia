@@ -1,0 +1,36 @@
+{
+  "utc": "2026-10-07T04:02:09.524540+00:00",
+  "source_pin": "NVIDIA570.144 / 8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f",
+  "generator": "Temp/Ossi08237/CursorStorageReference271/cursor-storage.c",
+  "scope": "Original-C physical request/reply pair, exact SDK CURSOR type, ISO attr2, display-compatible flags without NO_SCANOUT. Original RPC header and 128-byte parameter sizeof/offsetof independently asserted.64MB codec vector; actual cursor storage remains two private256KB slots. No GPU proof.",
+  "archive": "ExFiles/Reports/OssiGPU/20261005-tv08237/CursorIso271Verified/Reference",
+  "bytes": 320,
+  "sha256": "550c1840a5f2744c20e7180dc9e6f244e472f252c9751ac9bddf10406033699b",
+  "files": [
+    {
+      "file": "Temp/Ossi08237/CursorStorageReference271/cursor-storage.c",
+      "bytes": 10155,
+      "sha256": "6e514ce23f37cf59cb5727cb0ac1e2c99d8bad46fcf76c9287d46725d216b60b"
+    },
+    {
+      "file": "Temp/Ossi08237/CursorStorageReference271/MemoryOwner-original.h",
+      "bytes": 1452,
+      "sha256": "fdca00a4248b97ad7d2204541aaa7e1431f7fc5c1be8d708dd0a3e730627013b"
+    },
+    {
+      "file": "ExFiles/Reference/GFX/Nvidia/OpenKernelModules-570.144/src/common/sdk/nvidia/inc/nvos.h",
+      "bytes": 146013,
+      "sha256": "9e878195c522919f133c497aefbc3f4c076aae8bda25d4c7915e8981bb43563a"
+    },
+    {
+      "file": "ExFiles/Reference/GFX/Nvidia/OpenKernelModules-570.144/src/common/sdk/nvidia/inc/nvtypes.h",
+      "bytes": 25775,
+      "sha256": "3fd5e2c20b1432421a214b12e52778f48f7914b87645d4736cf55324d25c9d3c"
+    },
+    {
+      "file": "ExFiles/Reference/GFX/Nvidia/OpenKernelModules-570.144/src/nvidia/src/kernel/mem_mgr/standard_mem.c",
+      "bytes": 10056,
+      "sha256": "8e84b2a2641e580721ddccebc1c1a064e84b46614d7d65ae0022408224a995ee"
+    }
+  ]
+}

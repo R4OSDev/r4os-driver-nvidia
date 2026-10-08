@@ -22,7 +22,8 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 //! Sink power is separate from GPU idle and platform suspend. Runtime must
-//! prove Core/Window retirement before admitting these fixed controls.
+//! prove exact paused binding for digital controls, or Core/Window
+//! retirement for DP/MST. Neither control is a DMA retirement receipt.
 //! MST stops only its own stream; D3 on the shared root is never permitted.
 const std = @import("std");
 const aux = @import("gsp_aux_wire.zig");
@@ -35,6 +36,11 @@ pub const Plan = struct {
     mode: @import("gsp_boot_mode.zig").Plan,
     kind: Kind,
     sink_control: bool,
+    force_monitor_state: bool = false,
+    bound_paused: bool = false,
+    // A separately completed ownership Core binds the head while its Window
+    // ISO and the admitted link transaction are still unsubmitted.
+    pending_head: bool = false,
 };
 pub const Stage = enum { digital, sink, main_link, complete };
 pub const Result = struct { sequence: u64, on: bool, receipt: u64, failure: ?anyerror = null };
@@ -58,7 +64,10 @@ pub const Work = struct {
         if ((plan.kind == .dp_sst) != (plan.mode.displayPort() and plan.mode.signal.mst == null) or
             (plan.kind == .stream_only) != (plan.mode.signal.mst != null) or
             (plan.kind == .digital and !plan.sink_control) or
-            (plan.kind == .stream_only and plan.sink_control)) return error.Descriptor;
+            (plan.kind == .stream_only and plan.sink_control) or
+            (plan.force_monitor_state and (plan.kind != .digital or plan.mode.head >= 8)) or
+            (plan.bound_paused and plan.kind != .digital) or
+            (plan.pending_head and (!plan.bound_paused or plan.kind != .digital or !on))) return error.Descriptor;
         return .{ .plan = plan, .on = on, .sequence = sequence, .deadline = deadline,
             .stage = switch (plan.kind) {
                 .digital => .digital,
@@ -87,7 +96,13 @@ pub const Work = struct {
             if (self.plan.kind != .digital) return error.State;
             put(bytes, 8, 0x730295); put(bytes, 16, 20);
             put(params, 8, @intFromBool(self.on));
-            // nvkms-rm.c uses connector ID with zero headIdx and force flag.
+            // The original nvkms bound-head path leaves these zero. Runtime
+            // digital controls use that same exact paused bound route.
+            // Explicit forced packets remain a separate wire capability.
+            if (self.plan.force_monitor_state) {
+                put(params, 12, self.plan.mode.head);
+                params[16] = 1;
+            }
             return 44;
         }
         if (self.plan.kind != .dp_sst or self.on) return error.State;

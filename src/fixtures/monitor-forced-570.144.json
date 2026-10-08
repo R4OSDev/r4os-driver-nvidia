@@ -1,0 +1,30 @@
+{
+  "schema": 1,
+  "source_pin": "8ec351aeb96a93a4bb69ccc12a542bf8a8df2b6f",
+  "source_headers": [
+    "src/common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073specific.h"
+  ],
+  "generator": "Temp/Ossi08237/ReferenceMonitor285.c",
+  "generator_sha256": "0e823ab387c6a82ff269c139ac8db227cdbfdf5a63f94e3e1f44656782073840",
+  "command": [
+    "DevKit/Toolchains/Zig/zig",
+    "cc",
+    "-std=c11",
+    "-DNV_UNIX=1",
+    "-DNV_ARCH_BITS=64",
+    "-I",
+    "ExFiles/Reference/GFX/Nvidia/OpenKernelModules-570.144/src/common/sdk/nvidia/inc",
+    "Temp/Ossi08237/ReferenceMonitor285.c",
+    "-o",
+    "Temp/Ossi08237/ReferenceMonitor285"
+  ],
+  "compile_exit": 0,
+  "bytes": 88,
+  "sha256": "933128831ec4fb073643e1c10892b7918d65b3ca128898b8db92258d5fb55d3f",
+  "params_size": 20,
+  "head_offset": 12,
+  "force_offset": 16,
+  "nvbool_size": 1,
+  "vectors": "Original C: Off and On, explicit head1 and force monitor state; zero C padding, actual20-byte native layout and24-byte RM envelope.",
+  "license": "MIT NVIDIA unmodified headers; original generator Apache-2.0. Not a firmware behavioral oracle."
+}

@@ -249,6 +249,10 @@ pub const Owner = struct {
 };
 
 pub const Phase = enum { inspect, count_bindings, allocate, pushes, bindings, context, submit, wait, done };
+// A metadata turn copies/validates at most sixteen entries. Each entry still
+// uses the canonical queue and VA owner; no RM operation or submitted work
+// joins this batch. The common producer scheduler yields after the turn.
+const metadata_quantum = 16;
 pub fn activityForEngines(mask: u32) runtime.power.policy.Activity {
     if (!@import("gsp_fifo_wire.zig").validNativeEngines(mask)) return .{};
     return .{
@@ -333,7 +337,7 @@ pub const Job = struct {
             try self.finish(run, a.gfx_queue_result_cancelled);
             return true;
         }
-        const progress = self.advance(run) catch |err| {
+        const progress = self.advanceMetadata(run) catch |err| {
             if (err == error.Busy) {
                 if (self.waited) return false;
                 run.yieldWork() catch |yield_error| {
@@ -352,6 +356,22 @@ pub const Job = struct {
         self.waited = false;
         if (self.phase != .wait and self.phase != .done) try run.yieldWork();
         return true;
+    }
+    fn advanceMetadata(self: *Job, run: *runtime.Owner) !bool {
+        var progress = false;
+        for (0..metadata_quantum) |_| {
+            const before = self.phase;
+            const advanced = try self.advance(run);
+            progress = progress or advanced;
+            // Stop at every phase boundary. Allocation, context admission,
+            // publication and physical completion keep their own turns.
+            if (!advanced or self.phase != before) break;
+            switch (before) {
+                .count_bindings, .pushes, .bindings => {},
+                else => break,
+            }
+        }
+        return progress;
     }
     fn advance(self: *Job, run: *runtime.Owner) !bool {
         switch (self.phase) {
