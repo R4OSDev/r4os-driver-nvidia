@@ -642,6 +642,9 @@ const WorkFixture = struct {
     var completion_wait_error: i32 = 0;
     var stop_during_wait = false;
     var complete_before_timeout = false;
+    var pause_during_wait = false;
+    var pause_attempt_succeeded = false;
+    var cancels: u32 = 0;
     fn reset() void {
         task = .{}; ticks = 0; owner = false; busy = 0; release_busy = 0;
         submits = 0; releases = 0; callbacks = 0; active = 0; result = 0; cancelled = false;
@@ -652,6 +655,7 @@ const WorkFixture = struct {
         semaphore_waits = 0; wait_timeouts = @splat(0);
         defer_callback = false; pending_handler = null; pending_raw = 0; pending_running = false;
         completion_waits = 0; completion_wait_error = 0; stop_during_wait = false; complete_before_timeout = false;
+        pause_during_wait = false; pause_attempt_succeeded = false; cancels = 0;
     }
     fn threads(out: *a.DriverThreadApi) callconv(.c) i32 {
         out.* = .{ .start = @intFromPtr(&start), .stop = @intFromPtr(&stopTask),
@@ -723,6 +727,17 @@ const WorkFixture = struct {
     fn completionWait(handle: u32, timeout: u64, out: *i32) callconv(.c) i32 {
         std.debug.assert(handle == active and timeout != 0 and !owner and pending_handler != null);
         completion_waits += 1;
+        if (pause_during_wait) {
+            pause_during_wait = false;
+            const work: *@import("gsp_start_work.zig").Work = @ptrFromInt(pending_raw);
+            // Model the shutdown caller while this task is already asleep
+            // on Work, which thread stop alone does not cancel. The first
+            // join cannot succeed until this retained ticket really ends.
+            join_result = -7;
+            pause_attempt_succeeded = work.pause();
+            join_result = 0;
+            if (cancelled) { out.* = result; return a.driver_work_result_cancelled; }
+        }
         if (completion_wait_error != 0) {
             const error_code = completion_wait_error; completion_wait_error = 0;
             if (stop_during_wait) {
@@ -757,6 +772,13 @@ const WorkFixture = struct {
         if (release_busy != 0) { release_busy -= 1; return -2; }
         active = 0; releases += 1; return 0;
     }
+    fn cancel(handle: u32) callconv(.c) i32 {
+        cancels += 1;
+        if (handle != active or active == 0) return -1;
+        if (pending_handler == null or pending_running) return -2;
+        pending_handler = null; cancelled = true; result = a.driver_work_result_cancelled;
+        return 0;
+    }
     fn tick() callconv(.c) u64 { return ticks; }
     fn frequency() callconv(.c) u32 { return frequency_hz; }
     fn wait(count_ticks: u64) callconv(.c) void {
@@ -776,6 +798,7 @@ const WorkFixture = struct {
         api.driver_work_submit_owned = submit;
         api.driver_completion_status = status; api.driver_completion_release = release;
         api.driver_completion_wait = completionWait;
+        api.driver_work_cancel = cancel;
         api.tick_count = tick; api.timer_frequency = frequency; api.wait_ticks = wait;
         api.resource_query = WorkFixture.resources;
         return api;
@@ -792,7 +815,7 @@ test "NVIDIA actual driver lifecycle paces hardware under owned work and retains
     target.* = .{ .self_address = @intFromPtr(target), .stopped = true };
     var api = WorkFixture.table();
     const ctx = r4os.r4dev.DriverContext.init(&api);
-    for (0..16) |scenario| {
+    for (0..18) |scenario| {
         WorkFixture.reset();
         var work: worker.Work = .{};
         try work.start(&ctx, target);
@@ -821,6 +844,11 @@ test "NVIDIA actual driver lifecycle paces hardware under owned work and retains
                 WorkFixture.defer_callback = true;
                 WorkFixture.completion_wait_error = 1;
                 WorkFixture.complete_before_timeout = true;
+            },
+            16, 17 => {
+                WorkFixture.defer_callback = true;
+                WorkFixture.pause_during_wait = true;
+                WorkFixture.pending_running = scenario == 17;
             },
             else => unreachable,
         }
@@ -905,6 +933,16 @@ test "NVIDIA actual driver lifecycle paces hardware under owned work and retains
                 try t.expectEqual(@as(u32, 1), WorkFixture.releases);
                 try t.expectEqual(@as(u32, 0), work.completion);
                 try t.expectEqual(@as(u64, WorkFixture.frequency_hz), WorkFixture.ticks);
+            },
+            16, 17 => {
+                try t.expectEqual(@as(i32, if (scenario == 16) a.driver_work_result_cancelled else 0), result);
+                try t.expect(!WorkFixture.pause_attempt_succeeded);
+                try t.expectEqual(@as(u32, 1), WorkFixture.cancels);
+                try t.expectEqual(@as(u32, if (scenario == 16) 0 else 1), WorkFixture.callbacks);
+                try t.expectEqual(@as(u32, 1), WorkFixture.releases);
+                try t.expectEqual(@as(u32, 0), work.completion);
+                try t.expectEqual(@as(u32, 0), WorkFixture.semaphore_destroys);
+                try t.expect(work.pause());
             },
             else => unreachable,
         }

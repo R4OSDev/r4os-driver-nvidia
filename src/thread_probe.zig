@@ -4,6 +4,8 @@ const a = r4os.abi;
 const heap = @import("rm_heap.zig");
 const clock = @import("rm_clock.zig");
 const ThreadContext = r4os.r4dev.DriverThreadContext;
+const PacingWork = @import("gsp_start_work.zig").Work;
+const PacingDevice = @import("gsp_device.zig").Device;
 
 // Explicit runtime-check only. These counts describe this short diagnostic,
 // never a driver/runtime capacity. All callbacks use resident CPU services.
@@ -24,6 +26,8 @@ var prepared = false;
 var close_prepared = false;
 var cpu_mask: u32 = 0;
 var join_target: u64 = 0;
+var queued_pacing: PacingWork = .{};
+var queued_device: ?*PacingDevice = null;
 
 pub fn start(ctx: *const r4os.r4dev.DriverContext) bool {
     if (api != null) return false;
@@ -79,6 +83,7 @@ pub fn start(ctx: *const r4os.r4dev.DriverContext) bool {
         if (service.status(old, &stale) != a.driver_thread_error_stale) return failed(ctx, "stale");
     }
     if (@popCount(cpu_mask) < 2 or @atomicLoad(u32, &work_done, .acquire) != 0) return failed(ctx, "independent-progress");
+    if (!queuedPacingStop(ctx)) return failed(ctx, "queued-pacing-stop");
     @atomicStore(u32, &work_gate, 1, .release);
     var work_result: i32 = 0;
     if (!finishWork(ctx, &work_result) or work_result != 0) return failed(ctx, "work-complete");
@@ -131,6 +136,7 @@ pub fn shutdown(ctx: *const r4os.r4dev.DriverContext) bool {
     const service = threads orelse return true;
     @atomicStore(u32, &go, 1, .release);
     @atomicStore(u32, &work_gate, 1, .release);
+    if (!closeQueuedPacing()) return false;
     var correct = true;
     for (handles) |handle| {
         if (handle != 0 and service.stop(handle) != 0) return false;
@@ -164,6 +170,44 @@ pub fn shutdown(ctx: *const r4os.r4dev.DriverContext) bool {
     // CPU/GPU resource providers stay bound until this function has quiesced.
     threads = null;
     api = null;
+    return true;
+}
+
+fn queuedPacingStop(ctx: *const r4os.r4dev.DriverContext) bool {
+    if (queued_device != null or queued_pacing.self_address != 0) return false;
+    const pointer = heap.r4nv_heap_allocate(@sizeOf(PacingDevice)) orelse return false;
+    const target: *PacingDevice = @ptrCast(@alignCast(pointer));
+    queued_device = target;
+    // Resident CPU-only stopped target, initialized directly without putting
+    // the large native graph on the 64-KB task stack. No firmware/PCI/DMA
+    // owner is created; the shared worker remains blocked throughout.
+    @memset(@as([*]u8, @ptrCast(pointer))[0..@sizeOf(PacingDevice)], 0);
+    target.self_address = @intFromPtr(target);
+    target.stopped = true;
+    target.phase = .failed;
+    queued_pacing.start(ctx, target) catch return false;
+    const started = ctx.tickCount();
+    var pending: u32 = 0;
+    while (true) {
+        pending = @atomicLoad(u32, &queued_pacing.completion, .acquire);
+        if (pending != 0) break;
+        if (ctx.tickCount() -% started >= timeout(ctx)) return false;
+        ctx.waitTicks(1);
+    }
+    var status: a.DriverCompletionStatus = .{};
+    if (ctx.completionStatus(pending, &status) != 0 or status.state != a.driver_work_state_queued or
+        status.owner != work_owner or @atomicLoad(u32, &work_done, .acquire) != 0) return false;
+    if (!closeQueuedPacing() or @atomicLoad(u32, &work_done, .acquire) != 0) return false;
+    ctx.logInfo("NVIDIA runtime-check: queued-pacing-stop=OK work=cancelled shared-worker=blocked task=retired resources=retained-until-join");
+    return true;
+}
+
+fn closeQueuedPacing() bool {
+    if (!queued_pacing.pause() or !queued_pacing.finishPause()) return false;
+    if (queued_device) |pointer| {
+        heap.r4nv_heap_free(pointer);
+        queued_device = null;
+    }
     return true;
 }
 

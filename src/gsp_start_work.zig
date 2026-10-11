@@ -55,9 +55,15 @@ pub const Work = struct {
         if (self.task != 0) {
             const service = self.threads.?;
             if (service.stop(self.task) != 0) return false;
+            // Thread stop only wakes thread-service waits. The pacing task
+            // can already be asleep on an owned Work completion, behind a
+            // busy shared lane. Cancel only its exactly published queued
+            // ticket before joining. Running work still needs its real end.
+            const pending = @atomicLoad(u32, &self.completion, .acquire);
+            if (pending != 0) _ = self.ctx.?.workCancel(pending);
             var result: i32 = 0;
             if (service.join(self.task, @max(self.ctx.?.timerFrequency(), 1), &result) != 0) return false;
-            if (self.completion != 0) return false;
+            if (@atomicLoad(u32, &self.completion, .acquire) != 0) return false;
             // Callback completion precedes exact Task retirement. Allow that
             // existing bounded handoff; any other error retains this owner.
             const ctx = self.ctx.?;
@@ -70,11 +76,11 @@ pub const Work = struct {
             }
             self.task = 0;
         }
-        return self.completion == 0;
+        return @atomicLoad(u32, &self.completion, .acquire) == 0;
     }
     pub fn finishPause(self: *Work) bool {
         if (self.self_address == 0) return true;
-        if (self.self_address != @intFromPtr(self) or self.task != 0 or self.completion != 0 or
+        if (self.self_address != @intFromPtr(self) or self.task != 0 or @atomicLoad(u32, &self.completion, .acquire) != 0 or
             @atomicLoad(u32, &self.stopping, .acquire) == 0) return false;
         const target = self.device orelse return false;
         if (target.interrupts.self_address != 0 and !target.interrupts.closed) return false;
@@ -103,11 +109,16 @@ pub const Work = struct {
         while (@atomicLoad(u32, &self.stopping, .acquire) == 0) {
             // Ordinary Work carries a driver identity but no lifecycle guard;
             // it cannot query the boot hold or perform display/MMIO operations.
-            if (self.completion == 0) @atomicStore(u32, &self.completion_disposition, std.math.maxInt(u32), .release);
-            if (self.completion != 0 or ctx.workSubmitOwned(slice, raw, &self.completion) != 0 or self.completion == 0) {
+            if (@atomicLoad(u32, &self.completion, .acquire) == 0) @atomicStore(u32, &self.completion_disposition, std.math.maxInt(u32), .release);
+            var completion: u32 = 0;
+            if (@atomicLoad(u32, &self.completion, .acquire) != 0 or ctx.workSubmitOwned(slice, raw, &completion) != 0 or completion == 0) {
                 ctx.logError("NVIDIA gsp-start: pacing=failed reason=work-admission device=retained");
                 return -1;
             }
+            // API output is task-local. Shutdown must never race a plain
+            // output-pointer write; publication names the exact retained
+            // ticket, and finish handles stop before this publication too.
+            @atomicStore(u32, &self.completion, completion, .release);
             var result: i32 = 0;
             if (!self.finish(&result)) {
                 ctx.logError("NVIDIA gsp-start: pacing=failed reason=work-completion device=retained");
@@ -150,9 +161,10 @@ pub const Work = struct {
         const ctx = self.ctx.?;
         const started_at = ctx.tickCount();
         const bound = @max(ctx.timerFrequency(), 1);
+        const completion = @atomicLoad(u32, &self.completion, .acquire);
         while (true) {
             var status: a.DriverCompletionStatus = .{};
-            const queried = ctx.completionStatus(self.completion, &status);
+            const queried = ctx.completionStatus(completion, &status);
             if (queried != 0) return self.failedCompletion("status", queried, status, started_at);
             if (status.state == a.driver_work_state_completed or status.state == a.driver_work_state_cancelled) {
                 var disposition = status.result;
@@ -164,10 +176,10 @@ pub const Work = struct {
                     if (published > 3) return self.failedCompletion("disposition", 0, status, started_at);
                     disposition = @intCast(published);
                 }
-                const released = ctx.completionRelease(self.completion);
+                const released = ctx.completionRelease(completion);
                 if (released == 0) {
                     result.* = disposition;
-                    self.completion = 0;
+                    @atomicStore(u32, &self.completion, 0, .release);
                     @atomicStore(u32, &self.completion_disposition, std.math.maxInt(u32), .release);
                     return true;
                 }
@@ -175,14 +187,14 @@ pub const Work = struct {
                 // ticket until release succeeds or this bounded wait expires.
                 if (released != -2) return self.failedCompletion("release", released, status, started_at);
             } else if (status.state == a.driver_work_state_queued or status.state == a.driver_work_state_running) {
-                if (@atomicLoad(u32, &self.stopping, .acquire) != 0 and status.state == a.driver_work_state_queued) _ = ctx.workCancel(self.completion);
+                if (@atomicLoad(u32, &self.stopping, .acquire) != 0 and status.state == a.driver_work_state_queued) _ = ctx.workCancel(completion);
                 const elapsed = ctx.tickCount() -% started_at;
                 if (elapsed >= bound) return self.failedCompletion("deadline", 1, status, started_at);
                 // The dedicated task sleeps on this exact completion. Its
                 // physical callback and publication wake it immediately;
                 // periodic status polling would add a tick to every turn.
                 var waited_result: i32 = 0;
-                const waited = ctx.completionWait(self.completion, bound - elapsed, &waited_result);
+                const waited = ctx.completionWait(completion, bound - elapsed, &waited_result);
                 if (waited == 0 or waited == a.driver_work_result_cancelled) continue;
                 if (waited == 1) {
                     // A timeout wake can race the real callback's final
@@ -190,7 +202,7 @@ pub const Work = struct {
                     // state still needs its actual disposition and release.
                     // Running/queued work keeps the original expired bound.
                     var raced: a.DriverCompletionStatus = .{};
-                    const checked = ctx.completionStatus(self.completion, &raced);
+                    const checked = ctx.completionStatus(completion, &raced);
                     if (checked == 0 and (raced.state == a.driver_work_state_completed or
                         raced.state == a.driver_work_state_cancelled)) continue;
                     return self.failedCompletion("wait-timeout", if (checked == 0) waited else checked, raced, started_at);
@@ -208,11 +220,12 @@ pub const Work = struct {
     fn failedCompletion(self: *const Work, phase: []const u8, result: i32, previous: a.DriverCompletionStatus, started_at: u64) bool {
         const ctx = self.ctx.?;
         var live: a.DriverCompletionStatus = .{};
-        const queried = ctx.completionStatus(self.completion, &live);
+        const completion = @atomicLoad(u32, &self.completion, .acquire);
+        const queried = ctx.completionStatus(completion, &live);
         var bytes: [340]u8 = undefined;
         const message = std.fmt.bufPrintZ(&bytes,
             "NVIDIA work-completion: phase={s} code={d} ticket={d} prior-state={d} live-status={d} live-state={d} live-result={d} disposition={d} elapsed-ticks={d} stopping={d}",
-            .{ phase, result, self.completion, previous.state, queried, live.state, live.result,
+            .{ phase, result, completion, previous.state, queried, live.state, live.result,
                 @atomicLoad(u32, &self.completion_disposition, .acquire), ctx.tickCount() -% started_at,
                 @atomicLoad(u32, &self.stopping, .acquire) }) catch return false;
         ctx.logError(message.ptr);

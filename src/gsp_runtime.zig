@@ -818,8 +818,6 @@ pub const Owner = struct {
     /// existing RM/session resources. It is not physical GPU quiescence.
     pub fn stop(self: *Owner, err: anyerror) void {
         if (self.self_address == 0 or self.self_address != @intFromPtr(self) or self.failure != null) return;
-
-
         self.logResidency();
         self.allocations.close();
         self.virtual_provider.close();
@@ -4684,7 +4682,11 @@ pub const Owner = struct {
         const source = work.addresses[0] orelse return error.State;
         var plan: ?vram.surface.Plan = null;
         if (descriptor.location == a.gfx_buffer_location_device_local) {
-            const resource = try self.queuedGraphicsResource(work.references[0]);
+            // This image already belongs to the retained public CE job.
+            // Pending cursor PIO may hide fresh nativeAddressSpace access;
+            // authenticate its operand in the exact command channel instead.
+            const fifo = try self.findChannel(work.channel_handle);
+            const resource = try self.queuedGraphicsResourceInSpace(work.references[0], fifo.config.context.vaspace);
             _ = try render_job.image(resource, false);
             // bufferReserve binds the common BO to its confirmed driver
             // owner. Keep the immutable geometry plan unbound, but compare

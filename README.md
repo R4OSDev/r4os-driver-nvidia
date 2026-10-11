@@ -1,5 +1,11 @@
 ﻿# NVIDIA.R4D
 
+0.1.312 cancels the exact published queued pacing Work ticket before joining
+its stopped task. Thread stop alone does not wake Work completion waits.
+Atomic publication covers enqueue/pause races; running work and incomplete
+release still retain the task, semaphore and native device. The existing
+lifecycle model and explicit runtime-check cover a blocked shared lane.
+
 Roadmap0.82.37 / restored original-console terminal lifetime: reconstruction
 keeps a new private firmware/C67D graph resident after the common owner has
 returned to bootfb. It publishes no new public GPU queue. System shutdown
@@ -586,6 +592,11 @@ uses the existing depth-one common queue and receives Busy/failed/lost results.
 No per-frame allocation, table update or selected-image log is needed after
 the group is populated. Confirmation/rollback retires every outgoing image,
 including owned shadow aliases, mappings, RAMHT and native storage.
+Native image-to-output jobs validate their retained source in the exact CE
+channel's VA space. Pending cursor PIO can hide admission of new native VA
+users without invalidating this already owned image. Descriptor, owner,
+reference, geometry and address checks still bind the same operand; this
+lookup grants no fresh mapping or execution lease.
 The optional shared presentation snapshot reports acquire, CE completion,
 Window submission, visibility and previous-image FINISHED separately. The
 latest visible receipt retains its source queue fence, raw GPU timestamp and

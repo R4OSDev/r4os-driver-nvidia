@@ -6508,6 +6508,33 @@ fn checkComposedNativeImage(target: *@import("gsp_device.zig").Device) !void {
             if (run.copy_job != null and run.copy_job.?.submitted) break;
         }
         try t.expect(run.copy_job != null and run.copy_job.?.submitted and copy.initial_read.lease.id == 0);
+        {
+            // Cursor PIO hides admission of new native VA users. A retained
+            // image-to-output job must still validate its exact CE operands,
+            // without granting fresh VA access or publishing another slice.
+            const work = run.copy_job.?;
+            const work_deadline = work.deadline;
+            const transfer = work.transfer.?;
+            const point = fifo.ring.issued;
+            const put = fifo.ring.put;
+            const held = copy.heldReferences();
+            const sent = target.session.?.tx_sequence;
+            try t.expect(run.cursor_point == null);
+            run.cursor_point = 17;
+            defer run.cursor_point = null;
+            try t.expect(run.nativeAddressSpace() == null);
+            for (0..3) |_| try t.expectEqualDeep(transfer, try run.copyTransfer());
+            const bound = native.slots[source_index].descriptor;
+            native.slots[source_index].descriptor.driver_owner += 1;
+            try t.expectError(error.Stale, run.copyTransfer());
+            native.slots[source_index].descriptor = bound;
+            try t.expectEqualDeep(transfer, try run.copyTransfer());
+            try t.expect(run.copy_job.? == work and work.submitted and work.deadline == work_deadline and
+                copy.heldReferences() == held and copy.completed == completed and
+                fifo.ring.issued == point and fifo.ring.put == put and
+                target.session.?.tx_sequence == sent and run.failure == null and target.phase == .ready);
+            std.debug.print("[nvidia-present-cursor-validation] layout={s}; pending PIO hides fresh VA, exact retained CE image validates; wrong owner rejected; no new publication/RPC/completion\n", .{@tagName(layout)});
+        }
         // The public owner is bound by the kernel, while the authenticated
         // allocation plan stays unchanged. Wrong owners and geometry still
         // fail before any additional CE command can be admitted.
