@@ -191,8 +191,10 @@ channels, private initial clear and exact fault/normal retirement on186/235.
 Active output and manual criteria remain separate.
 The automatic path inventories NVIDIA display functions once through
 the kernel PCI inventory. Explicit diagnostic/start modes are described below.
-Starting with R4OS 0.79.9, `IMAGE_SCOPE=slim` includes the current module in
-Slim and Full. Since 0.79.42 the standard configuration selects `mode=auto`.
+Since the 0.82.44 driver cut, `IMAGE_SCOPE=none` keeps NVIDIA, R4NV and R4NAK
+out of standard images. `Build.sh image Full -GraphicsVendor nvidia` in the
+Distribution repository explicitly includes the stack. Standard releases use
+`GRAPHICS=SOFTWARE`; native startup needs an explicit `GRAPHICS=AUTO` setting.
 Auto (also an absent mode option) follows the native start path only after
 the effective boot policy, measured boot adapter, chip/board and pinned local
 firmware checks succeed. Unknown/ambiguous hardware preserves the fallback.
