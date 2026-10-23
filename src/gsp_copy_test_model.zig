@@ -87,6 +87,9 @@ pub const Model = struct {
     var additional_shadow_live = false;
     var additional_shadow_cpu = false;
     var registration: ?a.GfxBackendRegistration = null;
+    pub var profile_result: i32 = a.gfx_queue_ok;
+    pub var profile_calls: u32 = 0;
+    pub var unprofiled_calls: u32 = 0;
     var fetched = false;
     var executed = false;
     var signaled = false;
@@ -100,6 +103,7 @@ pub const Model = struct {
         present_mode = false; product_mode = false; render_mode = false; render_operations = 13; shadow_cpu = false; shadow_creates = 0;
         direct_mode = false; scanouts = @splat(null); next_point = 0;
         shadow_live = false; registration = null; decoded_count = 0; presentation_wakes = 0;
+        profile_result = a.gfx_queue_ok; profile_calls = 0; unprofiled_calls = 0;
         additional_shadow = false; additional_shadow_live = false; additional_shadow_cpu = false; additional_descriptor = null;
         mode_descriptor = null; mode_lent = false;
         initial_read = .{}; reject_initial_read = false; reject_initial_release = false;
@@ -325,7 +329,7 @@ pub const Model = struct {
         job.row_count = rows; job.source_pitch = source_pitch; job.target_pitch = target_pitch;
     }
     fn queue(out: *a.GfxDriverQueueApi) callconv(.c) i32 { out.* = .{ .size = if (product_mode or present_mode or render_mode) @sizeOf(a.GfxDriverQueueApi) else 64,
-        .register_backend = @intFromPtr(&register), .register_profile = if (product_mode) @intFromPtr(&registerProfile) else 0,
+        .register_backend = @intFromPtr(&registerUnprofiled), .register_profile = if (product_mode or present_mode or render_mode) @intFromPtr(&registerProfile) else 0,
         .update_operations = if (product_mode or present_mode or render_mode) @intFromPtr(&updateOperations) else 0,
         .read_render_list = if (render_mode) @intFromPtr(&readRenderList) else 0,
         .read_render_grid_list = if (render_mode) @intFromPtr(&readRenderGridList) else 0,
@@ -355,16 +359,22 @@ pub const Model = struct {
     }
     fn registerProfile(input: *const a.GfxBackendRegistration, profile: *const a.GfxBackendProfile, out: *a.GfxBackendBinding) callconv(.c) i32 {
         const nv = @import("r4nv_binding");
-        std.debug.assert(product_mode and profile.version == 1 and profile.size == 96 and profile.data_bytes == 32 and
+        profile_calls += 1;
+        std.debug.assert((product_mode or present_mode) and profile.version == 1 and profile.size == 96 and profile.data_bytes == 32 and
             profile.interface_id_lo == nv.backend_v1_header.interface_id_lo and profile.interface_id_hi == nv.backend_v1_header.interface_id_hi and profile.revision == 1);
         const details = std.mem.bytesToValue(nv.R4NvDriverProfile, profile.data[0..32]);
         std.debug.assert(details.version == 1 and details.size == 32 and details.vendor_id == 0x10de and
             (details.copy_class == 0xc6b5 or details.copy_class == 0xc7b5) and details.rm_release == nv.rm_release and details.command_abi == nv.command_abi and
             details.reserved0 == 0 and details.reserved1 == 0);
         for (profile.data[32..]) |byte| std.debug.assert(byte == 0);
-        return register(input, out);
+        if (profile_result != a.gfx_queue_ok) return profile_result;
+        return registerOwned(input, out);
     }
-    fn register(input: *const a.GfxBackendRegistration, out: *a.GfxBackendBinding) callconv(.c) i32 {
+    fn registerUnprofiled(input: *const a.GfxBackendRegistration, out: *a.GfxBackendBinding) callconv(.c) i32 {
+        unprofiled_calls += 1;
+        return registerOwned(input, out);
+    }
+    fn registerOwned(input: *const a.GfxBackendRegistration, out: *a.GfxBackendBinding) i32 {
         std.debug.assert((present_mode or product_mode) and registration == null and input.adapter_id == binding.adapter_id and input.operations == 9 and
             input.milestone == binding.milestone and input.notify_callback != 0 and input.context != 0);
         registration = input.*; out.* = binding; return a.gfx_queue_ok;

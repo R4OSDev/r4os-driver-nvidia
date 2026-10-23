@@ -2710,8 +2710,7 @@ pub const Owner = struct {
             .milestone = r4os.abi.gfx_queue_milestone_device_execution, .operations = 9, .memory_generation = self.epoch,
             .notify_callback = @intFromPtr(&notifyCopyBackend), .context = @intFromPtr(self) };
         var binding: r4os.abi.GfxBackendBinding = .{};
-        var result = queue.registerProfile(&registration, &profile, &binding);
-        if (result == r4os.abi.err_no_fn) result = queue.register(&registration, &binding);
+        const result = queue.registerProfile(&registration, &profile, &binding);
         if (result != r4os.abi.gfx_queue_ok and binding.device_generation == 0) return error.Queue;
         // Keep a returned identity even after a malformed/uncertain response.
         // Only the existing quarantine/reset path may retire this backend.

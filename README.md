@@ -1,5 +1,12 @@
 ﻿# NVIDIA.R4D
 
+0.1.314 requires the current profiled common queue registration. Missing
+profile support is refused; no unprofiled backend is substituted. The actual
+memory epoch remains explicit, and returned identities on uncertain failure
+still remain owned until the existing quarantine/reset acknowledgement.
+The current normal kernel already supplies this provider; hardware-family,
+firmware, shutdown and resource-retirement contracts are unchanged.
+
 0.1.312 cancels the exact published queued pacing Work ticket before joining
 its stopped task. Thread stop alone does not wake Work completion waits.
 Atomic publication covers enqueue/pause races; running work and incomplete

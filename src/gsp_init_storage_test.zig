@@ -12292,7 +12292,16 @@ fn checkInitialPresentation(target: *@import("gsp_device.zig").Device, table: *a
     model.installPresentation(table, source_index, 65, 20);
     target.running.memory_api = target.ctx.?.memory();
     target.irq_wake = .{ .context = @intFromPtr(target), .signal = model.wakePresentation };
+    // Missing current profile registration must not publish an unprofiled
+    // substitute or lose the already-owned channel/display resources.
+    try t.expect(running.copy_backend == null);
+    model.profile_result = a.err_no_fn;
+    try t.expectError(error.Queue, running.registerCopyBackend(handle, deadline));
+    try t.expect(running.copy_backend == null and running.presentation == null and
+        model.profile_calls == 1 and model.unprofiled_calls == 0);
+    model.profile_result = a.gfx_queue_ok;
     const binding = try running.registerDisplayPresentation(handle, root, window_handle, dma, model.shadowReference(), deadline);
+    try t.expect(model.profile_calls == 2 and model.unprofiled_calls == 0);
     try t.expect(std.meta.eql(binding, model.binding) and running.presentation.?.surface.valid());
     try t.expectError(error.Busy, running.registerDisplayPresentation(handle, root, window_handle, dma, model.shadowReference(), deadline));
     model.closeShadow(); // The driver must import its own alias, not the closed creator.
