@@ -184,6 +184,7 @@ pub const GraphicsWork = struct {
     queued: bool = false,
     diagnostic_timeout: bool = false,
     cursor_sequence: u64 = 0,
+    packet_rebound: bool = false,
 };
 pub const batch_job = @import("gsp_batch_job.zig");
 pub const BatchWork = struct {
@@ -449,6 +450,7 @@ pub const Owner = struct {
     graphics_starting: bool = false,
     graphics_completed: u64 = 0,
     graphics_cursor_completed: u64 = 0,
+    graphics_rebound_completed: u64 = 0,
     cursor_step_count: u64 = 0,
     cursor_step_ns: u64 = 0,
     cursor_sample: ?@import("gsp_cursor_pio.zig").Sample = null,
@@ -4069,6 +4071,7 @@ pub const Owner = struct {
         };
         work.command = .{ .draw = work.resources.command.? };
         if (self.cursor_point) |slot| work.cursor_sequence = self.display_channels[slot].?.point.pending.?.sequence;
+        work.packet_rebound = self.graphics_cache.last_reuse_rebound;
     }
     pub fn cancelQueuedGraphicsAdmission(self: *Owner, input: *render_queue.Owner) !void {
         try self.queuedRender(input);
@@ -4155,6 +4158,12 @@ pub const Owner = struct {
             if (try fifo.ring.poll() >= work.ticket.?.point) {
                 if (!work.resources.close(true)) return error.Retained;
                 work.receipt = .{ .channel = work.channel_handle, .point = work.ticket.?.point, .completed_ns = current };
+                if (work.queued and work.packet_rebound) {
+                    self.graphics_rebound_completed +|= 1;
+                    if (self.graphics_rebound_completed == 1) self.log(
+                        "NVIDIA render-cache: rebound-completed epoch={d} GR-point={d} packet-point={d} rebinds={d} completed-ns={d}",
+                        .{self.epoch,work.ticket.?.point,self.graphics_cache.packet_point,self.graphics_cache.packet_rebinds,current});
+                }
                 if (work.queued and work.cursor_sequence != 0) {
                     self.graphics_cursor_completed +|= 1;
                     if (self.graphics_cursor_completed == 1) {

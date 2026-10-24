@@ -1,6 +1,60 @@
 ﻿NVIDIA: nativer Grafik- und Displaybesitzer
 =========================================
 
+0.87.7 / NVIDIA331 / 24.10.2026:
+Ein Renderabschnitt umfasst hoechstens1048576 Pixel statt262144. Derselbe
+1080p-Auftrag braucht dadurch zwei statt acht CPU-gesteuerte GR-Abschnitte.
+Die vorhandene16er-Liste fasst auch Teilzeilen zusammen; Ziel-/Quellrechteck,
+ganzzahliges Samplegrid und Zeichenreihenfolge bleiben erhalten. Nach echter
+GR-Quittung gibt der Auftrag seinen Produzententurn weiter. Acht zugelassene
+Auftraege, getrennte Produzenten-/Jobturns, originaler Deadline-/Abbruch-/
+Resetvertrag und das CE-Bytequantum1MB bleiben erhalten. Der groessere
+Abschnitt ist GPU-Arbeit und haelt den CPU-Worker nicht bis zum Ende fest.
+Geaenderter GR-Scissor verlangt kein neues Deskriptor-/Vertexpaket, wenn die
+vollstaendige kanonische Kodierung unveraendert bleibt. Der NVIDIA-Cache
+validiert erst die ganze neue Bindingliste einschliesslich aller Speicher-
+und Aliasgrenzen, vergleicht dann hoechstens16 Paare zu je1280Byte und bindet
+erst nach vollstaendiger Gleichheit die neue GR-Metadatenliste. Zwei private
+CPU-Puffer zu je1280Byte begrenzen den Zusatzspeicher. Die GPU-Pakete werden
+dabei nicht beschrieben, ihre echten Uploadpunkte bleiben erhalten. Der
+vorhandene128KB-GPU-Cache waechst nicht; Borrow-/Upload-/Epochengrenzen gelten
+vor jeder Wiederverwendung. Andere Listenlaenge oder geaenderte Paketbytes
+brauchen weiterhin den normalen CE-Upload. Keine R4NV-/Plattform-ABI-Aenderung.
+`NVIDIA render-cache: rebound-completed` wird erst nach echtem GR-Ende und
+Freigabe der genauen Arbeitsleihen ausgegeben; die Meldung ist kein Timing-
+oder optischer Nachweis. Sie trennt verwendete bytegleiche Pakete von einer
+blossen CPU-Vorbereitung.
+Die bestehende Complete-run-Gruppe besteht1/1. Ihr Originalfall behaelt CE6/
+GR6 mit erzwungenen kleinen Quanten, allen echten Semaphoren, einer einzigen
+oeffentlichen Quittung und Cursoraufnahme zwischen physischen Abschnitten.
+Die ergaenzte1080p-Probe prueft vollstaendige lueckenlose Rasterabdeckung
+einschliesslich Teilzeilen, Pixelbudget sowie gleiche Ziel-/Quell-/Gridwerte
+fuer8 gegen2 Abschnitte. Der warme Originalcache prueft Scissorneubindung
+ohne CE-PUT/Uploadpunktwechsel, Busy bei ausgeliehenem Paket und Ablehnung
+eines Ziel-/Paketalias ohne Veraenderung der vorigen gueltigen Bindung.
+OssiPC16 ist regulär auf Release0.87.7/NVIDIA331 neu gestartet. Bereits der
+Desktopstart liefert den echten GR-Abschluss mit bytegleichem weitergenutztem
+Paket: Epoche1, GR-Punkt3, unveraenderter Paket-Uploadpunkt26, Neubindung1.
+Der ruhende Originalvergleich besteht14x2 Szenen, CE82/GR28 und87808 Bytes
+bei originalen Toleranzen,28 Freigaben vor dem Warten und voller Ressourcen-/
+Laufzeitbalance. Das belegt verwendete GPU-Arbeit, keinen Zeitgewinn.
+Ein zusaetzlicher normaler Explorerfall bleibt als GUI-Befund fuer0.87.8
+offen: Fenster1/Instanz40 war gebunden, GUI-Revision2 blieb waehrend384
+Mauspositionen gleich und der externe Abschlussleser erhielt keine gueltige
+Completion. Spaeter Fensterzahl0, keine stop-work-Meldung, keine offenen BO-
+Abbau-/Retentionsbytes, gleicher Reset1 und aktiver sichtbarer Cursor223/223.
+Erste veroeffentlichte GUI-Framebereitschaft und das Rennen des Beobachters
+gegen den Desktop-Reaper sind zu unterscheiden; daraus folgt kein belegter
+Treiberstillstand. Keine optische oder vollstaendige GUI-Abnahme aus Zaehlern.
+Finaler KVM4-STANDARD b43554b7-ee2f-4203-a76a-dfc360390a6a: Suite3,30Samples,
+vier vollstaendige Worker und sechs gueltige Scores mit unveraendertem
+vollstaendigem DevCenter-Readback; Gesamtindex149.3836. Originalexport:
+Artifacts/Distribution/Diagnostics/SpectraStandard/
+b43554b7-ee2f-4203-a76a-dfc360390a6a/run.json. BOOT-ELF gegen Kernel384
+verifiziert; NVIDIA IMAGE_SCOPE=none ist darin nicht ausgefuehrt. Kein
+physischer NVIDIA-Performancevergleich daraus. Kernel384/Desktop160 und
+die R4NV-/R4GFX-Artefakte sind unveraendert; keine neuen Full-/Slim-Images.
+
 0.87.6 / NVIDIA330, Desktop160 und DisplayDiag72 / 24.10.2026:
 Der Rust-Desktop pruefte die erfolgreiche Cursorinfo-Abfrage faelschlich auf0,
 obwohl der oeffentliche Vertrag gfx_output_ok=1 liefert. OssiPC bestaetigte

@@ -28,6 +28,11 @@ pub const Owner = struct {
     program_uploads: u64 = 0,
     packet_uploads: u64 = 0,
     packet_reuses: u64 = 0,
+    packet_rebinds: u64 = 0,
+    last_reuse_rebound: bool = false,
+    // CPU-only bounded comparison; the resident GPU packet is never written.
+    previous_packet: [render.packet_bytes]u8 = undefined,
+    candidate_packet: [render.packet_bytes]u8 = undefined,
     uploaded_bytes: u64 = 0,
 
     pub fn initialize(self: *Owner, epoch: u64) !void {
@@ -60,11 +65,30 @@ pub const Owner = struct {
     }
     pub fn reusePacketList(self: *Owner, draws: []const render.Draw) !bool {
         if (!self.valid() or self.borrowed or self.uploading != null) return error.Busy;
+        self.last_reuse_rebound = false;
         if (self.program_point == 0 or self.packet_point == 0 or self.draw == null) return false;
         // binding verifies generation, backing identity, adapter/owner and
         // address/format bounds before any descriptor bytes can be reused.
         const current = try self.binding();
-        if (!current.matches(draws)) return false;
+        if (!current.matches(draws)) {
+            if (draws.len != 1 + current.additional.len) return false;
+            const candidate: render.Binding = .{ .class = current.class, .draw = draws[0],
+                .additional = draws[1..], .programs = current.programs, .packet = current.packet };
+            try candidate.validate();
+            // Scissors and other GR push state can change without changing
+            // any descriptor/vertex byte. Compare the canonical encodings;
+            // guessing which Draw fields are absent from the packet is unsafe.
+            for (draws, 0..) |draw, index| {
+                try render.packetUpload(if (index == 0) current.draw else current.additional[index-1], &self.previous_packet);
+                try render.packetUpload(draw, &self.candidate_packet);
+                if (!std.mem.eql(u8, &self.previous_packet, &self.candidate_packet)) return false;
+            }
+            self.draw = draws[0];
+            self.additional_count = draws.len - 1;
+            std.mem.copyForwards(render.Draw, self.additional[0..self.additional_count], draws[1..]);
+            self.packet_rebinds +|= 1;
+            self.last_reuse_rebound = true;
+        }
         self.packet_reuses +|= 1;
         return true;
     }
@@ -73,6 +97,7 @@ pub const Owner = struct {
     }
     pub fn beginUploadList(self: *Owner, kind: Kind, draws: []const render.Draw, bytes: []u8) !void {
         if (!self.valid() or self.borrowed or self.uploading != null) return error.Busy;
+        self.last_reuse_rebound = false;
         if ((kind == .programs and draws.len != 0) or
             (kind == .packet and (draws.len == 0 or draws.len > render.batch_capacity))) return error.Descriptor;
         const info = self.buffer(kind).info() orelse return error.State;

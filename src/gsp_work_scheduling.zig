@@ -4,7 +4,9 @@ const std = @import("std");
 const a = @import("r4os").abi;
 pub const capacity = 8;
 pub const copy_bytes = 1024 * 1024;
-pub const render_pixels = 256 * 1024;
+// One finite GPU section, then the existing producer turn after real GR
+// completion. 1080p becomes two sections instead of eight; no unbounded batch.
+pub const render_pixels = 1024 * 1024;
 pub const Producer = struct { kind: u32, id: u64, generation: u64 };
 const Entry = struct { producer: Producer, producer_turn: u64, job_turn: u64 = 0 };
 pub const Owner = struct {

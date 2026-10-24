@@ -10889,9 +10889,11 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
     const fifo = @import("gsp_fifo_test_model.zig").Model;
     const model = @import("gsp_copy_test_model.zig").Model;
     const run = &target.running;
-    errdefer |err| std.debug.print("queued render: {s} phase={?} active={} completed={d} result={d} upload={} submitted={} native={?}\n", .{
-        @errorName(err), if (run.queued_render) |value| value.phase else null, model.active, model.completed, model.result,
+    var checkpoint: []const u8 = "setup";
+    errdefer |err| std.debug.print("queued render: {s} stage={s} scene={d} phase={?} active={} completed={d} result={d} upload={} submitted={} native={?}\n", .{
+        @errorName(err), checkpoint, scene_index, if (run.queued_render) |value| value.phase else null, model.active, model.completed, model.result,
         run.graphics_upload != null, if (run.graphics_upload) |*value| value.operation.submitted else false, run.native_active });
+    errdefer if (@errorReturnTrace()) |trace| std.debug.dumpErrorReturnTrace(trace);
     errdefer if (run.graphics_channel) |channel| {
         const owner = run.fifos[channel.slot].owner.?;
         std.debug.print("queued render GR diagnostic: class={x} expected={x} state={s} idle={} golden={} cache-class={x}\n", .{
@@ -10993,10 +10995,12 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
         try t.expect(try run.beginCopyWork(ce,model.binding,deadline));
         for (0..32) |_| { try stepQueuedRendering(target); if (run.queued_render == null) break; }
         const rejected = &run.faults.records[(run.faults.serial-1)%16];
+        checkpoint = "rejection-ownership";
         try t.expect(target.phase == .ready and run.queued_render == null and model.result == a.gfx_queue_result_failed and
             !model.active and !model.lost and model.heldReferences() == held and run.graphics_completed == before and
             run.graphics_upload == null and run.graphics_work == null and run.fifos[ce.slot].owner.?.ring.put == ce_put and
             run.fifos[target.native_graphics.channel.?.slot].owner.?.ring.put == gr_put);
+        checkpoint = "rejection-journal";
         try t.expect(rejected.source == .host and rejected.kind == .graphics_command and rejected.render_phase == .admission and
             !rejected.fatal and rejected.shader == .none and std.meta.eql(rejected.active_fence,model.job.fence));
     }
@@ -11007,6 +11011,7 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
     var packet_storage: [render.packet_capacity_bytes]u8 = undefined;
     const packet = packet_storage[0..if (batched) render.packet_capacity_bytes else render.packet_bytes];
     for (0..rounds) |round| {
+        checkpoint = "admission";
         const combined = colored and round == 1;
         const completed_copy = model.completed;
         const last = round+1 == rounds;
@@ -11054,6 +11059,7 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
         if (gridded or combined) model.render_grids[15].scale = 0;
         if (colored) model.render_color.words[32] = @bitCast(std.math.nan(f32)); // Retained copy must stay valid.
         if (round == 0) {
+            checkpoint = "cursor-admission";
             // Admit and retain the original queue job, then model a pending
             // cursor PIO point before its unsubmitted operand preparation.
             // This is a CPU admission interleaving, not a cursor IRQ receipt.
@@ -11067,6 +11073,7 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
             if (source_buffer) |value| try run.releaseNativeBuffer(value);
         }
         const load = @import("gsp_fifo_wire.zig").word;
+        checkpoint = "packet";
         if (round == 0 or combined) {
             for (0..20) |_| {
                 try stepQueuedRendering(target);
@@ -11096,6 +11103,7 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
             if (target.phase != .ready) return error.RenderQueue;
             if (run.graphics_work != null and run.graphics_work.?.submitted) break;
         }
+        checkpoint = "draw";
         try t.expect(run.graphics_work != null and run.graphics_work.?.submitted and run.graphics_work.?.queued);
         if (graphicsFaultScenario(scenario)) return checkGraphicsFault(target,ce,deadline,scenario,native_index);
         try checkSubmittedRenderCursorValidation(target);
@@ -11135,7 +11143,28 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
     }
     // A stale generation cannot bind a warm packet. An interrupted changed
     // packet invalidates the preceding descriptor even before CE execution.
+    checkpoint = "cache-rebind";
     const old_draw = run.graphics_cache.draw.?;
+    if (!batched and scene.solid) {
+        const point = run.graphics_cache.packet_point;
+        const uploaded = run.graphics_cache.uploaded_bytes;
+        const ce_put = run.fifos[ce.slot].owner.?.ring.put;
+        var clipped = old_draw;
+        clipped.scissor.width -= 1;
+        try t.expect(try run.graphics_cache.reusePacket(clipped));
+        try t.expectEqualDeep(clipped, (try run.graphics_cache.binding()).draw);
+        _ = try run.graphics_cache.acquire();
+        try t.expectError(error.Busy,run.graphics_cache.reusePacket(old_draw));
+        try run.graphics_cache.release();
+        var invalid = clipped;
+        invalid.target.address = (try run.graphics_cache.binding()).packet.address;
+        try t.expectError(error.Unsupported,run.graphics_cache.reusePacket(invalid));
+        try t.expectEqualDeep(clipped,(try run.graphics_cache.binding()).draw);
+        try t.expect(try run.graphics_cache.reusePacket(old_draw));
+        try t.expectEqual(point,run.graphics_cache.packet_point);
+        try t.expectEqual(uploaded,run.graphics_cache.uploaded_bytes);
+        try t.expectEqual(ce_put,run.fifos[ce.slot].owner.?.ring.put);
+    }
     run.graphics_cache.epoch += 1;
     try t.expectError(error.Stale,run.graphics_cache.binding());
     run.graphics_cache.epoch -= 1;
@@ -11407,6 +11436,7 @@ fn checkRenderAdmissionExpiry(target: *@import("gsp_device.zig").Device,
 }
 fn checkQueuedSlices(target: *@import("gsp_device.zig").Device, ce: @import("gsp_runtime.zig").ChannelHandle,
     image_index: usize, image: @import("r4nv_render").image.Image, deadline: u64) !void {
+    try checkLargeRenderQuanta();
     const model = @import("gsp_copy_test_model.zig").Model;
     const fifo = @import("gsp_fifo_test_model.zig").Model;
     const render = @import("r4nv_render");
@@ -11525,6 +11555,39 @@ fn checkQueuedSlices(target: *@import("gsp_device.zig").Device, ce: @import("gsp
     for (0..24) |y| for (0..32) |x| try t.expectEqual(@as(u32,0xff112233),load(pixels,y*image.pitch+x*4));
     try run.work_schedule.configure(@import("gsp_work_scheduling.zig").copy_bytes,@import("gsp_work_scheduling.zig").render_pixels);
     std.debug.print("[nvidia-slices] CE6+GR6; exact semaphores; one public fence each; retained mappings/cache; cursor admission between slices\n",.{});
+}
+fn checkLargeRenderQuanta() !void {
+    const render = @import("r4nv_render");
+    var draw = render.reference_model.cases.scenes[11].draw();
+    draw.target.width = 1920; draw.target.height = 1080;
+    draw.target.pitch = 7680; draw.target.bytes = 8323072;
+    draw.destination = .{.x=0,.y=0,.width=1920,.height=1080};
+    draw.scissor = draw.destination;
+    for ([_]u32{256*1024,@import("gsp_work_scheduling.zig").render_pixels},0..) |limit,profile| {
+        var queue: @import("gsp_render_queue.zig").Owner = .{.pixel_limit=limit,.draw_count=1};
+        queue.draws[0] = draw;
+        var pixels: u64 = 0;
+        var sections: u32 = 0;
+        while (queue.draw_cursor != 1) {
+            try queue.prepareSlice();
+            var section_pixels: u64 = 0;
+            for (queue.commands()) |part| {
+                const clip = try part.clip();
+                try t.expect(@as(u64,clip[1])*1920+clip[0]==pixels);
+                try t.expect(clip[3]-clip[1]==1 or (clip[0]==0 and clip[2]==1920));
+                const area: u64 = @as(u64,clip[2]-clip[0])*(clip[3]-clip[1]);
+                try t.expect(area>0 and clip[2]<=1920 and clip[3]<=1080);
+                try t.expectEqualDeep(draw.destination,part.destination);
+                try t.expectEqualDeep(draw.source_rect,part.source_rect);
+                try t.expectEqualDeep(draw.grid,part.grid);
+                pixels += area; section_pixels += area;
+            }
+            try t.expect(section_pixels<=limit);
+            sections += 1;
+            queue.draw_cursor = queue.next_draw; queue.pixel_cursor = queue.next_pixel;
+        }
+        try t.expect(pixels==1920*1080 and sections==(if(profile==0) @as(u32,8) else 2));
+    }
 }
 fn queuedSrgbProgram() @import("r4nv_render").ColorProgram {
     var program: @import("r4nv_render").ColorProgram = .{};
