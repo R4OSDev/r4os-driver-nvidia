@@ -213,6 +213,14 @@ pub const ReadyImage = struct { image: *Presentation, deadline: u64 };
 pub const FrameCounters = struct { acquired: u64 = 0, rendered: u64 = 0, rejected: u64 = 0,
     submitted: u64 = 0, visible: u64 = 0, released: u64 = 0 };
 const DeferredPresentation = struct { job: r4os.abi.GfxDriverJob, deadline: u64 };
+const CopyAdmission = struct {
+    notify_ns: u64 = 0,
+    first_ns: u64 = 0,
+    steps: u64 = 0,
+    busy_steps: u64 = 0,
+    last_busy_ns: u64 = 0,
+    last_busy_mask: u64 = 0,
+};
 pub const CopyJob = struct {
     queue: r4os.driver_queue.Context,
     memory: r4os.driver_memory.Context,
@@ -221,6 +229,15 @@ pub const CopyJob = struct {
     job: r4os.abi.GfxDriverJob,
     job_stamp: r4os.abi.GfxDriverJob,
     deadline: u64,
+    dispatch_ns: u64 = 0,
+    claim_ns: u64 = 0,
+    first_step_ns: u64 = 0,
+    steps: u64 = 0,
+    blocked_main: u64 = 0,
+    blocked_mapping: u64 = 0,
+    last_main_phase: exchange.Phase = .idle,
+    last_main_owner: diagnostics.Operation = .event,
+    admission: CopyAdmission = .{},
     references: [2]r4os.abi.GfxBufferReference = @splat(.{}),
     addresses: [2]?CopyAddress = @splat(null),
     mappings: [2]?BufferHandle = @splat(null),
@@ -408,6 +425,7 @@ pub const Owner = struct {
     work_schedule: scheduling.Owner = .{},
     active_work: ?usize = null,
     copy_job: ?*CopyJob = null,
+    copy_admission: CopyAdmission = .{},
     // Explicit headless diagnostic only. Consumed by one public CE submit;
     // rebuilding Owner does not rearm it. Hardware completion is not forged.
     diagnostic_copy_timeout: bool = false,
@@ -2853,6 +2871,7 @@ pub const Owner = struct {
         if (self.self_address != raw or self.failure != null) return -1;
         const backend = if (self.copy_backend) |*value| value else return -1;
         // Already under the serialized DriverWork owner. Pacing owns waits.
+        if (!backend.pending) self.copy_admission.notify_ns = self.now() catch 0;
         backend.pending = true;
         self.native_queues.wake();
         if (self.queued_native) |work| work.waited = false;
@@ -4361,6 +4380,8 @@ pub const Owner = struct {
         if (result != a.gfx_queue_ok and result != a.gfx_queue_error_busy and job.fence.timeline == 0) return error.Queue;
         if (self.copy_backend == null) self.copy_backend = .{ .queue = queue, .binding = binding };
         if (result == a.gfx_queue_error_busy and job.fence.timeline == 0) return false;
+        const admission = self.copy_admission;
+        self.copy_admission = .{};
         if (result == a.gfx_queue_ok and job.operation == a.gfx_queue_operation_native) {
             if (!self.native_queues.ready()) {
                 if (queue.complete(&job.fence, a.gfx_queue_result_failed, 1) != 1) return error.Retained;
@@ -4425,7 +4446,7 @@ pub const Owner = struct {
         }
         try self.work_schedule.admit(work_slot, job);
         self.work_slots[work_slot] = .{ .copy = .{ .queue = queue, .memory = memory, .channel_handle = handle, .binding = binding,
-            .job = job, .job_stamp = job, .deadline = work_deadline } };
+            .job = job, .job_stamp = job, .deadline = work_deadline, .dispatch_ns = now_ns, .claim_ns = try self.now(), .admission = admission } };
         self.active_work = work_slot;
         self.copy_job = &self.work_slots[work_slot].copy;
         if (result != a.gfx_queue_ok or job.version != 1 or job.size < @offsetOf(a.GfxDriverJob, "row_count") or job.reserved0 != 0 or job.reserved1 != 0 or
@@ -4522,6 +4543,8 @@ pub const Owner = struct {
     }
     fn advanceCopy(self: *Owner, current: u64) !bool {
         const work = if (self.copy_job) |value| value else return false;
+        if (work.first_step_ns == 0) work.first_step_ns = current;
+        work.steps +|= 1;
         if (!std.meta.eql(work.job, work.job_stamp)) return error.Stale;
         const fifo = try self.findChannel(work.channel_handle);
         if (work.submitted) {
@@ -4560,10 +4583,32 @@ pub const Owner = struct {
             try self.finishCopy(r4os.abi.gfx_queue_result_cancelled); return true;
         }
         if (current >= work.deadline) {
+            const waiting = work.admission;
+            self.log("NVIDIA copy-admission-pending: notify={d} first={d} steps={d} busy={d} last={d} mask={x}", .{
+                waiting.notify_ns, waiting.first_ns, waiting.steps, waiting.busy_steps, waiting.last_busy_ns, waiting.last_busy_mask });
+            self.log("NVIDIA copy-admission-time: dispatch={d} claim={d} first={d} steps={d} job-end={d} main-waits={d} map-waits={d} last-main={s}/{s}", .{
+                work.dispatch_ns, work.claim_ns, work.first_step_ns, work.steps, work.job.deadline_ns,
+                work.blocked_main, work.blocked_mapping, @tagName(work.last_main_phase), @tagName(work.last_main_owner) });
+            self.log("NVIDIA copy-admission-expired: fence={d}:{d} op={d} producer={d}/{d}/{d} deadline={d} now={d} copied={d} ticket={} addresses={}/{} mappings={}/{}", .{
+                work.job.fence.timeline, work.job.fence.point, work.job.operation,
+                work.job.producer_kind, work.job.producer_id, work.job.producer_generation,
+                work.deadline, current, work.copied, work.ticket != null,
+                work.addresses[0] != null, work.addresses[1] != null, work.mappings[0] != null, work.mappings[1] != null });
+            self.log("NVIDIA copy-admission-owner: main={s} pending={} lockdown={} current={} power={} mode={} display-engine={} display-channel={?} FIFO={?} context={?} native={?} buffer={?} VA={} output={} sequence={}", .{
+                @tagName(self.channel.?.phase), self.channel.?.pending != null, self.channel.?.in_lockdown,
+                self.activeChannel() == &self.channel.?, self.power_active, self.mode_control_active,
+                self.display_engine_active, self.display_channel_active, self.fifo_active, self.context_active,
+                self.native_active, self.buffer_active, self.virtuals.active_range != null,
+                self.outputs.active(), self.sequence.self_address != 0 });
             try self.recordFault(diagnostics.host(.submit, error.Timeout, false));
             try self.finishCopy(r4os.abi.gfx_queue_result_failed); return true;
         }
-        if (self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return false;
+        if (self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) {
+            work.blocked_main +|= 1;
+            work.last_main_phase = self.channel.?.phase;
+            work.last_main_owner = if (self.outputs.active()) .display_engine else self.failureOperation();
+            return false;
+        }
         if (work.presentation and self.presentation_buffers != 0 and work.target_presentation == null) {
             const current_image = try self.copyPresentation(work);
             if (self.readyImage(current_image.window.slot - 1) != null) return false;
@@ -4585,7 +4630,7 @@ pub const Owner = struct {
             if (work.addresses[i] != null) continue;
             if (work.mappings[i]) |handle| {
                 const mapped = try self.bufferStatus(handle);
-                if (mapped.state != .handed_off) return false;
+                if (mapped.state != .handed_off) { work.blocked_mapping +|= 1; return false; }
                 const value = mapped.info orelse { try self.finishCopy(r4os.abi.gfx_queue_result_failed); return true; };
                 if (!std.meta.eql(value.buffer, reference.buffer) or value.epoch != self.epoch) return error.Stale;
                 work.addresses[i] = .{ .address = value.address, .bytes = value.logical_bytes }; continue;
@@ -6516,6 +6561,33 @@ pub const Owner = struct {
         // exchange. The subscription owner still rejects a pending receipt.
         return graph.takeChanges(try std.math.add(u64, current, std.time.ns_per_s));
     }
+    // Cached admission metadata only; no device probe or command is issued.
+    // This is the backend's pending streak, not an inferred individual job.
+    fn observeCopyAdmission(self: *Owner, current: u64) void {
+        const backend = if (self.copy_backend) |value| value else return;
+        if (!backend.pending) { self.copy_admission = .{}; return; }
+        if (self.active_work != null) return;
+        const masks = [_]bool{
+            self.sequence.self_address != 0, self.power_active, self.mode_control_active,
+            self.display_engine_active, self.display_channel_active != null, self.fifo_active != null,
+            self.context_active != null, self.virtuals.active_range != null, self.native_active != null,
+            self.buffer_active != null, self.outputs.active(), self.channel == null or self.channel.?.phase != .idle,
+            self.channel != null and self.channel.?.pending != null, self.channel != null and self.channel.?.in_lockdown,
+            self.graphics_starting, self.frame_setup != null, self.copyAdmissionBusy(), self.graph_closing,
+            self.powerStopping(), self.work_schedule.free() == null, backend.channel == null,
+            self.refresh_quiescing, self.cursor_point != null, self.frame_ready != null,
+        };
+        var mask: u64 = 0;
+        for (masks, 0..) |set, index| if (set) { mask |= @as(u64, 1) << @as(u6, @intCast(index)); };
+        const observation = &self.copy_admission;
+        if (observation.first_ns == 0) observation.first_ns = current;
+        observation.steps +|= 1;
+        if (mask != 0) {
+            observation.busy_steps +|= 1;
+            observation.last_busy_ns = current;
+            observation.last_busy_mask = mask;
+        }
+    }
     // DriverWork runs on the shared 64 KB task stack. Keep independently
     // selected phase buffers in their own frames; inlining all branches here
     // reserves their combined high-water mark even during the first RM poll.
@@ -6525,6 +6597,7 @@ pub const Owner = struct {
     }
     noinline fn advance(self: *Owner) !Progress {
         const current = try self.now();
+        self.observeCopyAdmission(current);
         if (self.graph) |*graph| if (graph.address_space) |*space| {
             if (try space.host_storage.collectDeferred()) return .progress;
         };

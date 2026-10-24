@@ -682,6 +682,16 @@ pub const Owner = struct {
             if (try self.additional.step(self)) return true;
             if (self.additional.hardwareBusy()) return false;
         }
+        // A first console upload can already be waiting for this private
+        // pool while optional receiver-mode enumeration is still running.
+        // Build it between catalogue RPCs, under the same RM admission and
+        // actual image/import receipts used by ordinary pool preparation.
+        // Waiting for the whole catalogue would consume the upload deadline.
+        const cataloguing = switch (self.modes.phase) {
+            .catalog_next, .catalog_query, .catalog_wait => true,
+            else => false,
+        };
+        if (cataloguing and try run.prepareFramePool()) return true;
         if (try @call(.never_inline, @TypeOf(self.modes).step, .{ &self.modes, self })) return true;
         if (self.modes.phase == .idle or self.modes.phase == .decision or self.modes.phase == .unavailable)
             return run.prepareFramePool();

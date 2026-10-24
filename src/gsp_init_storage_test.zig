@@ -6365,6 +6365,20 @@ fn checkNativeFrames(target: *@import("gsp_device.zig").Device, extra: bool) !vo
     const push = @import("gsp_display_push.zig");
     const count = run.presentation_buffers;
     try t.expect(count >= 2 and count <= 3);
+    const catalogue_pool = NativeCommon.hasModes() and !extra and
+        run.presentationGroupCount(run.presentation.?) < count;
+    if (catalogue_pool) {
+        // Stop between genuine catalogue queries, before submitting the
+        // first frame. Optional enumeration must yield to its private pool.
+        for (0..100) |_| {
+            if (product.modes.phase == .catalog_next) break;
+            clock += 1000; _ = target.step();
+            try t.expect(target.phase == .ready);
+            if (run.activeChannel().?.phase == .waiting) try replyNativeProduct(target);
+        }
+        try t.expect(product.modes.phase == .catalog_next);
+    }
+    var pool_before_catalogue = !catalogue_pool;
     try t.expectEqual(@as(u8, 2), try @import("gsp_native_output.zig").frameCount(""));
     try t.expectError(error.Descriptor, @import("gsp_native_output.zig").frameCount("4"));
     const original = run.presentation.?;
@@ -6399,6 +6413,14 @@ fn checkNativeFrames(target: *@import("gsp_device.zig").Device, extra: bool) !vo
         checkpoint = "copy";
         for (0..400) |_| {
             clock += 1000; _ = target.step(); try t.expect(target.phase == .ready);
+            if (catalogue_pool and frame == 0) {
+                if (!pool_before_catalogue and run.frame_setup == null and
+                    run.presentationGroupCount(run.presentation.?) == count) {
+                    try t.expect(product.modes.phase == .catalog_next);
+                    pool_before_catalogue = true;
+                }
+                if (run.mode_control_active) try t.expect(pool_before_catalogue);
+            }
             if (run.buffer_active != null) { try replyCopyMapping(target); continue; }
             if (run.activeChannel().?.phase == .waiting) { try replyNativeProduct(target); continue; }
             if (run.display_upload_job) |work| if (work.operation.phase == .prepared and work.operation.part == 0)
@@ -6532,6 +6554,18 @@ fn checkNativeFrames(target: *@import("gsp_device.zig").Device, extra: bool) !vo
     }
     var used: usize = 0; for (seen) |value| if (value) { used += 1; };
     try t.expect(used == count and ((run.presentation == original) != extra));
+    if (catalogue_pool) {
+        try t.expect(pool_before_catalogue);
+        checkpoint = "finish optional catalogue after initial frames";
+        for (0..100) |_| {
+            if (product.modes.phase == .idle) break;
+            clock += 1000; _ = target.step();
+            try t.expect(target.phase == .ready);
+            if (run.activeChannel().?.phase == .waiting) try replyNativeProduct(target);
+        }
+        try t.expect(product.modes.phase == .idle);
+        std.debug.print("[nvidia-catalogue-pool] first private pool precedes optional catalogue RPCs; complete frame rotations retain CE/BEGUN/FINISHED and pixel oracles, catalogue then completes\n", .{});
+    }
     // Invalid Present extents receive one deterministic failed queue result.
     // They do not acquire a source read lease or create a visible frame.
     const prior_visible = run.flip_visible; const prior_completed = copy.completed;
