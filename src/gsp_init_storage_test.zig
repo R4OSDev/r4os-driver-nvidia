@@ -1710,7 +1710,7 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         context_display_present, context_display_present_timeout, context_display_present_fault,
         context_display_present_initial_timeout, context_display_present_initial_fault, context_display_present_initial_release,
         context_display_present_initial_acquire, context_display_present_initial_retry,
-        context_native_unknown, context_native_headless, context_native_allocation_fault, context_native_terminal, context_native_headless_reset, context_native_headless_reset_limit, context_native_headless_reset_catalog, context_native_reset, context_native_console, context_native_connected, context_native_connected_primary_timeout, context_native_dp, context_native_jobs, context_native_job_timeout, context_native_prepare_reject,
+        context_native_unknown, context_native_headless, context_native_allocation_fault, context_native_terminal, context_native_headless_reset, context_native_headless_reset_limit, context_native_headless_reset_catalog, context_native_reset, context_native_console, context_native_connected, context_native_connected_primary_timeout, context_native_initial_refresh, context_native_dp, context_native_jobs, context_native_job_timeout, context_native_prepare_reject,
         context_native_private_corrupt, context_native_private_timeout, context_native_private_shutdown,
         context_native_flip_irq_timeout, context_native_flip_probe_timeout, context_native_flip_notifier_timeout, context_native_flip_release_timeout,
         context_native_frame_timeout,
@@ -3930,7 +3930,7 @@ const NativeCommon = struct {
     var scenario: []const u8 = "";
     fn is(name: []const u8) bool {
         return std.mem.eql(u8, scenario, name) or (std.mem.eql(u8, name, "context_native_connected") and
-            std.mem.eql(u8, scenario, "context_native_connected_primary_timeout")) or
+            (std.mem.eql(u8, scenario, "context_native_connected_primary_timeout") or std.mem.eql(u8, scenario, "context_native_initial_refresh"))) or
             (std.mem.eql(u8, name, "context_native_headless_reset") and std.mem.startsWith(u8, scenario, "context_native_headless_reset_")) or
             ((std.mem.eql(u8, name, "context_native_unknown") or std.mem.eql(u8, name, "context_native_reset")) and
                 std.mem.eql(u8, scenario, "context_native_console")) or
@@ -4565,6 +4565,12 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
     var steps: usize = 0;
     var initial_fetched = false;
     var table_fetched = false;
+    var initial_refresh_tested = false;
+    var initial_refresh_receipt: u64 = 0;
+    var initial_link_refresh_started = false;
+    var initial_link_refreshed = false;
+    var initial_link_cancelled_before: u64 = 0;
+    var initial_link_deadline: u64 = 0;
     var checkpoint: []const u8 = "takeover";
     errdefer _ = target.stop();
     errdefer |err| std.debug.print("native product {s}: {s} check={s} step={d} device={s} failure={?} phase={s} failed-phase={?} status={d}\n",
@@ -4575,6 +4581,66 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
         _ = target.step();
         if (target.phase != .ready) break;
         try PrivateClearPeer.step(target);
+        if (NativeCommon.is("context_native_initial_refresh") and !initial_refresh_tested and target.native_output.phase == .scanout_commit) {
+            const product = &target.native_output;
+            const deadline = product.deadline;
+            initial_refresh_receipt = product.mode_admission.?.receipt;
+            try run.outputs.invalidate();
+            try run.receiver_events.note(run.epoch, clock, .{ .hotplug = .{ .plug_mask = 0, .unplug_mask = 0 } });
+            _ = try product.step();
+            try t.expect(product.phase == .initial_route_refresh and product.deadline == deadline and NativeCommon.commits == 0);
+            var preparing = DeviceModel.boot_info;
+            preparing.generation = product.prepared.generation;
+            preparing.state = a.display_state_preparing;
+            try t.expect(product.ownsPreparing(preparing));
+            preparing.generation += 1;
+            try t.expect(!product.ownsPreparing(preparing));
+            // Receiver transport/capture is separately covered. Supply its
+            // next coherent unchanged snapshot to this real takeover owner.
+            try run.receiver_events.started(run.epoch, clock);
+            run.outputs.data.generation += 1; run.output_generation = run.outputs.data.generation;
+            run.outputs.data.final_receipt_serial += 1;
+            run.outputs.invalidated = false; run.outputs.data.coherent = true;
+            try run.receiver_events.finished(run.epoch, clock, false);
+            run.outputs.data.receivers[0].bytes[12] ^= 1;
+            try t.expectError(error.Stale, product.validateInitialReceiver(&run.outputs.data));
+            run.outputs.data.receivers[0].bytes[12] ^= 1;
+            try product.validateInitialReceiver(&run.outputs.data);
+            var refreshed: @import("gsp_runtime.zig").Owner.RefreshedInitialMode = undefined;
+            const ring = &run.display_channels[product.core.?.slot].?.ring;
+            ring.issued = 1;
+            try t.expectError(error.Stale, run.refreshInitialDisplayMode(&refreshed, product.engine.?, product.mode.?, product.link.?));
+            ring.issued = 0;
+            initial_refresh_tested = true;
+        }
+        if (NativeCommon.is("context_native_initial_refresh") and initial_refresh_tested and !initial_link_refresh_started and
+            target.native_output.phase == .scanout_wait)
+        {
+            if (run.display_work) |*work| if (work.link) |*link| {
+                if (link.phase == .before_scanout and link.pending and link.last_receipt != 0) {
+                    initial_link_deadline = target.native_output.deadline;
+                    initial_link_cancelled_before = run.display_cancelled;
+                    initial_refresh_receipt = target.native_output.mode_admission.?.receipt;
+                    try run.outputs.invalidate();
+                    try run.receiver_events.note(run.epoch, clock, .{ .hotplug = .{ .plug_mask = 0, .unplug_mask = 0 } });
+                    try t.expect(!run.outputPaused(target.native_output.mode.?.window) and run.displayWorkObsolete());
+                    initial_link_refresh_started = true;
+                }
+            };
+        }
+        if (initial_link_refresh_started and !initial_link_refreshed and target.native_output.phase == .initial_route_refresh) {
+            try t.expect(run.display_work == null and run.display_cancelled == initial_link_cancelled_before + 1 and
+                target.native_output.deadline == initial_link_deadline and NativeCommon.commits == 0 and
+                run.display_images[target.native_output.mode.?.window] == null and
+                run.display_channels[target.native_output.core.?.slot].?.ring.issued == 0 and
+                run.display_channels[target.native_output.window.?.slot].?.ring.issued == 0);
+            try run.receiver_events.started(run.epoch, clock);
+            run.outputs.data.generation += 1; run.output_generation = run.outputs.data.generation;
+            run.outputs.data.final_receipt_serial += 1;
+            run.outputs.invalidated = false; run.outputs.data.coherent = true;
+            try run.receiver_events.finished(run.epoch, clock, false);
+            initial_link_refreshed = true;
+        }
         if (NativeCommon.is("context_native_mode_retire") and target.native_output.phase == .instance_allocate) {
             checkpoint = "mode control retirement";
             const handle = target.native_output.mode_control.?;
@@ -4662,6 +4728,35 @@ fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.Drive
         NativeCommon.flipFailure() or NativeCommon.is("context_native_frame_timeout") or NativeCommon.cursorCase();
     if (success) {
         try t.expect(target.phase == .ready and target.native_output.phase == .active and NativeCommon.commits == 1 and captured.boot.native_adopted);
+        if (NativeCommon.is("context_native_initial_refresh")) {
+            try t.expect(initial_refresh_tested and initial_link_refreshed and target.native_output.mode_admission.?.receipt > initial_refresh_receipt and
+                target.native_output.initial_receiver_sequence == run.receiver_events.sequence and !run.outputs.invalidated);
+            // A second HPD can obsolete a topology before its receiver
+            // captures exist. This is still pending acquisition, not a
+            // malformed connected snapshot or an active GPU failure.
+            const saved_count = run.outputs.data.count;
+            const saved_coherent = run.outputs.data.coherent;
+            defer {
+                run.outputs.data.count = saved_count;
+                run.outputs.data.coherent = saved_coherent;
+                run.outputs.invalidated = false;
+            }
+            try t.expect(run.outputs.state == .returned and run.outputs.data.topology.count > 0);
+            run.outputs.invalidated = true;
+            run.outputs.data.coherent = false;
+            run.outputs.data.count = 0;
+            var awaiting: @import("gsp_native_hotplug.zig").Owner = .{
+                .initialized = true, .phase = .receiver_wait,
+                .sequence = run.receiver_events.sequence, .generation = target.native_output.mode.?.output_generation,
+            };
+            try t.expect(!try awaiting.step(&target.native_output));
+            try t.expect(awaiting.phase == .receiver_wait and awaiting.attempted_generation == 0 and
+                awaiting.observation == null and target.native_output.phase == .active and run.failure == null);
+            // Without the actual invalidation, a malformed returned inventory
+            // must still fail the existing structural identity check.
+            run.outputs.invalidated = false;
+            try t.expectError(error.Stale, awaiting.step(&target.native_output));
+        }
         if (NativeCommon.is("context_native_connected")) {
             const native_mode = target.native_output.mode.?;
             try t.expect(native_mode.hasAudio());
@@ -7492,7 +7587,8 @@ fn checkReceiverModeSwitch(target: *@import("gsp_device.zig").Device) !void {
     try t.expect(current.mode_receipt == checked.receipt);
     try t.expectError(error.Stale, run.commitModeDisplayImage(product.core.?, product.window.?, product.dma, 1, deadline));
     try t.expect(run.display_work == null and std.meta.eql(current, (try run.displayImageStatus(root, plan.window)).?));
-    try t.expectEqualSlices(usize, &.{ 1, 1, 2, 2, 0, 0, 0, 0 }, &NativeCommon.mode_requests);
+    const query_count: usize = if (NativeCommon.is("context_native_initial_refresh")) 4 else 2;
+    try t.expectEqualSlices(usize, &.{ 1, 1, query_count, query_count, 0, 0, 0, 0 }, &NativeCommon.mode_requests);
     try t.expect(NativeCommon.commits == 1); // Common geometry transition is separate work.
     if (NativeCommon.is("context_native_connected")) try checkFrlRecovery(target);
 }
@@ -14504,6 +14600,12 @@ fn checkDeviceOutputs(target: *@import("gsp_device.zig").Device, words: []u32, f
             interleaved = true;
         }
         switch (query) {
+            .hotplug_state => {
+                try t.expect(owner.state == .topology and owner.probe.?.state == .hotplug_state);
+                try t.expect(std.mem.readInt(u32, payload[8..12], .little) == 0x730401 and payload.len == 40);
+                outputWord(payload, 32, mask);
+                outputWord(payload, 36, 0);
+            },
             .dp_source, .frl_source, .mst_allocate, .mst_free => return error.UnexpectedDpProbe, // These fixtures leave every DP SOR unassigned and have no FRL EDID.
             .heads => outputWord(payload, 32, if (scenario == .outputs_empty) 0 else if (scenario == .outputs_all) 32 else 4),
             .windows => @memcpy(payload[28..36], &[_]u8{ 1, 1, 2, 2, 4, 4, 8, 8 }),
@@ -14544,7 +14646,7 @@ fn checkDeviceOutputs(target: *@import("gsp_device.zig").Device, words: []u32, f
                 outputWord(payload, 32, 0);
                 outputWord(payload, 36, if (ddc_case) (if (scenario == .outputs_ddc_bus_changed and owner.state == .receivers) @as(u32, 4) else 3) else 37);
             },
-            .connected => |id| outputWord(payload, 32, if (id == 1 and scenario != .outputs_all) 1 else 0),
+            .connected => |value| outputWord(payload, 32, if (value.mask == 1 and scenario != .outputs_all) 1 else 0),
             .edid => {
                 try t.expect(std.mem.readInt(u32, payload[36..40], .little) == 2); // RAW; no cached boot EDID.
                 outputWord(payload, 32, if (scenario == .outputs_missing) 0 else 256);
@@ -14647,8 +14749,9 @@ fn checkDeviceOutputs(target: *@import("gsp_device.zig").Device, words: []u32, f
     if (scenario == .outputs_partial) try t.expect(data.topology.activeHeads(1) == null and data.topology.heads[1].rejected.?.control.? == 0x55)
     else try t.expect(data.topology.activeHeads(1).? == 1 and data.topology.activeHeads(0x80000000).? == 8);
     if (scenario == .outputs_all) {
-        // Includes the initial and final window/head capability queries.
-        try t.expect(requests == 231 and data.final_receipt_serial != 0 and data.receivers[31].display_id == 0x80000000);
+        // Includes physical HPD-state consumption and the initial/final
+        // window/head capability queries; no extra receiver inference.
+        try t.expect(requests == 232 and owner.probe.?.hotplug_state != null and data.final_receipt_serial != 0 and data.receivers[31].display_id == 0x80000000);
         for (&data.receivers) |*capture| try t.expect(capture.status == .disconnected and capture.edid_bytes == 0);
     } else {
         const expected_status: @import("gsp_receiver.zig").Status = switch (scenario) {

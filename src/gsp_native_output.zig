@@ -21,7 +21,7 @@ pub const Phase = enum {
     storage_wait, storage_release, table_upload, table_wait,
     core_create, core_wait, window_create, window_wait, immediate_create, immediate_wait,
     shadow_create, shadow_map, shadow_copy, shadow_unmap, register, publish, prepare,
-    image_upload, image_wait, console_mapping, scanout_commit, scanout_wait, handoff, console_handoff, console_active, active, failed,
+    image_upload, image_wait, initial_route_refresh, initial_mode_wait, console_mapping, scanout_commit, scanout_wait, handoff, console_handoff, console_active, active, failed,
 };
 
 pub const Owner = struct {
@@ -82,6 +82,11 @@ pub const Owner = struct {
     sor_saved: ?runtime.boot_mode.Plan = null,
     sor_sequence: u64 = 0,
     sor_attempted: bool = false,
+    commit_gate: enum { none, route, audio, image } = .none,
+    initial_receiver_sequence: u64 = 0,
+    initial_refresh_sequence: u64 = 0,
+    initial_resume: Phase = .detached,
+    initial_cancelled_before_commit: u64 = 0,
 
     /// Explicit mode=native only. Check the common handoff API before the
     /// device worker can execute the already prepared firmware operations.
@@ -303,6 +308,7 @@ pub const Owner = struct {
                         .{@errorName(err), self.mode.?.signal.display_id, saved.transport_hdmi, saved.signal.clock, saved.signal.hdmi});
                     return err;
                 };
+                self.initial_receiver_sequence = run.receiver_events.sequence;
                 // Time without a receiver consumes no active modeset budget.
                 self.deadline = try std.math.add(u64, self.last_clock, 120 * std.time.ns_per_s);
                 self.next(.mode_create);
@@ -519,6 +525,7 @@ pub const Owner = struct {
                 self.next(.image_upload);
             },
             .image_upload => {
+                if (try self.refreshInitialRouteIfNeeded(.image_upload)) return false;
                 try self.validateRoute();
                 try run.uploadInitialImage(self.phase_deadline);
                 self.next(.image_wait);
@@ -531,15 +538,58 @@ pub const Owner = struct {
             },
             .scanout_commit => {
                 if (self.console == null) {
+                    if (try self.refreshInitialRouteIfNeeded(.scanout_commit)) return false;
+                    self.commit_gate = .route;
                     try self.validateRoute();
+                    self.commit_gate = .audio;
                     if (!try self.audio.beforeInitial(self)) return false;
                 } else run.require_mode_receipt = true;
+                self.commit_gate = .image;
                 try run.commitBootDisplayImage(self.core.?, self.window.?, self.dma, self.phase_deadline);
+                self.initial_cancelled_before_commit = run.display_cancelled;
+                self.commit_gate = .none;
                 self.next(.scanout_wait);
             },
+            .initial_route_refresh => {
+                const snapshot = run.nativeOutputs() orelse return false;
+                if (run.receiver_events.pending or run.receiver_events.capturing or
+                    snapshot.generation <= self.mode.?.output_generation) return false;
+                try self.validateInitialReceiver(snapshot);
+                var refreshed: runtime.Owner.RefreshedInitialMode = undefined;
+                try run.refreshInitialDisplayMode(&refreshed, self.engine.?, self.mode.?, self.link.?);
+                try run.queryDisplayMode(self.mode_control.?, refreshed.mode, self.phase_deadline);
+                self.mode = refreshed.mode; self.link = refreshed.link;
+                self.initial_refresh_sequence = run.receiver_events.sequence;
+                self.next(.initial_mode_wait);
+            },
+            .initial_mode_wait => {
+                const status = try run.modeControlStatus(self.mode_control.?);
+                if (status.state != .handed_off) return false;
+                if (run.outputs.invalidated or self.initial_refresh_sequence != run.receiver_events.sequence) {
+                    self.beginInitialRefresh();
+                    return true;
+                }
+                if (status.rejected != null or status.unavailable) return error.Unsupported;
+                const admission = status.info orelse return error.State;
+                if (admission.receipt == 0 or admission.receipt <= self.mode_admission.?.receipt or
+                    !std.meta.eql(admission.mode, self.mode.?) or !admission.possible or admission.over_clock) return error.Unsupported;
+                self.mode_admission = admission;
+                self.initial_receiver_sequence = self.initial_refresh_sequence;
+                @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,
+                    "NVIDIA native-output: initial-route refreshed generation={d} event={d} mode-receipt={d} channels=unsubmitted deadline=preserved",
+                    .{self.mode.?.output_generation,self.initial_receiver_sequence,admission.receipt});
+                self.next(self.initial_resume);
+            },
             .scanout_wait => {
-                const image = try run.displayImageStatus(self.engine.?, self.mode.?.window) orelse return false;
                 if (run.display_work != null) return false;
+                const image = try run.displayImageStatus(self.engine.?, self.mode.?.window) orelse {
+                    // Runtime drained the exact admitted link without a
+                    // first PUT. Refresh still proves unsubmitted rings,
+                    // the same receiver and a new mode receipt before retry.
+                    if (self.console == null and run.display_cancelled > self.initial_cancelled_before_commit and
+                        try self.refreshInitialRouteIfNeeded(.scanout_commit)) return false;
+                    return false;
+                };
                 self.confirmed_image = image;
                 if (self.console != null) {
                     try self.validateConsoleCompletion();
@@ -609,7 +659,13 @@ pub const Owner = struct {
             if (try self.modes.failedJobs(self, err)) return true;
             return self.additional.step(self);
         }
-        const changed = try @call(.never_inline, @TypeOf(self.hotplug).step, .{ &self.hotplug, self });
+        const changed = @call(.never_inline, @TypeOf(self.hotplug).step, .{ &self.hotplug, self }) catch |err| {
+            @import("gsp_mode_diagnostics.zig").write(&self.ctx.?,
+                "NVIDIA native-hotplug: rejected phase={s} capture={s} invalidated={} routes={d} receivers={d} reason={s}",
+                .{@tagName(self.hotplug.phase), @tagName(run.outputs.state), run.outputs.invalidated,
+                    run.outputs.data.topology.count, run.outputs.data.count, @errorName(err)});
+            return err;
+        };
         if (changed) return true;
         if (self.hotplug.phase != .online or self.hotplug.refreshing) return self.additional.step(self);
         if (@call(.never_inline, @TypeOf(self.color).step, .{ &self.color, self })) return true;
@@ -677,12 +733,46 @@ pub const Owner = struct {
         return self.outputs.?.pauseOutput(&self.output, paused);
     }
     pub fn quiesceCommonOutput(_: *Owner) !bool { return true; }
+    pub fn validateInitialReceiver(self: *const Owner, snapshot: *const @import("gsp_outputs.zig").Snapshot) !void {
+        if (self.mode == null or snapshot.count > snapshot.receivers.len) return error.Stale;
+        var found = false;
+        for (snapshot.receivers[0..snapshot.count]) |*receiver| {
+            if (receiver.display_id != self.mode.?.signal.display_id) continue;
+            if (found or receiver.connected != true or self.receiver.edid_bytes == 0 or
+                receiver.edid_bytes > receiver.bytes.len or self.receiver.edid_bytes > self.receiver.edid.len or
+                receiver.edid_bytes != self.receiver.edid_bytes or
+                !std.mem.eql(u8, receiver.bytes[0..receiver.edid_bytes], self.receiver.edid[0..self.receiver.edid_bytes])) return error.Stale;
+            found = true;
+        }
+        if (!found) return error.Stale;
+    }
+    fn refreshInitialRouteIfNeeded(self: *Owner, phase_after: Phase) !bool {
+        if (self.console != null or self.running.?.receiver_events.sequence == self.initial_receiver_sequence) return false;
+        if (phase_after != .image_upload and phase_after != .scanout_commit) return error.State;
+        if (self.callback_confirmed or self.receipt.outcome != 0 or self.mode_admission == null) return error.Stale;
+        self.initial_resume = phase_after;
+        self.beginInitialRefresh();
+        return true;
+    }
+    fn beginInitialRefresh(self: *Owner) void {
+        self.next(.initial_route_refresh);
+        // Receiver acquisition owns a finite ten-second budget. Retain the
+        // original overall takeover deadline through every refresh/requery.
+        self.phase_deadline = @min(self.deadline, self.last_clock +| (15 * std.time.ns_per_s));
+    }
     fn validateRoute(self: *Owner) !void {
         const run = self.running.?;
-        if (run.failure != null or run.outputs.invalidated) return error.Stale;
+        if (run.failure != null or run.outputs.invalidated) {
+            @import("gsp_mode_diagnostics.zig").write(&self.ctx.?, "NVIDIA native-route: rejected runtime-failed={} receivers-invalidated={}", .{run.failure != null,run.outputs.invalidated});
+            return error.Stale;
+        }
         const snapshot = run.nativeOutputs() orelse return error.Busy;
         const bound = try runtime.boot_mode.bind(self.mode.?, snapshot, run.epoch, self.captured.?.boot.held_generation);
-        if (!std.meta.eql(bound, self.mode.?)) return error.Stale;
+        if (!std.meta.eql(bound, self.mode.?)) {
+            @import("gsp_mode_diagnostics.zig").write(&self.ctx.?, "NVIDIA native-route: changed generation={d}/{d} receipt={d}/{d} held={d}/{d}",
+                .{self.mode.?.output_generation,bound.output_generation,self.mode.?.receipt_serial,bound.receipt_serial,self.mode.?.held_generation,bound.held_generation});
+            return error.Stale;
+        }
         const object = run.nativeObject() orelse return error.Busy;
         if (!std.meta.eql(try runtime.display_link.derive(bound, object, snapshot), self.link.?)) return error.Stale;
     }
@@ -776,7 +866,8 @@ pub const Owner = struct {
         return self.self_address == @intFromPtr(self) and self.captured != null and self.prepared.generation != 0 and
             self.prepared.generation == self.captured.?.boot.native_generation and self.captured.?.boot.native_adopted and
             current.state == a.display_state_preparing and current.generation == self.prepared.generation and
-            (self.phase == .image_upload or self.phase == .image_wait or self.phase == .scanout_commit or self.phase == .scanout_wait or self.phase == .handoff);
+            (self.phase == .image_upload or self.phase == .image_wait or self.phase == .initial_route_refresh or self.phase == .initial_mode_wait or
+                self.phase == .scanout_commit or self.phase == .scanout_wait or self.phase == .handoff);
     }
     pub fn quarantine(self: *Owner, err: anyerror) void {
         if (self.phase == .detached) return;
@@ -787,6 +878,9 @@ pub const Owner = struct {
         self.modes.quarantine(self, err);
         if (self.failure == null) { self.failure = err; self.failed_phase = self.phase; }
         self.phase = .failed;
+        if (self.failed_phase == .scanout_commit) {
+            @import("gsp_mode_diagnostics.zig").write(&self.ctx.?, "NVIDIA native-output: commit-gate={s} reason={s}", .{@tagName(self.commit_gate),@errorName(err)});
+        }
         // Metadata withdrawal never proves physical display/DMA quiescence.
         // Keep shadow, capture, registered callbacks and the complete RM graph.
         if (self.output.connection_generation != 0) {

@@ -259,7 +259,7 @@ pub const Work = struct {
         if (self.request != null) return error.Pending;
         if (!self.ready(now)) return false;
         const request: Request = switch (self.stage) {
-            .connected => .{ .query = .{ .connected = self.token.root } },
+            .connected => .{ .query = .{ .connected = .{ .mask = self.token.root } } },
             .resource => .{ .query = .{ .resource = self.token.root } },
             .source => .{ .query = .{ .dp_source = .{ .display_id = self.token.root, .sor = self.plan.mode.signal.sor } } },
             .leaf => .{ .query = .{ .resource = self.target().entries[self.cursor].allocation.display_id } },

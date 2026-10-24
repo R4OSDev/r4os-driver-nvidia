@@ -140,7 +140,7 @@ pub const Catalog = struct {
         return mask;
     }
 };
-pub const State = enum { supported, heads, active, windows, connectors, resource, buses, verify_heads, verify_active, verify_windows, verify, drain, complete, obsolete, failed, released };
+pub const State = enum { hotplug_state, supported, heads, active, windows, connectors, resource, buses, verify_heads, verify_active, verify_windows, verify, drain, complete, obsolete, failed, released };
 
 /// A relation to the validated passive VBIOS, not an active routing lease.
 /// RM's explicit dcb_index selects the original DCB slot, never log2(id).
@@ -264,6 +264,7 @@ pub const Discovery = struct {
     channel: display.Channel,
     catalog: *Catalog,
     state: State = .supported,
+    hotplug_state: ?display.HotplugState = null,
     deadline: u64,
     cursor: usize = 0,
     head_cursor: u32 = 0,
@@ -302,6 +303,7 @@ pub const Discovery = struct {
     }
     fn query(self: *Discovery) Error!display.Query {
         return switch (self.state) {
+            .hotplug_state => .hotplug_state,
             .supported, .verify => .supported,
             .heads, .verify_heads => .heads,
             .active, .verify_active => .{ .active = self.head_cursor },
@@ -376,7 +378,7 @@ pub const Discovery = struct {
                 self.takeActive(.{ .rejected = rejection });
             } else if (self.state == .windows or self.state == .verify_windows) {
                 self.takeWindows(null, rejection);
-            } else if (self.state == .supported or self.state == .verify) {
+            } else if (self.state == .hotplug_state or self.state == .supported or self.state == .verify) {
                 // No successful final supported-mask comparison: no usable
                 // catalog, even if earlier per-display queries succeeded.
                 self.catalog.rejected = rejection;
@@ -396,6 +398,11 @@ pub const Discovery = struct {
             return;
         }
         switch (self.state) {
+            .hotplug_state => {
+                if (reply != .hotplug_state) return error.Unexpected;
+                self.hotplug_state = reply.hotplug_state;
+                self.state = .supported;
+            },
             .supported => {
                 if (reply != .supported) return error.Unexpected;
                 self.catalog.supported = reply.supported;

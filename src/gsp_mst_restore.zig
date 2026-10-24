@@ -235,7 +235,7 @@ pub const Work = struct {
             }
             break :blk .{ .query = .{ .aux = try up.prepare(self.token.generation, now) orelse return false } };
         } else switch (self.stage) {
-            .connected => .{ .query = .{ .connected = self.token.root } },
+            .connected => .{ .query = .{ .connected = .{ .mask = self.token.root } } },
             .resource => .{ .query = .{ .resource = self.token.root } }, .guid => self.mst(.guid),
             .link_config => self.read(.link_config), .link_status => self.read(.link_status),
             .heads => .{ .query = .heads }, .active => .{ .query = .{ .active = self.cursor } },

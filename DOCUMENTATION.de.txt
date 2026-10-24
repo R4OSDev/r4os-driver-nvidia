@@ -1,6 +1,51 @@
 ﻿NVIDIA: nativer Grafik- und Displaybesitzer
 =========================================
 
+0.87.2 / NVIDIA322 / 24.10.2026:
+Drei echte OssiPC-Startfenster fuer authentifizierte Receiverinvalidierung
+sind beim Treiberbesitzer korrigiert. Vor dem ersten PUT muss die neue
+cohaerente Abfrage denselben vollstaendigen EDID-/Modus-/Linkvertrag belegen;
+der bestehende Mode-Control liefert eine neue Source-/IMP-Quittung. Speicher,
+unbeschriebene Kanaele und die urspruengliche Gesamtfrist bleiben erhalten.
+Trifft HPD die bereits begonnene erste Link-Transaktion, braucht deren genauer
+Abbruch noch keinen publizierten Ausgabeowner als Pausenbesitzer. Erst nach
+wirklichem Reply-Drain/Abbruch und nachgewiesen unbeschriebenen Ringen darf
+dieselbe Vorbereitung eine frische Mode-Abnahme versuchen. Bereits bestehende
+Bilder behalten unveraendert ihre genaue Ausgabepausenbarriere. Ein spaeter
+obsolete zurueckkehrendes Teilinventar bleibt wartend; ein ohne Invalidierung
+fehlerhaftes Inventar bleibt Stale. Der vorhandene Complete-run-Besitzertest
+prueft beide Initialfenster, neue Quittung/gleiche Frist/keine fruehen PUTs,
+geaenderte EDID, geschriebene Kanaele und das obsolete Teilinventar. Kein neuer
+Runner; Modellbeleg ist getrennt von physischer Aktivierung und Sichtbarkeit.
+Nach authentifiziertem HPD holt die bestehende Topologieabfrage vor der
+Receivererkennung den gespeicherten physischen Hotplugzustand mit730401 ab.
+Der originale oeffentliche73012d-Wrapper leitet genau dorthin unter derselben
+Display-Common-Identitaet weiter. Die16Byte-Rueckgabe liefert nur Hinweise;
+ohne erfolgreiche Abholung oder neue cohaerente Receiver-/Modebelege gibt es
+keine Zulassung. Queue-ACK allein ersetzt diese physische Zustandsabholung
+nicht. Original570.144, Aufrufer und konkrete physische Weiterleitung:
+https://github.com/NVIDIA/open-gpu-kernel-modules/blob/570.144/src/nvidia-modeset/src/nvkms-event.c
+https://github.com/NVIDIA/open-gpu-kernel-modules/blob/570.144/src/nvidia/src/kernel/gpu/disp/disp_common_kern_ctrl_minimal.c
+Native TMDS-Anschluesse mit gemeldeter DDC-Unterstuetzung nutzen fuer erste
+und letzte Praesenzprobe METHOD_ECONODDC=2, den original dokumentierten
+physischen DDC-Ping. Das vermeidet eine erneute vollstaendige Erkennung im
+Receiver-Koerper. Andere Anschluesse behalten METHOD_DEFAULT=0. CACHED=1
+ist keine zugelassene Option; Antworten mit falscher Methode oder fremden
+Masken scheitern. Vollstaendige EDID-, Wiederholungs-, Ressourcen-, Link-,
+Mode-/IMP- und Abschlusspruefungen bleiben unveraendert Pflicht. Quelle:
+https://github.com/NVIDIA/open-gpu-kernel-modules/blob/570.144/src/common/sdk/nvidia/inc/ctrl/ctrl0073/ctrl0073system.h
+Hardware-/SNES-Qualifikation und Vergleichsgrenzen: Docs/Diagnostics/SnesBenchmark.txt.
+Der User hat einen unvollstaendig eingesteckten HDMI-Stecker als Ursache der
+fortlaufenden Plug-Ereignisse festgestellt. Dieselben322-Bytes erreichen nach
+der Kabelkorrektur eine stabile native Ausgabe unter dem aktuellen Rust-Kernel.
+Auch ohne gestarteten Desktop trat der Plug-Sturm auf; er ist kein Beleg
+fuer einen Kernel-/Desktop-Portierungsfehler. Separat stellt Desktop156 sein
+urspruengliches provisorisches Startlayout bis zur echten Ausgabe wieder her.
+Die Besitzerkorrekturen oben sichern die reproduzierten Initial-/Hotplugfenster
+ab. Zusaetzliche HPD-Kontextlogs
+lesen nur bereits gehaltene Metadaten, begrenzt auf die ersten zwoelf Ereignisse;
+sie erzeugen keine zusaetzlichen RM-Abfragen oder Ressourcenleihen.
+
 0.82.10 / NVIDIA190-191 / 01.10.2026:
 190 korrigiert den reproduzierten Vulkan-Abbaufehler bei gleichzeitigem
 Kanal-/BO-Ende. Nur einzeln quittiert freigegebene FIFO-Commandpuffer duerfen

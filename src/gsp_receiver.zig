@@ -173,6 +173,7 @@ pub const Refresh = struct {
     aux_verifying: bool = false,
     probe_dp: bool = false, // Only a current topology resource can request it.
     probe_hdmi: bool = false,
+    ddc_presence: bool = false,
 
     /// Storage and graph remain exclusively borrowed until release. Moving
     /// this value is allowed only before its first poll; never copy it live.
@@ -213,7 +214,8 @@ pub const Refresh = struct {
     fn query(self: *Refresh) Error!display.Query {
         return switch (self.state) {
             .supported => .supported,
-            .connected, .verify => .{ .connected = self.capture.display_id },
+            .connected, .verify => .{ .connected = .{ .mask = self.capture.display_id,
+                .method = if (self.ddc_presence) .ddc_ping else .full } },
             .edid => .{ .edid = self.capture.display_id },
             .resource, .aux_verify_resource => .{ .resource = self.capture.display_id },
             .dp_verify => .{ .resource = self.capture.display_id },

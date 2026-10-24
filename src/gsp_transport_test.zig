@@ -708,7 +708,7 @@ fn displayReply(model: *Model, channel: *display_rpc.Channel, status: u32, value
                 byte.* = @truncate(i);
             };
         },
-        .heads, .active, .windows, .connectors, .resource, .buses, .ports, .ddc, .aux, .dp_source, .frl_source, .mst_allocate, .mst_free => unreachable, // Dedicated bounded topology/DDC fixtures below.
+        .hotplug_state, .heads, .active, .windows, .connectors, .resource, .buses, .ports, .ddc, .aux, .dp_source, .frl_source, .mst_allocate, .mst_free => unreachable, // Dedicated bounded topology/DDC fixtures below.
     }
     // The RPC sequence and private result deliberately do not echo the request.
     try model.replyRpc(channel.exchange.session, .{ .function = 76, .result = 0, .result_private = 0x19283746, .sequence = 0xdeadbeef }, encoded);
@@ -719,7 +719,7 @@ fn readyDisplay(model: *Model, session: *transport.Session) !display_rpc.Channel
     try t.expect((try channel.poll(deadline)) == null);
     try displayReply(model, &channel, 0, 0x80000005);
     try channel.complete((try channel.poll(deadline)).?.ticket);
-    try channel.begin(.{ .connected = 0x80000005 }, deadline);
+    try channel.begin(.{ .connected = .{ .mask = 0x80000005 } }, deadline);
     try t.expect((try channel.poll(deadline)) == null);
     try displayReply(model, &channel, 0, 0x80000001);
     try channel.complete((try channel.poll(deadline)).?.ticket);
@@ -729,9 +729,9 @@ fn checkDisplayRpc(model: *Model) !void {
     // Original-header byte offsets, sizes and command IDs are independent
     // of the encoder, and travel through the real framing/queue model below.
     var payload: [2089]u8 = undefined;
-    const queries = [_]display_rpc.Query{ .supported, .{ .connected = 0x80000005 }, .{ .edid = 0x80000000 }, .{ .connectors = 0x80000000 }, .{ .resource = 0x80000000 }, .{ .buses = 0x80000000 }, .heads, .{ .active = 31 } };
-    const sizes = [_]usize{ 36, 40, 2088, 96, 80, 40, 36, 40 };
-    const commands = [_]u32{ 0x730107, 0x730108, 0x730245, 0x730250, 0x73028b, 0x730211, 0x730102, 0x73010c };
+    const queries = [_]display_rpc.Query{ .hotplug_state, .supported, .{ .connected = .{ .mask = 0x80000005 } }, .{ .edid = 0x80000000 }, .{ .connectors = 0x80000000 }, .{ .resource = 0x80000000 }, .{ .buses = 0x80000000 }, .heads, .{ .active = 31 } };
+    const sizes = [_]usize{ 40, 36, 40, 2088, 96, 80, 40, 36, 40 };
+    const commands = [_]u32{ 0x730401, 0x730107, 0x730108, 0x730245, 0x730250, 0x73028b, 0x730211, 0x730102, 0x73010c };
     for (queries, sizes, commands) |query, size, command| {
         @memset(&payload, 0xa5);
         const bytes = try display_rpc.encode(display_object, query, &payload);
@@ -771,12 +771,41 @@ fn checkDisplayRpc(model: *Model) !void {
             try t.expectError(err, display_rpc.decode(display_object, query, record));
         }
     }
+    // Original internal 730401, not the public host 73012d wrapper.
+    // Physical state consumption is not a connected-receiver receipt.
+    const hotplug_bytes = try display_rpc.encode(display_object, .hotplug_state, &payload);
+    for (hotplug_bytes[24..]) |byte| try t.expectEqual(@as(u8, 0), byte);
+    put(&payload, 32, 0x800); put(&payload, 36, 0x100);
+    const hotplug_shape = try message.encode(profile, 0, .{ .function = 76, .result = 0 }, hotplug_bytes, &model.frame);
+    var hotplug_record = try message.decode(profile, model.frame[0..hotplug_shape.storage_bytes], 0);
+    hotplug_record.payload = payload[0..40];
+    const hotplug = (try display_rpc.decode(display_object, .hotplug_state, hotplug_record)).hotplug_state;
+    try t.expectEqual(@as(u32, 0x800), hotplug.plug_mask);
+    try t.expectEqual(@as(u32, 0x100), hotplug.unplug_mask);
+    put(&payload, 36, 0x800);
+    try t.expectError(error.Payload, display_rpc.decode(display_object, .hotplug_state, hotplug_record));
+    put(&payload, 36, 0x100); put(&payload, 28, 2);
+    try t.expectError(error.Payload, display_rpc.decode(display_object, .hotplug_state, hotplug_record));
+    const ddc_presence: display_rpc.Query = .{ .connected = .{ .mask = 0x800, .method = .ddc_ping } };
+    const presence_bytes = try display_rpc.encode(display_object, ddc_presence, &payload);
+    try t.expect(presence_bytes.len == 40 and get(presence_bytes, 28) == 2 and get(presence_bytes, 32) == 0x800);
+    put(&payload, 32, 0x800);
+    const presence_shape = try message.encode(profile, 0, .{ .function = 76, .result = 0 }, presence_bytes, &model.frame);
+    var presence_record = try message.decode(profile, model.frame[0..presence_shape.storage_bytes], 0);
+    presence_record.payload = payload[0..40];
+    try t.expect((try display_rpc.decode(display_object, ddc_presence, presence_record)).connected == 0x800);
+    put(&payload, 28, 1); // A cached response cannot satisfy the physical ping.
+    try t.expectError(error.Payload, display_rpc.decode(display_object, ddc_presence, presence_record));
+    put(&payload, 28, 0);
+    try t.expectError(error.Payload, display_rpc.decode(display_object, ddc_presence, presence_record));
+    put(&payload, 28, 2); put(&payload, 32, 0x1000);
+    try t.expectError(error.Payload, display_rpc.decode(display_object, ddc_presence, presence_record));
     for ([_]u32{ 0, 3, 0xffffffff }) |id|
         try t.expectError(error.Query, display_rpc.encode(display_object, .{ .edid = id }, &payload));
 
     var session: transport.Session = undefined;
     var channel = try startDisplay(model, &session);
-    try t.expectError(error.Query, channel.begin(.{ .connected = 1 }, deadline));
+    try t.expectError(error.Query, channel.begin(.{ .connected = .{ .mask = 1 } }, deadline));
     try t.expectError(error.Query, channel.begin(.{ .edid = 1 }, deadline));
     try t.expectEqual(@as(usize, 0), model.count);
     try channel.begin(.supported, deadline);
@@ -805,8 +834,8 @@ fn checkDisplayRpc(model: *Model) !void {
     try t.expect(channel.supported == null);
     try channel.complete(event.ticket);
     try t.expectEqual(@as(u32, 0x80000005), channel.supported.?.displays);
-    try t.expectError(error.Query, channel.begin(.{ .connected = 2 }, deadline));
-    try channel.begin(.{ .connected = 0x80000005 }, deadline);
+    try t.expectError(error.Query, channel.begin(.{ .connected = .{ .mask = 2 } }, deadline));
+    try channel.begin(.{ .connected = .{ .mask = 0x80000005 } }, deadline);
     try t.expect((try channel.poll(deadline)) == null);
     try displayReply(model, &channel, 0, 0x80000001);
     try channel.complete((try channel.poll(deadline)).?.ticket);
@@ -830,7 +859,7 @@ fn checkDisplayRpc(model: *Model) !void {
     try channel.complete(event.ticket);
     try t.expectError(error.Obsolete, channel.poll(deadline));
     try t.expectEqual(sent_before, session.tx_sequence); // Never sent after invalidation.
-    try channel.begin(.{ .connected = 1 }, deadline);
+    try channel.begin(.{ .connected = .{ .mask = 1 } }, deadline);
     try t.expect((try channel.poll(deadline)) == null);
     try model.replyRpc(&session, .{ .function = 0x1003 }, "second hotplug");
     try channel.complete((try channel.poll(deadline)).?.ticket);
@@ -841,7 +870,7 @@ fn checkDisplayRpc(model: *Model) !void {
     try t.expectEqual(@as(u32, 0), channel.connected);
 
     channel = try readyDisplay(model, &session);
-    try channel.begin(.{ .connected = 1 }, deadline);
+    try channel.begin(.{ .connected = .{ .mask = 1 } }, deadline);
     try t.expect((try channel.poll(deadline)) == null);
     try displayReply(model, &channel, 66, 0xffffffff);
     event = (try channel.poll(deadline)).?;
@@ -1497,7 +1526,7 @@ fn checkEventObjects(model: *Model) !void {
     try t.expect((try channel.poll(deadline)) == null);
     try displayReply(model, &channel, 0, 0x80000001);
     try channel.complete((try channel.poll(deadline)).?.ticket);
-    try channel.begin(.{ .connected = 0x80000001 }, deadline);
+    try channel.begin(.{ .connected = .{ .mask = 0x80000001 } }, deadline);
     try t.expect((try channel.poll(deadline)) == null);
     var post: [40]u8 = undefined;
     // Both routing forms reach the sole matching registration, even while
@@ -2079,7 +2108,7 @@ fn checkLiveMst(model: *Model) !void {
             const payload = try display_rpc.encode(work.channel.object, query, &bytes);
             switch (query) {
                 .supported => { put(&bytes, 28, supported); put(&bytes, 32, supported); },
-                .connected => |id| { try t.expect(id == 4); put(&bytes, 32, 4); },
+                .connected => |value| { try t.expect(value.mask == 4 and value.method == .full); put(&bytes, 32, 4); },
                 .resource => |id| {
                     try t.expect(id == 4 or id == 16 or id == 32);
                     put(&bytes, 32, 2); put(&bytes, 36, 2); put(&bytes, 40, 8); put(&bytes, 60, 27);

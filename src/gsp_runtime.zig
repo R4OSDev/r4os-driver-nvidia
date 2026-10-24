@@ -2146,6 +2146,25 @@ pub const Owner = struct {
         return plan;
     }
     pub const RefreshedDisplay = struct { mode: boot_mode.Plan, link: display_link.Plan, image: ActiveDisplayImage };
+    pub const RefreshedInitialMode = struct { mode: boot_mode.Plan, link: display_link.Plan };
+    /// Refresh only the metadata of an unchanged initial route. No display
+    /// channel may have issued a method yet; a new source/IMP query is still
+    /// required before the first scanout PUT. Existing image/storage stays.
+    pub noinline fn refreshInitialDisplayMode(self: *Owner, result: *RefreshedInitialMode, root_handle: DisplayEngineHandle,
+        base: boot_mode.Plan, link: display_link.Plan) !void
+    {
+        const root = try self.findDisplayEngine(root_handle);
+        if (base.window >= self.display_images.len or self.display_images[base.window] != null or
+            self.display_work != null or self.mode_control_active or !std.meta.eql(base, link.mode)) return error.Stale;
+        for (&self.display_channels) |*slot| if (slot.*) |*channel| {
+            if (channel.parent != root) continue;
+            if (channel.ring.initialized or channel.ring.issued != 0 or channel.ring.completed != 0 or channel.ring.pending != null) return error.Stale;
+        };
+        const snapshot = self.nativeOutputs() orelse return error.Busy;
+        if (snapshot.generation <= base.output_generation or snapshot.final_receipt_serial <= base.receipt_serial) return error.Stale;
+        result.mode = try refreshPlan(base, snapshot);
+        result.link = try refreshLink(link, result.mode, snapshot);
+    }
     fn refreshPlan(saved: boot_mode.Plan, snapshot: *const outputs.Snapshot) !boot_mode.Plan {
         var value = try boot_mode.bind(saved, snapshot, saved.epoch, saved.held_generation);
         if (saved.receiver_mode_id != 0) {
@@ -2297,16 +2316,26 @@ pub const Owner = struct {
         image_handle: u32, receiver_mode_id: u32, color: ?@import("gsp_color_signal.zig").color.Signal,
         pipeline: @import("gsp_color_signal.zig").color.Pipeline, deadline: u64) !void
     {
+        var gate: enum { channels, plan, peers, link, receipt, image, submit, work } = .channels;
+        errdefer |err| if (err != error.Busy) {
+            self.log("NVIDIA display-admission: gate={s} reason={s} epoch={d} mode={d} dma={x}",
+                .{@tagName(gate),@errorName(err),self.epoch,receiver_mode_id,image_handle});
+        };
         const core = try self.findDisplayChannel(core_handle);
         const window = try self.findDisplayChannel(window_handle);
         if (core.parent != window.parent or window.config.kind != .window) return error.Stale;
         const root: DisplayEngineHandle = .{ .epoch = self.epoch, .root = core.parent.binding.root };
+        gate = .plan;
         const plan = try self.admittedDisplayMode(root, try self.displayColorModePlan(root, window.config.index, receiver_mode_id, color, pipeline));
+        gate = .peers;
         const shared_sor = try @import("gsp_mst_sor.zig").control(plan, &self.display_images, false);
         const peer_windows = try self.displayPeerWindows(plan.window);
         if (self.display_link_failures[plan.window] != null) return error.Busy;
+        gate = .link;
         const link = try display_link.derive(plan, self.display_object.?, self.outputs.snapshot().?);
+        gate = .receipt;
         const receipt = try self.modeAdmission(root, plan);
+        gate = .image;
         var clear_previous: ?display_link.Plan = null;
         var clear_dsc = false;
         if (self.display_images[plan.window]) |*prior| if (prior.link) |*previous_link| {
@@ -2325,9 +2354,11 @@ pub const Owner = struct {
         if (image.width != plan.width or image.height != plan.height or image.format != format) return error.Descriptor;
         const slot = try display_channel.wire.slot(.immediate, window.config.index);
         const position = if (self.display_channels[slot]) |*value| value else return error.Unsupported;
+        gate = .submit;
         try self.commitPositionedDisplayImage(core_handle, window_handle,
             .{ .epoch = self.epoch, .handle = position.config.handle, .slot = @intCast(slot) }, image_handle, plan.head, .{}, deadline);
         errdefer self.display_work = null;
+        gate = .work;
         self.display_work.?.link = @as(display_link.Work, undefined);
         const link_work = &self.display_work.?.link.?;
         link_work.initInPlace(link);
@@ -4883,7 +4914,13 @@ pub const Owner = struct {
     pub fn displayWorkObsolete(self: *const Owner) bool {
         const work = self.display_work orelse return false;
         const admitted = work.admission orelse return false;
-        return self.outputPaused(admitted.mode.window) and (self.outputs.invalidated or admitted.receiver_sequence != self.receiver_events.sequence);
+        // The first image has no published output owner to pause yet. Its
+        // admitted link must still drain/cancel on receiver invalidation.
+        // Existing images keep the exact output owner's pause barrier.
+        const initial = admitted.mode.window < self.display_images.len and
+            self.display_images[admitted.mode.window] == null and self.display_retired[admitted.mode.window] == null;
+        return (self.outputPaused(admitted.mode.window) or initial) and
+            (self.outputs.invalidated or admitted.receiver_sequence != self.receiver_events.sequence);
     }
     /// Only an already admitted transaction may drain with its old signal.
     /// New commits continue to require a fresh receiver and IMP admission.
@@ -6685,6 +6722,8 @@ pub const Owner = struct {
                 var loan = try self.graph.?.loan(self.outputs.deadline);
                 self.channel = try exchange.Exchange.init(&loan.runtime, self.outputs.deadline);
                 try self.outputs.returned(current);
+                if (self.outputs.probe) |*probe| if (probe.hotplug_state) |state|
+                    self.log("NVIDIA gsp-hotplug-state: physical-command=730401 flags={x} plug={x} unplug={x} receiver-proof=no", .{state.flags,state.plug_mask,state.unplug_mask});
                 try self.receiver_events.finished(self.epoch, current, hotplug.retrySnapshot(&self.outputs.data));
                 self.log("NVIDIA gsp-outputs: generation={d} inventory={s} routes={d} receivers={d} native-output=unavailable",
                     .{self.output_generation, if (!self.outputs.data.coherent) @as([]const u8, "obsolete") else if (self.outputs.data.topology.rejected != null) "query-rejected" else "complete",
@@ -7145,6 +7184,10 @@ pub const Owner = struct {
         var token = try channel.handoff(end);
         try self.graph.?.reclaim(&token, end);
         try self.outputs.begin(&self.graph.?, self.output_generation, end);
+        // Original public 73012d consumes the physical RM's 730401 state
+        // before detecting receivers. A queue ACK alone does not do that.
+        // Masks are hints only; the complete fresh capture remains required.
+        if (self.snapshot.hotplug_events != 0) self.outputs.probe.?.state = .hotplug_state;
         try self.receiver_events.started(self.epoch, current);
         self.log("NVIDIA gsp-outputs: acquiring generation={d} deadline-ns={d}", .{self.output_generation, end});
         return true;
@@ -7312,11 +7355,33 @@ pub const Owner = struct {
                 const sink = try graph.eventSink();
                 try sink.deliver(sink.context, scope, event);
                 const kind = (try post.display()) orelse return error.Unexpected;
+                // Inspect only already retained metadata, before invalidating
+                // it. This distinguishes an RM query-induced event from a
+                // platform/Desktop request without taking another RM loan.
+                if (kind == .hotplug and self.snapshot.hotplug_events < 12) {
+                    self.log("NVIDIA gsp-hotplug-context: clock-ns={d} capture={s} receivers={d} mode-query={} image={}",
+                        .{self.last_clock, @tagName(self.outputs.state), self.outputs.data.count,
+                            self.mode_control_active, self.presentation != null});
+                    if (self.outputs.refresh) |*refresh| {
+                        const command = if (refresh.channel.request) |request| @intFromEnum(std.meta.activeTag(request)) else 0;
+                        self.log("NVIDIA gsp-hotplug-query: display={x} phase={s} command={x} presence={s}",
+                            .{refresh.capture.display_id, @tagName(refresh.state), command,
+                                if (refresh.ddc_presence) @as([]const u8, "ddc-ping") else "full"});
+                        const index = self.outputs.data.count;
+                        if (index < self.outputs.data.topology.count and index < self.outputs.data.topology.routes.len) {
+                            const route = self.outputs.data.topology.routes[index];
+                            if (route.resource) |resource| self.log("NVIDIA gsp-hotplug-route: display={x} kind={d} protocol={d} dynamic={} ddc-mask={?x}",
+                                .{route.id, resource.kind, resource.protocol, resource.dynamic,
+                                    if (self.outputs.data.topology.supported) |supported| supported.ddc else null});
+                        }
+                    }
+                }
                 try self.outputs.invalidate();
                 // The capture generation changed before this query could
                 // publish. Drain its reply, but never admit its old result.
                 if (self.mode_control_active) try self.invalidateModeQuery();
                 try self.receiver_events.note(self.epoch, self.last_clock, kind);
+                if (kind == .hotplug) self.log("NVIDIA gsp-hotplug-hint: plug={x} unplug={x} sequence={d}", .{kind.hotplug.plug_mask,kind.hotplug.unplug_mask,self.receiver_events.sequence});
                 if (kind == .hotplug) self.snapshot.hotplug_events +|= 1 else self.snapshot.dp_irq_events +|= 1;
                 self.log("NVIDIA gsp-event: kind={s} status={x} data={x} refresh=required", .{@tagName(kind), post.status, post.data});
             },

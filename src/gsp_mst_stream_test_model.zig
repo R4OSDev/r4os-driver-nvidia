@@ -122,7 +122,7 @@ pub fn respond(request: link.Request, bytes: []u8, snapshot: *const outputs.Snap
             else => return error.UnexpectedMstControl,
         },
         .query => |query| switch (query) {
-            .connected => |mask| put(bytes, 32, if (root_present) mask & 8 else 0),
+            .connected => |value| put(bytes, 32, if (root_present) value.mask & 8 else 0),
             .resource => |id| {
                 var found = false;
                 for (snapshot.topology.routes[0..snapshot.count]) |route| if (route.id == id) {

@@ -242,7 +242,11 @@ pub const Owner = struct {
                 product.ctx.?.logInfo("NVIDIA hotplug: state=headless scanout=quiesced shadow=retained queues=drained");
             },
             .receiver_wait => {
-                if (run.outputs.active() or run.outputs.state != .returned or run.outputs.data.generation == self.attempted_generation) return false;
+                // A later HPD may return an obsolete topology before its
+                // receivers have been captured. Keep the retired image and
+                // wait for acquisition; never consume that partial inventory.
+                if (run.outputs.active() or run.outputs.state != .returned or run.outputs.invalidated or
+                    run.outputs.data.generation == self.attempted_generation) return false;
                 const snapshot = &run.outputs.data;
                 self.attempted_generation = snapshot.generation;
                 const seen = try receiver.observe(snapshot, product.mode.?.signal.display_id);

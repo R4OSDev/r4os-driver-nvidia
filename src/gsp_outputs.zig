@@ -167,6 +167,11 @@ pub const Owner = struct {
                     self.refresh = try receiver.Refresh.init(self.graph.?, self.data.topology.routes[index].id,
                         &self.data.receivers[index], self.deadline);
                     if (self.data.topology.routes[index].resource) |resource| {
+                        // Physical TMDS presence needs no assigned SOR. Use
+                        // the documented DDC ping, then retain full EDID and
+                        // end verification; never use cached connection data.
+                        self.refresh.?.ddc_presence = display.nativeTmds(resource) and
+                            self.data.topology.supported.?.ddc & self.data.topology.routes[index].id != 0;
                         self.refresh.?.probe_dp = display.nativeDp(resource) and (resource.index < 8 or resource.index == 0xffffffff);
                         self.refresh.?.probe_hdmi = display.nativeTmds(resource) and resource.index < 8;
                     }

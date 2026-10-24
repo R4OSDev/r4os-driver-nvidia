@@ -228,12 +228,21 @@ pub const max_edid_bytes = 2048;
 pub const max_request_bytes = header_bytes + 16 + max_edid_bytes;
 pub const max_heads = 32;
 const mst_control = @import("gsp_mst_control.zig");
-pub const Command = enum(u32) { heads = 0x730102, active = 0x73010c, windows = 0x7302ad, supported = 0x730107, connected = 0x730108, edid = 0x730245, connectors = 0x730250, resource = 0x73028b, buses = 0x730211, ports = 0x402c0101, ddc = ddc_wire.command, aux = aux_wire.command, dp_source = 0x731369, frl_source = 0x7302a2, mst_allocate = 0x73135b, mst_free = 0x73135c };
+pub const Command = enum(u32) { hotplug_state = 0x730401, heads = 0x730102, active = 0x73010c, windows = 0x7302ad, supported = 0x730107, connected = 0x730108, edid = 0x730245, connectors = 0x730250, resource = 0x73028b, buses = 0x730211, ports = 0x402c0101, ddc = ddc_wire.command, aux = aux_wire.command, dp_source = 0x731369, frl_source = 0x7302a2, mst_allocate = 0x73135b, mst_free = 0x73135c };
 pub const Ddc = struct { display_id: u32, port: u8, block: u8 };
-pub const Query = union(Command) { heads: void, active: u32, windows: void, supported: void, connected: u32, edid: u32, connectors: u32, resource: u32, buses: u32, ports: void, ddc: Ddc, aux: aux_wire.Request,
+pub const ConnectionQuery = struct {
+    mask: u32,
+    // Original 570.144 METHOD_ECONODDC performs a real DDC presence ping.
+    // METHOD_CACHED is deliberately not an admitted query option.
+    method: enum(u32) { full = 0, ddc_ping = 2 } = .full,
+};
+pub const Query = union(Command) { hotplug_state: void, heads: void, active: u32, windows: void, supported: void, connected: ConnectionQuery, edid: u32, connectors: u32, resource: u32, buses: u32, ports: void, ddc: Ddc, aux: aux_wire.Request,
     dp_source: struct { display_id: u32, sor: u32, transport: enum { dp, hdmi } = .dp }, frl_source: u32, mst_allocate: u32, mst_free: u32 };
 pub const Object = struct { epoch: u64, client: u32, display: u32, i2c: u32 = 0 };
 pub const Supported = struct { displays: u32, ddc: u32 };
+// Public 73012d delegates to this physical RM command in the original
+// disp_common_kern_ctrl_minimal.c. Same display-common handle, 16 bytes.
+pub const HotplugState = struct { flags: u32, plug_mask: u32, unplug_mask: u32 };
 pub const Connector = struct { index: u32 = 0, kind: u32 = 0, location: u32 = 0 };
 pub const Connectors = struct {
     flags: u32,
@@ -262,6 +271,7 @@ pub const Resource = struct {
 };
 pub const Buses = struct { communication: u32, ddc: u32 }; // RM port IDs; zero means NONE, not CCB index 0.
 pub const Reply = union(enum) {
+    hotplug_state: HotplugState,
     heads: u32,
     active: u32,
     windows: [32]u8,
@@ -303,7 +313,7 @@ fn paramsSize(query: Query) usize {
         .supported, .heads => 12,
         .windows => 36, // NV0073: subDeviceInstance, 32 byte-sized head masks.
         .active => 16,
-        .connected => 16,
+        .connected, .hotplug_state => 16,
         .edid => 16 + max_edid_bytes,
         .connectors => 72,
         .resource => 56,
@@ -337,14 +347,14 @@ pub fn nativeTmds(resource: Resource) bool { return resource.kind == 2 and (reso
 pub fn encode(object: Object, query: Query, output: []u8) Error![]const u8 {
     if (object.epoch == 0 or object.client == 0 or object.display == 0 or target(object, query) == 0) return error.Handle;
     switch (query) {
-        .supported, .heads, .windows, .ports => {},
+        .supported, .heads, .windows, .ports, .hotplug_state => {},
         .ddc => |request| if (!oneBit(request.display_id) or request.port >= 16 or request.block >= ddc_wire.max_blocks) return error.Query,
         .aux => |request| if (!oneBit(request.display_id)) return error.Query,
         .dp_source => |request| if (!oneBit(request.display_id) or request.sor >= 8 or
             (request.transport == .hdmi and request.sor != 0)) return error.Query,
         .frl_source, .mst_allocate, .mst_free => |id| if (!oneBit(id)) return error.Query,
         .active => |head| if (head >= max_heads) return error.Query,
-        .connected => |mask| if (mask == 0) return error.Query,
+        .connected => |value| if (value.mask == 0) return error.Query,
         .edid, .connectors, .resource, .buses => |id| if (!oneBit(id)) return error.Query,
     }
     const size = paramsSize(query);
@@ -360,11 +370,14 @@ pub fn encode(object: Object, query: Query, output: []u8) Error![]const u8 {
     // with COPY_CACHE=NO and DISPMUX=DEFAULT. Display IDs are RM masks,
     // never VBIOS physical connector indices or GPIO numbers.
     switch (query) {
-        .supported, .heads, .windows, .ports => {},
+        .supported, .heads, .windows, .ports, .hotplug_state => {},
         .ddc => |request| { _ = try ddc_wire.encode(.{ .port = request.port, .block = request.block }, null, bytes[header_bytes..]); },
         .aux => |request| { _ = try aux_wire.encode(request, bytes[header_bytes..]); },
         .active => |head| put(bytes, header_bytes + 4, head),
-        .connected => |mask| put(bytes, header_bytes + 8, mask),
+        .connected => |value| {
+            put(bytes, header_bytes + 4, @intFromEnum(value.method));
+            put(bytes, header_bytes + 8, value.mask);
+        },
         .connectors, .resource, .buses => |id| put(bytes, header_bytes + 4, id),
         .dp_source => |request| put(bytes, header_bytes + 4, request.sor),
         .frl_source => {}, // GPU-wide query; receiver identity gates the owner, not the wire.
@@ -406,6 +419,11 @@ pub fn decode(object: Object, query: Query, record: message.Record) Error!Reply 
     if (word(params, 0) != 0) return error.Unexpected;
     return switch (query) {
         .ports, .ddc, .aux => unreachable,
+        .hotplug_state => blk: {
+            const value: HotplugState = .{ .flags = word(params, 4), .plug_mask = word(params, 8), .unplug_mask = word(params, 12) };
+            if (value.flags & ~@as(u32, 1) != 0 or value.plug_mask & value.unplug_mask != 0) return error.Payload;
+            break :blk .{ .hotplug_state = value };
+        },
         .dp_source => |request| blk: {
             if (word(params,4) != request.sor) return error.Unexpected;
             break :blk .{ .dp_source = params[0..64].* };
@@ -435,8 +453,8 @@ pub fn decode(object: Object, query: Query, record: message.Record) Error!Reply 
             if (supported.ddc & ~supported.displays != 0) return error.Payload;
             break :blk .{ .supported = supported };
         },
-        .connected => |mask| blk: {
-            if (word(params, 4) != 0 or word(params, 8) & ~mask != 0) return error.Payload;
+        .connected => |value| blk: {
+            if (word(params, 4) != @intFromEnum(value.method) or word(params, 8) & ~value.mask != 0) return error.Payload;
             break :blk .{ .connected = word(params, 8) };
         },
         .edid => |id| blk: {
@@ -518,7 +536,7 @@ pub const Channel = struct {
         self.exchange.guard(@min(self.exchange.deadline orelse deadline, deadline)) catch |err| return self.fail(err);
         if (self.aux_open) |id| if (query != .aux or query.aux.display_id != id or !aux_wire.i2c(query.aux.operation)) return error.Query;
         switch (query) {
-            .supported => {},
+            .supported, .hotplug_state => {},
             .dp_source => |request| {
                 if (request.display_id & self.connected == 0) return error.Query;
                 if (request.transport == .dp) {
@@ -547,9 +565,9 @@ pub const Channel = struct {
                 const count = self.heads orelse return error.Query;
                 if (head >= count) return error.Query;
             },
-            .connected => |mask| {
+            .connected => |value| {
                 const available = self.supported orelse return error.Query;
-                if (mask == 0 or mask & ~available.displays != 0) return error.Query;
+                if (value.mask == 0 or value.mask & ~available.displays != 0) return error.Query;
             },
             .edid => |id| if (!oneBit(id) or id & self.connected == 0) return error.Query,
             .connectors, .resource, .buses => |id| {
@@ -562,7 +580,7 @@ pub const Channel = struct {
         self.request = query;
         self.request_revision = self.exchange.revision;
         if (query == .aux and aux_wire.i2c(query.aux.operation) and query.aux.operation != .stop) self.aux_open = query.aux.display_id;
-        if (query == .connected) self.connected &= ~query.connected;
+        if (query == .connected) self.connected &= ~query.connected.mask;
         if (query == .buses) self.ddc_bus = null;
         if (query == .resource) { self.aux_dp = null; self.dp_sor = null; self.hdmi_display = null; }
         if (query == .ports) self.ports = null;
@@ -652,7 +670,7 @@ pub const Channel = struct {
                         const operation = self.request.?.aux.operation;
                         if (value.status == 0 and value.kind == .ack and (operation == .stop or (operation == .read and operation.read.last))) self.aux_open = null;
                     },
-                    .connected => |mask| self.connected = (self.connected & ~self.request.?.connected) | mask,
+                    .connected => |mask| self.connected = (self.connected & ~self.request.?.connected.mask) | mask,
                     else => {},
                 }
                 self.request = null;

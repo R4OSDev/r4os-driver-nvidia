@@ -213,7 +213,7 @@ pub const Work = struct {
         if (self.retry_query) |query| return query;
         return switch (self.stage) {
             .supported, .allocated_mask, .final_supported => .supported,
-            .connected, .root_connected, .final_connected => .{ .connected = self.root.id },
+            .connected, .root_connected, .final_connected => .{ .connected = .{ .mask = self.root.id } },
             .resource, .root_resource, .final_resource => .{ .resource = self.root.id },
             .source => .{ .dp_source = .{ .display_id = self.root.id, .sor = self.resource.index } },
             .dpcd => .{ .aux = .{ .display_id = self.root.id, .operation = .caps } },
