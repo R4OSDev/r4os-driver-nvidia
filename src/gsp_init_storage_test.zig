@@ -5860,15 +5860,23 @@ fn checkNativeCursor(target: *@import("gsp_device.zig").Device) !void {
     try t.expectEqual(@as(u64, 1), try run.moveCursor(handle, -17, 29, deadline));
     try t.expectError(error.Busy, run.moveCursor(handle, 0, 0, deadline));
     try t.expectError(error.Busy, run.retireDisplayChannel(handle, deadline));
+    try checkCursorGraphicsSpace(target, handle);
     dm.words[(user + 8) / 4] = 0;
     clock += 1000; _ = target.step();
     try t.expect(owner.point.pending != null and !owner.point.pending.?.published and owner.point.issued == 0);
     // Original NVIDIA cursor HAL admits one PIO method at a time. A
     // one-credit FIFO must work; reserving four credits is not its contract.
     dm.words[(user + 8) / 4] = 1;
-    clock += 1000; _ = target.step();
+    // Deliver a real decoded IRQ after the entry time was sampled. Later
+    // register-admission clocks have advanced too; the PIO step must use
+    // that actual time instead of indefinitely deferring a writable FIFO.
+    clock += 1000; clock_interrupt = target;
+    defer clock_interrupt = null;
+    _ = try run.step();
+    try t.expect(clock_interrupt == null and owner.point.pending.?.deadline == deadline);
     try t.expect(target.phase == .ready and owner.point.pending.?.published);
     try t.expect(owner.point.pending.?.next_method == 1 and owner.point.completed == null);
+    try checkCursorGraphicsSpace(target, handle);
     // No second credit: keep the first method and UPDATE state intact even
     // with a fresh IRQ. The exact next worker step can issue UPDATE once.
     dm.words[(user + 8) / 4] = 0;
@@ -5879,6 +5887,7 @@ fn checkNativeCursor(target: *@import("gsp_device.zig").Device) !void {
     dm.words[(user + 8) / 4] = 1;
     clock += 1000; _ = target.step();
     try t.expect(owner.point.pending.?.next_method == 2);
+    try checkCursorGraphicsSpace(target, handle);
     for (pio.methods, 0..) |method, i| try t.expectEqual(pio.value(.{ .x = -17, .y = 29 }, i), dm.words[(user + method) / 4]);
     // Retrying the worker with no new IRQ must neither replay UPDATE nor
     // manufacture visible/CE completion. Hardware state remains owned.
@@ -11248,6 +11257,58 @@ fn checkSubmittedRenderCursorValidation(target: *@import("gsp_device.zig").Devic
         run.channel.?.phase == .idle and target.session.?.state == .active and run.graphics_cache.borrowed and
         fifo.ring.put == put and fifo.ring.issued == issued);
     std.debug.print("[nvidia-render-cursor-validation] submitted GR point={d}; pending PIO hides new VA access; exact retained work remains valid; wrong channel/target/source rejected; no new RPC/publication/completion; original deadline and references retained\n", .{ticket.point});
+}
+fn checkCursorGraphicsSpace(target: *@import("gsp_device.zig").Device,
+    handle: @import("gsp_runtime.zig").DisplayChannelHandle) !void
+{
+    const run = &target.running;
+    const owner = &run.display_channels[handle.slot].?;
+    const point = owner.point.pending.?;
+    const original = run.graph.?.address_space.?.info.?;
+    const rpc = target.session.?.tx_sequence;
+    const completed = owner.point.completed;
+    try t.expect(run.cursor_point == handle.slot and run.nativeAddressSpace() == null);
+    for (0..3) |_| try t.expectEqualDeep(original, (try run.queuedGraphicsAddressSpace()).*);
+    // A fresh SYSTEM mapping needs RM, unlike the retained GR operands.
+    // Cursor pressure must report transient Busy before touching the fence,
+    // importing a reference or reserving a mapping slot.
+    const buffer_serial = run.buffer_serial;
+    const mapping_count = run.buffers.items().len;
+    try t.expectError(error.Busy, run.mapQueuedBuffer(&.{}, 0, point.deadline));
+    try t.expect(run.buffer_serial == buffer_serial and run.buffers.items().len == mapping_count and run.buffer_active == null);
+    {
+        defer run.display_paused = false;
+        run.display_paused = true;
+        try t.expectError(error.Busy, run.queuedGraphicsAddressSpace());
+    }
+    {
+        const kind = owner.config.kind;
+        defer owner.config.kind = kind;
+        owner.config.kind = .core;
+        try t.expectError(error.Busy, run.queuedGraphicsAddressSpace());
+    }
+    {
+        const epoch = owner.config.root.epoch;
+        defer owner.config.root.epoch = epoch;
+        owner.config.root.epoch +%= 1;
+        try t.expectError(error.Busy, run.queuedGraphicsAddressSpace());
+    }
+    {
+        defer owner.point.pending = point;
+        owner.point.pending.?.point.x +%= 1;
+        try t.expectError(error.Busy, run.queuedGraphicsAddressSpace());
+    }
+    {
+        const phase = run.channel.?.phase;
+        defer run.channel.?.phase = phase;
+        run.channel.?.phase = .waiting;
+        try t.expectError(error.Busy, run.queuedGraphicsAddressSpace());
+    }
+    try t.expectEqualDeep(original, (try run.queuedGraphicsAddressSpace()).*);
+    try t.expect(std.meta.eql(owner.point.pending.?, point) and std.meta.eql(owner.point.completed, completed) and
+        run.cursor_point == handle.slot and run.nativeAddressSpace() == null and
+        target.session.?.tx_sequence == rpc and run.failure == null and target.phase == .ready);
+    std.debug.print("[nvidia-cursor-gr-space] sequence={d} prefix={d}; exact live PIO permits unchanged GR VA; display/RM remains closed; paused/wrong-kind/epoch/position/RPC rejected; no fake completion\n", .{point.sequence, point.next_method});
 }
 fn checkRenderCursorAdmission(target: *@import("gsp_device.zig").Device,
     queued: *@import("gsp_render_queue.zig").Owner) !void

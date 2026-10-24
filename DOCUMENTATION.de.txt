@@ -1,6 +1,87 @@
 ﻿NVIDIA: nativer Grafik- und Displaybesitzer
 =========================================
 
+0.87.6 / NVIDIA330, Desktop160 und DisplayDiag72 / 24.10.2026:
+Der Rust-Desktop pruefte die erfolgreiche Cursorinfo-Abfrage faelschlich auf0,
+obwohl der oeffentliche Vertrag gfx_output_ok=1 liefert. OssiPC bestaetigte
+vor der Korrektur info=1/flags=f/max256, aber keinen einzigen Cursorauftrag.
+Desktop160 verwendet den kanonischen Erfolgswert und behaelt die genaue
+Ausgabezuordnung und Cleanframe-Zulassung. Softwarecursor wurde dadurch trotz
+verfuegbarer Hardware erzwungen; daraus allein folgt noch kein Zeitanteil.
+Reine Cursor-Positionsarbeit und kanonische GR-Aufnahme besitzen getrennte
+Zulassungen. Der allgemeine Display-/RM-Zugriff bleibt waehrend Cursor-PIO
+geschlossen. Nur die Renderaufnahme darf denselben unveraenderten Graph-/VA-
+Besitzer verwenden, wenn der genaue lebende Cursor-Kanal, dessen Namespace,
+Epoche, Session, Positionsstempel, Frist und aktiver Head stimmen. Ausgangspause,
+Cursorbild-Upload, Core-/Moduswechsel und fremde RM-Arbeit bleiben sperrend.
+Die Aufnahme gibt weder das Cursor-Praefix noch dessen Sichtbarkeit frei:
+einmal geschriebene Methoden, eigenes UPDATE und frischer Head-IRQ bleiben
+erforderlich. Bereits eingereichte Grafik behaelt ihre echten GPU-Quittungen.
+Ein unter Mausdruck fehlgeschlagener Originalfall zeigte zusaetzlich eine
+neue SYSTEM-Abbildung im falschen Moment: das durch Cursor-PIO voruebergehend
+verborgene VA wurde als State-Fehler behandelt und der Kopierauftrag beendet.
+Neue Abbildungen melden jetzt vor Reservation/Import Busy; der genaue bereits
+gehaltene Kopierauftrag wartet mit seiner urspruenglichen Frist. Bestehende
+Abbildungen bleiben nutzbar. Der Hostfall prueft alle drei PIO-Praefixe ohne
+neue RM-Nachricht, Slotreservation oder gefaelschte Cursorquittung.
+DisplayDiag protokolliert unerwartete Abschlussfelder, behaelt aber die
+originalen14 Szenen, beide Layouts, Abhaengigkeiten und Pixeltoleranzen.
+Unter Mauslast blieb eine neue Position trotz freiem PIO und laufendem
+Head-IRQ bei Praefix0. Der damalige direkte Explorerstart hatte noch keine
+Desktop-Fensterbindung und belegt keine Explorer-Neuzeichnung.
+Die Registerabfragen koennen einen neuen
+VBlank ueberleben; die zuvor gelesene Workerzeit liess den danach gelesenen
+IRQ immer wieder zukuenftig erscheinen. NVIDIA330 liest die monotone Zeit
+nach dem genauen IRQ-Snapshot und verwendet sie fuer POSITION/UPDATE und
+Beobachtung. Echte zukuenftige IRQs warten weiter, die urspruengliche Frist
+bleibt verbindlich. Der vorhandene Cursorfall injiziert den IRQ nach der
+Eintrittszeit durch den echten Decoder und verlangt trotzdem genau einen
+POSITION-Schritt ohne Fristverlaengerung; die Originalgruppe besteht1/1.
+Die erste tatsaechliche GR-Quittung eines waehrend Cursor-PIO aufgenommenen
+Auftrags wird einmal als `NVIDIA render-cursor: overlap-completed` mit Epoche,
+Cursorsequenz, GR-Punkt und oeffentlichem Queue-Fence protokolliert. Sie ist
+kein optischer Maus-/Desktopnachweis und keine separate Cursorquittung.
+
+Die vorhandene Complete-run-Originalgruppe prueft nun die erlaubte genaue
+GR-VA-Bindung vor POSITION, zwischen POSITION/UPDATE und nach UPDATE sowie
+Pause, falsche Kanalart, Epoche, Positionsstempel und wartenden RM-Austausch.
+Sie behaelt die bisherigen Ablehnungen einer ungebundenen Cursor-Slotnummer,
+die genaue Validierung bereits eingereichter GR-Arbeit und alle originalen
+PIO-/Head-/Abbaufaelle. Gruppe1/1 und die zwei bestehenden Rust-Desktop-
+Cursorfaelle bestanden; Desktop fasst wartende Positionen bereits korrekt
+auf das neueste Ziel zusammen. Der Desktopartefaktwechsel korrigiert die
+Erfolgspruefung am produktiven Koordinator.
+OssiPC16 laeuft mit Release0.87.6, unveraendertem Kernel384, Desktop160 und
+NVIDIA330. Der unveraenderte ruhende Originalvergleich besteht14 Szenen in
+zwei Layouts, CE82/GR28,87808 Originalbytes und28 Freigaben vor dem Warten;
+Pixel-, Laufzeit- und Ressourcenorakel bestehen. CHECK DESKTOP besteht mit
+Verschieben/Skalieren, statischer und tickender GUI, REMOTEFRAME und genauer
+Bereinigung. Der normale Run-Dialog startet anschliessend Explorer auf C:;
+waehrend384 begrenzter Mauspositionen steigt dessen GUI-Revision2 auf6.
+Das genaue Fenster1 endet mit Exit0 und Completion58; der Desktop uebernimmt
+den wirklichen Abbau. Danach wieder Fensterzahl0, gleiche Geraetegeneration2/
+Reset1, keine stop-work-Meldung und keine ausstehenden/retinierten BO-Bytes.
+Der erste physische Ueberlappungsbeleg stammt aus NVIDIA328 mit derselben
+GR-Zulassung: Cursor11, wirklich abgeschlossener GR-Punkt318, Queue8:3.
+Die abschliessende Cursorabfrage ist verborgen (flags9, Sequenz5/5); sie
+belegt keine durchgehend sichtbare Hardwarecursor-Nutzung. Modelle und
+Queuequittungen ersetzen weder TV-Sichtpruefung noch optische Mauslatenz.
+Ein zusaetzlicher paralleler Render-/Mauslauf verfehlte die unveraenderte
+globale1s-Abbauprobe: zwei BOs/128KB noch im Abbau, danach vollstaendig frei.
+Der ruhende Originalvergleich besteht; die Latenz bleibt fuer die folgenden
+Worker-/Weckoptimierungen offen. Gleichzeitige CHECK-Steuerung lehnt echte
+Eingabe mit BusyOrUserActivity ab; diese Schutzgrenze wurde nicht gelockert.
+Finaler KVM4-STANDARD995d941f-afe6-4940-9ab3-2c4cca07a82a: Suite3,30Samples,
+vier vollstaendige Worker je Sample und sechs gueltige Scorebereiche samt
+vollstaendigem unveraendertem DevCenter-Readback; Gesamtindex150.697205.
+Original: Artifacts/Distribution/Diagnostics/SpectraStandard/
+995d941f-afe6-4940-9ab3-2c4cca07a82a/run.json. Der Testprofilstand enthaelt
+Desktop160 und denselben Kernel384; NVIDIA ist IMAGE_SCOPE=none und wird
+dort nicht ausgefuehrt. Dieser Lauf qualifiziert keine physische GPU-Wirkung.
+Weitere Desktop-/GR-/Workeroptimierungen und der abschliessende gleiche
+SNES-A/B-Kontext bleiben0.87.7-.12. Keine neuen Full-/Slim-Paketimages;
+deren veroeffentlichter Stand bleibt0.86.94.
+
 0.87.2 / NVIDIA322 / 24.10.2026:
 Drei echte OssiPC-Startfenster fuer authentifizierte Receiverinvalidierung
 sind beim Treiberbesitzer korrigiert. Vor dem ersten PUT muss die neue

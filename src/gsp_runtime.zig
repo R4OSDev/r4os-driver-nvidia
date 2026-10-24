@@ -183,6 +183,7 @@ pub const GraphicsWork = struct {
     resources: render_job.Owner = .{},
     queued: bool = false,
     diagnostic_timeout: bool = false,
+    cursor_sequence: u64 = 0,
 };
 pub const batch_job = @import("gsp_batch_job.zig");
 pub const BatchWork = struct {
@@ -447,6 +448,10 @@ pub const Owner = struct {
     graphics_enabled: bool = false,
     graphics_starting: bool = false,
     graphics_completed: u64 = 0,
+    graphics_cursor_completed: u64 = 0,
+    cursor_step_count: u64 = 0,
+    cursor_step_ns: u64 = 0,
+    cursor_sample: ?@import("gsp_cursor_pio.zig").Sample = null,
     graphics_upload: ?struct { channel: ChannelHandle, queued: bool = false, operation: @import("gsp_render_upload.zig").Owner = .{} } = null,
     copy_completed: u64 = 0,
     copy_bytes: u64 = 0,
@@ -836,6 +841,28 @@ pub const Owner = struct {
     /// existing RM/session resources. It is not physical GPU quiescence.
     pub fn stop(self: *Owner, err: anyerror) void {
         if (self.self_address == 0 or self.self_address != @intFromPtr(self) or self.failure != null) return;
+        self.log("NVIDIA stop-work: error={s} cursor={} display={} flips={} channel={?d} render={s}",
+            .{@errorName(err),self.cursor_point!=null,self.display_work!=null,self.hasDisplayFlips(),self.display_channel_active,
+              if(self.queued_render)|v|@tagName(v.phase) else "none"});
+        for (&self.display_flips, 0..) |*slot, index| if (slot.*) |*work| {
+            const observed: ?@import("gsp_head_events.zig").Sample = if (self.headSource(work.receipt.head)) |head| head.snapshot() else |_| null;
+            self.log("NVIDIA stop-flip: output={d} phase={s} point={d} now={d} deadline={d} submitted={d} begun={d}",
+                .{index,@tagName(work.window.phase),if(work.window.ticket)|v|v.point else 0,self.last_clock,work.deadline,
+                  work.receipt.submitted_ns,work.receipt.begun_observed_ns});
+            self.log("NVIDIA stop-flip-head: output={d} known={} current={d}/{d} baseline={d}/{d} ordinary={}",
+                .{index,observed!=null,if(observed)|v|v.sequence else 0,if(observed)|v|v.observed_ns else 0,
+                  work.baseline.sequence,work.baseline.observed_ns,work.ordinary});
+        };
+        if (self.cursor_point) |slot| if (slot < self.display_channels.len) if (self.display_channels[slot]) |*cursor| if (cursor.point.pending) |point| {
+            const observed: ?@import("gsp_head_events.zig").Sample = if (self.headSource(cursor.config.index)) |head| head.snapshot() else |_| null;
+            self.log("NVIDIA cursor-timeout: error={s} sequence={d} prefix={d} polls={d} worker={d} now={d} deadline={d} position={d} update={d}",
+                .{@errorName(err),point.sequence,point.next_method,self.cursor_step_count,self.cursor_step_ns,self.last_clock,point.deadline,point.submitted_ns,point.update_submitted_ns});
+            self.log("NVIDIA cursor-timeout-head: known={} head={d}/{d} baseline={d}/{d} sample={} free={x} control={x} state={x} paused={} flips={} display={}",
+                .{observed!=null,if(observed)|v|v.sequence else 0,if(observed)|v|v.observed_ns else 0,
+                  point.baseline.sequence,point.baseline.observed_ns,self.cursor_sample!=null,
+                  if(self.cursor_sample)|v|v.free else 0,if(self.cursor_sample)|v|v.control else 0,if(self.cursor_sample)|v|v.state else 0,
+                  self.display_paused,self.hasDisplayFlips(),self.display_work!=null});
+        };
         self.logResidency();
         self.allocations.close();
         self.virtual_provider.close();
@@ -1163,8 +1190,12 @@ pub const Owner = struct {
         return self.nativeObjectForDisplay();
     }
     fn nativeObjectForDisplay(self: *Owner) ?display.Object {
+        if (self.cursor_point != null) return null;
+        return self.nativeObjectForGraphics();
+    }
+    fn nativeObjectForGraphics(self: *Owner) ?display.Object {
         if (self.self_address != @intFromPtr(self) or self.failure != null or self.graph == null or
-            self.display_upload_job != null or self.display_work != null or self.cursor_point != null or self.cursor_upload != null or self.audio_work != null or self.monitor_work != null or self.sor_work != null or
+            self.display_upload_job != null or self.display_work != null or self.cursor_upload != null or self.audio_work != null or self.monitor_work != null or self.sor_work != null or
             self.graph.?.self_address != @intFromPtr(&self.graph.?) or self.graph.?.state != .loaned or
             self.display_object == null or self.channel == null or self.activeChannel() != &self.channel.? or
             self.channel.?.session.state != .active) return null;
@@ -1207,6 +1238,28 @@ pub const Owner = struct {
     pub fn nativeAddressSpace(self: *Owner) ?*const @import("gsp_vaspace.zig").Info {
         _ = self.now() catch return null;
         if (self.nativeObjectForDisplay() == null) return null;
+        return self.nativeGraphAddressSpace();
+    }
+    /// Canonical GR may use the unchanged graph while an exact live cursor
+    /// PIO position awaits its own head IRQ. Display/RM admission stays closed.
+    pub fn queuedGraphicsAddressSpace(self: *Owner) !*const @import("gsp_vaspace.zig").Info {
+        _ = try self.now();
+        if (self.commandExchangeBusy() or self.graph_closing or self.cursorPointBlocksGraphics() or
+            self.nativeObjectForGraphics() == null) return error.Busy;
+        return self.nativeGraphAddressSpace() orelse error.Busy;
+    }
+    fn cursorPointBlocksGraphics(self: *Owner) bool {
+        const slot = self.cursor_point orelse return false;
+        if (slot >= self.display_channels.len or self.display_channels[slot] == null or self.display_paused) return true;
+        const owner = &self.display_channels[slot].?;
+        const point = owner.point.pending orelse return true;
+        if (owner.config.kind != .cursor or owner.config.root.epoch != self.epoch or owner.info() == null or
+            self.channel == null or owner.exchange.session != self.channel.?.session or
+            !owner.point.valid(point.deadline) or self.last_clock >= point.deadline) return true;
+        _ = self.headSource(owner.config.index) catch return true;
+        return false;
+    }
+    fn nativeGraphAddressSpace(self: *Owner) ?*const @import("gsp_vaspace.zig").Info {
         const owner = if (self.graph.?.address_space) |*value| value else return null;
         if (owner.self_address != @intFromPtr(owner) or owner.state != .handed_off or owner.exchange.session.state != .active) return null;
         return if (owner.info) |*info| info else null;
@@ -2634,6 +2687,7 @@ pub const Owner = struct {
         try self.channel.?.guard(deadline);
         const result = try owner.point.begin(x, y, current, deadline);
         self.cursor_point = handle.slot;
+        self.cursor_step_count = 0; self.cursor_step_ns = 0; self.cursor_sample = null;
         return result;
     }
     pub fn validateCursorPoint(self: *Owner, owner: *display_channel.Owner, deadline: u64) !void {
@@ -2648,18 +2702,20 @@ pub const Owner = struct {
     }
     fn advanceCursorPoint(self: *Owner, current: u64) !bool {
         const slot = self.cursor_point orelse return false;
+        self.cursor_step_count +|= 1; self.cursor_step_ns = current;
         const owner = if (self.display_channels[slot]) |*value| value else return error.Stale;
         const job = owner.point.pending orelse return error.Stale;
         try self.validateCursorPoint(owner, job.deadline);
         if (current >= job.deadline) return error.Timeout;
         const sample = (try self.device.?.readCursorPoint(owner, job.deadline)) orelse return false;
+        self.cursor_sample = sample;
         if (self.display_paused) {
             // Finish only the already published PIO prefix. Its UPDATE
             // drains the owned position; no new cursor request or visibility
             // receipt is created while the output is paused.
             if (job.published and job.next_method < @import("gsp_cursor_pio.zig").methods.len) {
                 if (!try @import("gsp_cursor_pio.zig").writable(sample)) return false;
-                try owner.point.prepareUpdate(current,job.baseline);
+                try owner.point.prepareUpdate(try self.now(),job.baseline);
                 self.device.?.submitCursorPoint(owner,job.deadline) catch |err| {if(err==error.Busy)return false;return err;};
                 return true;
             }
@@ -2671,20 +2727,23 @@ pub const Owner = struct {
             return true;
         }
         const observed = self.headObservation(owner.config.index) catch |err| { if (err == error.Busy) return false; return err; };
-        // An electrical IRQ may advance the snapshot after this worker read
-        // its clock. Keep the exact PIO prefix until the next worker time;
-        // this is neither a deadline failure nor a visibility receipt.
-        if (observed.observed_ns > current) return false;
+        // Register admission/read callbacks can outlive a vblank. Sample
+        // time after that exact IRQ snapshot, rather than repeatedly waiting
+        // on the stale entry time. The original job deadline is unchanged.
+        const point_now = try self.now();
+        self.cursor_step_ns = point_now;
+        if (point_now >= job.deadline) return error.Timeout;
+        if (observed.observed_ns > point_now) return false;
         if (job.next_method < @import("gsp_cursor_pio.zig").methods.len) {
             if (!try @import("gsp_cursor_pio.zig").writable(sample)) return false;
-            if (!job.published) try owner.point.prepare(current, observed)
-            else try owner.point.prepareUpdate(current, observed);
+            if (!job.published) try owner.point.prepare(point_now, observed)
+            else try owner.point.prepareUpdate(point_now, observed);
             self.device.?.submitCursorPoint(owner, job.deadline) catch |err| { if (err == error.Busy) return false; return err; };
             if (owner.point.issued == 1) self.log("NVIDIA cursor-point: first sequence={d} method-prefix={d}/2 free={x} control={x} state={x} x={d} y={d}",
                 .{owner.point.issued,owner.point.pending.?.next_method,sample.free,sample.control,sample.state,job.point.x,job.point.y});
             return true;
         }
-        if (!try owner.point.observe(sample, observed, current)) return false;
+        if (!try owner.point.observe(sample, observed, point_now)) return false;
         if (owner.point.issued == 1) self.log("NVIDIA cursor-point: first complete sequence={d} head-IRQ={d} observed={d} update-submitted={d} free={x} control={x} state={x}",
             .{owner.point.issued,observed.sequence,observed.observed_ns,job.update_submitted_ns,sample.free,sample.control,sample.state});
         self.cursor_point = null; return true;
@@ -3909,7 +3968,7 @@ pub const Owner = struct {
             self.copy_backend == null or !std.meta.eql(held.binding, self.copy_backend.?.binding)) return error.Stale;
     }
     fn queuedGraphicsResource(self: *Owner, reference: r4os.abi.GfxBufferReference) !render_job.Resource {
-        const space = self.nativeAddressSpace() orelse return error.State;
+        const space = try self.queuedGraphicsAddressSpace();
         return self.queuedGraphicsResourceInSpace(reference, space.handle);
     }
     // Read an already retained mapping in the exact command channel's VA
@@ -3922,14 +3981,13 @@ pub const Owner = struct {
         };
         return error.Unsupported;
     }
-    // A retained public job may be between physical slices when the cursor
-    // or another display/RM owner is admitted. Its native address space is
-    // intentionally hidden until that exact work hands back the device.
-    // Wait before looking up operands or reusing/reserving a cache packet.
+    // Only an exact live position PIO can overlap the canonical GR owner.
+    // Cursor images, Core changes and any RM borrower keep their admission
+    // barrier before operand lookup or packet reservation.
     fn queuedGraphicsAdmission(self: *Owner, input: *render_queue.Owner) !void {
         try self.queuedRender(input);
         if (self.commandExchangeBusy() or self.executionAdmissionBusy() or
-            self.cursor_point != null or self.graph_closing) return error.Busy;
+            self.cursorPointBlocksGraphics() or self.graph_closing) return error.Busy;
     }
     pub fn prepareQueuedGraphics(self: *Owner, input: *render_queue.Owner) !void {
         try self.queuedGraphicsAdmission(input);
@@ -3943,7 +4001,7 @@ pub const Owner = struct {
         if (input.draw_count == 0) return error.Empty;
     }
     fn validateQueuedGraphics(self: *Owner, input: *render_queue.Owner) !void {
-        const space = self.nativeAddressSpace() orelse return error.State;
+        const space = try self.queuedGraphicsAddressSpace();
         return self.validateQueuedGraphicsInSpace(input, space.handle);
     }
     fn validateQueuedGraphicsInSpace(self: *Owner, input: *render_queue.Owner, space: u32) !void {
@@ -3959,7 +4017,7 @@ pub const Owner = struct {
         try input.validateSlice();
     }
     fn queuedGraphicsDraw(self: *Owner, input: *render_queue.Owner, state: r4os.abi.GfxRenderCommand, grid: r4os.abi.GfxSampleGrid) !render.Draw {
-        const space = self.nativeAddressSpace() orelse return error.State;
+        const space = try self.queuedGraphicsAddressSpace();
         return self.queuedGraphicsDrawInSpace(input, state, grid, space.handle);
     }
     fn queuedGraphicsDrawInSpace(self: *Owner, input: *render_queue.Owner, state: r4os.abi.GfxRenderCommand,
@@ -4010,6 +4068,7 @@ pub const Owner = struct {
             return err;
         };
         work.command = .{ .draw = work.resources.command.? };
+        if (self.cursor_point) |slot| work.cursor_sequence = self.display_channels[slot].?.point.pending.?.sequence;
     }
     pub fn cancelQueuedGraphicsAdmission(self: *Owner, input: *render_queue.Owner) !void {
         try self.queuedRender(input);
@@ -4096,6 +4155,14 @@ pub const Owner = struct {
             if (try fifo.ring.poll() >= work.ticket.?.point) {
                 if (!work.resources.close(true)) return error.Retained;
                 work.receipt = .{ .channel = work.channel_handle, .point = work.ticket.?.point, .completed_ns = current };
+                if (work.queued and work.cursor_sequence != 0) {
+                    self.graphics_cursor_completed +|= 1;
+                    if (self.graphics_cursor_completed == 1) {
+                        const queued = self.queued_render orelse return error.State;
+                        self.log("NVIDIA render-cursor: overlap-completed epoch={d} cursor={d} GR-point={d} queue={d}:{d} completed-ns={d}",
+                            .{self.epoch, work.cursor_sequence, work.ticket.?.point, queued.job.fence.timeline, queued.job.fence.point, current});
+                    }
+                }
                 return true;
             }
             if (current >= work.deadline) return error.Deadline;
@@ -4645,6 +4712,10 @@ pub const Owner = struct {
                 };
             };
             if (work.addresses[i] != null) continue;
+            // New SYSTEM mappings borrow RM and cannot start during the
+            // cursor's PIO/IRQ lease. Already retained mappings above remain
+            // usable. Keep the exact copy job and its original deadline.
+            if (self.cursor_point != null) { work.blocked_mapping +|= 1; return false; }
             work.mappings[i] = self.mapQueuedBuffer(&work.job.fence, @intCast(i), work.deadline) catch |err| {
                 if (err == error.Retained or err == error.Descriptor or self.failure != null) return err;
                 try self.finishCopy(r4os.abi.gfx_queue_result_failed); return true;
@@ -6090,7 +6161,7 @@ pub const Owner = struct {
     const MappingSource = union(enum) { queue: struct { fence: r4os.abi.GfxFence, which: u32 }, initial_image, public_import };
     fn mapBuffer(self: *Owner, request: MappingSource, deadline: u64) !BufferHandle {
         const current = try self.now();
-        if (self.graph_closing or self.fifo_active != null or self.context_active != null or self.virtuals.active_range != null or self.native_active != null or self.buffer_active != null or self.sequence.self_address != 0 or self.outputs.active()) return error.Busy;
+        if (self.cursor_point != null or self.graph_closing or self.fifo_active != null or self.context_active != null or self.virtuals.active_range != null or self.native_active != null or self.buffer_active != null or self.sequence.self_address != 0 or self.outputs.active()) return error.Busy;
         const space = (self.nativeAddressSpace() orelse return error.State).*;
         if (self.channel.?.phase != .idle or self.channel.?.pending != null or self.channel.?.in_lockdown) return error.Busy;
         try self.channel.?.guard(deadline);
