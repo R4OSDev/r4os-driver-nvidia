@@ -5,6 +5,10 @@ const std = @import("std");
 const r4os = @import("r4os");
 const a = r4os.abi;
 const device = @import("gsp_device.zig");
+// Requeue behind other normal Work owners after this finite quantum. The
+// clock is checked between indivisible device steps; their own deadlines stay.
+const slice_steps = 8;
+const slice_ns = 250 * std.time.ns_per_us;
 pub fn supported(ctx: *const r4os.r4dev.DriverContext) bool {
     return ctx.supportsDriverApi(a.driver_api_owned_work_version, @offsetOf(a.DriverApi, "driver_work_submit_owned") + 8) and
         ctx.api.driver_work_submit_owned != null;
@@ -20,6 +24,7 @@ pub const Work = struct {
     completion: u32 = 0,
     completion_disposition: u32 = std.math.maxInt(u32),
     stopping: u32 = 0,
+    budget_reported: bool = false,
 
     pub fn start(self: *Work, ctx: *const r4os.r4dev.DriverContext, target: *device.Device) !void {
         if (self.self_address != 0 or target.self_address != @intFromPtr(target)) return error.State;
@@ -235,6 +240,15 @@ pub const Work = struct {
         @atomicStore(u32, &self.completion_disposition, disposition, .release);
         return 0;
     }
+    fn yieldBudget(self: *Work, steps: usize, elapsed: u64) i32 {
+        if (!self.budget_reported) {
+            self.budget_reported = true;
+            var bytes: [160]u8 = undefined;
+            if (std.fmt.bufPrintZ(&bytes, "NVIDIA work-budget: steps={d}/{d} observed-ns={d} target-ns={d} disposition=requeue owner=released-by-completion",
+                .{ steps, slice_steps, elapsed, slice_ns })) |line| self.ctx.?.logInfo(line.ptr) else |_| {}
+        }
+        return self.completeSlice(3);
+    }
     fn slice(raw: usize) callconv(.c) i32 {
         const self = from(raw);
         if (self.self_address != raw or self.ctx == null or self.device == null) return -1;
@@ -246,7 +260,8 @@ pub const Work = struct {
         if (started_at == std.math.maxInt(u64)) return -1;
         // Both a step count and a monotonic time bound apply. A single step
         // already has its native phase's finite deadline and register limit.
-        for (0..64) |_| {
+        var elapsed: u64 = 0;
+        for (0..slice_steps) |index| {
             if (@atomicLoad(u32, &self.stopping, .acquire) != 0) return self.completeSlice(1);
             switch (self.device.?.step()) {
                 .stopped => return self.completeSlice(1),
@@ -259,10 +274,11 @@ pub const Work = struct {
             }
             const current = clock.nowNs();
             if (current == std.math.maxInt(u64) or current < started_at) return -1;
-            if (current - started_at >= 2 * std.time.ns_per_ms) break;
+            elapsed = current - started_at;
+            if (elapsed >= slice_ns) return self.yieldBudget(index + 1, elapsed);
         }
         // The last step made progress; only the shared callback's step/time
         // budget ended this turn. Its next turn must not wait for an IRQ.
-        return self.completeSlice(3);
+        return self.yieldBudget(slice_steps, elapsed);
     }
 };

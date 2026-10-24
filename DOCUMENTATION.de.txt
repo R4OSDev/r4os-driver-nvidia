@@ -1,6 +1,58 @@
 ﻿NVIDIA: nativer Grafik- und Displaybesitzer
 =========================================
 
+0.87.10 / NVIDIA333 / 25.10.2026:
+Der vorhandene normale BSP-Worker fuehrt NVIDIA weiter mit exakt serialisiertem
+Lifecyclebesitz aus. Sein Quantum umfasst nun maximal8 statt64 Device-Schritte
+und250us statt2ms bis zum naechsten Check zwischen den Schritten. Nach Budget-
+ende publiziert der Callback nur die vorhandene Disposition3. Die Pacing-Task
+wartet auf dessen wirklichen Abschluss, gibt genau dieses Workticket frei und
+reiht die Fortsetzung hinter andere normale Workauftraege ein. Sie haelt weder
+Lifecycle- noch Devicebesitz waehrend Completion-/Semaphore-Waits. Kernel,
+Taskplatzierung und andere Speicher-/Audiotreiber bleiben unveraendert.
+
+Die primaere Boot-Schattenkopie liest dieselbe immutable RAM-Aufnahme und
+kopiert dieselben Nutzzeilen ohne Padding, nun16 statt64KB pro Phase. Fuer
+diesen Kopierpfad sinkt die reine Mengenobergrenze eines Callbacks dadurch
+von4MB (64x64KB) auf128KB (8x16KB). Verbindlich bleiben alle originalen Frame-
+bytes, Referenzen, MMIO-/GPU-/Unregister- und Shutdownquittungen. Eine einzelne
+unteilbare Device-/MMIO-Phase kann das weiche Zeitbudget ueberschreiten; ihr
+eigener originaler Deadlinevertrag bleibt erhalten. Die Reduktion behauptet
+keine Praeemption innerhalb einer Firmwareoperation und keine gemessene harte
+250us-Grenze. Einmal pro geladenem Workbesitzer protokolliert der ohnehin
+benoetigte funktionale Clockcheck seinen ersten Budgetpunkt; das ist weder
+eine Quittung noch ein neuer Detail-Sampler.
+
+Originale Complete-run1/1 und Pacing-Lifecycle1/1 sowie der Treiberbau bestehen
+mit unveraenderten Pixel-, Ressourcen-, IRQ-, Stop-/Cancel-/Join-/Ticket- und
+Fristorakeln. R4U107918454Bytes/SHA256
+33b4663dfdb83d86e92aa42a245985a208f3e27af6220a977e008737cfcb6ea9 wurde voll
+transportiert/zurueckgelesen. SYSUPD installiert333/Release0.87.10; regulaerer
+frischer Bootclock/Hostkey und echtes Render-ready, kein restartwake. Der
+wirkliche Budgetpunkt nach2/8Schritten misst408109ns: die indivisible Phase
+ueberschreitet250us und der Callback gibt danach ab. Dies bestaetigt gerade
+keine harte Zeitobergrenze mitten in einem Device-Schritt.
+
+Normale Run-/Explorerfolge mit15Auswahl-/Refresh-/D:/C:/End-/Homeaktionen,
+384Mauspositionen und genauem Childabbau besteht parallel zu originalem
+SPECTRA CHECK ASYNC_IO /POOL: echte Datei-/Streambytes,128Requests/4Worker,
+64er-Grenze/Overload/Stale-Handle bestehen. Bestehende Testpfade waren vorab
+nachweislich abwesend. Die weitere2304-Mausfolge ueberlappt die gesamte
+originale14x2-GPUprobe (CE82/GR28/87808Bytes/28pendingCloses) samt strenger1s-
+BO- und Runtimebalance. Keine Pixel-/Frist-/Freigabepruefung wurde gelockert.
+Dies belegt endlichen normalen BSP-/I/O-/Grafikfortschritt, keine allgemeine
+maximale I/O-Latenz. Danach leiser Desktopcheck mit Cleanup-ACK, Cursor1223/1223
+sichtbar/error0, BO allocation/destruction/retained0 und keine stop-work.
+Kleine Originalquittungen: Temp/08710-native-{gui-io,long-render}-receipt.json
+mit ihren unveraenderten Kommandorohdaten; keine physische Pixel-/Latenzprobe.
+
+Genau ein finaler KVM4-STANDARD2642f82f-4060-4e3e-a0f8-3ae4bf0e2f67 besteht:
+Suite3/30Samples/4Worker/sechs gueltige Scores, Gesamt137.306883. Unveraenderter
+Export SHA256482ea41c9b596e07f4f933e12e292cb75e3e34c1ee1352a14ef6fdfbbbb993cf,
+voller DevCenter-Rohdatenreadback mit allen sechs gueltigen Bereichen. Das
+Headlessprofil misst kein NVIDIA; daraus folgt kein nativer Geschwindigkeits-
+vergleich. Kernel384/Desktop162/Explorer27/R4GFX38/R4NV19 bleiben unveraendert.
+
 0.87.9 / NVIDIA332 / 25.10.2026:
 Native BO- und VA-Notify publizieren ihre vorhandenen requested-Marker vor
 Weckung der residenten coalesced Work-Semaphore. Der zum registrierten Handle

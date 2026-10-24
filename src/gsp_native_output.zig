@@ -479,7 +479,9 @@ pub const Owner = struct {
                 const target: [*]u8 = @ptrFromInt(self.shadow_map.cpu_address);
                 const source: [*]const u8 = @ptrFromInt(held.boot.read.cpu_address);
                 const pitch = self.shadow_descriptor.plane_pitches[0];
-                var budget: u64 = 65536;
+                // CPU-only copy of retained RAM. Return to the shared Work
+                // owner between small chunks instead of holding its lane.
+                var budget: u64 = 16384;
                 while (budget != 0 and self.copied < self.shadow_descriptor.byte_length) {
                     const x = self.copied % pitch;
                     const y = self.copied / pitch;
