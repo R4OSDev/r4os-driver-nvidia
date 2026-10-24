@@ -10,13 +10,14 @@ pub const Model = struct {
     pub var claim: ?a.GfxVirtualJob = null;
     pub var completion: ?a.GfxVirtualCompletion = null;
     pub var completed: usize = 0;
+    pub var notifying = false;
     const Resource = struct { job: a.GfxVirtualJob, token: a.GfxVirtualToken };
     var live: [4]?Resource = @splat(null);
     const provider: a.GfxBufferHandle = .{ .id = 37, .generation = 91 };
     pub fn install(table: *a.DriverApi) void {
         original = table.*; table.gfx_memory_query = memory;
         config = null; closing = false; queued = null; claim = null; completion = null;
-        completed = 0; live = @splat(null);
+        completed = 0; notifying = false; live = @splat(null);
     }
     pub fn dispose(table: *a.DriverApi) void { table.* = original; }
     fn memory(out: *a.GfxDriverMemoryApi) callconv(.c) i32 {
@@ -40,6 +41,8 @@ pub const Model = struct {
         std.debug.assert(config != null and queued == null and claim == null and !closing);
         queued = job; completion = null;
         const notify: *const fn (usize) callconv(.c) i32 = @ptrFromInt(config.?.notify);
+        notifying = true;
+        defer notifying = false;
         std.debug.assert(notify(config.?.context) == 0);
     }
     fn take(input: *const a.GfxBufferHandle, out: *a.GfxVirtualJob) callconv(.c) i32 {

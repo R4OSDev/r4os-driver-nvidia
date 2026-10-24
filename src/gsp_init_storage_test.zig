@@ -2550,6 +2550,13 @@ const IrqModel = struct {
         return 0;
     }
     fn wake(raw: usize) i32 {
+        // The shared semaphore also accepts the real task-context VA notify;
+        // keep physical IRQ counting/failure injection scoped to IRQ events.
+        if (@import("gsp_virtual_provider_test_model.zig").Model.notifying) {
+            const target: *@import("gsp_device.zig").Device = @ptrFromInt(raw);
+            std.debug.assert(!in_irq and target.running.virtual_provider.requested);
+            return 0;
+        }
         std.debug.assert(in_irq);
         wakes += 1;
         const target: *@import("gsp_device.zig").Device = @ptrFromInt(raw);
@@ -5685,6 +5692,7 @@ fn checkCommonCursor(target: *@import("gsp_device.zig").Device) !void {
             if (run.cursor_point) |slot| {
                 const point = &run.display_channels[slot].?.point;
                 if (point.pending != null and point.pending.?.published) {
+                    try t.expect(run.workPolling() and target.workPolling());
                     clock += 1000; _ = target.step();
                     try t.expect(run.cursor_point != null and NativeCommon.cursor_receipt == null);
                     const user = try @import("gsp_cursor_pio.zig").base(product.mode.?.head);
@@ -5692,7 +5700,10 @@ fn checkCommonCursor(target: *@import("gsp_device.zig").Device) !void {
                     try deliverNativeHead(target, true); point_pending = true;
                 }
             }
-            if (run.display_work != null) { try pumpCursorCommit(target); continue; }
+            if (run.display_work != null) {
+                try t.expect(run.workPolling() and target.workPolling());
+                try pumpCursorCommit(target); continue;
+            }
         }
         const receipt = NativeCommon.cursor_receipt orelse return error.MissingCursorCompletion;
         try t.expect(NativeCommon.cursor_reply_busy and !product.cursor.busy() and !run.cursor_reserving and
@@ -14011,6 +14022,18 @@ fn checkNativeVirtualProvider(target: *@import("gsp_device.zig").Device, table: 
     try t.expect(running.virtual_provider.closed());
 }
 fn checkVirtualProvider(target: *@import("gsp_device.zig").Device, table: *a.DriverApi) !void {
+    const Wake = struct {
+        var count: u32 = 0;
+        fn signal(raw: usize) i32 {
+            const device: *@import("gsp_device.zig").Device = @ptrFromInt(raw);
+            std.debug.assert(device.self_address == raw);
+            count += 1; return 0;
+        }
+    };
+    const original_wake = target.irq_wake;
+    defer target.irq_wake = original_wake;
+    Wake.count = 0;
+    target.irq_wake = .{ .context = @intFromPtr(target), .signal = Wake.signal };
     // Host fixtures replace providers mid-run; production tables stay bound.
     defer target.running.memory_api = target.ctx.?.memory();
     const model = @import("gsp_buffer_test_model.zig").Model;
@@ -14035,7 +14058,10 @@ fn checkVirtualProvider(target: *@import("gsp_device.zig").Device, table: *a.Dri
     checkpoint = "metadata OOM";
     for ([_]@TypeOf(model.allocation_fault){ .empty, .partial }) |allocation_case| {
         model.allocation_fault = allocation_case;
-        peer.submit(range_job); try t.expect(try running.virtual_provider.step(running));
+        const wakes = Wake.count;
+        peer.submit(range_job);
+        try t.expect(Wake.count == wakes + 1 and running.virtual_provider.requested and target.workPolling());
+        try t.expect(try running.virtual_provider.step(running));
         try t.expect(peer.completion.?.result == a.gfx_buffer_error_oom and model.heapLive() == heap_before and target.session.?.tx_sequence == sent);
     }
     checkpoint = "range";
@@ -15895,6 +15921,7 @@ fn checkDeviceRuntime(target: *@import("gsp_device.zig").Device, words: []u32, f
             fails = true;
         },
         .runtime_sequence_timeout => {
+            try t.expect(!target.workPolling());
             try deviceSequence(target, &.{ 3, 100000 });
             try t.expect(target.step() == .progress and target.running.sequence.self_address != 0);
             // A real sequencer delay is a hardware wait, not productive work

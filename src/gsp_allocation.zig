@@ -12,16 +12,21 @@ pub fn operationDeadline(instant: u64, request_deadline: u64) !u64 {
 pub const Owner = struct {
     handle: a.GfxBufferHandle = .{},
     memory: ?r4os.driver_memory.Context = null,
+    running: ?*runtime.Owner = null,
     requested: bool = false,
     closing: bool = false,
     pending: ?struct { job: a.GfxNativeJob, buffer: ?runtime.BufferHandle = null } = null,
 
     fn notify(raw: usize) callconv(.c) i32 {
         const self: *Owner = @ptrFromInt(raw);
-        if (!self.closing) self.requested = true;
+        if (!self.closing) {
+            self.requested = true;
+            if (self.running) |running| running.wakeWork();
+        }
         return 0;
     }
     pub fn step(self: *Owner, running: *runtime.Owner) !bool {
+        self.running = running;
         if (self.closing or running.failure != null or running.graph_closing or running.nativeAddressSpace() == null) return false;
         if (self.memory == null) {
             const memory = running.ctx.?.memory() orelse return false;

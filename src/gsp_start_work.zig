@@ -254,7 +254,7 @@ pub const Work = struct {
                 // sub-operations. Poll that owner's full lifetime at one tick;
                 // the 10-ms delay belongs to a ready device without queued
                 // work. Classify under the serialized lifecycle owner.
-                .idle => return self.completeSlice(if (self.device.?.phase == .ready and !self.device.?.running.workPolling()) 2 else 0),
+                .idle => return self.completeSlice(if (self.device.?.workPolling()) 0 else 2),
                 .progress => {},
             }
             const current = clock.nowNs();

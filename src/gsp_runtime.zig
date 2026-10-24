@@ -2937,8 +2937,12 @@ pub const Owner = struct {
         self.native_queues.wake();
         if (self.queued_native) |work| work.waited = false;
         if (self.presentation) |entry| entry.pending = true;
-        if (self.device.?.owner) |io| if (io.wake_work) |wake| wake(io.context);
+        self.wakeWork();
         return 0;
+    }
+    pub fn wakeWork(self: *const Owner) void {
+        const device = self.device orelse return;
+        if (device.owner) |io| if (io.wake_work) |wake| wake(io.context);
     }
     fn presentationValid(self: *Owner) bool {
         return self.validPresentation(self.presentation orelse return false);
@@ -3226,9 +3230,20 @@ pub const Owner = struct {
     pub fn workPolling(self: *const Owner) bool {
         return self.sequence.self_address != 0 or self.hasQueuedWork() or self.queued_render != null or self.queued_native != null or
             (if (self.copy_backend) |backend| backend.pending else false) or
-            self.copy_job != null or self.graphics_work != null or self.graphics_upload != null or
-            self.batch_work != null or self.display_upload_job != null or self.initial_image != null or
-            self.cursor_upload != null or self.native_copy.probe.busy();
+            self.executionWorkBusy() or self.cursor_point != null or self.direct_work != null or
+            self.native_active != null or self.buffer_active != null or self.fifo_active != null or
+            self.context_active != null or self.virtuals.active_range != null or self.display_engine_active or
+            self.display_channel_active != null or self.outputs.active() or self.frame_setup != null or
+            self.unload.self_address != 0 or
+            (self.native_queues.ready() and (self.native_queues.dirty or self.native_queues.scan_remaining != 0)) or self.pendingOutputFlip();
+    }
+    fn pendingOutputFlip(self: *const Owner) bool {
+        for (&self.display_flips, 0..) |*slot, index| {
+            // A quarantined output retains ownership until explicit recovery;
+            // repeated polling cannot manufacture its missing receipt.
+            if (slot.* != null and self.output_faults[index] == null) return true;
+        }
+        return false;
     }
     fn executionWorkBusy(self: *const Owner) bool { return self.native_copy.probe.busy() or self.batch_work != null or self.power_active or self.graphics_upload != null or self.graphics_work != null or self.copy_job != null or self.display_upload_job != null or self.display_work != null or self.initial_image != null or self.mode_control_active or self.cursor_upload != null or self.audio_work != null or self.monitor_work != null or self.sor_work != null; }
     fn engineWorkBusy(self: *const Owner) bool { return self.executionWorkBusy() or self.hasDisplayFlips(); }

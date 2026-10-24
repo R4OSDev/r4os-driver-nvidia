@@ -1,6 +1,62 @@
 ﻿NVIDIA: nativer Grafik- und Displaybesitzer
 =========================================
 
+0.87.9 / NVIDIA332 / 25.10.2026:
+Native BO- und VA-Notify publizieren ihre vorhandenen requested-Marker vor
+Weckung der residenten coalesced Work-Semaphore. Der zum registrierten Handle
+gehoerende Runtime-Besitzer bleibt bis zum echten Unregister erhalten; neue
+GPU-/Fertigquittungen entstehen dadurch nicht. Copy-Notify und GSP-/Head-IRQs
+nutzen denselben vorhandenen Weckweg. Die bestehende Kernelqueue weckt den
+Desktop bereits nach wirklicher Fence-/Ressourcenpublikation; Kernel384 und
+Desktop162 bleiben unveraendert. Es war keine neue API noetig.
+
+Die Pacingentscheidung liest alle echten aktuellen Runtime- und aeusseren
+Devicephasen unter dem Lifecyclebesitzer: Cursor-PIO/Commit, Display/Flip,
+BO-/VA-/Kontext-/FIFO-Rueckgaben, Native-Consumer und Startup. Ein warmer
+Kontextkatalog, residente Bilder und unregistrierte Provider sind allein kein
+Arbeitsgrund. Quarantinierte Flip-/Cursorphasen und geparkte Receiver-/Power-
+Zustaende erhalten ihre eigenen Grenzen. Ein aktiver Metadatenumlauf bleibt
+begrenzt; reine Katalogkapazitaet wird nicht als ausstehende Arbeit gezaehlt.
+
+Budgetende3 reiht nach echtem Work-Release unmittelbar neu ein. Ownerkonflikt
+und Hardwarewarten behalten einen Tick Fallback, Ruhe10ms. Echte GSP-/Head-IRQs
+und die neuen Notify-Ereignisse koennen das Semaphore-Wait sofort beenden;
+ein vor Wait publiziertes Permit bleibt erhalten, Overflow coalesciert. Stop,
+Cancel, Join und Ticket-/Semaphore-Release behalten ihre originalen Grenzen.
+Der bisherige64-Schritte/2ms-Callback bleibt fuer die folgende0.87.10 getrennt.
+
+Die originale Complete-run-Gruppe1/1 und der bestehende Pacing-Lifecyclefall1/1
+bestehen (zuvor auch alle10Lifecyclegruppen). Echte wartende Cursor-PIO-/Core-
+Phasen bleiben aktiv; ein ruhender Runtime-Sequencer hat keinen Pollbedarf.
+Tatsaechliches VA-Notify im bestehenden OOM-/Rangefall weckt vor naechstem
+Workeraufruf mit bereits publiziertem Marker. Der gemeinsame Test-Wakepfad
+unterscheidet diese Tasknachricht von IRQ-/Copy-Ereignissen und behaelt deren
+bisherige separate Zaehler, Fehler-Injektionen, Pixel- und Abschlussorakel.
+OssiPC: R4U107914356Bytes/SHA256bf671574d19b6e6b036347c076f1e32a8f96ab97727f14443e75c4481955c76c
+vollstaendig transportiert/zurueckgelesen, SYSUPD installiert und regulaerer
+Neustart mit frischem Bootclock/Hostkey, geladenem332 und echtem Render-ready.
+Keine restartwake-Nutzung. Originale14Szenen x2Layouts bestehen ruhig und in
+der gezielt wiederholten Maus-Parallelfolge: jeweils CE82/GR28/87808verglichene
+Bytes/28pendingCloses, unveraendertes Pixel-/Clip-/Alpha-/Nearestorakel und
+volle BO-/Runtimebalance. Nach384 Positionen deckt die begruendete laengere
+Folge mit2304 Positionen auch den Abschluss ab (Host-Kommandofenster ca11,3s
+Grafik/21,5s Maus). Damit besteht
+auch die in0.87.6 auffaellige unveraenderte globale1s-BO-Freigabeprobe; ihre
+Frist und Zaehler wurden nicht gelockert. Dies ist eine endliche Folge und
+keine universelle Aussage ueber alle Cursor-/GPU-/Abbruchrennen.
+
+Finaler KVM4-STANDARD77ec3fa5-2e6c-44ca-938c-eb82507c5fce: Suite3/30Samples/
+vier Worker je Sample/sechs gueltige Scorebereiche, Gesamt150.768166.
+Voller DevCenter-Rohdatenreadback passt zum unveraenderten Originalexport
+(SHA256318fff1426ca32b2bb105d317699e534cb78c80075197ee6903ceb48d75c2ee6).
+Der Headless-Lauf misst kein NVIDIA; Hostmodelle und finite Hardwarefaelle
+belegen keine physische Pixel-/Eingabelatenz. Ruhiger originaler Desktopcheck mit Cleanup-ACK besteht; Cursor1223/1223
+bleibt fehlerfrei sichtbar, BO-allocation/destruction/retained0 und keine
+stop-work-Meldung. Eine passive Work-Zaehlerstichprobe erhaelt1212 NVIDIA-
+Abschluesse in9,67s ohne neue Fehl-/Timeout-/Kapazitaetsfaelle; Detailzeiten
+sind ausgeschaltet und bleiben ungemessen. Kein dauernder schneller Pollkreis
+wird daraus fuer andere Hardware-/Fehlerzustaende ausgeschlossen.
+
 0.87.7 / NVIDIA331 / 24.10.2026:
 Ein Renderabschnitt umfasst hoechstens1048576 Pixel statt262144. Derselbe
 1080p-Auftrag braucht dadurch zwei statt acht CPU-gesteuerte GR-Abschnitte.

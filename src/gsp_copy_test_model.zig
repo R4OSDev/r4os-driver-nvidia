@@ -231,6 +231,13 @@ pub const Model = struct {
     pub fn closeShadow() void { shadow_live = false; }
     pub fn wakePresentation(raw: usize) i32 {
         const target: *@import("gsp_device.zig").Device = @ptrFromInt(raw);
+        // The production semaphore now also receives actual VA notifications.
+        // Keep the original copy-specific flag and count oracle unchanged for
+        // copy events; validate publication of the distinct VA event instead.
+        if (@import("gsp_virtual_provider_test_model.zig").Model.notifying) {
+            std.debug.assert(target.running.virtual_provider.requested);
+            return 0;
+        }
         std.debug.assert(target.running.copy_backend.?.pending);
         if (target.running.presentation) |entry| std.debug.assert(entry.pending);
         presentation_wakes += 1; return 0;

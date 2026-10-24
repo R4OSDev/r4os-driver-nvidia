@@ -1050,6 +1050,26 @@ pub const Device = struct {
         self.checkLive(false) catch return 0;
         return self.epoch;
     }
+    /// Read under the same lifecycle owner as step. Retained results and
+    /// dormant images/providers do not turn a ready device into busy polling.
+    pub fn workPolling(self: *const Device) bool {
+        if (self.phase != .ready) return true;
+        if (self.running.workPolling() or self.running.allocations.pending != null or self.running.virtual_provider.pending != null or
+            (self.running.allocations.handle.id != 0 and self.running.allocations.requested) or
+            (self.running.virtual_provider.handle.id != 0 and self.running.virtual_provider.requested)) return true;
+        switch (self.running.native_copy.phase) { .detached, .ready => {}, else => return true }
+        switch (self.native_graphics.phase) { .detached, .waiting, .ready, .unavailable, .closed => {}, else => return true }
+        switch (self.render_startup.phase) { .waiting, .ready, .unavailable => {}, else => return true }
+        const output = &self.native_output;
+        switch (output.phase) {
+            .detached, .waiting, .receiver_wait, .console_active, .failed => return false,
+            .active => {},
+            else => return true,
+        }
+        if ((output.cursor.phase != .failed and output.cursor.busy()) or output.audio.busy() or output.refresh.busy() or
+            output.modes.job != null or output.additional.hardwareBusy()) return true;
+        return switch (output.hotplug.phase) { .online, .receiver_wait, .power_asleep, .power_failed => output.hotplug.refreshing, else => true };
+    }
     fn wakeWork(raw: *anyopaque) void {
         const self = from(raw);
         if (self.irq_wake) |wake| _ = wake.signal(wake.context);

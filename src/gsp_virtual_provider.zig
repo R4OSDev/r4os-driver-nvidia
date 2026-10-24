@@ -38,6 +38,7 @@ const Node = struct {
 pub const Owner = struct {
     handle: a.GfxBufferHandle = .{},
     memory: ?r4os.driver_memory.Context = null,
+    running: ?*runtime.Owner = null,
     heap: ?r4os.r4dev.DriverHeapContext = null,
     serial: u64 = 0,
     nodes: Tree = .{},
@@ -50,6 +51,7 @@ pub const Owner = struct {
     fn notify(raw: usize) callconv(.c) i32 {
         const self: *Owner = @ptrFromInt(raw);
         self.requested = true; // Closing providers must still receive retire jobs.
+        if (self.running) |running| running.wakeWork();
         return 0;
     }
     pub fn closed(self: *const Owner) bool {
@@ -198,6 +200,7 @@ pub const Owner = struct {
         return true;
     }
     pub fn step(self: *Owner, running: *runtime.Owner) !bool {
+        self.running = running;
         if (running.failure != null) return false;
         if (self.handle.id == 0) {
             if (self.closing or running.graph_closing or running.nativeAddressSpace() == null) return false;
