@@ -6984,13 +6984,25 @@ pub const Owner = struct {
     }
     noinline fn advancePowerOwner(self: *Owner, current: u64) !Progress {
         const owner = if (self.power_owner) |*value| value else return error.State;
+        if (!owner.started and !owner.completed and current >= owner.deadline) {
+            // Scheduling can delay Work before the first command. Expire
+            // only the internal intention, without poisoning the idle RM
+            // session or resetting the GPU. A later choice gets its own
+            // unchanged one-second RPC limit and current demand.
+            self.channel = owner.cancelUnstarted(try std.math.add(u64, current, std.time.ns_per_s)) catch |err| {
+                if (err == error.AdmissionExpired) return .idle;
+                return err;
+            };
+            self.power_active = false;
+            return .progress;
+        }
         if (owner.completed) {
             const operation = owner.operation orelse return error.State;
             const boost = switch (operation) { .boost => |value| value, else => null };
-            self.log("NVIDIA power: control={x} status={?x} telemetry={s} poll-mask={x} policy={s} requested-level={?d} seconds={?d} accepted-level={d}",
+            self.log("NVIDIA power: control={x} status={?x} telemetry={s} poll-mask={x} policy={s} requested-level={?d} seconds={?d} accepted-level={d} unstarted-expired={d}",
                 .{power.wire.command(operation),owner.last_status,@tagName(owner.status),owner.active_mask,
                 @tagName(owner.performance.reason),if (boost) |value| @as(?u2, value.level) else null,
-                if (boost) |value| @as(?u16, value.seconds) else null,owner.performance.accepted_level});
+                if (boost) |value| @as(?u16, value.seconds) else null,owner.performance.accepted_level,owner.admission_expiries});
             // Decoding and the exact ACK already completed under the original
             // RPC deadline. A later scheduling/log pause cannot expire that
             // finished operation. Return the now-idle channel with a fresh

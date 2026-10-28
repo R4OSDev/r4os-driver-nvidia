@@ -14455,9 +14455,26 @@ fn checkDevicePower(target: *@import("gsp_device.zig").Device) !void {
     errdefer |err| std.debug.print("power {s}: {s} at={s} status={s} mask={x} active={} phase={s} failure={?}\n",
         .{model.scenario,@errorName(err),checkpoint,@tagName(owner.status),owner.active_mask,run.power_active,@tagName(target.phase),target.failure});
     var iterations: usize = 0;
+    var unstarted_poll_delayed = false;
     var completed_poll_delayed = false;
     while (iterations < 30 and target.phase == .ready) : (iterations += 1) {
         if (!run.power_active and (owner.active_mask != 0 or owner.rejection != null or owner.poll_rejection != null)) break;
+        if (model.is("power_success") and !unstarted_poll_delayed and run.power_active and
+            !owner.started and owner.operation.? == .poll)
+        {
+            // Actual native failure: the internal intent owns an idle loan,
+            // but Work resumes after admission expired, before its first RPC.
+            const sent = owner.active.?.session.tx_sequence;
+            const accepted = owner.performance.accepted_requests;
+            clock = owner.deadline + 477_232_659;
+            try stepDevicePower(target);
+            try t.expect(target.phase == .ready and run.failure == null and !run.power_active and
+                owner.active == null and owner.operation == null and owner.next_tracker == null and
+                run.channel.?.phase == .idle and run.channel.?.session.tx_sequence == sent and
+                owner.performance.accepted_requests == accepted and owner.attached and model.releases == 0);
+            unstarted_poll_delayed = true;
+            continue;
+        }
         if (model.is("power_success") and !completed_poll_delayed and run.power_active and owner.completed and owner.operation.? == .poll) {
             // The exact reply was decoded and physically ACKed within its
             // original one-second limit. Only ownership return is delayed,
@@ -14476,7 +14493,7 @@ fn checkDevicePower(target: *@import("gsp_device.zig").Device) !void {
         return;
     }
     try t.expect(target.phase == .ready and run.failure == null and !run.power_active);
-    if (model.is("power_success")) try t.expect(completed_poll_delayed and owner.active == null and run.activeChannel().?.phase == .idle);
+    if (model.is("power_success")) try t.expect(unstarted_poll_delayed and completed_poll_delayed and owner.active == null and run.activeChannel().?.phase == .idle);
     if (model.is("power_attach_reject")) {
         try t.expect(owner.status == .rejected and !owner.possibly_attached and !model.active and model.releases == 1);
         try t.expect(try owner.stop(clock));
@@ -14516,11 +14533,28 @@ fn checkDevicePower(target: *@import("gsp_device.zig").Device) !void {
         // retained channel, using the same activity observation as Work.
         checkpoint = "accepted boost";
         owner.observeActivity(clock, .{ .render = true, .outputs = 2 });
+        var unstarted_boost_delayed = false;
         for (0..12) |_| {
+            if (!unstarted_boost_delayed and run.power_active and !owner.started and owner.operation.? == .boost) {
+                const sent = owner.active.?.session.tx_sequence;
+                const accepted = owner.performance.accepted_requests;
+                clock = owner.deadline + 1;
+                try stepDevicePower(target);
+                try t.expect(target.phase == .ready and !run.power_active and owner.active == null and
+                    owner.performance.pending == null and owner.performance_request == null and
+                    owner.performance.accepted_requests == accepted and run.channel.?.session.tx_sequence == sent);
+                // The old render demand has aged out during that pause.
+                // Do not replay its boost. A new real activity authorizes
+                // the later accepted boost required by the original oracle.
+                try t.expect((try owner.choose(clock, .{ .outputs = 2 })) == null);
+                owner.observeActivity(clock, .{ .render = true, .outputs = 2 });
+                unstarted_boost_delayed = true;
+                continue;
+            }
             try stepDevicePower(target);
             if (!run.power_active and owner.performance.accepted_level == 2) break;
         }
-        try t.expect(!run.power_active and owner.performance.accepted_level == 2 and
+        try t.expect(unstarted_boost_delayed and !run.power_active and owner.performance.accepted_level == 2 and
             owner.publicState(clock).boost == 2 and owner.performance.accepted_until == clock + 2 * std.time.ns_per_s);
         clock += power.policy.hold_ns + 1;
         checkpoint = "idle clear";
@@ -14647,6 +14681,9 @@ fn stepDevicePower(target: *@import("gsp_device.zig").Device) !void {
     const calls_before = range_calls;
     const sequence_before = target.session.?.tx_sequence;
     const serial_before = run.buffer_serial;
+    try t.expectError(error.State, owner.cancelUnstarted(deadline + std.time.ns_per_s));
+    try t.expect(owner.started and owner.active.?.deadline == deadline and owner.deadline == deadline and
+        owner.active.?.phase == .waiting and target.session.?.tx_sequence == sequence_before and range_calls == calls_before);
     try t.expect(run.channel.?.phase == .handed_off and run.nativeAddressSpace() == null);
     try t.expectError(error.Busy, run.createNvencChannel(.{ .epoch = run.epoch, .serial = 1, .slot = 0 },
         0, .{ .epoch = run.epoch, .serial = 1, .slot = 0 }, deadline));

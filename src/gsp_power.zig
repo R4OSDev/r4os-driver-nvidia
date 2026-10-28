@@ -32,6 +32,7 @@ pub const Owner = struct {
     request: [wire.max_bytes]u8 = @splat(0),
     started: bool = false,
     completed: bool = false,
+    admission_expiries: u64 = 0,
     deadline: u64 = 0,
     rejection: ?u32 = null,
     poll_rejection: ?u32 = null,
@@ -255,6 +256,33 @@ pub const Owner = struct {
         self.last_status = null;
         // No later method is allowed to recreate a different request.
         if (encoded.ptr != self.request[0..].ptr) return error.Binding;
+    }
+    /// An expired internal intention has not started an RPC. Return the
+    /// exact idle exchange and discard that intention; never renew a prepared,
+    /// published or pending request. Attached RUSD storage stays attached.
+    pub fn cancelUnstarted(self: *Owner, idle_deadline: u64) !exchange.Exchange {
+        try self.stable();
+        if (self.started or self.completed) return error.State;
+        const operation = self.operation orelse return error.State;
+        const current = if (self.active) |*value| value else return error.State;
+        if (operation == .boost) {
+            const request = self.performance_request orelse return error.State;
+            if (self.performance.pending == null or !std.meta.eql(request, self.performance.pending.?)) return error.Binding;
+        }
+        try current.guardUnsubmitted(idle_deadline);
+        // Move this sole, empty exchange back. There is no request pointer,
+        // receipt or pending session ticket whose lifetime could be shortened.
+        const returned = current.*;
+        self.active = null;
+        self.operation = null;
+        self.next_tracker = null;
+        if (operation == .boost) {
+            self.performance.pending = null;
+            self.performance_request = null;
+        }
+        if (operation == .timer) self.timer_requested_ns = 0;
+        self.admission_expiries +|= 1;
+        return returned;
     }
     pub fn poll(self: *Owner, now: u64) !?exchange.Dispatch {
         try self.stable();
