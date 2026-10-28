@@ -81,6 +81,8 @@ pub const Port = struct {
     notification: ?Notification = null,
 };
 
+pub const IoKind = enum { read, publish, prepare, submit };
+pub const IoFailure = struct { kind: IoKind, queue: ?ring.Queue = null, offset: usize = 0, bytes: usize = 0, deadline: u64, started_ns: u64 };
 pub const Session = struct {
     port: Port,
     profile: message.Profile,
@@ -92,6 +94,9 @@ pub const Session = struct {
     link_deadline: ?u64 = null,
     last_clock: u64 = 0,
     last_io_error: ?anyerror = null,
+    // Filled only by a failed callback, before any teardown can replace the
+    // physical port's failure. No normal-mode polling or extra clock reads.
+    last_io_failure: ?IoFailure = null,
     tx_write: u32 = 0,
     tx_peer_read: u32 = 0,
     rx_read: u32 = 0,
@@ -157,6 +162,7 @@ pub const Session = struct {
         try self.check(deadline);
         self.port.read(self.port.context, deadline, queue, offset, output) catch |err| {
             self.last_io_error = err;
+            self.last_io_failure = .{ .kind = .read, .queue = queue, .offset = offset, .bytes = output.len, .deadline = deadline, .started_ns = self.last_clock };
             return self.fail(error.Io);
         };
         try self.check(deadline);
@@ -165,6 +171,7 @@ pub const Session = struct {
         try self.check(deadline);
         self.port.publish(self.port.context, deadline, queue, offset, input) catch |err| {
             self.last_io_error = err;
+            self.last_io_failure = .{ .kind = .publish, .queue = queue, .offset = offset, .bytes = input.len, .deadline = deadline, .started_ns = self.last_clock };
             return self.fail(error.Io);
         };
         // A failure here is ambiguous: the cursor may already be visible.
@@ -187,6 +194,7 @@ pub const Session = struct {
         const callback = if (prepare) notification.prepare else notification.submit;
         callback(notification.context, deadline) catch |err| {
             self.last_io_error = err;
+            self.last_io_failure = .{ .kind = if (prepare) .prepare else .submit, .deadline = deadline, .started_ns = self.last_clock };
             return self.fail(error.Io);
         };
         try self.check(deadline);

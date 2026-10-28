@@ -3549,3 +3549,46 @@ fuer vorhandene DMA-Mappings bereit, am Kernel-Besitzer und im normalen
 EXAMPLE-Fixture qualifiziert. Der GSP-Laufzeitbesitzer muss weiterhin Payload
 und Cursor geordnet publizieren, jeweils exklusive Bytes synchronisieren
 und vor Unmap Ruhe nachweisen. NVIDIA0.1.24 bindet Codec/Ring noch nicht live.
+
+0.87.59 / NVIDIA0.1.334: freie RM-Kanalrueckgabe nach Power-ACK
+-------------------------------------------------------------
+Nach einer erfolgreich dekodierten und exakt quittierten Powerantwort war
+owner.deadline der erledigten1sRPC auch die Frist fuer Handoff und neue
+Main-Exchange-Initialisierung. Eine reine Scheduler-/Logpause nach ACK konnte
+dadurch den gesamten GSP-Graphen als Deadlinefehler stoppen. Nur diese bereits
+abgeschlossene Rueckgabe nimmt jetzt nach dem Log eine frische kurze Leihe.
+Die laufende RPC bleibt exakt1s; ausstehende/mehrdeutige Antworten, Session-/
+Epochen-/Ticketgrenzen, DMA-Behaltepflicht und Resetnachweise bleiben gleich.
+Keine neue Diagnose-/Pollingloop oder CPU-/Threadbegrenzung.
+
+Erweiterung des bestehenden echten Device/Power-Erfolgsfalls: gematchtes ACK,
+danach Pause ueber alteFrist, dann freieKanalrueckgabe. Alter333Code reproduziert
+host_failure/pollmask1b/recovering/Deadline, Korrektur besteht die Originale.
+Native333Beobachtung bleibt FAIL: Power1bfatal, Copy1153/1153 undGR858/858
+komplett, native-jobnone, automatischeResetversucheohneRestorenachweis. Der
+Grund der urspruenglichen Verzogerung und genaueAusfuehrungdesBOProduzenten
+sind damit nicht belegt. Neue physische334-Abnahme noch offen.
+
+28.10.2026 / NVIDIA0.1.335: erster I/O-Fehler vor Teardown erhalten
+----------------------------------------------------------------
+Die echte334-Abnahme scheitert weiterhin: klassische Desktopfaelle und deren
+Close/Reap bestehen, danach DesktopTimeout beim neuen nativen Bildproduzenten.
+Erster GSP-Fehler ist diesmal Power/Io; der anschliessende Restore scheitert und
+behaelt die Ressourcen. Dies bestaetigt keine Heilung durch den ACK-Lease-Fix.
+Der Ursprung von Io und die Ausfuehrung des Bildproduzenten sind noch offen.
+
+335 erhaelt nur beim fehlgeschlagenen Transportcallback dessen urspruenglichen
+Fehler, Art (Read/Publish/Prepare/Submit), Queue/Offset/Bytes, Frist und bereits
+vorhandene Startclock. Stop protokolliert diese Daten und den Powerbesitz vor
+weiterem Teardown. Keine zusaetzliche Clocklesung oder Samplingloop im Normalfall;
+Fristen, ACKs, Session-/Epochenpruefungen und Retention bleiben unveraendert.
+Der vorhandene Transportfall vergleicht die Angaben mit dem unabhaengigen
+Portmodell, einschliesslich Fehler vor/nach Publikation und Notification.
+Alle urspruenglichen Besitzerfaelle und normaler335-Build bestanden. Neue
+native335-Faelle mit417/16 bestehen spaeter den wirklichen Zwei-Bild-/Fence-/
+ReadReturn-Pfad ohne Beobachter sowie OriginalCPU-/Audiopruefungen. Das
+erklaert die frueherenIo-/pendingDeadline-Faelle nicht. Normaler PostGPU-
+Neustart67.769s: regulaeresUnload erreicht Originalfrist/SbProgress, danach
+terminalerFLR/DMAstopped/unbindresources0 und driver-shutdownOK/warmresetready.
+Kein eigener Hot-Modulunload-/Sichtbeleg. Quellen/Abnahmegrenzen in59-Laufarchiv;
+FinalerSTANDARD59 06365b71-c83d-4402-9d2e-fceea278e30e lokal und R4OSServer mit komplettenOriginal-/ReferenzGETs/30Samples/4Worker/6Scores validiert; keinUrsachen-/Speedupbeweis. Publikation separat.

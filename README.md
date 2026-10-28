@@ -3097,3 +3097,34 @@ FLR/headless rebuild while the recording encoder and final packet remain held.
 The native part survives; the recorder closes the old encoder before opening
 software. Both files decode correctly and all resource/worker owners retire.
 Shared evidence and limits: workspace Docs/Drivers/Videoencoding07941.txt.
+
+0.1.334 / 0.87.59: completed Power RPC ownership
+
+A successful decoded reply and its exact ACK retain the original one-second
+RPC deadline. Once that operation is complete, returning the idle channel
+uses a new short lease taken after the completion log. Scheduling or logging
+after ACK cannot expire an already finished transaction and poison the whole
+GSP session. Pending replies, rejected or ambiguous ACKs, session/epoch checks,
+retained DMA and physical reset requirements keep their original contracts.
+No polling interval, thread count, hardware admission or framebuffer policy changes.
+
+The existing real Device/Power complete-run fixture now pauses after matched
+ACK before ownership return. It reproduces the previous fatal Deadline/mask1b
+and passes the corrected path with all original power/DMA/shutdown oracles.
+Physical qualification in 0.87.59 is still pending. Native333's partial export
+and failed display restoration remain rejected observations.
+
+0.1.335 preserves the original transport callback failure before teardown can
+obscure it: callback kind, queue/range, original error, deadline and existing
+start clock. Failure reporting also copies the active Power owner state.
+There is no new normal clock read or polling loop. The original transport
+model checks these fields against the actual failed port event, including
+ambiguous publication and notification failures. Full owner tests and the
+normal build pass. Native334 failed with Power/Io and an early335 case with
+a pending Power deadline; these remain unresolved observations. Current335
+with Kernel417/native16 passes actual two-device-local-image/fence/read-return
+work without an observation fixture and the original CPU/audio contracts.
+Normal post-GPU reboot returns in67.769s: graceful unload reaches its original
+deadline/SbProgress, then terminal FLR confirms stopped DMA and unbindresources0
+before driver-shutdownOK/warm-reset-ready. This is system-transition evidence,
+not a separate hot module-unload test or a claim that earlier faults are fixed.

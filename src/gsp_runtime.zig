@@ -843,6 +843,19 @@ pub const Owner = struct {
     /// existing RM/session resources. It is not physical GPU quiescence.
     pub fn stop(self: *Owner, err: anyerror) void {
         if (self.self_address == 0 or self.self_address != @intFromPtr(self) or self.failure != null) return;
+        // Copy the first failed session's existing owner metadata before
+        // cleanup/logging can obscure it. No hardware access or deadline
+        // adjustment is authorized by these failure-only observations.
+        const failed_channel = self.activeChannel();
+        const failed_io = if (failed_channel) |channel| channel.session.last_io_failure else null;
+        const failed_io_error = if (failed_channel) |channel| channel.session.last_io_error else null;
+        const failed_port_clock = if (self.device) |device| device.last_clock else 0;
+        if (failed_io) |io| self.log("NVIDIA stop-io: kind={s} queue={s} offset={d} bytes={d} error={s} started={d} deadline={d} port-clock={d}",
+            .{@tagName(io.kind),if(io.queue)|queue|@tagName(queue) else "none",io.offset,io.bytes,
+              if(failed_io_error)|cause|@errorName(cause) else "none",io.started_ns,io.deadline,failed_port_clock});
+        if (self.power_active) if (self.power_owner) |*owner| self.log("NVIDIA stop-power: started={} completed={} operation={s} deadline={d} runtime-clock={d} channel={s} session-pending={}",
+            .{owner.started,owner.completed,if(owner.operation)|operation|@tagName(operation) else "none",owner.deadline,self.last_clock,
+              if(failed_channel)|channel|@tagName(channel.phase) else "none",if(failed_channel)|channel|channel.session.pending!=null else false});
         self.log("NVIDIA stop-work: error={s} cursor={} display={} flips={} channel={?d} render={s}",
             .{@errorName(err),self.cursor_point!=null,self.display_work!=null,self.hasDisplayFlips(),self.display_channel_active,
               if(self.queued_render)|v|@tagName(v.phase) else "none"});
@@ -6972,13 +6985,17 @@ pub const Owner = struct {
     noinline fn advancePowerOwner(self: *Owner, current: u64) !Progress {
         const owner = if (self.power_owner) |*value| value else return error.State;
         if (owner.completed) {
-            const deadline = owner.deadline;
             const operation = owner.operation orelse return error.State;
             const boost = switch (operation) { .boost => |value| value, else => null };
             self.log("NVIDIA power: control={x} status={?x} telemetry={s} poll-mask={x} policy={s} requested-level={?d} seconds={?d} accepted-level={d}",
                 .{power.wire.command(operation),owner.last_status,@tagName(owner.status),owner.active_mask,
                 @tagName(owner.performance.reason),if (boost) |value| @as(?u2, value.level) else null,
                 if (boost) |value| @as(?u16, value.seconds) else null,owner.performance.accepted_level});
+            // Decoding and the exact ACK already completed under the original
+            // RPC deadline. A later scheduling/log pause cannot expire that
+            // finished operation. Return the now-idle channel with a fresh
+            // short lease; pending/ambiguous RPCs keep their original limit.
+            const deadline = try std.math.add(u64, try self.now(), std.time.ns_per_s);
             var token = try owner.handoff(deadline);
             self.channel = try exchange.Exchange.init(&token, deadline);
             self.power_active = false;

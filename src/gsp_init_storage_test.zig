@@ -14455,8 +14455,18 @@ fn checkDevicePower(target: *@import("gsp_device.zig").Device) !void {
     errdefer |err| std.debug.print("power {s}: {s} at={s} status={s} mask={x} active={} phase={s} failure={?}\n",
         .{model.scenario,@errorName(err),checkpoint,@tagName(owner.status),owner.active_mask,run.power_active,@tagName(target.phase),target.failure});
     var iterations: usize = 0;
+    var completed_poll_delayed = false;
     while (iterations < 30 and target.phase == .ready) : (iterations += 1) {
         if (!run.power_active and (owner.active_mask != 0 or owner.rejection != null or owner.poll_rejection != null)) break;
+        if (model.is("power_success") and !completed_poll_delayed and run.power_active and owner.completed and owner.operation.? == .poll) {
+            // The exact reply was decoded and physically ACKed within its
+            // original one-second limit. Only ownership return is delayed,
+            // as by scheduling or a slow diagnostic log after completion.
+            try t.expect(owner.active.?.phase == .idle and owner.active.?.pending == null and
+                owner.active.?.session.pending == null and owner.active.?.deadline == null);
+            clock = owner.deadline + 1_235_212_223;
+            completed_poll_delayed = true;
+        }
         try stepDevicePower(target);
     }
     try t.expect(iterations < 30);
@@ -14466,6 +14476,7 @@ fn checkDevicePower(target: *@import("gsp_device.zig").Device) !void {
         return;
     }
     try t.expect(target.phase == .ready and run.failure == null and !run.power_active);
+    if (model.is("power_success")) try t.expect(completed_poll_delayed and owner.active == null and run.activeChannel().?.phase == .idle);
     if (model.is("power_attach_reject")) {
         try t.expect(owner.status == .rejected and !owner.possibly_attached and !model.active and model.releases == 1);
         try t.expect(try owner.stop(clock));

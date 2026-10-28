@@ -3915,6 +3915,8 @@ test "GSP transport orders range publication, explicit acknowledgement and termi
         model.signal_after = after;
         try t.expectError(error.Io, session.send(deadline, .{ .function = 79 }, "x"));
         try t.expectEqual(error.NotifyFailure, session.last_io_error.?);
+        try t.expectEqual(if (phase == .prepare) transport.IoKind.prepare else transport.IoKind.submit, session.last_io_failure.?.kind);
+        try t.expectEqual(deadline, session.last_io_failure.?.deadline);
         try t.expectEqual(@as(u32, if (phase == .submit) 1 else 0), get(&model.peer[0], 16));
         try t.expectEqual(@as(usize, if (phase == .submit and after) 1 else 0), model.notifications);
         const calls = model.count;
@@ -3940,6 +3942,12 @@ test "GSP transport orders range publication, explicit acknowledgement and termi
         try t.expectError(error.Io, session.send(deadline, .{ .function = 79 }, "x"));
         try t.expectEqual(transport.State.failed, session.state);
         try t.expectEqual(error.PortFailure, session.last_io_error.?);
+        const failed_event = model.events[model.count - 1];
+        try t.expectEqual(if (failed_event.write) transport.IoKind.publish else transport.IoKind.read, session.last_io_failure.?.kind);
+        try t.expectEqual(deadline, session.last_io_failure.?.deadline);
+        try t.expectEqual(failed_event.queue, session.last_io_failure.?.queue.?);
+        try t.expectEqual(failed_event.offset, session.last_io_failure.?.offset);
+        try t.expectEqual(failed_event.bytes, session.last_io_failure.?.bytes);
         try t.expectEqual(@as(u32, if (fault == 3 and after) 1 else 0), get(&model.peer[0], 16));
         const calls = model.count;
         try t.expectError(error.State, session.send(deadline, .{ .function = 79 }, "x"));
