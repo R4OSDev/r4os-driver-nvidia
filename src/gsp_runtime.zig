@@ -1083,8 +1083,13 @@ pub const Owner = struct {
                 if (record.fault_address) |va| record.programs_address_match = va >= programs.address and va-programs.address < render.shader_bytes;
             }
             if (self.graphics_cache.packet.info()) |packet| {
-                record.packet_address = packet.address;
-                if (record.fault_address) |va| record.packet_address_match = va >= packet.address and va-packet.address < packet.bytes;
+                const offset = self.graphics_cache.packet_slot * render.packet_capacity_bytes;
+                if (self.graphics_cache.packet_slot < render_cache.packet_slots and offset <= packet.bytes and
+                    render.packet_capacity_bytes <= packet.bytes - offset) {
+                    record.packet_address = packet.address + offset;
+                    if (record.fault_address) |va| record.packet_address_match = va >= record.packet_address and
+                        va-record.packet_address < render.packet_capacity_bytes;
+                }
             }
         }
         if (self.display_upload_job) |*work| {
@@ -4098,6 +4103,7 @@ pub const Owner = struct {
             return err;
         };
         work.command = .{ .draw = work.resources.command.? };
+        try self.graphics_cache.bindQueueFence(input.job.fence);
         if (self.cursor_point) |slot| work.cursor_sequence = self.display_channels[slot].?.point.pending.?.sequence;
         work.packet_rebound = self.graphics_cache.last_reuse_rebound;
     }
@@ -4184,8 +4190,15 @@ pub const Owner = struct {
                 return false;
             }
             if (try fifo.ring.poll() >= work.ticket.?.point) {
+                if (work.resources.cache_owner) |cache| try cache.completed(work.ticket.?.point);
                 if (!work.resources.close(true)) return error.Retained;
                 work.receipt = .{ .channel = work.channel_handle, .point = work.ticket.?.point, .completed_ns = current };
+                if (work.queued and self.graphics_cache.last_reuse_resident and self.graphics_cache.resident_completed == 1) {
+                    const fence = self.graphics_cache.packets[self.graphics_cache.packet_slot].queue_fence;
+                    self.log("NVIDIA render-ring: resident-completed epoch={d} slots={d} slot={d} CE-point={d} GR-point={d} queue={d}:{d} reuses={d} completed={d} reserved={d}",
+                        .{self.epoch,render_cache.packet_slots,self.graphics_cache.packet_slot,self.graphics_cache.packet_point,work.ticket.?.point,
+                        fence.timeline,fence.point,self.graphics_cache.resident_reuses,self.graphics_cache.resident_completed,self.graphics_cache.reservedBytes()});
+                }
                 if (work.queued and work.packet_rebound) {
                     self.graphics_rebound_completed +|= 1;
                     if (self.graphics_rebound_completed == 1) self.log(
@@ -4229,6 +4242,7 @@ pub const Owner = struct {
             return true;
         };
         work.submitted = true;
+        if (work.resources.cache_owner) |cache| try cache.submitted(work.ticket.?.point);
         if (self.diagnostic_render_timeout and work.queued) {
             const queued = self.queued_render orelse return error.State;
             self.diagnostic_render_timeout = false;

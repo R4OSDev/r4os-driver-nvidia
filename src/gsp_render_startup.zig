@@ -37,7 +37,7 @@ pub const Owner = struct {
     fn advance(self: *Owner, run: *runtime.Owner) !bool {
         switch (self.phase) {
             .allocate => {
-                self.storage = try run.allocateNativeStorage(if (self.kind == .programs) try runtime.render.shaderBytesFor(try run.graphicsClass()) else runtime.render.packet_capacity_bytes, self.deadline);
+                self.storage = try run.allocateNativeStorage(if (self.kind == .programs) try runtime.render.shaderBytesFor(try run.graphicsClass()) else runtime.render_cache.packet_storage_bytes, self.deadline);
                 self.phase = .storage;
             },
             .storage => {

@@ -25,6 +25,7 @@ pub const Owner = struct {
     gpu: a.GfxDeviceLease = .{},
     gpu_stamp: a.GfxDeviceLease = .{},
     bytes: u64 = 0,
+    target_offset: u64 = 0,
     deadline: u64 = 0,
     ticket: ?copy.Ticket = null,
     submitted: bool = false,
@@ -67,6 +68,8 @@ pub const Owner = struct {
         if (mapped != a.gfx_buffer_result_ok) return error.Map;
         const ptr: [*]u8 = @ptrFromInt(cpu.cpu_address);
         try self.cache_owner.?.beginUploadList(self.kind,draws,ptr[0..@intCast(self.bytes)]);
+        self.target_offset = self.cache_owner.?.uploadOffset();
+        if (self.target_offset > self.target_stamp.?.bytes or self.bytes > self.target_stamp.?.bytes - self.target_offset) return error.Bounds;
         if (memory.bufferUnmap(&cpu.lease) != a.gfx_buffer_result_ok) return error.Retained;
         self.cpu = .{}; self.cpu_stamp = .{};
         const acquired = memory.deviceAcquire(&reference, &.{ .byte_length = self.bytes, .gpu_virtual_address = self.source_stamp.?.address,
@@ -83,11 +86,13 @@ pub const Owner = struct {
         return self.self_address == @intFromPtr(self) and !self.failed and self.cache_owner != null and self.cache_owner.?.valid() and
             self.cache_owner.?.uploading == self.kind and !self.cache_owner.?.borrowed and self.source != null and self.target != null and
             std.meta.eql(self.source.?.info(),self.source_stamp) and std.meta.eql(self.target.?.info(),self.target_stamp) and
+            self.target_offset == self.cache_owner.?.uploadOffset() and self.target_offset <= self.target_stamp.?.bytes and
+            self.bytes <= self.target_stamp.?.bytes - self.target_offset and
             self.cpu.lease.id == 0 and self.gpu.lease.id != 0 and std.meta.eql(self.gpu,self.gpu_stamp);
     }
     pub fn transfer(self: *const Owner) !copy.wire.Transfer {
         if (!self.validState()) return error.Stale;
-        return .{ .source = self.source_stamp.?.address, .target = self.target_stamp.?.address, .bytes = self.bytes };
+        return .{ .source = self.source_stamp.?.address, .target = self.target_stamp.?.address + self.target_offset, .bytes = self.bytes };
     }
     pub fn matches(self: *const Owner, ticket: copy.Ticket, deadline: u64) bool {
         return self.validState() and !self.submitted and self.deadline == deadline and self.ticket != null and std.meta.eql(self.ticket.?,ticket);

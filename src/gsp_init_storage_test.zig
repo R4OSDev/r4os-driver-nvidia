@@ -10080,6 +10080,7 @@ fn checkGraphicsRendering(target: *@import("gsp_device.zig").Device, table: *@im
     try t.expectError(error.Binding,port_owner.admit_graphics.?(port_owner.context,&target.port,gr_owner,ticket,deadline));
     run.graphics_cache.draw.?.color ^= 1;
     try target.port.submitGraphics(gr_owner,ticket,deadline); run.graphics_work.?.submitted = true;
+    try run.graphics_cache.submitted(ticket.point);
     const commands = &fifo.slots[0].data;
     const load = @import("gsp_fifo_wire.zig").word;
     const gp = @as(usize,(ticket.put + 511) % 512) * 8;
@@ -10864,7 +10865,9 @@ fn checkRenderUpload(target: *@import("gsp_device.zig").Device, ce: @import("gsp
     const source_address = (@as(u64,load(commands,offset+12))<<32)|load(commands,offset+16);
     const destination = (@as(u64,load(commands,offset+20))<<32)|load(commands,offset+24);
     const bytes = load(commands,offset+32);
-    try t.expect(source_address == 0x600000 and destination == work.target_stamp.?.address and bytes == work.bytes and bytes == output.len);
+    try t.expect(source_address == 0x600000 and destination == work.target_stamp.?.address + work.target_offset and
+        work.target_offset == run.graphics_cache.uploadOffset() and work.target_offset + bytes <= work.target_stamp.?.bytes and
+        bytes == work.bytes and bytes == output.len);
     std.mem.writeInt(u32,commands[0x2088..][0..4],ticket.put,.little);
     try stepQueuedRendering(target); try t.expect(run.graphics_upload != null and ControlModel.reading);
     @memcpy(output,ControlModel.data[0..bytes]);
@@ -11017,9 +11020,10 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
     }
     const gridded = scene_index == 0 and !graphicsFaultScenario(scenario);
     const colored = scene_index == 8 and !graphicsFaultScenario(scenario);
-    const rounds: usize = if ((scene.solid or colored) and !graphicsFaultScenario(scenario)) 2 else 1;
+    const rounds: usize = if (scene.solid and !graphicsFaultScenario(scenario)) 4 else if (colored and !graphicsFaultScenario(scenario)) 2 else 1;
     const batched = gridded or colored or scene_index == 3 or graphicsFaultScenario(scenario);
     var packet_storage: [render.packet_capacity_bytes]u8 = undefined;
+    var original_packet: [render.packet_capacity_bytes]u8 = undefined;
     const packet = packet_storage[0..if (batched) render.packet_capacity_bytes else render.packet_bytes];
     for (0..rounds) |round| {
         checkpoint = "admission";
@@ -11029,12 +11033,22 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
         const ce_put = run.fifos[ce.slot].owner.?.ring.put;
         const uploaded = run.graphics_cache.uploaded_bytes;
         const reused = run.graphics_cache.packet_reuses;
-        const command: a.GfxRenderCommand = .{ .kind = if (scene.solid) 0 else 1,
+        const resident_reuses = run.graphics_cache.resident_reuses;
+        const resident_completed = run.graphics_cache.resident_completed;
+        var command: a.GfxRenderCommand = .{ .kind = if (scene.solid) 0 else 1,
             .target_rect = .{ .x = scene.destination.x, .y = scene.destination.y, .width = scene.destination.width, .height = scene.destination.height },
             .source_rect = if (scene.solid) .{} else .{ .x = scene.source_rect.x, .y = scene.source_rect.y, .width = scene.source_rect.width, .height = scene.source_rect.height },
             .scissor = .{ .x = scene.scissor.x, .y = scene.scissor.y, .width = scene.scissor.width, .height = scene.scissor.height },
             .filter = @intFromEnum(scene.filter), .blend = @intFromEnum(scene.blend), .transfer = if (colored) a.gfx_render_transfer_color else @intFromEnum(scene.transfer),
             .color = if (scene.solid) 0x80402010 else 0, .opacity = scene.opacity };
+        // A different vertex packet, with the same frozen fill result inside
+        // its original scissor. A,B,A must reuse A's still-resident bytes.
+        if (scene.solid and round == 2) {
+            command.target_rect.width += 1;
+            const clip = try scene.draw().clip();
+            command.scissor = .{ .x = @intCast(clip[0]), .y = @intCast(clip[1]),
+                .width = clip[2] - clip[0], .height = clip[3] - clip[1] };
+        }
         if (batched) {
             // Sixteen disjoint scissors exactly partition the frozen scene,
             // including bilinear alpha edges and a tiled source image.
@@ -11085,7 +11099,7 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
         }
         const load = @import("gsp_fifo_wire.zig").word;
         checkpoint = "packet";
-        if (round == 0 or combined) {
+        if (round == 0 or combined or (scene.solid and round == 2)) {
             for (0..20) |_| {
                 try stepQueuedRendering(target);
                 if (target.phase != .ready) return error.RenderQueue;
@@ -11093,14 +11107,17 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
             }
             try t.expect(run.graphics_upload != null);
             try checkRenderUpload(target,ce,packet);
+            if (round == 0) @memcpy(original_packet[0..packet.len], packet);
             if (gridded or combined) {
                 try t.expect(load(packet, 15 * render.packet_bytes + 544) == 1 and
                     load(packet, 15 * render.packet_bytes + 552) == 60);
             }
         } else {
+            if (scene.solid and round == 3) @memcpy(packet, original_packet[0..packet.len]);
             for (0..20) |_| {
                 try stepQueuedRendering(target);
                 try t.expect(run.graphics_upload == null);
+                try t.expect(run.queued_render.?.phase != .upload_wait);
                 if (run.graphics_work != null and run.graphics_work.?.submitted) break;
             }
             try t.expect(run.fifos[ce.slot].owner.?.ring.put == ce_put and run.graphics_cache.uploaded_bytes == uploaded and
@@ -11119,6 +11136,12 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
         if (graphicsFaultScenario(scenario)) return checkGraphicsFault(target,ce,deadline,scenario,native_index);
         try checkSubmittedRenderCursorValidation(target);
         const work = &run.graphics_work.?;
+        const resident_slot = run.graphics_cache.packet_slot;
+        const resident = &run.graphics_cache.packets[resident_slot];
+        try t.expect(resident.gr_submitted == work.ticket.?.point and resident.gr_completed != resident.gr_submitted and
+            std.meta.eql(resident.queue_fence, model.job.fence));
+        try t.expectError(error.State, run.graphics_cache.release());
+        try t.expectError(error.Busy, run.graphics_cache.reusePacketList(run.queued_render.?.commands()));
         const gr_data = &fifo.slots[0].data; const ticket = work.ticket.?;
         const gp = @as(usize,(ticket.put+511)%512)*8;
         const count: usize = load(gr_data,gp+4)>>10;
@@ -11150,10 +11173,17 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
         try t.expect(target.phase == .ready and run.queued_render == null and run.graphics_work == null and
             model.completed == completed_copy+1 and model.result == a.gfx_queue_result_complete and !model.active and !native.slots[native_index].imported and
             run.graphics_completed == before+round+1 and !run.graphics_cache.borrowed);
+        try t.expect(resident.gr_completed == ticket.point and resident.gr_submitted == ticket.point and
+            run.graphics_cache.submission_point == 0 and run.graphics_cache.reservedBytes() == @import("gsp_render_cache.zig").budget_bytes);
+        if (scene.solid and round == 3) {
+            try t.expect(run.graphics_cache.resident_reuses == resident_reuses + 1 and
+                run.graphics_cache.resident_completed == resident_completed + 1);
+            std.debug.print("[nvidia-render-ring] A,B,A: real CE offsets; no second A upload; exact GR/public fences; immutable until semaphore; same original pixels; 3 slots/131072 bytes\n", .{});
+        }
         if (source_index) |index| try t.expect(!native.slots[index].imported and native.slots[index].gpu.lease.id == 0);
     }
-    // A stale generation cannot bind a warm packet. An interrupted changed
-    // packet invalidates the preceding descriptor even before CE execution.
+    // A stale generation cannot bind a warm packet. A canceled changed copy
+    // invalidates its exact destination; other completed slots remain valid.
     checkpoint = "cache-rebind";
     const old_draw = run.graphics_cache.draw.?;
     if (!batched and scene.solid) {
@@ -11180,10 +11210,17 @@ fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("
     try t.expectError(error.Stale,run.graphics_cache.binding());
     run.graphics_cache.epoch -= 1;
     var altered = old_draw; altered.opacity ^= 1;
+    const old_slot = run.graphics_cache.packet_slot;
+    const old_binding = try run.graphics_cache.binding();
+    var old_commands: [render.batch_capacity]render.Draw = undefined;
+    old_commands[0] = old_binding.draw;
+    @memcpy(old_commands[1..][0..old_binding.additional.len], old_binding.additional);
+    const old_count = 1 + old_binding.additional.len;
     try run.graphics_cache.beginUpload(.packet,altered,packet[0..render.packet_bytes]);
+    const overwritten = old_slot == run.graphics_cache.packet_slot;
     try run.graphics_cache.cancelUpload();
-    try t.expect(!try run.graphics_cache.reusePacket(old_draw));
     try t.expectError(error.State,run.graphics_cache.binding());
+    try t.expectEqual(!overwritten, try run.graphics_cache.reusePacketList(old_commands[0..old_count]));
 }
 fn checkUnsubmittedRenderExpiry(target: *@import("gsp_device.zig").Device,
     ce: @import("gsp_runtime.zig").ChannelHandle, image_index: usize) !void

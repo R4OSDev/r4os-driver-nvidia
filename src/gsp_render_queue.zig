@@ -196,7 +196,13 @@ pub const Owner = struct {
                     }
                     return err;
                 };
-                self.phase = .upload_wait;
+                // A resident packet already has its real CE receipt. Avoid
+                // an empty upload-wait turn; GR still observes the unchanged
+                // dependencies, admission barriers and physical completion.
+                if (run.graphics_upload == null) {
+                    if (!(try run.graphics_cache.binding()).matches(self.commands())) return error.Stale;
+                    self.phase = .draw;
+                } else self.phase = .upload_wait;
             },
             .upload_wait => {
                 if (run.graphics_upload != null) return false;

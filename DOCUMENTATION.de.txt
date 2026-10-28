@@ -1,4 +1,4 @@
-﻿NVIDIA: nativer Grafik- und Displaybesitzer
+NVIDIA: nativer Grafik- und Displaybesitzer
 =========================================
 
 0.87.10 / NVIDIA333 / 25.10.2026:
@@ -3641,3 +3641,44 @@ ReferenzGET normalisiert gleich; OriginalSHA256 d538b089c24b973ba14209cdad415fed
 Gesamt135.521406/IPC141.872165 gegen59 137.870960/146.849660 unisoliert;
 keinSpeedup-/Noise-/Regressionsursachenbeweis und keinScore-/Uploadrerun.
 Alle Originale/Kontexte/SHA256 unter ExFiles/Reports/Benchmarks/87c87a4d-427c-4a9f-8c22-ac49e189dd03/.
+
+0.87.61 / drei residente Renderpakete (lokal/nativ qualifiziert)
+--------------------------------------------------------------------
+Der bisherige64KB-Paketpuffer enthaelt drei disjunkte Bereiche zu20480Byte.
+Je Bereich bleiben bis16 kanonische Draws mit echtem CE-Punkt, letzter
+oeffentlicher Queue-Fence und eingereichtem/abgeschlossenem GR-Punkt. Der
+Programmpuffer bleibt separat; das physische Gesamtbudget bleibt128KB.
+Ein CPU-Write, USERD-Fortschritt oder eine abgelaufene Frist ersetzt keine
+CE-/GR-Quittung. Der aktive Borrow sperrt jeden Wechsel und Upload bis zum
+genauen GR-Semaphor; ein Reset darf ihn nur mit dem bisherigen echten
+Quieszenzbeleg derselben Epoche verwerfen. Kein synthetischer Abschluss.
+
+Der begrenzte Suchlauf prueft zuerst das aktuelle Paket, danach zwei
+Residenten. Bytegleiche kanonische Deskriptor-/Vertex-/Konstantenbytes
+koennen mit frisch validiertem Pushzustand wiederverwendet werden. Ein
+Miss ueberschreibt genau den naechsten abgeschlossenen Ringplatz; ein
+abgebrochener Upload invalidiert nur diesen Platz. Alle anderen residenten
+Pakete behalten ihre nachgewiesenen CE-Punkte. A,B,A braucht dadurch nach
+der ersten A/B-Vorbereitung keinen zweiten Upload von A. Ein Residenthit
+ueberspringt auch den leeren upload_wait-Dispatch. Die erste Meldung
+NVIDIA render-ring: resident-completed entsteht erst nach echtem GR-Ende
+und der Freigabe der Arbeitsleihen; sie enthaelt Slot, CE-/GR-Punkt und
+Queue-Fence. Das ist keine optische oder Latenzmessung.
+
+WorkSlots8, Produzentenfairness,1MP-Render-/1MB-Copyabschnitte, Grenzen bei
+Ressourcen-/Blend-/Pipelinewechseln, Deadline-, Display-, Cursor- und
+RM-Barrieren bleiben erhalten. Physische CE-/GR-Arbeit bleibt seriell;
+keine unqualifizierte Engineueberlappung. Dieses Verfahren haelt fertige
+Pakete resident, es stellt keine parallele GPU-Submissionpipeline dar.
+
+0.87.61 Abschluss: aktuelle KVM4-/Native16-/Originalpixel-/Fence-/
+Ressourcen- und normale PostGPU-Neustartbelege stehen in
+Docs/Core/Parallelitaet.txt/0.87.61. Physische Sicht/Hoeren/Latenz SKIP.
+FinalerSTANDARD61: 287b890d-9d42-43de-95a1-7d39d67a8ae4, Suite3/metric2/30Samples/
+4vollstaendigeKVM-Worker/sechs gueltige Scores, lokal und R4OS Server
+vollstaendig validiert. Original- und frischer Referenz-GET vollstaendig
+verlustfrei normalisiert gleich; OriginalSHA256
+e496252f8ba7cfd01f400749f933a02005c60647f1f57ff8c72f4dbd584ba2a8.
+Gesamt139.615124/IPC131.865145 gegen60 135.521406/141.872165 unisoliert;
+kein Speedup-, Noise- oder Regressionsursachenbeweis, kein Score-/Uploadrerun.
+Originale/Kontexte/SHA256: ExFiles/Reports/Benchmarks/287b890d-9d42-43de-95a1-7d39d67a8ae4/.

@@ -161,7 +161,7 @@ pub const Owner = struct {
         if (!self.source.close(self.memory.?) or !self.target.close(self.memory.?)) return false;
         // This is a CPU borrow held solely by this command, not a completed
         // GPU receipt. The cache closes separately after this borrow ends.
-        self.cache_owner.?.borrowed = false;
+        if (!self.cache_owner.?.releaseAfterReset(proof)) return false;
         self.* = .{}; return true;
     }
 };
