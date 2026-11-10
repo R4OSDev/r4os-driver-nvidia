@@ -3,7 +3,7 @@
 const std = @import("std");
 const a = @import("r4os").abi;
 pub const Model = struct {
-    var original: a.DriverApi = undefined;
+    var original: a.DriverApi2 = undefined;
     var config: ?a.GfxNativeProvider = null;
     pub var closing = false;
     pub var queued: ?a.GfxVirtualJob = null;
@@ -14,12 +14,12 @@ pub const Model = struct {
     const Resource = struct { job: a.GfxVirtualJob, token: a.GfxVirtualToken };
     var live: [4]?Resource = @splat(null);
     const provider: a.GfxBufferHandle = .{ .id = 37, .generation = 91 };
-    pub fn install(table: *a.DriverApi) void {
+    pub fn install(table: *a.DriverApi2) void {
         original = table.*; table.gfx_memory_query = memory;
         config = null; closing = false; queued = null; claim = null; completion = null;
         completed = 0; notifying = false; live = @splat(null);
     }
-    pub fn dispose(table: *a.DriverApi) void { table.* = original; }
+    pub fn dispose(table: *a.DriverApi2) void { table.* = original; }
     fn memory(out: *a.GfxDriverMemoryApi) callconv(.c) i32 {
         if (original.gfx_memory_query.?(out) != 1) return -1;
         out.virtual_register = @intFromPtr(&register); out.virtual_unregister = @intFromPtr(&unregister);

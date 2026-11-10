@@ -26,7 +26,7 @@ pub const Model = struct {
     pub var reject_resource: ?u32 = null;
     pub var reject_read: u32 = 1;
     var next_point: u64 = 0;
-    pub fn install(table: *a.DriverApi) void {
+    pub fn install(table: *a.DriverApi2) void {
         original = table.gfx_queue_query;
         table.gfx_queue_query = query;
         registration = null;
@@ -46,7 +46,7 @@ pub const Model = struct {
         reject_resource = null;
         reject_read = 1;
     }
-    pub fn dispose(table: *a.DriverApi) void {
+    pub fn dispose(table: *a.DriverApi2) void {
         table.gfx_queue_query = original;
     }
     pub fn wake(raw: usize) i32 {

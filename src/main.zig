@@ -32,7 +32,7 @@ const thread_probe = @import("thread_probe.zig");
 const semaphore_probe = @import("semaphore_probe.zig");
 const rm_semaphore_probe = @import("rm_semaphore_probe.zig");
 const a = r4os.abi;
-var driver_api: ?*const a.DriverApi = null;
+var driver_api: ?*const a.DriverApi2 = null;
 var window: a.GfxMmioWindow = .{};
 var mapping_cleanup_needed = false;
 var identity_memory: ?r4os.driver_memory.Context = null;
@@ -71,12 +71,12 @@ var fwsec_frts: fwsec_storage.Storage = .{};
 var fwsec_hardware: fwsec_state_probe.Capture = .{};
 
 comptime {
-    asm (r4os.r4dev.driverEntriesAsm("nvidia_init", "nvidia_shutdown"));
+    if (!@import("builtin").is_test) asm (r4os.technical2.driverEntriesAsm("nvidia_init", "nvidia_shutdown"));
 }
 
-pub export fn nvidia_init(api: *const a.DriverApi) callconv(.c) i32 {
-    const ctx = r4os.r4dev.DriverContext.init(api);
-    if (!ctx.apiCompatible() or driver_api != null) return -1;
+pub export fn nvidia_init(api: *const a.DriverApi2) callconv(.c) i32 {
+    const ctx = r4os.r4dev.DriverContext2.init(api);
+    if (!ctx.requires(.{"get_option"}) or driver_api != null) return -1;
     driver_api = api;
     rm_heap.bind(&ctx);
     rm_clock.bind(&ctx);
@@ -175,7 +175,7 @@ pub export fn nvidia_init(api: *const a.DriverApi) callconv(.c) i32 {
     const inventory_count = ctx.pciDeviceCount();
     if (inventory_count > 4096) return -3;
     // One pass over the kernel's immutable inventory, not PCI probing loops.
-    // The loader already holds this module's DriverApi owner throughout init.
+    // The loader already holds this module's DriverApi2 owner throughout init.
     for (0..inventory_count) |index| {
         var info: a.PciDeviceInfo = .{};
         if (ctx.pciDeviceAt(@intCast(index), &info) != 0) return -3;
@@ -267,7 +267,7 @@ pub export fn nvidia_init(api: *const a.DriverApi) callconv(.c) i32 {
 
 pub export fn nvidia_shutdown() callconv(.c) i32 {
     const api = driver_api orelse return 0;
-    const ctx = r4os.r4dev.DriverContext.init(api);
+    const ctx = r4os.r4dev.DriverContext2.init(api);
     const native_effects = boot_vram.firmware_owner != 0 or native_device.terminal_requested;
     if (!wait_probe.shutdown(&ctx)) return -1;
     if (!native_probe.shutdown(&ctx)) return -1;
@@ -307,7 +307,7 @@ pub export fn nvidia_shutdown() callconv(.c) i32 {
     return 0;
 }
 
-fn checkFirmware(ctx: *const r4os.r4dev.DriverContext) bool {
+fn checkFirmware(ctx: *const r4os.r4dev.DriverContext2) bool {
     for ([_]firmware.Family{ .ga10x, .tu10x }) |family| {
         firmware_cpu.begin(ctx, family, 30 * std.time.ns_per_s) catch |err| {
             log("NVIDIA firmware: rejected family={s} phase=storage reason={s} native-writes=disabled", .{ @tagName(family), @errorName(err) });
@@ -352,7 +352,7 @@ fn checkFirmware(ctx: *const r4os.r4dev.DriverContext) bool {
     return true;
 }
 
-fn readIdentity(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, measured: *?identity.Chip) bool {
+fn readIdentity(ctx: *const r4os.r4dev.DriverContext2, snapshot: *const identity.Snapshot, measured: *?identity.Chip) bool {
     const memory = ctx.memory() orelse {
         ctx.logInfo("NVIDIA chip=unmeasured reason=MMIO-contract-unavailable");
         return true;
@@ -395,7 +395,7 @@ noinline fn diagnoseVbios(bytes: []const u8) void {
     var diagnostic: VbiosDiagnostic = .{};
     @import("vbios_diagnostic.zig").inspect(bytes, &diagnostic);
 }
-fn readVbios(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, chip: identity.Chip) bool {
+fn readVbios(ctx: *const r4os.r4dev.DriverContext2, snapshot: *const identity.Snapshot, chip: identity.Chip) bool {
     const bytes = board_rom.read(ctx, snapshot, chip) catch |err| {
         log("NVIDIA vbios: rejected phase=read reason={s} source=PROM native-writes=disabled fallback=preserved", .{@errorName(err)});
         _ = board_rom.close();
@@ -483,7 +483,7 @@ fn readVbios(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Sna
     return true;
 }
 
-fn inspectFwsec(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, chip: identity.Chip, rom: []const u8, board: *const vbios.Result) bool {
+fn inspectFwsec(ctx: *const r4os.r4dev.DriverContext2, snapshot: *const identity.Snapshot, chip: identity.Chip, rom: []const u8, board: *const vbios.Result) bool {
     log("NVIDIA fwsec: source=PROM expansion-bias={x} first-extension={x} bit-p={} native-writes=disabled", .{
         board.expansion_rom_offset orelse 0xffffffff, board.first_extension_offset orelse 0xffffffff, board.falcon != null,
     });
@@ -568,7 +568,7 @@ fn inspectFwsec(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.
 }
 
 const FwsecSource = struct { rom: []const u8, board: *const vbios.Result, fuses: fwsec_prepare.Fuses };
-fn inspectFwsecState(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, chip: identity.Chip, plan: *const @import("fwsec_load.zig").Plan, source: FwsecSource) bool {
+fn inspectFwsecState(ctx: *const r4os.r4dev.DriverContext2, snapshot: *const identity.Snapshot, chip: identity.Chip, plan: *const @import("fwsec_load.zig").Plan, source: FwsecSource) bool {
     const raw = fwsec_hardware.read(ctx, snapshot, chip) catch |err| {
         log("NVIDIA fwsec: preflight=unavailable phase=registers reason={s} native-writes=disabled", .{@errorName(err)});
         return fwsec_hardware.close();
@@ -673,7 +673,7 @@ fn logBootScanout(raw: *const @import("boot_scanout.zig").Raw) void {
     };
 }
 
-fn checkBoot(ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, chip: identity.Chip, raw: fwsec_state.Raw, source: FwsecSource) bool {
+fn checkBoot(ctx: *const r4os.r4dev.DriverContext2, snapshot: *const identity.Snapshot, chip: identity.Chip, raw: fwsec_state.Raw, source: FwsecSource) bool {
     const vram_copy = boot_vram.capture(ctx, snapshot, chip) catch |err| {
         log("NVIDIA boot-vram: rejected reason={s} status={d} window-writes={d} firmware-execution=disabled", .{
             @errorName(err), boot_vram.last_status, boot_vram.window_writes,
@@ -897,7 +897,7 @@ fn restageBootAfterReset(_: usize, target: *@import("gsp_device.zig").Device) !v
     if (!stageBootInit(&target.ctx.?, boot_vram.chip.?.id)) return error.Restage;
 }
 
-fn stageBootInit(ctx: *const r4os.r4dev.DriverContext, chip_id: u16) bool {
+fn stageBootInit(ctx: *const r4os.r4dev.DriverContext2, chip_id: u16) bool {
     const image_spans = boot_storage.image.segments[0..boot_storage.image.segment_count];
     @memcpy(init_excluded[0..image_spans.len], image_spans);
     const pack = boot_storage.mapping.segments[0];
@@ -982,7 +982,7 @@ fn closeBootInit() bool {
     return booters.close();
 }
 
-fn shutdownNative(ctx: *const r4os.r4dev.DriverContext) bool {
+fn shutdownNative(ctx: *const r4os.r4dev.DriverContext2) bool {
     if (native_device.self_address == 0 or (!native_device.port.effects_possible and boot_vram.firmware_owner == 0 and
         !native_device.terminal_requested)) return true;
     if (!native_work.pause()) return false;
@@ -1060,7 +1060,7 @@ const VbiosDiagnostic = struct {
     }
 };
 
-fn releaseWindow(ctx: *const r4os.r4dev.DriverContext) bool {
+fn releaseWindow(ctx: *const r4os.r4dev.DriverContext2) bool {
     _ = ctx;
     if (window.handle.id == 0 and !mapping_cleanup_needed) return true;
     const memory = identity_memory orelse return false;
@@ -1075,7 +1075,7 @@ fn releaseWindow(ctx: *const r4os.r4dev.DriverContext) bool {
     return true;
 }
 const ConfigReader = struct {
-    ctx: r4os.r4dev.DriverContext,
+    ctx: r4os.r4dev.DriverContext2,
     info: a.PciDeviceInfo,
     pub fn read(self: *ConfigReader, offset: u16) u32 {
         return self.ctx.pciReadConfig32(self.info, offset);
@@ -1085,7 +1085,7 @@ fn pciIdentity(info: a.PciDeviceInfo) identity.Pci {
     return .{ .bus_kind = info.bus_kind, .bus = info.bus, .device = info.device, .function = info.function, .vendor_id = info.vendor_id, .device_id = info.device_id, .class_code = info.class_code, .subclass = info.subclass, .prog_if = info.prog_if };
 }
 fn log(comptime format: []const u8, args: anytype) void {
-    const ctx = r4os.r4dev.DriverContext.init(driver_api orelse return);
+    const ctx = r4os.r4dev.DriverContext2.init(driver_api orelse return);
     var buffer: [320]u8 = undefined;
     const message = std.fmt.bufPrintZ(&buffer, format, args) catch return;
     ctx.logInfo(message.ptr);

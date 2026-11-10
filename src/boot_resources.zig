@@ -47,10 +47,10 @@ pub const Inputs = struct {
 
     /// The returned view borrows these resident inputs until close. The DMA
     /// boot owner copies them; no input pointer is ever a device address.
-    pub fn load(self: *Inputs, driver: *const r4os.r4dev.DriverContext, timeout_ns: u64) Error!View {
+    pub fn load(self: *Inputs, driver: *const r4os.r4dev.DriverContext2, timeout_ns: u64) Error!View {
         return self.loadFor(driver, 0x176, timeout_ns);
     }
-    pub fn loadFor(self: *Inputs, driver: *const r4os.r4dev.DriverContext, chip: u16, timeout_ns: u64) Error!View {
+    pub fn loadFor(self: *Inputs, driver: *const r4os.r4dev.DriverContext2, chip: u16, timeout_ns: u64) Error!View {
         if (self.active) return error.Busy;
         const spec = firmware.bootSpecification(chip) orelse return error.UnsupportedChip;
         if (spec.descriptor.bytes > self.descriptor.len) return error.Size;
@@ -121,12 +121,12 @@ test "firmware CPU storage boot resource reads keep exact generation, hash and d
             return @intCast(length);
         }
     };
-    var table: a.DriverApi = undefined;
-    table.magic = a.driver_magic;
+    var table: a.DriverApi2 = undefined;
+    table.magic = r4os.technical2.abi.driver_magic;
     table.version = 34;
-    table.size = @sizeOf(a.DriverApi);
+    table.size = @sizeOf(a.DriverApi2); table.reserved = 0;
     table.resource_query = Mock.query;
-    const driver = r4os.r4dev.DriverContext.init(&table);
+    const driver = r4os.r4dev.DriverContext2.init(&table);
     const ctx = driver.resources().?;
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(Mock.body, &digest, .{});

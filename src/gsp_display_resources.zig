@@ -255,7 +255,7 @@ pub const Owner = struct {
         if (self.table.entries[index].?.target != .vram or self.consoles[index] != null or self.surfaces[index] != null) return null;
         return &self.storage[index];
     }
-    pub fn createNotifier(self: *Owner, ctx: *const r4os.r4dev.DriverContext, channel: u32) Error!u32 {
+    pub fn createNotifier(self: *Owner, ctx: *const r4os.r4dev.DriverContext2, channel: u32) Error!u32 {
         if (!self.valid()) return error.Stale;
         if (channel >= self.notifiers.len) return error.Bounds;
         if (self.table.uploading or self.table.change != null or self.notifiers[channel].self_address != 0) return error.Busy;

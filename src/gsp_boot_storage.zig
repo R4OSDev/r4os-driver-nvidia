@@ -42,7 +42,7 @@ pub const Report = struct {
     app_version: u32 = 0,
 };
 pub const Storage = struct {
-    context: ?r4os.r4dev.DriverContext = null,
+    context: ?r4os.r4dev.DriverContext2 = null,
     heap: ?r4os.r4dev.DriverHeapContext = null,
     clock: ?r4os.r4dev.DriverResourceContext = null,
     deadline: u64 = 0,
@@ -68,7 +68,7 @@ pub const Storage = struct {
     /// The caller admitted the complete GSP container, its selected signature
     /// and production boot image before calling this ownership layer. The small
     /// descriptor and first-boot profile are independently rechecked here.
-    pub fn stageAdmitted(self: *Storage, ctx: *const r4os.r4dev.DriverContext, sources: *const Sources, timeout_ns: u64) Error!Report {
+    pub fn stageAdmitted(self: *Storage, ctx: *const r4os.r4dev.DriverContext2, sources: *const Sources, timeout_ns: u64) Error!Report {
         if (self.context != null) return error.Busy;
         const pack = try packFor(sources.chip_id);
         if (sources.boot_image.len != pack.signature) return error.WrongBootSize;
@@ -81,7 +81,7 @@ pub const Storage = struct {
         };
         const prepared = try wpr.prepare(&input);
         const boot_info = try boot.inspect(sources.descriptor, @intCast(sources.boot_image.len));
-        if (!ctx.supportsDriverApi(19, @offsetOf(a.DriverApi, "dma_unpin_buffer") + @sizeOf(usize))) return error.Api;
+        if (!(ctx.function("dma_unpin_buffer") != null)) return error.Api;
         self.context = ctx.*;
         self.clock = ctx.resources() orelse return error.Api;
         self.last_clock = self.clock.?.nowNs();

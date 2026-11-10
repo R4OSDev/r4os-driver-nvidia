@@ -27,7 +27,7 @@ pub const Phase = enum { unused, assign, assignment, refresh, query, queried, no
 pub const Output = struct {
     // Borrow shared adapter services. All mutable per-head owners below
     // remain in this stable slot; no second Device or RM graph is created.
-    ctx: ?r4os.r4dev.DriverContext = null,
+    ctx: ?r4os.r4dev.DriverContext2 = null,
     running: ?*runtime.Owner = null,
     captured: ?*@import("boot_vram.zig").Capture = null,
     memory: ?r4os.driver_memory.Context = null,

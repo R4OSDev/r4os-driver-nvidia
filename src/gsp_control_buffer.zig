@@ -14,7 +14,7 @@ pub const Info = struct { epoch: u64, memory: u32, virtual: u32, address: u64, b
 pub const Owner = struct {
     self_address: usize = 0,
     exchange: exchange.Exchange,
-    ctx: r4os.r4dev.DriverContext,
+    ctx: r4os.r4dev.DriverContext2,
     adapter: u32,
     binding: wire.Binding,
     byte_length: usize = storage.bytes,
@@ -39,10 +39,10 @@ pub const Owner = struct {
     host_binding: host_vm.Binding = .{},
     host_active: bool = false,
 
-    pub fn init(token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext, adapter: u32, binding: wire.Binding, deadline: u64) Error!Owner {
+    pub fn init(token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext2, adapter: u32, binding: wire.Binding, deadline: u64) Error!Owner {
         return initSized(token, ctx, adapter, binding, deadline, storage.bytes);
     }
-    pub fn initSized(token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext, adapter: u32, binding: wire.Binding, deadline: u64, byte_length: usize) Error!Owner {
+    pub fn initSized(token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext2, adapter: u32, binding: wire.Binding, deadline: u64, byte_length: usize) Error!Owner {
         if (byte_length != storage.bytes and byte_length != wire.bytes) return error.Bounds;
         try wire.validatePart(binding, .{ .total_bytes = byte_length, .byte_length = byte_length });
         if (adapter == 0 or token.session.epoch != binding.space.epoch) return error.Stale;

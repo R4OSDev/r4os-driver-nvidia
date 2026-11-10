@@ -16,7 +16,7 @@ pub const Storage = struct {
     cleanup_needed: bool = false,
     reads: usize = 0,
 
-    pub fn begin(self: *Storage, ctx: *const r4os.r4dev.DriverContext, family: firmware.Family, timeout_ns: u64) Error!void {
+    pub fn begin(self: *Storage, ctx: *const r4os.r4dev.DriverContext2, family: firmware.Family, timeout_ns: u64) Error!void {
         if (self.memory != null or self.cleanup_needed) return error.BadState;
         const source = ctx.resources() orelse return error.Api;
         const now = source.nowNs();

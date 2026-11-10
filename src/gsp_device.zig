@@ -37,7 +37,7 @@ pub const RecoveryHooks = struct {
 };
 pub const Device = struct {
     self_address: usize = 0,
-    ctx: ?r4os.r4dev.DriverContext = null,
+    ctx: ?r4os.r4dev.DriverContext2 = null,
     clock_api: ?r4os.r4dev.DriverResourceContext = null,
     display: ?*capture.Capture = null,
     vram: ?*vram.Lease = null,
@@ -129,12 +129,12 @@ pub const Device = struct {
     /// admitted. No reset or firmware instruction occurs until step(). The
     /// caller must retain this address and use a kernel with terminal display
     /// shutdown and thread-to-work admission (DriverApi35 / Kernel0.1.152).
-    pub fn open(self: *Device, ctx: *const r4os.r4dev.DriverContext, display: *capture.Capture,
+    pub fn open(self: *Device, ctx: *const r4os.r4dev.DriverContext2, display: *capture.Capture,
         reservation: *vram.Lease, backing: *memory.Lease, reader: *logs.Reader,
         board: ?*const @import("vbios.zig").Result) !void
     {
         if (self.self_address != 0) return error.Busy;
-        if (ctx.apiVersion() < a.driver_api_thread_work_version) return error.Api;
+        if (!ctx.requires(.{"thread_query", "driver_work_submit", "driver_completion_status", "driver_completion_release"})) return error.Api;
         if (display.context == null or display.context.?.api != ctx.api or display.snapshot == null or
             display.chip == null or !@import("generation.zig").ga102Hal(display.chip.?.id) or display.operation == null or
             !display.ready or display.firmware_owner != 0 or reservation.display != display or

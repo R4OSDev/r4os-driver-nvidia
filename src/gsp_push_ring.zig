@@ -329,7 +329,7 @@ pub const Ring = struct {
         return point;
     }
     pub fn idle(self: *const Ring) bool { return self.valid() and self.pending == null and self.issued == self.completed; }
-    pub noinline fn logDiagnostic(self: *const Ring, ctx: *const r4os.r4dev.DriverContext, channel: u32, cid: u32, token: u32) void {
+    pub noinline fn logDiagnostic(self: *const Ring, ctx: *const r4os.r4dev.DriverContext2, channel: u32, cid: u32, token: u32) void {
         const log = @import("gsp_mode_diagnostics.zig").write;
         // Already held CPU mappings only. GPU-owned fields can change between
         // samples; none of these values retires work or proves quiescence.

@@ -273,7 +273,7 @@ pub const Owner = struct {
         }
         return true;
     }
-    fn unavailable(self: *Owner, ctx: *const r4os.r4dev.DriverContext) void {
+    fn unavailable(self: *Owner, ctx: *const r4os.r4dev.DriverContext2) void {
         self.phase = .unavailable;
         var line: [200]u8 = undefined;
         const message = std.fmt.bufPrintZ(&line, "NVIDIA graphics-engine: unavailable reason={s} rm-status={?} phase={s} engines={x} display=preserved",
@@ -281,7 +281,7 @@ pub const Owner = struct {
                 if (self.failed_phase) |phase| @tagName(phase) else "none", self.engine_mask}) catch return;
         ctx.logInfo(message);
     }
-    pub fn quarantine(self: *Owner, ctx: ?*const r4os.r4dev.DriverContext, err: anyerror) void {
+    pub fn quarantine(self: *Owner, ctx: ?*const r4os.r4dev.DriverContext2, err: anyerror) void {
         if (self.self_address == 0 or self.phase == .closed or self.phase == .unavailable or self.phase == .failed) return;
         self.failed_phase = self.phase; self.reason = err; self.phase = .failed;
         if (ctx) |value| value.logInfo("NVIDIA graphics-engine: stopped resources=retained completion=not-inferred");

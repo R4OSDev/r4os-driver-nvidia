@@ -66,17 +66,17 @@ pub const Owner = struct {
     /// A normal import leases only logical bytes; its last partial segment
     /// still identifies the retained backing page for RM address translation.
     /// No access to page padding is granted. On error the caller owns the ref.
-    pub fn init(token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext, adapter: u32, space: vaspace.Info,
+    pub fn init(token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext2, adapter: u32, space: vaspace.Info,
         parent: names.Lease, source: a.GfxBufferReference, deadline: u64) Error!Owner
     {
         return initStorage(token, ctx, adapter, space, parent, source, deadline, null);
     }
-    pub fn initResident(token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext, adapter: u32, space: vaspace.Info,
+    pub fn initResident(token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext2, adapter: u32, space: vaspace.Info,
         parent: names.Lease, source: a.GfxBufferReference, deadline: u64, resident: *names.ResidentChildren) Error!Owner
     {
         return initStorage(token, ctx, adapter, space, parent, source, deadline, resident);
     }
-    fn initStorage(token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext, adapter: u32, space: vaspace.Info,
+    fn initStorage(token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext2, adapter: u32, space: vaspace.Info,
         parent: names.Lease, source: a.GfxBufferReference, deadline: u64, resident: ?*names.ResidentChildren) Error!Owner
     {
         if (token.claimed or token.session.state != .active or token.session.pending != null or

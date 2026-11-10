@@ -25,11 +25,11 @@ var unmaps: usize = 0;
 var releases: usize = 0;
 var clock: u64 = 100;
 
-fn apiTable() a.DriverApi {
-    var table: a.DriverApi = undefined;
-    table.magic = a.driver_magic;
+fn apiTable() a.DriverApi2 {
+    var table: a.DriverApi2 = undefined;
+    table.magic = r4os.technical2.abi.driver_magic;
     table.version = 29;
-    table.size = @sizeOf(a.DriverApi);
+    table.size = @sizeOf(a.DriverApi2); table.reserved = 0;
     table.resource_query = resourceQuery;
     table.gfx_memory_query = memoryQuery;
     return table;
@@ -104,7 +104,7 @@ fn collect() callconv(.c) i32 {
 
 test "firmware CPU storage retains private and public failures, uses cached shutdown API and exposes no partial view" {
     var table = apiTable();
-    const ctx = r4os.r4dev.DriverContext.init(&table);
+    const ctx = r4os.r4dev.DriverContext2.init(&table);
     for ([_]Fault{ .create, .map, .unmap, .release, .collect, .read, .short, .none }) |failure| {
         fault = if (failure == .create or failure == .map) failure else .none;
         closing = false;

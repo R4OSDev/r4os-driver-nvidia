@@ -13,7 +13,7 @@ comptime {
     if (@sizeOf(Header) != 16) @compileError("RM heap CPU alignment prefix drift");
 }
 
-pub fn bind(ctx: *const r4os.r4dev.DriverContext) void {
+pub fn bind(ctx: *const r4os.r4dev.DriverContext2) void {
     context = ctx.heap();
     @atomicStore(u64, &failed_releases, 0, .monotonic);
 }

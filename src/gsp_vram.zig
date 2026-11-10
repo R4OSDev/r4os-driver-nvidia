@@ -64,22 +64,22 @@ pub const Owner = struct {
     user_memory: ?struct { heap: *user_vram.Owner, view: *const @import("gsp_memory_inventory.zig").Owner } = null,
     user_range: user_vram.Range = .{},
 
-    pub fn init(token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext, adapter: u32, space: vaspace.Info,
+    pub fn init(token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext2, adapter: u32, space: vaspace.Info,
         parent: names.Lease, logical_bytes: u64, deadline: u64) Error!Owner
     {
         return initPlanned(token, ctx, adapter, space, parent, try surface.raw(adapter, space, logical_bytes), deadline);
     }
-    pub fn initPlanned(token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext, adapter: u32, space: vaspace.Info,
+    pub fn initPlanned(token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext2, adapter: u32, space: vaspace.Info,
         parent: names.Lease, plan: surface.Plan, deadline: u64) Error!Owner
     {
         return initStorage(token, ctx, adapter, space, parent, plan, null, deadline);
     }
-    pub fn initStorage(token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext, adapter: u32, space: vaspace.Info,
+    pub fn initStorage(token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext2, adapter: u32, space: vaspace.Info,
         parent: names.Lease, plan: surface.Plan, policy: ?storage.Policy, deadline: u64) Error!Owner
     {
         return initResident(token, ctx, adapter, space, parent, plan, policy, deadline, null);
     }
-    pub fn initResident(token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext, adapter: u32, space: vaspace.Info,
+    pub fn initResident(token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext2, adapter: u32, space: vaspace.Info,
         parent: names.Lease, plan: surface.Plan, policy: ?storage.Policy, deadline: u64, resident: ?*names.ResidentChildren) Error!Owner
     {
         if (token.claimed or token.session.state != .active or token.session.pending != null or adapter == 0 or

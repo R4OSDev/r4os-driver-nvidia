@@ -110,7 +110,7 @@ const Model = struct {
 };
 
 // Exercises real volatile accessors against host memory furnished through the
-// actual DriverContext -> GfxDriverMemoryApi path. This is not hardware MMIO.
+// actual DriverContext2 -> GfxDriverMemoryApi path. This is not hardware MMIO.
 const NativeRig = struct {
     words: []align(4096) u32,
     clock: u64 = 100,
@@ -228,11 +228,11 @@ const NativeRig = struct {
         if (rig.fail_collect) return a.gfx_buffer_error_busy;
         return a.gfx_buffer_result_ok;
     }
-    fn table() a.DriverApi {
-        var api: a.DriverApi = undefined;
-        api.magic = a.driver_magic;
+    fn table() a.DriverApi2 {
+        var api: a.DriverApi2 = undefined;
+        api.magic = r4os.technical2.abi.driver_magic;
         api.version = 34;
-        api.size = @sizeOf(a.DriverApi);
+        api.size = @sizeOf(a.DriverApi2); api.reserved = 0;
         api.resource_query = resourceQuery;
         api.gfx_memory_query = memoryQuery;
         return api;
@@ -381,7 +381,7 @@ test "firmware CPU storage GA106 core sequencing and native MMIO ownership" {
     words[0] = boot0;
     words[r.cpuctl / 4] = b.alias | b.halted;
     var api = NativeRig.table();
-    const ctx = r4os.r4dev.DriverContext.init(&api);
+    const ctx = r4os.r4dev.DriverContext2.init(&api);
     var snapshot: identity.Snapshot = .{ .pci = .{ .vendor_id = 0x10de, .device_id = 0x2504, .class_code = 3 }, .command = 2 };
     snapshot.bars[0] = .{ .kind = .memory32, .base = 0xfb000000, .bytes = words.len * 4 };
     var port: native.Port = .{};
@@ -658,7 +658,7 @@ test "firmware CPU storage GA106 core sequencing and native MMIO ownership" {
     wrong.bars[0].bytes -= 4096;
     try t.expectError(error.Stale, extra.acquire(&mapping, &ctx, &wrong, chip));
     var other_api = api;
-    const other_ctx = r4os.r4dev.DriverContext.init(&other_api);
+    const other_ctx = r4os.r4dev.DriverContext2.init(&other_api);
     try t.expectError(error.Stale, extra.acquire(&mapping, &other_ctx, &snapshot, chip));
     port = .{};
     try port.openShared(&ctx, &snapshot, boot0, 0, .{ .epoch = 9, .deadline_ns = 10000000 }, fixture.owner(), &mapping);

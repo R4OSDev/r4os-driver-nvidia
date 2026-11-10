@@ -123,7 +123,7 @@ pub const Owner = struct {
         if (plan.handles.vaspace == 0 or plan.epoch != token.session.epoch) return error.Handle;
         return .{ .exchange = try exchange.Exchange.init(token, deadline), .plan = plan, .deadline = deadline };
     }
-    pub fn configureHost(self: *Owner, ctx: *const @import("r4os").r4dev.DriverContext, adapter: u32, io: host_vm.tlb.Io) Error!void {
+    pub fn configureHost(self: *Owner, ctx: *const @import("r4os").r4dev.DriverContext2, adapter: u32, io: host_vm.tlb.Io) Error!void {
         if (self.self_address != 0 or self.state != .creating or !self.plan.external_vaspace or self.host_io != null) return error.State;
         try self.host_storage.configure(ctx, adapter, self.plan.epoch);
         self.host_io = io;

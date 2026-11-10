@@ -22,7 +22,7 @@ pub const Image = struct {
     metadata: [booter.metadata_bytes]u8 = @splat(0),
     prepared: ?booter.Prepared = null,
 
-    fn stage(self: *Image, owner: *Pair, ctx: *const r4os.r4dev.DriverContext, operation: booter.Operation, chip_id: u16, fuses: booter.Fuses) Error!void {
+    fn stage(self: *Image, owner: *Pair, ctx: *const r4os.r4dev.DriverContext2, operation: booter.Operation, chip_id: u16, fuses: booter.Fuses) Error!void {
         if (self.heap != null or self.allocation.handle != 0 or self.device.context != null) return error.Busy;
         const spec = try booter.specificationFor(chip_id, operation);
         self.heap = ctx.heap() orelse return error.Api;
@@ -68,7 +68,7 @@ pub const Image = struct {
     }
 };
 pub const Pair = struct {
-    api: ?*const a.DriverApi = null,
+    api: ?*const a.DriverApi2 = null,
     context: ?Context = null,
     images: [2]Image = .{ .{}, .{} },
     license: [license_capacity]u8 = @splat(0),
@@ -78,7 +78,7 @@ pub const Pair = struct {
     reads: usize = 0,
     complete: bool = false,
 
-    pub fn stage(self: *Pair, ctx: *const r4os.r4dev.DriverContext, chip_id: u16, fuses: booter.Fuses, expected_generation: u64, timeout_ns: u64) Error!void {
+    pub fn stage(self: *Pair, ctx: *const r4os.r4dev.DriverContext2, chip_id: u16, fuses: booter.Fuses, expected_generation: u64, timeout_ns: u64) Error!void {
         if (self.context != null) return error.Busy;
         if (!@import("generation.zig").ga102Hal(chip_id) or fuses.ucode_id != 3 or expected_generation == 0) return error.Profile;
         self.context = ctx.resources() orelse return error.Api;

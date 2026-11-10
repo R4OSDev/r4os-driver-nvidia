@@ -3128,3 +3128,18 @@ Normal post-GPU reboot returns in67.769s: graceful unload reaches its original
 deadline/SbProgress, then terminal FLR confirms stopped DMA and unbindresources0
 before driver-shutdownOK/warm-reset-ready. This is system-transition evidence,
 not a separate hot module-unload test or a claim that earlier faults are fixed.
+
+API-Migration 0.90.53: NVIDIA 0.1.338
+Aktueller Einstieg DriverInit2/DriverApi2/Query2:2 mit SDK194/Contract93.
+Die technischen API2-Callbacks werden wirklich ueber die neue Tabelle
+aufgerufen; eigenstaendige Grafik-/Memory-/Thread-/Resource-Records
+behalten ihre eigene Revision1. Alte DriverApi-Versionszahlen in den
+folgenden historischen Abschnitten beschreiben den damaligen Stand.
+Pflichtfaehigkeiten und optionale passive/software Modi bleiben getrennt.
+Shared DriverPollBudget begrenzt die AMD4096-Versuche und NVIDIA8-Schritt-
+Callbacks zusaetzlich zu ihren urspruenglichen Zeitgrenzen. Ablauf bestaetigt
+weder Work noch DMA, Mapping, GPU-Fence oder Unload. Bestehende Original-
+Ownerorakel bleiben erhalten. Konkrete Host-/Windowskompilat-/native
+Modellbelege und physische Grenzen: Docs/API/ConsumerMigration.txt und
+Research/API-ABI/Migration/0.90.53/Abnahme.json. AMD/NVIDIA-Hardware und
+bekannte NVIDIA-Hang-/Shutdownbefunde werden dadurch nicht abgenommen.

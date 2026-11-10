@@ -26,7 +26,7 @@ pub const Inputs = struct {
 };
 pub const Lease = struct {
     self_address: usize = 0,
-    api: ?*const a.DriverApi = null,
+    api: ?*const a.DriverApi2 = null,
     boot_storage: ?*boot.Storage = null,
     init_storage: ?*init.Storage = null,
     fwsec_storage: ?*security.Storage = null,
@@ -67,7 +67,7 @@ pub const Lease = struct {
         }
         return count;
     }
-    fn securityMatches(b: *boot.Storage, f: *security.Storage, s: *security.Storage, api: *const a.DriverApi, owner: usize) bool {
+    fn securityMatches(b: *boot.Storage, f: *security.Storage, s: *security.Storage, api: *const a.DriverApi2, owner: usize) bool {
         // A cold run needs both immutable images before any device effects:
         // FRTS for this exact boot reservation and SB for normal teardown.
         if (f == s or !f.preparationValid() or f.command != 0x15 or f.frts_owner == null or
@@ -78,7 +78,7 @@ pub const Lease = struct {
         }
         return true;
     }
-    fn available(b: *boot.Storage, i: *init.Storage, f: *security.Storage, s: *security.Storage, p: *booters.Pair, api: *const a.DriverApi) bool {
+    fn available(b: *boot.Storage, i: *init.Storage, f: *security.Storage, s: *security.Storage, p: *booters.Pair, api: *const a.DriverApi2) bool {
         if (b.execution_owner != 0 or b.image.execution_owner != 0 or i.execution_owner != 0) return false;
         if (b.report == null or b.image.report == null or i.report == null or !securityMatches(b, f, s, api, 0)) return false;
         if (b.context == null or b.image.context == null or i.context == null) return false;
@@ -87,7 +87,7 @@ pub const Lease = struct {
         return b.image.piece_count > 0 and b.image.piece_count <= gsp_dma.max_mappings and
             i.piece_count == init.max_mappings and i.queue_epoch == 0 and !i.device_access;
     }
-    fn bootersMatch(p: *const booters.Pair, api: *const a.DriverApi, owner: usize) bool {
+    fn bootersMatch(p: *const booters.Pair, api: *const a.DriverApi2, owner: usize) bool {
         if (!p.complete or p.context == null or p.api != api or p.generation == 0) return false;
         for (&p.images, 0..) |*image, n| {
             if (image.prepared == null or image.device.prepared_plan == null or image.device.context == null or
@@ -100,7 +100,7 @@ pub const Lease = struct {
     /// descriptor, size and synchronization admission. This adds common owner
     /// identity, disjoint CPU/DMA spans and an exclusive queue lease. No new
     /// allocation, engine operation, DMA submission or invented GPU address.
-    pub fn acquire(self: *Lease, ctx: *const r4os.r4dev.DriverContext, b: *boot.Storage, i: *init.Storage, f: *security.Storage, s: *security.Storage, p: *booters.Pair) !void {
+    pub fn acquire(self: *Lease, ctx: *const r4os.r4dev.DriverContext2, b: *boot.Storage, i: *init.Storage, f: *security.Storage, s: *security.Storage, p: *booters.Pair) !void {
         if (self.self_address != 0) return error.Busy;
         if (!available(b, i, f, s, p, ctx.api)) return error.Storage;
         const allocations = allocationsFor(b, i, f, s, p);

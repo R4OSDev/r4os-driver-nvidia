@@ -18,7 +18,7 @@ pub const Storage = struct {
     frts_owner: ?*vram.Lease = null,
     frts_binding: ?vram.Binding = null,
 
-    pub fn prepare(self: *Storage, ctx: *const r4os.r4dev.DriverContext, rom: []const u8, board: *const vbios.Result, fuses: preparation.Fuses) Error!Image {
+    pub fn prepare(self: *Storage, ctx: *const r4os.r4dev.DriverContext2, rom: []const u8, board: *const vbios.Result, fuses: preparation.Fuses) Error!Image {
         if (self.frts_owner != null) return error.Busy;
         return self.prepareCommand(ctx, rom, board, fuses, .sb);
     }
@@ -26,7 +26,7 @@ pub const Storage = struct {
     /// Cold-boot FRTS uses the exact retained VRAM target, never a caller's
     /// bare offset. Failures retain the borrow with any partially allocated
     /// backing until close. This does not execute FWSEC or establish recovery.
-    pub fn prepareFrts(self: *Storage, ctx: *const r4os.r4dev.DriverContext, rom: []const u8, board: *const vbios.Result, fuses: preparation.Fuses, owner: *vram.Lease) Error!Image {
+    pub fn prepareFrts(self: *Storage, ctx: *const r4os.r4dev.DriverContext2, rom: []const u8, board: *const vbios.Result, fuses: preparation.Fuses, owner: *vram.Lease) Error!Image {
         if (self.heap != null or self.allocation.handle != 0 or self.frts_owner != null) return error.Busy;
         const backing = owner.backing orelse return error.Vram;
         if (backing.context == null or backing.context.?.api != ctx.api) return error.Vram;
@@ -42,7 +42,7 @@ pub const Storage = struct {
         return result;
     }
 
-    fn prepareCommand(self: *Storage, ctx: *const r4os.r4dev.DriverContext, rom: []const u8, board: *const vbios.Result, fuses: preparation.Fuses, command: preparation.Command) Error!Image {
+    fn prepareCommand(self: *Storage, ctx: *const r4os.r4dev.DriverContext2, rom: []const u8, board: *const vbios.Result, fuses: preparation.Fuses, command: preparation.Command) Error!Image {
         if (self.heap != null or self.allocation.handle != 0) return error.Busy;
         const selection = try preparation.select(rom, board, fuses);
         const payload = try preparation.commandBytes(command);

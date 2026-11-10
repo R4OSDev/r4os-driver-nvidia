@@ -7,13 +7,13 @@ const load = @import("fwsec_load.zig");
 const preparation = @import("fwsec_prepare.zig");
 pub const Error = load.Error || error{ Api, Pin, Map, Descriptor, Busy };
 pub const Mapping = struct {
-    context: ?r4os.r4dev.DriverContext = null,
+    context: ?r4os.r4dev.DriverContext2 = null,
     pin: a.DmaPinnedBuffer = .{},
     mapping: a.DmaMapping = .{},
     prepared_plan: ?load.Plan = null,
     execution_owner: usize = 0,
 
-    pub fn stage(self: *Mapping, ctx: *const r4os.r4dev.DriverContext, image: []const u8, prepared: *const preparation.Prepared) Error!load.Plan {
+    pub fn stage(self: *Mapping, ctx: *const r4os.r4dev.DriverContext2, image: []const u8, prepared: *const preparation.Prepared) Error!load.Plan {
         if (image.len != prepared.bytes) return error.Bounds;
         try self.stageImage(ctx, image);
         self.prepared_plan = try load.plan(prepared, self.mapping.segments[0].phys_addr, self.mapping.segments[0].bytes);
@@ -23,9 +23,9 @@ pub const Mapping = struct {
     /// Common retained Falcon image mapping for FWSEC and SEC2 Booter. The
     /// caller validates its own firmware format and assigns prepared_plan;
     /// an image mapping alone is not an executable firmware plan.
-    pub fn stageImage(self: *Mapping, ctx: *const r4os.r4dev.DriverContext, image: []const u8) Error!void {
+    pub fn stageImage(self: *Mapping, ctx: *const r4os.r4dev.DriverContext2, image: []const u8) Error!void {
         if (self.context != null) return error.Busy;
-        if (!ctx.supportsDriverApi(19, @offsetOf(a.DriverApi, "dma_unpin_buffer") + @sizeOf(usize))) return error.Api;
+        if (!(ctx.function("dma_unpin_buffer") != null)) return error.Api;
         if (image.len == 0 or image.len > a.dma_mapping_max_bytes) return error.Bounds;
         if (@intFromPtr(image.ptr) & 255 != 0) return error.Alignment;
         self.context = ctx.*;

@@ -34,12 +34,12 @@ pub const Model = struct {
     var fallback_acquire: u64 = 0;
     var fallback_device_release: u64 = 0;
     var fallback_device_lost: u64 = 0;
-    pub fn install(table: *a.DriverApi, scenario: []const u8) void {
+    pub fn install(table: *a.DriverApi2, scenario: []const u8) void {
         heap_model.install(table, scenario); query = table.gfx_memory_query.?;
         table.gfx_memory_query = memory; slots = @splat(.{}); charged = 0; released = 0; aborted = 0;
         budget = .{}; budget_configurations = 0; import_failure = 0;
     }
-    pub fn dispose(table: *a.DriverApi) void { heap_model.dispose(table); }
+    pub fn dispose(table: *a.DriverApi2) void { heap_model.dispose(table); }
     pub fn retireReset(proof: @import("gsp_reset.zig").Quiescence) void {
         std.debug.assert(proof.valid(proof.epoch) and charged == 0);
         for (&slots) |slot| std.debug.assert(!slot.live);

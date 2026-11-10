@@ -17,20 +17,20 @@ pub const Capture = struct {
     cleanup_needed: bool = false,
     shared: bar0.Lease = .{},
 
-    pub fn read(self: *Capture, ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, chip: identity.Chip, catalog: *const fwsec.Catalog) Error!preparation.Fuses {
+    pub fn read(self: *Capture, ctx: *const r4os.r4dev.DriverContext2, snapshot: *const identity.Snapshot, chip: identity.Chip, catalog: *const fwsec.Catalog) Error!preparation.Fuses {
         return self.readSelected(ctx, snapshot, chip, catalog, 0, null);
     }
 
     /// SEC2 Booter has its own one-indexed fuse ID; the prior FWSEC result
     /// must not be reused. Reads and retained MMIO cleanup use the same owner.
-    pub fn readBooter(self: *Capture, ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, chip: identity.Chip) Error!preparation.Fuses {
+    pub fn readBooter(self: *Capture, ctx: *const r4os.r4dev.DriverContext2, snapshot: *const identity.Snapshot, chip: identity.Chip) Error!preparation.Fuses {
         return self.readSelected(ctx, snapshot, chip, null, 3, null);
     }
-    pub fn readBooterShared(self: *Capture, ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, chip: identity.Chip, shared: *bar0.Owner) Error!preparation.Fuses {
+    pub fn readBooterShared(self: *Capture, ctx: *const r4os.r4dev.DriverContext2, snapshot: *const identity.Snapshot, chip: identity.Chip, shared: *bar0.Owner) Error!preparation.Fuses {
         return self.readSelected(ctx, snapshot, chip, null, 3, shared);
     }
 
-    fn readSelected(self: *Capture, ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, chip: identity.Chip, catalog: ?*const fwsec.Catalog, fixed_id: u8, shared: ?*bar0.Owner) Error!preparation.Fuses {
+    fn readSelected(self: *Capture, ctx: *const r4os.r4dev.DriverContext2, snapshot: *const identity.Snapshot, chip: identity.Chip, catalog: ?*const fwsec.Catalog, fixed_id: u8, shared: ?*bar0.Owner) Error!preparation.Fuses {
         const bar = snapshot.bars[0];
         if (identity.decision(snapshot) != .identity_words_only or !@import("generation.zig").ga102Hal(chip.id) or
             bar.bytes < 0x825000 or bar.base > std.math.maxInt(u64) - bar.bytes) return error.UnmeasuredRange;

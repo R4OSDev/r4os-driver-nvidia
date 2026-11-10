@@ -4442,10 +4442,10 @@ fn checkResourceSlots() !void {
     const Slot = struct { allocation: a.DriverHeapAllocation = .{}, serial: u64 = 0, owner: ?*u64 = null };
     const Pool = @import("gsp_resource_slots.zig").Pool(Slot);
     for (0..3) |scenario| {
-        var table: a.DriverApi = undefined;
-        table.magic = a.driver_magic; table.version = 34; table.size = @sizeOf(a.DriverApi);
+        var table: a.DriverApi2 = undefined;
+        table.magic = r4os.technical2.abi.driver_magic; table.version = 34; table.size = @sizeOf(a.DriverApi2); table.reserved = 0;
         heap.install(&table, "resource_slots"); defer heap.dispose(&table);
-        const ctx = r4os.r4dev.DriverContext.init(&table);
+        const ctx = r4os.r4dev.DriverContext2.init(&table);
         const api = ctx.heap().?;
         var pool: Pool = .{};
         var owners: [513]u64 = undefined;
@@ -4538,11 +4538,11 @@ fn checkVirtualRegistry(model: *Model) !void {
     const reset = @import("gsp_reset.zig");
     const Scenario = enum { pending_map, release_failure, invalid_allocation };
     for (std.enums.values(Scenario)) |scenario| {
-        var table: a.DriverApi = undefined;
-        table.magic = a.driver_magic; table.version = 34; table.size = @sizeOf(a.DriverApi);
+        var table: a.DriverApi2 = undefined;
+        table.magic = r4os.technical2.abi.driver_magic; table.version = 34; table.size = @sizeOf(a.DriverApi2); table.reserved = 0;
         heap.install(&table, "virtual_registry");
         defer heap.dispose(&table);
-        const ctx = r4os.r4dev.DriverContext.init(&table);
+        const ctx = r4os.r4dev.DriverContext2.init(&table);
         var registry: resources.Owner = .{};
         try registry.configure(&ctx, 7);
         var copied = registry;

@@ -14,7 +14,7 @@ const bar0 = @import("bar0.zig");
 const scanout = @import("boot_scanout.zig");
 pub const Report = struct { boot: display.Report, range: pramin.Range, sha256: [32]u8, window_original: u32, window_restored: bool, window_writes: u32 };
 pub const Capture = struct {
-    context: ?r4os.r4dev.DriverContext = null,
+    context: ?r4os.r4dev.DriverContext2 = null,
     snapshot: ?identity.Snapshot = null,
     chip: ?identity.Chip = null,
     observation: ?state.Raw = null,
@@ -48,7 +48,7 @@ pub const Capture = struct {
 
     /// Driver init/work owner, stable resident address; no IRQ or parallel
     /// native port may use this GPU while the common display hold is pending.
-    pub fn capture(self: *Capture, ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, chip: identity.Chip) !Report {
+    pub fn capture(self: *Capture, ctx: *const r4os.r4dev.DriverContext2, snapshot: *const identity.Snapshot, chip: identity.Chip) !Report {
         if (self.self_address != 0) return error.Busy;
         const bar = snapshot.bars[0];
         if (identity.decision(snapshot) != .identity_words_only or !@import("generation.zig").ga102Hal(chip.id) or

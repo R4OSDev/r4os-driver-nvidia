@@ -7,7 +7,7 @@ const clock_provider = @import("rm_clock.zig");
 // Explicit CPU-only diagnostic. No ordinary driver start allocates these
 // buffers or submits these callbacks. If the same image is reused, retained
 // identities also check real owner retirement and stale handles at restart.
-var api: ?*const a.DriverApi = null;
+var api: ?*const a.DriverApi2 = null;
 var work: u32 = 0;
 var close_work: u32 = 0;
 var close_ready: u32 = 0;
@@ -17,7 +17,7 @@ var previous_epoch: u64 = 0;
 var previous_handle: u64 = 0;
 var receiver_records: [2]a.GfxReceiverInfo = @splat(.{});
 
-pub fn start(ctx: *const r4os.r4dev.DriverContext) bool {
+pub fn start(ctx: *const r4os.r4dev.DriverContext2) bool {
     if (api != null or !provider.available() or !clock_provider.available()) return false;
     api = ctx.api;
     prepared = false;
@@ -68,7 +68,7 @@ pub fn start(ctx: *const r4os.r4dev.DriverContext) bool {
     return true;
 }
 
-pub fn shutdown(ctx: *const r4os.r4dev.DriverContext) bool {
+pub fn shutdown(ctx: *const r4os.r4dev.DriverContext2) bool {
     if (api == null) return true;
     var worker_result: i32 = 0;
     var close_result: i32 = 0;
@@ -105,7 +105,7 @@ fn runWorker(seed: usize) callconv(.c) i32 {
 }
 
 fn exercise(seed: u8) bool {
-    const ctx = r4os.r4dev.DriverContext.init(api orelse return false);
+    const ctx = r4os.r4dev.DriverContext2.init(api orelse return false);
     if (r4nv_format_probe(seed) != 0) return false;
     const native_result = r4nv_cpu_probe(seed);
     if (native_result != 0) {
@@ -143,7 +143,7 @@ fn exercise(seed: u8) bool {
 // Reuse the explicit CPU-only diagnostic to exercise the actual R4D bridge
 // on a machine without an NVIDIA GPU. These named synthetic sources never
 // claim a monitor timing, EDID, execution queue or hardware capability.
-fn exerciseReceivers(ctx: *const r4os.r4dev.DriverContext, seed: u8) bool {
+fn exerciseReceivers(ctx: *const r4os.r4dev.DriverContext2, seed: u8) bool {
     if (seed < 1 or seed > receiver_records.len) return false;
     const outputs = ctx.graphicsOutputs() orelse return false;
     if (!outputs.supportsReceivers()) return false;
@@ -162,7 +162,7 @@ fn exerciseReceivers(ctx: *const r4os.r4dev.DriverContext, seed: u8) bool {
     return outputs.replaceReceivers(&update) == a.gfx_output_error_stale;
 }
 
-fn exerciseClock(ctx: *const r4os.r4dev.DriverContext) bool {
+fn exerciseClock(ctx: *const r4os.r4dev.DriverContext2) bool {
     const before = clock_provider.snapshot() orelse return false;
     var previous = before.instant_ns;
     for (0..64) |_| {
@@ -180,7 +180,7 @@ fn exerciseClock(ctx: *const r4os.r4dev.DriverContext) bool {
 }
 
 fn closeWorker(_: usize) callconv(.c) i32 {
-    const ctx = r4os.r4dev.DriverContext.init(api orelse return -1);
+    const ctx = r4os.r4dev.DriverContext2.init(api orelse return -1);
     const heap = ctx.heap() orelse return -1;
     heap_table = heap.table;
     @atomicStore(u32, &close_ready, 1, .release);
@@ -200,12 +200,12 @@ fn closeWorker(_: usize) callconv(.c) i32 {
     return if (provider.releaseFailures() == 0) 0 else -1;
 }
 
-fn timeout(ctx: *const r4os.r4dev.DriverContext) ?u64 {
+fn timeout(ctx: *const r4os.r4dev.DriverContext2) ?u64 {
     const hz = ctx.timerFrequency();
     return if (hz == 0) null else @as(u64, hz) * 5;
 }
 
-fn finishWork(ctx: *const r4os.r4dev.DriverContext, handle: *u32, result: *i32) bool {
+fn finishWork(ctx: *const r4os.r4dev.DriverContext2, handle: *u32, result: *i32) bool {
     if (handle.* == 0) return true;
     const limit = timeout(ctx) orelse return false;
     if (ctx.completionWait(handle.*, limit, result) != 0) return false;

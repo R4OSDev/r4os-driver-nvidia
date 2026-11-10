@@ -3,7 +3,7 @@ const r4os = @import("r4os");
 const a = r4os.abi;
 const provider = @import("rm_semaphore.zig");
 const heap = @import("rm_heap.zig");
-var api: ?*const a.DriverApi = null;
+var api: ?*const a.DriverApi2 = null;
 var semaphores: ?r4os.r4dev.DriverSemaphoreContext = null;
 var threads: ?r4os.r4dev.DriverThreadContext = null;
 var pointer: ?*anyopaque = null;
@@ -16,7 +16,7 @@ var baseline_acquires: u32 = 0;
 
 // Explicit diagnostic only. Executes the actual private Zig C-ABI provider
 // against R4D services; native_probe covers the linked original-header C path.
-pub fn start(ctx: *const r4os.r4dev.DriverContext) bool {
+pub fn start(ctx: *const r4os.r4dev.DriverContext2) bool {
     if (api != null or !provider.available()) return false;
     semaphores = ctx.semaphores() orelse return false;
     threads = ctx.threads() orelse return false;
@@ -51,7 +51,7 @@ pub fn start(ctx: *const r4os.r4dev.DriverContext) bool {
     ctx.logInfo("NVIDIA runtime-check: private-semaphores=OK callbacks=4 contention=128 timeout=bounded cpu-boxes=freed provider=zig");
     return true;
 }
-pub fn prepareClose(ctx: *const r4os.r4dev.DriverContext) bool {
+pub fn prepareClose(ctx: *const r4os.r4dev.DriverContext2) bool {
     var before: a.DriverSemaphoreStats = .{};
     if (semaphores.?.stats(&before) != 0) return failed(ctx, "close-stats");
     baseline_acquires = before.active_acquires;
@@ -65,7 +65,7 @@ pub fn prepareClose(ctx: *const r4os.r4dev.DriverContext) bool {
     close_prepared = true;
     return true;
 }
-pub fn shutdown(ctx: *const r4os.r4dev.DriverContext) bool {
+pub fn shutdown(ctx: *const r4os.r4dev.DriverContext2) bool {
     const t = threads orelse return true;
     var correct = true;
     if (close_prepared) {
@@ -117,7 +117,7 @@ fn waitForClose(_: usize) callconv(.c) i32 {
     var stats: a.DriverSemaphoreStats = .{};
     return if (semaphores.?.stats(&stats) == 0 and stats.closing == 1) 0 else -2;
 }
-fn awaitQueued(ctx: *const r4os.r4dev.DriverContext) bool {
+fn awaitQueued(ctx: *const r4os.r4dev.DriverContext2) bool {
     const began = ctx.tickCount();
     while (ctx.tickCount() -% began < timeout(ctx)) {
         var stats: a.DriverSemaphoreStats = .{};
@@ -132,7 +132,7 @@ fn freePointer() bool {
     pointer = null;
     return true;
 }
-fn retire(ctx: *const r4os.r4dev.DriverContext, handle: *u64) bool {
+fn retire(ctx: *const r4os.r4dev.DriverContext2, handle: *u64) bool {
     const began = ctx.tickCount();
     while (true) {
         const code = threads.?.release(handle.*);
@@ -144,10 +144,10 @@ fn retire(ctx: *const r4os.r4dev.DriverContext, handle: *u64) bool {
         ctx.waitTicks(1);
     }
 }
-fn timeout(ctx: *const r4os.r4dev.DriverContext) u64 {
+fn timeout(ctx: *const r4os.r4dev.DriverContext2) u64 {
     return @as(u64, @max(ctx.timerFrequency(), 1)) * 5;
 }
-fn failed(ctx: *const r4os.r4dev.DriverContext, phase: []const u8) bool {
+fn failed(ctx: *const r4os.r4dev.DriverContext2, phase: []const u8) bool {
     var message: [160]u8 = undefined;
     const line = std.fmt.bufPrintZ(&message, "NVIDIA runtime-check: FAILED phase=private-semaphore-{s}", .{phase}) catch unreachable;
     ctx.logError(line.ptr);

@@ -43,7 +43,7 @@ pub const Owner = struct {
     pending_valid: bool = false,
     failure: ?Error = null,
 
-    pub fn configure(self: *Owner, ctx: *const r4os.r4dev.DriverContext, epoch: u64) Error!void {
+    pub fn configure(self: *Owner, ctx: *const r4os.r4dev.DriverContext2, epoch: u64) Error!void {
         if (epoch == 0) return error.Stale;
         if (self.self_address != 0) {
             try self.stable();

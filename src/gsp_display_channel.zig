@@ -95,7 +95,7 @@ pub const Owner = struct {
     config_stamp: ?wire.Config = null,
     reservation: names.Children,
     namespace_live: bool = true,
-    ctx: r4os.r4dev.DriverContext,
+    ctx: r4os.r4dev.DriverContext2,
     adapter: u32,
     backing: storage.Storage = .{},
     ring: push.Ring = .{},
@@ -117,7 +117,7 @@ pub const Owner = struct {
     request: [wire.max_bytes]u8 = undefined,
     deadline: u64,
 
-    pub fn init(token: *boot.Handoff, ctx: r4os.r4dev.DriverContext, adapter: u32, parent: *engine.Owner, kind: wire.Kind, index: u32, deadline: u64) Error!Owner {
+    pub fn init(token: *boot.Handoff, ctx: r4os.r4dev.DriverContext2, adapter: u32, parent: *engine.Owner, kind: wire.Kind, index: u32, deadline: u64) Error!Owner {
         const root = parent.info() orelse return error.State;
         const parent_slot = try wire.slot(kind, index);
         if (parent.state != .handed_off or token.session != parent.exchange.session or token.claimed or adapter == 0 or !root.instance_bound or

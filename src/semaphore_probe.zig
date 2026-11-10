@@ -1,7 +1,7 @@
 const std = @import("std");
 const r4os = @import("r4os");
 const a = r4os.abi;
-var api: ?*const a.DriverApi = null;
+var api: ?*const a.DriverApi2 = null;
 var service: ?r4os.r4dev.DriverSemaphoreContext = null;
 var threads: ?r4os.r4dev.DriverThreadContext = null;
 var gate: u64 = 0;
@@ -15,7 +15,7 @@ var close_wait = false;
 
 // Runs only in the explicit offline runtime-check. These are real R4D API
 // calls, real Task waits and real permit handoffs, never a mock scheduler.
-pub fn start(ctx: *const r4os.r4dev.DriverContext) bool {
+pub fn start(ctx: *const r4os.r4dev.DriverContext2) bool {
     if (api != null) return false;
     const semaphore_service = ctx.semaphores() orelse return false;
     const thread_service = ctx.threads() orelse return false;
@@ -77,7 +77,7 @@ pub fn start(ctx: *const r4os.r4dev.DriverContext) bool {
     ctx.logInfo("NVIDIA runtime-check: semaphores=OK fifo=3 contention=256 timeout=bounded overflow=retained stale=verified");
     return true;
 }
-pub fn prepareClose(ctx: *const r4os.r4dev.DriverContext) bool {
+pub fn prepareClose(ctx: *const r4os.r4dev.DriverContext2) bool {
     const t = threads orelse return false;
     if (t.start(closeWait, 0, a.driver_thread_flag_parallel, &handles[0]) != 0 or !awaitQueued(ctx, 1)) return failed(ctx, "close-enrollment");
     // A cooperative stop must leave this uninterruptible semaphore wait
@@ -89,7 +89,7 @@ pub fn prepareClose(ctx: *const r4os.r4dev.DriverContext) bool {
     close_wait = true;
     return true;
 }
-pub fn shutdown(ctx: *const r4os.r4dev.DriverContext) bool {
+pub fn shutdown(ctx: *const r4os.r4dev.DriverContext2) bool {
     const sem = service orelse return true;
     const t = threads orelse return true;
     var correct = true;
@@ -132,13 +132,13 @@ pub fn shutdown(ctx: *const r4os.r4dev.DriverContext) bool {
     return true;
 }
 fn fifoWait(index: usize) callconv(.c) i32 {
-    const ctx = r4os.r4dev.DriverContext.init(api orelse return -1);
+    const ctx = r4os.r4dev.DriverContext2.init(api orelse return -1);
     if (service.?.acquire(gate, timeout(&ctx)) != 0) return -2;
     if (@atomicRmw(u32, &fifo_next, .Add, 1, .acq_rel) != index) return -3;
     return 79 + @as(i32, @intCast(index));
 }
 fn contend(_: usize) callconv(.c) i32 {
-    const ctx = r4os.r4dev.DriverContext.init(api orelse return -1);
+    const ctx = r4os.r4dev.DriverContext2.init(api orelse return -1);
     const sem = service.?;
     for (0..64) |_| {
         const acquired = sem.acquire(mutex, timeout(&ctx));
@@ -163,7 +163,7 @@ fn closeWait(_: usize) callconv(.c) i32 {
     if (service.?.stats(&stats) != 0 or stats.closing != 1) return -2;
     return 0;
 }
-fn awaitQueued(ctx: *const r4os.r4dev.DriverContext, count: u32) bool {
+fn awaitQueued(ctx: *const r4os.r4dev.DriverContext2, count: u32) bool {
     const began = ctx.tickCount();
     while (ctx.tickCount() -% began < timeout(ctx)) {
         var value: a.DriverSemaphoreStatus = .{};
@@ -173,7 +173,7 @@ fn awaitQueued(ctx: *const r4os.r4dev.DriverContext, count: u32) bool {
     }
     return false;
 }
-fn retire(ctx: *const r4os.r4dev.DriverContext, handle: *u64) bool {
+fn retire(ctx: *const r4os.r4dev.DriverContext2, handle: *u64) bool {
     const began = ctx.tickCount();
     while (true) {
         const result = threads.?.release(handle.*);
@@ -185,10 +185,10 @@ fn retire(ctx: *const r4os.r4dev.DriverContext, handle: *u64) bool {
         ctx.waitTicks(1);
     }
 }
-fn timeout(ctx: *const r4os.r4dev.DriverContext) u64 {
+fn timeout(ctx: *const r4os.r4dev.DriverContext2) u64 {
     return @as(u64, @max(ctx.timerFrequency(), 1)) * 5;
 }
-fn failed(ctx: *const r4os.r4dev.DriverContext, phase: []const u8) bool {
+fn failed(ctx: *const r4os.r4dev.DriverContext2, phase: []const u8) bool {
     var message: [160]u8 = undefined;
     const line = std.fmt.bufPrintZ(&message, "NVIDIA runtime-check: FAILED phase=semaphore-{s}", .{phase}) catch unreachable;
     ctx.logError(line.ptr);

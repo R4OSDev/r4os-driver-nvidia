@@ -39,7 +39,7 @@ pub const Report = struct {
     bounced: usize,
 };
 pub const Storage = struct {
-    context: ?r4os.r4dev.DriverContext = null,
+    context: ?r4os.r4dev.DriverContext2 = null,
     heap: ?r4os.r4dev.DriverHeapContext = null,
     clock: ?r4os.r4dev.DriverResourceContext = null,
     allocation: a.DriverHeapAllocation = .{},
@@ -64,11 +64,11 @@ pub const Storage = struct {
     /// Other allocations remain borrowed and owned by the caller through this
     /// call. Their spans only exclude aliasing; successful preparation confers
     /// no ownership of those external allocations or of GPU execution state.
-    pub fn stage(self: *Storage, ctx: *const r4os.r4dev.DriverContext, chip_id: u16, excluded: []const init.Span, timeout_ns: u64) Error!Report {
+    pub fn stage(self: *Storage, ctx: *const r4os.r4dev.DriverContext2, chip_id: u16, excluded: []const init.Span, timeout_ns: u64) Error!Report {
         if (self.context != null) return error.Busy;
         if (!@import("generation.zig").ga102Hal(chip_id)) return error.Profile;
         if (excluded.len > init.max_excluded) return error.Segments;
-        if (!ctx.supportsDriverApi(19, @offsetOf(a.DriverApi, "dma_unpin_buffer") + @sizeOf(usize))) return error.Api;
+        if (!(ctx.function("dma_unpin_buffer") != null)) return error.Api;
         self.context = ctx.*;
         self.clock = ctx.resources() orelse return error.Api;
         self.last_clock = self.clock.?.nowNs();
@@ -152,7 +152,7 @@ pub const Storage = struct {
         if (self.queue_epoch != 0 or self.device_access or self.execution_owner != 0) return error.Busy;
         if (self.report == null or self.piece_count != max_mappings or self.allocation.handle == 0) return error.QueueClosed;
         const ctx = self.context orelse return error.QueueClosed;
-        if (!ctx.supportsDriverApi(34, @offsetOf(a.DriverApi, "dma_sync_range_for_cpu") + @sizeOf(usize)) or
+        if (!(ctx.function("dma_sync_range_for_cpu") != null) or
             ctx.api.dma_sync_range_for_device == null or ctx.api.dma_sync_range_for_cpu == null) return error.Api;
         const mapping = &self.pieces[6].mapping;
         if (mapping.handle == 0) return error.QueueClosed;

@@ -251,15 +251,15 @@ pub const Port = struct {
 
     /// Stable address, serialized init/Driver Work owner; not an IRQ callback
     /// or a dedicated task. Failure retains any partially returned mapping.
-    pub fn open(self: *Port, ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, boot0: u32, boot1: u32, run: Run, owner: Owner) !void {
+    pub fn open(self: *Port, ctx: *const r4os.r4dev.DriverContext2, snapshot: *const identity.Snapshot, boot0: u32, boot1: u32, run: Run, owner: Owner) !void {
         return self.openUsing(ctx, snapshot, boot0, boot1, run, owner, null);
     }
     /// Borrow the capture's existing BAR0 window. Close retains this borrow
     /// through ambiguous effects; only the mapping owner can unmap it.
-    pub fn openShared(self: *Port, ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, boot0: u32, boot1: u32, run: Run, owner: Owner, shared: *bar0.Owner) !void {
+    pub fn openShared(self: *Port, ctx: *const r4os.r4dev.DriverContext2, snapshot: *const identity.Snapshot, boot0: u32, boot1: u32, run: Run, owner: Owner, shared: *bar0.Owner) !void {
         return self.openUsing(ctx, snapshot, boot0, boot1, run, owner, shared);
     }
-    fn openUsing(self: *Port, ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, boot0: u32, boot1: u32, run: Run, owner: Owner, shared: ?*bar0.Owner) !void {
+    fn openUsing(self: *Port, ctx: *const r4os.r4dev.DriverContext2, snapshot: *const identity.Snapshot, boot0: u32, boot1: u32, run: Run, owner: Owner, shared: ?*bar0.Owner) !void {
         if (self.self_address != 0) return error.Busy;
         const chip = identity.chip(boot0, boot1) orelse return error.Profile;
         const bar = snapshot.bars[0];

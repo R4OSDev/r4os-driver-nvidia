@@ -24,7 +24,7 @@ pub const Node = struct {
 };
 pub const Owner = struct {
     self_address: usize = 0,
-    ctx: ?r4os.r4dev.DriverContext = null,
+    ctx: ?r4os.r4dev.DriverContext2 = null,
     heap: ?r4os.r4dev.DriverHeapContext = null,
     adapter: u32 = 0,
     epoch: u64 = 0,
@@ -38,7 +38,7 @@ pub const Owner = struct {
     last_status: i32 = ok,
     last_backing_step: []const u8 = "none",
 
-    pub fn configure(self: *Owner, ctx: *const r4os.r4dev.DriverContext, adapter: u32, epoch: u64) vm.Error!void {
+    pub fn configure(self: *Owner, ctx: *const r4os.r4dev.DriverContext2, adapter: u32, epoch: u64) vm.Error!void {
         if (self.self_address != 0 or adapter == 0 or epoch == 0) return error.State;
         const heap = ctx.heap() orelse return error.Memory;
         self.* = .{ .self_address = @intFromPtr(self), .ctx = ctx.*, .heap = heap, .adapter = adapter, .epoch = epoch };

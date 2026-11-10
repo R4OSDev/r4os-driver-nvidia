@@ -22,7 +22,7 @@ pub const Report = struct {
     bounced: usize,
 };
 pub const Storage = struct {
-    context: ?r4os.r4dev.DriverContext = null,
+    context: ?r4os.r4dev.DriverContext2 = null,
     heap: ?r4os.r4dev.DriverHeapContext = null,
     clock: ?r4os.r4dev.DriverResourceContext = null,
     allocation: a.DriverHeapAllocation = .{},
@@ -49,11 +49,11 @@ pub const Storage = struct {
     /// Device mapping initially synchronizes zeroed backing. After the radix
     /// entries and image are written, EVERY mapping is synchronized again,
     /// including any bounce backing, before a usable root is published.
-    pub fn stage(self: *Storage, ctx: *const r4os.r4dev.DriverContext, image: []const u8, timeout_ns: u64) Error!Report {
+    pub fn stage(self: *Storage, ctx: *const r4os.r4dev.DriverContext2, image: []const u8, timeout_ns: u64) Error!Report {
         if (self.context != null) return error.Busy;
         const need = try radix.requirements(image.len);
         if (need.allocation_bytes > @as(usize, a.dma_mapping_max_bytes) * max_mappings) return error.Capacity;
-        if (!ctx.supportsDriverApi(19, @offsetOf(a.DriverApi, "dma_unpin_buffer") + @sizeOf(usize))) return error.Api;
+        if (!(ctx.function("dma_unpin_buffer") != null)) return error.Api;
         self.context = ctx.*;
         self.clock = ctx.resources() orelse return error.Api;
         self.last_clock = self.clock.?.nowNs();

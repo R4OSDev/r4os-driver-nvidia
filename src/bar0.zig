@@ -14,7 +14,7 @@ pub const View = struct { cpu_address: u64, physical_address: u64, byte_length: 
 const Borrower = struct { address: usize = 0, serial: u64 = 0 };
 pub const Owner = struct {
     self_address: usize = 0,
-    api: ?*const a.DriverApi = null,
+    api: ?*const a.DriverApi2 = null,
     memory: ?r4os.driver_memory.Context = null,
     pci: identity.Pci = .{},
     bar: identity.Bar = .{},
@@ -28,7 +28,7 @@ pub const Owner = struct {
     cleanup_needed: bool = false,
     last_status: i32 = 0,
 
-    pub fn open(self: *Owner, ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, chip: identity.Chip) Error!void {
+    pub fn open(self: *Owner, ctx: *const r4os.r4dev.DriverContext2, snapshot: *const identity.Snapshot, chip: identity.Chip) Error!void {
         if (self.self_address != 0) return error.Busy;
         const bar = snapshot.bars[0];
         if (identity.decision(snapshot) != .identity_words_only or !@import("generation.zig").ga102Hal(chip.id) or
@@ -49,7 +49,7 @@ pub const Owner = struct {
         return self.self_address != 0 and self.self_address == @intFromPtr(self) and self.ready and
             self.api != null and self.memory != null and std.meta.eql(self.window, self.stamp);
     }
-    fn matches(self: *const Owner, ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, chip: identity.Chip) bool {
+    fn matches(self: *const Owner, ctx: *const r4os.r4dev.DriverContext2, snapshot: *const identity.Snapshot, chip: identity.Chip) bool {
         return self.valid() and self.api == ctx.api and identity.decision(snapshot) == .identity_words_only and
             std.meta.eql(self.pci, snapshot.pci) and std.meta.eql(self.bar, snapshot.bars[0]) and
             chip.id == self.chip_id and chip.revision == self.chip_revision;
@@ -89,7 +89,7 @@ pub const Lease = struct {
     stamp: a.GfxMmioWindow = .{},
 
     /// No allocation or kernel call after publishing either owner address.
-    pub fn acquire(self: *Lease, owner: *Owner, ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, chip: identity.Chip) Error!void {
+    pub fn acquire(self: *Lease, owner: *Owner, ctx: *const r4os.r4dev.DriverContext2, snapshot: *const identity.Snapshot, chip: identity.Chip) Error!void {
         if (self.self_address != 0) return error.Busy;
         if (!owner.matches(ctx, snapshot, chip)) return error.Stale;
         if (owner.serial == std.math.maxInt(u64)) return error.Exhausted;

@@ -23,7 +23,7 @@ pub const Capture = struct {
     cleanup_needed: bool = false,
     complete: bool = false,
 
-    pub fn read(self: *Capture, ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, chip: identity.Chip) Error![]const u8 {
+    pub fn read(self: *Capture, ctx: *const r4os.r4dev.DriverContext2, snapshot: *const identity.Snapshot, chip: identity.Chip) Error![]const u8 {
         if (!admitted(snapshot, chip)) return error.UnmeasuredRange;
         if (self.heap != null or self.cleanup_needed) return error.Memory;
         const clock = ctx.resources() orelse return error.Api;

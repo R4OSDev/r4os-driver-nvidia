@@ -7,7 +7,7 @@ const storage = @import("gsp_control_storage.zig");
 const power = @import("gsp_power_memory_test.zig").Model;
 const host_pages = @import("gsp_host_vm_memory_test.zig").Model;
 pub const Model = struct {
-    pub var original: a.DriverApi = undefined;
+    pub var original: a.DriverApi2 = undefined;
     pub var data: [storage.bytes]u8 align(4096) = undefined;
     pub var active = false;
     pub var cpu_mapped = false;
@@ -35,7 +35,7 @@ pub const Model = struct {
         for (&result, 0..) |*page, i| page.* = if (i < prefix.len) prefix[i] else 0xa000000000 + i * 8192;
         break :blk result;
     };
-    pub fn install(api: *a.DriverApi) void {
+    pub fn install(api: *a.DriverApi2) void {
         original = api.*;
         api.gfx_memory_query = memory;
     }

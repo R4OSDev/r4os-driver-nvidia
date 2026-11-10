@@ -18,7 +18,7 @@ pub const Model = struct {
         return .{ .width = 37, .height = 43, .byte_length = data.len, .alignment = 4096, .format = a.gfx_buffer_format_argb8888,
             .plane_count = 1, .plane_pitches = .{160,0,0,0}, .usage = a.gfx_buffer_usage_cpu_read | a.gfx_buffer_usage_cpu_write | a.gfx_buffer_usage_transfer_source };
     }
-    pub fn install(table: *a.DriverApi) void {
+    pub fn install(table: *a.DriverApi2) void {
         std.debug.assert(table.gfx_memory_query.?(&original) == a.gfx_buffer_result_ok);
         table.gfx_memory_query = query;
         imported = false; mapped = false; producer = true; released = 0; reject_map = false;

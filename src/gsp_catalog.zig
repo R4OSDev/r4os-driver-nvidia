@@ -31,7 +31,7 @@ const a = r4os.abi;
 const outputs = @import("gsp_outputs.zig");
 const topology = @import("gsp_topology.zig");
 const receiver = @import("gsp_receiver.zig");
-const Context = @TypeOf(@as(r4os.r4dev.DriverContext, undefined).graphicsOutputs().?);
+const Context = @TypeOf(@as(r4os.r4dev.DriverContext2, undefined).graphicsOutputs().?);
 
 pub const Owner = struct {
     context: ?Context = null,
@@ -42,7 +42,7 @@ pub const Owner = struct {
     last_status: i32 = 0,
     records: [a.gfx_receiver_max_outputs]a.GfxReceiverInfo = @splat(.{}),
 
-    pub fn open(self: *Owner, ctx: *const r4os.r4dev.DriverContext, adapter: u32) !void {
+    pub fn open(self: *Owner, ctx: *const r4os.r4dev.DriverContext2, adapter: u32) !void {
         if (self.binding.generation != 0) return error.Busy;
         const context = ctx.graphicsOutputs() orelse return error.Api;
         if (!context.supportsReceivers()) return error.Api;

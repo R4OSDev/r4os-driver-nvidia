@@ -7,7 +7,7 @@ const a = r4os.abi;
 const runtime = @import("gsp_runtime.zig");
 const capture = @import("boot_vram.zig");
 const catalog = @import("gsp_catalog.zig");
-const Outputs = @TypeOf(@as(r4os.r4dev.DriverContext, undefined).graphicsOutputs().?);
+const Outputs = @TypeOf(@as(r4os.r4dev.DriverContext2, undefined).graphicsOutputs().?);
 
 pub fn frameCount(option: []const u8) !u8 {
     if (option.len == 0 or std.mem.eql(u8, option, "2")) return 2;
@@ -26,7 +26,7 @@ pub const Phase = enum {
 
 pub const Owner = struct {
     self_address: usize = 0,
-    ctx: ?r4os.r4dev.DriverContext = null,
+    ctx: ?r4os.r4dev.DriverContext2 = null,
     running: ?*runtime.Owner = null,
     captured: ?*capture.Capture = null,
     memory: ?r4os.driver_memory.Context = null,
@@ -90,7 +90,7 @@ pub const Owner = struct {
 
     /// Explicit mode=native only. Check the common handoff API before the
     /// device worker can execute the already prepared firmware operations.
-    pub fn request(self: *Owner, ctx: *const r4os.r4dev.DriverContext, running: *runtime.Owner, captured: *capture.Capture) !void {
+    pub fn request(self: *Owner, ctx: *const r4os.r4dev.DriverContext2, running: *runtime.Owner, captured: *capture.Capture) !void {
         if (self.self_address != 0) return error.Busy;
         const display = ctx.graphicsDisplay() orelse return error.Api;
         const outputs = ctx.graphicsOutputs() orelse return error.Api;
@@ -129,7 +129,7 @@ pub const Owner = struct {
     }
     /// Reuse the original captured CPU image and discovered device policy,
     /// while the common bridge retains the independently identified hold.
-    pub fn requestAfterReset(self: *Owner, ctx: *const r4os.r4dev.DriverContext, running: *runtime.Owner,
+    pub fn requestAfterReset(self: *Owner, ctx: *const r4os.r4dev.DriverContext2, running: *runtime.Owner,
         captured: *capture.Capture, generation: u64, route: ?runtime.output_route.RestoreIdentity) !void
     {
         if (generation == 0 or !captured.boot.native_adopted or captured.boot.native_generation != generation) return error.Stale;

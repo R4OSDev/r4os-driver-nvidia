@@ -13,16 +13,16 @@ pub const Capture = struct {
     cleanup_needed: bool = false,
     shared: bar0.Lease = .{},
 
-    pub fn read(self: *Capture, ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, chip: identity.Chip) Error!state.Raw {
+    pub fn read(self: *Capture, ctx: *const r4os.r4dev.DriverContext2, snapshot: *const identity.Snapshot, chip: identity.Chip) Error!state.Raw {
         return self.readUsing(ctx, snapshot, chip, null);
     }
 
     /// One real BAR0 borrow covers every observed page. No second MMIO alias
     /// or unowned copied kernel handle; failures retain this borrow until close.
-    pub fn readShared(self: *Capture, ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, chip: identity.Chip, shared: *bar0.Owner) Error!state.Raw {
+    pub fn readShared(self: *Capture, ctx: *const r4os.r4dev.DriverContext2, snapshot: *const identity.Snapshot, chip: identity.Chip, shared: *bar0.Owner) Error!state.Raw {
         return self.readUsing(ctx, snapshot, chip, shared);
     }
-    fn readUsing(self: *Capture, ctx: *const r4os.r4dev.DriverContext, snapshot: *const identity.Snapshot, chip: identity.Chip, shared: ?*bar0.Owner) Error!state.Raw {
+    fn readUsing(self: *Capture, ctx: *const r4os.r4dev.DriverContext2, snapshot: *const identity.Snapshot, chip: identity.Chip, shared: ?*bar0.Owner) Error!state.Raw {
         const bar = snapshot.bars[0];
         if (identity.decision(snapshot) != .identity_words_only or !@import("generation.zig").ga102Hal(chip.id) or
             bar.bytes < 0x821000 or bar.base > std.math.maxInt(u64) - bar.bytes) return error.UnmeasuredRange;

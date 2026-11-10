@@ -211,11 +211,11 @@ fn rangeCpu(mapping: *const a.DmaMapping, offset: u32, bytes: u32) callconv(.c) 
 fn rangeDevice(mapping: *const a.DmaMapping, offset: u32, bytes: u32) callconv(.c) i32 {
     return rangeSync(mapping, offset, bytes, false);
 }
-fn apiTable() a.DriverApi {
-    var table: a.DriverApi = undefined;
-    table.magic = a.driver_magic;
+fn apiTable() a.DriverApi2 {
+    var table: a.DriverApi2 = undefined;
+    table.magic = r4os.technical2.abi.driver_magic;
     table.version = 34;
-    table.size = @sizeOf(a.DriverApi);
+    table.size = @sizeOf(a.DriverApi2); table.reserved = 0;
     table.heap_query = heap;
     table.resource_query = resources;
     table.dma_pin_buffer = pin;
@@ -229,7 +229,7 @@ fn apiTable() a.DriverApi {
 }
 
 // The real native port reads/writes aligned host memory through the ordinary
-// DriverContext facade. This fixture supplies no hardware readiness proof.
+// DriverContext2 facade. This fixture supplies no hardware readiness proof.
 const QueueNative = struct {
     const native = @import("gsp_sequencer_port.zig");
     const run = @import("gsp_run_memory.zig");
@@ -369,7 +369,7 @@ const QueueNative = struct {
 };
 var queue_native: *QueueNative = undefined;
 
-fn checkNativeTeardown(memory: *@import("gsp_run_memory.zig").Lease, ctx: *const r4os.r4dev.DriverContext, table: *a.DriverApi) !void {
+fn checkNativeTeardown(memory: *@import("gsp_run_memory.zig").Lease, ctx: *const r4os.r4dev.DriverContext2, table: *a.DriverApi2) !void {
     const teardown = @import("gsp_teardown.zig");
     const native = QueueNative.native;
     const core = @import("gsp_core.zig");
@@ -515,7 +515,7 @@ fn checkNativeTeardown(memory: *@import("gsp_run_memory.zig").Lease, ctx: *const
     clock = 100;
 }
 
-fn checkNativeQueue(memory: *@import("gsp_run_memory.zig").Lease, ctx: *const r4os.r4dev.DriverContext, table: *a.DriverApi) !void {
+fn checkNativeQueue(memory: *@import("gsp_run_memory.zig").Lease, ctx: *const r4os.r4dev.DriverContext2, table: *a.DriverApi2) !void {
     const native = QueueNative.native;
     const identity = @import("identity.zig");
     const words = try t.allocator.alignedAlloc(u32, comptime std.mem.Alignment.fromByteUnits(4096), 0x842000 / 4);
@@ -548,7 +548,7 @@ fn checkNativeQueue(memory: *@import("gsp_run_memory.zig").Lease, ctx: *const r4
         const run: native.Run = .{ .epoch = epoch, .deadline_ns = 1000, .resume_args = if (case == .runtime_seq_resume) .{ .libos_dma = address(0), .app_version = 7 } else null };
         if (case == .success) {
             var other = table.*;
-            const wrong_ctx = r4os.r4dev.DriverContext.init(&other);
+            const wrong_ctx = r4os.r4dev.DriverContext2.init(&other);
             try t.expectError(error.Stale, port.open(&wrong_ctx, &snapshot, words[0], 0, run, fixture.owner()));
             var wrong_run = run;
             wrong_run.epoch += 1;
@@ -1027,7 +1027,7 @@ fn checkCompleteRun(chip: u16) !void {
     const booters = @import("booter_storage.zig");
     var table = apiTable();
     var other_table = apiTable();
-    const ctx = r4os.r4dev.DriverContext.init(&table);
+    const ctx = r4os.r4dev.DriverContext2.init(&table);
     fault = .none;
     closing = false;
     clock = 100;
@@ -1142,7 +1142,7 @@ fn checkCompleteRun(chip: u16) !void {
     s.complete = false;
     try t.expectError(error.Storage, lease.acquire(&ctx, &b, &storage, &f, &s, &p));
     s.complete = true;
-    s.device.context = r4os.r4dev.DriverContext.init(&other_table);
+    s.device.context = r4os.r4dev.DriverContext2.init(&other_table);
     try t.expectError(error.Storage, lease.acquire(&ctx, &b, &storage, &f, &s, &p));
     s.device.context = ctx;
     s.device.mapping.segments[0].phys_addr = f.device.mapping.segments[0].phys_addr;
@@ -1151,10 +1151,10 @@ fn checkCompleteRun(chip: u16) !void {
     s.device.mapping.pin_handle = f.device.mapping.pin_handle;
     try t.expectError(error.Mapping, lease.acquire(&ctx, &b, &storage, &f, &s, &p));
     s.device.mapping.pin_handle = 306;
-    f.device.context = r4os.r4dev.DriverContext.init(&other_table);
+    f.device.context = r4os.r4dev.DriverContext2.init(&other_table);
     try t.expectError(error.Storage, lease.acquire(&ctx, &b, &storage, &f, &s, &p));
     f.device.context = ctx;
-    p.images[1].device.context = r4os.r4dev.DriverContext.init(&other_table);
+    p.images[1].device.context = r4os.r4dev.DriverContext2.init(&other_table);
     try t.expectError(error.Storage, lease.acquire(&ctx, &b, &storage, &f, &s, &p));
     p.images[1].device.context = ctx;
     p.complete = false;
@@ -1263,7 +1263,7 @@ fn checkCompleteRun(chip: u16) !void {
 
 test "firmware CPU storage GSP queue lease binds range I/O and retains all backing before device quiescence" {
     var table = apiTable();
-    const ctx = r4os.r4dev.DriverContext.init(&table);
+    const ctx = r4os.r4dev.DriverContext2.init(&table);
     shadow = try t.allocator.alloc(u8, init.output_bytes);
     defer t.allocator.free(shadow);
     const tx = try t.allocator.create([65536]u8);
@@ -1281,12 +1281,12 @@ test "firmware CPU storage GSP queue lease binds range I/O and retains all backi
         range_failure = 0;
         var storage: Storage = .{};
         _ = try storage.stage(&ctx, 0x176, &.{}, 1000);
-        table.version = 33;
+        table.version = 0; // Older than the first supported API2 header.
         try t.expectError(error.Api, storage.borrowQueues());
-        table.version = 34;
+        table.version = r4os.technical2.abi.driver_version;
         table.size = 640;
         try t.expectError(error.Api, storage.borrowQueues());
-        table.size = @sizeOf(a.DriverApi);
+        table.size = @sizeOf(a.DriverApi2); table.reserved = 0;
         table.dma_sync_range_for_cpu = null;
         try t.expectError(error.Api, storage.borrowQueues());
         table.dma_sync_range_for_cpu = rangeCpu;
@@ -1383,7 +1383,7 @@ test "firmware CPU storage GSP queue lease binds range I/O and retains all backi
 
 test "firmware CPU storage GSP init owns bidirectional logs and queues with exact partial cleanup" {
     var table = apiTable();
-    const ctx = r4os.r4dev.DriverContext.init(&table);
+    const ctx = r4os.r4dev.DriverContext2.init(&table);
     shadow = try t.allocator.alloc(u8, init.output_bytes);
     defer t.allocator.free(shadow);
     const excluded = [_]init.Span{.{ .address = 0x400000000, .bytes = 4096 }};
@@ -1593,8 +1593,8 @@ const CatalogModel = struct {
     }
 };
 
-fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r4os.r4dev.DriverContext,
-    table: *a.DriverApi, capture: *@import("boot_vram.zig").Capture, held: *@import("boot_vram_lease.zig").Lease, chip_id: u16) !void
+fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r4os.r4dev.DriverContext2,
+    table: *a.DriverApi2, capture: *@import("boot_vram.zig").Capture, held: *@import("boot_vram_lease.zig").Lease, chip_id: u16) !void
 {
     const driver = @import("gsp_device.zig");
     const core = @import("gsp_core.zig");
@@ -1772,10 +1772,10 @@ fn checkDeviceStartup(lease: *@import("gsp_run_memory.zig").Lease, ctx: *const r
         capture.snapshot.?.interrupt_pin = 1;
         if (reset_capable) ResetDeviceModel.install(table, words, &capture.snapshot.?);
         if (case == .old_api) {
-            table.version = a.driver_api_thread_work_version - 1;
+            table.magic = a.driver_magic; // A legacy outer header is not API2.
             try t.expectError(error.Api, target.open(ctx, capture, held, lease, &reader, null));
             try t.expect(target.self_address == 0 and !lease.retained and capture.firmware_owner == 0);
-            table.version += 1;
+            table.magic = r4os.technical2.abi.driver_magic;
             CatalogModel.legacy = true;
             try t.expectError(error.Api, target.open(ctx, capture, held, lease, &reader, null));
             try t.expect(!target.port.effects_possible and !CatalogModel.active and !lease.retained);
@@ -2377,7 +2377,7 @@ const ResetDeviceModel = struct {
     var triggers: u32 = 0;
     var writes: u32 = 0;
     var effect: ?*const fn () void = null;
-    fn install(table: *a.DriverApi, backing_words: []u32, snapshot: *const @import("identity.zig").Snapshot) void {
+    fn install(table: *a.DriverApi2, backing_words: []u32, snapshot: *const @import("identity.zig").Snapshot) void {
         words = backing_words; triggered_at = 0; triggers = 0; writes = 0; effect = null;
         const config = words[reset.reg.config_base / 4 ..][0..1024];
         @memset(config, 0);
@@ -2772,7 +2772,7 @@ fn devicePostMasks(target: *@import("gsp_device.zig").Device, dp: bool, foreign:
     try nativeEvent(&target.session.?, 0x1003, bytes[0..if (dp) @as(usize, 36) else 40]);
 }
 
-fn checkDeviceHostMmu(target: *@import("gsp_device.zig").Device, words: []u32, table: *a.DriverApi) !void {
+fn checkDeviceHostMmu(target: *@import("gsp_device.zig").Device, words: []u32, table: *a.DriverApi2) !void {
     const pages = @import("gsp_host_vm_memory_test.zig").Model;
     const tlb = @import("gsp_host_tlb.zig");
     const vm_wire = @import("gsp_host_vm_wire.zig");
@@ -3629,7 +3629,7 @@ fn createTestDisplayRoot(target: *@import("gsp_device.zig").Device, deadline: u6
     try t.expect(steps < 60 and !running.display_engine_active);
     return root_handle;
 }
-fn checkDeviceDisplayChannels(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, words: []u32, scenario: []const u8) !void {
+fn checkDeviceDisplayChannels(target: *@import("gsp_device.zig").Device, table: *a.DriverApi2, words: []u32, scenario: []const u8) !void {
     // Host fixtures replace providers mid-run; production tables stay bound.
     defer target.running.memory_api = target.ctx.?.memory();
     const runtime = @import("gsp_runtime.zig");
@@ -4427,7 +4427,7 @@ const NativeCommon = struct {
         return a.gfx_output_ok;
     }
 };
-fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, scenario: []const u8) !void {
+fn checkNativeProduct(target: *@import("gsp_device.zig").Device, table: *a.DriverApi2, scenario: []const u8) !void {
     // Host fixtures replace providers mid-run; production tables stay bound.
     defer target.running.memory_api = target.ctx.?.memory();
     const native = @import("gsp_vram_test_model.zig").Model;
@@ -8325,7 +8325,7 @@ const HeadlessResetFixture = struct {
             .outcome = a.gfx_output_outcome_lost, .retained = 1 };
         return a.gfx_output_ok;
     }
-    fn check(target: *@import("gsp_device.zig").Device, table: *a.DriverApi) !void {
+    fn check(target: *@import("gsp_device.zig").Device, table: *a.DriverApi2) !void {
         const copy = @import("gsp_copy_test_model.zig").Model;
         const run = &target.running;
         const old_epoch = target.epoch;
@@ -8465,7 +8465,7 @@ const HeadlessResetFixture = struct {
             !proof.valid(old_epoch) and target.gpu_reset.quiescence().?.valid(target.epoch));
         std.debug.print("[nvidia-headless-reset] injected CE observation timeout; old wait lost/DMA retained; FLR; fresh RM/CE/GR; no output; later terminal FLR; original fault retained\n", .{});
     }
-    fn checkUnstartedRestartShutdown(target: *@import("gsp_device.zig").Device, table: *a.DriverApi) !void {
+    fn checkUnstartedRestartShutdown(target: *@import("gsp_device.zig").Device, table: *a.DriverApi2) !void {
         const run = &target.running;
         const lease = target.memory.?;
         const epoch = target.epoch;
@@ -8515,7 +8515,7 @@ const HeadlessResetFixture = struct {
         try t.expect(target.terminal_deadline == deadline and ResetDeviceModel.triggers == 2);
         std.debug.print("[nvidia-unstarted-restart-terminal] real catalog rejection after DMA resume; firmware/queue never started; fresh terminal FLR/current proof; exact already-retired display metadata; no query/restart; first fault preserved\n", .{});
     }
-    fn checkResetLimitShutdown(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, counts: *FifoCounts, graphics_stage: *u32) !void {
+    fn checkResetLimitShutdown(target: *@import("gsp_device.zig").Device, table: *a.DriverApi2, counts: *FifoCounts, graphics_stage: *u32) !void {
         const copy = @import("gsp_copy_test_model.zig").Model;
         const run = &target.running;
         const first = run.faults.first_fatal.?;
@@ -8631,7 +8631,7 @@ const ConsoleTerminalFixture = struct {
             .state = a.display_state_unavailable, .outcome = a.gfx_output_outcome_lost, .retained = 0 };
         return a.gfx_output_ok;
     }
-    fn check(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, old: @import("gsp_reset.zig").Quiescence) !void {
+    fn check(target: *@import("gsp_device.zig").Device, table: *a.DriverApi2, old: @import("gsp_reset.zig").Quiescence) !void {
         // The independent next CPU fixture reacquires these exact backing
         // owners after the real terminal release. Production never resumes.
         const lease = target.memory.?;
@@ -8756,7 +8756,7 @@ const TerminalFixture = struct {
             .state = a.display_state_unavailable, .outcome = a.gfx_output_outcome_lost, .retained = 0 };
         return a.gfx_output_ok;
     }
-    fn check(target: *@import("gsp_device.zig").Device, table: *a.DriverApi) !void {
+    fn check(target: *@import("gsp_device.zig").Device, table: *a.DriverApi2) !void {
         const run = &target.running;
         const lease = target.memory.?;
         const first_failure = target.failure;
@@ -8943,7 +8943,7 @@ fn checkPrivateClearStop(target: *@import("gsp_device.zig").Device) !void {
     std.debug.print("[nvidia-private-clear] {s}: no backend publication; held until semaphore/reset; exact BO retirement; no post-reset RPC\n", .{NativeCommon.scenario});
 }
 
-fn checkNativeHeadless(target: *@import("gsp_device.zig").Device, table: *a.DriverApi) !void {
+fn checkNativeHeadless(target: *@import("gsp_device.zig").Device, table: *a.DriverApi2) !void {
     const copy = @import("gsp_copy_test_model.zig").Model;
     const run = &target.running;
     var stage: u8 = 0;
@@ -9731,7 +9731,7 @@ fn replyNativeProduct(target: *@import("gsp_device.zig").Device) !void {
     try nativeReply(session, rpc.function, 0, response[0..rpc.request.len]);
 }
 
-fn checkDeviceGraphics(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, scenario: []const u8) !void {
+fn checkDeviceGraphics(target: *@import("gsp_device.zig").Device, table: *a.DriverApi2, scenario: []const u8) !void {
     // Host fixtures replace providers mid-run; production tables stay bound.
     defer target.running.memory_api = target.ctx.?.memory();
     const native = @import("gsp_vram_test_model.zig").Model;
@@ -10023,7 +10023,7 @@ fn driveRenderSetup(target: *@import("gsp_device.zig").Device, counts: *FifoCoun
     }
     return error.SetupTimeout;
 }
-fn checkGraphicsRendering(target: *@import("gsp_device.zig").Device, table: *@import("r4os").abi.DriverApi, counts: *FifoCounts, scenario: []const u8) !void {
+fn checkGraphicsRendering(target: *@import("gsp_device.zig").Device, table: *@import("r4os").abi.DriverApi2, counts: *FifoCounts, scenario: []const u8) !void {
     const render = @import("r4nv_render");
     const native = @import("gsp_vram_test_model.zig").Model;
     const fifo = @import("gsp_fifo_test_model.zig").Model;
@@ -10298,7 +10298,7 @@ fn checkVideoChannels(target: *@import("gsp_device.zig").Device, counts: *FifoCo
     std.debug.print("[nvidia-video-channel] NVDEC/NVENC; sparse engine discovery; internal Falcon size/VA promotion; exact unrounded context bytes; rejected/zero context and rejected promotion; close during context/method/Falcon storage/attach/channel; exact RM/BO retirement\n", .{});
     return fifo.released - released;
 }
-fn checkNativeQueues(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, counts: *FifoCounts, scenario: []const u8) anyerror!usize {
+fn checkNativeQueues(target: *@import("gsp_device.zig").Device, table: *a.DriverApi2, counts: *FifoCounts, scenario: []const u8) anyerror!usize {
     // Host fixtures replace providers mid-run; production tables stay bound.
     defer target.running.memory_api = target.ctx.?.memory();
     const load = @import("gsp_fifo_wire.zig").word;
@@ -10779,7 +10779,7 @@ fn checkPublicVideoQueues(target: *@import("gsp_device.zig").Device, counts: *Fi
     try t.expectEqual(before_bytes, native.charged);
     std.debug.print("[nvidia-video-queue] kind={s} mask={d}; no GR template; isolated/reused contexts; canonical VA retained after GET; HOST semaphore completion; active close; cross-family rejection; absent/class/allocation rollback; exact resources\n", .{@tagName(kind),mask});
 }
-fn checkRenderWarmup(target: *@import("gsp_device.zig").Device, table: *a.DriverApi,
+fn checkRenderWarmup(target: *@import("gsp_device.zig").Device, table: *a.DriverApi2,
     ce: @import("gsp_runtime.zig").ChannelHandle, image_index: usize, output: []u8) !void
 {
     // Host fixtures replace providers mid-run; production tables stay bound.
@@ -10878,7 +10878,7 @@ fn checkRenderUpload(target: *@import("gsp_device.zig").Device, ce: @import("gsp
     for (0..32) |_| { try stepQueuedRendering(target); if (run.graphics_upload == null) break; }
     try t.expect(run.graphics_upload == null and !ControlModel.reading and ce_owner.ring.idle());
 }
-fn checkQueuedRendering(target: *@import("gsp_device.zig").Device, table: *@import("r4os").abi.DriverApi, counts: *FifoCounts,
+fn checkQueuedRendering(target: *@import("gsp_device.zig").Device, table: *@import("r4os").abi.DriverApi2, counts: *FifoCounts,
     scenario: []const u8, ce: @import("gsp_runtime.zig").ChannelHandle) !void {
     // Existing owner case: solid baseline, cropped bilinear/scissor/alpha,
     // then the separate encode-sRGB shader, through the real queue runtime.
@@ -10892,7 +10892,7 @@ fn graphicsFaultScenario(scenario: []const u8) bool {
     return std.mem.eql(u8,scenario,"context_graphics_command_fault") or std.mem.eql(u8,scenario,"context_graphics_shader_fault") or
         std.mem.eql(u8,scenario,"context_graphics_observation_timeout");
 }
-fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("r4os").abi.DriverApi, counts: *FifoCounts,
+fn checkQueuedScene(target: *@import("gsp_device.zig").Device, table: *@import("r4os").abi.DriverApi2, counts: *FifoCounts,
     scenario: []const u8, ce: @import("gsp_runtime.zig").ChannelHandle, scene_index: usize) !void {
     // Host fixtures replace providers mid-run; production tables stay bound.
     defer target.running.memory_api = target.ctx.?.memory();
@@ -11846,7 +11846,7 @@ const UnloadFixture = struct {
     }
 };
 
-fn checkDeviceContexts(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, scenario: []const u8) !void {
+fn checkDeviceContexts(target: *@import("gsp_device.zig").Device, table: *a.DriverApi2, scenario: []const u8) !void {
     // Host fixtures replace providers mid-run; production tables stay bound.
     defer target.running.memory_api = target.ctx.?.memory();
     if (std.mem.startsWith(u8, scenario, "context_graphics")) return checkDeviceGraphics(target, table, scenario);
@@ -12068,7 +12068,7 @@ fn checkDeviceContexts(target: *@import("gsp_device.zig").Device, table: *a.Driv
         } else try t.expect(model.released == 1 and model.charged == 0 and !model.slots[0].live);
     }
 }
-fn checkDeviceDisplayUpload(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, handle: @import("gsp_runtime.zig").ChannelHandle, deadline: u64, scenario: []const u8) !void {
+fn checkDeviceDisplayUpload(target: *@import("gsp_device.zig").Device, table: *a.DriverApi2, handle: @import("gsp_runtime.zig").ChannelHandle, deadline: u64, scenario: []const u8) !void {
     // Host fixtures replace providers mid-run; production tables stay bound.
     defer target.running.memory_api = target.ctx.?.memory();
     const runtime = @import("gsp_runtime.zig");
@@ -12259,7 +12259,7 @@ fn pumpDisplayLink(target: *@import("gsp_device.zig").Device, deadline: u64, pha
     try t.expect(running.display_work.?.link.?.phase == if (phase == .before_scanout) link_api.Phase.scanout else .complete);
     return true;
 }
-fn checkDeviceDisplayImage(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, fifo_handle: @import("gsp_runtime.zig").ChannelHandle,
+fn checkDeviceDisplayImage(target: *@import("gsp_device.zig").Device, table: *a.DriverApi2, fifo_handle: @import("gsp_runtime.zig").ChannelHandle,
     root: @import("gsp_runtime.zig").DisplayEngineHandle,
     core_handle: @import("gsp_runtime.zig").DisplayChannelHandle, dma: u32, deadline: u64, scenario: []const u8) !void
 {
@@ -12575,7 +12575,7 @@ fn signalOwnershipModel(target: *@import("gsp_device.zig").Device) !void {
         const note: *u32 = @ptrFromInt(part.notifier.cpu.cpu_address); note.* = 2 << 30;
     }
 }
-fn checkInitialPresentation(target: *@import("gsp_device.zig").Device, table: *a.DriverApi,
+fn checkInitialPresentation(target: *@import("gsp_device.zig").Device, table: *a.DriverApi2,
     handle: @import("gsp_runtime.zig").ChannelHandle, root: @import("gsp_runtime.zig").DisplayEngineHandle,
     core_handle: @import("gsp_runtime.zig").DisplayChannelHandle, window_handle: @import("gsp_runtime.zig").DisplayChannelHandle,
     dma: u32, deadline: u64, scenario: []const u8) !bool
@@ -12967,7 +12967,7 @@ fn replyCopyMapping(target: *@import("gsp_device.zig").Device) !void {
     std.mem.writeInt(u32, backing.?[status + 64..][0..4], session.tx_write, .little);
     try nativeReply(session, rpc.function, 0, response[0..rpc.request.len]); _ = target.step();
 }
-fn checkDeviceCopies(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, scenario: []const u8,
+fn checkDeviceCopies(target: *@import("gsp_device.zig").Device, table: *a.DriverApi2, scenario: []const u8,
     context_handle: @import("gsp_runtime.zig").ContextHandle, deadline: u64) !void
 {
     // Host fixtures replace providers mid-run; production tables stay bound.
@@ -13148,7 +13148,7 @@ fn checkDeviceCopies(target: *@import("gsp_device.zig").Device, table: *a.Driver
     for (running.buffers.items()) |*slot| try t.expect(slot.owner == null);
     if (vram_model.is("context_copy_success")) try t.expect(model.heldReferences() == 0);
 }
-fn checkCopyLayouts(target: *@import("gsp_device.zig").Device, table: *a.DriverApi,
+fn checkCopyLayouts(target: *@import("gsp_device.zig").Device, table: *a.DriverApi2,
     handle: @import("gsp_runtime.zig").ChannelHandle, deadline: u64, mmio: []const u8) !void
 {
     _ = table;
@@ -13444,7 +13444,7 @@ fn driveDeviceFifo(target: *@import("gsp_device.zig").Device, counts: *FifoCount
     }
     try t.expect(steps < 140);
 }
-fn checkDeviceFifos(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, scenario: []const u8,
+fn checkDeviceFifos(target: *@import("gsp_device.zig").Device, table: *a.DriverApi2, scenario: []const u8,
     context_handle: @import("gsp_runtime.zig").ContextHandle, deadline: u64) !void
 {
     // Host fixtures replace providers mid-run; production tables stay bound.
@@ -13536,7 +13536,7 @@ fn checkDeviceFifos(target: *@import("gsp_device.zig").Device, table: *a.DriverA
     }
 }
 
-fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, scenario: []const u8) !void {
+fn checkDeviceVram(target: *@import("gsp_device.zig").Device, table: *a.DriverApi2, scenario: []const u8) !void {
     // Host fixtures replace providers mid-run; production tables stay bound.
     defer target.running.memory_api = target.ctx.?.memory();
     const model = @import("gsp_vram_test_model.zig").Model;
@@ -14028,7 +14028,7 @@ fn driveVirtualProvider(target: *@import("gsp_device.zig").Device, mode: Provide
     try t.expect(steps < 1000 and target.phase == .ready and peer.completion != null);
     return .{ .maps = bind_count, .unmaps = unbind_count };
 }
-fn checkNativeVirtualProvider(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, borrowed: a.GfxBufferReference) !void {
+fn checkNativeVirtualProvider(target: *@import("gsp_device.zig").Device, table: *a.DriverApi2, borrowed: a.GfxBufferReference) !void {
     // Host fixtures replace providers mid-run; production tables stay bound.
     defer target.running.memory_api = target.ctx.?.memory();
     const peer = @import("gsp_virtual_provider_test_model.zig").Model;
@@ -14058,7 +14058,7 @@ fn checkNativeVirtualProvider(target: *@import("gsp_device.zig").Device, table: 
     _ = try running.virtual_provider.step(running);
     try t.expect(running.virtual_provider.closed());
 }
-fn checkVirtualProvider(target: *@import("gsp_device.zig").Device, table: *a.DriverApi) !void {
+fn checkVirtualProvider(target: *@import("gsp_device.zig").Device, table: *a.DriverApi2) !void {
     const Wake = struct {
         var count: u32 = 0;
         fn signal(raw: usize) i32 {
@@ -14233,7 +14233,7 @@ fn fillLegacyNames(ledger: *@import("gsp_rm_names.zig").Ledger, parent: @import(
     return count;
 }
 
-fn checkVirtualProviderReset(target: *@import("gsp_device.zig").Device, table: *a.DriverApi) !void {
+fn checkVirtualProviderReset(target: *@import("gsp_device.zig").Device, table: *a.DriverApi2) !void {
     // Host fixtures replace providers mid-run; production tables stay bound.
     defer target.running.memory_api = target.ctx.?.memory();
     const model = @import("gsp_buffer_test_model.zig").Model;
@@ -14280,7 +14280,7 @@ fn checkVirtualProviderReset(target: *@import("gsp_device.zig").Device, table: *
     try t.expect(try running.closeAfterReset(proof));
 }
 
-fn checkDeviceMappings(target: *@import("gsp_device.zig").Device, table: *a.DriverApi, scenario: []const u8) !void {
+fn checkDeviceMappings(target: *@import("gsp_device.zig").Device, table: *a.DriverApi2, scenario: []const u8) !void {
     // Host fixtures replace providers mid-run; production tables stay bound.
     defer target.running.memory_api = target.ctx.?.memory();
     const model = @import("gsp_buffer_test_model.zig").Model;

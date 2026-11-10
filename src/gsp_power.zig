@@ -16,7 +16,7 @@ pub const max_age_ns = 3 * std.time.ns_per_s;
 pub const demand_ns = 10 * std.time.ns_per_s;
 pub const Owner = struct {
     self_address: usize = 0,
-    ctx: r4os.r4dev.DriverContext,
+    ctx: r4os.r4dev.DriverContext2,
     memory_api: ?r4os.driver_memory.Context = null,
     adapter: u32,
     binding: wire.Binding,
@@ -60,7 +60,7 @@ pub const Owner = struct {
     timer_requested_ns: u64 = 0,
     timer: @import("gsp_power_clock.zig").Owner = .{},
 
-    pub fn init(ctx: r4os.r4dev.DriverContext, adapter: u32, binding: wire.Binding, shared_binding: wire.Binding) !Owner {
+    pub fn init(ctx: r4os.r4dev.DriverContext2, adapter: u32, binding: wire.Binding, shared_binding: wire.Binding) !Owner {
         var check: [wire.max_bytes]u8 = undefined;
         _ = try wire.encode(binding, .detach, &check);
         _ = try wire.encode(shared_binding, .detach, &check);

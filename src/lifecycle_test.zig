@@ -117,7 +117,7 @@ fn semDestroy(handle: u64) callconv(.c) i32 {
 fn semFlags() callconv(.c) u32 {
     return sem_fixture.flags;
 }
-fn semaphoreApi() a.DriverApi {
+fn semaphoreApi() a.DriverApi2 {
     var api = apiTable();
     api.version = 33;
     api.heap_query = cpuQuery;
@@ -153,7 +153,7 @@ test "NVIDIA actual driver lifecycle bridges opaque semaphores and preserves clo
     try t.expectEqual(sem_provider.sleepable, sem_provider.r4nv_semaphore_context_flags());
     sem_fixture.closed = true;
     cpu_closed = true;
-    const ctx = r4os.r4dev.DriverContext.init(&api);
+    const ctx = r4os.r4dev.DriverContext2.init(&api);
     try t.expect(ctx.semaphores() == null and sem_provider.r4nv_semaphore_create(1) == null);
     try t.expectEqual(sem_provider.ok, sem_provider.r4nv_semaphore_release(pointer));
     try t.expectEqual(sem_provider.ok, sem_provider.r4nv_semaphore_acquire(pointer, std.math.maxInt(u64)));
@@ -163,7 +163,7 @@ test "NVIDIA actual driver lifecycle bridges opaque semaphores and preserves clo
     try t.expectEqual(@as(i32, 0), driver.nvidia_shutdown());
     try t.expect(!sem_provider.available() and sem_provider.r4nv_semaphore_context_flags() == 0);
     api.version = 32;
-    api.size = @offsetOf(a.DriverApi, "semaphore_query");
+    api.size = @offsetOf(a.DriverApi2, "semaphore_query");
     sem_provider.bind(&ctx);
     try t.expect(!sem_provider.available());
     sem_provider.unbind();
@@ -195,7 +195,7 @@ test "NVIDIA actual driver lifecycle retains independent semaphore and CPU free 
     try t.expectEqual(sem_provider.ok, sem_provider.r4nv_semaphore_free(pointer));
     try t.expect(cpu_backing == null and sem_fixture.destroys == 3 and cpu_provider.releaseFailures() == 1 and sem_provider.faultCount() == 2);
     try t.expect(sem_provider.r4nv_semaphore_create(1) == null);
-    const ctx = r4os.r4dev.DriverContext.init(&api);
+    const ctx = r4os.r4dev.DriverContext2.init(&api);
     sem_provider.bind(&ctx);
     const another = sem_provider.r4nv_semaphore_create(1) orelse return error.SemaphoreAllocation;
     sem_fixture.release_result = a.driver_semaphore_error_overflow;
@@ -235,7 +235,7 @@ test "NVIDIA actual driver lifecycle bridges monotonic clock units and latches c
     clock_value.resolution_ns = 10000001;
     try t.expectEqual(clock_value.instant_ns, clock_provider.r4nv_clock_now_ns());
     try t.expectEqual(@as(u64, 10000001), clock_provider.r4nv_clock_resolution_ns());
-    const ctx = r4os.r4dev.DriverContext.init(&api);
+    const ctx = r4os.r4dev.DriverContext2.init(&api);
     for (0..8) |fault| {
         clock_value = goodClock();
         clock_provider.bind(&ctx);
@@ -264,7 +264,7 @@ test "NVIDIA actual driver lifecycle bridges monotonic clock units and latches c
     try t.expectEqual(@as(i32, 0), driver.nvidia_shutdown());
     try t.expectEqual(clock_provider.unavailable, clock_provider.r4nv_clock_now_ns());
     api.version = 30;
-    api.size = @offsetOf(a.DriverApi, "monotonic_clock");
+    api.size = @offsetOf(a.DriverApi2, "monotonic_clock");
     clock_provider.bind(&ctx);
     try t.expect(!clock_provider.available());
     clock_provider.unbind();
@@ -357,9 +357,10 @@ test "NVIDIA actual driver lifecycle bridges resident CPU memory and retains fai
     try t.expectEqual(@as(i32, 0), driver.nvidia_shutdown());
     try t.expect(!cpu_provider.available() and cpu_backing == null);
     try t.expect(cpu_provider.r4nv_heap_allocate(1) == null);
-    // The unchanged old table prefix never evaluates the optional query.
-    api.version = 29;
-    api.size = @offsetOf(a.DriverApi, "heap_query");
+    // An admitted API2 header with an absent optional query must not invoke it.
+    api.version = r4os.technical2.abi.driver_version;
+    api.size = @sizeOf(a.DriverApi2);
+    api.heap_query = null;
     state = .{ .present = false };
     try t.expectEqual(@as(i32, -4), driver.nvidia_init(&api));
     try t.expect(!cpu_provider.available());
@@ -415,21 +416,21 @@ const State = struct {
 var state: State = .{};
 
 fn forbidden() callconv(.c) noreturn {
-    @panic("passive driver invoked an unadmitted DriverApi function");
+    @panic("passive driver invoked an unadmitted DriverApi2 function");
 }
-fn apiTable() a.DriverApi {
-    var api: a.DriverApi = undefined;
-    inline for (@typeInfo(a.DriverApi).@"struct".fields) |field| {
+fn apiTable() a.DriverApi2 {
+    var api: a.DriverApi2 = undefined;
+    inline for (@typeInfo(a.DriverApi2).@"struct".fields) |field| {
         switch (@typeInfo(field.type)) {
             .int => @field(api, field.name) = 0,
             .pointer => @field(api, field.name) = @ptrCast(&forbidden),
             .optional => @field(api, field.name) = null,
-            else => @compileError("DriverApi fixture must cover new field kinds"),
+            else => @compileError("DriverApi2 fixture must cover new field kinds"),
         }
     }
-    api.magic = a.driver_magic;
+    api.magic = r4os.technical2.abi.driver_magic;
     api.version = 29;
-    api.size = @sizeOf(a.DriverApi);
+    api.size = @sizeOf(a.DriverApi2); api.reserved = 0;
     api.log_info = log;
     api.log_warn = log;
     api.log_error = log;
@@ -549,13 +550,21 @@ test "NVIDIA actual driver lifecycle verifies loaded lock before PCI and binds f
     try t.expectEqual(@as(usize, 0), state.enumerate_count);
     try t.expectEqual(@as(i32, 0), driver.nvidia_shutdown());
     api.gfx_display_query = policyDisplay;
-    // Reject incomplete owned-work contracts before firmware, PCI or a boot
-    // hold can be acquired. Passive and software boots retain old prefixes.
+    // Reject actual incomplete API2 work capabilities before firmware, PCI
+    // or a boot hold. Passive and software boots need no owned-work contract.
     for (0..3) |missing| {
         state = .{ .selected_mode = "auto", .present = false };
-        api.version = if (missing == 0) a.driver_api_thread_work_version else a.driver_api_owned_work_version;
-        api.size = if (missing == 1) @offsetOf(a.DriverApi, "driver_work_submit_owned") else @sizeOf(a.DriverApi);
-        api.driver_work_submit_owned = if (missing == 2) null else WorkFixture.submit;
+        api.version = r4os.technical2.abi.driver_version;
+        api.size = @sizeOf(a.DriverApi2);
+        api.driver_work_submit_owned = if (missing == 0) null else WorkFixture.submit;
+        api.driver_completion_status = WorkFixture.status;
+        api.driver_completion_release = WorkFixture.release;
+        // Model malformed foreign mandatory slots as raw zero words; never
+        // manufacture a null Zig non-optional function pointer.
+        if (missing == 1) @as(*usize, @ptrCast(&api.driver_completion_status)).* = 0;
+        if (missing == 2) @as(*usize, @ptrCast(&api.driver_completion_release)).* = 0;
+        api.driver_completion_wait = WorkFixture.completionWait;
+        api.driver_work_cancel = WorkFixture.cancel;
         try t.expectEqual(@as(i32, -12), driver.nvidia_init(&api));
         try t.expectEqual(@as(usize, 0), state.enumerate_count);
         try t.expect(!state.lock_verified and !state.mapping);
@@ -563,8 +572,10 @@ test "NVIDIA actual driver lifecycle verifies loaded lock before PCI and binds f
     }
     state = .{ .selected_mode = "auto", .present = false };
     api.version = a.driver_api_owned_work_version;
-    api.size = @sizeOf(a.DriverApi);
+    api.size = @sizeOf(a.DriverApi2); api.reserved = 0;
     api.driver_work_submit_owned = WorkFixture.submit;
+    api.driver_completion_status = WorkFixture.status;
+    api.driver_completion_release = WorkFixture.release;
     try t.expectEqual(@as(i32, -4), driver.nvidia_init(&api));
     try t.expect(state.lock_verified and state.enumerate_count == 1);
     try t.expectEqual(@as(i32, 0), driver.nvidia_shutdown());
@@ -581,17 +592,19 @@ test "NVIDIA actual driver lifecycle verifies loaded lock before PCI and binds f
     try t.expectEqual(@as(i32, -4), driver.nvidia_init(&api));
     try t.expect(state.lock_verified);
     try t.expectEqual(@as(i32, 0), driver.nvidia_shutdown());
-    const ctx = r4os.r4dev.DriverContext.init(&api).resources().?;
+    const ctx = r4os.r4dev.DriverContext2.init(&api).resources().?;
     var reader = try resource_loader.Reader.init(ctx, .ga10x, 1000);
     var chunk: [65536]u8 = undefined;
     try t.expectEqual(chunk.len, try reader.readAt(firmware.specification(.ga10x).resource, 0, &chunk, 1000));
     try t.expectError(error.Name, reader.readAt("other-version.bin", 0, &chunk, 1000));
     state.resource_fault = .generation;
     try t.expectError(error.Size, resource_loader.Reader.init(ctx, .ga10x, 1000));
-    // The exact old prefix remains valid for the original passive probe.
+    // A valid API2 passive probe without the optional resource query keeps
+    // the original no-firmware-read behavior.
     state = .{ .present = false };
-    api.version = 28;
-    api.size = @offsetOf(a.DriverApi, "resource_query");
+    api.version = r4os.technical2.abi.driver_version;
+    api.size = @sizeOf(a.DriverApi2);
+    api.resource_query = null;
     try t.expectEqual(@as(i32, -4), driver.nvidia_init(&api));
     try t.expect(!state.lock_verified);
     try t.expectEqual(@as(i32, 0), driver.nvidia_shutdown());
@@ -791,7 +804,7 @@ const WorkFixture = struct {
     fn resources(out: *a.DriverResourceApi) callconv(.c) i32 {
         out.* = .{ .now_ns = @intFromPtr(&clock) }; return 0;
     }
-    fn table() a.DriverApi {
+    fn table() a.DriverApi2 {
         var api = apiTable();
         api.version = a.driver_api_owned_work_version;
         api.thread_query = threads; api.semaphore_query = semaphores;
@@ -814,7 +827,7 @@ test "NVIDIA actual driver lifecycle paces hardware under owned work and retains
     defer t.allocator.destroy(target);
     target.* = .{ .self_address = @intFromPtr(target), .stopped = true };
     var api = WorkFixture.table();
-    const ctx = r4os.r4dev.DriverContext.init(&api);
+    const ctx = r4os.r4dev.DriverContext2.init(&api);
     for (0..18) |scenario| {
         WorkFixture.reset();
         var work: worker.Work = .{};
@@ -1737,7 +1750,7 @@ const FrtsFixture = struct {
     fn wordAt(data: []const u8, offset: usize) u32 { return std.mem.readInt(u32, data[offset..][0..4], .little); }
 };
 
-fn checkFrtsStorage(ctx: *const r4os.r4dev.DriverContext, owner: *@import("boot_vram_lease.zig").Lease) !void {
+fn checkFrtsStorage(ctx: *const r4os.r4dev.DriverContext2, owner: *@import("boot_vram_lease.zig").Lease) !void {
     const f = FrtsFixture;
     const cpu = @import("fwsec_storage.zig");
     const input = @import("fwsec_test.zig");
@@ -1768,7 +1781,7 @@ fn checkFrtsStorage(ctx: *const r4os.r4dev.DriverContext, owner: *@import("boot_
         var image: cpu.Storage = .{};
         defer { f.fault = .none; _ = image.close(); }
         var other_api = ctx.api.*;
-        const other = r4os.r4dev.DriverContext.init(&other_api);
+        const other = r4os.r4dev.DriverContext2.init(&other_api);
         try t.expectError(error.Vram, image.prepareFrts(&other, &rom, &board, fuses, owner));
         try t.expect(f.allocations == allocation_count + 1 and owner.frts_consumer == 0);
         const prepared = image.prepareFrts(ctx, &rom, &board, fuses, owner);
@@ -1858,7 +1871,7 @@ fn checkBootVramOwner() !void {
     api.dma_map_pinned = FrtsFixture.mapImage;
     api.dma_unmap = FrtsFixture.unmapImage;
     api.dma_unpin_buffer = FrtsFixture.unpinImage;
-    const ctx = r4os.r4dev.DriverContext.init(&api);
+    const ctx = r4os.r4dev.DriverContext2.init(&api);
     const id = @import("identity.zig");
     var snapshot: id.Snapshot = .{ .pci = .{} };
     snapshot.pci = .{ .bus_kind = 2, .bus = 9, .vendor_id = 0x10de, .device_id = 0x2504, .class_code = 3 };
@@ -2372,7 +2385,7 @@ fn checkBootVramOwner() !void {
     try checkTerminalCapture(&ctx, &snapshot, chip);
 }
 
-fn checkTerminalCapture(ctx: *const r4os.r4dev.DriverContext, snapshot: *const @import("identity.zig").Snapshot,
+fn checkTerminalCapture(ctx: *const r4os.r4dev.DriverContext2, snapshot: *const @import("identity.zig").Snapshot,
     chip: @import("identity.zig").Chip) !void
 {
     const f = BootVramFixture;

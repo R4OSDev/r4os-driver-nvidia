@@ -39,7 +39,7 @@ pub const Storage = struct {
     close_step: enum { none, gpu, dma, cpu, reference, collect } = .none,
     close_status: i32 = ok,
 
-    pub fn prepare(self: *Storage, ctx: *const r4os.r4dev.DriverContext, adapter: u32, epoch: u64, byte_length: usize) Error!void {
+    pub fn prepare(self: *Storage, ctx: *const r4os.r4dev.DriverContext2, adapter: u32, epoch: u64, byte_length: usize) Error!void {
         if (self.self_address != 0) return error.Busy;
         if (adapter == 0 or epoch == 0 or (byte_length != shared_page_bytes and byte_length != bytes and byte_length != wire.bytes)) return error.Descriptor;
         // Older kernels reject a Work query: no private heap fallback can

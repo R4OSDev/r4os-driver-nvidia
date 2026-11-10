@@ -53,7 +53,7 @@ var state: State = .{};
 var calls: [2]native.Invocation = undefined;
 var handles: [2]u64 = .{ 0, 0 };
 
-pub fn start(ctx: *const r4os.r4dev.DriverContext) bool {
+pub fn start(ctx: *const r4os.r4dev.DriverContext2) bool {
     if (threads != null or !native.available()) return failed(ctx, "unavailable");
     threads = ctx.threads() orelse return failed(ctx, "query");
     if (!prefixCompatible(ctx) or threads.?.abortCurrent(native.aborted) != a.driver_thread_error_context)
@@ -92,7 +92,7 @@ pub fn start(ctx: *const r4os.r4dev.DriverContext) bool {
 
 // Run last: its latched failure must reject new ordinary native work, while
 // pre-existing waiters remain entitled to a real permit and explicit cleanup.
-pub fn prepareFault(ctx: *const r4os.r4dev.DriverContext) bool {
+pub fn prepareFault(ctx: *const r4os.r4dev.DriverContext2) bool {
     const cpu = ctx.heap() orelse return false;
     const sem = ctx.semaphores() orelse return false;
     var before_memory: a.DriverHeapStats = .{};
@@ -142,7 +142,7 @@ pub fn prepareFault(ctx: *const r4os.r4dev.DriverContext) bool {
     return true;
 }
 
-pub fn shutdown(ctx: *const r4os.r4dev.DriverContext) bool {
+pub fn shutdown(ctx: *const r4os.r4dev.DriverContext2) bool {
     if (threads == null) return true;
     // No new Tasks can be started after owner close. Finish any partial probe
     // with the cached providers, then free only after every peer has retired.
@@ -172,7 +172,7 @@ fn refuseAbort(context: usize) callconv(.c) i32 {
     if (context == 0 and service.abortCurrent(native.aborted) != a.driver_thread_error_context) return -3;
     return 0;
 }
-fn prefixCompatible(ctx: *const r4os.r4dev.DriverContext) bool {
+fn prefixCompatible(ctx: *const r4os.r4dev.DriverContext2) bool {
     const query = ctx.api.thread_query orelse return false;
     const Guard = extern struct { table: a.DriverThreadApi, tail: [16]u8 };
     for ([_]u32{ 72, 73, 79, 80, 81, 87, 88, 90 }) |capacity| {
@@ -200,19 +200,19 @@ fn launch(index: usize, handler: Handler, is_cleanup: bool, context: usize) bool
     calls[index] = .{ .handler = handler, .context = context, .cleanup = is_cleanup, .deadline_ns = deadline };
     return native.start(&calls[index], a.driver_thread_flag_parallel, &handles[index]) == 0;
 }
-fn completed(ctx: *const r4os.r4dev.DriverContext, index: usize, expected: i32, aborted: bool) bool {
+fn completed(ctx: *const r4os.r4dev.DriverContext2, index: usize, expected: i32, aborted: bool) bool {
     var result: i32 = 0;
     var status: a.DriverThreadStatus = .{};
     if (threads.?.join(handles[index], timeout(ctx), &result) != 0 or result != expected or
         threads.?.status(handles[index], &status) != 0 or (status.flags & a.driver_thread_flag_aborted != 0) != aborted) return false;
     return retire(ctx, &handles[index]);
 }
-fn quiesce(ctx: *const r4os.r4dev.DriverContext, index: usize) bool {
+fn quiesce(ctx: *const r4os.r4dev.DriverContext2, index: usize) bool {
     if (handles[index] == 0) return true;
     var result: i32 = 0;
     return threads.?.join(handles[index], timeout(ctx), &result) == 0 and retire(ctx, &handles[index]);
 }
-fn retire(ctx: *const r4os.r4dev.DriverContext, handle: *u64) bool {
+fn retire(ctx: *const r4os.r4dev.DriverContext2, handle: *u64) bool {
     const began = ctx.tickCount();
     while (true) {
         const code = threads.?.release(handle.*);
@@ -229,10 +229,10 @@ fn freeMemory() bool {
     state.memory = null;
     return true;
 }
-fn timeout(ctx: *const r4os.r4dev.DriverContext) u64 {
+fn timeout(ctx: *const r4os.r4dev.DriverContext2) u64 {
     return @as(u64, @max(ctx.timerFrequency(), 1)) * 5;
 }
-fn failed(ctx: *const r4os.r4dev.DriverContext, phase: []const u8) bool {
+fn failed(ctx: *const r4os.r4dev.DriverContext2, phase: []const u8) bool {
     var message: [160]u8 = undefined;
     const line = std.fmt.bufPrintZ(&message, "NVIDIA runtime-check: FAILED phase=native-{s}", .{phase}) catch unreachable;
     ctx.logError(line.ptr);

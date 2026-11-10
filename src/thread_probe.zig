@@ -9,7 +9,7 @@ const PacingDevice = @import("gsp_device.zig").Device;
 
 // Explicit runtime-check only. These counts describe this short diagnostic,
 // never a driver/runtime capacity. All callbacks use resident CPU services.
-var api: ?*const a.DriverApi = null;
+var api: ?*const a.DriverApi2 = null;
 var threads: ?ThreadContext = null;
 var handles: [7]u64 = .{0} ** 7;
 var ready: [7]u32 = .{0} ** 7;
@@ -29,7 +29,7 @@ var join_target: u64 = 0;
 var queued_pacing: PacingWork = .{};
 var queued_device: ?*PacingDevice = null;
 
-pub fn start(ctx: *const r4os.r4dev.DriverContext) bool {
+pub fn start(ctx: *const r4os.r4dev.DriverContext2) bool {
     if (api != null) return false;
     const service = ctx.threads() orelse return false;
     api = ctx.api;
@@ -123,7 +123,7 @@ pub fn start(ctx: *const r4os.r4dev.DriverContext) bool {
     return true;
 }
 
-pub fn prepareClose(ctx: *const r4os.r4dev.DriverContext) bool {
+pub fn prepareClose(ctx: *const r4os.r4dev.DriverContext2) bool {
     const service = threads orelse return false;
     close_pointer = heap.r4nv_heap_allocate(113) orelse return failed(ctx, "close-heap");
     @memset(@as([*]u8, @ptrCast(close_pointer.?))[0..113], 0x79);
@@ -132,7 +132,7 @@ pub fn prepareClose(ctx: *const r4os.r4dev.DriverContext) bool {
     return true;
 }
 
-pub fn shutdown(ctx: *const r4os.r4dev.DriverContext) bool {
+pub fn shutdown(ctx: *const r4os.r4dev.DriverContext2) bool {
     const service = threads orelse return true;
     @atomicStore(u32, &go, 1, .release);
     @atomicStore(u32, &work_gate, 1, .release);
@@ -173,7 +173,7 @@ pub fn shutdown(ctx: *const r4os.r4dev.DriverContext) bool {
     return true;
 }
 
-fn queuedPacingStop(ctx: *const r4os.r4dev.DriverContext) bool {
+fn queuedPacingStop(ctx: *const r4os.r4dev.DriverContext2) bool {
     if (queued_device != null or queued_pacing.self_address != 0) return false;
     const pointer = heap.r4nv_heap_allocate(@sizeOf(PacingDevice)) orelse return false;
     const target: *PacingDevice = @ptrCast(@alignCast(pointer));
@@ -213,7 +213,7 @@ fn closeQueuedPacing() bool {
 
 fn compute(index: usize) callconv(.c) i32 {
     const service = threads orelse return -1;
-    const ctx = r4os.r4dev.DriverContext.init(api orelse return -1);
+    const ctx = r4os.r4dev.DriverContext2.init(api orelse return -1);
     const me = service.current();
     var self_result: i32 = 79;
     if (me == 0 or service.status(me, &samples[index]) != 0 or
@@ -242,7 +242,7 @@ fn compute(index: usize) callconv(.c) i32 {
         }
     }
     if (index == 0) {
-        if (ctx.apiVersion() < a.driver_api_thread_work_version or ctx.workSubmit(postedCallback, 0, 0, &posted_work) != 0) return -10;
+        if (!ctx.requires(.{"thread_query", "driver_work_submit", "driver_completion_status", "driver_completion_release"}) or ctx.workSubmit(postedCallback, 0, 0, &posted_work) != 0) return -10;
     }
     return 79 + @as(i32, @intCast(index));
 }
@@ -255,7 +255,7 @@ fn stopWait(index: usize) callconv(.c) i32 {
 
 fn joinWait(_: usize) callconv(.c) i32 {
     const service = threads orelse return -1;
-    const ctx = r4os.r4dev.DriverContext.init(api orelse return -1);
+    const ctx = r4os.r4dev.DriverContext2.init(api orelse return -1);
     var result: i32 = 79;
     if (service.join(join_target, timeout(&ctx), &result) != a.driver_thread_error_cancelled or result != 0) return -1;
     var target: a.DriverThreadStatus = .{};
@@ -268,7 +268,7 @@ fn closeWait(_: usize) callconv(.c) i32 {
     if (service.sleepTicks(std.math.maxInt(u64)) != a.driver_thread_error_cancelled) return -1;
     var rejected: u64 = 79;
     if (service.start(compute, 0, 0, &rejected) != a.driver_thread_error_closed or rejected != 0 or heap.r4nv_heap_allocate(1) != null) return -2;
-    const ctx = r4os.r4dev.DriverContext.init(api orelse return -6);
+    const ctx = r4os.r4dev.DriverContext2.init(api orelse return -6);
     var work_rejected: u32 = 79;
     if (ctx.workSubmit(postedCallback, 0, 0, &work_rejected) != a.driver_thread_error_closed or work_rejected != 0) return -6;
     const pointer = close_pointer orelse return -3;
@@ -281,7 +281,7 @@ fn closeWait(_: usize) callconv(.c) i32 {
 }
 
 fn blockWork(_: usize) callconv(.c) i32 {
-    const ctx = r4os.r4dev.DriverContext.init(api orelse return -1);
+    const ctx = r4os.r4dev.DriverContext2.init(api orelse return -1);
     @atomicStore(u32, &work_ready, 1, .release);
     const started = ctx.tickCount();
     while (@atomicLoad(u32, &work_gate, .acquire) == 0) {
@@ -296,7 +296,7 @@ fn blockWork(_: usize) callconv(.c) i32 {
 }
 
 fn postedCallback(_: usize) callconv(.c) i32 {
-    const ctx = r4os.r4dev.DriverContext.init(api orelse return -1);
+    const ctx = r4os.r4dev.DriverContext2.init(api orelse return -1);
     const service = threads orelse return -1;
     var status: a.DriverCompletionStatus = .{};
     var owner: a.DriverHeapStats = .{};
@@ -307,10 +307,10 @@ fn postedCallback(_: usize) callconv(.c) i32 {
     return 0;
 }
 
-fn timeout(ctx: *const r4os.r4dev.DriverContext) u64 {
+fn timeout(ctx: *const r4os.r4dev.DriverContext2) u64 {
     return @as(u64, ctx.timerFrequency()) * 5;
 }
-fn awaitReady(ctx: *const r4os.r4dev.DriverContext, value: *u32) bool {
+fn awaitReady(ctx: *const r4os.r4dev.DriverContext2, value: *u32) bool {
     const started = ctx.tickCount();
     while (@atomicLoad(u32, value, .acquire) == 0) {
         if (ctx.tickCount() -% started >= timeout(ctx)) return false;
@@ -318,7 +318,7 @@ fn awaitReady(ctx: *const r4os.r4dev.DriverContext, value: *u32) bool {
     }
     return true;
 }
-fn release(ctx: *const r4os.r4dev.DriverContext, handle: *u64) bool {
+fn release(ctx: *const r4os.r4dev.DriverContext2, handle: *u64) bool {
     const service = threads orelse return false;
     const started = ctx.tickCount();
     while (true) {
@@ -331,14 +331,14 @@ fn release(ctx: *const r4os.r4dev.DriverContext, handle: *u64) bool {
         ctx.waitTicks(1);
     }
 }
-fn finishWork(ctx: *const r4os.r4dev.DriverContext, result: *i32) bool {
+fn finishWork(ctx: *const r4os.r4dev.DriverContext2, result: *i32) bool {
     result.* = 0;
     if (work_handle == 0) return true;
     if (ctx.completionWait(work_handle, timeout(ctx), result) != 0 or ctx.completionRelease(work_handle) != 0) return false;
     work_handle = 0;
     return true;
 }
-fn failed(ctx: *const r4os.r4dev.DriverContext, phase: []const u8) bool {
+fn failed(ctx: *const r4os.r4dev.DriverContext2, phase: []const u8) bool {
     var message: [160]u8 = undefined;
     const line = std.fmt.bufPrintZ(&message, "NVIDIA runtime-check: FAILED phase=thread-{s}", .{phase}) catch unreachable;
     ctx.logError(line.ptr);

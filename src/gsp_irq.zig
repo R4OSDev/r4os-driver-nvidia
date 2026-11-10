@@ -335,7 +335,7 @@ pub const reg = struct {
 pub const Wake = struct { context: usize, signal: *const fn (usize) i32 };
 pub const Owner = struct {
     self_address: usize = 0,
-    ctx: ?r4os.r4dev.DriverContext = null,
+    ctx: ?r4os.r4dev.DriverContext2 = null,
     lease: bar0.Lease = .{},
     cpu: u64 = 0,
     boot0: u32 = 0,
@@ -362,7 +362,7 @@ pub const Owner = struct {
     clock: ?r4os.r4dev.DriverResourceContext = null,
     display: @import("gsp_head_events.zig").Owner = .{},
 
-    pub fn open(self: *Owner, ctx: *const r4os.r4dev.DriverContext, mapping: *bar0.Owner,
+    pub fn open(self: *Owner, ctx: *const r4os.r4dev.DriverContext2, mapping: *bar0.Owner,
         snapshot: *const identity.Snapshot, chip: identity.Chip, inventory: *const postinit.Data,
         wake: Wake, boot0: u32) !void
     {

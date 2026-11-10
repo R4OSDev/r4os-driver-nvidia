@@ -133,17 +133,17 @@ fn unpin(input: *a.DmaPinnedBuffer) callconv(.c) i32 {
 }
 
 test "firmware CPU storage Booter pair validates production parts and retains every partial DMA owner" {
-    var table: a.DriverApi = undefined;
-    table.magic = a.driver_magic;
+    var table: a.DriverApi2 = undefined;
+    table.magic = r4os.technical2.abi.driver_magic;
     table.version = 34;
-    table.size = @sizeOf(a.DriverApi);
+    table.size = @sizeOf(a.DriverApi2); table.reserved = 0;
     table.resource_query = resourceQuery;
     table.heap_query = heapQuery;
     table.dma_pin_buffer = pin;
     table.dma_map_pinned = map;
     table.dma_unmap = unmap;
     table.dma_unpin_buffer = unpin;
-    const ctx = r4os.r4dev.DriverContext.init(&table);
+    const ctx = r4os.r4dev.DriverContext2.init(&table);
     const fuses = @import("booter.zig").Fuses{ .debug_disable_raw = 1, .ucode_version_raw = 1, .ucode_id = 3 };
     for ([_]u16{0x176,0x192,0x193,0x194,0x196,0x197}) |chip| {
         chip_id = chip;

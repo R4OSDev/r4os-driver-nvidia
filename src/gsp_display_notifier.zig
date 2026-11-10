@@ -171,7 +171,7 @@ pub const Owner = struct {
     window_points: [2]u64 = @splat(0),
     failed: bool = false,
 
-    pub fn open(self: *Owner, ctx: *const r4os.r4dev.DriverContext, adapter: u32, epoch: u64, channel: u32, handle: u32) Error!void {
+    pub fn open(self: *Owner, ctx: *const r4os.r4dev.DriverContext2, adapter: u32, epoch: u64, channel: u32, handle: u32) Error!void {
         if (self.self_address != 0) return error.Busy;
         if (epoch == 0 or channel > 8 or handle == 0) return error.Bounds;
         self.self_address = @intFromPtr(self); self.handle = handle; self.channel = channel; self.epoch = epoch;
@@ -180,7 +180,7 @@ pub const Owner = struct {
             return err;
         };
     }
-    fn prepare(self: *Owner, ctx: *const r4os.r4dev.DriverContext, adapter: u32) Error!void {
+    fn prepare(self: *Owner, ctx: *const r4os.r4dev.DriverContext2, adapter: u32) Error!void {
         try self.backing.prepareRole(ctx, adapter, self.epoch, .notifier);
         self.physical_stamp = self.backing.physical() orelse return error.Stale;
         const result = self.backing.memory.?.bufferMap(&self.backing.reference.reference, a.gfx_buffer_map_write, 0, storage.bytes, &self.cpu);

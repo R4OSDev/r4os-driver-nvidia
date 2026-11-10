@@ -21,11 +21,11 @@ pub const Snapshot = struct {
     // epoch still belong to the resident driver console reservation.
     console_active: bool = false,
 
-    pub fn capture(self: *Snapshot, ctx: *const r4os.r4dev.DriverContext, adapter: u32) Error!Report {
+    pub fn capture(self: *Snapshot, ctx: *const r4os.r4dev.DriverContext2, adapter: u32) Error!Report {
         return self.captureGuarded(ctx, adapter, .{ .context = 0, .callback = refuseRecovery });
     }
 
-    pub fn captureGuarded(self: *Snapshot, ctx: *const r4os.r4dev.DriverContext, adapter: u32, recovery: Recovery) Error!Report {
+    pub fn captureGuarded(self: *Snapshot, ctx: *const r4os.r4dev.DriverContext2, adapter: u32, recovery: Recovery) Error!Report {
         if (self.reference.reference.id != 0 or self.held_generation != 0 or self.read.lease.id != 0) return error.Busy;
         const memory = ctx.memory() orelse return error.Unsupported;
         const display = ctx.graphicsDisplay() orelse return error.Unsupported;

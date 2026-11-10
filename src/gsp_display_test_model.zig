@@ -10,7 +10,7 @@ pub const Model = struct {
     var scenario: []const u8 = "";
     pub var released: usize = 0;
     pub var words: []u32 = undefined;
-    pub fn install(table: *a.DriverApi, name: []const u8, mmio: []u32) void {
+    pub fn install(table: *a.DriverApi2, name: []const u8, mmio: []u32) void {
         std.debug.assert(table.gfx_memory_query.?(&original) == a.gfx_buffer_result_ok);
         table.gfx_memory_query = query; slots = @splat(.{}); scenario = name; released = 0; words = mmio;
     }

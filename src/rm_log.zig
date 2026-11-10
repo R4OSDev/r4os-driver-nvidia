@@ -3,9 +3,9 @@ const a = r4os.abi;
 
 // Published before callbacks; retained until all workers and dedicated native
 // invocations are retired. The kernel derives the real current driver owner.
-var api: ?*const a.DriverApi = null;
+var api: ?*const a.DriverApi2 = null;
 var records: u64 = 0;
-pub fn bind(ctx: *const r4os.r4dev.DriverContext) void {
+pub fn bind(ctx: *const r4os.r4dev.DriverContext2) void {
     api = ctx.api;
     @atomicStore(u64, &records, 0, .monotonic);
 }
@@ -31,7 +31,7 @@ pub export fn r4nv_log(severity: u32, text: ?[*:0]const u8) callconv(.c) i32 {
         @memcpy(buffer[512 - marker.len .. 512], marker);
     }
     buffer[length] = 0;
-    const ctx = r4os.r4dev.DriverContext.init(bound);
+    const ctx = r4os.r4dev.DriverContext2.init(bound);
     switch (severity) {
         0 => ctx.logInfo(@ptrCast(&buffer)),
         1 => ctx.logWarn(@ptrCast(&buffer)),

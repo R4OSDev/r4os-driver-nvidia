@@ -9,13 +9,12 @@ const device = @import("gsp_device.zig");
 // clock is checked between indivisible device steps; their own deadlines stay.
 const slice_steps = 8;
 const slice_ns = 250 * std.time.ns_per_us;
-pub fn supported(ctx: *const r4os.r4dev.DriverContext) bool {
-    return ctx.supportsDriverApi(a.driver_api_owned_work_version, @offsetOf(a.DriverApi, "driver_work_submit_owned") + 8) and
-        ctx.api.driver_work_submit_owned != null;
+pub fn supported(ctx: *const r4os.r4dev.DriverContext2) bool {
+    return ctx.requires(.{ "driver_work_submit_owned", "driver_work_cancel", "driver_completion_status", "driver_completion_wait", "driver_completion_release" });
 }
 pub const Work = struct {
     self_address: usize = 0,
-    ctx: ?r4os.r4dev.DriverContext = null,
+    ctx: ?r4os.r4dev.DriverContext2 = null,
     threads: ?r4os.r4dev.DriverThreadContext = null,
     semaphores: ?r4os.r4dev.DriverSemaphoreContext = null,
     wake_semaphore: u64 = 0,
@@ -26,7 +25,7 @@ pub const Work = struct {
     stopping: u32 = 0,
     budget_reported: bool = false,
 
-    pub fn start(self: *Work, ctx: *const r4os.r4dev.DriverContext, target: *device.Device) !void {
+    pub fn start(self: *Work, ctx: *const r4os.r4dev.DriverContext2, target: *device.Device) !void {
         if (self.self_address != 0 or target.self_address != @intFromPtr(target)) return error.State;
         if (!supported(ctx)) return error.Api;
         const service = ctx.threads() orelse return error.Api;
@@ -261,7 +260,9 @@ pub const Work = struct {
         // Both a step count and a monotonic time bound apply. A single step
         // already has its native phase's finite deadline and register limit.
         var elapsed: u64 = 0;
-        for (0..slice_steps) |index| {
+        var budget = r4os.driver_poll_budget.DriverPollBudget.initIterations(slice_steps, .no_sleep);
+        var index: usize = 0;
+        while (budget.step(null, false) == .proceed) : (index += 1) {
             if (@atomicLoad(u32, &self.stopping, .acquire) != 0) return self.completeSlice(1);
             switch (self.device.?.step()) {
                 .stopped => return self.completeSlice(1),

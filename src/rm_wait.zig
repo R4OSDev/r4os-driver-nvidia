@@ -6,7 +6,7 @@ const native = @import("rm_native.zig");
 const semaphore = @import("rm_semaphore.zig");
 const policy = @import("wait_policy.zig");
 const Result = policy.Result;
-var context: ?r4os.r4dev.DriverContext = null;
+var context: ?r4os.r4dev.DriverContext2 = null;
 var threads: ?r4os.r4dev.DriverThreadContext = null;
 var sleep_calls: u64 = 0;
 var spin_calls: u64 = 0;
@@ -15,7 +15,7 @@ pub const Stats = struct { sleeps: u64, spins: u64, yields: u64 };
 pub fn stats() Stats {
     return .{ .sleeps = @atomicLoad(u64, &sleep_calls, .monotonic), .spins = @atomicLoad(u64, &spin_calls, .monotonic), .yields = @atomicLoad(u64, &yield_calls, .monotonic) };
 }
-pub fn bind(ctx: *const r4os.r4dev.DriverContext) void {
+pub fn bind(ctx: *const r4os.r4dev.DriverContext2) void {
     context = ctx.*;
     threads = ctx.threads();
     @atomicStore(u64, &sleep_calls, 0, .monotonic);

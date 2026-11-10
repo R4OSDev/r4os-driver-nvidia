@@ -6,7 +6,7 @@ const t = std.testing;
 pub const Model = struct {
     pub const rounded = [_]u64{ 80 * 1024 * 1024, 4096 };
     pub const fence: a.GfxFence = .{ .slot = 1, .adapter_id = 0x01000000, .timeline = 19, .point = 31, .device_generation = 7, .reset_generation = 11 };
-    pub var original: a.DriverApi = undefined;
+    pub var original: a.DriverApi2 = undefined;
     pub var refs: [2]bool = @splat(false);
     pub var full_refs: [2]bool = @splat(false);
     pub var verification_refs: [2]bool = @splat(false);
@@ -27,7 +27,7 @@ pub const Model = struct {
         for (&allocations) |*entry| if (entry.bytes != null) { count += 1; };
         return count;
     }
-    pub fn install(table: *a.DriverApi, name: []const u8) void {
+    pub fn install(table: *a.DriverApi2, name: []const u8) void {
         original = table.*;
         table.heap_query = heap;
         table.gfx_memory_query = memory;
@@ -39,7 +39,7 @@ pub const Model = struct {
         releases = 0; segments = 0;
         allocation_fault = .none; release_fault = false;
     }
-    pub fn dispose(table: *a.DriverApi) void {
+    pub fn dispose(table: *a.DriverApi2) void {
         table.* = original;
         // Used only after retention assertions; production has no forced
         // disposal. The fixture owns these host allocations independently.
@@ -48,7 +48,7 @@ pub const Model = struct {
         };
     }
     pub fn is(name: []const u8) bool { return std.mem.eql(u8, name, scenario); }
-    pub fn closeHeapAdmission(table: *a.DriverApi) void { table.heap_query = heapClosed; }
+    pub fn closeHeapAdmission(table: *a.DriverApi2) void { table.heap_query = heapClosed; }
     fn heapClosed(_: *a.DriverHeapApi) callconv(.c) i32 { return a.driver_heap_error_closed; }
     pub fn page(index: usize, offset: u64) u64 { return 0x6000000000 + index * 0x100000000 + offset * 2; }
     pub fn address(index: usize) u64 { return 0x10000000 + index * 0x10000000; }

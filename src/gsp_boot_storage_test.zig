@@ -126,10 +126,10 @@ fn unpin(info: *a.DmaPinnedBuffer) callconv(.c) i32 {
 }
 
 test "firmware CPU storage boot pack owns complete GSP lifetime and resynchronizes metadata before publication" {
-    var api: a.DriverApi = undefined;
-    api.magic = a.driver_magic;
+    var api: a.DriverApi2 = undefined;
+    api.magic = r4os.technical2.abi.driver_magic;
     api.version = 34;
-    api.size = @sizeOf(a.DriverApi);
+    api.size = @sizeOf(a.DriverApi2); api.reserved = 0;
     api.heap_query = heap;
     api.resource_query = resources;
     api.dma_pin_buffer = pin;
@@ -137,7 +137,7 @@ test "firmware CPU storage boot pack owns complete GSP lifetime and resynchroniz
     api.dma_sync_for_device = sync;
     api.dma_unmap = unmap;
     api.dma_unpin_buffer = unpin;
-    const ctx = r4os.r4dev.DriverContext.init(&api);
+    const ctx = r4os.r4dev.DriverContext2.init(&api);
     const image = try t.allocator.alloc(u8, wpr.image_bytes);
     defer t.allocator.free(image);
     @memset(image, 0x79);

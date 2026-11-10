@@ -20,7 +20,7 @@ var threads: ?r4os.r4dev.DriverThreadContext = null;
 var first_fault: u64 = 0;
 var faults: u64 = 0;
 
-pub fn bind(ctx: *const r4os.r4dev.DriverContext) void {
+pub fn bind(ctx: *const r4os.r4dev.DriverContext2) void {
     const candidate = ctx.threads();
     threads = if (candidate != null and candidate.?.canAbort() and candidate.?.hasCurrentRequest()) candidate else null;
     @atomicStore(u64, &first_fault, 0, .release);

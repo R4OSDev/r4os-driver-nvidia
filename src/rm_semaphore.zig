@@ -17,7 +17,7 @@ var failures: u64 = 0;
 const Box = extern struct { handle: u64, cookie: u64 };
 const cookie_mask: u64 = 0x52344e5653454d41;
 
-pub fn bind(ctx: *const r4os.r4dev.DriverContext) void {
+pub fn bind(ctx: *const r4os.r4dev.DriverContext2) void {
     context = ctx.semaphores();
     @atomicStore(u64, &failures, 0, .monotonic);
 }

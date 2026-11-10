@@ -99,7 +99,7 @@ pub const Report = struct {
         write(ctx, "NVIDIA mode-held: ticket={d} seq={d} selected={d} pending-mask={x} initial-read-lease={d} shadows={d} native-owners={d}",
             .{self.ticket,self.operation_sequence,self.selected,self.pending,self.initial_read_lease,self.shadow_imports,self.native_owners});
     }
-    fn imageLog(self: *const Report, ctx: *const r4os.r4dev.DriverContext, label: []const u8, value: Image) void {
+    fn imageLog(self: *const Report, ctx: *const r4os.r4dev.DriverContext2, label: []const u8, value: Image) void {
         write(ctx, "NVIDIA mode-ack-{s}: ticket={d} seq={d} dma={d} size={d}x{d} pitch={d} format={x} head={d} window={d} sor={d} mode={d}",
             .{label,self.ticket,self.operation_sequence,value.dma,value.width,value.height,value.pitch,value.format,value.head,value.window,value.sor,value.mode});
         write(ctx, "NVIDIA mode-proof-{s}: ticket={d} seq={d} clock-word={x} refresh-uHz={d} core={d} window={d} mode-receipt={d} link-receipt={d}",
@@ -121,7 +121,7 @@ fn acknowledged(product: anytype) Image {
     }
     return value;
 }
-pub fn write(ctx: *const r4os.r4dev.DriverContext, comptime format: []const u8, args: anytype) void {
+pub fn write(ctx: *const r4os.r4dev.DriverContext2, comptime format: []const u8, args: anytype) void {
     var buffer: [384]u8 = undefined;
     const text = std.fmt.bufPrintZ(&buffer, format, args) catch {
         ctx.logError("NVIDIA mode-diagnostic: record-overflow"); return;

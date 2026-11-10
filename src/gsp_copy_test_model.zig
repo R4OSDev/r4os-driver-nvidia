@@ -93,7 +93,7 @@ pub const Model = struct {
     var fetched = false;
     var executed = false;
     var signaled = false;
-    pub fn install(table: *a.DriverApi, index: usize) void {
+    pub fn install(table: *a.DriverApi2, index: usize) void {
         binding = .{ .adapter_id = 0x01000000, .milestone = 1, .device_generation = 7, .reset_generation = 11 };
         std.debug.assert(table.gfx_memory_query.?(&original) == a.gfx_buffer_result_ok);
         table.gfx_memory_query = memory; table.gfx_queue_query = queue;
@@ -114,13 +114,13 @@ pub const Model = struct {
         @memset(&replacement_vram, 0xcc);
         for (&extra_vram) |*bytes| @memset(bytes, 0xcc);
     }
-    pub fn installPresentation(table: *a.DriverApi, index: usize, width: u32, height: u32) void {
+    pub fn installPresentation(table: *a.DriverApi2, index: usize, width: u32, height: u32) void {
         install(table, index); present_mode = true; shadow_live = true;
         shadow_descriptor = .{ .byte_length = @as(u64, width) * height * 4, .alignment = 4096,
             .width = width, .height = height, .format = a.gfx_buffer_format_xrgb8888, .plane_count = 1,
             .plane_pitches = .{ @as(u64, width) * 4, 0, 0, 0 }, .usage = 39 };
     }
-    pub fn installProduct(table: *a.DriverApi, index: usize) void {
+    pub fn installProduct(table: *a.DriverApi2, index: usize) void {
         const previous = native.slots[index].imported;
         install(table, index);
         native.slots[index].imported = previous;
@@ -128,7 +128,7 @@ pub const Model = struct {
         present_mode = true; product_mode = true;
         direct_mode = native.is("context_native_unknown");
     }
-    pub fn installHeadless(table: *a.DriverApi, index: usize) void {
+    pub fn installHeadless(table: *a.DriverApi2, index: usize) void {
         install(table, index);
         app_reference = false;
         product_mode = true; render_mode = true;
@@ -140,7 +140,7 @@ pub const Model = struct {
         fetched = false; executed = false; signaled = false;
         binding.device_generation += 1; binding.reset_generation += 1;
     }
-    pub fn installRender(table: *a.DriverApi, index: usize) void {
+    pub fn installRender(table: *a.DriverApi2, index: usize) void {
         install(table, index); render_mode = true;
         closeApp();
     }

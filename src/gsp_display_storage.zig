@@ -26,10 +26,10 @@ pub const Storage = struct {
     close_step: enum { none, dma, cpu, reference, collect } = .none,
     close_status: i32 = a.gfx_buffer_result_ok,
 
-    pub fn prepare(self: *Storage, ctx: *const r4os.r4dev.DriverContext, adapter: u32, epoch: u64) Error!void {
+    pub fn prepare(self: *Storage, ctx: *const r4os.r4dev.DriverContext2, adapter: u32, epoch: u64) Error!void {
         return self.prepareRole(ctx, adapter, epoch, .pushbuffer);
     }
-    pub fn prepareRole(self: *Storage, ctx: *const r4os.r4dev.DriverContext, adapter: u32, epoch: u64, role: Role) Error!void {
+    pub fn prepareRole(self: *Storage, ctx: *const r4os.r4dev.DriverContext2, adapter: u32, epoch: u64, role: Role) Error!void {
         if (self.self_address != 0) return error.Busy;
         if (adapter == 0 or epoch == 0) return error.Descriptor;
         const memory = ctx.memory() orelse return error.Api;

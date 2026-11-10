@@ -120,10 +120,10 @@ fn unpin(pin_info: *a.DmaPinnedBuffer) callconv(.c) i32 {
 }
 
 test "firmware CPU storage GSP DMA keeps partial maps and synchronizes all radix backing before publication" {
-    var table: a.DriverApi = undefined;
-    table.magic = a.driver_magic;
+    var table: a.DriverApi2 = undefined;
+    table.magic = r4os.technical2.abi.driver_magic;
     table.version = 34;
-    table.size = @sizeOf(a.DriverApi);
+    table.size = @sizeOf(a.DriverApi2); table.reserved = 0;
     table.heap_query = heap;
     table.resource_query = resources;
     table.dma_pin_buffer = pin;
@@ -131,7 +131,7 @@ test "firmware CPU storage GSP DMA keeps partial maps and synchronizes all radix
     table.dma_sync_for_device = sync;
     table.dma_unmap = unmap;
     table.dma_unpin_buffer = unpin;
-    const ctx = r4os.r4dev.DriverContext.init(&table);
+    const ctx = r4os.r4dev.DriverContext2.init(&table);
     for (std.enums.values(Fault)) |case| {
         fault = case;
         clock = 100;

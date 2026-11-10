@@ -5,12 +5,12 @@ const a = r4os.abi;
 // Bound before publishing callbacks; cleared only after their quiescence.
 // The source owns monotonic publication across CPUs and source transitions.
 // Do not derive nanoseconds or hardware resolution from timerFrequency().
-var context: ?r4os.r4dev.DriverContext = null;
+var context: ?r4os.r4dev.DriverContext2 = null;
 var fast_clock: ?r4os.r4dev.DriverResourceContext = null;
 var failed: u32 = 0;
 pub const unavailable = std.math.maxInt(u64);
 
-pub fn bind(ctx: *const r4os.r4dev.DriverContext) void {
+pub fn bind(ctx: *const r4os.r4dev.DriverContext2) void {
     context = ctx.*;
     fast_clock = ctx.resources();
     @atomicStore(u32, &failed, 0, .release);

@@ -303,12 +303,12 @@ pub const Owner = struct {
     protocol_failure: ?exchange.Error = null,
     unwind: bool = false,
 
-    pub fn open(self: *Owner, token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext, adapter: u32, graph: names.Lease,
+    pub fn open(self: *Owner, token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext2, adapter: u32, graph: names.Lease,
         parent: *context.Owner, runqueue: u8, hardware_channel: u32, instance: *vram.Owner, userd: ?*vram.Owner, engine: wire.Engine, deadline: u64) Error!void
     {
         return self.openEngines(token, ctx, adapter, graph, parent, runqueue, hardware_channel, instance, userd, engine, wire.defaultEngineMask(engine), deadline);
     }
-    pub fn openEngines(self: *Owner, token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext, adapter: u32, graph: names.Lease,
+    pub fn openEngines(self: *Owner, token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext2, adapter: u32, graph: names.Lease,
         parent: *context.Owner, runqueue: u8, hardware_channel: u32, instance: *vram.Owner, userd: ?*vram.Owner, engine: wire.Engine, engine_mask: u32, deadline: u64) Error!void
     {
         const nv = @import("r4nv_binding");
@@ -363,7 +363,7 @@ pub const Owner = struct {
             self.* = .{}; return err;
         };
     }
-    fn acquire(self: *Owner, token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext, adapter: u32, instance: *vram.Owner, userd: ?*vram.Owner) Error!void {
+    fn acquire(self: *Owner, token: *boot.Handoff, ctx: *const r4os.r4dev.DriverContext2, adapter: u32, instance: *vram.Owner, userd: ?*vram.Owner) Error!void {
         try wire.validate(self.config);
         self.child = try self.parent.?.retainChild();
         try instance.retainStorage(&self.instance);

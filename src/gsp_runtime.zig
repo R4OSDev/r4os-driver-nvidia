@@ -303,7 +303,7 @@ pub const Snapshot = struct {
 };
 pub const Owner = struct {
     self_address: usize = 0,
-    ctx: ?r4os.r4dev.DriverContext = null,
+    ctx: ?r4os.r4dev.DriverContext2 = null,
     device: ?*native.Port = null,
     reader: ?*logs.Reader = null,
     channel: ?exchange.Exchange = null,
@@ -487,7 +487,7 @@ pub const Owner = struct {
     reset_cursor: usize = 0,
     words: [logs.output_bytes]u8 = undefined,
 
-    pub fn open(self: *Owner, ctx: *const r4os.r4dev.DriverContext, device: *native.Port,
+    pub fn open(self: *Owner, ctx: *const r4os.r4dev.DriverContext2, device: *native.Port,
         handoff: *boot.Handoff, reader: *logs.Reader, reservation: *const @import("boot_vram_lease.zig").Lease, deadline: u64) !void
     {
         if (self.self_address != 0) return error.Busy;
