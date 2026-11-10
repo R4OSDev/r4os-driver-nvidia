@@ -3130,7 +3130,7 @@ before driver-shutdownOK/warm-reset-ready. This is system-transition evidence,
 not a separate hot module-unload test or a claim that earlier faults are fixed.
 
 API-Migration 0.90.53: NVIDIA 0.1.338
-Aktueller Einstieg DriverInit2/DriverApi2/Query2:2 mit SDK194/Contract93.
+Aktueller Einstieg DriverInit2/DriverApi2/Query2:2 mit SDK195/Contract93.
 Die technischen API2-Callbacks werden wirklich ueber die neue Tabelle
 aufgerufen; eigenstaendige Grafik-/Memory-/Thread-/Resource-Records
 behalten ihre eigene Revision1. Alte DriverApi-Versionszahlen in den
