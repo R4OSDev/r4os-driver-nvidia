@@ -1,6 +1,39 @@
 ﻿NVIDIA: nativer Grafik- und Displaybesitzer
 =========================================
 
+0.91.8 / NVIDIA0.1.339 / 15.11.2026:
+Der bestaetigte feste10-ms-Leerlauftakt entfaellt. Der bestehende Lifecycle-
+besitzer bildet die naechste Faelligkeit aus den vorhandenen Log-, Telemetrie-,
+Sensor-, Leistungsnachfrage-, Empfaenger- und aktiven VRR-Uhren. Ohne faellige
+Wartung wartet die Pacing-Task unbegrenzt auf ihr bestehendes Semaphor. GSP-
+und Display-IRQs sowie angenommene Queue-, Allokations- und VA-Auftraege wecken
+weiter ueber dessen einen koaleszierten Permit. Stop weckt diesen Wait; keine
+Device-/Lifecycle-Sperre wird beim Warten gehalten. Zwischen Callback und Wait
+verstrichene Completion-/Freigabezeit wird von der veroeffentlichten Wartefrist
+abgezogen. Aufrundung auf mindestens einen Tick wahrt die vorhandene Uhr.
+
+Bei unveraendertem laufendem Auftrag sind vor dem Einschlafen hoechstens acht
+Device-Beobachtungen mit8us-Grenze zwischen den Clockchecks erlaubt. Weiter
+wirken die vorhandenen acht Schritte/soft250us pro Workcallback und die Frist
+der jeweils unteilbaren Operation. Ein unveraenderter letzter Schritt wartet
+einen Tick; auch bei stehender Uhr entsteht keine sofortige Endlos-Neureihung.
+Damit ist Fables vorgeschlagene begrenzte Poll-Alternative umgesetzt. CE-/GR-
+Nonstall-Vektoren und Kommandostrom bleiben unveraendert. Lange GPU-Auftraege
+verwenden weiter den Tick-Rueckfall. Der Kernelvertrag wird nicht erweitert;
+keine Deadline oder Beobachtung gilt als Hardwareabschluss oder DMA-Freigabe.
+
+Pruefumfang: bestehende Lifecycle-, Transport-, VRR- und komplette Device-
+Besitzergruppen, mit erweiterten Faellen fuer reale begrenzte Work-Slices,
+stehende/fortschreitende Uhr, verspätete Completionfreigabe und Stop eines
+unbegrenzten Waits. Es wird keine neue physische GPU-/Desktoplatenz- oder
+Leerlaufmessung behauptet. OssiPC war am15.11.2026 beim begrenzten TCP22-
+Zugangstest nicht erreichbar (Timeout); daraus wird kein ausgeschalteter
+Zustand abgeleitet. IMAGE_SCOPE=none bleibt bestehen; STANDARD auf
+KVM4 prueft das normale Gesamtsystem und fuehrt diesen Treiber nicht aus.
+Abnahme0.91.8: regulaerer NVIDIA339-Build10/10 und volle bestehende Besitzerpruefung54/54 bestanden, darunter11 eigentliche Lifecyclegruppen. Finaler STANDARD c3ed4bfd-9cab-4589-822d-abf31a5f3477 mit30 Rohsamples, fuenf metric-v2-Werten und sechs nachgerechneten Scores: lokal validiert; R4OS Server ausstehend. Rest: Claim, Import, voller GET-Readback und unabhaengige Serverauswertung. Keine neue physische GPU-/Bildzeit-/Idlezaehlermessung; OssiPC-TCP22-Zugangstest endet mit Timeout. STANDARD fuehrt NVIDIA/IMAGE_SCOPE=none nicht aus. Belegarchiv ExFiles/Reports/Fable091/0.91.8/ und unveraenderte Volloriginale ExFiles/Reports/Benchmarks/c3ed4bfd-9cab-4589-822d-abf31a5f3477/.
+Belege: ExFiles/Reports/Fable091/0.91.8/. Aeltere Abschnitte bleiben historische
+Messungen ihrer ausdruecklich genannten Versionen.
+
 0.87.10 / NVIDIA333 / 25.10.2026:
 Der vorhandene normale BSP-Worker fuehrt NVIDIA weiter mit exakt serialisiertem
 Lifecyclebesitz aus. Sein Quantum umfasst nun maximal8 statt64 Device-Schritte

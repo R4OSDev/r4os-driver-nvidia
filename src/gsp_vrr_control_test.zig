@@ -155,9 +155,14 @@ fn pacingCheck(plan: vrr.edid.vrr.Plan) !void {
     try t.expect(pacing.observer.summary().samples == 1 and pacing.scheduler.state == .active);
     pacing.observe(.{ .sequence = 3, .frame_counter = 2, .observed_ns = base + 36_000_000 });
     try t.expect(pacing.observer.summary().samples == 0 and pacing.scheduler.previous_period_ns == 0);
-    pacing.checkClock(base + 36_000_000 + plan.max_period_ns * 3 + 1);
+    const stale_at = base + 36_000_000 + plan.max_period_ns * 3 + 1;
+    try t.expectEqual(stale_at, pacing.nextCheckNs());
+    pacing.checkClock(stale_at - 1);
+    try t.expect(pacing.scheduler.state == .active);
+    pacing.checkClock(stale_at);
     try t.expect(pacing.scheduler.state == .disabling and pacing.scheduler.reason == .stale_clock and
         !pacing.allowFrame(base + 100_000_000));
+    try t.expectEqual(std.math.maxInt(u64), pacing.nextCheckNs());
     try pacing.begin(1, plan, false, base + 100_000_000);
     try pacing.completed(false, base + 110_000_000);
     try t.expect(pacing.scheduler.state == .faulted and pacing.allowFrame(base + 120_000_000));

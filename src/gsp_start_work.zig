@@ -9,6 +9,14 @@ const device = @import("gsp_device.zig");
 // clock is checked between indivisible device steps; their own deadlines stay.
 const slice_steps = 8;
 const slice_ns = 250 * std.time.ns_per_us;
+const idle_poll_ns = 8 * std.time.ns_per_us;
+/// Round a finite maintenance deadline upwards; MAX remains a true IRQ wait.
+pub fn deadlineTicks(current: u64, deadline: u64, frequency: u32) u64 {
+    if (deadline == std.math.maxInt(u64)) return std.math.maxInt(u64);
+    if (deadline <= current) return 1;
+    const scaled = @as(u128, deadline - current) * @max(frequency, 1);
+    return @intCast(@min(std.math.maxInt(u64) - 1, @max((scaled + std.time.ns_per_s - 1) / std.time.ns_per_s, 1)));
+}
 pub fn supported(ctx: *const r4os.r4dev.DriverContext2) bool {
     return ctx.requires(.{ "driver_work_submit_owned", "driver_work_cancel", "driver_completion_status", "driver_completion_wait", "driver_completion_release" });
 }
@@ -22,6 +30,8 @@ pub const Work = struct {
     task: u64 = 0,
     completion: u32 = 0,
     completion_disposition: u32 = std.math.maxInt(u32),
+    completion_wait_ticks: u64 = 1,
+    completion_wait_started: u64 = 0,
     stopping: u32 = 0,
     budget_reported: bool = false,
 
@@ -113,7 +123,10 @@ pub const Work = struct {
         while (@atomicLoad(u32, &self.stopping, .acquire) == 0) {
             // Ordinary Work carries a driver identity but no lifecycle guard;
             // it cannot query the boot hold or perform display/MMIO operations.
-            if (@atomicLoad(u32, &self.completion, .acquire) == 0) @atomicStore(u32, &self.completion_disposition, std.math.maxInt(u32), .release);
+            if (@atomicLoad(u32, &self.completion, .acquire) == 0) {
+                @atomicStore(u32, &self.completion_disposition, std.math.maxInt(u32), .release);
+                @atomicStore(u64, &self.completion_wait_ticks, 1, .release);
+            }
             var completion: u32 = 0;
             if (@atomicLoad(u32, &self.completion, .acquire) != 0 or ctx.workSubmitOwned(slice, raw, &completion) != 0 or completion == 0) {
                 ctx.logError("NVIDIA gsp-start: pacing=failed reason=work-admission device=retained");
@@ -149,9 +162,17 @@ pub const Work = struct {
             if (result == 3) continue;
             // Sleeping here releases the dedicated task's owner context.
             // No shared worker, MMIO callback or device lock spans this wait.
-            // A GSP IRQ supplies a permit immediately; the finite timeout
-            // preserves startup, deadlines and log polling if no IRQ arrives.
-            const ticks = if (result == 2) @max(ctx.timerFrequency() / 100, 1) else 1;
+            // IRQs and admitted producers supply a coalesced permit. The
+            // completed owner publishes the actual next maintenance timeout;
+            // startup, pending work and contention keep their one-tick bound.
+            const ticks = if (result == 2) blk: {
+                const timeout = @atomicLoad(u64, &self.completion_wait_ticks, .acquire);
+                if (timeout == std.math.maxInt(u64)) break :blk timeout;
+                // Completion publication/Task scheduling may consume part of
+                // the relative timeout. Never restart its full duration.
+                const began = @atomicLoad(u64, &self.completion_wait_started, .acquire);
+                break :blk @max(timeout -| (ctx.tickCount() -% began), 1);
+            } else 1;
             const waited = self.semaphores.?.acquire(self.wake_semaphore, ticks);
             if (waited != 0 and waited != a.driver_semaphore_error_timeout) {
                 if (@atomicLoad(u32, &self.stopping, .acquire) != 0 or waited == a.driver_semaphore_error_cancelled) return 0;
@@ -249,8 +270,11 @@ pub const Work = struct {
         return self.completeSlice(3);
     }
     fn slice(raw: usize) callconv(.c) i32 {
-        const self = from(raw);
-        if (self.self_address != raw or self.ctx == null or self.device == null) return -1;
+        return from(raw).runOwnedSlice();
+    }
+    /// One bounded turn; caller must hold the existing lifecycle owner.
+    pub fn runOwnedSlice(self: *Work) i32 {
+        if (self.self_address != @intFromPtr(self) or self.ctx == null or self.device == null) return -1;
         if (@atomicLoad(u32, &self.stopping, .acquire) != 0) return self.completeSlice(1);
         // Reset temporarily retires the firmware port. Pacing belongs to
         // the resident driver, and must survive that port's replacement.
@@ -260,26 +284,41 @@ pub const Work = struct {
         // Both a step count and a monotonic time bound apply. A single step
         // already has its native phase's finite deadline and register limit.
         var elapsed: u64 = 0;
+        var idle_started: ?u64 = null;
+        var last_idle = false;
         var budget = r4os.driver_poll_budget.DriverPollBudget.initIterations(slice_steps, .no_sleep);
         var index: usize = 0;
         while (budget.step(null, false) == .proceed) : (index += 1) {
             if (@atomicLoad(u32, &self.stopping, .acquire) != 0) return self.completeSlice(1);
             switch (self.device.?.step()) {
                 .stopped => return self.completeSlice(1),
-                // An unchanged snapshot can retain a queue job between CE/GR
-                // sub-operations. Poll that owner's full lifetime at one tick;
-                // the 10-ms delay belongs to a ready device without queued
-                // work. Classify under the serialized lifecycle owner.
-                .idle => return self.completeSlice(if (self.device.?.workPolling()) 0 else 2),
-                .progress => {},
+                .idle => {
+                    const current = clock.nowNs();
+                    if (current == std.math.maxInt(u64) or current < started_at) return -1;
+                    if (!self.device.?.workPolling()) {
+                        @atomicStore(u64, &self.completion_wait_ticks,
+                            deadlineTicks(current, self.device.?.idleDeadline(), self.ctx.?.timerFrequency()), .release);
+                        @atomicStore(u64, &self.completion_wait_started, self.ctx.?.tickCount(), .release);
+                        return self.completeSlice(2);
+                    }
+                    // Observe a short CE/GR completion before adding a tick.
+                    // The same step/clock budgets still bound all owner work;
+                    // an unchanged eighth observation sleeps, never requeues.
+                    const first = idle_started orelse current;
+                    idle_started = first;
+                    if (current < first) return -1;
+                    if (current - first >= idle_poll_ns) return self.completeSlice(0);
+                    last_idle = true;
+                },
+                .progress => { last_idle = false; },
             }
             const current = clock.nowNs();
             if (current == std.math.maxInt(u64) or current < started_at) return -1;
             elapsed = current - started_at;
-            if (elapsed >= slice_ns) return self.yieldBudget(index + 1, elapsed);
+            if (elapsed >= slice_ns) return if (last_idle) self.completeSlice(0) else self.yieldBudget(index + 1, elapsed);
         }
         // The last step made progress; only the shared callback's step/time
         // budget ended this turn. Its next turn must not wait for an IRQ.
-        return self.yieldBudget(slice_steps, elapsed);
+        return if (last_idle) self.completeSlice(0) else self.yieldBudget(slice_steps, elapsed);
     }
 };

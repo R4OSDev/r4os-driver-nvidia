@@ -1,5 +1,23 @@
 ﻿# NVIDIA.R4D
 
+0.1.339 / Roadmap0.91.8 replaces the fixed10-ms idle timeout with the
+next existing owner deadline: logs, common telemetry, sensor samples, finite
+power demand, debounced receiver work and live adaptive-refresh clock checks.
+No due maintenance means an indefinite semaphore wait. Existing GSP/display
+IRQs, queue/allocation/VA notifications and stop still supply coalesced permits.
+Time spent publishing/releasing a Work completion is subtracted before waiting.
+
+Before sleeping on unchanged pending work, the actual Device step may observe
+again for at most8 steps and8us between clock checks. The existing soft250-us
+slice bound and each indivisible operation's original deadline also apply.
+An unchanged last observation sleeps for one tick; it cannot cause an endless
+immediate requeue, including when the clock stands still. This is the planned
+bounded-poll alternative, not an implementation of CE/GR nonstall interrupts.
+Long operations retain the tick fallback and all original completion words,
+receipts, exact epochs, cancellation and physical-retirement requirements.
+Host qualification and its limits: DOCUMENTATION.de.txt, Roadmap0.91.8.
+Older entries below describe their dated checkpoints.
+
 0.1.314 requires the current profiled common queue registration. Missing
 profile support is refused; no unprofiled backend is substituted. The actual
 memory epoch remains explicit, and returned identities on uncertain failure

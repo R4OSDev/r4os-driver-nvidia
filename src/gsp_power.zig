@@ -60,6 +60,19 @@ pub const Owner = struct {
     timer_requested_ns: u64 = 0,
     timer: @import("gsp_power_clock.zig").Owner = .{},
 
+    /// Metadata only, under the same owner as choose/sample. Common demand
+    /// is exchanged at its existing cadence even when no sensor is active.
+    pub fn nextServiceNs(self: *const Owner, now: u64) u64 {
+        var next = self.common_next;
+        if (self.attached and self.active_mask != 0) next = @min(next, self.next_sample);
+        for ([_]u64{ self.demanded_until, self.work_until, self.recent_until, self.performance.accepted_until }) |end| {
+            if (end > now) next = @min(next, end);
+        }
+        if (!self.stopping and self.timer.rejected == null and !self.timer.faulted and now < self.timing_until)
+            next = @min(next, self.timer_next);
+        return next;
+    }
+
     pub fn init(ctx: r4os.r4dev.DriverContext2, adapter: u32, binding: wire.Binding, shared_binding: wire.Binding) !Owner {
         var check: [wire.max_bytes]u8 = undefined;
         _ = try wire.encode(binding, .detach, &check);

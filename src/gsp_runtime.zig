@@ -3242,6 +3242,22 @@ pub const Owner = struct {
         self.log("NVIDIA gsp-present-image: retired={d} shadow=unmapped,import-released scanout=retained", .{dma});
         return true;
     }
+    /// Next idle maintenance observation, not a hardware completion or loan.
+    /// Active operations retain their existing short wait and own deadlines.
+    pub fn idleDeadline(self: *const Owner) u64 {
+        var next: u64 = std.math.maxInt(u64);
+        if (self.reader) |reader| if (reader.enabled) { next = self.next_log; };
+        if (self.power_owner) |*owner| next = @min(next, owner.nextServiceNs(self.last_clock));
+        if (self.discover_receivers and !self.shutdown_closing and !self.refresh_quiescing and !self.anyAdaptiveRefresh() and
+            self.receiver_events.pending and !self.receiver_events.capturing)
+            next = @min(next, self.receiver_events.dueNs());
+        for (&self.refresh_clocks, 0..) |*pacing, window| {
+            if (self.presentation_targets[window] == null) continue;
+            const image = self.display_images[window] orelse continue;
+            if (image.boot_mode != null) next = @min(next, pacing.nextCheckNs());
+        }
+        return next;
+    }
     /// Retained queue work needs polling between its hardware sub-operations,
     /// too. A completed CE packet does not make the enclosing GR job idle.
     /// Read only under the lifecycle owner; this pacing hint grants no receipt.

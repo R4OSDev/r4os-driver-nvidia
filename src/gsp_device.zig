@@ -1053,7 +1053,7 @@ pub const Device = struct {
     /// Read under the same lifecycle owner as step. Retained results and
     /// dormant images/providers do not turn a ready device into busy polling.
     pub fn workPolling(self: *const Device) bool {
-        if (self.phase != .ready) return true;
+        if (self.phase != .ready or self.terminal_requested) return true;
         if (self.running.workPolling() or self.running.allocations.pending != null or self.running.virtual_provider.pending != null or
             (self.running.allocations.handle.id != 0 and self.running.allocations.requested) or
             (self.running.virtual_provider.handle.id != 0 and self.running.virtual_provider.requested)) return true;
@@ -1069,6 +1069,13 @@ pub const Device = struct {
         if ((output.cursor.phase != .failed and output.cursor.busy()) or output.audio.busy() or output.refresh.busy() or
             output.modes.job != null or output.additional.hardwareBusy()) return true;
         return switch (output.hotplug.phase) { .online, .receiver_wait, .power_asleep, .power_failed => output.hotplug.refreshing, else => true };
+    }
+    pub fn idleDeadline(self: *const Device) u64 {
+        var next = self.running.idleDeadline();
+        const hotplug = &self.native_output.hotplug;
+        if (self.native_output.phase == .active and hotplug.phase == .receiver_wait and hotplug.power_cycle)
+            next = @min(next, hotplug.deadline);
+        return next;
     }
     fn wakeWork(raw: *anyopaque) void {
         const self = from(raw);

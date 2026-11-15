@@ -647,6 +647,8 @@ const WorkFixture = struct {
     var script_index: usize = 0;
     var semaphore_waits: u32 = 0;
     var wait_timeouts: [8]u64 = @splat(0);
+    var idle_wait_ticks: u64 = 37;
+    var stop_on_semaphore = false;
     var defer_callback = false;
     var pending_handler: ?a.DriverWorkHandler = null;
     var pending_raw: usize = 0;
@@ -665,6 +667,7 @@ const WorkFixture = struct {
         join_result = 0; task_release_busy = 0; semaphore_destroy_result = 0;
         semaphore_destroys = 0; task_releases = 0;
         frequency_hz = 10; completion_script = &.{}; script_index = 0;
+        idle_wait_ticks = 37; stop_on_semaphore = false;
         semaphore_waits = 0; wait_timeouts = @splat(0);
         defer_callback = false; pending_handler = null; pending_raw = 0; pending_running = false;
         completion_waits = 0; completion_wait_error = 0; stop_during_wait = false; complete_before_timeout = false;
@@ -703,6 +706,11 @@ const WorkFixture = struct {
         std.debug.assert(handle == 9 and active == 0 and !owner);
         if (semaphore_waits < wait_timeouts.len) wait_timeouts[semaphore_waits] = timeout;
         semaphore_waits += 1;
+        if (stop_on_semaphore) {
+            const work: *@import("gsp_start_work.zig").Work = @ptrFromInt(task.context);
+            @atomicStore(u32, &work.stopping, 1, .release);
+            return a.driver_semaphore_error_cancelled;
+        }
         wait(timeout); return a.driver_semaphore_error_timeout;
     }
     fn submit(handler: a.DriverWorkHandler, raw: usize, out: *u32) callconv(.c) i32 {
@@ -718,6 +726,10 @@ const WorkFixture = struct {
             if (disposition >= 0) {
                 const work: *@import("gsp_start_work.zig").Work = @ptrFromInt(raw);
                 if (disposition != 99) @atomicStore(u32, &work.completion_disposition, @intCast(disposition), .release);
+                if (disposition == 2) {
+                    @atomicStore(u64, &work.completion_wait_ticks, idle_wait_ticks, .release);
+                    @atomicStore(u64, &work.completion_wait_started, ticks, .release);
+                }
                 result = 0;
             } else result = disposition;
         } else if (defer_callback) {
@@ -821,6 +833,45 @@ const WorkFixture = struct {
         return handler(task.context);
     }
 };
+test "NVIDIA actual driver lifecycle idle waits follow maintenance deadlines and round upwards" {
+    const worker = @import("gsp_start_work.zig");
+    const ns = std.time.ns_per_ms;
+    const target = try t.allocator.create(@import("gsp_device.zig").Device);
+    defer t.allocator.destroy(target);
+    target.* = .{ .phase = .ready };
+    try t.expectEqual(std.math.maxInt(u64), target.idleDeadline());
+    var reader: @import("gsp_logs.zig").Reader = .{};
+    target.running.reader = &reader;
+    target.running.next_log = 1000 * ns;
+    try t.expectEqual(@as(u64, 1000 * ns), target.idleDeadline());
+    reader.enabled = false;
+    try t.expectEqual(std.math.maxInt(u64), target.idleDeadline());
+    reader.enabled = true;
+    var api = WorkFixture.table();
+    target.running.power_owner = .{ .ctx = r4os.r4dev.DriverContext2.init(&api), .adapter = 1,
+        .binding = .{ .epoch = 1, .client = 1, .subdevice = 2 }, .shared_binding = .{ .epoch = 1, .client = 1, .subdevice = 2 },
+        .common_next = 200 * ns };
+    try t.expectEqual(@as(u64, 200 * ns), target.idleDeadline());
+    target.running.last_clock = 50 * ns;
+    target.running.power_owner.?.work_until = 75 * ns;
+    try t.expectEqual(@as(u64, 75 * ns), target.idleDeadline());
+    target.running.last_clock = 75 * ns;
+    try t.expectEqual(@as(u64, 200 * ns), target.idleDeadline());
+    target.running.discover_receivers = true;
+    target.running.receiver_events = .{ .pending = true };
+    try t.expectEqual(@as(u64, 100 * ns), target.idleDeadline());
+    target.running.receiver_events.capturing = true;
+    try t.expectEqual(@as(u64, 200 * ns), target.idleDeadline());
+    target.native_output.phase = .active;
+    target.native_output.hotplug = .{ .phase = .receiver_wait, .power_cycle = true, .deadline = 90 * ns };
+    try t.expectEqual(@as(u64, 90 * ns), target.idleDeadline());
+    try t.expectEqual(@as(u64, 1), worker.deadlineTicks(100, 99, 1000));
+    try t.expectEqual(@as(u64, 1), worker.deadlineTicks(100, 101, 1000));
+    try t.expectEqual(@as(u64, 2), worker.deadlineTicks(100, 100 + ns + 1, 1000));
+    try t.expectEqual(@as(u64, 1), worker.deadlineTicks(100, 200 * ns, 0));
+    try t.expectEqual(std.math.maxInt(u64), worker.deadlineTicks(100, std.math.maxInt(u64), 1000));
+    try t.expect(worker.deadlineTicks(0, std.math.maxInt(u64) - 1, std.math.maxInt(u32)) > 0);
+}
 test "NVIDIA actual driver lifecycle paces hardware under owned work and retains incomplete tickets" {
     const worker = @import("gsp_start_work.zig");
     const target = try t.allocator.create(@import("gsp_device.zig").Device);
@@ -828,7 +879,7 @@ test "NVIDIA actual driver lifecycle paces hardware under owned work and retains
     target.* = .{ .self_address = @intFromPtr(target), .stopped = true };
     var api = WorkFixture.table();
     const ctx = r4os.r4dev.DriverContext2.init(&api);
-    for (0..18) |scenario| {
+    for (0..20) |scenario| {
         WorkFixture.reset();
         var work: worker.Work = .{};
         try work.start(&ctx, target);
@@ -863,10 +914,38 @@ test "NVIDIA actual driver lifecycle paces hardware under owned work and retains
                 WorkFixture.pause_during_wait = true;
                 WorkFixture.pending_running = scenario == 17;
             },
+            18 => {
+                WorkFixture.frequency_hz = 1000;
+                WorkFixture.completion_script = &.{2};
+                WorkFixture.release_busy = 2;
+            },
+            19 => {
+                WorkFixture.completion_script = &.{2};
+                WorkFixture.idle_wait_ticks = std.math.maxInt(u64);
+                WorkFixture.stop_on_semaphore = true;
+            },
             else => unreachable,
         }
         const result = WorkFixture.run();
         switch (scenario) {
+            19 => {
+                try t.expectEqual(@as(i32, 0), result);
+                try t.expectEqual(@as(u32, 1), WorkFixture.submits);
+                try t.expectEqual(WorkFixture.submits, WorkFixture.releases);
+                try t.expectEqual(@as(u32, 1), WorkFixture.semaphore_waits);
+                try t.expectEqual(std.math.maxInt(u64), WorkFixture.wait_timeouts[0]);
+                try t.expectEqual(@as(u64, 0), WorkFixture.ticks);
+                try t.expectEqual(@as(u32, 0), work.completion);
+            },
+            18 => {
+                try t.expectEqual(@as(i32, 0), result);
+                try t.expectEqual(@as(u32, 2), WorkFixture.submits);
+                try t.expectEqual(WorkFixture.submits, WorkFixture.releases);
+                try t.expectEqual(@as(u32, 1), WorkFixture.semaphore_waits);
+                try t.expectEqual(@as(u64, 35), WorkFixture.wait_timeouts[0]);
+                try t.expectEqual(@as(u64, 37), WorkFixture.ticks);
+                try t.expectEqual(@as(u32, 0), work.completion);
+            },
             0 => {
                 try t.expectEqual(@as(i32, 0), result);
                 try t.expectEqual(@as(u32, 3), WorkFixture.submits);
@@ -899,8 +978,8 @@ test "NVIDIA actual driver lifecycle paces hardware under owned work and retains
                 try t.expectEqual(@as(u32, 1), WorkFixture.callbacks);
                 try t.expectEqual(@as(u32, 0), work.completion);
                 try t.expectEqual(@as(u32, 3), WorkFixture.semaphore_waits);
-                try t.expectEqualSlices(u64, &.{ 1, 10, 1 }, WorkFixture.wait_timeouts[0..3]);
-                try t.expectEqual(@as(u64, if (scenario == 5) 14 else 12), WorkFixture.ticks);
+                try t.expectEqualSlices(u64, &.{ 1, 37, 1 }, WorkFixture.wait_timeouts[0..3]);
+                try t.expectEqual(@as(u64, if (scenario == 5) 41 else 39), WorkFixture.ticks);
             },
             6, 7, 10 => {
                 try t.expectEqual(@as(i32, 0), result);

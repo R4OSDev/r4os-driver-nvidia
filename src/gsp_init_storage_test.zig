@@ -20,6 +20,7 @@ var close_calls: usize = 0;
 var queries: usize = 0;
 var closing = false;
 var clock: u64 = 100;
+var clock_step_ns: u64 = 0;
 var clock_interrupt: ?*@import("gsp_device.zig").Device = null;
 const AdmissionExpiry = struct {
     target: *@import("gsp_device.zig").Device,
@@ -72,6 +73,7 @@ fn now() callconv(.c) u64 {
         };
     }
     const sampled = clock;
+    clock +|= clock_step_ns;
     if (clock_interrupt) |target| {
         // Keep the worker's returned sample while the independent IRQ uses
         // a newer value from the same monotonic clock. Clear before its own
@@ -218,6 +220,8 @@ fn apiTable() a.DriverApi2 {
     table.size = @sizeOf(a.DriverApi2); table.reserved = 0;
     table.heap_query = heap;
     table.resource_query = resources;
+    table.timer_frequency = timerFrequency;
+    table.tick_count = tickCount;
     table.dma_pin_buffer = pin;
     table.dma_map_pinned = map;
     table.dma_sync_for_device = sync;
@@ -227,6 +231,8 @@ fn apiTable() a.DriverApi2 {
     table.dma_sync_range_for_cpu = rangeCpu;
     return table;
 }
+fn timerFrequency() callconv(.c) u32 { return 1000; }
+fn tickCount() callconv(.c) u64 { return clock / std.time.ns_per_ms; }
 
 // The real native port reads/writes aligned host memory through the ordinary
 // DriverContext2 facade. This fixture supplies no hardware readiness proof.
@@ -16007,6 +16013,14 @@ fn checkDeviceRuntime(target: *@import("gsp_device.zig").Device, words: []u32, f
         },
         .runtime_sequence_timeout => {
             try t.expect(!target.workPolling());
+            // Exercise the real bounded Work slice with this live Device.
+            // Its idle wait follows the log owner, rather than a 10-ms timer.
+            const work_owner = @import("gsp_start_work.zig");
+            var work: work_owner.Work = .{ .ctx = target.ctx, .device = target };
+            work.self_address = @intFromPtr(&work);
+            try t.expectEqual(@as(i32, 0), work.runOwnedSlice());
+            try t.expectEqual(@as(u32, 2), work.completion_disposition);
+            try t.expectEqual(work_owner.deadlineTicks(clock, target.idleDeadline(), 1000), work.completion_wait_ticks);
             try deviceSequence(target, &.{ 3, 100000 });
             try t.expect(target.step() == .progress and target.running.sequence.self_address != 0);
             // A real sequencer delay is a hardware wait, not productive work
@@ -16017,6 +16031,20 @@ fn checkDeviceRuntime(target: *@import("gsp_device.zig").Device, words: []u32, f
             const sequence_deadline = target.running.sequence.deadline;
             try t.expect(target.running.workPolling());
             try t.expect(target.step() == .idle);
+            const polls = target.running.snapshot.polls;
+            try t.expectEqual(@as(i32, 0), work.runOwnedSlice());
+            // A clock which stands still cannot create an unbounded spin or
+            // immediate requeue. Exactly eight unchanged observations sleep.
+            try t.expectEqual(@as(u32, 0), work.completion_disposition);
+            try t.expectEqual(polls + 8, target.running.snapshot.polls);
+            {
+                clock_step_ns = 2 * std.time.ns_per_us;
+                defer clock_step_ns = 0;
+                const before = target.running.snapshot.polls;
+                try t.expectEqual(@as(i32, 0), work.runOwnedSlice());
+                try t.expectEqual(@as(u32, 0), work.completion_disposition);
+                try t.expect(target.running.snapshot.polls > before and target.running.snapshot.polls < before + 8);
+            }
             for (0..3) |_| {
                 try t.expect(target.step() == .idle and target.running.sequence.self_address != 0);
                 try t.expect(target.running.workPolling());

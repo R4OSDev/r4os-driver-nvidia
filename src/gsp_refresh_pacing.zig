@@ -90,6 +90,12 @@ pub const State = struct {
         };
         return !frame.repeat and frame.submit_ns <= now;
     }
+    pub fn nextCheckNs(self: *const State) u64 {
+        if (self.scheduler.state != .active) return std.math.maxInt(u64);
+        const plan = self.scheduler.plan orelse return std.math.maxInt(u64);
+        const anchor = if (self.scheduler.observed_ns != 0) self.scheduler.observed_ns else self.since_ns;
+        return anchor +| (plan.max_period_ns *| 3) +| 1;
+    }
     pub fn checkClock(self: *State, now: u64) void {
         if (self.scheduler.state != .active) return;
         const plan = self.scheduler.plan orelse return;
