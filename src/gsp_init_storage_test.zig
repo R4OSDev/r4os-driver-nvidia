@@ -9863,7 +9863,11 @@ fn checkDeviceGraphics(target: *@import("gsp_device.zig").Device, table: *a.Driv
         // use the same production Port submission and Runtime receipt path.
         const deadline = clock + std.time.ns_per_s;
         try run.beginGraphicsBarrier(handle, deadline);
+        const before_stores = owner.ring.graphics_words_stored;
+        const before_reused = owner.ring.graphics_words_reused;
         const ticket = try owner.prepareGraphics(.barrier);
+        try t.expect(owner.ring.graphics_words_stored == before_stores + 1 and
+            owner.ring.graphics_words_reused == before_reused + 10);
         run.graphics_work.?.ticket = ticket;
         const port_owner = target.port.owner.?;
         try port_owner.admit_graphics.?(port_owner.context, &target.port, owner, ticket, deadline);
@@ -9884,6 +9888,20 @@ fn checkDeviceGraphics(target: *@import("gsp_device.zig").Device, table: *a.Driv
         std.mem.writeInt(u32, data[wire.completion_offset..][0..4], owner.ring.completed - 1, .little);
         try t.expectError(error.Retained, owner.ring.abortUnpublished(ticket));
         std.mem.writeInt(u32, data[wire.completion_offset..][0..4], owner.ring.completed, .little);
+        try owner.ring.abortUnpublished(ticket);
+        const stored = owner.ring.graphics_words_stored;
+        const reused = owner.ring.graphics_words_reused;
+        const again = try owner.prepareGraphics(.barrier);
+        try t.expectEqualDeep(ticket, again);
+        try t.expect(owner.ring.graphics_words_stored == stored and owner.ring.graphics_words_reused > reused and
+            owner.ring.matchesGraphics(again, info.config.object_class, .barrier));
+        try owner.ring.abortUnpublished(again);
+        data[4096 + 9 * 4] ^= 1;
+        const repaired = try owner.prepareGraphics(.barrier);
+        try t.expectEqualDeep(ticket, repaired);
+        try t.expect(owner.ring.graphics_words_stored == stored + 1 and
+            owner.ring.matchesGraphics(repaired, info.config.object_class, .barrier));
+        if (native.is("context_graphics")) std.debug.print("[nvidia-packet-reuse] next physical barrier: 1/11 command stores; identical unpublished packet: 0; corrupted word: 1 repair; exact ticket/admission retained\n", .{});
         try t.expect(owner.ring.matches(ticket) and owner.ring.issued == 1 and owner.ring.completed == 1);
         try t.expectError(error.Busy, run.retireExecutionChannel(handle, deadline, true));
         try target.port.submitGraphics(owner, ticket, deadline);
@@ -11642,6 +11660,65 @@ fn checkLargeRenderQuanta() !void {
         }
         try t.expect(pixels==1920*1080 and sections==(if(profile==0) @as(u32,8) else 2));
     }
+    const scheduling = @import("gsp_work_scheduling.zig");
+    var schedule: scheduling.Owner = .{};
+    var job: a.GfxDriverJob = .{ .size = @sizeOf(a.GfxDriverJob), .producer_kind = 1,
+        .producer_id = 7, .producer_generation = 1, .fence = .{ .timeline = 1 } };
+    try schedule.admit(0, job);
+    try schedule.admit(1, job); // A second job does not give one producer two shares.
+    const instant: u64 = std.time.ns_per_ms;
+    const far = instant + std.time.ns_per_s;
+    const near = instant + scheduling.work_slice_ns;
+    try t.expectEqual(@as(u32, scheduling.copy_bytes), schedule.sectionLimit(0, scheduling.copy_bytes, 4*1024*1024, instant, near));
+    job.producer_id += 1;
+    try schedule.admit(2, job);
+    try t.expectEqual(@as(u32, 512*1024), schedule.sectionLimit(0, scheduling.copy_bytes, 4*1024*1024, instant, far));
+    try t.expectEqual(@as(u32, 256*1024), schedule.sectionLimit(0, scheduling.copy_bytes, 4*1024*1024, instant, near));
+    try t.expectEqual(@as(u32, 17), schedule.sectionLimit(0, scheduling.copy_bytes, 17, instant, near));
+    try t.expectEqual(@as(u32, 512), schedule.sectionLimit(0, 512, 8192, instant, near));
+    try t.expectEqual(@as(u32, 0), schedule.sectionLimit(0, scheduling.copy_bytes, 8192, instant, instant));
+    try t.expectEqual(@as(u32, 0), schedule.sectionLimit(0, scheduling.copy_bytes, 0, instant, far));
+    for ([_]u64{far, near}, 0..) |deadline, profile| {
+        var queue: @import("gsp_render_queue.zig").Owner = .{ .draw_count = 1, .deadline = deadline };
+        queue.draws[0] = draw;
+        var pixels: u64 = 0;
+        var sections: u32 = 0;
+        while (queue.draw_cursor != 1) {
+            try queue.prepareBudgetedSlice(&schedule, 0, instant);
+            const limit = queue.pixel_limit;
+            const peer = schedule.entries[2];
+            schedule.entries[2] = null;
+            try queue.validateSlice(); // Changing contention cannot change an already prepared section.
+            try t.expectEqual(limit, queue.pixel_limit);
+            schedule.entries[2] = peer;
+            var area: u64 = 0;
+            for (queue.commands()) |part| {
+                const clip = try part.clip();
+                try t.expectEqual(pixels, @as(u64, clip[1])*1920 + clip[0]);
+                const count = @as(u64, clip[2]-clip[0])*(clip[3]-clip[1]);
+                try t.expect(count != 0 and clip[2] <= 1920 and clip[3] <= 1080);
+                try t.expectEqualDeep(draw.destination, part.destination);
+                pixels += count; area += count;
+            }
+            try t.expect(area <= limit and limit <= scheduling.render_pixels);
+            sections += 1;
+            queue.draw_cursor = queue.next_draw; queue.pixel_cursor = queue.next_pixel;
+        }
+        try t.expect(pixels == 1920*1080 and sections == (if (profile == 0) @as(u32, 4) else 8));
+        const wire = @import("gsp_copy_wire.zig");
+        const transfer: wire.Transfer = .{ .source = 0x10000000, .target = 0x20000000, .bytes = 2*1024*1024+17 };
+        var copied: u64 = 0;
+        var copies: u32 = 0;
+        while (copied != transfer.bytes) {
+            const limit_copy = schedule.sectionLimit(0, scheduling.copy_bytes, transfer.bytes - copied, instant, deadline);
+            const part = try wire.slice(transfer, copied, limit_copy);
+            try t.expect(part.transfer.source == transfer.source + copied and part.transfer.target == transfer.target + copied and
+                part.next == copied + part.transfer.bytes and part.transfer.bytes <= limit_copy);
+            copied = part.next; copies += 1;
+        }
+        try t.expectEqual(if (profile == 0) @as(u32, 5) else 9, copies);
+    }
+    std.debug.print("[nvidia-section-policy] one producer: 1080p/2 unchanged; two producers: 4 sections, near deadline: 8; copy 2MB+17: 5/9 exact sections; small limits and frozen operands retained\n", .{});
 }
 fn queuedSrgbProgram() @import("r4nv_render").ColorProgram {
     var program: @import("r4nv_render").ColorProgram = .{};
@@ -12757,11 +12834,15 @@ fn checkDevicePresentation(target: *@import("gsp_device.zig").Device, handle: @i
                     if (!std.meta.eql(source.buffer, job.job.source_buffer)) continue;
                     job.addresses[0] = .{ .address = source.address, .bytes = source.logical_bytes };
                     job.transfer = try running.copyTransfer();
-                    const slice = try @import("gsp_copy_wire.zig").slice(job.transfer.?, job.copied, running.work_schedule.copy_limit);
+                    job.slice_limit = running.work_schedule.copy_limit;
+                    const slice = try @import("gsp_copy_wire.zig").slice(job.transfer.?, job.copied, job.slice_limit);
                     job.slice_end = slice.next;
                     job.ticket = try fifo.prepareCopy(slice.transfer);
                     const io = target.port.owner.?; const gate = io.admit_copy.?;
                     try gate(io.context, &target.port, fifo, job.ticket.?, job.deadline);
+                    job.slice_limit = 0;
+                    try t.expectError(error.Binding, gate(io.context, &target.port, fifo, job.ticket.?, job.deadline));
+                    job.slice_limit = running.work_schedule.copy_limit;
                     job.transfer.?.rows.?.target_pitch += 64;
                     try t.expectError(error.Binding, gate(io.context, &target.port, fifo, job.ticket.?, job.deadline));
                     job.transfer.?.rows.?.target_pitch -= 64;

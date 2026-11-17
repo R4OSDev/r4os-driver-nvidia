@@ -7,6 +7,7 @@ pub const copy_bytes = 1024 * 1024;
 // One finite GPU section, then the existing producer turn after real GR
 // completion. 1080p becomes two sections instead of eight; no unbounded batch.
 pub const render_pixels = 1024 * 1024;
+pub const work_slice_ns = 250 * std.time.ns_per_us;
 pub const Producer = struct { kind: u32, id: u64, generation: u64 };
 const Entry = struct { producer: Producer, producer_turn: u64, job_turn: u64 = 0 };
 pub const Owner = struct {
@@ -16,6 +17,28 @@ pub const Owner = struct {
     high_water: u32 = 0,
     copy_limit: u32 = copy_bytes,
     render_limit: u32 = render_pixels,
+    /// A scheduling hint, never a GPU duration estimate or retirement proof.
+    /// Keep the old ceiling for an uncontended producer and explicit small
+    /// quanta. Distinct competing producers share the bounded section; inside
+    /// one remaining Work callback budget, halve that share once more.
+    pub fn sectionLimit(self: *const Owner, index: ?usize, ceiling: u32, remaining: u64, now: u64, deadline: u64) u32 {
+        if (ceiling == 0 or remaining == 0 or deadline <= now) return 0;
+        var producers: [capacity]Producer = undefined;
+        var producer_count: usize = 0;
+        if (index) |slot| if (slot < capacity and self.entries[slot] != null) {
+            for (self.entries) |entry| if (entry) |peer| {
+                var known = false;
+                for (producers[0..producer_count]) |producer| if (std.meta.eql(producer, peer.producer)) { known = true; break; };
+                if (!known) { producers[producer_count] = peer.producer; producer_count += 1; }
+            };
+        };
+        var limit = ceiling;
+        if (producer_count > 1 and ceiling > 4096) {
+            limit = @max(4096, ceiling / @as(u32, @intCast(producer_count)));
+            if (deadline - now <= work_slice_ns) limit = @max(4096, limit / 2);
+        }
+        return @intCast(@min(limit, remaining));
+    }
     /// Driver-local tuning may lower a quantum only between complete jobs.
     pub fn configure(self: *Owner, copy_limit: u32, render_limit: u32) !void {
         if (self.count() != 0) return error.Busy;

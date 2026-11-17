@@ -1,4 +1,4 @@
-﻿NVIDIA: nativer Grafik- und Displaybesitzer
+NVIDIA: nativer Grafik- und Displaybesitzer
 =========================================
 
 0.91.8 / NVIDIA0.1.339 / 15.11.2026:
@@ -3730,3 +3730,32 @@ Ownerorakel bleiben erhalten. Konkrete Host-/Windowskompilat-/native
 Modellbelege und physische Grenzen: Docs/API/ConsumerMigration.txt und
 Research/API-ABI/Migration/0.90.53/Abnahme.json. AMD/NVIDIA-Hardware und
 bekannte NVIDIA-Hang-/Shutdownbefunde werden dadurch nicht abgenommen.
+
+NVIDIA340 behaelt den privaten WB-Pushbuffer und seine bisherigen GPFIFO-/
+Semaphorgrenzen. Der Encoder validiert weiterhin das vollstaendige Paket;
+vor Publikation prueft die Admission saemtliche wirklichen Paketbytes.
+Nur identische32Bit-Graphicsworte brauchen keinen erneuten Store. Verglichen
+wird der echte, nicht mehr laufende private Slot, kein CPU-Schatteneintrag.
+Geaenderte oder beschaedigte Worte werden geschrieben. Releasepunkt, exaktes
+Ticket, mfence/PUT, Stop, Reset und Freigaben bleiben beim bisherigen Besitzer.
+Copy-,Video- und native Batchpakete behalten ihre bisherigen Writes.
+
+Die acht vorhandenen Workplaetze erhalten eine begrenzte Groessenwahl ohne
+neue Allokationen. Ein einzelner Producer behaelt bis1MB/1MP je Abschnitt;
+der Rest des Auftrags begrenzt die tatsaechliche Auswahl. Verschiedene
+konkurrierende Producer teilen diesen Hoechstwert. Innerhalb der letzten
+250us der Auftragsdeadline wird dieser Anteil nochmals halbiert. Das ist
+ein Schedulinghinweis unter Verwendung des vorhandenen Workbudgets, keine
+Schaetzung der GPU-Dauer oder Zusage, die Deadline zu schaffen. Derselbe
+Producer mit mehreren Jobs erhaelt keinen mehrfachen Anteil. Eine4KB-/4096-
+Pixel-Untergrenze gilt nur oberhalb expliziter kleiner konfigurierter Werte;
+512Byte/128Pixel bleiben gleich. Die alten1MB-/1MP-Hoechstwerte werden nie
+erhoeht. Producerturns wechseln weiterhin erst nach wirklichem Semaphor.
+
+CopyJob haelt die gewaehlte Grenze gemeinsam mit seinem Teilende; die echte
+Port-Admission rekonstruiert genau diesen Transfer statt mit spaeterer Uhr
+oder Konkurrenz neu zu entscheiden. Renderjobs halten ihre gewaehlte Grenze
+ueber CE-Upload, Operandpruefung und GR-Beleg. Erst vor einem neuen Abschnitt
+wird erneut entschieden. Nach Deadlineablauf und bestaetigtem GR-Ende kann
+ein unvollstaendiger Job fehlschlagen; eine abgelaufene Uhr gibt niemals
+laufende GPU-Arbeit oder ihre Aliase frei.

@@ -170,6 +170,8 @@ pub const Ring = struct {
     pending_batch: bool = false,
     batch_entries: u32 = 0,
     batch_point: u32 = 0,
+    graphics_words_stored: u64 = 0,
+    graphics_words_reused: u64 = 0,
 
     pub fn open(self: *Ring, backing: *storage.Storage, address: u64) Error!void {
         return self.openKind(backing, address, .copy);
@@ -252,7 +254,18 @@ pub const Ring = struct {
         if (commands.len == 0 or commands.len > self.slotBytes() / 4) return error.Bounds;
         const push = self.pushOffset();
         const gp = try entryWords(self.address + push, @intCast(commands.len));
-        for (commands, 0..) |value, i| self.word(push + i * 4).* = value;
+        // The graphics slot is idle after its real semaphore or an exact
+        // unpublished abort. Compare this private WB packet's real bytes;
+        // admission still authenticates every operand, including repaired words.
+        if (self.kind == .graphics) {
+            var stored: u64 = 0;
+            for (commands, 0..) |value, i| {
+                const destination = self.word(push + i * 4);
+                if (destination.* != value) { destination.* = value; stored += 1; }
+            }
+            self.graphics_words_stored +|= stored;
+            self.graphics_words_reused +|= commands.len - stored;
+        } else for (commands, 0..) |value, i| self.word(push + i * 4).* = value;
         self.word(self.put * 8).* = gp[0]; self.word(self.put * 8 + 4).* = gp[1];
         const ticket: Ticket = .{ .owner = @intFromPtr(self), .epoch = self.backing.?.epoch,
             .channel = channel_handle, .token = token, .point = point, .put = (self.put + 1) % 512 };

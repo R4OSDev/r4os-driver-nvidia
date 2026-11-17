@@ -30,6 +30,7 @@ pub const Owner = struct {
     next_draw: usize = 0,
     next_pixel: u64 = 0,
     pixel_limit: u32 = @import("gsp_work_scheduling.zig").render_pixels,
+    pixel_ceiling: u32 = @import("gsp_work_scheduling.zig").render_pixels,
     phase: Phase = .retain,
     deadline: u64 = 0,
     acknowledged: bool = false,
@@ -40,7 +41,7 @@ pub const Owner = struct {
         if (self.self_address != 0) return error.Busy;
         const pixel_limit = self.pixel_limit;
         if (pixel_limit == 0 or pixel_limit > @import("gsp_work_scheduling.zig").render_pixels) return error.Bounds;
-        self.* = .{ .self_address = @intFromPtr(self), .queue = queue, .memory = memory, .pixel_limit = pixel_limit,
+        self.* = .{ .self_address = @intFromPtr(self), .queue = queue, .memory = memory, .pixel_limit = pixel_limit, .pixel_ceiling = pixel_limit,
             .binding = binding, .job = job, .stamp = job, .deadline = job.deadline_ns };
         if (job.version != 1 or job.size < @offsetOf(a.GfxDriverJob, "producer_kind") or
             (job.operation != a.gfx_queue_operation_render and job.operation != a.gfx_queue_operation_render_list and job.operation != a.gfx_queue_operation_render_grid_list and job.operation != a.gfx_queue_operation_render_color_list and job.operation != a.gfx_queue_operation_render_color_grid_list) or
@@ -90,6 +91,8 @@ pub const Owner = struct {
             std.meta.eql(self.references, self.reference_stamps) and self.deadline == self.stamp.deadline_ns and
             std.meta.eql(self.list, self.list_stamp) and std.meta.eql(self.grids, self.grid_stamps) and
             std.meta.eql(self.color, self.color_stamp) and self.draw_count <= render.batch_capacity and
+            self.pixel_limit != 0 and self.pixel_limit <= self.pixel_ceiling and
+            self.pixel_ceiling <= @import("gsp_work_scheduling.zig").render_pixels and
             self.slice_count <= render.batch_capacity and self.draw_cursor <= self.draw_count and self.next_draw <= self.draw_count;
     }
     pub fn commands(self: *const Owner) []const render.Draw { return self.slices[0..self.slice_count]; }
@@ -120,6 +123,23 @@ pub const Owner = struct {
             if (part.next == part.total) { self.next_draw += 1; self.next_pixel = 0; }
         }
         if (self.slice_count == 0) return error.Empty;
+    }
+    /// Select only before a fresh CE/GR section. pixel_limit then remains
+    /// fixed through upload, operand admission and the physical GR receipt.
+    pub fn prepareBudgetedSlice(self: *Owner, schedule: *const @import("gsp_work_scheduling.zig").Owner, index: ?usize, now: u64) !void {
+        if (self.draw_cursor >= self.draw_count or self.pixel_ceiling == 0 or
+            self.pixel_ceiling > @import("gsp_work_scheduling.zig").render_pixels) return error.Bounds;
+        var remaining: u64 = 0;
+        for (self.draws[self.draw_cursor..self.draw_count], self.draw_cursor..) |draw, i| {
+            const clip = try draw.clip();
+            const area = @as(u64, clip[2] - clip[0]) * (clip[3] - clip[1]);
+            const consumed = if (i == self.draw_cursor) self.pixel_cursor else 0;
+            if (consumed > area) return error.Bounds;
+            remaining = try std.math.add(u64, remaining, area - consumed);
+        }
+        self.pixel_limit = schedule.sectionLimit(index, self.pixel_ceiling, remaining, now, self.deadline);
+        if (self.pixel_limit == 0) return error.Empty;
+        try self.prepareSlice();
     }
     pub fn validateSlice(self: *const Owner) !void {
         var draw = self.draw_cursor;
@@ -184,7 +204,7 @@ pub const Owner = struct {
                     }
                     return err;
                 };
-                try self.prepareSlice();
+                try self.prepareBudgetedSlice(&run.work_schedule, run.active_work, now);
                 self.phase = .upload;
             },
             .upload => {
@@ -226,8 +246,10 @@ pub const Owner = struct {
                 if (self.draw_cursor == self.draw_count) {
                     run.graphics_completed +|= 1;
                     try self.finish(a.gfx_queue_result_complete);
+                } else if (now >= self.deadline) {
+                    try self.finish(a.gfx_queue_result_failed);
                 } else {
-                    try self.prepareSlice();
+                    try self.prepareBudgetedSlice(&run.work_schedule, run.active_work, now);
                     self.phase = .upload;
                     try run.yieldWork();
                 }

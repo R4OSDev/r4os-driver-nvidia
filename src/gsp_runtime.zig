@@ -251,6 +251,7 @@ pub const CopyJob = struct {
     transfer: ?execution_fifo.copy.wire.Transfer = null,
     copied: u64 = 0,
     slice_end: u64 = 0,
+    slice_limit: u32 = 0,
     target_presentation: ?*Presentation = null,
     render_read: present.Initial = .{},
 };
@@ -4805,7 +4806,11 @@ pub const Owner = struct {
         };
         if (work.transfer) |original| { if (!std.meta.eql(original, transfer)) return error.Stale; }
         else work.transfer = transfer;
-        const part = try execution_fifo.copy.wire.slice(transfer, work.copied, self.work_schedule.copy_limit);
+        const total = try execution_fifo.copy.wire.logicalBytes(transfer);
+        if (work.copied >= total) return error.Bounds;
+        work.slice_limit = self.work_schedule.sectionLimit(self.active_work, self.work_schedule.copy_limit,
+            total - work.copied, current, work.deadline);
+        const part = try execution_fifo.copy.wire.slice(transfer, work.copied, work.slice_limit);
         work.slice_end = part.next;
         work.ticket = fifo.prepareCopy(part.transfer) catch |err| {
             if (err == error.Bounds or err == error.Unsupported or err == error.Exhausted) { try self.finishCopy(r4os.abi.gfx_queue_result_failed); return true; }

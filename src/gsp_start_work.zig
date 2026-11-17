@@ -8,7 +8,7 @@ const device = @import("gsp_device.zig");
 // Requeue behind other normal Work owners after this finite quantum. The
 // clock is checked between indivisible device steps; their own deadlines stay.
 const slice_steps = 8;
-const slice_ns = 250 * std.time.ns_per_us;
+const slice_ns = @import("gsp_work_scheduling.zig").work_slice_ns;
 const idle_poll_ns = 8 * std.time.ns_per_us;
 /// Round a finite maintenance deadline upwards; MAX remains a true IRQ wait.
 pub fn deadlineTicks(current: u64, deadline: u64, frequency: u32) u64 {

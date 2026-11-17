@@ -1,4 +1,14 @@
-﻿# NVIDIA.R4D
+# NVIDIA.R4D
+
+0.1.340 / Roadmap0.92.12 keeps the existing three resident render packets
+and their actual CE/GR receipts. The private idle WB graphics packet writes
+only changed words; full encoding, operand admission, mfence/PUT and exact
+semaphore retirement remain. Copy/render sections adapt within the existing
+1MB/1MP ceilings to remaining work, distinct competing producers and a near
+deadline. The selected operands remain fixed through their physical receipt.
+Small configured limits and the existing bounded pacing remain unchanged.
+Qualification uses the original owner models and general QEMU regression;
+no NVIDIA hardware IRQ, GPU latency or scanout claim is made.
 
 0.1.339 / Roadmap0.91.8 replaces the fixed10-ms idle timeout with the
 next existing owner deadline: logs, common telemetry, sensor samples, finite

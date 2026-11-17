@@ -1378,7 +1378,10 @@ pub const Device = struct {
                 } else if (!work.render_read.matches(ticket, deadline)) return error.Binding;
             }
             const transfer = self.running.copyTransfer() catch return error.Binding;
-            const part = @import("gsp_copy_wire.zig").slice(transfer, work.copied, self.running.work_schedule.copy_limit) catch return error.Binding;
+            // Freeze the chosen quantum until this exact semaphore retires;
+            // a new producer or a later clock cannot change admitted operands.
+            if (work.slice_limit == 0 or work.slice_limit > self.running.work_schedule.copy_limit) return error.Binding;
+            const part = @import("gsp_copy_wire.zig").slice(transfer, work.copied, work.slice_limit) catch return error.Binding;
             if (!std.meta.eql(work.transfer, transfer) or work.slice_end != part.next or
                 !fifo.ring.matchesTransfer(ticket, fifo.config.object_class, part.transfer)) return error.Binding;
             break :blk work.channel_handle;
